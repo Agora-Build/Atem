@@ -447,12 +447,41 @@ pub struct AstationClient {
     /// Shows the pairing code and its outcome (`authenticate_with_pairing`);
     /// `None` prints them. The runtime sends them to the CLI that pairs.
     pairing_notice: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
-    /// The key agent encryption messages and reports use (`with_agent`);
+    /// The cred agent encryption messages and reports use (`with_agent`);
     /// `None` is this user's agent.
-    agent: Option<std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>>,
+    agent: Option<std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>>,
     /// A handle for one runtime operation (`op_view`): it waits for a
     /// migration the link is finishing instead of skipping its own.
     is_op_view: bool,
+    /// How this client reached Astation, once connected (`atem status`).
+    via: Option<LinkVia>,
+}
+
+/// How a link reached Astation, for `atem status`: never a secret (no
+/// session, token or relay room code).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkVia {
+    Local,
+    /// The relay's host and this Atem's id in the room.
+    Relay { label: String },
+}
+
+/// `<relay host> as <atem_id>`: what `atem status` shows for a relay link.
+pub(crate) fn relay_label(relay_url: &str, atem_id: &str) -> String {
+    let host = relay_url
+        .split_once("://")
+        .map_or(relay_url, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if atem_id.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host} as {atem_id}")
+    }
 }
 
 /// One encryption migration at a time per process: the runtime's link and
@@ -521,31 +550,32 @@ impl AstationClient {
             pairing_notice: None,
             agent: None,
             is_op_view: false,
+            via: None,
         }
     }
 
     /// Encryption messages and reports use `agent` (not this user's).
     pub(crate) fn with_agent(
         mut self,
-        agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>,
+        agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>,
     ) -> Self {
         self.agent = Some(agent);
         self
     }
 
-    /// The key agent of this client (started on demand when it's the user's).
-    fn key_agent(&self) -> std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi> {
+    /// The cred agent of this client (started on demand when it's the user's).
+    fn cred_agent(&self) -> std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi> {
         match &self.agent {
             Some(agent) => agent.clone(),
-            None => std::sync::Arc::from(crate::memory::key_agent::default_agent()),
+            None => std::sync::Arc::from(crate::memory::cred_agent::default_agent()),
         }
     }
 
-    /// The running key agent of this client, never started.
-    fn running_key_agent(&self) -> Option<std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>> {
+    /// The running cred agent of this client, never started.
+    fn running_cred_agent(&self) -> Option<std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>> {
         match &self.agent {
             Some(agent) => Some(agent.clone()),
-            None => crate::memory::key_agent::running_agent().map(std::sync::Arc::from),
+            None => crate::memory::cred_agent::running_agent().map(std::sync::Arc::from),
         }
     }
 
@@ -737,6 +767,11 @@ impl AstationClient {
         self.connected_astation_id.as_deref()
     }
 
+    /// How this client reached Astation (`None`: not connected yet).
+    pub fn via(&self) -> Option<&LinkVia> {
+        self.via.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_test_state(atem_id: &str, session_path: std::path::PathBuf) -> Self {
         let mut client = Self::new();
@@ -855,6 +890,8 @@ impl AstationClient {
             .await;
         if result.is_err() {
             self.abort_transport();
+        } else {
+            self.via = Some(LinkVia::Local);
         }
         result
     }
@@ -1380,8 +1417,8 @@ impl AstationClient {
             .map_err(|_| anyhow!("this machine isn't paired with an Astation"))?;
         let agent = match &self.agent {
             Some(agent) => agent.clone(),
-            None => crate::memory::key_agent::blocking(|| {
-                crate::memory::key_agent::running_agent().ok_or_else(|| anyhow!("key agent is not running"))
+            None => crate::memory::cred_agent::blocking(|| {
+                crate::memory::cred_agent::running_agent().ok_or_else(|| anyhow!("cred agent is not running"))
             })
             .await
             .map(std::sync::Arc::from)?,
@@ -1394,16 +1431,16 @@ impl AstationClient {
     pub(crate) async fn report_credential_projects_with(
         &self,
         cwd: Option<std::path::PathBuf>,
-        agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>,
+        agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>,
     ) -> Result<()> {
-        use crate::memory::key_agent::{blocking, KeyAgentApi};
+        use crate::memory::cred_agent::{blocking, CredAgentApi};
         let astation_id = self.connected_astation_id.clone().ok_or_else(|| anyhow!("Astation identity is not known"))?;
         // Signed only under the pairing this connection authenticated with.
         let capture = self.capture.clone().ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
         capture.bound()?;
         let report = blocking(move || {
             let agent = crate::pairing_binding::BoundAgent::new(capture, agent)?;
-            if !agent.status()?.unlocked { return Err(anyhow!("key agent is locked")); }
+            if !agent.status()?.unlocked { return Err(anyhow!("cred agent is locked")); }
             let project = cwd.and_then(|cwd| crate::memory::project::detect_repo(&cwd)).map(|repo| repo.label);
             agent.credential_projects(&astation_id, project)
         }).await?;
@@ -1416,7 +1453,7 @@ impl AstationClient {
         &mut self,
         message: &AstationMessage,
     ) -> Result<Option<String>> {
-        use crate::memory::key_agent::{blocking, LOCKED};
+        use crate::memory::cred_agent::{blocking, LOCKED};
         use crate::memory::verification::{apply_account_state, apply_grant, key_needed, Applied};
 
         if matches!(message, AstationMessage::CredentialProjectListRequest) {
@@ -1442,13 +1479,13 @@ impl AstationClient {
             return Ok(Some(HOLDING_ENCRYPTION.into()));
         };
         let paths = self.profile_sources()?.keys;
-        let agent = self.key_agent();
+        let agent = self.cred_agent();
         let applied = match message {
             AstationMessage::EncryptionMode { account_state } => {
                 capture.apply(|| apply_account_state(&paths, &astation_id, account_state.as_ref()))?
             }
             AstationMessage::KeyGrant { grant } => {
-                // Grants are opened only inside the key agent (blocking socket I/O).
+                // Grants are opened only inside the cred agent (blocking socket I/O).
                 let (paths, astation_id, grant) = (paths.clone(), astation_id.clone(), grant.clone());
                 let (capture, agent) = (capture.clone(), agent.clone());
                 blocking(move || capture.apply(|| apply_grant(&paths, agent.as_ref(), &astation_id, grant.as_ref()))).await?
@@ -1492,7 +1529,7 @@ impl AstationClient {
                     // A running, unlocked agent drops the account's keys now; a
                     // locked one does at its next unlock.
                     let astation = astation_id.clone();
-                    let running = self.running_key_agent();
+                    let running = self.running_cred_agent();
                     blocking(move || {
                         if let Some(agent) = running {
                             let _ = agent.held_kid(&astation);
@@ -1580,7 +1617,7 @@ impl AstationClient {
             }
         };
         let src = self.profile_sources()?;
-        let agent = self.key_agent();
+        let agent = self.cred_agent();
         let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust)?;
         let epoch = crate::memory::verification::effective_state(&trust, astation_id)?
             .and_then(|(_, state)| state).map(|state| state.epoch);
@@ -1588,7 +1625,7 @@ impl AstationClient {
             let kid = kid.ok_or_else(|| anyhow!("encryption migration has no key id"))?;
             let (account, proof_kid) = (astation_id.to_string(), kid.clone());
             let epoch = epoch.ok_or_else(|| anyhow!("the signed migration state is missing"))?;
-            let completion = crate::memory::key_agent::blocking(move ||
+            let completion = crate::memory::cred_agent::blocking(move ||
                 agent.migration_completion(&account, epoch, target, &proof_kid)).await?;
             self.send_message_flushed(AstationMessage::EncryptionMigrationComplete { mode: target.to_string(), kid, completion }).await?;
             return Ok(Some(format!("Encryption migration complete; requesting {target}")));
@@ -1694,6 +1731,10 @@ impl AstationClient {
         };
         let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
         self.connect_raw(&ws_url).await?;
+        // A pairing room: its code is a secret until the pairing ends.
+        self.via = Some(LinkVia::Relay {
+            label: relay_label(&station_url, ""),
+        });
 
         // Return the code — caller is responsible for any UI (println!, open_browser, etc.)
         // so this function stays silent and TUI-safe.
@@ -1771,6 +1812,10 @@ impl AstationClient {
         .await;
         if result.is_err() {
             self.abort_transport();
+        } else {
+            self.via = Some(LinkVia::Relay {
+                label: relay_label(relay_url, &atem_id),
+            });
         }
         result
     }
@@ -2122,7 +2167,7 @@ mod tests {
         let paths = capture.sources().keys.clone();
         let mut authenticated = AstationClient::new()
             .with_profile(capture.sources().clone())
-            .with_agent(std::sync::Arc::new(crate::memory::key_agent::test_agent(&paths)));
+            .with_agent(std::sync::Arc::new(crate::memory::cred_agent::test_agent(&paths)));
         authenticated.connected_astation_id = Some("astation-1".into());
         authenticated.set_capture_for_test(capture.clone());
         let held = pairing.take_held_encryption();

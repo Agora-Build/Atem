@@ -28,7 +28,7 @@ signatures that chain back to what it pinned.
 | Log entry | in the log | `{account_id, seq, prev_hash, action: add\|remove\|set_roles, device_id, device_sign_pub, device_enc_pub, roles, signer_device_id, signed_at}` + signature by a device whose roles include `manage` at `seq-1` |
 | Genesis | entry `seq = 1` | `add` of the first Astation by itself, roles `manage, view, control` |
 | Head attestation | produced on request by any online `manage` device | `{account_id, seq, head_hash, issued_at, atem_nonce?}` signed by a manager — "this is the latest log as of now" |
-| Atem pin | Atem's `cred_state.json`, next to the existing verification pins | `{account_id, genesis_hash, high_water_seq, high_water_hash, last_fresh_at}` |
+| Atem pin | Atem's `cred/state.json`, next to the existing verification pins | `{account_id, genesis_hash, high_water_seq, high_water_hash, last_fresh_at}` |
 
 Roles: `view` (see sessions/output), `control` (take the lease, type, submit,
 answer the agent's permission prompts while holding the lease), `manage` (add/remove devices).

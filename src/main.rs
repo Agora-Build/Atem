@@ -27,6 +27,7 @@ mod memory;
 mod pair_verify;
 mod pairing_binding;
 mod status;
+mod version;
 mod chat;
 mod daemon;
 mod runtime;
@@ -53,6 +54,10 @@ use clap::Parser;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli_args = cli::Cli::parse();
+    if cli_args.version {
+        print!("{}", tokio::task::spawn_blocking(version::text).await?);
+        return Ok(());
+    }
     if let Some(command) = cli_args.command {
         cli::handle_cli_command(command).await
     } else {

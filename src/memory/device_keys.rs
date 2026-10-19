@@ -28,7 +28,7 @@ pub trait PublicKeys {
     fn unlock_auth_pub(&self) -> [u8; 32];
 }
 
-/// Public keys of a device whose secrets stay sealed (or in the key agent).
+/// Public keys of a device whose secrets stay sealed (or in the cred agent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevicePublics {
     pub device_pub: [u8; 32],
@@ -107,7 +107,7 @@ impl DeviceKeys {
         }
     }
 
-    /// Keys from raw secrets: known-answer tests, and the key agent taking
+    /// Keys from raw secrets: known-answer tests, and the cred agent taking
     /// keys handed over at verification.
     pub(crate) fn from_secrets(
         device: [u8; 32],
@@ -148,7 +148,7 @@ impl DeviceKeys {
         signed_wire(&self.device_sign, statement)
     }
 
-    /// The three secrets, for handing unlocked keys to the key agent.
+    /// The three secrets, for handing unlocked keys to the cred agent.
     pub(crate) fn secret_parts(&self) -> SecretParts {
         (
             Zeroizing::new(self.device.to_bytes()),
@@ -246,8 +246,8 @@ impl DeviceKeys {
 
     /// The plain `device_keys` file (0600, written atomically): a fresh
     /// device's keys until Astation is known to hold the storage key, like a
-    /// step-1 device's. The key agent re-seals it at each start while it
-    /// exists and deletes it at the first confirmed escrow (key_agent.rs).
+    /// step-1 device's. The cred agent re-seals it at each start while it
+    /// exists and deletes it at the first confirmed escrow (cred_agent.rs).
     pub fn save_to(&self, path: &Path) -> Result<()> {
         let (device, device_sign, unlock_auth) = self.secret_parts();
         let (device, device_sign, unlock_auth) = (
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn keys_are_distinct_and_survive_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("device_keys");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys;
         assert!(DeviceKeys::load_from(&path).unwrap().is_none());
         let keys = DeviceKeys::generate();
         assert_ne!(keys.device_sign_pub(), keys.unlock_auth_pub());
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn unlock_auth_key_round_trips_as_its_own_0600_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unlock_auth_key");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).unlock_auth_key;
         assert!(UnlockAuthKey::load_from(&path).unwrap().is_none());
         let keys = DeviceKeys::generate();
         keys.unlock_auth_key().save_to(&path).unwrap();

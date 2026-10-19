@@ -1,6 +1,6 @@
-//! `~/.config/atem/project_names.json`: the readable project key each `h1.`
+//! `~/.config/atem/cred/project_names.json`: the readable project key each `h1.`
 //! project hash on the relay stands for, per account. The relay sees only
-//! the hash (keyed by `K`, which never leaves the key agent); atem keeps the
+//! the hash (keyed by `K`, which never leaves the cred agent); atem keeps the
 //! names locally to show and filter by them. No secrets, still 0600 and
 //! written atomically. See designs/e2e-encryption.md "What each side stores".
 use anyhow::{Context, Result, bail};
@@ -105,8 +105,8 @@ impl ProjectNames {
 }
 
 /// Records `hash → name` pairs for `account`: a read-modify-write under an
-/// `flock` on `project_names.lock` (the helper cred_state.json uses), so the
-/// key agent and other atem commands keep each other's names. Writes only
+/// `flock` on `project_names.lock` (the helper cred/state.json uses), so the
+/// cred agent and other atem commands keep each other's names. Writes only
 /// when something is new.
 pub fn remember(
     path: &Path,
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn names_round_trip_per_account_in_a_private_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project_names.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).project_names;
         assert_eq!(ProjectNames::load_from(&path).unwrap().len("acct"), 0);
         remember(
             &path,
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn display_labels_survive_name_writes_and_remain_account_scoped() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project_names.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).project_names;
         remember(&path, "acct", [pair("h1.x.aa", "github.com/org/repo")]).unwrap();
         remember_label(&path, "acct", "github.com/Org/Repo").unwrap();
         remember_label(&path, "other", "github.com/Private/Other").unwrap();
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn nothing_new_writes_nothing_and_nothing_is_created_by_a_forget() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project_names.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).project_names;
         remember(&path, "acct", Vec::new()).unwrap();
         forget_account_at(&path, "acct").unwrap();
         assert!(!path.exists());
@@ -250,8 +250,8 @@ mod tests {
     #[test]
     fn an_unreadable_file_is_an_error_naming_it_for_direct_readers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project_names.json");
-        std::fs::write(&path, b"not json").unwrap();
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).project_names;
+        crate::memory::verification::write_test_file(&path, b"not json");
         let error = format!("{:#}", ProjectNames::load_from(&path).err().unwrap());
         assert!(error.contains("project_names.json"), "{error}");
     }
@@ -259,19 +259,20 @@ mod tests {
     #[test]
     fn a_corrupt_file_is_moved_aside_by_the_writers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project_names.json");
-        std::fs::write(&path, b"not json").unwrap();
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).project_names;
+        crate::memory::verification::write_test_file(&path, b"not json");
         remember(&path, "acct", [pair("h1.x.aa", "a")]).unwrap();
         let names = ProjectNames::load_from(&path).unwrap();
         assert_eq!(names.len("acct"), 1);
         assert_eq!(names.name("acct", "h1.x.aa"), Some("a"));
-        let aside: Vec<_> = std::fs::read_dir(dir.path())
+        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
+        let aside: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("project_names.json.corrupt-"))
+            .filter(|n| n.starts_with(&prefix))
             .collect();
         assert_eq!(aside.len(), 1, "{aside:?}");
-        std::fs::write(&path, b"not json").unwrap();
+        crate::memory::verification::write_test_file(&path, b"not json");
         forget_account_at(&path, "acct").unwrap();
         assert!(ProjectNames::load_from(&path).is_ok());
     }
@@ -279,8 +280,8 @@ mod tests {
     #[test]
     fn a_newer_version_stays_an_error_for_writers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project_names.json");
-        std::fs::write(&path, br#"{"version":2,"accounts":{}}"#).unwrap();
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).project_names;
+        crate::memory::verification::write_test_file(&path, br#"{"version":2,"accounts":{}}"#);
         assert!(remember(&path, "acct", [pair("h1.x.aa", "a")]).is_err());
         assert!(path.exists());
     }
@@ -288,7 +289,7 @@ mod tests {
     #[test]
     fn concurrent_writers_keep_each_others_names() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("project_names.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).project_names;
         let writers: Vec<_> = (0..4)
             .map(|writer| {
                 let path = path.clone();

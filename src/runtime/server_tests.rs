@@ -259,7 +259,7 @@ fn hello_launch_two_sessions_and_list_them() {
         let mut client = runtime.client().await;
         assert_eq!(client.welcome.protocol, PROTOCOL);
         assert_eq!(client.welcome.pid, std::process::id());
-        assert_eq!(client.welcome.build, crate::memory::key_agent::build_id());
+        assert_eq!(client.welcome.build, crate::memory::cred_agent::build_id());
         client
             .send(&runtime.launch("codex", "one", &agent))
             .await
@@ -677,6 +677,8 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
             socket: dir.path().join("rt.sock"),
             record: dir.path().join("runtime.socket"),
             log: dir.path().join("runtime.log"),
+            lock: dir.path().join("runtime.lock"),
+            replaced: dir.path().join("runtime.replaced"),
         };
         let socket = locator.socket.clone();
         let root = dir.path().to_path_buf();
@@ -1102,6 +1104,7 @@ impl FakeWorker {
             dropped: 0,
             exited: None,
             chat: false,
+            build: None,
         });
         let (lines, mut to_send) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (heard_tx, heard) = tokio::sync::mpsc::unbounded_channel();
@@ -1590,5 +1593,186 @@ fn a_damaged_runtime_epoch_disables_remote_sessions_and_says_so() {
         // Never reset behind the user's back.
         assert_eq!(std::fs::read_to_string(&epoch).unwrap(), "not a number");
         runtime.shutdown().await;
+    });
+}
+
+/// A client of another build replaces the runtime by its own (here: a new
+/// broker on the same state dir), whose sessions it adopts; a second
+/// replacement within a minute is refused (two builds would flap); a
+/// runtime whose workers this build can't adopt is kept.
+#[test]
+fn a_runtime_of_another_build_is_replaced_and_its_sessions_kept() {
+    use super::client::{Kept, Locator, kept_message, replace_other_build};
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let first = runtime_on(dir.clone());
+        let agent = echo_agent(dir.path());
+        let mut client = first.client().await;
+        client
+            .send(&first.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let session = launched(&mut client).await;
+        let locator = Locator::in_dir(dir.path());
+        assert_eq!(locator.socket, first.socket);
+        let second = std::cell::RefCell::new(None);
+        let start = || {
+            // The old broker left its socket file behind.
+            let _ = std::fs::remove_file(&locator.socket);
+            *second.borrow_mut() = Some(runtime_on(dir.clone()));
+            Ok(())
+        };
+        let mut notes = Vec::new();
+        let mut client = replace_other_build(
+            client,
+            &locator,
+            "0.0.0+another-build",
+            &start,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            notes,
+            [format!(
+                "Atem's runtime updated to {} (was {}); sessions kept.",
+                client.welcome.build, client.welcome.build
+            )]
+        );
+        tokio::time::timeout(Duration::from_secs(5), first.server)
+            .await
+            .expect("the old broker exited")
+            .unwrap()
+            .unwrap();
+        // The new broker adopted the session.
+        let sessions = list(&mut client).await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            (sessions[0].id.as_str(), sessions[0].state.as_str()),
+            (session.id.as_str(), "running")
+        );
+        assert!(locator.replaced.exists(), "the replacement is recorded");
+
+        // Within a minute another build doesn't replace it again.
+        let mut notes = Vec::new();
+        let start_again = || anyhow::bail!("not replaced again");
+        let client = replace_other_build(
+            client,
+            &locator,
+            "0.0.0+a-third-build",
+            &start_again,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("less than a minute ago"), "{notes:?}");
+        // The same build: nothing happens.
+        let mut notes = Vec::new();
+        let own = client.welcome.build.clone();
+        let mut client = replace_other_build(
+            client,
+            &locator,
+            &own,
+            &start_again,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert!(notes.is_empty());
+        client
+            .send(&ClientMsg::Stop {
+                session_id: session.id.clone(),
+            })
+            .await
+            .unwrap();
+        drop(client);
+        let second = second.borrow_mut().take().unwrap();
+        second.shutdown().await;
+        // Sessions of another worker protocol block a replacement.
+        let text = kept_message(
+            &Kept::Incompatible {
+                worker_protocol: 2,
+                sessions: vec!["ses-aaaaaaaaaaaa".into()],
+            },
+            "0.9.0+1",
+            "0.8.0+1",
+        );
+        assert!(text.contains("ses-aaaaaaaaaaaa"), "{text}");
+        assert!(text.contains("worker protocol 2"), "{text}");
+        assert!(text.contains("atem runtime restart"), "{text}");
+    });
+}
+
+/// A runtime whose welcome names another worker protocol is kept: this
+/// build couldn't adopt its sessions.
+#[test]
+fn a_runtime_of_another_worker_protocol_is_kept() {
+    use super::client::{Locator, replace_other_build};
+    local(async {
+        let dir = short_dir();
+        let locator = Locator::in_dir(dir.path());
+        let socket = locator.socket.clone();
+        // A fake runtime: welcome with worker protocol 9, one running session.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                let reply = match super::protocol::decode_client(&line).unwrap() {
+                    ClientMsg::Hello { .. } => RuntimeMsg::Welcome {
+                        protocol: PROTOCOL,
+                        build: "9.9.9+1".into(),
+                        pid: 1,
+                        astation: false,
+                        host_error: None,
+                        worker_protocol: Some(9),
+                    },
+                    ClientMsg::List => RuntimeMsg::Sessions {
+                        sessions: vec![SessionSummary {
+                            id: "ses-bbbbbbbbbbbb".into(),
+                            provider: "claude".into(),
+                            cwd: "/w".into(),
+                            created_at_ms: 1,
+                            state: "running".into(),
+                            status: "ready".into(),
+                            attached: false,
+                            remote_controlled: false,
+                            exited: None,
+                            rows: 24,
+                            cols: 80,
+                            generation: "g".into(),
+                            worker_build: Some("9.9.9+1".into()),
+                        }],
+                    },
+                    other => panic!("unexpected {other:?}"),
+                };
+                let text = super::protocol::encode_runtime(&reply);
+                write.write_all(text.as_bytes()).await.unwrap();
+                line.clear();
+            }
+        });
+        let client = RuntimeClient::connect_at(&socket).await.unwrap();
+        let mut notes = Vec::new();
+        let start = || anyhow::bail!("never started");
+        let client = replace_other_build(
+            client,
+            &locator,
+            "0.0.0+this-build",
+            &start,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.welcome.build, "9.9.9+1", "kept");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("ses-bbbbbbbbbbbb"), "{notes:?}");
+        assert!(notes[0].contains("worker protocol 9"), "{notes:?}");
     });
 }

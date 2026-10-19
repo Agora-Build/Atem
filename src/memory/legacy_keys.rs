@@ -1,10 +1,10 @@
 //! `data_keys.enc`, where build steps 0–2a kept `K`, its previous keys and
 //! the project names, encrypted with the machine-bound key (which a copied
 //! disk includes). Build step 2b never writes it (except the purge below):
-//! at each unlock the key agent moves the keys and names of every verified
+//! at each unlock the cred agent moves the keys and names of every verified
 //! account into `device_keys.sealed` and `project_names.json`, and deletes
 //! the file once the home Astation holds the storage key of the sealed file
-//! and every entry of those accounts parsed (key_agent.rs
+//! and every entry of those accounts parsed (cred_agent.rs
 //! `migrate_data_keys`; a malformed entry keeps the file). An agent on an
 //! unverified device deletes it at start. An unreadable one is moved aside
 //! (`move_aside`), never deleted. A first verification purges what the
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn a_written_store_reads_back_and_a_missing_one_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
         assert!(matches!(read(&path).unwrap(), Legacy::Missing));
         write_for_test(
             &path,
@@ -342,14 +342,14 @@ mod tests {
             summary_at(&path, "acct"),
             (Some("11112222".into()), vec!["0123abcd".into()], 1)
         );
-        std::fs::write(&path, b"not machine-bound").unwrap();
+        crate::memory::verification::write_test_file(&path, b"not machine-bound");
         assert!(matches!(read(&path).unwrap(), Legacy::Unreadable(_)));
     }
 
     #[test]
     fn purge_removes_only_this_astations_legacy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",
@@ -393,11 +393,12 @@ mod tests {
     #[test]
     fn purge_moves_an_unreadable_store_aside() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
-        std::fs::write(&path, b"not machine-bound").unwrap();
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
+        crate::memory::verification::write_test_file(&path, b"not machine-bound");
         purge_unverified_at(&path, "astation", "certified", &BTreeSet::new()).unwrap();
         assert!(!path.exists());
-        let aside: Vec<_> = std::fs::read_dir(dir.path())
+        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
+        let aside: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|entry| {
@@ -405,7 +406,7 @@ mod tests {
                     .file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with("data_keys.enc.corrupt-")
+                    .starts_with(&prefix)
             })
             .collect();
         assert_eq!(aside.len(), 1, "kept, never deleted");
@@ -415,7 +416,7 @@ mod tests {
     #[test]
     fn purge_keeps_accounts_another_verified_astation_names() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",
@@ -434,7 +435,7 @@ mod tests {
     #[test]
     fn the_plaintext_is_written_into_one_exact_allocation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
         for account in ["a", "b", "c", "d"] {
             write_for_test(
                 &path,
@@ -458,7 +459,7 @@ mod tests {
     #[test]
     fn malformed_entries_are_reported_and_the_valid_keys_still_move() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",
@@ -528,7 +529,7 @@ mod tests {
     #[test]
     fn keys_and_names_are_read_for_the_given_accounts_only() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data_keys.enc");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",

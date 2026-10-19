@@ -10,9 +10,9 @@
 //! operations through the runtime".
 
 use super::protocol::{AnswerValue, AskKind, OpKind, OpOptions, PrintLevel, RuntimeMsg};
-use crate::memory::key_agent::{KeyAgentApi, LOCKED, blocking, default_agent};
+use crate::memory::cred_agent::{CredAgentApi, LOCKED, blocking, default_agent};
 use crate::memory::unlock::{AstationLink, shown};
-use crate::memory::verification::KeyPaths;
+use crate::memory::verification::CredPaths;
 use crate::pair_verify::{CodeAnswer, VerifyFailure};
 use crate::status::Sources;
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -142,10 +142,10 @@ impl OpUi for ClientUi {
 
 /// Where an operation's profile comes from (read when it starts).
 type ProfileSource = Arc<dyn Fn() -> Result<Sources> + Send + Sync>;
-/// Where an operation's key agent comes from.
-type AgentSource = Arc<dyn Fn() -> Result<Arc<dyn KeyAgentApi>> + Send + Sync>;
+/// Where an operation's cred agent comes from.
+type AgentSource = Arc<dyn Fn() -> Result<Arc<dyn CredAgentApi>> + Send + Sync>;
 
-/// What operations need besides the link: the profile, the key agent and
+/// What operations need besides the link: the profile, the cred agent and
 /// how long to wait for the link. Named explicitly: this user's
 /// (`for_user`, `atem runtime`), a given one (`for_profile`, tests), or
 /// none (`unavailable`: every operation fails).
@@ -158,7 +158,7 @@ pub struct OpEnv {
 }
 
 impl OpEnv {
-    /// This user's profile (read when each operation starts) and key agent.
+    /// This user's profile (read when each operation starts) and cred agent.
     pub fn for_user() -> Self {
         Self {
             profile: Arc::new(Sources::current),
@@ -167,9 +167,9 @@ impl OpEnv {
         }
     }
 
-    /// The profile `src` and the key agent `agent`.
+    /// The profile `src` and the cred agent `agent`.
     #[cfg(test)]
-    pub fn for_profile(src: Sources, agent: Arc<dyn KeyAgentApi>) -> Self {
+    pub fn for_profile(src: Sources, agent: Arc<dyn CredAgentApi>) -> Self {
         Self {
             profile: Arc::new(move || Ok(src.clone())),
             agent: Arc::new(move || Ok(agent.clone())),
@@ -198,7 +198,7 @@ impl OpEnv {
         (self.profile)()
     }
 
-    fn agent(&self) -> Result<Arc<dyn KeyAgentApi>> {
+    fn agent(&self) -> Result<Arc<dyn CredAgentApi>> {
         (self.agent)()
     }
 
@@ -470,8 +470,8 @@ fn code_answer(answer: Option<AnswerValue>) -> CodeAnswer {
 pub(crate) async fn verify_device<U: OpUi>(
     client: &mut AstationClient,
     astation_id: &str,
-    paths: &KeyPaths,
-    raw_agent: Arc<dyn KeyAgentApi>,
+    paths: &CredPaths,
+    raw_agent: Arc<dyn CredAgentApi>,
     ui: &U,
 ) -> Result<()> {
     use crate::memory::trust::TrustStore;
@@ -482,7 +482,7 @@ pub(crate) async fn verify_device<U: OpUi>(
         code_failure, next_verify_message, request_key_after_verification,
     };
 
-    // The pairing this verification runs under: every key-agent request,
+    // The pairing this verification runs under: every cred-agent request,
     // the pending pin, Astation's certificate and the escrow apply only while
     // it is current.
     let capture = client
@@ -493,7 +493,7 @@ pub(crate) async fn verify_device<U: OpUi>(
     // The device id is this atem's relay identity (`atem_id`): Astation checks it
     // equals the id the connection authenticated as.
     let device_id = client.device_atem_id();
-    let agent: Arc<dyn KeyAgentApi> = Arc::new(crate::pairing_binding::BoundAgent::new(
+    let agent: Arc<dyn CredAgentApi> = Arc::new(crate::pairing_binding::BoundAgent::new(
         capture.clone(),
         raw_agent.clone(),
     )?);
@@ -932,14 +932,14 @@ async fn cred_unlock<U: OpUi>(
         return Ok(());
     }
     let mut view = link_to(calls, env, &home, "this device's home Astation", true).await?;
-    // Every key-agent request from here on (finishing the unlock, rotation,
+    // Every cred-agent request from here on (finishing the unlock, rotation,
     // escrow) runs only while the pairing the link authenticated under is
     // current: a grant or ack arriving after `atem unpair` is dropped.
     let capture = view
         .capture()
         .cloned()
         .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
-    let agent: Arc<dyn KeyAgentApi> =
+    let agent: Arc<dyn CredAgentApi> =
         Arc::new(crate::pairing_binding::BoundAgent::new(capture, agent)?);
     {
         let mut link = UiLink {
@@ -984,7 +984,7 @@ async fn cred_projects<U: OpUi>(
     let view = link_to(calls, env, &home, "this device's home Astation", false).await?;
     view.report_credential_projects_with(cwd, agent)
         .await
-        .context("Project reporting requires an updated, unlocked Atem key agent")?;
+        .context("Project reporting requires an updated, unlocked Atem cred agent")?;
     ui.print(PrintLevel::Info, "Sent project suggestions to Astation.");
     Ok(())
 }

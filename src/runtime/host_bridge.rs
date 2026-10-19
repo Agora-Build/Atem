@@ -10,7 +10,7 @@
 //! attachment and the link's messages go to the new one (`Effect::Replaced`;
 //! r7.1). Each `hello`'s outcome is one line in runtime.log. Only the Astation this profile is
 //! paired with (the pairing binding the link captured) and verified with
-//! (`cred_state.json`) gets one, with `view` and `control`; any
+//! (`cred/state.json`) gets one, with `view` and `control`; any
 //! other link — unpaired, unverified, or another Astation — gets no
 //! attachment at all, so its session-family messages are answered
 //! `unauthorized`. `welcome` names the verified account (`data_account`), this
@@ -360,6 +360,8 @@ struct Link {
     /// while the machine is suspended).
     deadline: u64,
     wall_deadline: u64,
+    /// When its attachment was last welcomed (wall ms), for `atem status`.
+    welcomed_at: Option<u64>,
 }
 
 pub struct HostBridge {
@@ -406,6 +408,19 @@ pub struct HostBridge {
     refusing: Option<(u64, Request, Option<String>)>,
     /// The host closed the link's attachment: drop the link after this pass.
     close_link: bool,
+    /// The last `hello` refused for its revision (`atem status`): the
+    /// revision it named and when (wall ms). A welcome clears it.
+    last_refusal: Option<(Option<u64>, u64)>,
+}
+
+/// What `atem status` shows of the link's session attachment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkStatus {
+    /// The link has a session attachment (a verified pairing).
+    pub attachment: bool,
+    pub welcomed: Option<crate::runtime::protocol::Welcomed>,
+    pub refused: Option<crate::runtime::protocol::Refusal>,
+    pub journal_halted: bool,
 }
 
 /// Where effects go: the link's client and the broker's sessions.
@@ -462,7 +477,37 @@ impl HostBridge {
             refusal_log: RefusalLog::default(),
             refusing: None,
             close_link: false,
+            last_refusal: None,
         })
+    }
+
+    /// The link's attachment, its welcome and authorization, the last
+    /// refused `hello` and the journal, for `atem status`.
+    pub fn link_status(&self) -> LinkStatus {
+        use crate::runtime::protocol::{Refusal, Welcomed};
+        let (now, wall) = (self.clock.now(), self.clock.wall());
+        let welcomed = self.link.as_ref().and_then(|link| {
+            Some(Welcomed {
+                revision: crate::session_protocol::revision::REVISION,
+                at_ms: link.welcomed_at?,
+                ms_left: link
+                    .deadline
+                    .saturating_sub(now)
+                    .min(link.wall_deadline.saturating_sub(wall)),
+            })
+        });
+        LinkStatus {
+            attachment: self.link.is_some(),
+            refused: self
+                .last_refusal
+                .map(|(revision, at_ms)| Refusal {
+                    revision,
+                    needs: crate::session_protocol::revision::REVISION,
+                    at_ms,
+                }),
+            welcomed,
+            journal_halted: self.host.journal_halted(),
+        }
     }
 
     fn build(
@@ -729,6 +774,7 @@ impl HostBridge {
                     attachment,
                     deadline: self.clock.now().saturating_add(LINK_AUTHORIZATION_MS),
                     wall_deadline: self.clock.wall().saturating_add(LINK_AUTHORIZATION_MS),
+                    welcomed_at: None,
                 });
                 self.exec(effects, cx);
             }
@@ -845,11 +891,12 @@ impl HostBridge {
 
     fn receive(&mut self, link_gen: u64, text: &str, cx: &mut Cx) {
         let decoded = wire::decode(text.as_bytes());
-        let hello = match &decoded {
-            Ok(Envelope::Session(m)) if matches!(m.op, wire::Op::Hello { .. }) => {
-                Some(m.id.clone())
-            }
-            _ => None,
+        let (hello, hello_revision) = match &decoded {
+            Ok(Envelope::Session(m)) => match &m.op {
+                wire::Op::Hello { revision, .. } => (Some(m.id.clone()), *revision),
+                _ => (None, None),
+            },
+            _ => (None, None),
         };
         let Some(attachment) = self
             .link
@@ -893,11 +940,22 @@ impl HostBridge {
             self.refusing = Some((link_gen, Request::of(&decoded, text), reason));
         }
         let effects = self.host.receive_decoded(&attachment, decoded, now);
-        if let Some(id) = &hello {
-            log_hello(id, &effects);
-        }
+        let outcome = hello.as_deref().and_then(|id| log_hello(id, &effects));
         self.exec(effects, cx);
         self.refusing = None;
+        let wall = self.clock.wall();
+        match outcome {
+            Some(HelloOutcome::Welcomed) => {
+                if let Some(link) = self.link.as_mut() {
+                    link.welcomed_at = Some(wall);
+                }
+                self.last_refusal = None;
+            }
+            Some(HelloOutcome::Refused(code)) if code == "unsupported_version" => {
+                self.last_refusal = Some((hello_revision, wall));
+            }
+            _ => {}
+        }
     }
 
     /// Writes `line` unless the link's refusal lines are suppressed.
@@ -2709,7 +2767,7 @@ fn chat_error(
 /// One line in runtime.log per session handshake outcome of the `hello`
 /// `id`: welcomed, replaced (and welcomed) or refused with its code. Never a
 /// payload; attachments by their first 8 characters.
-fn log_hello(id: &str, effects: &[Effect]) {
+fn log_hello(id: &str, effects: &[Effect]) -> Option<HelloOutcome> {
     use crate::session_protocol::wire::{Op, SessionMessage};
     let short = |a: &str| a.chars().take(8).collect::<String>();
     let mut replaced = None;
@@ -2730,20 +2788,30 @@ fn log_hello(id: &str, effects: &[Effect]) {
                         }
                         None => format!("welcome (attachment {})", short(attachment_gen)),
                     };
-                    return log_handshake(&line);
+                    log_handshake(&line);
+                    return Some(HelloOutcome::Welcomed);
                 }
                 Op::Error { code, .. } => {
                     let code = serde_json::to_value(code)
                         .ok()
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_default();
-                    return log_handshake(&format!("refused {code}"));
+                    log_handshake(&format!("refused {code}"));
+                    return Some(HelloOutcome::Refused(code));
                 }
                 _ => {}
             },
             _ => {}
         }
     }
+    None
+}
+
+/// What became of a session `hello`.
+enum HelloOutcome {
+    Welcomed,
+    /// Refused with this error code.
+    Refused(String),
 }
 
 fn log_handshake(what: &str) {

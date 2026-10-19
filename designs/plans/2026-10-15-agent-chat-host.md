@@ -24,7 +24,7 @@
 - Per-session directory: `$XDG_RUNTIME_DIR/atem/chat-<id>/` else `~/.config/atem/run/chat-<id>/`; mode 0700; `settings.json` 0600; `events/` 0700; removed when the agent ends or Atem exits.
 - Never rustfmt `src/cli.rs`, `src/websocket_client.rs`, `src/main.rs`, `src/app.rs`, `src/memory/crypto.rs`, `src/memory/mod.rs`; new files under `src/chat/` may be formatted with `rustfmt --edition 2024`; never project-wide `cargo fmt`.
 - Every task: `cargo test` reading EVERY `test result` line (unit + `tests/*` binaries), and `cargo clippy --all-targets` with no new warnings.
-- Never run the installed `atem`, never touch `~/.config/atem`, the user's running atem processes or key agent. Task 1 may run the real `claude` binary in a temporary directory.
+- Never run the installed `atem`, never touch `~/.config/atem`, the user's running atem processes or cred agent. Task 1 may run the real `claude` binary in a temporary directory.
 
 ## File Structure
 

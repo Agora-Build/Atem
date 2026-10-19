@@ -187,11 +187,10 @@ fn profile(dir: &Path, verified: bool) {
             "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
             "safety_code": "", "epoch_floor": 0, "account_state": null, "account_epoch": 0,
         });
-        std::fs::write(
-            dir.join("cred_state.json"),
+        crate::memory::verification::write_test_file(
+            &crate::memory::verification::CredPaths::in_dir(dir).trust,
             json!({"version":1,"astations":{ASTATION: entry}}).to_string(),
-        )
-        .unwrap();
+        );
     }
     let mut sessions = crate::auth::SessionManager::default();
     sessions.insert_session(crate::auth::AuthSession::new(
@@ -3489,7 +3488,7 @@ async fn adopted_rules_dropped_after(change: &str) {
         )
         .unwrap(),
         _ => {
-            let path = profile.join("cred_state.json");
+            let path = crate::memory::verification::CredPaths::in_dir(&profile).trust;
             let mut state: Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             state["astations"][ASTATION]["data_account"] = json!("account-other");
@@ -3955,4 +3954,54 @@ fn turn_replies_follow_the_retained_history() {
     assert_eq!(r.ids.len(), MAX_HISTORY_MESSAGES);
     assert_eq!(r.ids[0], "t7-b-0");
     assert_eq!(r.coverage, Coverage::Partial);
+}
+
+async fn status(client: &mut RuntimeClient) -> crate::runtime::protocol::RuntimeStatus {
+    client.send(&ClientMsg::Status).await.unwrap();
+    expect(client, |m| match m {
+        RuntimeMsg::Status { status } => Some(status),
+        _ => None,
+    })
+    .await
+}
+
+/// The runtime's `status` (`atem status`): the link, its attachment, the
+/// last refused `hello` and the welcome with what is left of its
+/// authorization.
+#[test]
+fn status_reports_the_attachment_its_refusals_and_its_welcome() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        // Wait for the broker to consider the link.
+        let mut first = status(&mut client).await;
+        while !first.attachment {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            first = status(&mut client).await;
+        }
+        assert!(first.astation && first.welcomed.is_none() && first.refused.is_none());
+        assert!(!first.journal_halted && first.host_error.is_none());
+        // A hello of revision 7 is refused and remembered.
+        let id = rt.peer.request("hello", json!({"revision": 7}));
+        assert_eq!(rt.peer.reply(&id).await["code"], "unsupported_version");
+        let refused = status(&mut client).await;
+        let refusal = refused.refused.expect("the refusal is reported");
+        assert_eq!((refusal.revision, refusal.needs), (Some(7), 8));
+        assert!(refused.welcomed.is_none());
+        // A welcome clears it and reports the revision and time left.
+        rt.peer.hello().await;
+        rt.clock.skip(3_600_000);
+        let welcomed = status(&mut client).await;
+        assert!(welcomed.refused.is_none());
+        let welcome = welcomed.welcomed.expect("the welcome is reported");
+        assert_eq!(welcome.revision, 8);
+        let left = super::LINK_AUTHORIZATION_MS - 3_600_000;
+        assert!(
+            welcome.ms_left <= left && welcome.ms_left > left - 10_000,
+            "{}",
+            welcome.ms_left
+        );
+        assert!(welcome.at_ms > 0);
+        rt.shutdown().await;
+    });
 }

@@ -34,7 +34,7 @@ atem repl                               # Interactive REPL with AI command inter
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
 atem logout                             # Log out from SSO
-atem status                             # Account, pairing, verification and credentials (offline, read-only)
+atem status                             # Account, pairing, verification, credentials, Astation link and sessions (read-only)
 atem pair                               # Pair with Astation, then verify this device (shows the status when already paired)
 atem pair --save                        # Same, and keep credentials for offline use
 atem pair verify                        # Verify this device with the paired Astation (no re-pairing)
@@ -64,25 +64,28 @@ device: atem pair verify · Replace the pairing: atem unpair, then atem pair`):
 it never pairs again or changes keys, trust or sessions. `atem pair verify`
 verifies the existing pairing on the runtime's Astation link, does nothing when the
 device is already verified, and refuses after a revocation (run `atem unpair`,
-which sets the revoked keys aside, then `atem pair`). `atem status` reads only
-local files and an already running key agent; it never connects, so
-authorization and relay show as `unknown (stale)`.
+which sets the revoked keys aside, then `atem pair`). `atem status` reads
+local files and asks an already running cred agent and `atem runtime`
+(never starting either, never writing, never using the network): the session
+authorization, the Astation link and the local agents, or `no runtime
+running`.
 
 ### Device keys (`atem cred`)
 
 ```bash
 atem cred unlock                        # Unlock this device's keys (approve with Touch ID on your Mac)
-atem cred lock                          # Wipe unlocked keys and stop the key agent
+atem cred lock                          # Wipe unlocked keys and stop the cred agent
 atem cred projects                      # Send known Git projects to Astation's credential picker (keys must be unlocked)
 ```
 
 This device's keys are sealed on disk under a storage key that only the paired
 Mac (the home Astation) holds. `atem cred unlock` asks the Mac for it (Touch
-ID) and starts a background `atem key-agent` that holds the keys in memory;
+ID) and starts a background `atem cred-agent` that holds the keys in memory;
 on a device no Astation verified it stops with `This device isn't verified.
 Run atem pair verify first.` and never starts pairing or verification.
 `atem cred lock` wipes them and stops the agent. After upgrading atem, run
-`atem cred lock` then `atem cred unlock` to pick up the new agent.
+`atem cred lock` then `atem cred unlock` to pick up the new agent (the unlock
+first updates Atem's runtime, which starts the agent, to the new build).
 
 `atem cred projects` sends this repo's Git remote, and the project names atem
 remembers, to Astation's credential picker, encrypted to your Mac. An
@@ -93,7 +96,7 @@ values from Astation's local Credentials store (`atem cred get/list`) is not
 available yet; it is described in the
 [encryption design](https://github.com/Agora-Build/Atem/blob/main/designs/e2e-encryption.md).
 
-Updated clients and key agents retain the remote's original capitalization,
+Updated clients and cred agents retain the remote's original capitalization,
 such as `github.com/Agora-Build/Atem`; project identity and duplicate checks
 ignore case. Older clients/agents may report lowercase names. Reports are
 encrypted even when memory encryption is off and can remain in the picker
@@ -278,6 +281,7 @@ atem agent launch claude -- --help      # Use -- to read the agent's own help
 atem agent list                         # The sessions the background runtime holds
 atem agent attach ses-…                 # Reopen a session (screen restored)
 atem agent stop ses-…                   # Stop a session
+atem runtime restart                    # Restart the runtime as this build; sessions keep running
 ```
 
 `atem agent launch [claude|claude-code|codex] [ARGS]...` runs the installed

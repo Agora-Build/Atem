@@ -1,5 +1,5 @@
-//! The key agent's Unix socket: newline-delimited JSON, `"v": 2` on every
-//! request, same-user peers only. `atem key-agent` serves it; commands that
+//! The cred agent's Unix socket: newline-delimited JSON, `"v": 2` on every
+//! request, same-user peers only. `atem cred-agent` serves it; commands that
 //! need keys connect, starting the agent when none is running.
 //! See designs/e2e-encryption.md "Keys on disk (atem)".
 //!
@@ -29,11 +29,11 @@ use crate::daemon::{
     self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, process_uid,
 };
 use crate::memory::account_keys::{CryptOp, CryptOut};
-use crate::memory::encoding::WipingBuf;
-use crate::memory::key_agent::{
-    KeyAgent, KeyAgentApi, OLDER_BUILD, PROTOCOL_VERSION, Reply, Request, build_id,
+use crate::memory::cred_agent::{
+    CredAgent, CredAgentApi, PROTOCOL_VERSION, Reply, Request, build_id,
 };
-use crate::memory::verification::KeyPaths;
+use crate::memory::encoding::WipingBuf;
+use crate::memory::verification::CredPaths;
 
 /// Bounds a misbehaving peer. A `Crypt` batch is kept under 2 MiB of input by
 /// `EncryptionContext`, and one skill (at most 1 MiB, base64 on the wire)
@@ -50,8 +50,8 @@ fn own_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// `$XDG_RUNTIME_DIR/atem/agent.sock` when that directory is safe, else
-/// `~/.config/atem/agent.sock`.
+/// `$XDG_RUNTIME_DIR/atem/cred-agent.sock` when that directory is safe,
+/// else `~/.config/atem/cred/agent.sock` (`CredPaths::agent_sock`).
 pub fn agent_socket_path() -> PathBuf {
     #[cfg(test)]
     return socket_path_in(&crate::test_profile::dir(), None);
@@ -69,19 +69,7 @@ fn socket_path_in(config_dir: &Path, runtime_dir: Option<OsString>) -> PathBuf {
     let runtime = runtime_dir.filter(|dir| {
         Path::new(dir).is_absolute() && check_parent_dir(Path::new(dir), own_uid()).is_ok()
     });
-    socket_path_from(runtime, config_dir)
-}
-
-fn socket_path_from(runtime_dir: Option<OsString>, config_dir: &Path) -> PathBuf {
-    match runtime_dir {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("atem").join("agent.sock"),
-        _ => config_dir.join("agent.sock"),
-    }
-}
-
-#[cfg_attr(test, allow(dead_code))]
-pub fn agent_log_path() -> PathBuf {
-    crate::config::AtemConfig::config_dir().join("key-agent.log")
+    CredPaths::in_dir(config_dir).agent_sock(runtime.as_deref().map(Path::new))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,7 +103,7 @@ pub(crate) fn encode_request(request: &Request) -> Result<Zeroizing<String>> {
         v: PROTOCOL_VERSION,
     })?;
     let text = String::from_utf8(std::mem::take(&mut *buf.0))
-        .map_err(|_| anyhow!("key agent request is not UTF-8"))?;
+        .map_err(|_| anyhow!("cred agent request is not UTF-8"))?;
     Ok(Zeroizing::new(text))
 }
 
@@ -146,17 +134,17 @@ struct CryptWire {
 }
 
 pub(crate) fn decode_request(line: &str) -> Result<Request> {
-    let head: RequestHead = serde_json::from_str(line).context("key agent request is not JSON")?;
+    let head: RequestHead = serde_json::from_str(line).context("cred agent request is not JSON")?;
     match head.v {
         Some(PROTOCOL_VERSION) => {}
         other => bail!(
-            "unsupported key agent protocol version {}; this agent speaks v{PROTOCOL_VERSION}",
+            "unsupported cred agent protocol version {}; this agent speaks v{PROTOCOL_VERSION}",
             other.map_or_else(|| "(none)".to_string(), |v| v.to_string())
         ),
     }
     if head.op.as_deref() == Some("load_unlocked") {
         let wire: LoadUnlockedWire =
-            serde_json::from_str(line).context("key agent request is malformed")?;
+            serde_json::from_str(line).context("cred agent request is malformed")?;
         return Ok(Request::LoadUnlocked {
             device_id: wire.device_id,
             device: wire.device,
@@ -168,13 +156,13 @@ pub(crate) fn decode_request(line: &str) -> Result<Request> {
     }
     if head.op.as_deref() == Some("crypt") {
         let wire: CryptWire =
-            serde_json::from_str(line).context("key agent request is malformed")?;
+            serde_json::from_str(line).context("cred agent request is malformed")?;
         return Ok(Request::Crypt {
             astation_id: wire.astation_id,
             ops: wire.ops,
         });
     }
-    serde_json::from_str(line).context("key agent request is malformed")
+    serde_json::from_str(line).context("cred agent request is malformed")
 }
 
 #[derive(Deserialize)]
@@ -207,14 +195,14 @@ struct CryptedReply {
 /// What to do about a running agent of another protocol version.
 fn version_mismatch(version: u64) -> anyhow::Error {
     anyhow!(
-        "the running key agent speaks protocol v{version}, this atem speaks v{PROTOCOL_VERSION}; check `atem status` first (a storage key not yet held by Astation needs `atem cred unlock` from the atem that started the agent), then stop it with `pkill -u \"$USER\" -f 'atem key-agent'` (its keys stay sealed on disk) and retry"
+        "the running cred agent speaks protocol v{version}, this atem speaks v{PROTOCOL_VERSION}; check `atem status` first (a storage key not yet held by Astation needs `atem cred unlock` from the atem that started the agent), then stop it with `pkill -u \"$USER\" -f 'atem cred-agent'` (its keys stay sealed on disk) and retry"
     )
 }
 
 pub(crate) fn decode_response(line: &str) -> Result<Reply> {
     let line = line.trim();
     let head: ResponseHead =
-        serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
+        serde_json::from_str(line).context("the cred agent sent an unreadable reply")?;
     if head.v != PROTOCOL_VERSION {
         return Err(version_mismatch(head.v));
     }
@@ -222,28 +210,28 @@ pub(crate) fn decode_response(line: &str) -> Result<Reply> {
         bail!(
             "{}",
             head.error
-                .unwrap_or_else(|| "the key agent refused the request".into())
+                .unwrap_or_else(|| "the cred agent refused the request".into())
         );
     }
     let Some(reply) = head.reply else {
-        bail!("the key agent sent an empty reply");
+        bail!("the cred agent sent an empty reply");
     };
     if reply.kind.as_deref() == Some("crypted") {
         let crypted: CryptedResponse =
-            serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
+            serde_json::from_str(line).context("the cred agent sent an unreadable reply")?;
         return Ok(Reply::Crypted {
             results: crypted.reply.results,
         });
     }
     let response: Response =
-        serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
+        serde_json::from_str(line).context("the cred agent sent an unreadable reply")?;
     response
         .reply
-        .ok_or_else(|| anyhow!("the key agent sent an empty reply"))
+        .ok_or_else(|| anyhow!("the cred agent sent an empty reply"))
 }
 
 /// The reply to `line`, and whether it was a lock that stops the agent.
-fn respond(agent: &Mutex<KeyAgent>, line: &str) -> (WipingBuf, bool) {
+fn respond(agent: &Mutex<CredAgent>, line: &str) -> (WipingBuf, bool) {
     let mut stop = false;
     let response = match decode_request(line).and_then(|request| {
         stop = matches!(request, Request::Lock { stop: true });
@@ -266,14 +254,14 @@ fn respond(agent: &Mutex<KeyAgent>, line: &str) -> (WipingBuf, bool) {
     let reply = to_wiping_json(&response).unwrap_or_else(|_| {
         let mut buf = WipingBuf::new();
         buf.append(
-            b"{\"v\":2,\"ok\":false,\"error\":\"the key agent could not encode its reply\"}\n",
+            b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent could not encode its reply\"}\n",
         );
         buf
     });
     (reply, stop)
 }
 
-/// Another key agent holds a lock or answers on the socket.
+/// Another cred agent holds a lock or answers on the socket.
 #[derive(Debug)]
 pub struct AlreadyRunning(String);
 
@@ -285,7 +273,7 @@ impl AlreadyRunning {
 
 impl std::fmt::Display for AlreadyRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "a key agent is already running {}", self.0)
+        write!(f, "a cred agent is already running {}", self.0)
     }
 }
 
@@ -299,7 +287,7 @@ static HELD_LOCKS: Mutex<Vec<(PathBuf, std::fs::File)>> = Mutex::new(Vec::new())
 /// together can't both replace the socket. Waits briefly for a starting agent.
 fn lock_agent(socket: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let lock_path = socket.with_file_name("agent.lock");
+    let lock_path = crate::memory::verification::socket_lock(socket);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -350,14 +338,14 @@ impl std::fmt::Display for StuckAgent {
 impl std::error::Error for StuckAgent {}
 
 /// The pid recorded in the (held) lock file, only when that process is
-/// confirmed to be an `atem key-agent`: the pid survives the agent (and
+/// confirmed to be an `atem cred-agent`: the pid survives the agent (and
 /// reboots), so it may name an unrelated process. Linux: its command line
-/// has a `key-agent` argument and, where its fds can be listed (the agent
+/// has a `cred-agent` argument and, where its fds can be listed (the agent
 /// is not dumpable, so usually they can't), one of them is the lock file.
 /// Elsewhere nothing can be confirmed.
 fn confirmed_holder(lock_path: &Path) -> Option<u32> {
     let pid = daemon::read_lock_pid(lock_path)?;
-    if !daemon::confirmed_atem_pid(pid, "key-agent") {
+    if !daemon::confirmed_atem_pid(pid, "cred-agent") {
         return None;
     }
     #[cfg(target_os = "linux")]
@@ -376,16 +364,16 @@ fn confirmed_holder(lock_path: &Path) -> Option<u32> {
 }
 
 /// What to say when the key files' agent can't be reached (its lock is
-/// held): names the holder's pid when it is confirmed to be a key agent,
+/// held): names the holder's pid when it is confirmed to be a cred agent,
 /// else how to find and stop one.
 fn stuck_message(lock_path: &Path) -> String {
     let dir = lock_path.parent().unwrap_or(Path::new(".")).display();
     match confirmed_holder(lock_path) {
         Some(pid) => format!(
-            "a key agent (pid {pid}) holds the key files in {dir} but answers on no socket (its runtime dir may have been removed); stop it with `kill {pid}` and retry (its keys stay sealed on disk)"
+            "a cred agent (pid {pid}) holds the key files in {dir} but answers on no socket (its runtime dir may have been removed); stop it with `kill {pid}` and retry (its keys stay sealed on disk)"
         ),
         None => format!(
-            "a key agent holds the key files in {dir} but answers on no socket; find it with `pgrep -af '[a]tem key-agent'` and stop it (`pkill -u \"$USER\" -f 'atem key-agent'`), then retry (its keys stay sealed on disk)"
+            "a cred agent holds the key files in {dir} but answers on no socket; find it with `pgrep -af '[a]tem cred-agent'` and stop it (`pkill -u \"$USER\" -f 'atem cred-agent'`), then retry (its keys stay sealed on disk)"
         ),
     }
 }
@@ -398,7 +386,7 @@ fn stuck_message(lock_path: &Path) -> String {
 /// recorded socket, and `StuckAgent` if it still doesn't after `wait` (an
 /// orphaned agent exits by itself well within that, freeing the lock).
 /// Held by the returned file until it is dropped or the process exits.
-fn lock_key_dir(paths: &KeyPaths, wait: Duration) -> Result<std::fs::File> {
+fn lock_key_dir(paths: &CredPaths, wait: Duration) -> Result<std::fs::File> {
     let lock_path = &paths.agent_lock;
     let deadline = std::time::Instant::now() + wait;
     loop {
@@ -424,12 +412,15 @@ fn lock_key_dir(paths: &KeyPaths, wait: Duration) -> Result<std::fs::File> {
 /// Takes the key directory for this agent and listens on `socket`, then
 /// records `socket` in `paths.agent_socket` (0600, atomic) for clients that
 /// would look elsewhere. The returned lock must live as long as the agent.
-pub fn claim(paths: &KeyPaths, socket: &Path) -> Result<(std::fs::File, tokio::net::UnixListener)> {
+pub fn claim(
+    paths: &CredPaths,
+    socket: &Path,
+) -> Result<(std::fs::File, tokio::net::UnixListener)> {
     claim_waiting(paths, socket, CLAIM_WAIT)
 }
 
 fn claim_waiting(
-    paths: &KeyPaths,
+    paths: &CredPaths,
     socket: &Path,
     wait: Duration,
 ) -> Result<(std::fs::File, tokio::net::UnixListener)> {
@@ -550,7 +541,7 @@ fn bind_as(socket: &Path, uid: u32) -> Result<tokio::net::UnixListener> {
 #[cfg(test)]
 pub async fn serve(
     listener: tokio::net::UnixListener,
-    agent: Arc<Mutex<KeyAgent>>,
+    agent: Arc<Mutex<CredAgent>>,
     allowed_uid: u32,
 ) -> Result<()> {
     serve_watched(listener, agent, allowed_uid, None).await
@@ -563,7 +554,7 @@ pub async fn serve(
 /// `DRAIN_WAIT` to finish, then drop the rest and return.
 pub(crate) async fn serve_watched(
     listener: tokio::net::UnixListener,
-    agent: Arc<Mutex<KeyAgent>>,
+    agent: Arc<Mutex<CredAgent>>,
     allowed_uid: u32,
     watch: Option<Watch>,
 ) -> Result<()> {
@@ -595,7 +586,7 @@ pub(crate) async fn serve_watched(
                 if let Some(watch) = &watch
                     && let Some(why) = watch.orphaned()
                 {
-                    eprintln!("key agent: {why}; no client can reach this agent, so it wipes its keys and exits");
+                    eprintln!("cred agent: {why}; no client can reach this agent, so it wipes its keys and exits");
                     if let Ok(mut agent) = agent.lock() {
                         let _ = agent.handle(Request::Lock { stop: false });
                     }
@@ -609,7 +600,7 @@ pub(crate) async fn serve_watched(
             Ok((stream, _)) => stream,
             Err(error) => {
                 // e.g. out of file descriptors: keep serving once there is room.
-                eprintln!("key agent: accept failed: {error}");
+                eprintln!("cred agent: accept failed: {error}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -617,11 +608,11 @@ pub(crate) async fn serve_watched(
         let (agent, stopping) = (agent.clone(), stopping.clone());
         connections.spawn(async move {
             if let Err(error) = serve_connection(stream, &agent, allowed_uid, &stopping).await {
-                eprintln!("key agent: {error:#}");
+                eprintln!("cred agent: {error:#}");
             }
         });
     }
-    eprintln!("key agent: locked by `atem cred lock`; exiting");
+    eprintln!("cred agent: locked by `atem cred lock`; exiting");
     // Unlink before closing the listener: clients count the agent as stopped
     // once a dial fails, and by then its socket file must be gone too.
     if let Some((path, identity)) = &bound
@@ -643,7 +634,7 @@ pub(crate) async fn serve_watched(
     })
     .await;
     if drained.is_err() {
-        eprintln!("key agent: dropped requests still in flight");
+        eprintln!("cred agent: dropped requests still in flight");
         connections.abort_all();
     }
     // A request that finished after the lock (an unlock, say) is wiped too.
@@ -655,7 +646,7 @@ pub(crate) async fn serve_watched(
 
 async fn serve_connection(
     stream: tokio::net::UnixStream,
-    agent: &Mutex<KeyAgent>,
+    agent: &Mutex<CredAgent>,
     allowed_uid: u32,
     stopping: &tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
@@ -713,7 +704,7 @@ fn harden_process() {
     {
         if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) } != 0 {
             eprintln!(
-                "key agent: PR_SET_DUMPABLE failed ({})",
+                "cred agent: PR_SET_DUMPABLE failed ({})",
                 std::io::Error::last_os_error()
             );
         }
@@ -726,23 +717,23 @@ fn harden_process() {
         // when the limit leaves room for the whole process.
         if !known || (limit.rlim_cur != libc::RLIM_INFINITY && limit.rlim_cur < 512 << 20) {
             eprintln!(
-                "key agent: not locking memory (RLIMIT_MEMLOCK is too low); keys could reach swap"
+                "cred agent: not locking memory (RLIMIT_MEMLOCK is too low); keys could reach swap"
             );
         } else if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
             eprintln!(
-                "key agent: mlockall failed ({}); keys could reach swap",
+                "cred agent: mlockall failed ({}); keys could reach swap",
                 std::io::Error::last_os_error()
             );
         }
     }
 }
 
-/// `atem key-agent`: serve this user's agent until the process exits.
-pub async fn run_key_agent() -> Result<()> {
+/// `atem cred-agent`: serve this user's agent until the process exits.
+pub async fn run_cred_agent() -> Result<()> {
     harden_process();
     // Taken now, before a rebuild can replace the executable on disk.
     let _ = build_id();
-    let paths = KeyPaths::default_paths();
+    let paths = CredPaths::default_paths();
     let socket = agent_socket_path();
     // `key_dir` holds the key directory's lock until the process exits.
     let (key_dir, listener) = match claim(&paths, &socket) {
@@ -755,10 +746,10 @@ pub async fn run_key_agent() -> Result<()> {
     };
     let watch = Watch::new(&socket, &paths.agent_socket, ORPHAN_CHECK)?;
     // A key-file error never stops the agent: it starts locked and says why
-    // on `atem status` (see KeyAgent::new).
-    let agent = KeyAgent::new(paths)?;
+    // on `atem status` (see CredAgent::new).
+    let agent = CredAgent::new(paths)?;
     eprintln!(
-        "atem key agent (protocol v{PROTOCOL_VERSION}, pid {}) listening on {}",
+        "atem cred agent (protocol v{PROTOCOL_VERSION}, pid {}) listening on {}",
         std::process::id(),
         socket.display()
     );
@@ -774,21 +765,27 @@ pub async fn run_key_agent() -> Result<()> {
     served
 }
 
-/// Starts `exe key-agent` detached from this command and its terminal, with
+/// Starts `exe cred-agent` detached from this command and its terminal, with
 /// `envs` added to its environment. Returns the agent's pid.
 fn spawn_agent(exe: &Path, log: &Path, envs: &[(&str, &Path)]) -> Result<u32> {
     let envs: Vec<(OsString, OsString)> = envs
         .iter()
         .map(|(key, value)| (OsString::from(key), value.as_os_str().to_owned()))
         .collect();
-    daemon::spawn_detached(exe, "key-agent", Path::new("/"), log, &envs)
-        .context("could not start the key agent")
+    daemon::spawn_detached(exe, "cred-agent", Path::new("/"), log, &envs)
+        .context("could not start the cred agent")
+}
+
+/// Where a test client's agent logs: beside its socket's directory.
+#[cfg(test)]
+fn test_log(socket: &Path) -> PathBuf {
+    CredPaths::in_dir(socket.parent().unwrap_or(Path::new("/"))).agent_log
 }
 
 /// How a client starts an agent when none answers.
 type Launcher = Box<dyn Fn() -> Result<()> + Send + Sync>;
 
-pub struct KeyAgentClient {
+pub struct CredAgentClient {
     /// Where this session's agent would listen (from its runtime dir).
     socket: PathBuf,
     /// The running agent's own record of its socket (`agent.socket`), tried
@@ -812,14 +809,17 @@ pub struct KeyAgentClient {
     build_checked: std::sync::atomic::AtomicBool,
     /// `OLDER_BUILD`, once the check found an unlocked older agent.
     older_build: Mutex<Option<String>>,
+    /// Look whether Atem's runtime is another build too, for the warning
+    /// (this user's clients; never in tests).
+    runtime_check: bool,
 }
 
-impl KeyAgentClient {
+impl CredAgentClient {
     /// A client for the agent at `socket` that never starts one.
     #[cfg(test)]
     pub(crate) fn at(socket: PathBuf) -> Self {
         Self {
-            log: socket.with_file_name("key-agent.log"),
+            log: test_log(&socket),
             socket,
             record: None,
             launcher: None,
@@ -829,6 +829,7 @@ impl KeyAgentClient {
             build: None,
             build_checked: std::sync::atomic::AtomicBool::new(false),
             older_build: Mutex::new(None),
+            runtime_check: false,
         }
     }
 
@@ -839,20 +840,35 @@ impl KeyAgentClient {
             &crate::config::AtemConfig::config_dir(),
             std::env::var_os("XDG_RUNTIME_DIR"),
             Some(Box::new(|| {
-                spawn_agent(&std::env::current_exe()?, &agent_log_path(), &[]).map(|_| ())
+                spawn_agent(
+                    &std::env::current_exe()?,
+                    &CredPaths::default_paths().agent_log,
+                    &[],
+                )
+                .map(|_| ())
             })),
         );
         client.build = Some(build_id().to_string());
+        client.runtime_check = true;
         client
     }
 
     /// A client for this user's running agent that never starts one.
     #[cfg_attr(test, allow(dead_code))]
     pub fn existing() -> Self {
-        Self::finding(
+        let mut client = Self::finding(
             &crate::config::AtemConfig::config_dir(),
             std::env::var_os("XDG_RUNTIME_DIR"),
             None,
+        );
+        client.runtime_check = true;
+        client
+    }
+
+    /// The warning for an unlocked agent of another build.
+    fn older_build_text(&self) -> &'static str {
+        crate::memory::cred_agent::older_build_warning(
+            self.runtime_check && crate::memory::cred_agent::runtime_differs(),
         )
     }
 
@@ -864,17 +880,19 @@ impl KeyAgentClient {
         runtime_dir: Option<OsString>,
         launcher: Option<Launcher>,
     ) -> Self {
+        let paths = CredPaths::in_dir(config_dir);
         Self {
             socket: socket_path_in(config_dir, runtime_dir),
-            record: Some(config_dir.join("agent.socket")),
+            record: Some(paths.agent_socket),
             launcher,
-            log: config_dir.join("key-agent.log"),
-            lock: Some(config_dir.join("key_agent.lock")),
+            log: paths.agent_log,
+            lock: Some(paths.agent_lock),
             start_wait: START_WAIT,
             expected_uid: own_uid(),
             build: None,
             build_checked: std::sync::atomic::AtomicBool::new(false),
             older_build: Mutex::new(None),
+            runtime_check: false,
         }
     }
 
@@ -882,7 +900,7 @@ impl KeyAgentClient {
     #[cfg(test)]
     pub(crate) fn with_launcher(socket: PathBuf, launcher: Launcher) -> Self {
         Self {
-            log: socket.with_file_name("key-agent.log"),
+            log: test_log(&socket),
             socket,
             record: None,
             launcher: Some(launcher),
@@ -892,6 +910,7 @@ impl KeyAgentClient {
             build: None,
             build_checked: std::sync::atomic::AtomicBool::new(false),
             older_build: Mutex::new(None),
+            runtime_check: false,
         }
     }
 
@@ -983,10 +1002,10 @@ impl KeyAgentClient {
                 {
                     return Err(StuckAgent(stuck_message(lock)).into());
                 }
-                bail!("the key agent didn't start; see {}", self.log.display())
+                bail!("the cred agent didn't start; see {}", self.log.display())
             }
             Err(error) => Err(anyhow!(error).context(format!(
-                "the key agent isn't running at {}",
+                "the cred agent isn't running at {}",
                 self.socket.display()
             ))),
         }
@@ -1009,7 +1028,7 @@ fn read_reply(mut stream: &UnixStream) -> std::io::Result<WipingBuf> {
     }
 }
 
-impl KeyAgentClient {
+impl CredAgentClient {
     /// Why the agent hung up (or timed out). An agent of an older atem
     /// closes the connection on a request it can't read (a step-2a agent
     /// reads at most 1 MiB), so a short `status` asks for its version first.
@@ -1023,8 +1042,8 @@ impl KeyAgentClient {
         // says why it hung up.
         let log = self.log.display();
         match error {
-            Some(error) => anyhow!("the key agent closed the connection ({error}); see {log}"),
-            None => anyhow!("the key agent closed the connection; see {log}"),
+            Some(error) => anyhow!("the cred agent closed the connection ({error}); see {log}"),
+            None => anyhow!("the cred agent closed the connection; see {log}"),
         }
     }
 
@@ -1046,7 +1065,7 @@ impl KeyAgentClient {
     }
 }
 
-impl KeyAgentClient {
+impl CredAgentClient {
     /// Waits up to `wait` for the agent to stop answering; true once it has.
     fn wait_gone(&self, wait: Duration) -> bool {
         let deadline = std::time::Instant::now() + wait;
@@ -1078,7 +1097,7 @@ impl KeyAgentClient {
     /// Once per client (with a build to compare): the running agent must be
     /// this build. A locked agent of another build holds no keys, so it is
     /// asked to stop (or, an agent too old to stop when asked, confirmed as
-    /// this user's `atem key-agent` and sent SIGTERM) and the next request
+    /// this user's `atem cred-agent` and sent SIGTERM) and the next request
     /// starts this build's. An unlocked one is never restarted: it is used,
     /// with a warning.
     fn check_build(&self) -> Result<()> {
@@ -1104,11 +1123,12 @@ impl KeyAgentClient {
             // Once per process, however many clients a command makes.
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
+            let text = self.older_build_text();
             if !WARNED.swap(true, Ordering::SeqCst) {
-                crate::diagnostics::warn(OLDER_BUILD);
+                crate::diagnostics::warn(text);
             }
             if let Ok(mut older) = self.older_build.lock() {
-                *older = Some(OLDER_BUILD.to_string());
+                *older = Some(text.to_string());
             }
             return Ok(());
         }
@@ -1127,26 +1147,26 @@ impl KeyAgentClient {
             }
         }
         bail!(
-            "the running key agent is from an older atem build and doesn't stop when asked; find it with `pgrep -af '[a]tem key-agent'` and stop it (`pkill -u \"$USER\" -f 'atem key-agent'`), then retry (it is locked: its keys stay sealed on disk)"
+            "the running cred agent is from an older atem build and doesn't stop when asked; find it with `pgrep -af '[a]tem cred-agent'` and stop it (`pkill -u \"$USER\" -f 'atem cred-agent'`), then retry (it is locked: its keys stay sealed on disk)"
         )
     }
 }
 
 /// An agent from an older atem rejects a request it doesn't know as
 /// malformed (`unknown variant`): say what to do instead.
-fn explain_unknown_request(error: anyhow::Error) -> anyhow::Error {
+fn explain_unknown_request(error: anyhow::Error, older: &str) -> anyhow::Error {
     if format!("{error:#}").contains("unknown variant") {
-        anyhow!("{OLDER_BUILD} (It doesn't know this request.)")
+        anyhow!("{older} (It doesn't know this request.)")
     } else {
         error
     }
 }
 
-impl KeyAgentApi for KeyAgentClient {
+impl CredAgentApi for CredAgentClient {
     fn lock_and_stop(&self) -> Result<bool> {
         match self.call(Request::Lock { stop: true })? {
             Reply::Done => Ok(self.wait_gone(STOP_WAIT)),
-            _ => bail!("the key agent sent an unexpected reply"),
+            _ => bail!("the cred agent sent an unexpected reply"),
         }
     }
 
@@ -1169,8 +1189,9 @@ impl KeyAgentApi for KeyAgentClient {
             return Err(self.closed(None));
         }
         let text = std::str::from_utf8(&reply.0)
-            .map_err(|_| anyhow!("the key agent sent a non-UTF-8 reply"))?;
-        decode_response(text).map_err(explain_unknown_request)
+            .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))?;
+        decode_response(text)
+            .map_err(|error| explain_unknown_request(error, self.older_build_text()))
     }
 }
 
@@ -1205,6 +1226,11 @@ mod tests {
         attempt().unwrap()
     }
 
+    /// The agent socket under the runtime dir `run` (`CredPaths::agent_sock`).
+    fn sock(run: &Path) -> PathBuf {
+        CredPaths::in_dir(run).agent_sock(Some(run))
+    }
+
     /// Creates `path` private, whatever the umask: the agent refuses a socket
     /// directory others can write to.
     fn make_private(path: &Path) {
@@ -1215,8 +1241,8 @@ mod tests {
 
     /// Serves an agent for the key files in `dir` on its own thread.
     fn start_agent(dir: &Path, allowed_uid: u32) -> PathBuf {
-        let socket = dir.join("run").join("agent.sock");
-        let paths = KeyPaths::in_dir(dir);
+        let socket = sock(&dir.join("run"));
+        let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
         let path = socket.clone();
         std::thread::spawn(move || {
@@ -1226,30 +1252,13 @@ mod tests {
                 .unwrap();
             runtime.block_on(async move {
                 let listener = bind(&path).unwrap();
-                let agent = Arc::new(Mutex::new(KeyAgent::new(paths).unwrap()));
+                let agent = Arc::new(Mutex::new(CredAgent::new(paths).unwrap()));
                 ready.send(()).unwrap();
                 let _ = serve(listener, agent, allowed_uid).await;
             });
         });
         started.recv().unwrap();
         socket
-    }
-
-    #[test]
-    fn the_socket_prefers_the_runtime_dir() {
-        let config = Path::new("/home/u/.config/atem");
-        assert_eq!(
-            socket_path_from(Some("/run/user/1000".into()), config),
-            Path::new("/run/user/1000/atem/agent.sock")
-        );
-        assert_eq!(
-            socket_path_from(None, config),
-            Path::new("/home/u/.config/atem/agent.sock")
-        );
-        assert_eq!(
-            socket_path_from(Some("".into()), config),
-            Path::new("/home/u/.config/atem/agent.sock")
-        );
     }
 
     #[test]
@@ -1281,7 +1290,7 @@ mod tests {
         );
         assert!(status < pkill, "{hint}");
         let refused = decode_response(
-            r#"{"v":2,"ok":false,"error":"unsupported key agent protocol version 3"}"#,
+            r#"{"v":2,"ok":false,"error":"unsupported cred agent protocol version 3"}"#,
         );
         assert!(format!("{:#}", refused.err().unwrap()).contains("protocol version 3"));
         assert!(matches!(
@@ -1295,7 +1304,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid());
-        let client = KeyAgentClient::at(socket.clone());
+        let client = CredAgentClient::at(socket.clone());
         assert!(client.is_running());
         assert!(!client.status().unwrap().unlocked);
         client.lock_keys().unwrap();
@@ -1331,8 +1340,8 @@ mod tests {
     fn another_user_is_refused() {
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid().wrapping_add(1));
-        let log = socket.with_file_name("key-agent.log");
-        let error = format!("{:#}", KeyAgentClient::at(socket).status().err().unwrap());
+        let log = test_log(&socket);
+        let error = format!("{:#}", CredAgentClient::at(socket).status().err().unwrap());
         assert!(error.contains("closed the connection"), "{error}");
         // The client checked the listener's uid already: the hint is the log.
         assert!(error.contains(&format!("see {}", log.display())), "{error}");
@@ -1350,7 +1359,7 @@ mod tests {
         runtime.block_on(async {
             let live = bind(&socket).err().unwrap();
             assert!(format!("{live:#}").contains("already running"));
-            let stale = dir.path().join("stale").join("agent.sock");
+            let stale = sock(&dir.path().join("stale"));
             make_private(stale.parent().unwrap());
             drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
             assert!(stale.exists());
@@ -1361,20 +1370,20 @@ mod tests {
     #[test]
     fn a_client_that_may_not_start_an_agent_says_so() {
         let dir = short_dir();
-        let client = KeyAgentClient::at(dir.path().join("none.sock"));
+        let client = CredAgentClient::at(dir.path().join("none.sock"));
         assert!(!client.is_running());
         assert!(format!("{:#}", client.status().err().unwrap()).contains("isn't running"));
     }
 
     #[test]
     fn every_request_survives_the_wire_and_reaches_the_agent() {
-        use crate::memory::key_agent::{error_of, test_agent};
+        use crate::memory::cred_agent::{error_of, test_agent};
         use crate::memory::statements::SignedWire;
         use crate::memory::storage_key::UnlockGrantWire;
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid());
-        let client = KeyAgentClient::at(socket);
-        let local = test_agent(&KeyPaths::in_dir(dir.path()));
+        let client = CredAgentClient::at(socket);
+        let local = test_agent(&CredPaths::in_dir(dir.path()));
         let signed = || SignedWire {
             statement: "AA==".into(),
             signature: "AA==".into(),
@@ -1385,7 +1394,7 @@ mod tests {
             ciphertext: "AA==".into(),
         };
         // The locked agent's answer must be the same over the socket as in
-        // process: the request reached `KeyAgent::handle` intact.
+        // process: the request reached `CredAgent::handle` intact.
         assert_eq!(
             error_of(client.public_keys()),
             error_of(local.public_keys())
@@ -1476,14 +1485,14 @@ mod tests {
             "atem binary missing or stale at {}: run `cargo build` first",
             exe.display()
         );
-        let socket = runtime.join("atem").join("agent.sock");
+        let socket = sock(&runtime);
         let pid = Arc::new(Mutex::new(None));
         let launcher = {
             let (home, runtime, pid, log) = (
                 home.clone(),
                 runtime.clone(),
                 pid.clone(),
-                dir.path().join("agent.log"),
+                CredPaths::in_dir(dir.path()).agent_log,
             );
             Box::new(move || {
                 let started = spawn_agent(
@@ -1504,15 +1513,15 @@ mod tests {
             }
         }
         let _kill = Kill(pid.clone());
-        let client = KeyAgentClient::with_launcher(socket.clone(), launcher)
-            .logging_to(dir.path().join("agent.log"));
+        let client = CredAgentClient::with_launcher(socket.clone(), launcher)
+            .logging_to(CredPaths::in_dir(dir.path()).agent_log);
         assert!(!client.is_running());
         let status = client.status().unwrap();
         assert!(!status.unlocked);
         assert!(client.is_running());
         assert!(pid.lock().unwrap().is_some());
         // A second client finds the same agent without starting another.
-        let second = KeyAgentClient::with_launcher(
+        let second = CredAgentClient::with_launcher(
             socket,
             Box::new(|| -> Result<()> { panic!("a second agent must not be started") }),
         );
@@ -1526,15 +1535,15 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         let link = dir.path().join("atem");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let error = bind(&link.join("agent.sock")).err().unwrap();
+        let error = bind(&sock(dir.path())).err().unwrap();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
-        assert!(!real.join("agent.sock").exists());
+        assert!(!real.join(sock(dir.path()).file_name().unwrap()).exists());
     }
 
     #[test]
     fn bind_does_not_delete_a_file_that_is_not_a_socket() {
         let dir = short_dir();
-        let socket = dir.path().join("run").join("agent.sock");
+        let socket = sock(&dir.path().join("run"));
         make_private(socket.parent().unwrap());
         std::fs::write(&socket, b"precious").unwrap();
         let error = bind(&socket).err().unwrap();
@@ -1568,19 +1577,19 @@ mod tests {
         };
         assert!(closed);
         // The agent still serves others.
-        assert!(KeyAgentClient::at(socket).status().is_ok());
+        assert!(CredAgentClient::at(socket).status().is_ok());
     }
 
     #[test]
     fn a_listener_run_by_someone_else_is_not_trusted() {
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid());
-        let client = KeyAgentClient::at(socket.clone()).expecting_uid(own_uid().wrapping_add(1));
+        let client = CredAgentClient::at(socket.clone()).expecting_uid(own_uid().wrapping_add(1));
         assert!(!client.is_running());
         let error = format!("{:#}", client.status().err().unwrap());
         assert!(error.contains("served by another user"), "{error}");
         // The same socket is fine for its own user.
-        assert!(KeyAgentClient::at(socket).is_running());
+        assert!(CredAgentClient::at(socket).is_running());
     }
 
     #[test]
@@ -1611,11 +1620,11 @@ mod tests {
         // And the socket path falls back to the config dir for an unsafe runtime dir.
         let pick = |runtime: &Path| {
             let ok = check_parent_dir(runtime, uid).is_ok();
-            socket_path_from(ok.then(|| runtime.as_os_str().to_owned()), &config)
+            socket_path_in(&config, ok.then(|| runtime.as_os_str().to_owned()))
         };
-        assert_eq!(pick(&private), private.join("atem").join("agent.sock"));
-        assert_eq!(pick(&open), config.join("agent.sock"));
-        assert_eq!(pick(&link), config.join("agent.sock"));
+        assert_eq!(pick(&private), sock(&private));
+        assert_eq!(pick(&open), CredPaths::in_dir(&config).agent_sock(None));
+        assert_eq!(pick(&link), CredPaths::in_dir(&config).agent_sock(None));
     }
 
     #[test]
@@ -1715,7 +1724,7 @@ mod tests {
     /// A step-2a (v1) agent left running: answers a line in v1 and, like
     /// it, closes the connection unanswered on a request over 1 MiB.
     fn start_v1_agent(dir: &Path) -> PathBuf {
-        let socket = dir.join("run").join("agent.sock");
+        let socket = sock(&dir.join("run"));
         make_private(socket.parent().unwrap());
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::thread::spawn(move || {
@@ -1747,7 +1756,7 @@ mod tests {
     fn a_big_first_request_to_an_old_agent_says_to_stop_it() {
         use crate::memory::account_keys::CryptOp;
         let dir = short_dir();
-        let client = KeyAgentClient::at(start_v1_agent(dir.path()));
+        let client = CredAgentClient::at(start_v1_agent(dir.path()));
         // Over the step-2a agent's 1 MiB line limit: it hangs up unanswered.
         let big = vec![7u8; 3 << 19];
         let error = format!(
@@ -1790,17 +1799,20 @@ mod tests {
     #[test]
     fn status_against_an_old_agent_says_to_stop_it() {
         let dir = short_dir();
-        let client = KeyAgentClient::at(start_v1_agent(dir.path()));
+        let client = CredAgentClient::at(start_v1_agent(dir.path()));
         assert!(client.is_running());
         let profile = tempfile::tempdir().unwrap();
-        std::fs::write(profile.path().join("device_keys.sealed"), b"{}").unwrap();
+        crate::memory::verification::write_test_file(
+            &crate::memory::verification::CredPaths::in_dir(profile.path()).device_keys_sealed,
+            b"{}",
+        );
         let src = crate::status::Sources::in_dir(profile.path());
         let credentials = crate::status::gather_with(&src, Some(&client))
             .credentials
             .value;
         // Shown, not an error: the mismatch and what to do.
         assert!(
-            credentials.starts_with("unknown (key agent not answering: the running key agent speaks protocol v1, this atem speaks v2"),
+            credentials.starts_with("unknown (cred agent not answering: the running cred agent speaks protocol v1, this atem speaks v2"),
             "{credentials}"
         );
         assert!(credentials.contains("pkill"), "{credentials}");
@@ -1848,10 +1860,10 @@ mod tests {
     #[test]
     fn a_crypt_batch_bigger_than_a_mebibyte_reaches_the_agent() {
         use crate::memory::account_keys::CryptOp;
-        use crate::memory::key_agent::error_of;
+        use crate::memory::cred_agent::error_of;
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid());
-        let client = KeyAgentClient::at(socket);
+        let client = CredAgentClient::at(socket);
         let big = vec![b'x'; 3 << 20];
         let error = error_of(client.crypt("a", vec![CryptOp::seal("r", "f", &big)]));
         // The locked agent's answer, not a refused line.
@@ -1869,11 +1881,11 @@ mod tests {
 
     #[test]
     fn secret_and_grant_requests_reach_the_agent_over_the_wire() {
-        use crate::memory::key_agent::{error_of, test_agent};
+        use crate::memory::cred_agent::{error_of, test_agent};
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid());
-        let client = KeyAgentClient::at(socket);
-        let local = test_agent(&KeyPaths::in_dir(dir.path()));
+        let client = CredAgentClient::at(socket);
+        let local = test_agent(&CredPaths::in_dir(dir.path()));
         for (over_wire, in_process) in rich_requests().into_iter().zip(rich_requests()) {
             let wire_error = error_of(client.call(over_wire));
             let local_error = error_of(local.call(in_process));
@@ -1889,7 +1901,7 @@ mod tests {
         let open = dir.path().join("atem");
         std::fs::create_dir_all(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
-        let error = bind(&open.join("agent.sock")).err().unwrap();
+        let error = bind(&sock(dir.path())).err().unwrap();
         let text = format!("{error:#}");
         assert!(text.contains("written by other users"), "{text}");
         assert!(text.contains(open.to_str().unwrap()), "{text}");
@@ -1926,12 +1938,12 @@ mod tests {
         }
     }
 
-    /// `atem key-agent` for `home`, with its socket under `runtime`.
-    fn key_agent_process(home: &Path, runtime: &Path, log: &Path) -> Reaped {
+    /// `atem cred-agent` for `home`, with its socket under `runtime`.
+    fn cred_agent_process(home: &Path, runtime: &Path, log: &Path) -> Reaped {
         let log = std::fs::File::create(log).unwrap();
         Reaped(
             std::process::Command::new(atem_binary())
-                .arg("key-agent")
+                .arg("cred-agent")
                 .env("HOME", home)
                 .env("XDG_RUNTIME_DIR", runtime)
                 .stdin(std::process::Stdio::null())
@@ -1954,25 +1966,28 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_key_agent_process_exits_and_clears_its_records() {
+    fn a_locked_cred_agent_process_exits_and_clears_its_records() {
         let dir = short_dir();
         let home = dir.path().join("home");
         let run = dir.path().join("run");
         std::fs::create_dir_all(&home).unwrap();
         make_private(&run);
-        let mut agent = key_agent_process(&home, &run, &dir.path().join("a.log"));
+        let mut agent = cred_agent_process(&home, &run, &dir.path().join("a.log"));
         let config = home.join(".config").join("atem");
-        let client = KeyAgentClient::finding(&config, Some(run.clone().into_os_string()), None);
+        let client = CredAgentClient::finding(&config, Some(run.clone().into_os_string()), None);
         assert!(eventually(|| client.is_running()));
         assert!(client.lock_and_stop().unwrap(), "the agent stopped");
         assert!(
             eventually(|| agent.0.try_wait().unwrap().is_some()),
             "the agent process kept running"
         );
-        assert!(!run.join("atem").join("agent.sock").exists());
-        assert!(!config.join("agent.socket").exists(), "its record is gone");
+        assert!(!sock(&run).exists());
+        assert!(
+            !CredPaths::in_dir(&config).agent_socket.exists(),
+            "its record is gone"
+        );
         assert_eq!(
-            std::fs::read_to_string(config.join("key_agent.lock")).unwrap(),
+            std::fs::read_to_string(CredPaths::in_dir(&config).agent_lock).unwrap(),
             "",
             "a clean exit clears its pid"
         );
@@ -1988,25 +2003,25 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         make_private(&run_a);
         make_private(&run_b);
-        let mut first = key_agent_process(&home, &run_a, &dir.path().join("a.log"));
-        let socket_a = run_a.join("atem").join("agent.sock");
+        let mut first = cred_agent_process(&home, &run_a, &dir.path().join("a.log"));
+        let socket_a = sock(&run_a);
         assert!(eventually(
-            || KeyAgentClient::at(socket_a.clone()).is_running()
+            || CredAgentClient::at(socket_a.clone()).is_running()
         ));
         // A second agent for the same key files (another login session with
         // its own runtime dir) must not run beside the first: two agents
         // rotating one storage key could each strand the other's files.
-        let mut second = key_agent_process(&home, &run_b, &dir.path().join("b.log"));
+        let mut second = cred_agent_process(&home, &run_b, &dir.path().join("b.log"));
         assert!(
             eventually(|| second.0.try_wait().unwrap().is_some()),
             "the second agent kept running"
         );
-        assert!(!run_b.join("atem").join("agent.sock").exists());
+        assert!(!sock(&run_b).exists());
         let log = std::fs::read_to_string(dir.path().join("b.log")).unwrap();
         assert!(log.contains("already running"), "{log}");
         // A client from the second session finds the first agent through
         // the socket path it recorded, and starts no other.
-        let client = KeyAgentClient::finding(
+        let client = CredAgentClient::finding(
             &home.join(".config").join("atem"),
             Some(run_b.clone().into_os_string()),
             Some(Box::new(|| -> Result<()> {
@@ -2021,7 +2036,7 @@ mod tests {
     #[test]
     fn a_second_claim_on_the_same_key_files_is_refused_and_the_socket_recorded() {
         let dir = short_dir();
-        let paths = KeyPaths::in_dir(&dir.path().join("config"));
+        let paths = CredPaths::in_dir(&dir.path().join("config"));
         let (run_a, run_b) = (dir.path().join("ra"), dir.path().join("rb"));
         make_private(&run_a);
         make_private(&run_b);
@@ -2030,7 +2045,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let socket_a = run_a.join("atem").join("agent.sock");
+            let socket_a = sock(&run_a);
             let (lock, listener) = claim(&paths, &socket_a).unwrap();
             assert_eq!(recorded_socket(&paths.agent_socket), Some(socket_a.clone()));
             assert_eq!(
@@ -2041,27 +2056,26 @@ mod tests {
                     & 0o777,
                 0o600
             );
-            let error = claim(&paths, &run_b.join("atem").join("agent.sock"))
-                .err()
-                .unwrap();
+            let error = claim(&paths, &sock(&run_b)).err().unwrap();
             assert!(
                 error.downcast_ref::<AlreadyRunning>().is_some(),
                 "{error:#}"
             );
-            assert!(!run_b.join("atem").join("agent.sock").exists());
+            assert!(!sock(&run_b).exists());
             assert_eq!(recorded_socket(&paths.agent_socket), Some(socket_a));
             // Once the first agent is gone, another may take the directory.
             drop((lock, listener));
-            retrying(|| claim(&paths, &run_b.join("atem").join("agent.sock")));
+            retrying(|| claim(&paths, &sock(&run_b)));
         });
     }
 
     #[test]
     fn a_symlinked_key_directory_lock_is_refused() {
         let dir = short_dir();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let target = dir.path().join("target");
         std::fs::write(&target, b"keep").unwrap();
+        crate::memory::verification::create_private_dir(&paths.dir).unwrap();
         std::os::unix::fs::symlink(&target, &paths.agent_lock).unwrap();
         let error = lock_key_dir(&paths, Duration::ZERO).err().unwrap();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
@@ -2073,11 +2087,12 @@ mod tests {
         let dir = short_dir();
         let run = dir.path().join("run");
         let target = dir.path().join("target");
-        std::fs::create_dir(&run).unwrap();
+        let socket = sock(&run);
+        make_private(socket.parent().unwrap());
         std::fs::write(&target, b"keep").unwrap();
-        std::os::unix::fs::symlink(&target, run.join("agent.lock")).unwrap();
-        let _ = std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-        let error = bind(&run.join("agent.sock")).err().unwrap();
+        std::os::unix::fs::symlink(&target, crate::memory::verification::socket_lock(&socket))
+            .unwrap();
+        let error = bind(&socket).err().unwrap();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
@@ -2089,22 +2104,22 @@ mod tests {
         dir: &Path,
     ) -> (
         PathBuf,
-        KeyPaths,
-        Arc<Mutex<KeyAgent>>,
+        CredPaths,
+        Arc<Mutex<CredAgent>>,
         std::sync::mpsc::Receiver<()>,
     ) {
         use crate::memory::device_keys::DeviceKeys;
         use crate::memory::statements::FakeAstation;
-        let paths = KeyPaths::in_dir(&dir.join("config"));
+        let paths = CredPaths::in_dir(&dir.join("config"));
         let keys = DeviceKeys::generate();
         crate::memory::fake_astation::pin(&paths, &FakeAstation::new(), &keys, true);
         keys.save_to(&paths.device_keys).unwrap();
-        let agent = Arc::new(Mutex::new(KeyAgent::new(paths.clone()).unwrap()));
+        let agent = Arc::new(Mutex::new(CredAgent::new(paths.clone()).unwrap()));
         assert!(
             agent.status().unwrap().unlocked,
             "the plain keys were migrated"
         );
-        let socket = dir.join("run").join("atem").join("agent.sock");
+        let socket = sock(&dir.join("run"));
         make_private(&dir.join("run"));
         let (ready, started) = std::sync::mpsc::channel();
         let (done, stopped) = std::sync::mpsc::channel();
@@ -2131,7 +2146,7 @@ mod tests {
     fn an_agent_whose_socket_is_removed_wipes_its_keys_and_stops() {
         let dir = short_dir();
         let (socket, paths, agent, stopped) = watched_agent(dir.path());
-        assert!(KeyAgentClient::at(socket.clone()).is_running());
+        assert!(CredAgentClient::at(socket.clone()).is_running());
         // Still reachable: it keeps serving.
         assert!(stopped.recv_timeout(Duration::from_millis(300)).is_err());
         // logind removes the runtime dir after the last session ends.
@@ -2182,8 +2197,8 @@ mod tests {
 
     /// A client for the key files in `config` from a session whose runtime
     /// dir is `runtime`, whose launcher starts nothing, waiting 300 ms.
-    fn idle_launch_client(config: &Path, runtime: &Path) -> KeyAgentClient {
-        KeyAgentClient::finding(
+    fn idle_launch_client(config: &Path, runtime: &Path) -> CredAgentClient {
+        CredAgentClient::finding(
             config,
             Some(runtime.as_os_str().to_owned()),
             Some(Box::new(|| -> Result<()> { Ok(()) })),
@@ -2192,20 +2207,20 @@ mod tests {
     }
 
     #[test]
-    fn a_holder_that_cant_be_confirmed_as_a_key_agent_is_not_named() {
+    fn a_holder_that_cant_be_confirmed_as_a_cred_agent_is_not_named() {
         let dir = short_dir();
         let config = dir.path().join("config");
-        let paths = KeyPaths::in_dir(&config);
+        let paths = CredPaths::in_dir(&config);
         make_private(&dir.path().join("rb"));
         // The holder (this test process) records its pid and answers on no
-        // socket, but it isn't an `atem key-agent`: no pid is named.
+        // socket, but it isn't an `atem cred-agent`: no pid is named.
         let _held = lock_key_dir(&paths, Duration::ZERO).unwrap();
         let pid = std::process::id();
         assert_eq!(
             std::fs::read_to_string(&paths.agent_lock).unwrap().trim(),
             pid.to_string()
         );
-        let socket = dir.path().join("rb").join("atem").join("agent.sock");
+        let socket = sock(&dir.path().join("rb"));
         let started = std::time::Instant::now();
         let error = claim_waiting(&paths, &socket, Duration::from_millis(300))
             .err()
@@ -2223,7 +2238,7 @@ mod tests {
             ),
         ] {
             assert!(!text.contains(&format!("{pid}")), "{text}");
-            assert!(text.contains("pgrep -af '[a]tem key-agent'"), "{text}");
+            assert!(text.contains("pgrep -af '[a]tem cred-agent'"), "{text}");
             assert!(text.contains("pkill -u"), "{text}");
             assert!(!text.contains("didn't start"), "{text}");
         }
@@ -2234,13 +2249,13 @@ mod tests {
     fn an_unheld_lock_naming_a_live_pid_names_no_one() {
         let dir = short_dir();
         let config = dir.path().join("config");
-        let paths = KeyPaths::in_dir(&config);
+        let paths = CredPaths::in_dir(&config);
         make_private(&dir.path().join("rb"));
         // Left by an agent that exited (or from before a reboot): the pid
         // now belongs to a live, unrelated process (here: this one).
         std::fs::create_dir_all(&config).unwrap();
         let pid = std::process::id();
-        std::fs::write(&paths.agent_lock, format!("{pid}\n")).unwrap();
+        crate::memory::verification::write_test_file(&paths.agent_lock, format!("{pid}\n"));
         let text = format!(
             "{:#}",
             idle_launch_client(&config, &dir.path().join("rb"))
@@ -2276,31 +2291,27 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_confirmed_key_agent_that_no_one_can_reach_is_named_with_its_pid() {
+    fn a_confirmed_cred_agent_that_no_one_can_reach_is_named_with_its_pid() {
         let dir = short_dir();
         let home = dir.path().join("home");
         let (run_a, run_b) = (dir.path().join("ra"), dir.path().join("rb"));
         std::fs::create_dir_all(&home).unwrap();
         make_private(&run_a);
         make_private(&run_b);
-        let agent = key_agent_process(&home, &run_a, &dir.path().join("a.log"));
-        let socket_a = run_a.join("atem").join("agent.sock");
+        let agent = cred_agent_process(&home, &run_a, &dir.path().join("a.log"));
+        let socket_a = sock(&run_a);
         assert!(eventually(
-            || KeyAgentClient::at(socket_a.clone()).is_running()
+            || CredAgentClient::at(socket_a.clone()).is_running()
         ));
         let pid = agent.0.id();
         // Its socket directory can't be entered: nobody can connect, yet the
         // agent itself can't tell (not a NotFound) and keeps its lock.
         let _blocked = Unreadable::new(&run_a.join("atem"));
         let config = home.join(".config").join("atem");
-        let paths = KeyPaths::in_dir(&config);
-        let error = claim_waiting(
-            &paths,
-            &run_b.join("atem").join("agent.sock"),
-            Duration::from_millis(300),
-        )
-        .err()
-        .unwrap();
+        let paths = CredPaths::in_dir(&config);
+        let error = claim_waiting(&paths, &sock(&run_b), Duration::from_millis(300))
+            .err()
+            .unwrap();
         let client = idle_launch_client(&config, &run_b);
         for text in [
             format!("{error:#}"),
@@ -2315,10 +2326,10 @@ mod tests {
     fn only_a_missing_or_renamed_socket_orphans_the_agent() {
         let dir = short_dir();
         let run = dir.path().join("run");
-        make_private(&run);
-        let socket = run.join("agent.sock");
+        let socket = sock(&run);
+        make_private(socket.parent().unwrap());
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let record = dir.path().join("agent.socket");
+        let record = CredPaths::in_dir(dir.path()).agent_socket;
         let write_record = |path: &Path| {
             use std::os::unix::ffi::OsStrExt;
             crate::memory::crypto::write_private(&record, path.as_os_str().as_bytes()).unwrap();
@@ -2362,18 +2373,18 @@ mod tests {
         assert!(relative.is_relative() && relative.is_dir());
         assert_eq!(
             socket_path_in(&config, Some(relative.into_os_string())),
-            config.join("agent.sock")
+            CredPaths::in_dir(&config).agent_sock(None)
         );
         assert_eq!(
             socket_path_in(&config, Some(private.clone().into_os_string())),
-            private.join("atem").join("agent.sock")
+            sock(&private)
         );
     }
 
     /// `start_agent`, plus a receiver that fires once serving stops.
     fn start_stoppable_agent(dir: &Path) -> (PathBuf, std::sync::mpsc::Receiver<()>) {
-        let socket = dir.join("run").join("agent.sock");
-        let paths = KeyPaths::in_dir(dir);
+        let socket = sock(&dir.join("run"));
+        let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
         let (done, stopped) = std::sync::mpsc::channel();
         let path = socket.clone();
@@ -2384,7 +2395,7 @@ mod tests {
                 .unwrap();
             runtime.block_on(async move {
                 let listener = bind(&path).unwrap();
-                let agent = Arc::new(Mutex::new(KeyAgent::new(paths).unwrap()));
+                let agent = Arc::new(Mutex::new(CredAgent::new(paths).unwrap()));
                 ready.send(()).unwrap();
                 let _ = serve(listener, agent, own_uid()).await;
                 let _ = done.send(());
@@ -2397,7 +2408,7 @@ mod tests {
     /// An agent of an older build: answers `status` with `status` (a JSON
     /// reply) and every other request with `other`, and never exits.
     fn start_scripted_agent(dir: &Path, status: &'static str, other: &'static str) -> PathBuf {
-        let socket = dir.join("run").join("agent.sock");
+        let socket = sock(&dir.join("run"));
         make_private(socket.parent().unwrap());
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::thread::spawn(move || {
@@ -2435,7 +2446,7 @@ mod tests {
         let (socket, stopped) = start_stoppable_agent(dir.path());
         // A client that keeps its connection open doesn't hold the agent up.
         let idle = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-        let client = KeyAgentClient::at(socket.clone());
+        let client = CredAgentClient::at(socket.clone());
         assert!(client.lock_and_stop().unwrap(), "the agent stopped");
         assert!(!socket.exists(), "its socket is gone");
         assert!(!client.is_running());
@@ -2449,7 +2460,7 @@ mod tests {
     fn lock_stops_a_watched_agent_and_removes_its_record() {
         let dir = short_dir();
         let (socket, paths, agent, stopped) = watched_agent(dir.path());
-        let client = KeyAgentClient::at(socket.clone());
+        let client = CredAgentClient::at(socket.clone());
         assert!(client.lock_and_stop().unwrap());
         stopped
             .recv_timeout(Duration::from_secs(3))
@@ -2464,7 +2475,7 @@ mod tests {
         use crate::memory::unlock::lock_keys_message;
         let dir = short_dir();
         let socket = start_scripted_agent(dir.path(), OLD_LOCKED, OLD_DONE);
-        let client = KeyAgentClient::at(socket);
+        let client = CredAgentClient::at(socket);
         assert!(!client.lock_and_stop().unwrap(), "an older agent stays");
         let message = lock_keys_message(Some(&client)).unwrap();
         assert!(message.starts_with("Locked"), "{message}");
@@ -2474,7 +2485,7 @@ mod tests {
 
     #[test]
     fn the_status_reply_carries_the_build_and_none_means_older() {
-        use crate::memory::key_agent::build_id;
+        use crate::memory::cred_agent::build_id;
         let dir = short_dir();
         let (socket, _stopped) = start_stoppable_agent(dir.path());
         let line = encode_request(&Request::Status).unwrap();
@@ -2485,7 +2496,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(value["reply"]["build"], build_id());
         assert!(build_id().starts_with(env!("CARGO_PKG_VERSION")));
-        let status = KeyAgentClient::at(socket).status().unwrap();
+        let status = CredAgentClient::at(socket).status().unwrap();
         assert!(!status.older_build);
         // An agent from before the field existed.
         assert!(matches!(
@@ -2493,7 +2504,7 @@ mod tests {
             Reply::Status { build: None, .. }
         ));
         let old = short_dir();
-        let status = KeyAgentClient::at(start_scripted_agent(old.path(), OLD_LOCKED, OLD_DONE))
+        let status = CredAgentClient::at(start_scripted_agent(old.path(), OLD_LOCKED, OLD_DONE))
             .status()
             .unwrap();
         assert!(status.older_build);
@@ -2514,7 +2525,7 @@ mod tests {
         let dir = short_dir();
         let (socket, stopped) = start_stoppable_agent(dir.path());
         let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let client = KeyAgentClient::with_launcher(
+        let client = CredAgentClient::with_launcher(
             socket.clone(),
             relaunching(dir.path(), launches.clone()),
         )
@@ -2534,7 +2545,7 @@ mod tests {
         let socket = start_scripted_agent(dir.path(), OLD_LOCKED, OLD_DONE);
         let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client =
-            KeyAgentClient::with_launcher(socket, relaunching(dir.path(), launches.clone()))
+            CredAgentClient::with_launcher(socket, relaunching(dir.path(), launches.clone()))
                 .checking_build("0.0.0+another-build");
         let error = format!("{:#}", client.status().err().unwrap());
         assert!(error.contains("older atem build"), "{error}");
@@ -2548,16 +2559,26 @@ mod tests {
         let (socket, _paths, agent, stopped) = watched_agent(dir.path());
         let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client =
-            KeyAgentClient::with_launcher(socket, relaunching(dir.path(), launches.clone()))
+            CredAgentClient::with_launcher(socket, relaunching(dir.path(), launches.clone()))
                 .checking_build("0.0.0+another-build");
         assert!(client.status().unwrap().unlocked, "the old agent answered");
         assert_eq!(
             client.older_build_warning().as_deref(),
-            Some(crate::memory::key_agent::OLDER_BUILD)
+            Some(crate::memory::cred_agent::OLDER_BUILD)
         );
         assert_eq!(
-            crate::memory::key_agent::OLDER_BUILD,
-            "The key agent was started by another atem build; run `atem cred lock`, then `atem cred unlock` to use this one."
+            crate::memory::cred_agent::OLDER_BUILD,
+            "The cred agent was started by another atem build; run `atem cred lock`, then `atem cred unlock` to use this one."
+        );
+        // When Atem's runtime (which starts the agent for an unlock) is
+        // another build too, unlocking again alone wouldn't help.
+        assert_eq!(
+            crate::memory::cred_agent::older_build_warning(true),
+            "The cred agent was started by another atem build, and Atem's runtime is another build too; run `atem runtime restart`, then `atem cred lock` and `atem cred unlock` to use this one."
+        );
+        assert_eq!(
+            crate::memory::cred_agent::older_build_warning(false),
+            crate::memory::cred_agent::OLDER_BUILD
         );
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
@@ -2573,9 +2594,9 @@ mod tests {
         let socket = start_scripted_agent(
             dir.path(),
             OLD_LOCKED,
-            r#"{"v":2,"ok":false,"error":"key agent request is malformed: unknown variant `credential_projects`, expected one of `status`, `lock`"}"#,
+            r#"{"v":2,"ok":false,"error":"cred agent request is malformed: unknown variant `credential_projects`, expected one of `status`, `lock`"}"#,
         );
-        let client = KeyAgentClient::at(socket);
+        let client = CredAgentClient::at(socket);
         let error = format!(
             "{:#}",
             client

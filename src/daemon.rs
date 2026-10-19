@@ -1,4 +1,4 @@
-//! Plumbing shared by Atem's detached daemons (the key agent, the runtime):
+//! Plumbing shared by Atem's detached daemons (the cred agent, the runtime):
 //! per-user socket directories, peer checks, pid-bearing lock files, socket
 //! binding and detached spawning. Same-user only; nothing here knows a
 //! protocol.
@@ -470,7 +470,7 @@ pub fn remove_socket(files: &DaemonFiles) {
 }
 
 /// Writes `bytes` to `path` through a private temporary file and a rename.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -624,11 +624,11 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        assert!(!confirmed_atem_pid(child.id(), "key-agent"));
-        assert!(!confirmed_atem_pid(0, "key-agent"));
+        assert!(!confirmed_atem_pid(child.id(), "cred-agent"));
+        assert!(!confirmed_atem_pid(0, "cred-agent"));
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!confirmed_atem_pid(child.id(), "key-agent"));
+        assert!(!confirmed_atem_pid(child.id(), "cred-agent"));
     }
 
     #[tokio::test]

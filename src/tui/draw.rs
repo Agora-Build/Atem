@@ -499,6 +499,7 @@ mod paired_status_tests {
                 rows,
                 cols,
                 generation: "g".into(),
+                worker_build: None,
             },
             restore: String::new(),
             offset: 0,

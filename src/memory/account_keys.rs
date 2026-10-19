@@ -1,4 +1,4 @@
-//! The account keys `K` (current and previous, per account) as the key agent
+//! The account keys `K` (current and previous, per account) as the cred agent
 //! holds them, and the field operations it performs for callers that never
 //! see `K`: `e1.` seals and opens, `h1.` keyed hashes. Formats and associated
 //! data are exactly those of build steps 0–2a, so ciphertext on the relay
@@ -401,7 +401,7 @@ impl CryptOut {
         match self {
             Self::Sealed(value) | Self::Hashed(value) => Ok(value),
             Self::Opened(_) => {
-                bail!("the key agent answered an open where a seal or hash was asked")
+                bail!("the cred agent answered an open where a seal or hash was asked")
             }
         }
     }
@@ -409,7 +409,7 @@ impl CryptOut {
     pub fn into_plain(self) -> Result<Zeroizing<Vec<u8>>> {
         match self {
             Self::Opened(encoded) => decode_bytes(&encoded, "an opened field"),
-            _ => bail!("the key agent answered a seal or hash where an open was asked"),
+            _ => bail!("the cred agent answered a seal or hash where an open was asked"),
         }
     }
 }

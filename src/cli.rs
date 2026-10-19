@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "atem")]
-#[command(version)]
+#[command(disable_version_flag = true)]
 #[command(about = "A terminal that connects builders, Agora platform, and AI agents.")]
 #[command(long_about = "A terminal that connects builders, Agora platform, and AI agents.
 
@@ -13,6 +13,9 @@ Disclaimer: This is an unofficial community tool that contains some experimental
 functions, provided AS-IS, with no SLA or guarantees. Contributions welcome.
 For official products and support, visit https://www.agora.io/")]
 pub struct Cli {
+    /// Print the version, and those of Atem's background processes while they run
+    #[arg(short = 'V', long = "version")]
+    pub version: bool,
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -96,12 +99,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: CredCommands,
     },
-    /// Runs the key agent (started automatically when keys are needed)
+    /// Runs the cred agent (started automatically when keys are needed)
     #[command(hide = true)]
-    KeyAgent,
-    /// Runs the agent runtime (started automatically by `atem agent`)
-    #[command(hide = true)]
-    Runtime,
+    CredAgent,
+    /// Atem's background runtime (agent sessions, the Astation link): `atem runtime restart`
+    Runtime {
+        #[command(subcommand)]
+        command: Option<RuntimeCommands>,
+    },
     /// Runs one agent session for the runtime (started by it; outlives it)
     #[command(hide = true)]
     Worker {
@@ -429,12 +434,18 @@ pub enum PairCommands {
 }
 
 #[derive(clap::Subcommand, Debug)]
+pub enum RuntimeCommands {
+    /// Restart the runtime as this build; sessions keep running
+    Restart,
+}
+
+#[derive(clap::Subcommand, Debug)]
 pub enum CredCommands {
     /// Send known Git projects to Astation's credential picker (keys must be unlocked)
     Projects,
     /// Unlock this device's keys (approve with Touch ID on your Mac)
     Unlock,
-    /// Wipe the unlocked keys from memory and stop the key agent
+    /// Wipe the unlocked keys from memory and stop the cred agent
     Lock,
 }
 
@@ -925,7 +936,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         Commands::Status => {
             let src = crate::status::Sources::current()?;
-            print!("{}", crate::memory::key_agent::blocking(move || Ok(crate::status::text(&src))).await?);
+            print!("{}", crate::memory::cred_agent::blocking(move || Ok(crate::status::text(&src))).await?);
             Ok(())
         }
         Commands::Pair { save, command: None } => run_pair(&crate::status::Sources::current()?, save).await,
@@ -951,8 +962,8 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             }
             let notices = {
                 let src = src.clone();
-                crate::memory::key_agent::blocking(move || {
-                    let agent = crate::memory::key_agent::running_agent();
+                crate::memory::cred_agent::blocking(move || {
+                    let agent = crate::memory::cred_agent::running_agent();
                     unpair_profile(&src, agent.as_deref())
                 })
                 .await?
@@ -1081,19 +1092,24 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Memory { command } => crate::memory::cmd::handle_memory(command).await,
         Commands::Skill { command } => crate::memory::cmd::handle_skill(command).await,
         Commands::Cred { command } => crate::memory::unlock::handle_cred(command).await,
-        Commands::KeyAgent => {
+        Commands::CredAgent => {
             #[cfg(unix)]
             {
-                crate::memory::agent_socket::run_key_agent().await
+                crate::memory::agent_socket::run_cred_agent().await
             }
             #[cfg(not(unix))]
             {
-                anyhow::bail!("the key agent needs a Unix system")
+                anyhow::bail!("the cred agent needs a Unix system")
             }
         }
-        Commands::Runtime => {
+        // Bare `atem runtime` is the runtime itself (started detached by the
+        // commands that need it).
+        Commands::Runtime { command: None } => {
             crate::runtime::run_runtime(crate::config::AtemConfig::config_dir()).await
         }
+        Commands::Runtime {
+            command: Some(RuntimeCommands::Restart),
+        } => crate::runtime::client::restart().await,
         Commands::Worker { state, session } => crate::runtime::worker::run_worker(state, session).await,
     }
 }
@@ -1221,14 +1237,14 @@ fn revocation_recorded(src: &crate::status::Sources) -> bool {
 /// pairing can't apply anything, even if what follows is interrupted), then
 /// removes the paired credential entries and the saved Astation sessions (the
 /// login, memory, vault data, trust pins and keys stay), and, when an
-/// Astation revoked this device and `agent` (the running key agent, if any)
+/// Astation revoked this device and `agent` (the running cred agent, if any)
 /// doesn't hold its keys unlocked, sets the revoked keys aside so the next
 /// `atem pair` verifies with new ones. Returns the notices to print: keys set
 /// aside, a revocation left recorded, or a failure to set them aside (the
 /// pairing is removed regardless). Blocking.
 fn unpair_profile(
     src: &crate::status::Sources,
-    agent: Option<&dyn crate::memory::key_agent::KeyAgentApi>,
+    agent: Option<&dyn crate::memory::cred_agent::CredAgentApi>,
 ) -> Result<Vec<String>> {
     crate::pairing_binding::commit_unpair(src)?;
     let mut store = crate::credentials::CredentialStore::load_from(&src.credentials);
@@ -1257,7 +1273,7 @@ fn unpair_profile(
         let why = if trust.recorded_home() != Some(revoked.astation_id.as_str()) {
             "it isn't this device's home Astation"
         } else {
-            "the key agent holds them unlocked; run `atem cred lock`, then `atem unpair` again"
+            "the cred agent holds them unlocked; run `atem cred lock`, then `atem unpair` again"
         };
         notices.push(format!(
             "Astation {}'s revocation of this device is still recorded and its keys were not set aside ({why}).",
@@ -1285,7 +1301,7 @@ async fn run_pair_with<F: std::future::Future<Output = Result<()>>>(
 ) -> Result<()> {
     let already = {
         let src = src.clone();
-        crate::memory::key_agent::blocking(move || Ok(crate::status::already_paired(&src))).await?
+        crate::memory::cred_agent::blocking(move || Ok(crate::status::already_paired(&src))).await?
     };
     if let Some(text) = already {
         print!("{text}");
@@ -2005,21 +2021,33 @@ mod tests {
     }
 
     #[test]
-    fn key_agent_is_a_hidden_subcommand() {
+    fn cred_agent_is_a_hidden_subcommand() {
         use clap::CommandFactory;
-        let cli = Cli::try_parse_from(["atem", "key-agent"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::KeyAgent)));
+        let cli = Cli::try_parse_from(["atem", "cred-agent"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::CredAgent)));
         let help = Cli::command().render_help().to_string();
-        assert!(!help.contains("key-agent"), "{help}");
+        assert!(!help.contains("cred-agent"), "{help}");
     }
 
     #[test]
-    fn runtime_is_a_hidden_subcommand() {
+    fn runtime_runs_bare_and_restarts_visibly() {
         use clap::CommandFactory;
         let cli = Cli::try_parse_from(["atem", "runtime"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Runtime)));
+        assert!(matches!(cli.command, Some(Commands::Runtime { command: None })));
+        let cli = Cli::try_parse_from(["atem", "runtime", "restart"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime { command: Some(RuntimeCommands::Restart) })
+        ));
         let help = Cli::command().render_help().to_string();
-        assert!(!help.contains("runtime"), "{help}");
+        assert!(help.contains("runtime restart"), "{help}");
+        let mut command = Cli::command();
+        let runtime = command.find_subcommand_mut("runtime").unwrap();
+        let help = runtime.render_help().to_string();
+        assert!(
+            help.contains("Restart the runtime as this build; sessions keep running"),
+            "{help}"
+        );
     }
 
     #[test]
@@ -2181,7 +2209,7 @@ mod tests {
         store.save_to(&path).unwrap();
     }
 
-    /// cred_state.json: verified with astation-1, revoked by it when `revoked`.
+    /// cred/state.json: verified with astation-1, revoked by it when `revoked`.
     fn trust_file(dir: &std::path::Path, revoked: bool) {
         let pin = crate::memory::trust::AstationTrust {
             device_id: "device".into(),
@@ -2207,19 +2235,22 @@ mod tests {
         if revoked {
             store["revoked"] = serde_json::json!({"astation_id": "astation-1", "at": 1_700_000_000u64});
         }
-        std::fs::write(dir.join("cred_state.json"), store.to_string()).unwrap();
-        std::fs::write(dir.join("device_keys.sealed"), b"{}").unwrap();
+        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir).trust, store.to_string());
+        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir).device_keys_sealed, b"{}");
     }
 
+    /// Every file under `dir` (recursively) with its contents.
     fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        let mut files: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| {
-                let path = entry.unwrap().path();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(self::tests::files(&path));
+            } else {
                 let contents = std::fs::read(&path).unwrap();
-                (path, contents)
-            })
-            .collect();
+                files.push((path, contents));
+            }
+        }
         files.sort();
         files
     }
@@ -2341,7 +2372,7 @@ mod tests {
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("old keys were moved aside"), "{notices:?}");
-        assert!(!dir.path().join("device_keys.sealed").exists());
+        assert!(!crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_sealed.exists());
         let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust).unwrap();
         assert!(trust.revoked().is_none());
         assert!(trust.verified("astation-1").is_none());
@@ -2361,7 +2392,7 @@ mod tests {
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("Astation astation-9's revocation of this device is still recorded"), "{notices:?}");
-        assert!(dir.path().join("device_keys.sealed").exists());
+        assert!(crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_sealed.exists());
         assert_eq!(crate::status::pairing(&src), None);
     }
 
@@ -2369,7 +2400,7 @@ mod tests {
     fn unpair_still_unpairs_when_the_keys_cant_be_set_aside() {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
-        std::fs::write(dir.path().join("cred_state.json"), b"not json").unwrap();
+        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir.path()).trust, b"not json");
         let src = crate::status::Sources::in_dir(dir.path());
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -2403,13 +2434,14 @@ mod tests {
         paired_profile(dir.path());
         trust_file(dir.path(), false);
         std::fs::write(dir.path().join("knowledge.db"), b"memories").unwrap();
-        std::fs::write(dir.path().join("project_names.json"), b"{}").unwrap();
+        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir.path()).project_names, b"{}");
         let src = crate::status::Sources::in_dir(dir.path());
-        let kept = ["cred_state.json", "device_keys.sealed", "knowledge.db", "project_names.json"]
-            .map(|name| (name, std::fs::read(dir.path().join(name)).unwrap()));
+        let cred = crate::memory::verification::CredPaths::in_dir(dir.path());
+        let kept = [cred.trust, cred.device_keys_sealed, dir.path().join("knowledge.db"), cred.project_names]
+            .map(|path| { let contents = std::fs::read(&path).unwrap(); (path, contents) });
         assert!(unpair_profile(&src, None).unwrap().is_empty());
-        for (name, contents) in kept {
-            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), contents, "{name}");
+        for (path, contents) in kept {
+            assert_eq!(std::fs::read(&path).unwrap(), contents, "{}", path.display());
         }
         // The migrated pairing was generation 1.
         assert_eq!(crate::pairing_binding::load(&src).unwrap().host_trust_gen, 2);

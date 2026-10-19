@@ -1079,6 +1079,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            worker_build: None,
         };
         app.runtime_sessions = vec![
             session("ses-aaaaaaaaaaaa", "running"),

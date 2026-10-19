@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::memory::key_agent::{KeyAgentApi, Reply, Request};
+use crate::memory::cred_agent::{CredAgentApi, Reply, Request};
 use crate::memory::trust::{TrustLock, TrustStore};
 use crate::status::Sources;
 
@@ -337,23 +337,23 @@ impl Captured {
     }
 }
 
-/// A key agent whose every request runs only while the pairing it was
+/// A cred agent whose every request runs only while the pairing it was
 /// captured under is current (under the lock, so `atem unpair` waits for a
 /// request in flight and every later one is refused).
 pub struct BoundAgent {
     captured: Captured,
-    inner: Arc<dyn KeyAgentApi>,
+    inner: Arc<dyn CredAgentApi>,
 }
 
 impl BoundAgent {
     /// Needs a bound capture.
-    pub fn new(captured: Captured, inner: Arc<dyn KeyAgentApi>) -> Result<Self> {
+    pub fn new(captured: Captured, inner: Arc<dyn CredAgentApi>) -> Result<Self> {
         captured.bound()?;
         Ok(Self { captured, inner })
     }
 }
 
-impl KeyAgentApi for BoundAgent {
+impl CredAgentApi for BoundAgent {
     fn call(&self, request: Request) -> Result<Reply> {
         self.captured.apply(|| self.inner.call(request))
     }
@@ -500,9 +500,9 @@ pub(crate) mod tests {
     /// Fails every request it gets.
     struct NeverCalled;
 
-    impl KeyAgentApi for NeverCalled {
+    impl CredAgentApi for NeverCalled {
         fn call(&self, _: Request) -> Result<Reply> {
-            panic!("the key agent was called for a stale pairing")
+            panic!("the cred agent was called for a stale pairing")
         }
     }
 

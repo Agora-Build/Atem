@@ -1,11 +1,11 @@
 //! Astation operations in the broker, in process: a real `serve` (workers in
 //! this process, fake agents) whose App links to a fake Astation WebSocket
 //! peer, and a client that runs `astation_op` like the CLI does. The profile
-//! and the key agent are temp ones (`OpEnv`).
+//! and the cred agent are temp ones (`OpEnv`).
 use crate::app::App;
-use crate::memory::key_agent::{KeyAgentApi, test_agent};
+use crate::memory::cred_agent::{CredAgentApi, test_agent};
 use crate::memory::statements::{AccountState, DeviceVerified, FakeAstation, SignedWire};
-use crate::memory::verification::{KeyPaths, transcript_for};
+use crate::memory::verification::{CredPaths, transcript_for};
 use crate::runtime::broker::{InProcess, Launcher};
 use crate::runtime::client::RuntimeClient;
 use crate::runtime::ops::{BUSY, OpEnv};
@@ -359,17 +359,17 @@ struct Runtime {
     socket: PathBuf,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
-    /// The profile and key agent stand in for the user's on this thread.
+    /// The profile and cred agent stand in for the user's on this thread.
     _scopes: (crate::test_profile::Scope, crate::test_profile::Scope),
 }
 
 impl Runtime {
     /// The App linked to `peer_url` (already authenticated with `ASTATION`)
-    /// when given; else unlinked. `agent`: the key agent of the profile.
+    /// when given; else unlinked. `agent`: the cred agent of the profile.
     async fn start(
         dir: Rc<tempfile::TempDir>,
         peer_url: Option<&str>,
-        agent: Arc<dyn KeyAgentApi>,
+        agent: Arc<dyn CredAgentApi>,
     ) -> Self {
         let root = dir.path();
         let profile = root.join("profile");
@@ -421,8 +421,8 @@ impl Runtime {
         }
     }
 
-    fn keys(&self) -> KeyPaths {
-        KeyPaths::in_dir(&self.profile)
+    fn keys(&self) -> CredPaths {
+        CredPaths::in_dir(&self.profile)
     }
 
     async fn client(&self) -> RuntimeClient {
@@ -612,7 +612,7 @@ impl Op {
 }
 
 /// Verification of the profile with `ASTATION` as `account`.
-fn verified_as(keys: &KeyPaths, account: &str) -> bool {
+fn verified_as(keys: &CredPaths, account: &str) -> bool {
     crate::memory::trust::TrustStore::load_from(&keys.trust)
         .ok()
         .and_then(|trust| trust.verified(ASTATION).map(|e| e.data_account == account))
@@ -620,7 +620,7 @@ fn verified_as(keys: &KeyPaths, account: &str) -> bool {
 }
 
 /// A pending pin (a verification under way) is on disk.
-fn pending(keys: &KeyPaths) -> bool {
+fn pending(keys: &CredPaths) -> bool {
     std::fs::read_to_string(&keys.trust)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -657,7 +657,7 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut frontend = rt.client().await;
         let session = rt.attached_session(&mut frontend).await;
@@ -710,7 +710,7 @@ fn a_cli_gone_mid_verification_aborts_it_and_a_late_certificate_is_dropped() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let (mut op, question, certificate) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
@@ -738,7 +738,7 @@ fn a_lost_link_fails_the_verification_without_replay() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut frontend = rt.client().await;
         let session = rt.attached_session(&mut frontend).await;
@@ -777,7 +777,7 @@ fn a_second_operation_is_refused_while_one_runs() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
         for kind in [OpKind::CredUnlock, OpKind::Pair, OpKind::PairVerify] {
@@ -800,7 +800,7 @@ fn a_reply_without_an_operation_is_dropped() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let verifier = FakeAstation::new();
         peer.send(&AstationMessage::DeviceVerified {
@@ -829,7 +829,7 @@ fn cred_unlock_runs_on_the_runtimes_link_while_sessions_stay_attached() {
         let profile = dir.path().join("profile");
         paired(&profile);
         let (keys, mut server, _) = sealed_device(&profile, "0a1b2c3d");
-        let agent: Arc<dyn KeyAgentApi> = Arc::new(test_agent(&keys));
+        let agent: Arc<dyn CredAgentApi> = Arc::new(test_agent(&keys));
         let (url, mut peer) = Peer::listen().await;
         let rt = Runtime::start(dir, Some(&url), agent.clone()).await;
         let mut frontend = rt.client().await;
@@ -897,7 +897,7 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
             ),
         )
         .unwrap();
-        let keys = KeyPaths::in_dir(&profile);
+        let keys = CredPaths::in_dir(&profile);
         let rt = Runtime::start(dir, None, Arc::new(test_agent(&keys))).await;
         let mut op = Op::start(rt.client().await, OpKind::Pair, OpOptions::default()).await;
 
@@ -999,7 +999,7 @@ fn the_token_op_saves_the_credentials_astation_sends() {
         ));
         store.save_to(&creds).unwrap();
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&profile);
+        let keys = CredPaths::in_dir(&profile);
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         assert!(!crate::runtime::ops::paired_fresh(&creds, ASTATION));
         let options = OpOptions {
@@ -1125,7 +1125,7 @@ fn the_cli_side_renders_answers_and_ends_with_done() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let client = rt.client().await;
         let mut script = Script {
@@ -1334,5 +1334,52 @@ fn credentials_astation_sends_go_to_the_links_profile() {
             !elsewhere.join("credentials.enc").exists(),
             "only the link's profile"
         );
+    });
+}
+
+/// A runtime of another build is never replaced while an Astation
+/// operation runs: `restart` is refused and the client keeps it, saying why.
+#[test]
+fn the_runtime_is_not_replaced_while_an_operation_runs() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir.clone(), Some(&url), Arc::new(test_agent(&keys))).await;
+        let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let mut other = rt.client().await;
+        other.send(&ClientMsg::Restart).await.unwrap();
+        let refused = expect(&mut other, |m| match m {
+            RuntimeMsg::Error { text, op } if op.as_deref() == Some("restart") => Some(text),
+            _ => None,
+        })
+        .await;
+        assert!(
+            refused.starts_with(crate::runtime::client::OP_RUNNING),
+            "{refused}"
+        );
+        // The client's replacement keeps it and says why.
+        let locator = crate::runtime::client::Locator::in_dir(dir.path());
+        let start = || anyhow::bail!("never started while the runtime runs");
+        let mut notes = Vec::new();
+        let client = crate::runtime::client::replace_other_build(
+            rt.client().await,
+            &locator,
+            "0.0.0+another-build",
+            &start,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.welcome.pid, std::process::id());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Astation operation"), "{notes:?}");
+        assert!(!locator.replaced.exists(), "no replacement recorded");
+        // The operation goes on.
+        op.answer(question, AnswerValue::No).await;
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        rt.shutdown().await;
     });
 }

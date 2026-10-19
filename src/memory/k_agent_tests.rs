@@ -1,4 +1,4 @@
-//! The key agent holding `K` (build step 2b): installed from signed grants,
+//! The cred agent holding `K` (build step 2b): installed from signed grants,
 //! kept sealed, used only through `Crypt`, retired by signed states.
 use base64::{Engine, engine::general_purpose::STANDARD};
 
@@ -10,7 +10,7 @@ use crate::memory::fake_astation::{
     sealed_account_keys, sealed_device, set_state, set_state_as, unlock_with,
 };
 use crate::memory::grant::seal_k_grant;
-use crate::memory::key_agent::{KeyAgentApi, build_unlock_request, error_of, holds_k, test_agent};
+use crate::memory::cred_agent::{CredAgentApi, build_unlock_request, error_of, holds_k, test_agent};
 use crate::memory::statements::FakeAstation;
 use crate::memory::storage_key::{SealedDeviceKeys, new_storage_key};
 use crate::memory::trust::TrustStore;
@@ -20,7 +20,7 @@ use crate::memory::device_keys::DeviceKeys;
 use crate::memory::fake_astation::{FakeKeyServer, pin};
 use crate::memory::legacy_keys::{Damage, damage_for_test, write_for_test};
 use crate::memory::project_names::ProjectNames;
-use crate::memory::verification::KeyPaths;
+use crate::memory::verification::CredPaths;
 
 const A: &str = "0123abcd";
 const B: &str = "89abcdef";
@@ -630,7 +630,7 @@ fn a_prune_error_before_anything_changed_is_logged_once() {
     assert_eq!(
         logged(&device),
         1,
-        "an unreadable cred_state.json is logged once"
+        "an unreadable cred/state.json is logged once"
     );
     std::fs::write(&device.paths.trust, trust).unwrap();
     assert_eq!(
@@ -644,7 +644,7 @@ const OLD: &str = "11112222";
 
 /// A step-2a data_keys.enc for the fake device: K = [42; 32] (kid A) with
 /// the older [1; 32] (kid OLD), and one project name.
-fn legacy(paths: &KeyPaths, account: &str) {
+fn legacy(paths: &CredPaths, account: &str) {
     write_for_test(
         &paths.data_keys,
         ASTATION_ID,
@@ -668,17 +668,13 @@ fn sealed_under_old() -> String {
     .unwrap()
 }
 
-/// `data_keys.enc.corrupt-*` files beside `paths.data_keys`.
-fn moved_aside(paths: &KeyPaths) -> Vec<std::path::PathBuf> {
+/// `<data_keys>.corrupt-*` files beside `paths.data_keys`.
+fn moved_aside(paths: &CredPaths) -> Vec<std::path::PathBuf> {
+    let prefix = format!("{}.corrupt-", paths.data_keys.file_name().unwrap().to_string_lossy());
     std::fs::read_dir(paths.data_keys.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("data_keys.enc.corrupt-")
-        })
+        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with(&prefix))
         .collect()
 }
 
@@ -797,7 +793,7 @@ fn only_verified_accounts_move() {
 fn an_unreadable_data_keys_enc_is_moved_aside_at_unlock() {
     let dir = tempfile::tempdir().unwrap();
     let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
-    std::fs::write(&paths.data_keys, b"from another machine").unwrap();
+    crate::memory::verification::write_test_file(&paths.data_keys, b"from another machine");
     let agent = test_agent(&paths);
     assert!(paths.data_keys.exists(), "a locked agent leaves it");
     unlock_with(&agent, &server, &paths).unwrap();
@@ -810,7 +806,7 @@ fn an_unreadable_data_keys_enc_is_moved_aside_at_unlock() {
 #[test]
 fn an_unverified_device_deletes_data_keys_enc_and_a_locked_one_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
-    let paths = KeyPaths::in_dir(dir.path());
+    let paths = CredPaths::in_dir(dir.path());
     legacy(&paths, ACCOUNT);
     let _agent = test_agent(&paths);
     assert!(
@@ -821,8 +817,8 @@ fn an_unverified_device_deletes_data_keys_enc_and_a_locked_one_keeps_it() {
 
     // An unreadable one is moved aside, even there.
     let dir = tempfile::tempdir().unwrap();
-    let paths = KeyPaths::in_dir(dir.path());
-    std::fs::write(&paths.data_keys, b"from another machine").unwrap();
+    let paths = CredPaths::in_dir(dir.path());
+    crate::memory::verification::write_test_file(&paths.data_keys, b"from another machine");
     let _agent = test_agent(&paths);
     assert!(!paths.data_keys.exists());
     assert_eq!(moved_aside(&paths).len(), 1);
@@ -891,7 +887,7 @@ fn unlocked_via_the_previous_file_data_keys_enc_stays() {
 #[test]
 fn before_its_first_escrow_a_device_keeps_data_keys_enc() {
     let dir = tempfile::tempdir().unwrap();
-    let paths = KeyPaths::in_dir(dir.path());
+    let paths = CredPaths::in_dir(dir.path());
     let keys = DeviceKeys::generate();
     keys.save_to(&paths.device_keys).unwrap();
     let astation = FakeAstation::new();
@@ -1070,14 +1066,14 @@ fn server_grant(
 }
 
 #[test]
-fn a_verified_device_with_a_corrupt_cred_state_keeps_data_keys_enc_at_start() {
+fn a_verified_device_with_a_corrupt_trust_state_keeps_data_keys_enc_at_start() {
     let dir = tempfile::tempdir().unwrap();
     let (paths, _, _) = sealed_device(dir.path(), "0a1b2c3d");
     legacy(&paths, ACCOUNT);
     let before = std::fs::read(&paths.data_keys).unwrap();
-    // cred_state.json can't be read: the agent can't tell the device is
+    // cred/state.json can't be read: the agent can't tell the device is
     // verified, so it must not take it for an unverified one.
-    std::fs::write(&paths.trust, b"not json").unwrap();
+    crate::memory::verification::write_test_file(&paths.trust, b"not json");
     let _agent = test_agent(&paths);
     assert_eq!(std::fs::read(&paths.data_keys).unwrap(), before);
     assert!(moved_aside(&paths).is_empty());

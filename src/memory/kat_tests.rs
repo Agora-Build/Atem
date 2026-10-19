@@ -480,7 +480,7 @@ fn atem_opens_the_fixed_unlock_grant() {
         encapped_key: STANDARD.encode(unhex(UNLOCK_ENCAPPED_KEY)),
         ciphertext: STANDARD.encode(unhex(UNLOCK_CIPHERTEXT)),
     };
-    // The key agent's checks and open, with the fixed single-use key.
+    // The cred agent's checks and open, with the fixed single-use key.
     let checked = check_unlock_grant(&verified_trust(), &unhex(UNLOCK_REQUEST), &wire).unwrap();
     assert_eq!(checked.grant.storage_kid, OLD_STORAGE_KID);
     let info = unlock_info(

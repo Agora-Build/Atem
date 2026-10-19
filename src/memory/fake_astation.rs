@@ -8,11 +8,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::memory::account_keys::AccountKeys;
+use crate::memory::cred_agent::{CredAgent, CredAgentApi, build_unlock_request, test_agent};
 use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
 use crate::memory::encoding::dec;
 use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, seal_k_grant};
-use crate::memory::key_agent::{KeyAgent, KeyAgentApi, build_unlock_request, test_agent};
 use crate::memory::statements::{
     AccountState, DeviceVerified, FakeAstation, SignedWire, StorageAbandon, StorageAck,
     StorageConfirm, StorageRotate, UnlockGrant, UnlockRequest, sealed_hash, storage_key_info,
@@ -22,7 +22,7 @@ use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, UnlockGrantWire, new_storage_key,
 };
 use crate::memory::trust::TrustStore;
-use crate::memory::verification::{AstationKeys, KeyPaths};
+use crate::memory::verification::{AstationKeys, CredPaths};
 
 pub(crate) const ASTATION_ID: &str = "astation-1";
 pub(crate) const ACCOUNT: &str = "acct";
@@ -30,13 +30,13 @@ pub(crate) const DEVICE_ID: &str = "dev-1";
 
 /// Pins `astation` for `keys` in `paths.trust`, as a finished verification
 /// does; `home` also makes it the home Astation.
-pub(crate) fn pin(paths: &KeyPaths, astation: &FakeAstation, keys: &DeviceKeys, home: bool) {
+pub(crate) fn pin(paths: &CredPaths, astation: &FakeAstation, keys: &DeviceKeys, home: bool) {
     pin_as(paths, ASTATION_ID, astation, keys, home);
 }
 
 /// [`pin`] under another Astation id (same account and device).
 pub(crate) fn pin_as(
-    paths: &KeyPaths,
+    paths: &CredPaths,
     astation_id: &str,
     astation: &FakeAstation,
     keys: &DeviceKeys,
@@ -47,7 +47,7 @@ pub(crate) fn pin_as(
 
 /// [`pin_as`] for another data account.
 pub(crate) fn pin_for_account(
-    paths: &KeyPaths,
+    paths: &CredPaths,
     astation_id: &str,
     astation: &FakeAstation,
     keys: &DeviceKeys,
@@ -90,8 +90,8 @@ pub(crate) fn pin_for_account(
 
 /// A verified device in `dir`: home Astation pinned, keys sealed under a
 /// storage key with id `kid` that Astation holds, unlock-auth key on disk.
-pub(crate) fn sealed_device(dir: &Path, kid: &str) -> (KeyPaths, FakeKeyServer, DeviceKeys) {
-    let paths = KeyPaths::in_dir(dir);
+pub(crate) fn sealed_device(dir: &Path, kid: &str) -> (CredPaths, FakeKeyServer, DeviceKeys) {
+    let paths = CredPaths::in_dir(dir);
     let keys = DeviceKeys::generate();
     let astation = FakeAstation::new();
     pin(&paths, &astation, &keys, true);
@@ -429,8 +429,8 @@ impl FakeKeyServer {
 /// and a server speaking for the Astation that was pinned.
 pub(crate) fn migrated_device(
     dir: &Path,
-) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>) {
-    let paths = KeyPaths::in_dir(dir);
+) -> (CredPaths, FakeKeyServer, DeviceKeys, Mutex<CredAgent>) {
+    let paths = CredPaths::in_dir(dir);
     let keys = DeviceKeys::generate();
     keys.save_to(&paths.device_keys).unwrap();
     let astation = FakeAstation::new();
@@ -450,9 +450,9 @@ pub(crate) fn migrated_device(
 
 /// What `atem cred unlock` does with `agent`, against `server`.
 pub(crate) fn unlock_with(
-    agent: &dyn KeyAgentApi,
+    agent: &dyn CredAgentApi,
     server: &FakeKeyServer,
-    paths: &KeyPaths,
+    paths: &CredPaths,
 ) -> Result<String> {
     let challenge = agent.begin_unlock(ASTATION_ID)?;
     let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?
@@ -465,7 +465,7 @@ pub(crate) fn unlock_with(
 /// Signs `mode`/`kid` at `epoch` as `astation` and accepts it into
 /// `paths.trust`, as `apply_account_state` does.
 pub(crate) fn set_state(
-    paths: &KeyPaths,
+    paths: &CredPaths,
     astation: &FakeAstation,
     mode: EncryptionMode,
     kid: Option<&str>,
@@ -476,7 +476,7 @@ pub(crate) fn set_state(
 
 /// [`set_state`] for the Astation pinned as `astation_id`.
 pub(crate) fn set_state_as(
-    paths: &KeyPaths,
+    paths: &CredPaths,
     astation_id: &str,
     astation: &FakeAstation,
     mode: EncryptionMode,
@@ -504,7 +504,7 @@ pub(crate) fn set_state_as(
 /// `server` holds for it (not through an agent).
 pub(crate) fn sealed_account_keys(
     server: &FakeKeyServer,
-    paths: &KeyPaths,
+    paths: &CredPaths,
     path: &Path,
 ) -> AccountKeys {
     let sealed = SealedDeviceKeys::load_from(path).unwrap().unwrap();
@@ -532,10 +532,10 @@ pub(crate) fn sealed_account_keys(
 /// A verified device with its home Astation, unlocked through the
 /// in-process agent (shared, so contexts and clients can hold it).
 pub(crate) struct UnlockedDevice {
-    pub paths: KeyPaths,
+    pub paths: CredPaths,
     pub server: FakeKeyServer,
     pub keys: DeviceKeys,
-    pub agent: Arc<Mutex<KeyAgent>>,
+    pub agent: Arc<Mutex<CredAgent>>,
     epoch: u64,
 }
 

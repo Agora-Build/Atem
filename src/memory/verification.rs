@@ -12,7 +12,7 @@ use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::{DeviceKeys, DevicePublics, PublicKeys, UnlockAuthKey};
 use crate::memory::encoding::{base32_prefix, dec, enc};
 use crate::memory::grant::{GrantWire, open_grant};
-use crate::memory::key_agent::{KeyAgentApi, LOCKED};
+use crate::memory::cred_agent::{CredAgentApi, LOCKED};
 use crate::memory::statements::{AccountState, SignedWire};
 use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, new_storage_key, new_storage_kid,
@@ -112,7 +112,7 @@ pub fn transcript_for(commitment: &[u8; 32], nonce_a: &[u8; 32], nonce_s: &[u8; 
 }
 
 /// The keys a verification reveals: fresh ones (first verification, secrets
-/// in hand), or this device's sealed keys, which only the key agent opens.
+/// in hand), or this device's sealed keys, which only the cred agent opens.
 // One short-lived value per verification: boxing the larger variant buys nothing.
 #[allow(clippy::large_enum_variant)]
 pub enum VerificationKeys {
@@ -192,19 +192,25 @@ impl Handshake {
     }
 }
 
-/// Every file verification and the key agent read or write. Tests point
-/// these at a temp dir.
+/// The cred directory's layout: every file of this device's keys, its trust
+/// state and the cred agent, under `<profile>/cred/` (0700, files 0600).
+/// The only place these names are written down; tests use it too.
 #[derive(Debug, Clone)]
-pub struct KeyPaths {
+pub struct CredPaths {
+    /// `<profile>/cred`.
+    pub dir: PathBuf,
     /// `data_keys.enc` from build steps 0–2a (`K`, project names, under the
-    /// machine-bound key). The key agent moves it into `device_keys_sealed`
+    /// machine-bound key). The cred agent moves it into `device_keys_sealed`
     /// and `project_names` at the first unlock and deletes it.
     pub data_keys: PathBuf,
-    /// `project_names.json`: `h1.` project hash → readable project key.
+    /// `project_names.json`: `h1.` project hash → readable project key
+    /// (its lock: `project_names.lock`).
     pub project_names: PathBuf,
+    /// `state.json`: pinned Astations, the signed account state (its lock:
+    /// `state.lock`).
     pub trust: PathBuf,
     /// The plain file (a step-1 device's, or a fresh device's until its
-    /// first escrow); the key agent seals it into `device_keys_sealed` and
+    /// first escrow); the cred agent seals it into `device_keys_sealed` and
     /// deletes it once Astation is known to hold the storage key.
     pub device_keys: PathBuf,
     pub device_keys_sealed: PathBuf,
@@ -216,32 +222,76 @@ pub struct KeyPaths {
     pub unlock_auth_key: PathBuf,
     /// The plain X25519 key from #36; deleted once a device is verified.
     pub legacy_device_key: PathBuf,
-    /// Held (flock) by the one key agent serving these files, for its life.
+    /// Held (flock, with its pid) by the one cred agent serving these
+    /// files, for its life.
     pub agent_lock: PathBuf,
     /// The socket path that agent listens on, for clients whose runtime
     /// dir differs from the agent's.
     pub agent_socket: PathBuf,
+    /// Output of the detached cred agent.
+    pub agent_log: PathBuf,
 }
 
-impl KeyPaths {
+impl CredPaths {
     pub fn default_paths() -> Self {
         Self::in_dir(&crate::config::AtemConfig::config_dir())
     }
 
-    pub fn in_dir(dir: &Path) -> Self {
+    /// The layout under the profile directory `profile`.
+    pub fn in_dir(profile: &Path) -> Self {
+        let dir = profile.join("cred");
         Self {
             data_keys: dir.join("data_keys.enc"),
             project_names: dir.join("project_names.json"),
-            trust: dir.join("cred_state.json"),
+            trust: dir.join("state.json"),
             device_keys: dir.join("device_keys"),
             device_keys_sealed: dir.join("device_keys.sealed"),
             device_keys_next: dir.join("device_keys.sealed.next"),
             device_keys_prev: dir.join("device_keys.sealed.prev"),
             unlock_auth_key: dir.join("unlock_auth_key"),
             legacy_device_key: dir.join("device_key"),
-            agent_lock: dir.join("key_agent.lock"),
+            agent_lock: dir.join("agent.lock"),
             agent_socket: dir.join("agent.socket"),
+            agent_log: dir.join("agent.log"),
+            dir,
         }
+    }
+
+    /// The agent's socket: `<runtime_dir>/atem/cred-agent.sock` when
+    /// `runtime_dir` is set (the caller checked it is safe), else
+    /// `cred/agent.sock`.
+    pub fn agent_sock(&self, runtime_dir: Option<&Path>) -> PathBuf {
+        match runtime_dir {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join("atem").join("cred-agent.sock"),
+            _ => self.dir.join("agent.sock"),
+        }
+    }
+}
+
+/// The lock beside an agent socket: `<socket>.lock`.
+pub fn socket_lock(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Tests: writes `bytes` to `path`, creating its directory (the cred dir).
+#[cfg(test)]
+pub(crate) fn write_test_file(path: &Path, bytes: impl AsRef<[u8]>) {
+    create_private_dir(path.parent().expect("a file in a directory")).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Creates `dir` (and missing parents) private to this user (0700).
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
     }
 }
 
@@ -253,7 +303,7 @@ pub enum Applied {
     /// A repeated signed pending state resumes a failed or interrupted migration.
     MigrationPending(AccountState),
     KeyInstalled(String),
-    /// A key grant arrived while the key agent is locked. After
+    /// A key grant arrived while the cred agent is locked. After
     /// `atem cred unlock`, atem asks for the key again.
     Locked,
 }
@@ -261,7 +311,7 @@ pub enum Applied {
 /// Applies a signed account state from a verified Astation. Unsigned states,
 /// and any state for a device that isn't verified, are ignored.
 pub fn apply_account_state(
-    paths: &KeyPaths,
+    paths: &CredPaths,
     astation_id: &str,
     signed: Option<&SignedWire>,
 ) -> Result<Applied> {
@@ -324,7 +374,7 @@ pub(crate) fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>
 /// The newest signed state of every account a verified Astation names: the
 /// highest epoch when two name one account (on equal epochs, the state of
 /// the smallest Astation id), `None` while none of them has a signed state.
-/// The one rule for which `K` an account needs, shared by the key agent
+/// The one rule for which `K` an account needs, shared by the cred agent
 /// (which keys it keeps and uses) and `key_needed` (which it asks for);
 /// `effective_state` reads it for one Astation.
 pub(crate) fn newest_states(
@@ -397,11 +447,11 @@ pub fn account_mode(trust_path: &Path, astation_id: &str) -> Result<AccountMode>
     })
 }
 
-/// Installs a signed `K` grant for this verified device. The key agent opens
+/// Installs a signed `K` grant for this verified device. The cred agent opens
 /// it and keeps `K` sealed; nothing returns `K` to this process.
 pub fn apply_grant(
-    paths: &KeyPaths,
-    agent: &dyn KeyAgentApi,
+    paths: &CredPaths,
+    agent: &dyn CredAgentApi,
     astation_id: &str,
     grant: Option<&GrantWire>,
 ) -> Result<Applied> {
@@ -444,18 +494,18 @@ pub struct VerificationOutcome {
 /// and every grant, and that sealed keys are still the ones the unlocked key
 /// agent holds. Fresh keys (a device's first verification) make this
 /// Astation the home: they are sealed under a new storage key and handed to
-/// the key agent before anything is written, so if the agent can't take
+/// the cred agent before anything is written, so if the agent can't take
 /// them nothing is saved. Then the sealed keys (and, for fresh keys, a
 /// plain `device_keys` kept until the first escrow is confirmed), the state,
 /// the pins and the home are written and the legacy plain key deleted. On
-/// any failure before that point nothing is written. Then the key agent
+/// any failure before that point nothing is written. Then the cred agent
 /// installs the grants; a failure there is a warning (`K` is asked for again).
 ///
 /// For fresh keys the outcome carries the storage key for the home Astation
 /// (the first escrow), prepared by the agent once the home is saved.
 pub fn complete_verification(
-    paths: &KeyPaths,
-    agent: &dyn KeyAgentApi,
+    paths: &CredPaths,
+    agent: &dyn CredAgentApi,
     astation_id: &str,
     keys: VerificationKeys,
     device_verified: &SignedWire,
@@ -489,7 +539,7 @@ pub fn complete_verification(
             }
             if staged.home_is_set() && staged.home() != Some(astation_id) {
                 bail!(
-                    "this device's home Astation is {}; verify with it, or set the device up again (move ~/.config/atem/cred_state.json into a backup folder too, then `atem unpair` and `atem pair`)",
+                    "this device's home Astation is {}; verify with it, or set the device up again (move ~/.config/atem/cred into a backup folder, then `atem unpair` and `atem pair`)",
                     staged.recorded_home().unwrap_or_default()
                 );
             }
@@ -500,7 +550,7 @@ pub fn complete_verification(
                 bail!("{LOCKED}, then `atem pair verify`");
             }
             if agent.public_keys()? != (publics.device_pub, publics.device_sign_pub) {
-                bail!("the key agent holds other device keys than this verification revealed");
+                bail!("the cred agent holds other device keys than this verification revealed");
             }
         }
     }
@@ -576,7 +626,7 @@ pub fn complete_verification(
             // Whatever the unauthenticated path stored for this Astation (K,
             // rotation history, project names) is dropped, not trusted, unless
             // another verified Astation names that account. Lock order:
-            // cred_state.json's lock (held) before project_names.lock.
+            // cred/state.json's lock (held) before project_names.lock.
             crate::memory::legacy_keys::purge_unverified_at(&paths.data_keys, astation_id, &state.account, &named_elsewhere)?;
             if !named_elsewhere.contains(&state.account) {
                 crate::memory::project_names::forget_account_at(&paths.project_names, &state.account)?;
@@ -630,7 +680,7 @@ pub fn complete_verification(
         }
         if let Err(error) = agent.install_grant(astation_id, grant) {
             warnings.push(format!(
-                "the encryption key couldn't be stored in the key agent ({error:#}); atem asks Astation for it again"
+                "the encryption key couldn't be stored in the cred agent ({error:#}); atem asks Astation for it again"
             ));
         }
     }
@@ -649,7 +699,7 @@ pub fn complete_verification(
     // Saved: an agent that can't answer means K is asked for, never an error.
     let key_needed = key_needed(paths, agent, astation_id).unwrap_or_else(|error| {
         warnings.push(format!(
-            "couldn't check whether the key agent holds the encryption key ({error:#}); atem asks Astation for it"
+            "couldn't check whether the cred agent holds the encryption key ({error:#}); atem asks Astation for it"
         ));
         true
     });
@@ -670,11 +720,11 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 
 /// Whether this device is verified with `astation_id`, the newest signed
 /// state of its account (from any verified Astation naming it, as the key
-/// agent decides which keys to keep) needs `K`, and the key agent doesn't
+/// agent decides which keys to keep) needs `K`, and the cred agent doesn't
 /// hold that `K` (a locked agent counts as not holding it): then it should
 /// send `keyRequest`. Blocking: from async code call it inside
-/// `key_agent::blocking`.
-pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) -> Result<bool> {
+/// `cred_agent::blocking`.
+pub fn key_needed(paths: &CredPaths, agent: &dyn CredAgentApi, astation_id: &str) -> Result<bool> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let Some((_, Some(state))) = effective_state(&trust, astation_id)? else {
         return Ok(false);
@@ -691,7 +741,7 @@ pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) 
 
 /// Whether this device has keys on disk: a plain `device_keys` file, or any
 /// sealed file (the current one, or a rotation's `.next` / `.prev`).
-pub(crate) fn has_device_keys(paths: &KeyPaths) -> bool {
+pub(crate) fn has_device_keys(paths: &CredPaths) -> bool {
     [
         &paths.device_keys,
         &paths.device_keys_sealed,
@@ -703,7 +753,7 @@ pub(crate) fn has_device_keys(paths: &KeyPaths) -> bool {
 }
 
 /// When the home Astation revoked this device (recorded by `atem cred
-/// unlock`) and the key agent (`agent`, the running one; `None` when none
+/// unlock`) and the cred agent (`agent`, the running one; `None` when none
 /// runs) is locked, its keys can never unlock again (`atem unpair` calls this):
 /// renames every key file to `<name>.revoked-<stamp>` (never deletes),
 /// forgets that Astation's verification, the home and the escrow state, so
@@ -714,10 +764,10 @@ pub(crate) fn has_device_keys(paths: &KeyPaths) -> bool {
 /// it only renames the old files aside and re-verifies with a fresh safety
 /// code the user compares, so a forged "revoked" can cost a re-pair but
 /// never keys (the files stay on disk) or trust (nothing new is trusted
-/// without the ceremony). Blocking: call it inside `key_agent::blocking`.
+/// without the ceremony). Blocking: call it inside `cred_agent::blocking`.
 pub fn set_aside_revoked_keys(
-    paths: &KeyPaths,
-    agent: Option<&dyn KeyAgentApi>,
+    paths: &CredPaths,
+    agent: Option<&dyn CredAgentApi>,
 ) -> Result<Option<String>> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let Some(revoked) = trust.revoked() else {
@@ -769,11 +819,11 @@ pub fn set_aside_revoked_keys(
 
 /// The keys to verify with: this device's sealed keys when it has them (so
 /// every Astation pins the same device key), fresh ones otherwise. Sealed
-/// keys are revealed only while the key agent holds them unlocked; starting
+/// keys are revealed only while the cred agent holds them unlocked; starting
 /// the agent also seals a plain `device_keys` file.
 pub fn device_keys_for_verification(
-    paths: &KeyPaths,
-    agent: &dyn KeyAgentApi,
+    paths: &CredPaths,
+    agent: &dyn CredAgentApi,
 ) -> Result<VerificationKeys> {
     if !has_device_keys(paths) {
         return Ok(VerificationKeys::Fresh(DeviceKeys::generate()));
@@ -785,7 +835,7 @@ pub fn device_keys_for_verification(
     let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?.ok_or_else(|| {
         anyhow!(
             "unlock_auth_key is missing. {}",
-            crate::memory::key_agent::RESET
+            crate::memory::cred_agent::RESET
         )
     })?;
     Ok(VerificationKeys::Sealed(DevicePublics {
@@ -797,6 +847,41 @@ pub fn device_keys_for_verification(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cred_layout_lives_under_cred() {
+        let paths = CredPaths::in_dir(Path::new("/home/u/.config/atem"));
+        let cred = Path::new("/home/u/.config/atem/cred");
+        assert_eq!(paths.dir, cred);
+        for (path, name) in [
+            (&paths.trust, "state.json"),
+            (&paths.project_names, "project_names.json"),
+            (&paths.device_keys, "device_keys"),
+            (&paths.device_keys_sealed, "device_keys.sealed"),
+            (&paths.device_keys_next, "device_keys.sealed.next"),
+            (&paths.device_keys_prev, "device_keys.sealed.prev"),
+            (&paths.unlock_auth_key, "unlock_auth_key"),
+            (&paths.agent_lock, "agent.lock"),
+            (&paths.agent_socket, "agent.socket"),
+            (&paths.agent_log, "agent.log"),
+        ] {
+            assert_eq!(path, &cred.join(name));
+        }
+        assert_eq!(
+            paths.agent_sock(Some(Path::new("/run/user/1000"))),
+            Path::new("/run/user/1000/atem/cred-agent.sock")
+        );
+        assert_eq!(paths.agent_sock(None), cred.join("agent.sock"));
+        assert_eq!(paths.agent_sock(Some(Path::new(""))), cred.join("agent.sock"));
+        assert_eq!(
+            socket_lock(&cred.join("agent.sock")),
+            cred.join("agent.sock.lock")
+        );
+        assert_eq!(
+            crate::memory::trust::TrustStore::lock_path(&paths.trust),
+            cred.join("state.lock")
+        );
+    }
+
     use super::*;
 
     fn astation() -> AstationKeys {
@@ -809,19 +894,9 @@ mod tests {
     }
 
     #[test]
-    fn key_paths_name_every_key_file() {
-        let paths = KeyPaths::in_dir(std::path::Path::new("/x"));
-        assert_eq!(paths.device_keys, std::path::Path::new("/x/device_keys"));
-        assert_eq!(paths.device_keys_sealed, std::path::Path::new("/x/device_keys.sealed"));
-        assert_eq!(paths.device_keys_next, std::path::Path::new("/x/device_keys.sealed.next"));
-        assert_eq!(paths.unlock_auth_key, std::path::Path::new("/x/unlock_auth_key"));
-        assert_eq!(paths.project_names, std::path::Path::new("/x/project_names.json"));
-    }
-
-    #[test]
     fn verification_reuses_the_sealed_device_keys() {
         let empty = tempfile::tempdir().unwrap();
-        let empty_paths = KeyPaths::in_dir(empty.path());
+        let empty_paths = CredPaths::in_dir(empty.path());
         let fresh_agent = test_agent(&empty_paths);
         assert!(matches!(
             device_keys_for_verification(&empty_paths, &fresh_agent).unwrap(),
@@ -895,7 +970,7 @@ mod tests {
 
     use crate::memory::crypto::EncryptionMode;
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::key_agent::{KeyAgent, holds_k, test_agent};
+    use crate::memory::cred_agent::{CredAgent, holds_k, test_agent};
     use crate::memory::statements::{AccountState, DeviceVerified, FakeAstation};
     use crate::memory::trust::TrustStore;
 
@@ -919,14 +994,14 @@ mod tests {
     }
 
     /// Runs the atem side of verification against a fake Astation and returns
-    /// the paths, the (unlocked) key agent, the fake, and the device public key.
+    /// the paths, the (unlocked) cred agent, the fake, and the device public key.
     fn verify(
         dir: &std::path::Path,
         mode: EncryptionMode,
-    ) -> (KeyPaths, std::sync::Mutex<KeyAgent>, FakeAstation, [u8; 32]) {
-        let paths = KeyPaths::in_dir(dir);
+    ) -> (CredPaths, std::sync::Mutex<CredAgent>, FakeAstation, [u8; 32]) {
+        let paths = CredPaths::in_dir(dir);
         let agent = test_agent(&paths);
-        std::fs::write(&paths.legacy_device_key, [1u8; 32]).unwrap();
+        write_test_file(&paths.legacy_device_key, [1u8; 32]);
         let fake = FakeAstation::new();
         let handshake = Handshake::start(DeviceKeys::generate());
         let astation = AstationKeys {
@@ -1025,7 +1100,7 @@ mod tests {
         let raw = std::fs::read_to_string(&paths.trust)
             .unwrap()
             .replace("\"account_state\": {", "\"account_state_was\": {");
-        std::fs::write(&paths.trust, raw).unwrap();
+        crate::memory::verification::write_test_file(&paths.trust, raw);
         let error = format!("{:#}", account_mode(&paths.trust, ASTATION_ID).unwrap_err());
         assert!(error.contains("waiting for Astation's signed encryption state"), "{error}");
     }
@@ -1130,7 +1205,7 @@ mod tests {
     #[test]
     fn unverified_devices_ignore_everything() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let fake = FakeAstation::new();
         assert!(matches!(
             apply_account_state(
@@ -1162,7 +1237,7 @@ mod tests {
         let raw = std::fs::read_to_string(&paths.trust)
             .unwrap()
             .replace("\"account_state\": {", "\"account_state_was\": {");
-        std::fs::write(&paths.trust, raw).unwrap();
+        crate::memory::verification::write_test_file(&paths.trust, raw);
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(trust.verified(ASTATION_ID).unwrap().account_state.is_none());
         let error = account_mode(&paths.trust, ASTATION_ID)
@@ -1178,7 +1253,7 @@ mod ceremony_tests {
     use crate::memory::crypto::EncryptionMode;
     use crate::memory::fake_astation::FakeKeyServer;
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::key_agent::{error_of, holds_k, test_agent};
+    use crate::memory::cred_agent::{error_of, holds_k, test_agent};
     use crate::memory::statements::{DeviceVerified, FakeAstation, StorageRotate, verify_device};
 
     const ASTATION_ID: &str = "astation-1";
@@ -1204,7 +1279,7 @@ mod ceremony_tests {
     /// Starts a ceremony with `keys` and leaves its pending pin in the trust
     /// store; returns the handshake and the certificate Astation would sign.
     fn start(
-        paths: &KeyPaths,
+        paths: &CredPaths,
         fake: &FakeAstation,
         keys: impl Into<VerificationKeys>,
         nonce_s: u8,
@@ -1246,7 +1321,7 @@ mod ceremony_tests {
     #[test]
     fn replayed_old_certificate_cannot_roll_a_verified_device_back() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
@@ -1293,7 +1368,7 @@ mod ceremony_tests {
     #[test]
     fn legitimate_re_verification_keeps_mode_and_key() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
@@ -1335,7 +1410,7 @@ mod ceremony_tests {
     }
 
     /// What a first verification attempt may have left on disk.
-    fn assert_nothing_written(paths: &KeyPaths) {
+    fn assert_nothing_written(paths: &CredPaths) {
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(
             trust.verified(ASTATION_ID).is_none(),
@@ -1363,7 +1438,7 @@ mod ceremony_tests {
         dir: &Path,
         cert_epoch: u64,
         make: impl FnOnce(&FakeAstation, [u8; 32]) -> (SignedWire, Vec<GrantWire>),
-    ) -> (KeyPaths, Result<VerificationOutcome>) {
+    ) -> (CredPaths, Result<VerificationOutcome>) {
         first_verification_with(dir, cert_epoch, |_| {}, make)
     }
 
@@ -1372,13 +1447,13 @@ mod ceremony_tests {
     fn first_verification_with(
         dir: &Path,
         cert_epoch: u64,
-        setup: impl FnOnce(&KeyPaths),
+        setup: impl FnOnce(&CredPaths),
         make: impl FnOnce(&FakeAstation, [u8; 32]) -> (SignedWire, Vec<GrantWire>),
-    ) -> (KeyPaths, Result<VerificationOutcome>) {
-        let paths = KeyPaths::in_dir(dir);
+    ) -> (CredPaths, Result<VerificationOutcome>) {
+        let paths = CredPaths::in_dir(dir);
         let agent = test_agent(&paths);
         setup(&paths);
-        std::fs::write(&paths.legacy_device_key, [1u8; 32]).unwrap();
+        write_test_file(&paths.legacy_device_key, [1u8; 32]);
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, cert_epoch);
         let (account_state, grants) = make(&fake, certificate.device_pub);
@@ -1525,7 +1600,7 @@ mod ceremony_tests {
         });
         assert!(!result.unwrap().key_needed);
         let empty = tempfile::tempdir().unwrap();
-        let locked = test_agent(&KeyPaths::in_dir(empty.path()));
+        let locked = test_agent(&CredPaths::in_dir(empty.path()));
         assert!(!key_needed(&paths, &locked, ASTATION_ID).unwrap(), "off needs no K");
         assert!(!key_needed(&paths, &locked, "never-verified").unwrap());
     }
@@ -1533,8 +1608,8 @@ mod ceremony_tests {
     /// A first verification of fresh keys with `fake` (certificate epoch 1,
     /// state epoch 2, no grants); returns the certificate and the outcome.
     fn verified_device(
-        paths: &KeyPaths,
-        agent: &dyn KeyAgentApi,
+        paths: &CredPaths,
+        agent: &dyn CredAgentApi,
         fake: &FakeAstation,
         mode: EncryptionMode,
         kid: Option<&str>,
@@ -1556,7 +1631,7 @@ mod ceremony_tests {
     #[test]
     fn first_verification_seals_the_keys_and_hands_them_to_the_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, outcome) =
@@ -1635,7 +1710,7 @@ mod ceremony_tests {
     /// it: Astation holds the storage key and the plain file goes, so a
     /// restarted agent starts locked.
     fn escrow_first(
-        agent: &dyn KeyAgentApi,
+        agent: &dyn CredAgentApi,
         fake: &FakeAstation,
         certificate: &DeviceVerified,
         outcome: VerificationOutcome,
@@ -1650,7 +1725,7 @@ mod ceremony_tests {
     #[test]
     fn a_fresh_device_whose_agent_stops_before_the_escrow_re_seals_from_the_plain_file() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, _outcome) =
@@ -1720,7 +1795,7 @@ mod ceremony_tests {
     #[test]
     fn re_verification_with_sealed_keys_opens_grants_in_the_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
@@ -1754,7 +1829,7 @@ mod ceremony_tests {
     #[test]
     fn a_locked_agent_cannot_verify_existing_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, outcome) =
@@ -1802,7 +1877,7 @@ mod ceremony_tests {
     #[test]
     fn a_revoked_device_sets_its_old_keys_aside_and_verifies_with_new_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, outcome) =
@@ -1813,7 +1888,7 @@ mod ceremony_tests {
         for path in [&paths.device_keys_next, &paths.device_keys_prev, &paths.device_keys] {
             std::fs::write(path, b"old").unwrap();
         }
-        std::fs::write(&paths.project_names, b"{}").unwrap();
+        crate::memory::verification::write_test_file(&paths.project_names, b"{}");
         TrustStore::update(&paths.trust, |store| {
             store.record_abandoned("0f0f0f0f");
             store.record_escrow_unanswered();
@@ -1827,19 +1902,21 @@ mod ceremony_tests {
             .unwrap()
             .expect("the old keys are moved aside");
         assert!(notice.contains("moved aside"), "{notice}");
-        for name in [
-            "device_keys.sealed",
-            "device_keys.sealed.next",
-            "device_keys.sealed.prev",
-            "unlock_auth_key",
-            "device_keys",
+        for path in [
+            &paths.device_keys_sealed,
+            &paths.device_keys_next,
+            &paths.device_keys_prev,
+            &paths.unlock_auth_key,
+            &paths.device_keys,
         ] {
-            assert!(!dir.path().join(name).exists(), "{name} is still there");
-            let aside = set_aside(dir.path(), name);
+            assert!(!path.exists(), "{} is still there", path.display());
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let aside = set_aside(&paths.dir, name);
             assert_eq!(aside.len(), 1, "{name}: {aside:?}");
         }
-        let aside = set_aside(dir.path(), "device_keys.sealed");
-        assert_eq!(std::fs::read(dir.path().join(&aside[0])).unwrap(), sealed_before, "renamed, not rewritten");
+        let name = paths.device_keys_sealed.file_name().unwrap().to_str().unwrap();
+        let aside = set_aside(&paths.dir, name);
+        assert_eq!(std::fs::read(paths.dir.join(&aside[0])).unwrap(), sealed_before, "renamed, not rewritten");
         assert_eq!(std::fs::read(&paths.project_names).unwrap(), b"{}");
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(trust.verified(ASTATION_ID).is_none());
@@ -1871,7 +1948,7 @@ mod ceremony_tests {
     #[test]
     fn without_a_recorded_revocation_a_locked_agent_still_refuses() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, outcome) =
@@ -1912,7 +1989,7 @@ mod ceremony_tests {
     #[test]
     fn a_second_astation_does_not_move_the_home() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, _) = verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
@@ -1980,7 +2057,7 @@ mod ceremony_tests {
     fn a_second_astation_naming_a_verified_account_purges_nothing_of_it() {
         use crate::memory::legacy_keys::{summary_at, write_for_test};
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
@@ -2031,7 +2108,7 @@ mod ceremony_tests {
     #[test]
     fn fresh_keys_never_verify_under_another_home() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         // The key files were deleted, but this device's home is another Astation.
         let mut trust = TrustStore::default();
         trust.set_home("astation-0");
@@ -2047,7 +2124,7 @@ mod ceremony_tests {
     #[test]
     fn grants_wait_while_the_agent_is_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, outcome) =
@@ -2078,17 +2155,17 @@ mod ceremony_tests {
     /// Answers `Status` from one agent and everything else from another
     /// (e.g. a lock between the two calls), or fails `BeginRotation`.
     struct Scripted {
-        status: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
-        rest: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        status: std::sync::Mutex<crate::memory::cred_agent::CredAgent>,
+        rest: std::sync::Mutex<crate::memory::cred_agent::CredAgent>,
         fail_rotation: bool,
     }
 
-    impl KeyAgentApi for Scripted {
+    impl CredAgentApi for Scripted {
         fn call(
             &self,
-            request: crate::memory::key_agent::Request,
-        ) -> Result<crate::memory::key_agent::Reply> {
-            use crate::memory::key_agent::Request;
+            request: crate::memory::cred_agent::Request,
+        ) -> Result<crate::memory::cred_agent::Reply> {
+            use crate::memory::cred_agent::Request;
             match request {
                 Request::Status => self.status.call(request),
                 Request::BeginRotation { .. } if self.fail_rotation => {
@@ -2102,23 +2179,23 @@ mod ceremony_tests {
     /// Forwards to `agent`, failing `InstallGrant` and/or `HeldKid` with a
     /// non-lock error (a socket or protocol failure).
     struct FailingAfterWrite {
-        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
+        agent: std::sync::Mutex<crate::memory::cred_agent::CredAgent>,
         fail_install: bool,
         fail_held_kid: bool,
     }
 
-    impl KeyAgentApi for FailingAfterWrite {
+    impl CredAgentApi for FailingAfterWrite {
         fn call(
             &self,
-            request: crate::memory::key_agent::Request,
-        ) -> Result<crate::memory::key_agent::Reply> {
-            use crate::memory::key_agent::Request;
+            request: crate::memory::cred_agent::Request,
+        ) -> Result<crate::memory::cred_agent::Reply> {
+            use crate::memory::cred_agent::Request;
             match request {
                 Request::InstallGrant { .. } if self.fail_install => {
-                    bail!("the key agent closed the connection")
+                    bail!("the cred agent closed the connection")
                 }
                 Request::HeldKid { .. } if self.fail_held_kid => {
-                    bail!("the key agent sent an unreadable reply")
+                    bail!("the cred agent sent an unreadable reply")
                 }
                 _ => self.agent.call(request),
             }
@@ -2127,7 +2204,7 @@ mod ceremony_tests {
 
     /// A first verification (state on, kid 0123abcd, its grant) through
     /// `agent`.
-    fn verify_on_with_grant(paths: &KeyPaths, agent: &dyn KeyAgentApi) -> Result<VerificationOutcome> {
+    fn verify_on_with_grant(paths: &CredPaths, agent: &dyn CredAgentApi) -> Result<VerificationOutcome> {
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(paths, &fake, DeviceKeys::generate(), 7, 1);
         let grant = seal_k_grant(
@@ -2152,7 +2229,7 @@ mod ceremony_tests {
     #[test]
     fn a_failed_install_after_a_saved_verification_is_a_warning() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = FailingAfterWrite {
             agent: test_agent(&paths),
             fail_install: true,
@@ -2160,7 +2237,7 @@ mod ceremony_tests {
         };
         let outcome = verify_on_with_grant(&paths, &agent).expect("the verification is saved");
         let warning = outcome.warning.expect("a warning");
-        assert!(warning.contains("couldn't be stored in the key agent"), "{warning}");
+        assert!(warning.contains("couldn't be stored in the cred agent"), "{warning}");
         assert!(outcome.key_needed, "K is asked for again");
         assert!(TrustStore::load_from(&paths.trust).unwrap().verified(ASTATION_ID).is_some());
         assert!(!holds_k(&agent.agent, ASTATION_ID));
@@ -2169,7 +2246,7 @@ mod ceremony_tests {
     #[test]
     fn an_agent_error_after_a_saved_verification_means_k_is_needed() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = FailingAfterWrite {
             agent: test_agent(&paths),
             fail_install: false,
@@ -2185,11 +2262,11 @@ mod ceremony_tests {
     #[test]
     fn a_failed_write_on_a_fresh_device_leaves_no_sealed_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(&paths, &fake, DeviceKeys::generate(), 7, 1);
-        // cred_state.json can't be saved: the last write, after the key
+        // cred/state.json can't be saved: the last write, after the key
         // files, fails.
         let _failing = crate::memory::crypto::fail_writes_to(&paths.trust);
         assert!(
@@ -2226,7 +2303,7 @@ mod ceremony_tests {
     #[test]
     fn any_sealed_file_means_this_device_has_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let keys = DeviceKeys::generate();
         let storage_key = new_storage_key();
         for (path, kid) in [
@@ -2267,7 +2344,7 @@ mod ceremony_tests {
     #[test]
     fn a_failed_escrow_preparation_still_verifies_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = Scripted {
             status: test_agent(&paths),
             rest: test_agent(&paths),
@@ -2300,7 +2377,7 @@ mod ceremony_tests {
     #[test]
     fn a_lock_between_status_and_open_is_reported_as_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let unlocked = test_agent(&paths);
         let fake = FakeAstation::new();
         let (certificate, outcome) = verified_device(
@@ -2334,18 +2411,18 @@ mod ceremony_tests {
     /// pairing run writes its own key files, and this run's write of the
     /// sealed file fails.
     struct RacedByAnotherRun {
-        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
-        paths: KeyPaths,
+        agent: std::sync::Mutex<crate::memory::cred_agent::CredAgent>,
+        paths: CredPaths,
         other: DeviceKeys,
         failing: std::sync::Mutex<Option<crate::memory::crypto::FailingWrite>>,
     }
 
-    impl KeyAgentApi for RacedByAnotherRun {
+    impl CredAgentApi for RacedByAnotherRun {
         fn call(
             &self,
-            request: crate::memory::key_agent::Request,
-        ) -> Result<crate::memory::key_agent::Reply> {
-            let load = matches!(request, crate::memory::key_agent::Request::LoadUnlocked { .. });
+            request: crate::memory::cred_agent::Request,
+        ) -> Result<crate::memory::cred_agent::Reply> {
+            let load = matches!(request, crate::memory::cred_agent::Request::LoadUnlocked { .. });
             let reply = self.agent.call(request)?;
             if load {
                 SealedDeviceKeys::seal(&self.other, "dev-1", "7a7b7c7d", &new_storage_key())
@@ -2367,18 +2444,18 @@ mod ceremony_tests {
     }
 
     /// Forwards to `agent`; right after the keys are loaded, another atem
-    /// process changes cred_state.json (here: records an abandoned kid).
+    /// process changes cred/state.json (here: records an abandoned kid).
     struct ChangedMeanwhile {
-        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
-        paths: KeyPaths,
+        agent: std::sync::Mutex<crate::memory::cred_agent::CredAgent>,
+        paths: CredPaths,
     }
 
-    impl KeyAgentApi for ChangedMeanwhile {
+    impl CredAgentApi for ChangedMeanwhile {
         fn call(
             &self,
-            request: crate::memory::key_agent::Request,
-        ) -> Result<crate::memory::key_agent::Reply> {
-            let load = matches!(request, crate::memory::key_agent::Request::LoadUnlocked { .. });
+            request: crate::memory::cred_agent::Request,
+        ) -> Result<crate::memory::cred_agent::Reply> {
+            let load = matches!(request, crate::memory::cred_agent::Request::LoadUnlocked { .. });
             let reply = self.agent.call(request)?;
             if load {
                 TrustStore::update(&self.paths.trust, |store| {
@@ -2391,9 +2468,9 @@ mod ceremony_tests {
     }
 
     #[test]
-    fn verification_keeps_changes_made_to_cred_state_meanwhile() {
+    fn verification_keeps_changes_made_to_trust_state_meanwhile() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let agent = ChangedMeanwhile {
             agent: test_agent(&paths),
             paths: paths.clone(),
@@ -2409,7 +2486,7 @@ mod ceremony_tests {
     #[test]
     fn a_failed_fresh_write_leaves_another_runs_key_files_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let other = DeviceKeys::generate();
         let (other_unlock_auth, other_sign) = (other.unlock_auth_pub(), other.device_sign_pub());
         let agent = RacedByAnotherRun {
@@ -2460,17 +2537,17 @@ mod ceremony_tests {
     /// atem process (the TUI's Astation link) applies `newer`, a later
     /// signed account state, as `apply_account_state` does.
     struct NewerStateMeanwhile {
-        agent: std::sync::Mutex<crate::memory::key_agent::KeyAgent>,
-        paths: KeyPaths,
+        agent: std::sync::Mutex<crate::memory::cred_agent::CredAgent>,
+        paths: CredPaths,
         newer: std::sync::Mutex<Option<SignedWire>>,
     }
 
-    impl KeyAgentApi for NewerStateMeanwhile {
+    impl CredAgentApi for NewerStateMeanwhile {
         fn call(
             &self,
-            request: crate::memory::key_agent::Request,
-        ) -> Result<crate::memory::key_agent::Reply> {
-            let open = matches!(request, crate::memory::key_agent::Request::CheckGrant { .. });
+            request: crate::memory::cred_agent::Request,
+        ) -> Result<crate::memory::cred_agent::Reply> {
+            let open = matches!(request, crate::memory::cred_agent::Request::CheckGrant { .. });
             let reply = self.agent.call(request)?;
             if open && let Some(newer) = self.newer.lock().unwrap().take() {
                 assert!(matches!(
@@ -2485,7 +2562,7 @@ mod ceremony_tests {
     #[test]
     fn a_newer_state_applied_during_re_verification_is_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let fake = FakeAstation::new();
         let agent = NewerStateMeanwhile {
             agent: test_agent(&paths),

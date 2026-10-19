@@ -184,7 +184,7 @@ pub struct VaultClient {
     session_id: String,
     astation_id: String,
     http: reqwest::Client,
-    encryption_with: Option<(crate::memory::verification::KeyPaths, std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>)>,
+    encryption_with: Option<(crate::memory::verification::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 }
 
 impl VaultClient {
@@ -203,7 +203,7 @@ impl VaultClient {
     }
 
     
-    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::KeyPaths, agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>) -> Self {
+    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
     }
@@ -347,7 +347,7 @@ impl VaultClient {
     }
 }
 
-/// Opens every sealed summary in one key-agent round trip; plain text is
+/// Opens every sealed summary in one cred-agent round trip; plain text is
 /// refused while encryption is on.
 fn open_summaries(encryption: &EncryptionContext, mut items: Vec<VaultListItem>) -> Result<Vec<VaultListItem>> {
     for item in &items {
@@ -370,7 +370,7 @@ fn open_summaries(encryption: &EncryptionContext, mut items: Vec<VaultListItem>)
     Ok(items)
 }
 
-/// Opens every sealed entry of `vault_id` in one key-agent round trip.
+/// Opens every sealed entry of `vault_id` in one cred-agent round trip.
 fn open_entries(encryption: &EncryptionContext, vault_id: &str, mut entries: Vec<VaultEntry>) -> Result<Vec<VaultEntry>> {
     for entry in &entries {
         encryption.require_sealed(&entry.content, "e1.", "vault entry")?;
@@ -394,7 +394,7 @@ fn open_entries(encryption: &EncryptionContext, vault_id: &str, mut entries: Vec
 
 /// One vault's summary and every entry version, re-sealed under the current
 /// key (`enabling`) or opened to plain text (`disabling`): the body of
-/// `POST /api/vault/{id}/encryption`, in one or two key-agent round trips.
+/// `POST /api/vault/{id}/encryption`, in one or two cred-agent round trips.
 fn migrated_vault(encryption: &EncryptionContext, item: &VaultListItem, entries: &[VaultEntry]) -> Result<Value> {
     use crate::memory::crypto::EncryptionMode;
     let id = item.vault_id.as_str();

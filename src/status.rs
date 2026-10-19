@@ -1,8 +1,9 @@
-//! `atem status`: one read-only, offline
-//! report of the account, the pairing, this device's verification and its
-//! credentials. It never connects anywhere, never starts the key agent (it
-//! asks only one that is already running) and never writes a file. Remote
-//! facts it can't check offline are shown as unknown and stale.
+//! `atem status`: one read-only report of the account, the pairing, this
+//! device's verification and its credentials, and — from an `atem runtime`
+//! that is already running, asked as a passive client within 500 ms — the
+//! Astation link, its session authorization and the local agents. It never
+//! connects to the network, never starts the cred agent or the runtime (it
+//! asks only ones already running) and never writes a file.
 //!
 //! The same facts decide `atem pair` (a no-op once paired), `atem pair
 //! verify` (only for an existing pairing, never after a revocation) and the
@@ -14,9 +15,12 @@ use std::path::{Path, PathBuf};
 use crate::auth::SessionManager;
 use crate::config::AtemConfig;
 use crate::credentials::{CredentialEntry, CredentialSource, CredentialStore};
-use crate::memory::key_agent::KeyAgentApi;
+use crate::memory::cred_agent::AgentStatus;
+#[cfg(test)]
+use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::trust::TrustStore;
-use crate::memory::verification::KeyPaths;
+use crate::memory::verification::CredPaths;
+use crate::runtime::client::Look;
 
 /// `atem pair` on a profile that is already paired (after the status).
 pub const ALREADY_PAIRED: &str = "Already paired. Verify this device: atem pair verify · Replace the pairing: atem unpair, then atem pair";
@@ -31,9 +35,14 @@ pub const NO_ASTATION_ID: &str =
 /// would only print the status.
 pub const SESSION_GONE: &str =
     "The saved Astation session expired or was refused. Run `atem unpair`, then `atem pair`.";
-/// Credentials note: the running key agent was started by another build.
+/// Credentials note: the running cred agent was started by another build.
 const OLDER_BUILD_NOTE: &str =
     " (started by another atem build; run atem cred lock, then atem cred unlock)";
+/// The same when Atem's runtime (which starts the agent for an unlock) is
+/// another build too.
+const OLDER_RUNTIME_NOTE: &str = " (started by another atem build, and Atem's runtime is another build too; run atem runtime restart, then atem cred lock and atem cred unlock)";
+/// Authorization, relay and local agents without a running runtime.
+pub const NO_RUNTIME: &str = "no runtime running";
 
 /// `atem pair verify` on a device the Astation revoked.
 pub fn revoked_message(astation_id: &str) -> String {
@@ -47,25 +56,16 @@ pub fn already_verified_message(safety_code: &str) -> String {
     format!("Already verified (safety code {safety_code}).")
 }
 
-/// One status value; `stale` marks cached or unchecked remote information.
+/// One status value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     pub value: String,
-    pub stale: bool,
 }
 
 impl Line {
-    fn fresh(value: impl Into<String>) -> Self {
+    fn new(value: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            stale: false,
-        }
-    }
-
-    fn stale(value: impl Into<String>) -> Self {
-        Self {
-            value: value.into(),
-            stale: true,
         }
     }
 }
@@ -94,10 +94,13 @@ pub struct Sources {
     pub sessions: PathBuf,
     /// `pairing.json`: the host trust generation and the pairing binding.
     pub pairing: PathBuf,
-    pub keys: KeyPaths,
-    /// Ask an already running key agent whether the keys are unlocked
+    pub keys: CredPaths,
+    /// Ask an already running cred agent whether the keys are unlocked
     /// (never starts one). Off in tests, so they never reach the user's agent.
     pub query_agent: bool,
+    /// Ask an already running `atem runtime` here for its link and sessions
+    /// (never starts one). `None` in tests unless they set it.
+    pub runtime: Option<crate::runtime::client::Locator>,
 }
 
 impl Sources {
@@ -109,8 +112,9 @@ impl Sources {
             credentials: CredentialStore::path(),
             sessions: SessionManager::sessions_path()?,
             pairing: AtemConfig::config_dir().join("pairing.json"),
-            keys: KeyPaths::default_paths(),
+            keys: CredPaths::default_paths(),
             query_agent: true,
+            runtime: Some(crate::runtime::client::Locator::default_paths()),
         })
     }
 
@@ -123,7 +127,7 @@ impl Sources {
     }
 
     /// A profile directory: its `config.toml` (no env overrides), and every
-    /// file in it. Never queries a key agent.
+    /// file in it. Never queries a cred agent.
     #[cfg(test)]
     pub fn in_dir(dir: &Path) -> Self {
         let config = std::fs::read_to_string(dir.join("config.toml"))
@@ -135,8 +139,9 @@ impl Sources {
             credentials: dir.join("credentials.enc"),
             sessions: dir.join("sessions.json"),
             pairing: dir.join("pairing.json"),
-            keys: KeyPaths::in_dir(dir),
+            keys: CredPaths::in_dir(dir),
             query_agent: false,
+            runtime: None,
         }
     }
 }
@@ -248,11 +253,11 @@ pub enum Verification {
     Revoked {
         by: String,
     },
-    /// `cred_state.json` can't be read.
+    /// `cred/state.json` can't be read.
     Unknown(String),
 }
 
-pub fn verification(keys: &KeyPaths, astation_id: &str) -> Verification {
+pub fn verification(keys: &CredPaths, astation_id: &str) -> Verification {
     let trust = match TrustStore::load_from(&keys.trust) {
         Ok(trust) => trust,
         Err(error) => return Verification::Unknown(format!("{error:#}")),
@@ -274,7 +279,7 @@ pub fn verification(keys: &KeyPaths, astation_id: &str) -> Verification {
 }
 
 fn account_line(store: &CredentialStore, now: u64) -> Line {
-    Line::fresh(if store.entries.is_empty() {
+    Line::new(if store.entries.is_empty() {
         "signed out"
     } else if store.entries.iter().any(|entry| entry.expires_at > now) {
         "signed in"
@@ -283,20 +288,25 @@ fn account_line(store: &CredentialStore, now: u64) -> Line {
     })
 }
 
-/// The credentials line, and the notes printed after the block.
-fn credentials_line(keys: &KeyPaths, agent: Option<&dyn KeyAgentApi>) -> (Line, Vec<String>) {
-    let status = match agent.map(|agent| agent.status()) {
+/// The credentials line, and the notes printed after the block;
+/// `runtime_differs`: Atem's runtime is another build than this atem.
+fn credentials_line(
+    keys: &CredPaths,
+    agent: Option<&Result<AgentStatus, String>>,
+    runtime_differs: bool,
+) -> (Line, Vec<String>) {
+    let status = match agent {
         None => None,
         Some(Ok(status)) => Some(status),
         Some(Err(error)) => {
-            let line = format!("unknown (key agent not answering: {error:#})");
-            return (Line::fresh(line), Vec::new());
+            let line = format!("unknown (cred agent not answering: {error})");
+            return (Line::new(line), Vec::new());
         }
     };
-    let older = if status.as_ref().is_some_and(|status| status.older_build) {
-        OLDER_BUILD_NOTE
-    } else {
-        ""
+    let older = match status.as_ref().is_some_and(|status| status.older_build) {
+        true if runtime_differs => OLDER_RUNTIME_NOTE,
+        true => OLDER_BUILD_NOTE,
+        false => "",
     };
     let value = match &status {
         Some(status) if status.unlocked && !status.escrowed => {
@@ -309,8 +319,8 @@ fn credentials_line(keys: &KeyPaths, agent: Option<&dyn KeyAgentApi>) -> (Line, 
                 .and_then(|trust| crate::memory::unlock::key_file_problem(keys, &trust));
             if let Some(problem) = problem {
                 let line = format!("broken ({problem}){older}");
-                let reset = crate::memory::key_agent::RESET.to_string();
-                return (Line::fresh(line), vec![reset]);
+                let reset = crate::memory::cred_agent::RESET.to_string();
+                return (Line::new(line), vec![reset]);
             }
             if crate::memory::verification::has_device_keys(keys) {
                 // No running agent holds them unlocked: locked.
@@ -320,13 +330,13 @@ fn credentials_line(keys: &KeyPaths, agent: Option<&dyn KeyAgentApi>) -> (Line, 
             }
         }
     };
-    (Line::fresh(format!("{value}{older}")), Vec::new())
+    (Line::new(format!("{value}{older}")), Vec::new())
 }
 
 /// The pairing and verification lines.
 fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
     let Some(pairing) = pairing else {
-        return (Line::fresh("not paired"), Line::fresh("—"));
+        return (Line::new("not paired"), Line::new("—"));
     };
     let more = match pairing.others {
         0 => String::new(),
@@ -334,7 +344,7 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
     };
     let Some(astation_id) = &pairing.astation_id else {
         let line = format!("paired (no Astation id){more}");
-        return (Line::fresh(line), Line::fresh("—"));
+        return (Line::new(line), Line::new("—"));
     };
     let expired = if pairing.session_expired {
         ", session expired"
@@ -349,8 +359,8 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
         Verification::Unknown(error) => format!("unknown ({error})"),
     };
     (
-        Line::fresh(format!("paired ({astation_id}{trust}{expired}){more}")),
-        Line::fresh(verification),
+        Line::new(format!("paired ({astation_id}{trust}{expired}){more}")),
+        Line::new(verification),
     )
 }
 
@@ -373,36 +383,189 @@ fn trust_note(src: &Sources, astation_id: &str) -> String {
     }
 }
 
-/// The status from `src`, with `agent` the already running key agent (if any).
-pub fn gather_with(src: &Sources, agent: Option<&dyn KeyAgentApi>) -> StatusReport {
+/// The status from `src`, with `agent` the already running cred agent (if
+/// any) and no runtime running.
+#[cfg(test)]
+pub fn gather_with(src: &Sources, agent: Option<&dyn CredAgentApi>) -> StatusReport {
+    let agent = agent.map(|agent| agent.status().map_err(|error| format!("{error:#}")));
+    gather_full(src, agent.as_ref(), &Look::NotRunning)
+}
+
+/// The status from `src`, with what the running cred agent answered (if
+/// one runs) and what a passive look at the runtime found.
+pub fn gather_full(
+    src: &Sources,
+    agent: Option<&Result<AgentStatus, String>>,
+    runtime: &Look,
+) -> StatusReport {
     let store = CredentialStore::load_from(&src.credentials);
     let paired = pairing(src);
     let (pairing_line, verification_line) = pairing_lines(src, paired.as_ref());
-    let (credentials, notes) = credentials_line(&src.keys, agent);
+    let runtime_differs = matches!(runtime, Look::Running { welcome, .. }
+        if welcome.build != crate::memory::cred_agent::build_id());
+    let (credentials, notes) = credentials_line(&src.keys, agent, runtime_differs);
+    let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
     StatusReport {
         account: account_line(&store, CredentialEntry::now_secs()),
         pairing: pairing_line,
         verification: verification_line,
         credentials,
-        // No freshness contract yet: never "fresh" without proof.
-        authorization: Line::stale("unknown"),
-        // Status never connects.
-        relay: Line::stale("unknown"),
-        // No shared runtime to ask yet.
-        local_agents: Line::fresh("unknown"),
+        authorization,
+        relay,
+        local_agents,
         notes,
     }
 }
 
-/// The status from `src`, asking an already running key agent when
-/// `src.query_agent` (blocking: socket I/O).
+/// The status from `src`, asking an already running cred agent when
+/// `src.query_agent` and an already running runtime when `src.runtime`
+/// (blocking: socket I/O).
 pub fn gather(src: &Sources) -> StatusReport {
     let agent = if src.query_agent {
-        crate::memory::key_agent::running_agent()
+        crate::memory::cred_agent::look(&src.keys, crate::runtime::client::LOOK_TIMEOUT)
+            .map(|found| found.map(|(status, _pid)| status))
     } else {
         None
     };
-    gather_with(src, agent.as_deref())
+    let runtime = match &src.runtime {
+        Some(locator) => {
+            crate::runtime::client::look(locator, crate::runtime::client::LOOK_TIMEOUT)
+        }
+        None => Look::NotRunning,
+    };
+    gather_full(src, agent.as_ref(), &runtime)
+}
+
+/// `HH:MM` of the Unix ms `at` in the local time zone.
+fn local_hhmm(at: u64) -> String {
+    let t = (at / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return "?".into();
+    }
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// What is left of an authorization: `23 h left`, `5 min left`.
+fn time_left(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    if minutes >= 60 {
+        format!("{} h left", minutes / 60)
+    } else {
+        format!("{minutes} min left")
+    }
+}
+
+/// The Authorization, Relay and Local agents lines from a passive look at
+/// the runtime (`hhmm` formats a Unix ms time of day).
+pub fn runtime_lines(look: &Look, hhmm: impl Fn(u64) -> String) -> (Line, Line, Line) {
+    use crate::runtime::protocol::Transport;
+    let status = match look {
+        Look::NotRunning => {
+            return (
+                Line::new(NO_RUNTIME),
+                Line::new(NO_RUNTIME),
+                Line::new(NO_RUNTIME),
+            );
+        }
+        Look::Unreachable(error) => {
+            let line = format!("unknown (the runtime didn't answer: {error})");
+            return (
+                Line::new(line.clone()),
+                Line::new(line.clone()),
+                Line::new(line),
+            );
+        }
+        Look::Running {
+            status: None,
+            welcome,
+        } => {
+            let line = format!(
+                "unknown (Atem's runtime is build {}, which doesn't report it; run atem runtime restart)",
+                welcome.build
+            );
+            return (
+                Line::new(line.clone()),
+                Line::new(line.clone()),
+                Line::new(line),
+            );
+        }
+        Look::Running {
+            status: Some(status),
+            ..
+        } => status,
+    };
+    let authorization = if let Some(error) = &status.host_error {
+        format!("unavailable ({error})")
+    } else if status.journal_halted {
+        "paused (journal halted; run atem runtime restart)".into()
+    } else if status.reauthenticating {
+        "not authorized (Astation is authenticating the link again)".into()
+    } else if !status.astation {
+        "not authorized (Astation not connected)".into()
+    } else if !status.attachment {
+        "not authorized (the Astation link isn't a verified pairing; run atem pair verify)".into()
+    } else if let Some(welcomed) = &status.welcomed {
+        format!(
+            "authorized (r{}, since {}, {})",
+            welcomed.revision,
+            hhmm(welcomed.at_ms),
+            time_left(welcomed.ms_left)
+        )
+    } else if let Some(refused) = &status.refused {
+        match refused.revision {
+            Some(revision) => format!(
+                "refused (Astation sent revision {revision}; needs r{})",
+                refused.needs
+            ),
+            None => format!(
+                "refused (Astation sent no revision; needs r{})",
+                refused.needs
+            ),
+        }
+    } else {
+        "not authorized (Astation connected but no session hello yet)".into()
+    };
+    let relay = match (status.astation || status.reauthenticating, status.transport) {
+        (true, Some(Transport::Relay)) => match &status.relay {
+            Some(label) => format!("connected via relay ({label})"),
+            None => "connected via relay".into(),
+        },
+        (true, Some(Transport::Local)) => "connected locally".into(),
+        (true, None) => "connected".into(),
+        (false, _) if status.retrying => "not connected (retrying)".into(),
+        (false, _) => "not connected".into(),
+    };
+    (
+        Line::new(authorization),
+        Line::new(relay),
+        Line::new(local_agents(&status.sessions, status.adopting)),
+    )
+}
+
+/// `2 running (claude ready, codex working)`, `none`, `1 running (…); 1 exited`.
+fn local_agents(sessions: &[crate::runtime::protocol::SessionSummary], adopting: bool) -> String {
+    let running: Vec<String> = sessions
+        .iter()
+        .filter(|s| s.state == "running")
+        .map(|s| format!("{} {}", s.provider, s.status))
+        .collect();
+    let mut others: std::collections::BTreeMap<&str, usize> = Default::default();
+    for s in sessions.iter().filter(|s| s.state != "running") {
+        *others.entry(s.state.as_str()).or_default() += 1;
+    }
+    let mut text = if running.is_empty() {
+        "none running".to_string()
+    } else {
+        format!("{} running ({})", running.len(), running.join(", "))
+    };
+    for (state, n) in others {
+        text.push_str(&format!("; {n} {}", state.replace('_', " ")));
+    }
+    if adopting {
+        text.push_str(" (still adopting sessions)");
+    }
+    text
 }
 
 /// The aligned block `atem status` prints.
@@ -418,8 +581,7 @@ pub fn render(report: &StatusReport) -> String {
     ];
     let mut out = String::new();
     for (label, line) in rows {
-        let stale = if line.stale { " (stale)" } else { "" };
-        out.push_str(&format!("{label:<16}{}{stale}\n", line.value));
+        out.push_str(&format!("{label:<16}{}\n", line.value));
     }
     for note in &report.notes {
         out.push_str(note);
@@ -468,12 +630,12 @@ pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
 pub(crate) mod tests {
     use super::*;
     use crate::auth::AuthSession;
-    use crate::memory::key_agent::{Reply, Request};
+    use crate::memory::cred_agent::{Reply, Request};
     use crate::memory::trust::AstationTrust;
 
     const ASTATION: &str = "astation-1";
 
-    /// A running key agent that answers `Status` as told.
+    /// A running cred agent that answers `Status` as told.
     struct StubAgent {
         unlocked: bool,
         escrowed: bool,
@@ -485,12 +647,12 @@ pub(crate) mod tests {
             Self {
                 unlocked,
                 escrowed: true,
-                build: Some(crate::memory::key_agent::build_id().to_string()),
+                build: Some(crate::memory::cred_agent::build_id().to_string()),
             }
         }
     }
 
-    impl KeyAgentApi for StubAgent {
+    impl CredAgentApi for StubAgent {
         fn call(&self, request: Request) -> Result<Reply> {
             match request {
                 Request::Status => Ok(Reply::Status {
@@ -523,7 +685,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Writes `cred_state.json`: verified with `verified` (if any), revoked
+    /// Writes `cred/state.json`: verified with `verified` (if any), revoked
     /// by `revoked` (if any).
     fn write_trust(dir: &Path, verified: Option<&str>, revoked: Option<&str>) {
         let mut astations = serde_json::Map::new();
@@ -541,7 +703,10 @@ pub(crate) mod tests {
         if let Some(id) = revoked {
             store["revoked"] = serde_json::json!({"astation_id": id, "at": 1_700_000_000u64});
         }
-        std::fs::write(dir.join("cred_state.json"), store.to_string()).unwrap();
+        crate::memory::verification::write_test_file(
+            &crate::memory::verification::CredPaths::in_dir(dir).trust,
+            store.to_string(),
+        );
     }
 
     fn write_paired(dir: &Path, astation_id: &str, expires_at: u64) {
@@ -573,7 +738,10 @@ pub(crate) mod tests {
     /// A plain `device_keys` file: keys on disk that `key_file_problem`
     /// accepts (the agent seals it when it starts).
     fn write_device_keys(dir: &Path) {
-        std::fs::write(dir.join("device_keys"), b"{}").unwrap();
+        crate::memory::verification::write_test_file(
+            &crate::memory::verification::CredPaths::in_dir(dir).device_keys,
+            b"{}",
+        );
     }
 
     fn later() -> u64 {
@@ -585,15 +753,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn render_aligns_every_label_and_marks_stale_lines() {
+    fn render_aligns_every_label() {
         let report = StatusReport {
-            account: Line::fresh("signed in"),
-            pairing: Line::fresh("paired (astation-1)"),
-            verification: Line::fresh("verified (safety code MN3H-A74N-FJE4)"),
-            credentials: Line::fresh("locked"),
-            authorization: Line::stale("unknown"),
-            relay: Line::stale("unknown"),
-            local_agents: Line::fresh("unknown"),
+            account: Line::new("signed in"),
+            pairing: Line::new("paired (astation-1)"),
+            verification: Line::new("verified (safety code MN3H-A74N-FJE4)"),
+            credentials: Line::new("locked"),
+            authorization: Line::new("authorized (r8, since 18:25, 23 h left)"),
+            relay: Line::new("connected locally"),
+            local_agents: Line::new("2 running (claude ready, codex ready)"),
             notes: Vec::new(),
         };
         assert_eq!(
@@ -602,9 +770,9 @@ pub(crate) mod tests {
              Pairing:        paired (astation-1)\n\
              Verification:   verified (safety code MN3H-A74N-FJE4)\n\
              Credentials:    locked\n\
-             Authorization:  unknown (stale)\n\
-             Relay:          unknown (stale)\n\
-             Local agents:   unknown\n"
+             Authorization:  authorized (r8, since 18:25, 23 h left)\n\
+             Relay:          connected locally\n\
+             Local agents:   2 running (claude ready, codex ready)\n"
         );
     }
 
@@ -616,9 +784,10 @@ pub(crate) mod tests {
         assert_eq!(report.pairing.value, "not paired");
         assert_eq!(report.verification.value, "—");
         assert_eq!(report.credentials.value, "not set up");
-        assert_eq!(report.authorization, Line::stale("unknown"));
-        assert_eq!(report.relay, Line::stale("unknown"));
-        assert_eq!(report.local_agents, Line::fresh("unknown"));
+        // No runtime runs.
+        assert_eq!(report.authorization, Line::new(NO_RUNTIME));
+        assert_eq!(report.relay, Line::new(NO_RUNTIME));
+        assert_eq!(report.local_agents, Line::new(NO_RUNTIME));
         assert_eq!(pairing(&Sources::in_dir(dir.path())), None);
     }
 
@@ -904,8 +1073,8 @@ pub(crate) mod tests {
         let text = render(&report);
         assert!(
             text.ends_with(&format!(
-                "Local agents:   unknown\n{}\n",
-                crate::memory::key_agent::RESET
+                "Local agents:   no runtime running\n{}\n",
+                crate::memory::cred_agent::RESET
             )),
             "{text}"
         );
@@ -959,5 +1128,317 @@ pub(crate) mod tests {
         }
         files.sort();
         files
+    }
+
+    // ── The runtime's lines ──
+
+    use crate::runtime::client::{Locator, Welcome, look};
+    use crate::runtime::protocol::{
+        Refusal, RuntimeMsg, RuntimeStatus, SessionSummary, Transport, Welcomed,
+    };
+
+    fn welcome(build: &str) -> Welcome {
+        Welcome {
+            protocol: crate::runtime::protocol::PROTOCOL,
+            build: build.into(),
+            pid: 42,
+            astation: true,
+            host_error: None,
+            worker_protocol: Some(1),
+        }
+    }
+
+    fn running(status: RuntimeStatus) -> Look {
+        Look::Running {
+            welcome: welcome(crate::memory::cred_agent::build_id()),
+            status: Some(status),
+        }
+    }
+
+    fn session(provider: &str, state: &str, status: &str) -> SessionSummary {
+        SessionSummary {
+            id: "ses-aaaaaaaaaaaa".into(),
+            provider: provider.into(),
+            cwd: "/w".into(),
+            created_at_ms: 1,
+            state: state.into(),
+            status: status.into(),
+            attached: false,
+            remote_controlled: false,
+            exited: None,
+            rows: 24,
+            cols: 80,
+            generation: "g".into(),
+            worker_build: None,
+        }
+    }
+
+    /// The three lines' values for `look`, with times shown as `@<ms>`.
+    fn lines(look: &Look) -> [String; 3] {
+        let (a, r, l) = runtime_lines(look, |ms| format!("@{ms}"));
+        [a.value, r.value, l.value]
+    }
+
+    fn connected(transport: Transport) -> RuntimeStatus {
+        RuntimeStatus {
+            astation: true,
+            transport: Some(transport),
+            relay: (transport == Transport::Relay)
+                .then(|| "station.agora.build as Genie-dc1649f-956631ec".into()),
+            attachment: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_welcomed_link_is_authorized_with_its_revision_time_and_what_is_left() {
+        let status = RuntimeStatus {
+            welcomed: Some(Welcomed {
+                revision: 8,
+                at_ms: 1_000,
+                ms_left: 23 * 3_600_000 + 59 * 60_000,
+            }),
+            sessions: vec![
+                session("claude", "running", "ready"),
+                session("codex", "running", "working"),
+                session("codex", "exited", "unknown"),
+            ],
+            ..connected(Transport::Relay)
+        };
+        assert_eq!(
+            lines(&running(status)),
+            [
+                "authorized (r8, since @1000, 23 h left)",
+                "connected via relay (station.agora.build as Genie-dc1649f-956631ec)",
+                "2 running (claude ready, codex working); 1 exited",
+            ]
+        );
+        let status = RuntimeStatus {
+            welcomed: Some(Welcomed {
+                revision: 8,
+                at_ms: 5,
+                ms_left: 5 * 60_000,
+            }),
+            ..connected(Transport::Local)
+        };
+        let [authorization, relay, agents] = lines(&running(status));
+        assert_eq!(authorization, "authorized (r8, since @5, 5 min left)");
+        assert_eq!(relay, "connected locally");
+        assert_eq!(agents, "none running");
+    }
+
+    #[test]
+    fn a_connected_link_without_a_welcome_says_why() {
+        let [authorization, ..] = lines(&running(connected(Transport::Local)));
+        assert_eq!(
+            authorization,
+            "not authorized (Astation connected but no session hello yet)"
+        );
+        // The last refused hello, by revision.
+        let refused = |revision| RuntimeStatus {
+            refused: Some(Refusal {
+                revision,
+                needs: 8,
+                at_ms: 1,
+            }),
+            ..connected(Transport::Local)
+        };
+        assert_eq!(
+            lines(&running(refused(Some(7))))[0],
+            "refused (Astation sent revision 7; needs r8)"
+        );
+        assert_eq!(
+            lines(&running(refused(None)))[0],
+            "refused (Astation sent no revision; needs r8)"
+        );
+        // A link that isn't a verified pairing gets no attachment.
+        let unverified = RuntimeStatus {
+            attachment: false,
+            ..connected(Transport::Local)
+        };
+        assert!(lines(&running(unverified))[0].contains("isn't a verified pairing"));
+    }
+
+    #[test]
+    fn a_disconnected_link_and_a_halted_journal() {
+        let retrying = RuntimeStatus {
+            retrying: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            lines(&running(retrying))[..2],
+            [
+                "not authorized (Astation not connected)",
+                "not connected (retrying)"
+            ]
+        );
+        assert_eq!(
+            lines(&running(RuntimeStatus::default()))[1],
+            "not connected"
+        );
+        let halted = RuntimeStatus {
+            journal_halted: true,
+            ..connected(Transport::Local)
+        };
+        assert_eq!(
+            lines(&running(halted))[0],
+            "paused (journal halted; run atem runtime restart)"
+        );
+        let disabled = RuntimeStatus {
+            host_error: Some("remote sessions disabled: x".into()),
+            ..connected(Transport::Local)
+        };
+        assert_eq!(
+            lines(&running(disabled))[0],
+            "unavailable (remote sessions disabled: x)"
+        );
+    }
+
+    #[test]
+    fn without_a_runtime_every_line_says_so() {
+        assert_eq!(lines(&Look::NotRunning), [NO_RUNTIME; 3].map(String::from));
+        let old = Look::Running {
+            welcome: welcome("0.7.1+1"),
+            status: None,
+        };
+        assert!(
+            lines(&old)[0].contains("run atem runtime restart"),
+            "{:?}",
+            lines(&old)
+        );
+        assert!(lines(&Look::Unreachable("x".into()))[1].contains("didn't answer: x"));
+    }
+
+    /// A fake runtime on `socket`: answers one client's `hello` with a
+    /// welcome of `build`, then its `status` with `status` (`None`: an
+    /// unknown-op error, as a runtime from before `status`).
+    fn fake_runtime(socket: &Path, build: &str, status: Option<RuntimeStatus>) {
+        use crate::runtime::protocol::{ClientMsg, decode_client, encode_runtime};
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let build = build.to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let reply = match decode_client(&line) {
+                    Ok(ClientMsg::Hello { passive, .. }) => {
+                        assert!(passive, "status is a passive client");
+                        RuntimeMsg::Welcome {
+                            protocol: crate::runtime::protocol::PROTOCOL,
+                            build: build.clone(),
+                            pid: 42,
+                            astation: true,
+                            host_error: None,
+                            worker_protocol: Some(1),
+                        }
+                    }
+                    Ok(ClientMsg::Status) => match status.clone() {
+                        Some(status) => RuntimeMsg::Status { status },
+                        None => RuntimeMsg::error("unknown variant `status`", None),
+                    },
+                    other => panic!("status sent {other:?}"),
+                };
+                writer.write_all(encode_runtime(&reply).as_bytes()).unwrap();
+                line.clear();
+            }
+        });
+    }
+
+    #[test]
+    fn status_asks_a_running_runtime_passively() {
+        let dir = tempfile::tempdir().unwrap();
+        let locator = Locator::in_dir(dir.path());
+        let status = RuntimeStatus {
+            sessions: vec![session("claude", "running", "ready")],
+            ..connected(Transport::Local)
+        };
+        fake_runtime(
+            &locator.socket,
+            crate::memory::cred_agent::build_id(),
+            Some(status),
+        );
+        let mut src = Sources::in_dir(dir.path());
+        src.runtime = Some(locator);
+        let report = gather(&src);
+        assert_eq!(
+            report.authorization.value,
+            "not authorized (Astation connected but no session hello yet)"
+        );
+        assert_eq!(report.relay.value, "connected locally");
+        assert_eq!(report.local_agents.value, "1 running (claude ready)");
+    }
+
+    #[test]
+    fn a_runtime_from_before_status_is_named_with_its_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let locator = Locator::in_dir(dir.path());
+        fake_runtime(&locator.socket, "0.7.1+1", None);
+        let found = look(&locator, crate::runtime::client::LOOK_TIMEOUT);
+        assert!(
+            matches!(&found, Look::Running { welcome, status: None } if welcome.build == "0.7.1+1"),
+            "{found:?}"
+        );
+        assert!(lines(&found)[0].contains("Atem's runtime is build 0.7.1+1"));
+    }
+
+    #[test]
+    fn status_starts_nothing_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let locator = Locator::in_dir(dir.path());
+        let mut src = Sources::in_dir(dir.path());
+        src.runtime = Some(locator.clone());
+        let started = std::time::Instant::now();
+        let report = gather(&src);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(report.authorization.value, NO_RUNTIME);
+        assert!(!locator.socket.exists(), "no runtime was started");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "nothing written"
+        );
+        // A socket that accepts but never answers costs at most the timeout.
+        let _silent = std::os::unix::net::UnixListener::bind(&locator.socket).unwrap();
+        let started = std::time::Instant::now();
+        let report = gather(&src);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            report
+                .authorization
+                .value
+                .starts_with("unknown (the runtime didn't answer")
+        );
+    }
+
+    #[test]
+    fn another_build_of_runtime_and_agent_points_to_the_runtime_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        write_trust(dir.path(), Some(ASTATION), None);
+        write_device_keys(dir.path());
+        let src = Sources::in_dir(dir.path());
+        let older = StubAgent {
+            build: Some("other".into()),
+            ..StubAgent::new(true)
+        };
+        let agent = older.status().map_err(|e| e.to_string());
+        let runtime = Look::Running {
+            welcome: welcome("other"),
+            status: Some(RuntimeStatus::default()),
+        };
+        assert_eq!(
+            gather_full(&src, Some(&agent), &runtime).credentials.value,
+            "unlocked (started by another atem build, and Atem's runtime is another build too; run atem runtime restart, then atem cred lock and atem cred unlock)"
+        );
+        // Only the agent differs: the lock/unlock advice.
+        assert_eq!(
+            gather_full(&src, Some(&agent), &running(RuntimeStatus::default()))
+                .credentials
+                .value,
+            "unlocked (started by another atem build; run atem cred lock, then atem cred unlock)"
+        );
     }
 }

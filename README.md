@@ -43,7 +43,7 @@ atem repl                               # Interactive REPL with AI command inter
 ```bash
 atem login                              # Log in with Agora Console (opens browser)
 atem logout                             # Log out from SSO
-atem status                             # Account, pairing, verification and credentials (offline, read-only)
+atem status                             # Account, pairing, verification, credentials, Astation link and sessions (read-only)
 atem pair                               # Pair with Astation, then verify this device (shows the status when already paired)
 atem pair --save                        # Same, and keep credentials for offline use
 atem pair verify                        # Verify this device with the paired Astation (no re-pairing)
@@ -73,25 +73,33 @@ device: atem pair verify · Replace the pairing: atem unpair, then atem pair`):
 it never pairs again or changes keys, trust or sessions. `atem pair verify`
 verifies the existing pairing on the runtime's Astation link, does nothing when the
 device is already verified, and refuses after a revocation (run `atem unpair`,
-which sets the revoked keys aside, then `atem pair`). `atem status` reads only
-local files and an already running key agent; it never connects, so
-authorization and relay show as `unknown (stale)`.
+which sets the revoked keys aside, then `atem pair`). `atem status` reads
+local files and asks an already running cred agent and `atem runtime` (each
+within half a second; it never starts either, never writes and never uses the
+network). From the runtime it shows the session authorization
+(`authorized (r8, since 18:25, 23 h left)`, `not authorized (…)`, `refused
+(Astation sent revision 7; needs r8)`, `paused (journal halted; …)`), the
+Astation link (`connected via relay (<relay> as <atem id>)`, `connected
+locally`, `not connected (retrying)`) and the local agents (`2 running
+(claude ready, codex working)`); without a runtime all three say `no runtime
+running`.
 
 ### Device keys (`atem cred`)
 
 ```bash
 atem cred unlock                        # Unlock this device's keys (approve with Touch ID on your Mac)
-atem cred lock                          # Wipe unlocked keys and stop the key agent
+atem cred lock                          # Wipe unlocked keys and stop the cred agent
 atem cred projects                      # Send known Git projects to Astation's credential picker (keys must be unlocked)
 ```
 
 This device's keys are sealed on disk under a storage key that only the paired
 Mac (the home Astation) holds. `atem cred unlock` asks the Mac for it (Touch
-ID) and starts a background `atem key-agent` that holds the keys in memory;
+ID) and starts a background `atem cred-agent` that holds the keys in memory;
 on a device no Astation verified it stops with `This device isn't verified.
 Run atem pair verify first.` and never starts pairing or verification.
 `atem cred lock` wipes them and stops the agent. After upgrading atem, run
-`atem cred lock` then `atem cred unlock` to pick up the new agent.
+`atem cred lock` then `atem cred unlock` to pick up the new agent (the unlock
+first updates Atem's runtime, which starts the agent, to the new build).
 
 `atem cred projects` sends this repo's Git remote, and the project names atem
 remembers, to Astation's credential picker, encrypted to your Mac. An
@@ -101,7 +109,7 @@ TUI, `atem pair`, and right after `atem cred unlock`), so you need
 values from Astation's local Credentials store (`atem cred get/list`) is not
 available yet; it is designed in `designs/e2e-encryption.md`.
 
-Updated clients and key agents retain the remote's original capitalization,
+Updated clients and cred agents retain the remote's original capitalization,
 such as `github.com/Agora-Build/Atem`; project identity and duplicate checks
 ignore case. Older clients/agents may report lowercase names. Reports are
 encrypted even when memory encryption is off and can remain in the picker
@@ -145,6 +153,8 @@ atem agent launch claude -- --help      # Use -- to read the agent's own help
 atem agent list                         # The sessions the background runtime holds
 atem agent attach ses-…                 # Reopen a session (screen restored)
 atem agent stop ses-…                   # Stop a session
+atem runtime restart                    # Restart the runtime as this build; sessions keep running
+atem --version                          # This atem, and the runtime, cred agent and workers while they run
 ```
 
 `atem agent launch [claude|claude-code|codex] [ARGS]...` runs the installed
@@ -160,7 +170,14 @@ and Codex sessions can run at once, and they keep running if the runtime
 itself restarts. The runtime also holds this machine's one Astation
 connection: `atem pair`, `atem pair verify`, `atem cred unlock` and `atem cred
 projects` run on it (they start the runtime if needed) and never open their
-own, so pairing never disconnects a running session. When an agent that
+own, so pairing never disconnects a running session. When a command of
+another atem build (an upgrade, a dev build) uses the runtime, it replaces the
+runtime by its own build first and prints `Atem's runtime updated to … (was
+…); sessions kept.`; the new runtime adopts the sessions. It doesn't when the
+new build couldn't adopt them (it names the sessions that block it), while an
+Astation operation runs, or when the runtime was replaced less than a minute
+ago (two atem builds in use); `atem runtime restart` applies it then. `atem
+status` and `atem --version` only look. When an agent that
 printed something ends, its last output and a short summary are saved under
 `~/.config/atem/logs/<session id>/`.
 
@@ -490,13 +507,22 @@ Files in `~/.config/atem/`:
 | `project_cache.enc` | Project list + active project selection | AES-256-GCM (machine-bound) |
 | `sessions.json` | Per-Astation device session IDs and tokens | Plaintext (chmod 0600) |
 | `knowledge.db` | Atem Memory: memories, skills, search index, pending-sync queue (no credentials) | None (chmod 0600) |
+| `cred/` | This device's keys, trust state and cred agent files (directory 0700, see below) | — |
+| `runtime.lock`, `runtime.socket`, `runtime.log`, `runtime.replaced`, `runtime/` | The background runtime: its lock, socket path, log, last replacement by another build, worker records and session journal | None (chmod 0600) |
+
+Files in `~/.config/atem/cred/`:
+
+| File | Contents | Encryption |
+|------|----------|------------|
 | `device_keys.sealed` | This device's keys (device, signing and account keys). `.next` exists only during a storage-key rotation, `.prev` until the next unlock | XChaCha20-Poly1305 under a storage key held only by the home Astation |
 | `device_keys` | The same keys in plain form, only until the home Astation first holds the storage key; then deleted | None (chmod 0600) |
 | `unlock_auth_key` | Key that signs unlock requests (it can only ask Astation) | None (chmod 0600) |
-| `cred_state.json` | Verified Astation keys, safety code, signed encryption state, home Astation (no secrets) | None (chmod 0600) |
-| `project_names.json` | Account-scoped project hash-to-key mappings and known original-case display labels (no credential values) | None (chmod 0600) |
-| `key-agent.log` | Output of the background `atem key-agent` | None |
-| `agent.sock`, `agent.socket`, `*.lock` | Key-agent socket and lock files (the socket lives in `$XDG_RUNTIME_DIR/atem/` when that is set) | Socket 0600, same user only |
+| `state.json` (+ `state.lock`) | Verified Astation keys, safety code, signed encryption state, home Astation (no secrets) | None (chmod 0600) |
+| `project_names.json` (+ `.lock`) | Account-scoped project hash-to-key mappings and known original-case display labels (no credential values) | None (chmod 0600) |
+| `agent.lock`, `agent.socket`, `agent.log` | The cred agent's lock (with its pid), its socket path and its output | None (chmod 0600) |
+| `agent.sock` (+ `.lock`) | The cred agent's socket when `$XDG_RUNTIME_DIR` is unset; otherwise `$XDG_RUNTIME_DIR/atem/cred-agent.sock` | Socket 0600, same user only |
+
+Revoked keys set aside by `atem unpair` stay in `cred/` as `<name>.revoked-<stamp>`.
 
 Machine-bound files can't be decrypted on another machine. `device_keys.sealed` opens only with a storage key from your Mac.
 

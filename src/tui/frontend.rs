@@ -618,6 +618,7 @@ mod tests {
             rows: 4,
             cols: 20,
             generation: "g".into(),
+            worker_build: None,
         }
     }
 

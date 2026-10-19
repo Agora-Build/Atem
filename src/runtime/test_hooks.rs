@@ -18,6 +18,9 @@
 //!
 //!   A fault marker is removed when it is used, and its name is appended to
 //!   `<dir>/used`.
+//! - `ATEM_TEST_BUILD=<id>`: this process reports `<id>` as its build
+//!   (`cred_agent::build_id`), so a binary test can run a runtime that looks
+//!   like another atem build.
 
 #[cfg(debug_assertions)]
 mod imp {
@@ -32,6 +35,10 @@ mod imp {
     fn clock_file() -> Option<&'static PathBuf> {
         static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
         env_path("ATEM_TEST_CLOCK_FILE", &CELL)
+    }
+
+    pub fn build() -> Option<String> {
+        std::env::var("ATEM_TEST_BUILD").ok()
     }
 
     fn faults_dir() -> Option<&'static PathBuf> {
@@ -80,6 +87,14 @@ mod imp {
 pub fn clock_ms() -> Option<u64> {
     #[cfg(debug_assertions)]
     return imp::clock_ms();
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+/// The build this process reports instead of its own, when one is set.
+pub fn build() -> Option<String> {
+    #[cfg(debug_assertions)]
+    return imp::build();
     #[cfg(not(debug_assertions))]
     None
 }

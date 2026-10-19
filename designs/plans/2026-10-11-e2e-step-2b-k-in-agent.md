@@ -1,12 +1,12 @@
-# E2E Build Step 2b: `K` Behind the Key Agent — Implementation Plan
+# E2E Build Step 2b: `K` Behind the Cred Agent — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Move the account key `K` (and its previous keys) into the key agent's sealed payload, make the agent the only code that ever uses `K` (batched `Crypt` requests), derive the encryption mode from the signed account state alone, move project names to `project_names.json`, and migrate away `data_keys.enc`.
+**Goal:** Move the account key `K` (and its previous keys) into the cred agent's sealed payload, make the agent the only code that ever uses `K` (batched `Crypt` requests), derive the encryption mode from the signed account state alone, move project names to `project_names.json`, and migrate away `data_keys.enc`.
 
-**Architecture:** `device_keys.sealed` gains an `account_keys` field inside its encrypted payload; the agent installs granted `K`s itself (`InstallGrant`) by re-sealing the file it holds the storage key for, and serves `Crypt { astation_id, ops }` (seal / open / keyed hash in the unchanged `e1.`/`h1.` formats). `EncryptionContext` becomes a thin client: it reads mode and kid from the latest signed account state in `cred_state.json`, never touches the agent when encryption is off, and batches one call site's fields into as few `Crypt` requests as a size budget allows. At the first unlock the agent moves `data_keys.enc` into the sealed payload and `project_names.json`, then deletes it.
+**Architecture:** `device_keys.sealed` gains an `account_keys` field inside its encrypted payload; the agent installs granted `K`s itself (`InstallGrant`) by re-sealing the file it holds the storage key for, and serves `Crypt { astation_id, ops }` (seal / open / keyed hash in the unchanged `e1.`/`h1.` formats). `EncryptionContext` becomes a thin client: it reads mode and kid from the latest signed account state in `cred/state.json`, never touches the agent when encryption is off, and batches one call site's fields into as few `Crypt` requests as a size budget allows. At the first unlock the agent moves `data_keys.enc` into the sealed payload and `project_names.json`, then deletes it.
 
-**Tech Stack:** Rust 2024 (bin crate `atem`), serde/serde_json, chacha20poly1305 0.10 (XChaCha20-Poly1305), hmac 0.12 + sha2 0.10, zeroize 1 (serde feature), tokio (`spawn_blocking`), existing in-process test agent (`Mutex<KeyAgent>`) and `FakeKeyServer`.
+**Tech Stack:** Rust 2024 (bin crate `atem`), serde/serde_json, chacha20poly1305 0.10 (XChaCha20-Poly1305), hmac 0.12 + sha2 0.10, zeroize 1 (serde feature), tokio (`spawn_blocking`), existing in-process test agent (`Mutex<CredAgent>`) and `FakeKeyServer`.
 
 **Spec:** `designs/e2e-encryption.md` ("Keys on disk (atem)", "What each side stores", "Memory, skills and vault notes", "Migration", step 2a sections). This plan's scope was decided with the user; the decisions are listed in "Scope" below and implemented exactly.
 
@@ -22,17 +22,17 @@
 ## Scope (decided with the user)
 
 1. `K` storage: the sealed payload gains `account_keys` (account → current kid + key, previous keys by kid). Storage-key rotation re-seals it. Installing/replacing `K` = the agent atomically re-seals the current sealed file under the current storage key; a new `K` arrives via a signed grant, so a crashed re-seal is recovered by requesting `K` again.
-2. Mode and kid come from the latest signed account state in `cred_state.json`. `StoredMode` and the "local state doesn't match" check are removed. Unverified devices: mode Off.
+2. Mode and kid come from the latest signed account state in `cred/state.json`. `StoredMode` and the "local state doesn't match" check are removed. Unverified devices: mode Off.
 3. Project names live in `~/.config/atem/project_names.json` (0600, `write_private`, no secrets). The HMAC is computed by the agent.
 4. `data_keys.enc` is migrated at the first unlock (or at agent start when it starts unlocked) and deleted; unverified devices just delete it. Crash-safe ordering + tests.
 5. The agent never hands out `K`: batched `Crypt`; secrets `Zeroizing` on the wire; `OpenGrant` no longer returns `K`.
-6. `EncryptionContext` keeps its public methods; pull/push/migrate send one `Crypt` per batch. Every sync agent call from async code goes through `key_agent::blocking` (R7).
+6. `EncryptionContext` keeps its public methods; pull/push/migrate send one `Crypt` per batch. Every sync agent call from async code goes through `cred_agent::blocking` (R7).
 7. A locked agent with encryption on errors like a missing key ("run `atem cred unlock`"), queued ops stay queued. Off / unverified never touch the agent.
 8. Out of scope: `K` subkeys / format changes (step 3), auto-unlock (step 7), credentials get/list (step 5).
 
 ## Rulings made while planning (beyond the scope list)
 
-- `Crypt` names the Astation (`astation_id`), not the account: the agent derives the account and the signed state from that one `cred_state.json` entry, so a caller can't pair one Astation's state with another account's key.
+- `Crypt` names the Astation (`astation_id`), not the account: the agent derives the account and the signed state from that one `cred/state.json` entry, so a caller can't pair one Astation's state with another account's key.
 - Requests are `InstallGrant` (installs, returns the kid) and `CheckGrant` (verification staging, returns the kid, stores nothing); `OpenGrant` and `Reply::Grant` are removed, so no request returns `K`.
 - Agent protocol bumped to v2: a step-2a agent left running gets the existing "stop it and retry" message instead of a confusing "malformed request".
 - `MAX_LINE` 1 MiB → 8 MiB; `EncryptionContext` splits batches at 2 MiB / 1024 ops (one skill, max 1 MiB, always fits).
@@ -40,7 +40,7 @@
 - `data_keys.enc` is deleted only when the agent is escrowed and not unlocked via `.prev`; an unreadable one is deleted; an unverified device's is deleted at agent start.
 - Fresh-key verification still checks grants in-process (this process holds the fresh device key anyway) and drops `K` at once; the agent installs after the write. An install failure after a saved verification is a warning, not an error.
 - Single-item `EncryptionContext` methods production no longer calls (`open`, `keyed_hash`, `encrypt_memory`, `decrypt_memory`, `encrypt_skill`) become `#[cfg(test)]`.
-- `project_names.json` writes take an `flock` on `project_names.lock` (the same helper `cred_state.json` uses).
+- `project_names.json` writes take an `flock` on `project_names.lock` (the same helper `cred/state.json` uses).
 - `key_needed` treats a locked agent as "K missing".
 - `persist` refuses to re-seal a file whose storage kid isn't the one the agent holds.
 
@@ -54,9 +54,9 @@
 | `src/memory/k_agent_tests.rs` | Create | (test-only) the agent holding `K`: install, crypt, rotation, reconcile, migration crash windows |
 | `src/memory/device_keys.rs` | Modify | Sealed plaintext carries optional `account_keys` |
 | `src/memory/storage_key.rs` | Modify | `seal_with` / `open_with_accounts` |
-| `src/memory/key_agent.rs` | Modify | `Unlocked.accounts`, `persist`, `reconcile`, `InstallGrant`, `CheckGrant`, `Crypt`, `HeldKid`; `OpenGrant`/`Reply::Grant` removed; protocol v2; `data_keys.enc` migration |
+| `src/memory/cred_agent.rs` | Modify | `Unlocked.accounts`, `persist`, `reconcile`, `InstallGrant`, `CheckGrant`, `Crypt`, `HeldKid`; `OpenGrant`/`Reply::Grant` removed; protocol v2; `data_keys.enc` migration |
 | `src/memory/agent_socket.rs` | Modify | `crypt`/`crypted` parsed straight into `Zeroizing`; `grant` special case removed; `MAX_LINE` 8 MiB |
-| `src/memory/verification.rs` | Modify | `KeyPaths.project_names`, `AccountMode`/`account_mode`, `stored_state` pub(crate), `apply_grant`/`complete_verification`/`key_needed` use the agent; `VerifiedForTest` removed |
+| `src/memory/verification.rs` | Modify | `CredPaths.project_names`, `AccountMode`/`account_mode`, `stored_state` pub(crate), `apply_grant`/`complete_verification`/`key_needed` use the agent; `VerifiedForTest` removed |
 | `src/memory/trust.rs` | Modify | `verified_entries()`; `trust_path_for` removed |
 | `src/memory/crypto.rs` | Modify | `StoredKeys` & co. removed; `EncryptionContext` thin client with batching and `blocking` |
 | `src/memory/api.rs` | Modify | Batched encrypt/decrypt inside `EncryptionContext::blocking`; test hook `with_encryption` |
@@ -65,7 +65,7 @@
 | `src/memory/e2e_tests.rs` | Modify | Relay tests against the agent-backed context; batching and copied-config-dir tests |
 | `src/memory/unlock.rs`, `src/websocket_client.rs` | Modify | `key_needed` takes the agent and runs on a blocking thread |
 | `src/memory/mod.rs` | Modify | Register new modules |
-| `tests/key_agent_binary.rs` | Modify | Protocol v2 literal |
+| `tests/cred_agent_binary.rs` | Modify | Protocol v2 literal |
 | `designs/e2e-encryption.md`, `AGENTS.md` | Modify | Status, step-2b description, files |
 
 ---
@@ -91,7 +91,7 @@
 
 - [ ] **Step 1: Register the module**
 
-In `src/memory/mod.rs` (edit by hand, never rustfmt), add after `pub mod key_agent;`:
+In `src/memory/mod.rs` (edit by hand, never rustfmt), add after `pub mod cred_agent;`:
 
 ```rust
 pub mod account_keys;
@@ -313,7 +313,7 @@ Expected: FAIL to compile (`AccountKeys`, `CryptOp`, `seal_field_with_nonce` …
 Put this at the top of `src/memory/account_keys.rs`:
 
 ```rust
-//! The account keys `K` (current and previous, per account) as the key agent
+//! The account keys `K` (current and previous, per account) as the cred agent
 //! holds them, and the field operations it performs for callers that never
 //! see `K`: `e1.` seals and opens, `h1.` keyed hashes. Formats and associated
 //! data are exactly those of build steps 0–2a, so ciphertext on the relay
@@ -639,14 +639,14 @@ impl CryptOut {
     pub fn into_text(self) -> Result<String> {
         match self {
             Self::Sealed(value) | Self::Hashed(value) => Ok(value),
-            Self::Opened(_) => bail!("the key agent answered an open where a seal or hash was asked"),
+            Self::Opened(_) => bail!("the cred agent answered an open where a seal or hash was asked"),
         }
     }
 
     pub fn into_plain(self) -> Result<Zeroizing<Vec<u8>>> {
         match self {
             Self::Opened(encoded) => decode_bytes(&encoded, "an opened field"),
-            _ => bail!("the key agent answered a seal or hash where an open was asked"),
+            _ => bail!("the cred agent answered a seal or hash where an open was asked"),
         }
     }
 }
@@ -763,7 +763,7 @@ Expected: builds. `dead_code` warnings for the new items are expected until Task
 
 ```bash
 git add src/memory/account_keys.rs src/memory/mod.rs
-git commit -m "feat(memory): account keys and the e1/h1 field operations for the key agent
+git commit -m "feat(memory): account keys and the e1/h1 field operations for the cred agent
 
 🤖 Built with SMT <smt@agora.build>"
 ```
@@ -1061,7 +1061,7 @@ git commit -m "feat(memory): device_keys.sealed carries the account keys
 
 **Files:**
 - Create: `src/memory/project_names.rs`
-- Modify: `src/memory/mod.rs` (one line), `src/memory/verification.rs` (`KeyPaths`, `stored_state`, new `AccountMode`/`account_mode`, test), `src/memory/trust.rs` (`verified_entries`)
+- Modify: `src/memory/mod.rs` (one line), `src/memory/verification.rs` (`CredPaths`, `stored_state`, new `AccountMode`/`account_mode`, test), `src/memory/trust.rs` (`verified_entries`)
 - Test: `src/memory/project_names.rs`, `src/memory/verification.rs`
 
 **Interfaces:**
@@ -1070,7 +1070,7 @@ git commit -m "feat(memory): device_keys.sealed carries the account keys
   - `pub struct ProjectNames` with `load_from(&Path) -> Result<Self>`, `name(&self, account: &str, hash: &str) -> Option<&str>`, `len(&self, account: &str) -> usize`
   - `pub fn remember(path: &Path, account: &str, pairs: impl IntoIterator<Item = (String, String)>) -> Result<()>`
   - `pub fn forget_account_at(path: &Path, account: &str) -> Result<()>`
-  - `KeyPaths.project_names: PathBuf` (`<dir>/project_names.json`)
+  - `CredPaths.project_names: PathBuf` (`<dir>/project_names.json`)
   - `pub(crate) fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>>` (verification.rs, was private)
   - `pub struct AccountMode { pub mode: EncryptionMode, pub data_account: String, pub kid: Option<String> }` and `pub fn account_mode(trust_path: &Path, astation_id: &str) -> Result<AccountMode>` (verification.rs)
   - `TrustStore::verified_entries(&self) -> impl Iterator<Item = &AstationTrust>`
@@ -1174,7 +1174,7 @@ Expected: FAIL to compile (`ProjectNames`, `remember`, `forget_account_at` not f
 ```rust
 //! `~/.config/atem/project_names.json`: the readable project key each `h1.`
 //! project hash on the relay stands for, per account. The relay sees only
-//! the hash (keyed by `K`, which never leaves the key agent); atem keeps the
+//! the hash (keyed by `K`, which never leaves the cred agent); atem keeps the
 //! names locally to show and filter by them. No secrets, still 0600 and
 //! written atomically. See designs/e2e-encryption.md "What each side stores".
 use anyhow::{Context, Result, bail};
@@ -1232,8 +1232,8 @@ impl ProjectNames {
 }
 
 /// Records `hash → name` pairs for `account`: a read-modify-write under an
-/// `flock` on `project_names.lock` (the helper cred_state.json uses), so the
-/// key agent and other atem commands keep each other's names. Writes only
+/// `flock` on `project_names.lock` (the helper cred/state.json uses), so the
+/// cred agent and other atem commands keep each other's names. Writes only
 /// when something is new.
 pub fn remember(
     path: &Path,
@@ -1280,7 +1280,7 @@ pub fn forget_account_at(path: &Path, account: &str) -> Result<()> {
 Run: `cargo test memory::project_names`
 Expected: PASS (4 tests).
 
-- [ ] **Step 6: `KeyPaths.project_names`, `verified_entries`, `stored_state`, `account_mode` — write the failing tests**
+- [ ] **Step 6: `CredPaths.project_names`, `verified_entries`, `stored_state`, `account_mode` — write the failing tests**
 
 In `src/memory/verification.rs`, test `key_paths_name_every_key_file` (in `mod tests`), add:
 
@@ -1343,18 +1343,18 @@ Expected: FAIL to compile (`project_names` field, `account_mode`, `AccountMode`,
 
 `src/memory/verification.rs` (edit by hand):
 
-1. In `struct KeyPaths`, replace `pub data_keys: PathBuf,` with:
+1. In `struct CredPaths`, replace `pub data_keys: PathBuf,` with:
 
 ```rust
     /// `data_keys.enc` from build steps 0–2a (`K`, project names, under the
-    /// machine-bound key). The key agent moves it into `device_keys_sealed`
+    /// machine-bound key). The cred agent moves it into `device_keys_sealed`
     /// and `project_names` at the first unlock and deletes it.
     pub data_keys: PathBuf,
     /// `project_names.json`: `h1.` project hash → readable project key.
     pub project_names: PathBuf,
 ```
 
-2. In `KeyPaths::in_dir`, after `data_keys: dir.join("data_keys.enc"),` add `project_names: dir.join("project_names.json"),`.
+2. In `CredPaths::in_dir`, after `data_keys: dir.join("data_keys.enc"),` add `project_names: dir.join("project_names.json"),`.
 
 3. Change `fn stored_state(entry: &AstationTrust)` to `pub(crate) fn stored_state(entry: &AstationTrust)`.
 
@@ -1413,10 +1413,10 @@ git commit -m "feat(memory): project_names.json and the mode from the signed sta
 
 ---
 
-### Task 4: The key agent holds `K` and serves `Crypt`
+### Task 4: The cred agent holds `K` and serves `Crypt`
 
 **Files:**
-- Modify: `src/memory/key_agent.rs`
+- Modify: `src/memory/cred_agent.rs`
 - Modify: `src/memory/fake_astation.rs` (test helpers)
 - Create: `src/memory/k_agent_tests.rs`
 - Modify: `src/memory/mod.rs` (one line)
@@ -1429,14 +1429,14 @@ git commit -m "feat(memory): project_names.json and the mode from the signed sta
   - `Request::CheckGrant { grant: GrantWire, trust: AstationTrust }` → `Reply::GrantChecked { kid: String }`
   - `Request::Crypt { astation_id: String, ops: Vec<CryptOp> }` → `Reply::Crypted { results: Vec<CryptOut> }`
   - `Request::HeldKid { astation_id: String }` → `Reply::HeldKid { kid: Option<String> }`
-  - `KeyAgentApi::install_grant(&self, astation_id: &str, grant: &GrantWire) -> Result<String>`
-  - `KeyAgentApi::check_grant(&self, grant: &GrantWire, trust: &AstationTrust) -> Result<String>`
-  - `KeyAgentApi::crypt(&self, astation_id: &str, ops: Vec<CryptOp>) -> Result<Vec<CryptOut>>`
-  - `KeyAgentApi::held_kid(&self, astation_id: &str) -> Result<Option<String>>`
-  - `impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T>`
+  - `CredAgentApi::install_grant(&self, astation_id: &str, grant: &GrantWire) -> Result<String>`
+  - `CredAgentApi::check_grant(&self, grant: &GrantWire, trust: &AstationTrust) -> Result<String>`
+  - `CredAgentApi::crypt(&self, astation_id: &str, ops: Vec<CryptOp>) -> Result<Vec<CryptOut>>`
+  - `CredAgentApi::held_kid(&self, astation_id: &str) -> Result<Option<String>>`
+  - `impl<T: CredAgentApi + ?Sized> CredAgentApi for std::sync::Arc<T>`
   - `pub(crate) fn open_sealed_checked(...) -> Result<(DeviceKeys, AccountKeys)>`
-  - `#[cfg(test)] pub(crate) fn holds_k(agent: &dyn KeyAgentApi, astation_id: &str) -> bool`
-  - fake_astation: `pub(crate) fn unlock_with(agent: &dyn KeyAgentApi, server: &FakeKeyServer, paths: &KeyPaths) -> Result<String>`, `pub(crate) fn set_state(paths: &KeyPaths, astation: &FakeAstation, mode: EncryptionMode, kid: Option<&str>, epoch: u64)`, `pub(crate) struct UnlockedDevice { pub paths, pub server, pub keys, pub agent: Arc<Mutex<KeyAgent>>, .. }` with `new(dir: &Path) -> Self`, `state(&mut self, mode, kid: Option<&str>)`, `grant(&self, kid: &str, key: [u8; 32]) -> GrantWire`, `set_key(&mut self, mode, kid: &str, key: [u8; 32])`
+  - `#[cfg(test)] pub(crate) fn holds_k(agent: &dyn CredAgentApi, astation_id: &str) -> bool`
+  - fake_astation: `pub(crate) fn unlock_with(agent: &dyn CredAgentApi, server: &FakeKeyServer, paths: &CredPaths) -> Result<String>`, `pub(crate) fn set_state(paths: &CredPaths, astation: &FakeAstation, mode: EncryptionMode, kid: Option<&str>, epoch: u64)`, `pub(crate) struct UnlockedDevice { pub paths, pub server, pub keys, pub agent: Arc<Mutex<CredAgent>>, .. }` with `new(dir: &Path) -> Self`, `state(&mut self, mode, kid: Option<&str>)`, `grant(&self, kid: &str, key: [u8; 32]) -> GrantWire`, `set_key(&mut self, mode, kid: &str, key: [u8; 32])`
   - `OpenGrant` / `Reply::Grant` still exist after this task (removed in Task 5).
 
 - [ ] **Step 1: Register the test module**
@@ -1456,7 +1456,7 @@ Add to the imports of `src/memory/fake_astation.rs`:
 use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::UnlockAuthKey;
 use crate::memory::grant::{GrantWire, seal_k_grant};
-use crate::memory::key_agent::{KeyAgent, KeyAgentApi, build_unlock_request, test_agent};
+use crate::memory::cred_agent::{CredAgent, CredAgentApi, build_unlock_request, test_agent};
 use crate::memory::statements::AccountState;
 use std::sync::{Arc, Mutex};
 ```
@@ -1466,9 +1466,9 @@ Append (before the file's `mod tests`):
 ```rust
 /// What `atem cred unlock` does with `agent`, against `server`.
 pub(crate) fn unlock_with(
-    agent: &dyn KeyAgentApi,
+    agent: &dyn CredAgentApi,
     server: &FakeKeyServer,
-    paths: &KeyPaths,
+    paths: &CredPaths,
 ) -> Result<String> {
     let challenge = agent.begin_unlock(ASTATION_ID)?;
     let unlock_auth = UnlockAuthKey::load_from(&paths.unlock_auth_key)?
@@ -1481,7 +1481,7 @@ pub(crate) fn unlock_with(
 /// Signs `mode`/`kid` at `epoch` as `astation` and accepts it into
 /// `paths.trust`, as `apply_account_state` does.
 pub(crate) fn set_state(
-    paths: &KeyPaths,
+    paths: &CredPaths,
     astation: &FakeAstation,
     mode: EncryptionMode,
     kid: Option<&str>,
@@ -1507,10 +1507,10 @@ pub(crate) fn set_state(
 /// A verified device with its home Astation, unlocked through the
 /// in-process agent (shared, so contexts and clients can hold it).
 pub(crate) struct UnlockedDevice {
-    pub paths: KeyPaths,
+    pub paths: CredPaths,
     pub server: FakeKeyServer,
     pub keys: DeviceKeys,
-    pub agent: Arc<Mutex<KeyAgent>>,
+    pub agent: Arc<Mutex<CredAgent>>,
     epoch: u64,
 }
 
@@ -1561,7 +1561,7 @@ impl UnlockedDevice {
 Create `src/memory/k_agent_tests.rs`:
 
 ```rust
-//! The key agent holding `K` (build step 2b): installed from signed grants,
+//! The cred agent holding `K` (build step 2b): installed from signed grants,
 //! kept sealed, used only through `Crypt`, retired by signed states.
 use base64::{Engine, engine::general_purpose::STANDARD};
 
@@ -1570,7 +1570,7 @@ use crate::memory::crypto::{EncryptionMode, fail_writes_to};
 use crate::memory::fake_astation::{
     ASTATION_ID, UnlockedDevice, sealed_device, set_state, unlock_with,
 };
-use crate::memory::key_agent::{KeyAgentApi, error_of, holds_k, test_agent};
+use crate::memory::cred_agent::{CredAgentApi, error_of, holds_k, test_agent};
 use crate::memory::trust::TrustStore;
 
 const A: &str = "0123abcd";
@@ -1751,7 +1751,7 @@ fn check_grant_opens_against_given_pins_and_stores_nothing() {
 Run: `cargo test memory::k_agent_tests`
 Expected: FAIL to compile (`install_grant`, `crypt`, `held_kid`, `check_grant`, `holds_k` not found).
 
-- [ ] **Step 5: Implement in `key_agent.rs`**
+- [ ] **Step 5: Implement in `cred_agent.rs`**
 
 1. Imports: add
 
@@ -1762,14 +1762,14 @@ use crate::memory::account_keys::{AccountKeys, CryptOp, CryptOut, SignedModes};
 use crate::memory::crypto::EncryptionMode;
 ```
 
-and change `use crate::memory::verification::KeyPaths;` to `use crate::memory::verification::{KeyPaths, stored_state};`.
+and change `use crate::memory::verification::CredPaths;` to `use crate::memory::verification::{CredPaths, stored_state};`.
 
 2. In `enum Request`, add after the `OpenGrant { .. }` variant:
 
 ```rust
     /// Opens a `K` grant from a verified Astation and stores `K` in the
     /// sealed file (it is never handed back). The grant must name the kid
-    /// of the latest signed account state in cred_state.json.
+    /// of the latest signed account state in cred/state.json.
     InstallGrant {
         astation_id: String,
         grant: GrantWire,
@@ -1891,7 +1891,7 @@ with
             accounts: AccountKeys::default(),
 ```
 
-11. Add these methods to `impl KeyAgent` (after `open_grant`):
+11. Add these methods to `impl CredAgent` (after `open_grant`):
 
 ```rust
     fn install_grant(&mut self, astation_id: &str, grant: &GrantWire) -> Result<Reply> {
@@ -2036,12 +2036,12 @@ with
     /// agent was locked. Never fatal: logged.
     fn after_unlock(&mut self) {
         if let Err(error) = self.reconcile() {
-            eprintln!("key agent: {error:#}");
+            eprintln!("cred agent: {error:#}");
         }
     }
 ```
 
-12. Add to `trait KeyAgentApi` (after `open_grant`):
+12. Add to `trait CredAgentApi` (after `open_grant`):
 
 ```rust
     /// Installs a granted `K` in the agent; returns its kid.
@@ -2074,7 +2074,7 @@ with
             ops,
         })? {
             Reply::Crypted { results } if results.len() == count => Ok(results),
-            Reply::Crypted { .. } => bail!("the key agent answered a different number of operations"),
+            Reply::Crypted { .. } => bail!("the cred agent answered a different number of operations"),
             _ => unexpected(),
         }
     }
@@ -2090,11 +2090,11 @@ with
     }
 ```
 
-13. After `impl KeyAgentApi for std::sync::Mutex<KeyAgent>`, add:
+13. After `impl CredAgentApi for std::sync::Mutex<CredAgent>`, add:
 
 ```rust
-/// A shared agent (`EncryptionContext` holds an `Arc<dyn KeyAgentApi>`).
-impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T> {
+/// A shared agent (`EncryptionContext` holds an `Arc<dyn CredAgentApi>`).
+impl<T: CredAgentApi + ?Sized> CredAgentApi for std::sync::Arc<T> {
     fn call(&self, request: Request) -> Result<Reply> {
         (**self).call(request)
     }
@@ -2106,7 +2106,7 @@ impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T> {
 ```rust
 /// Whether `agent` holds `K` for `astation_id`'s account: it can seal.
 #[cfg(test)]
-pub(crate) fn holds_k(agent: &dyn KeyAgentApi, astation_id: &str) -> bool {
+pub(crate) fn holds_k(agent: &dyn CredAgentApi, astation_id: &str) -> bool {
     agent
         .crypt(astation_id, vec![CryptOp::seal("mem", "content", b"x")])
         .is_ok()
@@ -2118,7 +2118,7 @@ pub(crate) fn holds_k(agent: &dyn KeyAgentApi, astation_id: &str) -> bool {
 Run: `cargo test memory::k_agent_tests`
 Expected: PASS (9 tests).
 
-Run: `cargo test memory::key_agent`
+Run: `cargo test memory::cred_agent`
 Expected: PASS (existing tests unchanged; `open_sealed_checked` callers use `.is_ok()` / `error_of`).
 
 Run: `cargo test memory::verification`
@@ -2127,9 +2127,9 @@ Expected: PASS.
 - [ ] **Step 7: Format and commit**
 
 ```bash
-rustfmt --edition 2024 src/memory/key_agent.rs src/memory/fake_astation.rs src/memory/k_agent_tests.rs
-git add src/memory/key_agent.rs src/memory/fake_astation.rs src/memory/k_agent_tests.rs src/memory/mod.rs
-git commit -m "feat(memory): the key agent installs K, keeps it sealed and serves Crypt
+rustfmt --edition 2024 src/memory/cred_agent.rs src/memory/fake_astation.rs src/memory/k_agent_tests.rs
+git add src/memory/cred_agent.rs src/memory/fake_astation.rs src/memory/k_agent_tests.rs src/memory/mod.rs
+git commit -m "feat(memory): the cred agent installs K, keeps it sealed and serves Crypt
 
 🤖 Built with SMT <smt@agora.build>"
 ```
@@ -2140,15 +2140,15 @@ git commit -m "feat(memory): the key agent installs K, keeps it sealed and serve
 
 **Files:**
 - Modify: `src/memory/verification.rs` (`apply_account_state`, `apply_grant`, `complete_verification`, `key_needed`, tests)
-- Modify: `src/memory/key_agent.rs` (remove `OpenGrant`, `Reply::Grant`, `open_grant`; tests)
+- Modify: `src/memory/cred_agent.rs` (remove `OpenGrant`, `Reply::Grant`, `open_grant`; tests)
 - Modify: `src/memory/agent_socket.rs` (remove the `grant` reply special case; tests)
 - Modify: `src/memory/unlock.rs`, `src/websocket_client.rs` (`key_needed` call sites)
-- Test: `src/memory/verification.rs`, `src/memory/key_agent.rs`, `src/memory/agent_socket.rs`
+- Test: `src/memory/verification.rs`, `src/memory/cred_agent.rs`, `src/memory/agent_socket.rs`
 
 **Interfaces:**
 - Consumes: Task 4 (`install_grant`, `check_grant`, `held_kid`, `holds_k`), Task 3 (`account_mode`, `project_names::forget_account_at`).
 - Produces:
-  - `pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) -> Result<bool>` (blocking: agent call; a locked agent counts as not holding `K`)
+  - `pub fn key_needed(paths: &CredPaths, agent: &dyn CredAgentApi, astation_id: &str) -> Result<bool>` (blocking: agent call; a locked agent counts as not holding `K`)
   - `apply_grant` unchanged signature; installs through the agent.
   - `complete_verification` unchanged signature; installs grants through the agent after the write; an install failure becomes `outcome.warning`.
   - After this task `data_keys.enc` is never written by atem (only purged at a first verification).
@@ -2157,7 +2157,7 @@ git commit -m "feat(memory): the key agent installs K, keeps it sealed and serve
 
 In `src/memory/verification.rs`:
 
-(a) `mod tests` imports: replace `use crate::memory::crypto::{EncryptionContext, EncryptionMode};` with `use crate::memory::crypto::EncryptionMode;` and `use crate::memory::key_agent::{KeyAgent, test_agent};` with `use crate::memory::key_agent::{KeyAgent, holds_k, test_agent};`.
+(a) `mod tests` imports: replace `use crate::memory::crypto::{EncryptionContext, EncryptionMode};` with `use crate::memory::crypto::EncryptionMode;` and `use crate::memory::cred_agent::{CredAgent, test_agent};` with `use crate::memory::cred_agent::{CredAgent, holds_k, test_agent};`.
 
 (b) `verification_installs_signed_state_and_key`: replace the two lines starting `let context = EncryptionContext::for_astation_at` / `assert!(context.seal(...` with:
 
@@ -2193,7 +2193,7 @@ with
 
 (e) `verified_device_without_a_state_refuses_to_build_a_context`: replace `let error = EncryptionContext::for_astation_at(ASTATION_ID, &paths.data_keys)` with `let error = account_mode(&paths.trust, ASTATION_ID)`.
 
-(f) `ceremony_tests` imports: replace `use crate::memory::key_agent::{error_of, test_agent};` with `use crate::memory::key_agent::{error_of, holds_k, test_agent};`.
+(f) `ceremony_tests` imports: replace `use crate::memory::cred_agent::{error_of, test_agent};` with `use crate::memory::cred_agent::{error_of, holds_k, test_agent};`.
 
 (g) `replayed_old_certificate_cannot_roll_a_verified_device_back` and `legitimate_re_verification_keeps_mode_and_key`: replace
 
@@ -2249,7 +2249,7 @@ with
         });
         assert!(!result.unwrap().key_needed);
         let empty = tempfile::tempdir().unwrap();
-        let locked = test_agent(&KeyPaths::in_dir(empty.path()));
+        let locked = test_agent(&CredPaths::in_dir(empty.path()));
         assert!(!key_needed(&paths, &locked, ASTATION_ID).unwrap(), "off needs no K");
         assert!(!key_needed(&paths, &locked, "never-verified").unwrap());
     }
@@ -2264,7 +2264,7 @@ with
         assert!(holds_k(&agent, ASTATION_ID));
 ```
 
-(m) `NewerStateMeanwhile::call`: replace `let open = matches!(request, crate::memory::key_agent::Request::OpenGrant { .. });` with `let open = matches!(request, crate::memory::key_agent::Request::CheckGrant { .. });`. In `a_newer_state_applied_during_re_verification_is_kept`, replace the comment `// data_keys still announces the newer kid: its grant installs.` with `// The signed state names the newer kid: its grant installs.` and replace the final block from `let context = EncryptionContext::for_astation_at(` to the end of the test with:
+(m) `NewerStateMeanwhile::call`: replace `let open = matches!(request, crate::memory::cred_agent::Request::OpenGrant { .. });` with `let open = matches!(request, crate::memory::cred_agent::Request::CheckGrant { .. });`. In `a_newer_state_applied_during_re_verification_is_kept`, replace the comment `// data_keys still announces the newer kid: its grant installs.` with `// The signed state names the newer kid: its grant installs.` and replace the final block from `let context = EncryptionContext::for_astation_at(` to the end of the test with:
 
 ```rust
         let mode = account_mode(&paths.trust, ASTATION_ID).unwrap();
@@ -2274,7 +2274,7 @@ with
     }
 ```
 
-In `src/memory/key_agent.rs` `mod tests`:
+In `src/memory/cred_agent.rs` `mod tests`:
 
 (n) `a_new_agent_is_locked`: replace `agent.open_grant(ASTATION_ID, &grant, None)` with `agent.install_grant(ASTATION_ID, &grant)`.
 
@@ -2358,8 +2358,8 @@ Expected: FAIL to compile (`key_needed` arity, `Request::OpenGrant` still matche
 
 - [ ] **Step 2: Remove `OpenGrant` and the `K`-carrying reply**
 
-`src/memory/key_agent.rs`:
-- Delete the `Request::OpenGrant { .. }` variant (with its doc comment), the `Reply::Grant { .. }` variant (with its doc comment), the `Request::OpenGrant { .. } => self.open_grant(..)` arm in `handle`, the private `fn open_grant(&self, ...)` method of `KeyAgent`, and the `fn open_grant(...) -> Result<OpenedGrant>` method of `KeyAgentApi`.
+`src/memory/cred_agent.rs`:
+- Delete the `Request::OpenGrant { .. }` variant (with its doc comment), the `Reply::Grant { .. }` variant (with its doc comment), the `Request::OpenGrant { .. } => self.open_grant(..)` arm in `handle`, the private `fn open_grant(&self, ...)` method of `CredAgent`, and the `fn open_grant(...) -> Result<OpenedGrant>` method of `CredAgentApi`.
 - Change `use crate::memory::grant::{GrantWire, OpenedGrant, hpke_open, hpke_seal, open_grant as open_sealed_grant};` to `use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, open_grant as open_sealed_grant};`.
 
 `src/memory/agent_socket.rs`:
@@ -2381,11 +2381,11 @@ Replace `apply_account_state`'s body after `let Some(state) = trust.accept_accou
 Replace `apply_grant` with:
 
 ```rust
-/// Installs a signed `K` grant for this verified device. The key agent opens
+/// Installs a signed `K` grant for this verified device. The cred agent opens
 /// it and keeps `K` sealed; nothing returns `K` to this process.
 pub fn apply_grant(
-    paths: &KeyPaths,
-    agent: &dyn KeyAgentApi,
+    paths: &CredPaths,
+    agent: &dyn CredAgentApi,
     astation_id: &str,
     grant: Option<&GrantWire>,
 ) -> Result<Applied> {
@@ -2414,8 +2414,8 @@ Replace `complete_verification` (whole function, doc comment kept) with:
 
 ```rust
 pub fn complete_verification(
-    paths: &KeyPaths,
-    agent: &dyn KeyAgentApi,
+    paths: &CredPaths,
+    agent: &dyn CredAgentApi,
     astation_id: &str,
     keys: VerificationKeys,
     device_verified: &SignedWire,
@@ -2449,7 +2449,7 @@ pub fn complete_verification(
             }
             if staged.home_is_set() && staged.home() != Some(astation_id) {
                 bail!(
-                    "this device's home Astation is {}; verify with it, or start over (delete ~/.config/atem/cred_state.json too)",
+                    "this device's home Astation is {}; verify with it, or start over (delete ~/.config/atem/cred/state.json too)",
                     staged.recorded_home().unwrap_or_default()
                 );
             }
@@ -2460,7 +2460,7 @@ pub fn complete_verification(
                 bail!("{LOCKED}, then `atem pair` again");
             }
             if agent.public_keys()? != (publics.device_pub, publics.device_sign_pub) {
-                bail!("the key agent holds other device keys than this verification revealed");
+                bail!("the cred agent holds other device keys than this verification revealed");
             }
         }
     }
@@ -2582,7 +2582,7 @@ pub fn complete_verification(
         }
         if let Err(error) = agent.install_grant(astation_id, grant) {
             warnings.push(format!(
-                "the encryption key couldn't be stored in the key agent ({error:#}); atem asks Astation for it again"
+                "the encryption key couldn't be stored in the cred agent ({error:#}); atem asks Astation for it again"
             ));
         }
     }
@@ -2610,10 +2610,10 @@ Replace `key_needed` with:
 
 ```rust
 /// Whether this device is verified with `astation_id`, its signed state
-/// needs `K`, and the key agent doesn't hold that `K` (a locked agent counts
+/// needs `K`, and the cred agent doesn't hold that `K` (a locked agent counts
 /// as not holding it): then it should send `keyRequest`. Blocking: from
-/// async code call it inside `key_agent::blocking`.
-pub fn key_needed(paths: &KeyPaths, agent: &dyn KeyAgentApi, astation_id: &str) -> Result<bool> {
+/// async code call it inside `cred_agent::blocking`.
+pub fn key_needed(paths: &CredPaths, agent: &dyn CredAgentApi, astation_id: &str) -> Result<bool> {
     let trust = TrustStore::load_from(&paths.trust)?;
     let Some(entry) = trust.verified(astation_id) else {
         return Ok(false);
@@ -2658,7 +2658,7 @@ and in `already_unlocked` replace `|| key_needed(paths, home)?` with `|| key_nee
 
 `src/websocket_client.rs` (edit by hand, never rustfmt), in `handle_encryption_message`:
 
-1. Replace `use crate::memory::key_agent::{blocking, default_agent, LOCKED};` with `use crate::memory::key_agent::{blocking, default_agent, running_agent, LOCKED};`.
+1. Replace `use crate::memory::cred_agent::{blocking, default_agent, LOCKED};` with `use crate::memory::cred_agent::{blocking, default_agent, running_agent, LOCKED};`.
 2. After the `let request_key = || async { ... };` closure, add:
 
 ```rust
@@ -2698,7 +2698,7 @@ and in `already_unlocked` replace `|| key_needed(paths, home)?` with `|| key_nee
 Run: `cargo test memory::verification`
 Expected: PASS.
 
-Run: `cargo test memory::key_agent`
+Run: `cargo test memory::cred_agent`
 Expected: PASS.
 
 Run: `cargo test memory::agent_socket`
@@ -2713,8 +2713,8 @@ Expected: builds (websocket_client.rs, unlock.rs, cli.rs compile). `dead_code` w
 - [ ] **Step 6: Format and commit**
 
 ```bash
-rustfmt --edition 2024 src/memory/key_agent.rs src/memory/agent_socket.rs src/memory/unlock.rs
-git add src/memory/verification.rs src/memory/key_agent.rs src/memory/agent_socket.rs src/memory/unlock.rs src/websocket_client.rs
+rustfmt --edition 2024 src/memory/cred_agent.rs src/memory/agent_socket.rs src/memory/unlock.rs
+git add src/memory/verification.rs src/memory/cred_agent.rs src/memory/agent_socket.rs src/memory/unlock.rs src/websocket_client.rs
 git commit -m "feat(memory): verification and grants install K in the agent; no reply carries K
 
 🤖 Built with SMT <smt@agora.build>"
@@ -2725,11 +2725,11 @@ git commit -m "feat(memory): verification and grants install K in the agent; no 
 ### Task 6: `Crypt` on the wire: wiped buffers, protocol v2, bigger lines
 
 **Files:**
-- Modify: `src/memory/agent_socket.rs`, `src/memory/key_agent.rs` (`PROTOCOL_VERSION`), `tests/key_agent_binary.rs`
-- Test: `src/memory/agent_socket.rs`, `tests/key_agent_binary.rs`
+- Modify: `src/memory/agent_socket.rs`, `src/memory/cred_agent.rs` (`PROTOCOL_VERSION`), `tests/cred_agent_binary.rs`
+- Test: `src/memory/agent_socket.rs`, `tests/cred_agent_binary.rs`
 
 **Interfaces:**
-- Consumes: Task 4 (`Request::Crypt`, `Reply::Crypted`, `CryptOp`, `CryptOut`, `KeyAgentApi::crypt`).
+- Consumes: Task 4 (`Request::Crypt`, `Reply::Crypted`, `CryptOp`, `CryptOut`, `CredAgentApi::crypt`).
 - Produces: `PROTOCOL_VERSION = 2`; `MAX_LINE = 8 MiB`; `decode_request` parses `crypt` via a plain struct; `decode_response` parses `crypted` via a plain struct (no serde `Content` buffering of plain text).
 
 - [ ] **Step 1: Write the failing tests**
@@ -2772,7 +2772,7 @@ In `src/memory/agent_socket.rs` `mod tests`:
         );
         assert!(status < pkill, "{hint}");
         let refused = decode_response(
-            r#"{"v":2,"ok":false,"error":"unsupported key agent protocol version 3"}"#,
+            r#"{"v":2,"ok":false,"error":"unsupported cred agent protocol version 3"}"#,
         );
         assert!(format!("{:#}", refused.err().unwrap()).contains("protocol version 3"));
         assert!(matches!(
@@ -2844,10 +2844,10 @@ In `src/memory/agent_socket.rs` `mod tests`:
     #[test]
     fn a_crypt_batch_bigger_than_a_mebibyte_reaches_the_agent() {
         use crate::memory::account_keys::CryptOp;
-        use crate::memory::key_agent::error_of;
+        use crate::memory::cred_agent::error_of;
         let dir = short_dir();
         let socket = start_agent(dir.path(), own_uid());
-        let client = KeyAgentClient::at(socket);
+        let client = CredAgentClient::at(socket);
         let big = vec![b'x'; 3 << 20];
         let error = error_of(client.crypt("a", vec![CryptOp::seal("r", "f", &big)]));
         // The locked agent's answer, not a refused line.
@@ -2855,14 +2855,14 @@ In `src/memory/agent_socket.rs` `mod tests`:
     }
 ```
 
-In `tests/key_agent_binary.rs`, change both `b"{\"op\":\"status\",\"v\":1}\n"` to `b"{\"op\":\"status\",\"v\":2}\n"`.
+In `tests/cred_agent_binary.rs`, change both `b"{\"op\":\"status\",\"v\":1}\n"` to `b"{\"op\":\"status\",\"v\":2}\n"`.
 
 Run: `cargo test memory::agent_socket`
 Expected: FAIL (`"v": 1` still emitted; the 3 MiB line is refused as too long).
 
 - [ ] **Step 2: Implement**
 
-`src/memory/key_agent.rs`: `pub const PROTOCOL_VERSION: u64 = 2;` and update its doc comment:
+`src/memory/cred_agent.rs`: `pub const PROTOCOL_VERSION: u64 = 2;` and update its doc comment:
 
 ```rust
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
@@ -2872,8 +2872,8 @@ Expected: FAIL (`"v": 1` still emitted; the 3 MiB line is refused as too long).
 
 `src/memory/agent_socket.rs`:
 
-1. First doc line: `//! The key agent's Unix socket: newline-delimited JSON, `"v": 2` on every`.
-2. `use crate::memory::key_agent::{...}` stays; add `use crate::memory::account_keys::{CryptOp, CryptOut};`.
+1. First doc line: `//! The cred agent's Unix socket: newline-delimited JSON, `"v": 2` on every`.
+2. `use crate::memory::cred_agent::{...}` stays; add `use crate::memory::account_keys::{CryptOp, CryptOut};`.
 3. `MAX_LINE`:
 
 ```rust
@@ -2900,7 +2900,7 @@ and in `decode_request`, after the `load_unlocked` block:
 ```rust
     if head.op.as_deref() == Some("crypt") {
         let wire: CryptWire =
-            serde_json::from_str(line).context("key agent request is malformed")?;
+            serde_json::from_str(line).context("cred agent request is malformed")?;
         return Ok(Request::Crypt {
             astation_id: wire.astation_id,
             ops: wire.ops,
@@ -2928,14 +2928,14 @@ and in `decode_response`, where the `grant` block was (after `let kind = ...;`):
 ```rust
     if kind == "crypted" {
         let crypted: CryptedResponse =
-            serde_json::from_str(line).context("the key agent sent an unreadable reply")?;
+            serde_json::from_str(line).context("the cred agent sent an unreadable reply")?;
         return Ok(Reply::Crypted {
             results: crypted.reply.results,
         });
     }
 ```
 
-6. In `respond`, the fallback literal becomes `b"{\"v\":2,\"ok\":false,\"error\":\"the key agent could not encode its reply\"}\n"`.
+6. In `respond`, the fallback literal becomes `b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent could not encode its reply\"}\n"`.
 
 7. In `serve_connection`, look for the newline only in bytes not scanned yet (a multi-MiB `Crypt` line arrives in 4 KiB reads; rescanning the whole buffer each time is quadratic). Replace the loop
 
@@ -2968,14 +2968,14 @@ and, right after that `while` loop's closing brace (before `if pending.0.len() >
 Run: `cargo test memory::agent_socket`
 Expected: PASS (including `secret_and_grant_requests_reach_the_agent_over_the_wire` with the `Crypt`/`HeldKid` additions and `an_endless_line_closes_the_connection` with the larger `MAX_LINE`).
 
-Run: `cargo test --test key_agent_binary`
+Run: `cargo test --test cred_agent_binary`
 Expected: PASS.
 
 - [ ] **Step 4: Format and commit**
 
 ```bash
-rustfmt --edition 2024 src/memory/agent_socket.rs src/memory/key_agent.rs tests/key_agent_binary.rs
-git add src/memory/agent_socket.rs src/memory/key_agent.rs tests/key_agent_binary.rs
+rustfmt --edition 2024 src/memory/agent_socket.rs src/memory/cred_agent.rs tests/cred_agent_binary.rs
+git add src/memory/agent_socket.rs src/memory/cred_agent.rs tests/cred_agent_binary.rs
 git commit -m "feat(agent): Crypt parsed into wiped buffers, protocol v2, 8 MiB lines
 
 🤖 Built with SMT <smt@agora.build>"
@@ -2994,12 +2994,12 @@ git commit -m "feat(agent): Crypt parsed into wiped buffers, protocol v2, 8 MiB 
 - Consumes: Tasks 1, 3, 4, 6.
 - Produces:
   - `EncryptionContext::for_astation(astation_id: &str) -> Result<Self>` (default paths, lazy default agent)
-  - `EncryptionContext::for_astation_with(astation_id: &str, paths: &KeyPaths, agent: Arc<dyn KeyAgentApi>) -> Result<Self>` (pub(crate))
+  - `EncryptionContext::for_astation_with(astation_id: &str, paths: &CredPaths, agent: Arc<dyn CredAgentApi>) -> Result<Self>` (pub(crate))
   - `EncryptionContext::blocking<T: Send + 'static>(&self, work: impl FnOnce(&Self) -> Result<T> + Send + 'static) -> impl Future<Output = Result<T>>` (`pub async fn`)
   - Batch methods: `seal_many(&self, &[(&str, &str, &[u8])]) -> Result<Vec<String>>`, `open_many(&self, &[(&str, &str, &str)]) -> Result<Vec<Vec<u8>>>`, `wire_projects(&self, &[String]) -> Result<Vec<String>>`, `encrypt_memories(Vec<Memory>)`, `decrypt_memories(Vec<Memory>)`, `encrypt_skills(Vec<Skill>)`, `decrypt_skills(Vec<Skill>)` (all `-> Result<Vec<_>>`)
   - Single methods kept: `seal`, `wire_project`, `decrypt_skill`, `require_sealed`, `should_encrypt` (production) and `open`, `keyed_hash`, `encrypt_memory`, `decrypt_memory`, `encrypt_skill` (`#[cfg(test)]`: production batches)
   - `legacy_keys`: `pub enum Legacy { Missing, Unreadable(anyhow::Error), Keys(LegacyKeys) }`, `pub fn read(path: &Path) -> Result<Legacy>`, `pub fn purge_unverified_at(path: &Path, astation_id: &str, data_account: &str) -> Result<()>`, `#[cfg(test)] write_for_test`, `#[cfg(test)] summary_at`
-  - `KnowledgeClient::with_encryption(paths: KeyPaths, agent: Arc<dyn KeyAgentApi>)`, `VaultClient::with_encryption(...)` (test-only; replace `with_encryption_store`)
+  - `KnowledgeClient::with_encryption(paths: CredPaths, agent: Arc<dyn CredAgentApi>)`, `VaultClient::with_encryption(...)` (test-only; replace `with_encryption_store`)
 
 - [ ] **Step 1: `legacy_keys.rs` — failing tests first**
 
@@ -3050,9 +3050,9 @@ Expected: FAIL to compile.
 ```rust
 //! `data_keys.enc`, where build steps 0–2a kept `K`, its previous keys and
 //! the project names, encrypted with the machine-bound key (which a copied
-//! disk includes). Build step 2b only reads it: the key agent moves it into
+//! disk includes). Build step 2b only reads it: the cred agent moves it into
 //! `device_keys.sealed` and `project_names.json` and deletes it
-//! (key_agent.rs), and a first verification still purges what the
+//! (cred_agent.rs), and a first verification still purges what the
 //! unauthenticated #36 path stored in it.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -3138,7 +3138,7 @@ impl LegacyKeys {
 /// Astation: its mode entry, and the keys, rotation history and project
 /// names of `data_account` and of the account that entry named. Called on a
 /// device's first verification with this Astation. A missing or unreadable
-/// file is left as it is (the key agent deletes an unreadable one).
+/// file is left as it is (the cred agent deletes an unreadable one).
 pub fn purge_unverified_at(path: &Path, astation_id: &str, data_account: &str) -> Result<()> {
     let Legacy::Keys(mut store) = read(path)? else {
         return Ok(());
@@ -3224,7 +3224,7 @@ Expected: PASS (2 tests).
 ```rust
 //! End-to-end encryption for relay-backed memory, skills, and vaults.
 //! Local knowledge.db remains plaintext; transforms happen only at HTTP edges.
-//! `K` lives only in the key agent (build step 2b): `EncryptionContext` reads
+//! `K` lives only in the cred agent (build step 2b): `EncryptionContext` reads
 //! the mode from the signed account state and asks the agent to seal, open
 //! and hash. Also: private atomic file writes for every key file.
 
@@ -3236,9 +3236,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::memory::account_keys::{CryptOp, CryptOut};
-use crate::memory::key_agent::KeyAgentApi;
+use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::model::{content_hash, skill_hash, Memory, Skill};
-use crate::memory::verification::KeyPaths;
+use crate::memory::verification::CredPaths;
 ```
 
 2. Delete the items `struct StoredMode`, `struct StoredKey`, `struct StoredKeys` (with `impl StoredKeys`), `fn store_version`, `fn key_store_path` (old lines 57–139). Keep `set_mode_600`, `unique_temp`, `is_stale_temp`, `sweep_stale_temps`, the `FAILING_WRITES` test hook, `write_private`, `valid_kid`.
@@ -3253,7 +3253,7 @@ const CRYPT_BATCH_OPS: usize = 1024;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 
-/// One Astation's encryption mode, and a handle on the key agent, which
+/// One Astation's encryption mode, and a handle on the cred agent, which
 /// holds `K` and does every seal, open and keyed hash: this process never
 /// sees `K`. Mode and kid come from the latest signed account state; off
 /// (and unverified) contexts never touch the agent. Methods that reach the
@@ -3265,7 +3265,7 @@ pub struct EncryptionContext {
     pub kid: Option<String>,
     astation_id: String,
     /// `None` while encryption is off.
-    agent: Option<Arc<dyn KeyAgentApi>>,
+    agent: Option<Arc<dyn CredAgentApi>>,
     names_path: PathBuf,
 }
 
@@ -3280,11 +3280,11 @@ impl std::fmt::Debug for EncryptionContext {
 }
 
 fn next_text(results: &mut impl Iterator<Item = CryptOut>) -> Result<String> {
-    results.next().ok_or_else(|| anyhow!("the key agent answered too few operations"))?.into_text()
+    results.next().ok_or_else(|| anyhow!("the cred agent answered too few operations"))?.into_text()
 }
 
 fn next_plain(results: &mut impl Iterator<Item = CryptOut>) -> Result<Vec<u8>> {
-    Ok(results.next().ok_or_else(|| anyhow!("the key agent answered too few operations"))?.into_plain()?.to_vec())
+    Ok(results.next().ok_or_else(|| anyhow!("the cred agent answered too few operations"))?.into_plain()?.to_vec())
 }
 
 #[cfg(test)]
@@ -3296,12 +3296,12 @@ impl EncryptionContext {
     pub fn for_astation(astation_id: &str) -> Result<Self> {
         Self::for_astation_with(
             astation_id,
-            &KeyPaths::default_paths(),
-            Arc::from(crate::memory::key_agent::default_agent()),
+            &CredPaths::default_paths(),
+            Arc::from(crate::memory::cred_agent::default_agent()),
         )
     }
 
-    pub(crate) fn for_astation_with(astation_id: &str, paths: &KeyPaths, agent: Arc<dyn KeyAgentApi>) -> Result<Self> {
+    pub(crate) fn for_astation_with(astation_id: &str, paths: &CredPaths, agent: Arc<dyn CredAgentApi>) -> Result<Self> {
         let state = crate::memory::verification::account_mode(&paths.trust, astation_id)?;
         Ok(Self {
             mode: state.mode,
@@ -3313,7 +3313,7 @@ impl EncryptionContext {
         })
     }
 
-    /// Runs `work` on a blocking thread when it may reach the key agent
+    /// Runs `work` on a blocking thread when it may reach the cred agent
     /// (R7: socket I/O and autostart must not stall the runtime); inline
     /// when encryption is off.
     pub async fn blocking<T: Send + 'static>(
@@ -3324,7 +3324,7 @@ impl EncryptionContext {
             return work(self);
         }
         let context = self.clone();
-        crate::memory::key_agent::blocking(move || work(&context)).await
+        crate::memory::cred_agent::blocking(move || work(&context)).await
     }
 
     /// `ops` in as few `Crypt` requests as the budget allows, results in order.
@@ -3635,14 +3635,14 @@ fn skill_record(skill: &Skill) -> String {
 
 ```rust
     use crate::memory::fake_astation::{ASTATION_ID, UnlockedDevice};
-    use crate::memory::key_agent::{Reply, Request};
+    use crate::memory::cred_agent::{Reply, Request};
 
     /// An agent an off context must never reach.
     struct NoAgent;
 
-    impl KeyAgentApi for NoAgent {
+    impl CredAgentApi for NoAgent {
         fn call(&self, _request: Request) -> Result<Reply> {
-            panic!("an off or unverified context must not call the key agent")
+            panic!("an off or unverified context must not call the cred agent")
         }
     }
 
@@ -3752,7 +3752,7 @@ fn skill_record(skill: &Skill) -> String {
     #[test]
     fn off_and_unverified_contexts_never_touch_the_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let unverified = EncryptionContext::for_astation_with(ASTATION_ID, &paths, Arc::new(NoAgent)).unwrap();
         assert_eq!(unverified.mode, EncryptionMode::Off);
         let plain = memory("mem-1", "github.com/agora/atem", "fact");
@@ -3842,7 +3842,7 @@ fn skill_record(skill: &Skill) -> String {
     fn first_verification_purges_legacy_keys() {
         use crate::memory::legacy_keys::{summary_at, write_for_test};
         let dir = tempfile::tempdir().unwrap();
-        let legacy = KeyPaths::in_dir(dir.path());
+        let legacy = CredPaths::in_dir(dir.path());
         // K, its rotation history and a project name from the unauthenticated #36 path.
         write_for_test(&legacy.data_keys, ASTATION_ID, "acct", &[("0123abcd", [1; 32]), ("11112222", [2; 32])], &[("h1.11112222.aa", "github.com/agora/atem")]);
         crate::memory::project_names::remember(&legacy.project_names, "acct", [("h1.11112222.aa".to_string(), "github.com/agora/atem".to_string())]).unwrap();
@@ -3869,14 +3869,14 @@ use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 
 ```rust
     #[cfg(test)]
-    encryption_with: Option<(crate::memory::verification::KeyPaths, std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>)>,
+    encryption_with: Option<(crate::memory::verification::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 ```
 
 in `new`, `encryption_store: None,` → `encryption_with: None,`; replace `with_encryption_store` and `encryption` with:
 
 ```rust
     #[cfg(test)]
-    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::KeyPaths, agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>) -> Self {
+    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
     }
@@ -3898,7 +3898,7 @@ in `new`, `encryption_store: None,` → `encryption_with: None,`; replace `with_
 
 ```rust
 /// The wire form of `ops`, encrypted when the account is: every memory,
-/// skill and project hash of the batch in a few key-agent round trips.
+/// skill and project hash of the batch in a few cred-agent round trips.
 fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<Value>> {
     if !encryption.should_encrypt() {
         return Ok(ops.iter().map(op_to_wire).collect());
@@ -4022,14 +4022,14 @@ and the skill chunk loop's body up to `let response: BatchResponse = ...` with:
 
 ```rust
     #[cfg(test)]
-    encryption_with: Option<(crate::memory::verification::KeyPaths, std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>)>,
+    encryption_with: Option<(crate::memory::verification::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 ```
 
 `new`: `encryption_store: None,` → `encryption_with: None,`. Replace `with_encryption_store` and `encryption` with:
 
 ```rust
     #[cfg(test)]
-    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::KeyPaths, agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>) -> Self {
+    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
     }
@@ -4105,7 +4105,7 @@ and the skill chunk loop's body up to `let response: BatchResponse = ...` with:
 4. Add before `#[cfg(test)] mod tests`:
 
 ```rust
-/// Opens every sealed summary in one key-agent round trip; plain text is
+/// Opens every sealed summary in one cred-agent round trip; plain text is
 /// refused while encryption is on.
 fn open_summaries(encryption: &EncryptionContext, mut items: Vec<VaultListItem>) -> Result<Vec<VaultListItem>> {
     for item in &items {
@@ -4128,7 +4128,7 @@ fn open_summaries(encryption: &EncryptionContext, mut items: Vec<VaultListItem>)
     Ok(items)
 }
 
-/// Opens every sealed entry of `vault_id` in one key-agent round trip.
+/// Opens every sealed entry of `vault_id` in one cred-agent round trip.
 fn open_entries(encryption: &EncryptionContext, vault_id: &str, mut entries: Vec<VaultEntry>) -> Result<Vec<VaultEntry>> {
     for entry in &entries {
         encryption.require_sealed(&entry.content, "e1.", "vault entry")?;
@@ -4152,7 +4152,7 @@ fn open_entries(encryption: &EncryptionContext, vault_id: &str, mut entries: Vec
 
 /// One vault's summary and every entry version, re-sealed under the current
 /// key (`enabling`) or opened to plain text (`disabling`): the body of
-/// `POST /api/vault/{id}/encryption`, in one or two key-agent round trips.
+/// `POST /api/vault/{id}/encryption`, in one or two cred-agent round trips.
 fn migrated_vault(encryption: &EncryptionContext, item: &VaultListItem, entries: &[VaultEntry]) -> Result<Value> {
     use crate::memory::crypto::EncryptionMode;
     let id = item.vault_id.as_str();
@@ -4203,8 +4203,8 @@ fn migrated_vault(encryption: &EncryptionContext, item: &VaultListItem, entries:
 use crate::memory::account_keys::CryptOp;
 use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 use crate::memory::fake_astation::UnlockedDevice;
-use crate::memory::key_agent::{KeyAgent, KeyAgentApi, Reply, Request, error_of, test_agent};
-use crate::memory::verification::KeyPaths;
+use crate::memory::cred_agent::{CredAgent, CredAgentApi, Reply, Request, error_of, test_agent};
+use crate::memory::verification::CredPaths;
 use std::sync::atomic::{AtomicUsize, Ordering};
 ```
 
@@ -4309,11 +4309,11 @@ async fn missing_encryption_key_keeps_sync_operations_queued() {
 ```rust
 /// Counts the `Crypt` requests that reach the agent.
 struct CountingAgent {
-    inner: Arc<Mutex<KeyAgent>>,
+    inner: Arc<Mutex<CredAgent>>,
     crypts: AtomicUsize,
 }
 
-impl KeyAgentApi for CountingAgent {
+impl CredAgentApi for CountingAgent {
     fn call(&self, request: Request) -> anyhow::Result<Reply> {
         if matches!(request, Request::Crypt { .. }) {
             self.crypts.fetch_add(1, Ordering::SeqCst);
@@ -4387,7 +4387,7 @@ fn a_copied_config_directory_yields_no_k() {
             std::fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
         }
     }
-    let paths = KeyPaths::in_dir(copy.path());
+    let paths = CredPaths::in_dir(copy.path());
     assert!(paths.device_keys_sealed.exists() && paths.project_names.exists() && paths.trust.exists());
     assert!(!paths.data_keys.exists() && !paths.device_keys.exists());
     // No file holds K in any encoding.
@@ -4435,7 +4435,7 @@ Expected: build succeeds; no new warnings (in particular no `dead_code` for `Enc
 ```bash
 rustfmt --edition 2024 src/memory/legacy_keys.rs src/memory/trust.rs
 git add src/memory/legacy_keys.rs src/memory/mod.rs src/memory/crypto.rs src/memory/api.rs src/vault_client.rs src/memory/verification.rs src/memory/trust.rs src/memory/e2e_tests.rs
-git commit -m "feat(memory): EncryptionContext asks the key agent, in batches; data_keys.enc is read-only
+git commit -m "feat(memory): EncryptionContext asks the cred agent, in batches; data_keys.enc is read-only
 
 🤖 Built with SMT <smt@agora.build>"
 ```
@@ -4445,7 +4445,7 @@ git commit -m "feat(memory): EncryptionContext asks the key agent, in batches; d
 ### Task 8: The agent moves `data_keys.enc` in and deletes it
 
 **Files:**
-- Modify: `src/memory/account_keys.rs` (`merge`), `src/memory/legacy_keys.rs` (`keys_for`, `names_for`), `src/memory/key_agent.rs` (`migrate_data_keys`, `drop_unverified_data_keys`, `after_unlock`, `new`, `confirm_rotation`, `remove_synced`, test hook)
+- Modify: `src/memory/account_keys.rs` (`merge`), `src/memory/legacy_keys.rs` (`keys_for`, `names_for`), `src/memory/cred_agent.rs` (`migrate_data_keys`, `drop_unverified_data_keys`, `after_unlock`, `new`, `confirm_rotation`, `remove_synced`, test hook)
 - Test: `src/memory/account_keys.rs`, `src/memory/k_agent_tests.rs`
 
 **Interfaces:**
@@ -4453,7 +4453,7 @@ git commit -m "feat(memory): EncryptionContext asks the key agent, in batches; d
 - Produces:
   - `AccountKeys::merge(&mut self, account: &str, current: AccountKey, previous: Vec<AccountKey>) -> bool`
   - `LegacyKeys::keys_for(&self, accounts: &BTreeSet<String>) -> Vec<(String, AccountKey, Vec<AccountKey>)>`, `LegacyKeys::names_for(&self, accounts: &BTreeSet<String>) -> Vec<(String, Vec<(String, String)>)>`
-  - `#[cfg(test)] KeyAgent::kids_for_test(&self, account: &str) -> (Option<String>, Vec<String>)`
+  - `#[cfg(test)] CredAgent::kids_for_test(&self, account: &str) -> (Option<String>, Vec<String>)`
   - Behaviour: at every unlock (and at start when the agent starts unlocked from a plain `device_keys`, and at the first confirmed escrow) the agent merges `data_keys.enc` (verified accounts only) and deletes it once escrowed and not unlocked via `.prev`; unreadable → deleted; no verified Astation at agent start → deleted.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4486,13 +4486,13 @@ use crate::memory::legacy_keys::write_for_test;
 use crate::memory::project_names::ProjectNames;
 use crate::memory::statements::FakeAstation;
 use crate::memory::device_keys::DeviceKeys;
-use crate::memory::verification::KeyPaths;
+use crate::memory::verification::CredPaths;
 
 const OLD: &str = "11112222";
 
 /// A step-2a data_keys.enc for the fake device: K = [42; 32] (kid A) with
 /// the older [1; 32] (kid OLD), and one project name.
-fn legacy(paths: &KeyPaths, account: &str) {
+fn legacy(paths: &CredPaths, account: &str) {
     write_for_test(
         &paths.data_keys,
         ASTATION_ID,
@@ -4595,7 +4595,7 @@ fn an_unreadable_data_keys_enc_is_deleted_at_unlock() {
 #[test]
 fn an_unverified_device_deletes_data_keys_enc_and_a_locked_one_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
-    let paths = KeyPaths::in_dir(dir.path());
+    let paths = CredPaths::in_dir(dir.path());
     legacy(&paths, ACCOUNT);
     let _agent = test_agent(&paths);
     assert!(!paths.data_keys.exists(), "never used by an unverified device");
@@ -4610,7 +4610,7 @@ fn an_unverified_device_deletes_data_keys_enc_and_a_locked_one_keeps_it() {
 #[test]
 fn before_its_first_escrow_a_device_keeps_data_keys_enc() {
     let dir = tempfile::tempdir().unwrap();
-    let paths = KeyPaths::in_dir(dir.path());
+    let paths = CredPaths::in_dir(dir.path());
     let keys = DeviceKeys::generate();
     keys.save_to(&paths.device_keys).unwrap();
     let astation = FakeAstation::new();
@@ -4743,15 +4743,15 @@ impl LegacyKeys {
 
 (The existing `impl LegacyKeys { fn save_to … }` block may simply receive these two methods.)
 
-- [ ] **Step 4: Implement the migration in `key_agent.rs`**
+- [ ] **Step 4: Implement the migration in `cred_agent.rs`**
 
 1. Imports: add `use std::collections::BTreeSet;` (next to `BTreeMap`) and `use crate::memory::legacy_keys::{self, Legacy};`.
 
-2. `KeyAgent::new`: add `&paths.data_keys,` and `&paths.project_names,` to the sweep list, and replace
+2. `CredAgent::new`: add `&paths.data_keys,` and `&paths.project_names,` to the sweep list, and replace
 
 ```rust
         if let Err(error) = agent.migrate_plain_keys() {
-            eprintln!("key agent: {error:#}");
+            eprintln!("cred agent: {error:#}");
             agent.wipe();
         }
         Ok(agent)
@@ -4761,13 +4761,13 @@ with
 
 ```rust
         if let Err(error) = agent.migrate_plain_keys() {
-            eprintln!("key agent: {error:#}");
+            eprintln!("cred agent: {error:#}");
             agent.wipe();
         }
         if agent.unlocked.is_some() {
             agent.after_unlock();
         } else if let Err(error) = agent.drop_unverified_data_keys() {
-            eprintln!("key agent: {error:#}");
+            eprintln!("cred agent: {error:#}");
         }
         Ok(agent)
 ```
@@ -4780,10 +4780,10 @@ with
     /// logged, and repeated at the next unlock.
     fn after_unlock(&mut self) {
         if let Err(error) = self.migrate_data_keys() {
-            eprintln!("key agent: data_keys.enc not moved yet (tried again at the next unlock): {error:#}");
+            eprintln!("cred agent: data_keys.enc not moved yet (tried again at the next unlock): {error:#}");
         }
         if let Err(error) = self.reconcile() {
-            eprintln!("key agent: {error:#}");
+            eprintln!("cred agent: {error:#}");
         }
     }
 
@@ -4801,7 +4801,7 @@ with
             Legacy::Unreadable(error) => {
                 // It can never be read on this machine; K comes back by a signed grant.
                 eprintln!(
-                    "key agent: deleting data_keys.enc, which can't be read ({error:#}); atem asks Astation for the encryption key again"
+                    "cred agent: deleting data_keys.enc, which can't be read ({error:#}); atem asks Astation for the encryption key again"
                 );
                 return remove_synced(&self.paths.data_keys);
             }
@@ -4828,7 +4828,7 @@ with
         }
         if escrowed && !via_prev {
             remove_synced(&self.paths.data_keys)?;
-            eprintln!("key agent: moved data_keys.enc into device_keys.sealed and project_names.json");
+            eprintln!("cred agent: moved data_keys.enc into device_keys.sealed and project_names.json");
         }
         Ok(())
     }
@@ -4845,7 +4845,7 @@ with
             .is_none()
         {
             remove_synced(&self.paths.data_keys)?;
-            eprintln!("key agent: deleted data_keys.enc: this device isn't verified, so it was never used");
+            eprintln!("cred agent: deleted data_keys.enc: this device isn't verified, so it was never used");
         }
         Ok(())
     }
@@ -4926,7 +4926,7 @@ Expected: PASS (16 tests).
 Run: `cargo test memory::account_keys`
 Expected: PASS.
 
-Run: `cargo test memory::key_agent`
+Run: `cargo test memory::cred_agent`
 Expected: PASS (an agent with no `data_keys.enc` is unchanged).
 
 Run: `cargo test memory::verification`
@@ -4935,9 +4935,9 @@ Expected: PASS. (`first_verification_purges_legacy_keys` still passes: the unver
 - [ ] **Step 6: Format and commit**
 
 ```bash
-rustfmt --edition 2024 src/memory/account_keys.rs src/memory/legacy_keys.rs src/memory/key_agent.rs src/memory/k_agent_tests.rs
-git add src/memory/account_keys.rs src/memory/legacy_keys.rs src/memory/key_agent.rs src/memory/k_agent_tests.rs
-git commit -m "feat(memory): the key agent moves data_keys.enc into the sealed file and deletes it
+rustfmt --edition 2024 src/memory/account_keys.rs src/memory/legacy_keys.rs src/memory/cred_agent.rs src/memory/k_agent_tests.rs
+git add src/memory/account_keys.rs src/memory/legacy_keys.rs src/memory/cred_agent.rs src/memory/k_agent_tests.rs
+git commit -m "feat(memory): the cred agent moves data_keys.enc into the sealed file and deletes it
 
 🤖 Built with SMT <smt@agora.build>"
 ```
@@ -4959,7 +4959,7 @@ git commit -m "feat(memory): the key agent moves data_keys.enc into the sealed f
 
 ```markdown
 Build step 2b is built on the atem side (2026-10-11): `K` and its previous
-keys live in the sealed payload of `device_keys.sealed`, only the key agent
+keys live in the sealed payload of `device_keys.sealed`, only the cred agent
 uses them (batched `Crypt` requests), the mode and kid come from the signed
 account state alone, project names live in `project_names.json`, and
 `data_keys.enc` is moved in at the first unlock and deleted. 2b needs nothing
@@ -4998,7 +4998,7 @@ new from Astation. Device-signed writes (3), the recovery
   chunk, a migration chunk) into as few requests as a 2 MiB budget allows,
   always from a blocking thread.
 - **Mode and kid** come only from the latest signed account state in
-  `cred_state.json`. Unverified devices are `off`; an `off` (or unverified)
+  `cred/state.json`. Unverified devices are `off`; an `off` (or unverified)
   context never contacts the agent. A locked agent, or one without `K`,
   makes sync keep its changes queued and say `atem cred unlock` or that the
   account requires encryption.
@@ -5028,17 +5028,17 @@ new from Astation. Device-signed writes (3), the recovery
 - `project_names.json`: the readable project key of each `h1.` project
   hash, per account. No secrets.
 - `data_keys.enc`: gone in step 2b. Steps 0–2a kept `K`, its previous keys
-  and the project names there under the machine-bound key; the key agent
+  and the project names there under the machine-bound key; the cred agent
   moves it into `device_keys.sealed` and `project_names.json` at the first
   unlock and deletes it.
 ```
 
-and in the `device_keys.sealed` bullet, change `the device key and device signing key, encrypted` to `the device key, the device signing key and the account keys (`K` and its previous keys, step 2b), encrypted`. Change the "Key agent memory" bullet to `- Key agent memory: the unsealed device keys, `K` and its previous keys, index subkeys and scope keys.`
+and in the `device_keys.sealed` bullet, change `the device key and device signing key, encrypted` to `the device key, the device signing key and the account keys (`K` and its previous keys, step 2b), encrypted`. Change the "Cred agent memory" bullet to `- Cred agent memory: the unsealed device keys, `K` and its previous keys, index subkeys and scope keys.`
 
 5. "Migration": replace the `data_keys.enc` bullet with:
 
 ```markdown
-- **`data_keys.enc`** (built, step 2b): the key agent moves `K`, its previous
+- **`data_keys.enc`** (built, step 2b): the cred agent moves `K`, its previous
   keys and the project names into `device_keys.sealed` and
   `project_names.json` at the first unlock, then deletes the file.
 ```
@@ -5056,21 +5056,21 @@ and in the `device_keys.sealed` bullet, change `the device key and device signin
 │   ├── crypto.rs        #   EncryptionContext: mode from the signed state, batched Crypt via the agent; private writes
 ```
 
-change the `agent_socket.rs` line's `(v1 JSON lines, same UID only)` to `(v2 JSON lines, same UID only)`, change the `key_agent.rs` line to `key agent state: unlock, rotation, abandon, K installed and used in memory (Crypt)`, and after the `kat_tests.rs` line add `│   ├── k_agent_tests.rs #   (test-only) K in the agent: install, Crypt, rotation, data_keys.enc migration`.
+change the `agent_socket.rs` line's `(v1 JSON lines, same UID only)` to `(v2 JSON lines, same UID only)`, change the `cred_agent.rs` line to `cred agent state: unlock, rotation, abandon, K installed and used in memory (Crypt)`, and after the `kat_tests.rs` line add `│   ├── k_agent_tests.rs #   (test-only) K in the agent: install, Crypt, rotation, data_keys.enc migration`.
 
-2. Key agent paragraph: change `` `"v": 1` JSON lines`` to `` `"v": 2` JSON lines``, and replace the sentence `Until step 2b the agent hands `K` back to the caller.` with:
+2. Cred agent paragraph: change `` `"v": 1` JSON lines`` to `` `"v": 2` JSON lines``, and replace the sentence `Until step 2b the agent hands `K` back to the caller.` with:
 
 ```markdown
 Since step 2b `K` lives only in the agent: it installs granted keys into the sealed payload (`InstallGrant`), does every seal/open/keyed hash for `EncryptionContext` in batched `Crypt` requests, takes the mode and kid from the signed account state, and moves a leftover `data_keys.enc` in at the first unlock (then deletes it); a locked agent keeps sync changes queued until `atem cred unlock`.
 ```
 
-3. Files table: change the `device_keys.sealed` row's contents to begin `This device's X25519 device key, Ed25519 signing key and account keys (`K` + previous, step 2b) (`{version, device_id, storage_kid, nonce, ciphertext}`); …` (rest unchanged), and add after the `cred_state.json` row:
+3. Files table: change the `device_keys.sealed` row's contents to begin `This device's X25519 device key, Ed25519 signing key and account keys (`K` + previous, step 2b) (`{version, device_id, storage_kid, nonce, ciphertext}`); …` (rest unchanged), and add after the `cred/state.json` row:
 
 ```markdown
 | `project_names.json` | `h1.` project hash → readable project key, per account (memory/skills project names the relay sees only as HMACs); replaces the names part of the removed `data_keys.enc` | None (chmod 0600; no secrets) |
 ```
 
-(There is no `data_keys.enc` row today; the key agent deletes that file at the first unlock.)
+(There is no `data_keys.enc` row today; the cred agent deletes that file at the first unlock.)
 
 - [ ] **Step 3: Check and commit**
 
@@ -5079,7 +5079,7 @@ Expected: every hit describes it as removed/migrated (step 2b), none as current 
 
 ```bash
 git add designs/e2e-encryption.md AGENTS.md
-git commit -m "docs: e2e step 2b — K behind the key agent, project_names.json, data_keys.enc migrated
+git commit -m "docs: e2e step 2b — K behind the cred agent, project_names.json, data_keys.enc migrated
 
 🤖 Built with SMT <smt@agora.build>"
 ```
@@ -5093,11 +5093,11 @@ git commit -m "docs: e2e step 2b — K behind the key agent, project_names.json,
 - [ ] **Step 1: Full test suite**
 
 Run: `cargo test -- --test-threads=1`
-Expected: all tests pass (including `memory::kat_tests` unchanged and `tests/key_agent_binary.rs`).
+Expected: all tests pass (including `memory::kat_tests` unchanged and `tests/cred_agent_binary.rs`).
 
 - [ ] **Step 2: Lint**
 
-Run: `cargo clippy --all-targets --all-features 2>&1 | grep -E "src/memory/(account_keys|project_names|legacy_keys|k_agent_tests|key_agent|agent_socket|crypto|api|verification|device_keys|storage_key|fake_astation|e2e_tests)\.rs|src/vault_client\.rs"`
+Run: `cargo clippy --all-targets --all-features 2>&1 | grep -E "src/memory/(account_keys|project_names|legacy_keys|k_agent_tests|cred_agent|agent_socket|crypto|api|verification|device_keys|storage_key|fake_astation|e2e_tests)\.rs|src/vault_client\.rs"`
 Expected: no output (no warnings in the files this plan touched).
 
 - [ ] **Step 3: macOS build check of cfg gates**
@@ -5136,4 +5136,4 @@ Expected: PASS — the relay ciphertext format is identical to steps 0–2a.
 
 **2. Placeholder scan:** every code step carries complete code; edits name the exact item and give the full replacement. No TBD/TODO.
 
-**3. Type consistency:** `install_grant`/`check_grant`/`crypt`/`held_kid` (Task 4) are the names used in Tasks 5–8; `AccountKeys::{install, reconcile, merge, crypt, current_kid, previous_kids, to_wire, from_wire, is_empty}`; `SignedModes`; `CryptOp::{seal, open, keyed_hash}` + `wire_len`; `CryptOut::{into_text, into_plain}`; `account_mode`/`AccountMode` (Task 3) used in Tasks 5 and 7; `project_names::{remember, forget_account_at, ProjectNames::{load_from, name, len}}`; `legacy_keys::{read, Legacy, purge_unverified_at, write_for_test, summary_at, LegacyKeys::{keys_for, names_for}}`; `UnlockedDevice::{new, state, grant, set_key}` and fields `paths`, `server`, `keys`, `agent`; `KeyPaths.project_names`.
+**3. Type consistency:** `install_grant`/`check_grant`/`crypt`/`held_kid` (Task 4) are the names used in Tasks 5–8; `AccountKeys::{install, reconcile, merge, crypt, current_kid, previous_kids, to_wire, from_wire, is_empty}`; `SignedModes`; `CryptOp::{seal, open, keyed_hash}` + `wire_len`; `CryptOut::{into_text, into_plain}`; `account_mode`/`AccountMode` (Task 3) used in Tasks 5 and 7; `project_names::{remember, forget_account_at, ProjectNames::{load_from, name, len}}`; `legacy_keys::{read, Legacy, purge_unverified_at, write_for_test, summary_at, LegacyKeys::{keys_for, names_for}}`; `UnlockedDevice::{new, state, grant, set_key}` and fields `paths`, `server`, `keys`, `agent`; `CredPaths.project_names`.

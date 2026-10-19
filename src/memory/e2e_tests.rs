@@ -3,8 +3,8 @@ use crate::memory::api::KnowledgeClient;
 use crate::memory::account_keys::CryptOp;
 use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 use crate::memory::fake_astation::UnlockedDevice;
-use crate::memory::key_agent::{KeyAgent, KeyAgentApi, Reply, Request, error_of, test_agent};
-use crate::memory::verification::KeyPaths;
+use crate::memory::cred_agent::{CredAgent, CredAgentApi, Reply, Request, error_of, test_agent};
+use crate::memory::verification::CredPaths;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::memory::model::{Memory, Scope, Skill, content_hash, skill_hash};
 use crate::memory::store::{PendingOp, Store};
@@ -349,7 +349,7 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
 
 #[tokio::test]
 async fn repeated_signed_pending_states_resume_interrupted_migrations_with_a_loaded_key() {
-    use crate::memory::key_agent::KeyAgentApi;
+    use crate::memory::cred_agent::CredAgentApi;
     use crate::memory::trust::TrustStore;
     use crate::memory::verification::{Applied, apply_account_state};
 
@@ -493,11 +493,11 @@ async fn relay_injected_plain_text_is_rejected_while_on() {
 
 /// Counts the `Crypt` requests that reach the agent.
 struct CountingAgent {
-    inner: Arc<Mutex<KeyAgent>>,
+    inner: Arc<Mutex<CredAgent>>,
     crypts: AtomicUsize,
 }
 
-impl KeyAgentApi for CountingAgent {
+impl CredAgentApi for CountingAgent {
     fn call(&self, request: Request) -> anyhow::Result<Reply> {
         if matches!(request, Request::Crypt { .. }) {
             self.crypts.fetch_add(1, Ordering::SeqCst);
@@ -565,20 +565,21 @@ fn a_copied_config_directory_yields_no_k() {
         .wire_project("github.com/agora/atem")
         .unwrap();
     let copy = tempfile::tempdir().unwrap();
-    for entry in std::fs::read_dir(directory.path()).unwrap() {
+    let paths = CredPaths::in_dir(copy.path());
+    crate::memory::verification::create_private_dir(&paths.dir).unwrap();
+    for entry in std::fs::read_dir(&device.paths.dir).unwrap() {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_file() {
-            std::fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
+            std::fs::copy(entry.path(), paths.dir.join(entry.file_name())).unwrap();
         }
     }
-    let paths = KeyPaths::in_dir(copy.path());
     assert!(paths.device_keys_sealed.exists() && paths.project_names.exists() && paths.trust.exists());
     assert!(!paths.data_keys.exists() && !paths.device_keys.exists());
     // No file holds K in any encoding.
     let k = [42u8; 32];
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, k);
     let hex: String = k.iter().map(|byte| format!("{byte:02x}")).collect();
-    for entry in std::fs::read_dir(copy.path()).unwrap() {
+    for entry in std::fs::read_dir(&paths.dir).unwrap() {
         let bytes = std::fs::read(entry.unwrap().path()).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(!bytes.windows(32).any(|window| window == k));

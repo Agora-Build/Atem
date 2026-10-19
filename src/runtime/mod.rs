@@ -85,7 +85,7 @@ async fn shutdown_signal() {
 /// next runtime adopts them.
 pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     // Taken now, before a rebuild can replace the executable on disk.
-    let build = crate::memory::key_agent::build_id();
+    let build = crate::memory::cred_agent::build_id();
     IN_RUNTIME.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(home) = dirs::home_dir() {
         let _ = std::env::set_current_dir(home);

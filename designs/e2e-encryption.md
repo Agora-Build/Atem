@@ -5,13 +5,13 @@ account state and plain-text rejection (fixes to #36), and device
 verification (commit-then-reveal safety code, signed device certificate,
 signed account state, signed RFC 9180 HPKE grants for `K`). Build step 2a
 is built on the atem side (2026-10-10): `device_keys.sealed` under a
-storage key held by the home Astation, the key agent (`atem key-agent`),
+storage key held by the home Astation, the cred agent (`atem cred-agent`),
 Touch ID unlock through Astation, storage-key rotation at every unlock,
 and `atem cred unlock|lock|status`. The Astation side of steps 0–2a is
 pending (see "Astation work for steps 0–1" and "Astation work for step
 2a"); until it lands, atems stay unverified and keep plain-text sync.
 Build step 2b is built on the atem side (2026-10-11): `K` and its previous
-keys live in the sealed payload of `device_keys.sealed`, only the key agent
+keys live in the sealed payload of `device_keys.sealed`, only the cred agent
 uses them (batched `Crypt` requests), the mode and kid come from the signed
 account state alone, project names live in `project_names.json`, and
 `data_keys.enc` is moved in at the first unlock and deleted. 2b needs nothing
@@ -68,7 +68,7 @@ device key, unlock policy and recovery kit, described once below.
 | Relay operator or Cloudflare, actively malicious | protected (can deny service) | Key swaps fail the commit-then-reveal safety code. Every key grant, mode change, credential row, manifest and memory write is signed. Older credential values fail the signed counters and epoch floor. Plain text is rejected while encryption is on. |
 | Relay hides an invalidation or a recent memory write | partial | atem never accepts an older state of a record it already has, but a device that never saw the newer write can be shown the older one. This is withholding, not forgery. |
 | Valid pairing session on an unverified device | protected | Astation seals keys only to verified device keys, and other devices drop writes without a certified device signature. |
-| Another non-root user on the box | protected | Files are 0600. The key agent socket is 0600 and checks the caller's UID (`SO_PEERCRED`). |
+| Another non-root user on the box | protected | Files are 0600. The cred agent socket is 0600 and checks the caller's UID (`SO_PEERCRED`). |
 | Copied disk, VM snapshot or backup of a box | protected with Touch ID unlock; mostly protected with auto-unlock | The device keys are sealed (`device_keys.sealed`) by a storage key only Astation holds, and the storage key changes at every unlock, so copies older than the last unlock can't be opened. See "Unlock policy". |
 | Revoked device | partial | Its pairing session is killed; `K`, the index key and its scope keys are rotated; its writes are rejected by every device. It keeps what it already read. Every value in its scopes is listed for rotation at the provider. |
 | Root or malware on a granted device | exposed | Out of scope. Limited to what that device was granted. |
@@ -150,7 +150,7 @@ flowchart TB
     DKS["device_keys.sealed<br/>device key + device signing key"]
     UA["Unlock-auth key"]
     PIN["Pinned signing, encryption,<br/>recovery signing pubkeys"]
-    AG["Key agent<br/>unlocked keys in memory"]
+    AG["Cred agent<br/>unlocked keys in memory"]
   end
   K -->|encrypts| MEM
   SD -->|encrypts| CT
@@ -341,9 +341,9 @@ without one are ignored.
 
 ### Keys on disk (atem)
 
-Build step 1 kept the device keys in a plain `device_keys` file, protected
-only by mode 0600, so a copied disk could use them. Build step 2a replaces
-it with:
+Every file below lives in `~/.config/atem/cred/` (0700). Build step 1 kept
+the device keys in a plain `device_keys` file, protected only by mode 0600,
+so a copied disk could use them. Build step 2a replaces it with:
 
 - `device_keys.sealed`: the device key, the device signing key and (step 2b)
   the account keys, encrypted
@@ -364,9 +364,9 @@ Properties:
   A copy of the disk from before the latest unlock can't be opened, even by
   someone who stole an earlier storage key.
 - Once unlocked, the device keys and every key they opened (`K`, index key,
-  scope keys) live only in a small **key agent**, like ssh-agent: a Unix
-  socket at `$XDG_RUNTIME_DIR/atem/agent.sock` (falling back to
-  `~/.config/atem/agent.sock`, never `/tmp`), 0600 with the caller's UID
+  scope keys) live only in a small **cred agent**, like ssh-agent: a Unix
+  socket at `$XDG_RUNTIME_DIR/atem/cred-agent.sock` (falling back to
+  `~/.config/atem/cred/agent.sock`, never `/tmp`), 0600 with the caller's UID
   checked, `mlock`ed memory where the limit allows (see below), `zeroize`,
   no core dumps (`PR_SET_DUMPABLE=0`). The agent never hands out raw keys:
   callers ask it to decrypt, sign or compute an HMAC, and get only the
@@ -386,9 +386,9 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   lowercase hex characters, new at every rotation. After opening a file
   the agent requires its header `device_id` to be the pinned one and its
   `storage_kid` to be the one Astation released.
-- The agent is the same binary, `atem key-agent` (hidden), started on demand
+- The agent is the same binary, `atem cred-agent` (hidden), started on demand
   by the first command that needs keys and detached with `setsid`; it logs
-  to `~/.config/atem/key-agent.log`. It speaks newline-delimited JSON; every
+  to `~/.config/atem/cred-agent.log`. It speaks newline-delimited JSON; every
   request carries `"v": 2` (v1 until step 2b) and any other version gets an error (an old agent
   left running after an upgrade says so; stop it and the next command starts
   the new one). It refuses peers whose UID isn't its own, sets
@@ -401,7 +401,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
-- **Private writes.** Every key file and `cred_state.json` is written to a
+- **Private writes.** Every key file and `cred/state.json` is written to a
   temp file with a name of its own (`.<name>.<pid>.<counter>.<random>.tmp`,
   0600, `O_NOFOLLOW`), fsynced and renamed. A writer that crashes leaves
   its temp behind, possibly holding key bytes, so each write first deletes
@@ -427,11 +427,11 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   the keys stay sealed on disk (or in the plain file before the first
   escrow).
 - **One agent per key directory.** The agent takes an exclusive `flock` on
-  `~/.config/atem/key_agent.lock` for its whole life and exits if another
+  `~/.config/atem/cred_agent.lock` for its whole life and exits if another
   agent holds it, so two login sessions with different `$XDG_RUNTIME_DIR`s
   never run two agents over one set of key files (each would rotate the
   storage key and strand the other's sealed files). It records its socket
-  path in `~/.config/atem/agent.socket` (0600, written atomically) and its
+  path in `~/.config/atem/cred/agent.socket` (0600, written atomically) and its
   pid in the lock file; clients try that path first, then their own
   session's, and still refuse a listener that isn't their user. A starting
   agent that finds the lock held waits up to 8 seconds for the holder to
@@ -440,7 +440,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   the starting agent and the client that started it print an error naming
   the holder's pid and the `kill <pid>` that stops it, but only when the
   lock is really held and (Linux) that pid's command line is `atem
-  key-agent` (the pid stays in the file after a crash and across reboots,
+  cred-agent` (the pid stays in the file after a crash and across reboots,
   so it could name an unrelated process); otherwise the error gives the
   `pgrep`/`pkill` lines. A clean agent exit clears the pid. The agent
   counts as orphaned only when its socket or `agent.socket` is gone
@@ -454,7 +454,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   that may start the agent compares it with its own build once: a locked
   agent of another build holds no keys, so it is stopped (asked to, or, if
   too old for that, sent SIGTERM only when its pid is confirmed as this
-  user's `atem key-agent` as above) and this build's agent started. An
+  user's `atem cred-agent` as above) and this build's agent started. An
   unlocked one is never restarted silently: the command warns that `atem
   cred lock`, then `atem cred unlock` switches to the new agent, keeps
   using the old one, and turns its rejection of a request it doesn't know
@@ -462,7 +462,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   build; …)". Builds are compared for equality only: a dev build and the
   npm release of the same version differ, and neither counts as newer.
 - **Home Astation.** One storage key per device, held by the device's first
-  verified Astation and recorded as `home_astation` in `cred_state.json`;
+  verified Astation and recorded as `home_astation` in `cred/state.json`;
   the home never moves. Unlock and rotation go only through the home
   Astation; grants from any verified Astation are opened by the unlocked
   agent.
@@ -482,7 +482,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   is always allowed) loses nothing, and atem needs no Astation with step
   2a: against an older Astation the escrow just doesn't complete and the
   device keeps its plain keys, as in step 1.
-- **`escrowed_storage_kid`** in `cred_state.json` is the last storage kid
+- **`escrowed_storage_kid`** in `cred/state.json` is the last storage kid
   Astation is known to hold (set at every confirmed escrow or rotation and
   by an unlock that opened the current file). It tells an escrowed sealed
   file from one Astation may not hold, and new storage kids never
@@ -557,13 +557,13 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   `keyed_hash` ops and get the results in order, in exactly the `e1.`/`h1.`
   formats and associated data of steps 0-2a. `Crypt` names the Astation, not
   the account: the agent derives the account and the signed state from that
-  one `cred_state.json` entry, so a caller can't pair one Astation's state
+  one `cred/state.json` entry, so a caller can't pair one Astation's state
   with another account's key. Plain text on the socket is parsed straight
   into wiped buffers. Requests may be pipelined (two requests in one write
   get two replies). `MAX_LINE` is 8 MiB. `EncryptionContext` batches a call
   site (a pull page, a push chunk, a migration chunk) into as few requests as
   a 2 MiB / 1024-op budget allows, always from a blocking thread
-  (`key_agent::blocking`); one field whose wire size is over 6 MiB fails with
+  (`cred_agent::blocking`); one field whose wire size is over 6 MiB fails with
   "a field is too large to encrypt (N bytes)" (N is the field's own size),
   below the line limit. The sealed payload and the plaintext of
   `data_keys.enc` are serialized into one exactly sized, wiped buffer, so
@@ -573,7 +573,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   against a v1 agent prints the version-mismatch line and the same hint
   instead of failing.
 - **Mode and kid** come only from the latest signed account state in
-  `cred_state.json`; there is no stored mode and no "local state doesn't
+  `cred/state.json`; there is no stored mode and no "local state doesn't
   match" check. When several verified Astations name one account the newest
   signed state wins; on an equal epoch the lexicographically smallest
   Astation id wins. One helper (`effective_state`) applies that rule for
@@ -599,7 +599,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   discovery, and the file keeps optional original-case `labels` for
   credential project reports; failure to save optional OFF metadata does not
   fail a command. Writes hold
-  an `flock` on `project_names.lock`; lock order is `cred_state` / trust lock
+  an `flock` on `project_names.lock`; lock order is `cred/state.json` / trust lock
   first, then `project_names.lock`, never the reverse. A corrupt file is
   renamed aside and reset (it holds no secrets); a version mismatch is an
   error.
@@ -649,7 +649,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   - A step-2a binary refuses a v2 `device_keys.sealed` (see above). To
     downgrade after a `K` was installed, follow the reset steps that
     `atem status` prints, or wait for a fresh grant.
-  - A key agent left running across the upgrade speaks protocol v1; the
+  - A cred agent left running across the upgrade speaks protocol v1; the
     new atem tells you to stop it. After the upgrade a verified device needs
     `atem cred unlock` once (protocol v2 agent starts locked) before sync
     can use `K` again.
@@ -981,7 +981,7 @@ signed final state is useful delivery assurance, not an authorization rule.
    the device actually received. `key_proof` is HMAC-SHA256 over the encoded
    first nine fields (including the label), under HKDF-SHA256(`K`, empty
    salt, info `atem-migration-proof-v1`, 32 bytes). It proves possession of
-   the approved account key without exporting `K` from the key agent.
+   the approved account key without exporting `K` from the cred agent.
    Astation captures the authenticated transport's device identity,
    connection generation and data account at receipt, validates the report
    against its own pins and journal, and persists it before asynchronous
@@ -1146,7 +1146,7 @@ atem's signature check anyway.
 sequenceDiagram
   autonumber
   participant C as atem cred get
-  participant K as Key agent
+  participant K as Cred agent
   participant R as Relay
   C->>C: require_pairing, project from git remote
   C->>K: scope_hmac + name_hmac for project and global
@@ -1162,7 +1162,7 @@ sequenceDiagram
 ```
 
 1. `require_pairing`. Find the project from the current repo's remote.
-2. The key agent computes `scope_hmac` and `name_hmac` for the project and
+2. The cred agent computes `scope_hmac` and `name_hmac` for the project and
    for global.
 3. Fetch the scope directory, the manifests, the rows and the device's
    grants, with session auth. The relay refuses scopes the device has no
@@ -1180,7 +1180,7 @@ sequenceDiagram
 6. The row must match the manifest entry exactly
    (`name_hmac`, `version`, `ct_hash`). A validly signed older row is
    rejected.
-7. The key agent opens the sealed scope key and decrypts the value.
+7. The cred agent opens the sealed scope key and decrypts the value.
 8. Print the value to stdout. Messages go to stderr.
 
 A read needs three things: a valid pairing session (so the relay serves
@@ -1242,7 +1242,7 @@ A plain credential value is never written to disk anywhere.
   unlock baselines, epochs and counters: Keychain.
 - Credential values: only in memory while writing or rotating.
 
-**atem (`~/.config/atem/`, all 0600):**
+**atem (`~/.config/atem/cred/`, directory 0700, all files 0600; `CredPaths` in `src/memory/verification.rs` is the one definition):**
 - `device_keys.sealed`: the device key, the device signing key and the
   account keys (`K` and its previous keys, step 2b), encrypted with the
   current storage key.
@@ -1258,23 +1258,23 @@ A plain credential value is never written to disk anywhere.
   hash, per account. No secrets.
 - `data_keys.enc`: gone in step 2b. Steps 0-2a kept `K`, its previous keys
   and the project names there under the machine-bound key (derived from
-  `/etc/machine-id`, which a copied disk includes); the key agent moves it
+  `/etc/machine-id`, which a copied disk includes); the cred agent moves it
   into `device_keys.sealed` and `project_names.json` at the first unlock and
   deletes it.
 - Grants cache: signed grant rows, keys still sealed to the device key.
-- `cred_state`: pinned Astation keys and generation (and a pending
+- `cred/state.json`: pinned Astation keys and generation (and a pending
   replacement, if any), the account epoch floor, highest manifest counter
   per scope, highest `blob_version` seen, the current unlock ticket, the
   latest signed account state, scope directory and revocation list, the
   home Astation that holds the storage key, the last storage kid it is
   known to hold, and every storage kid the device abandoned. Every
-  read-modify-write of it holds an `flock` on `cred_state.lock`, so the key
+  read-modify-write of it holds an `flock` on `cred/state.lock`, so the key
   agent and other atem commands never drop each other's changes.
-- `key-agent.log`; the agent socket `agent.sock` and its `agent.lock` (in
-  `$XDG_RUNTIME_DIR/atem/` when set, else here); `key_agent.lock`, which
+- `cred-agent.log`; the agent socket `agent.sock` and its `agent.lock` (in
+  `$XDG_RUNTIME_DIR/atem/` when set, else here); `cred_agent.lock`, which
   the one agent serving these key files holds (`flock`) for its life, and
   `agent.socket`, the socket path it records for clients.
-- Key agent memory: the unsealed device keys, `K` and its previous keys,
+- Cred agent memory: the unsealed device keys, `K` and its previous keys,
   index subkeys and scope keys.
 - Credential values: never cached. `knowledge.db` holds plain memory and
   keeps refusing credentials.
@@ -1331,7 +1331,7 @@ New atem crates: `p256` (verify), `ed25519-dalek`, `hpke`, `zeroize`.
 - **`K` from the earlier flow** may have come from a relay that swapped the
   device key, so once verification ships Astation rotates `K` for every
   account that has it, granting the new `K` only to verified devices.
-- **`data_keys.enc`** (built, step 2b): the key agent moves `K`, its previous
+- **`data_keys.enc`** (built, step 2b): the cred agent moves `K`, its previous
   keys and the project names into `device_keys.sealed` and
   `project_names.json` at the first unlock, then deletes the file.
 - **Recovery kit.** Turning on memory encryption or credentials creates `R`
@@ -1519,7 +1519,7 @@ format characters from `reason` and `pending_kid` and shows at most 200
 characters.
 An `unlockDenied` with `revoked: true` (or, from an Astation that doesn't
 send the flag yet, "revoked" or "does not belong to this verified device" in
-`reason`, the answer of an Astation that has forgotten the device) is recorded in `cred_state.json`;
+`reason`, the answer of an Astation that has forgotten the device) is recorded in `cred/state.json`;
 `atem status` shows it ("revoked by <id>" for the paired Astation) and
 `atem pair verify` refuses; `atem unpair` with the agent locked renames the
 old key files to `<name>.revoked-<stamp>`, and the next `atem pair` verifies
@@ -1674,9 +1674,9 @@ If this device's keys can't be unlocked (the sealed file or
 `atem status` and
 `atem cred unlock` print:
 
-> To set this device up again: move ~/.config/atem/device_keys,
+> To set this device up again: move ~/.config/atem/cred/device_keys,
 > device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev,
-> unlock_auth_key and cred_state.json into a backup folder (don't delete them:
+> unlock_auth_key and cred/state.json into a backup folder (don't delete them:
 > device_keys.sealed holds the memory encryption key and its older keys, which
 > older data may need), then run `atem unpair` and `atem pair`. Astation grants
 > the current memory key again; older keys come back only from that backup.
@@ -1759,7 +1759,7 @@ encryption key (32 × `66`) and verifies the device signature.
 
 | Component | Work |
 |---|---|
-| atem | Signed account state and plain-text rejection (fixes to #36); key agent (socket, `SO_PEERCRED`, `mlock`, `zeroize`); fresh device, device signing and unlock-auth keys; `device_keys.sealed` with storage-key rotation (built, step 2a); commit-then-reveal safety code and `[y/N]` in `atem pair`; HPKE grants with signature checks; device-signed memory writes and verification; `atem cred` commands; scope directory, manifest and epoch checks; `cred_state`; ticket rolling; rotation delay and veto handling; device-reported checks (boot ID, TPM, cloud identity) |
+| atem | Signed account state and plain-text rejection (fixes to #36); cred agent (socket, `SO_PEERCRED`, `mlock`, `zeroize`); fresh device, device signing and unlock-auth keys; `device_keys.sealed` with storage-key rotation (built, step 2a); commit-then-reveal safety code and `[y/N]` in `atem pair`; HPKE grants with signature checks; device-signed memory writes and verification; `atem cred` commands; scope directory, manifest and epoch checks; `cred/state.json`; ticket rolling; rotation delay and veto handling; device-reported checks (boot ID, TPM, cloud identity) |
 | Astation | Secure Enclave signing key and encryption key; signed account state, device certificates, grants, directory, revocations; key manager for `K`; scope, index and storage keys; Credentials and Devices tabs; verification dialog; unlock prompts, auto-unlock checks, tickets; recovery secret `R` in the kit, versioned backup blob, signing-key rotation with 72-hour delay and veto |
 | Relay | Store and serve signed statements; per-account plain-text refusal; `credentials`, `cred_manifests`, `cred_directory`, `cred_grants`, `cred_devices`, `cred_recovery`, `cred_fetch_log`; credential writes from the Astation session only; grant-scoped reads; device signatures on memory rows; live-twin and network observations forwarded to Astation |
 
@@ -1772,7 +1772,7 @@ Suggested build order:
    as `off` for upload.
 1. Verification: fresh keys, commit-then-reveal safety code, signed device
    certificate, signed account state, HPKE signed grants (`K` first).
-2. Sealed device keys, key agent, signed unlock with storage-key rotation,
+2. Sealed device keys, cred agent, signed unlock with storage-key rotation,
    Touch ID unlock. Split: 2a (built on atem) seals the device keys and
    opens grants in the agent; 2b (built on atem) moves `K` and `data_keys.enc` behind the
    agent.

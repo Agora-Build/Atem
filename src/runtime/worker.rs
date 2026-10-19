@@ -715,6 +715,7 @@ impl Worker {
             dropped: self.dropped,
             exited: self.exited.clone(),
             chat: self.has_chat,
+            build: Some(crate::memory::cred_agent::build_id().to_string()),
         }
     }
 

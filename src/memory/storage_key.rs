@@ -1,5 +1,5 @@
 //! The storage key and the sealed device-keys file. The storage key's only
-//! job is to protect `device_keys.sealed`; Astation holds it, the key agent
+//! job is to protect `device_keys.sealed`; Astation holds it, the cred agent
 //! holds it while unlocked, and it is replaced at every unlock.
 //! See designs/e2e-encryption.md "Keys on disk (atem)".
 use anyhow::{Context, Result, anyhow, bail};
@@ -105,7 +105,7 @@ impl SealedDeviceKeys {
         })
     }
 
-    /// The device keys only (tests; the key agent opens with the account keys).
+    /// The device keys only (tests; the cred agent opens with the account keys).
     #[cfg(test)]
     pub fn open(&self, storage_key: &[u8; 32], unlock_auth: UnlockAuthKey) -> Result<DeviceKeys> {
         self.open_with_accounts(storage_key, unlock_auth)
@@ -370,8 +370,8 @@ mod tests {
     #[test]
     fn file_round_trips_0600_and_promotes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("device_keys.sealed");
-        let next = dir.path().join("device_keys.sealed.next");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_sealed;
+        let next = crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_next;
         assert!(SealedDeviceKeys::load_from(&path).unwrap().is_none());
         let file = sealed(&DeviceKeys::generate(), &new_storage_key());
         file.save_to(&next).unwrap();

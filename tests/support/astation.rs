@@ -148,8 +148,9 @@ pub fn write_verified_pairing(config: &Path, account: &str, device: &str, trust_
         "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
         "safety_code": "", "epoch_floor": 0, "account_state": null, "account_epoch": 0,
     });
+    std::fs::create_dir_all(super::cred::dir(config)).unwrap();
     std::fs::write(
-        config.join("cred_state.json"),
+        super::cred::state(config),
         json!({"version": 1, "astations": {ASTATION: entry}}).to_string(),
     )
     .unwrap();

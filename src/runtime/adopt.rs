@@ -184,6 +184,8 @@ pub struct WorkerInfo {
     pub exited: Option<String>,
     /// The worker runs a chat adapter (the session offers chat-v1).
     pub chat: bool,
+    /// The worker's atem build, when its hello says.
+    pub build: Option<String>,
 }
 
 /// The broker's connection to one worker. Messages to it go out in the order
@@ -413,6 +415,7 @@ impl WorkerHandle {
                 dropped,
                 exited,
                 chat,
+                build,
             } => WorkerInfo {
                 session_id,
                 process_gen,
@@ -424,6 +427,7 @@ impl WorkerHandle {
                 dropped,
                 exited,
                 chat,
+                build,
             },
             WorkerMsg::Error { text } => bail!("the worker refused: {text}"),
             other => bail!("the worker sent {other:?} before hello"),

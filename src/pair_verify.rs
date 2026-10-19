@@ -297,8 +297,8 @@ pub(crate) struct DeviceVerifiedReply {
 /// `BoundAgent` (the lock is already held).
 pub(crate) fn apply_device_verified(
     capture: &crate::pairing_binding::Captured,
-    paths: &crate::memory::verification::KeyPaths,
-    agent: &dyn crate::memory::key_agent::KeyAgentApi,
+    paths: &crate::memory::verification::CredPaths,
+    agent: &dyn crate::memory::cred_agent::CredAgentApi,
     astation_id: &str,
     keys: crate::memory::verification::VerificationKeys,
     reply: &DeviceVerifiedReply,
@@ -646,8 +646,13 @@ mod tests {
         let (url, server) = astation(Vec::new()).await;
         let client = connected(&url).await;
         let failure = code_failure(CodeAnswer::Refused).unwrap();
-        let error =
-            abandon_verification(&client, &dir.path().join("cred_state.json"), "a", failure).await;
+        let error = abandon_verification(
+            &client,
+            &crate::memory::verification::CredPaths::in_dir(dir.path()).trust,
+            "a",
+            failure,
+        )
+        .await;
         drop(client);
         assert!(error.to_string().contains("codes didn't match"));
         let frames = server.await.unwrap();
@@ -668,8 +673,13 @@ mod tests {
             failure.abort_reason(),
             Some("timed out waiting for Astation")
         );
-        let error =
-            abandon_verification(&client, &dir.path().join("cred_state.json"), "a", failure).await;
+        let error = abandon_verification(
+            &client,
+            &crate::memory::verification::CredPaths::in_dir(dir.path()).trust,
+            "a",
+            failure,
+        )
+        .await;
         drop(client);
         assert!(error.to_string().contains("Timed out"));
         let frames = server.await.unwrap();
@@ -692,8 +702,13 @@ mod tests {
             panic!("expected Astation's abort");
         };
         assert_eq!(failure.abort_reason(), None);
-        let error =
-            abandon_verification(&client, &dir.path().join("cred_state.json"), "a", failure).await;
+        let error = abandon_verification(
+            &client,
+            &crate::memory::verification::CredPaths::in_dir(dir.path()).trust,
+            "a",
+            failure,
+        )
+        .await;
         drop(client);
         assert!(error.to_string().contains("declined on the Mac"));
         assert!(server.await.unwrap().is_empty());
@@ -742,11 +757,11 @@ mod tests {
     /// (or replaced) meanwhile is never applied.
     #[test]
     fn a_delayed_device_verified_for_an_old_binding_is_not_applied() {
-        use crate::memory::key_agent::{KeyAgentApi, Reply, Request};
+        use crate::memory::cred_agent::{CredAgentApi, Reply, Request};
         struct NeverCalled;
-        impl KeyAgentApi for NeverCalled {
+        impl CredAgentApi for NeverCalled {
             fn call(&self, _: Request) -> Result<Reply> {
-                panic!("the key agent was asked to apply a stale verification")
+                panic!("the cred agent was asked to apply a stale verification")
             }
         }
         let wire = || SignedWire {

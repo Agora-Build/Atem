@@ -1,6 +1,6 @@
 //! What this device trusts about each Astation: the keys it pinned during
 //! verification, the epoch floor, and the latest signed account state.
-//! Pending entries are never trusted. Stored in `cred_state.json` (0600).
+//! Pending entries are never trusted. Stored in `cred/state.json` (0600).
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,7 @@ pub struct RevokedBy {
     pub at: u64,
 }
 
-/// Holds `cred_state.lock` (see `TrustStore::lock`) until dropped.
+/// Holds `cred/state.lock` (see `TrustStore::lock`) until dropped.
 pub struct TrustLock {
     #[cfg(unix)]
     _file: std::fs::File,
@@ -100,7 +100,7 @@ fn store_version() -> u8 {
 }
 
 pub fn trust_path() -> PathBuf {
-    crate::config::AtemConfig::config_dir().join("cred_state.json")
+    crate::memory::verification::CredPaths::default_paths().trust
 }
 
 impl TrustStore {
@@ -112,9 +112,9 @@ impl TrustStore {
             }
             Err(error) => return Err(error.into()),
         };
-        let store: Self = serde_json::from_slice(&raw).context("cred_state.json is unreadable")?;
+        let store: Self = serde_json::from_slice(&raw).context("cred/state.json is unreadable")?;
         if store.version != 1 {
-            bail!("unsupported cred_state.json version {}", store.version);
+            bail!("unsupported cred/state.json version {}", store.version);
         }
         Ok(store)
     }
@@ -124,19 +124,24 @@ impl TrustStore {
         crate::memory::crypto::write_private(path, &serde_json::to_vec_pretty(self)?)
     }
 
-    /// Takes the exclusive lock on `cred_state.lock` beside `path`, held
+    /// The lock file of the store at `path` (`state.json` → `state.lock`).
+    pub fn lock_path(path: &Path) -> PathBuf {
+        path.with_extension("lock")
+    }
+
+    /// Takes the exclusive lock on `state.lock` beside `path`, held
     /// until the guard drops. Every read-modify-write of the store holds it,
-    /// so the key agent and other atem commands don't drop each other's
-    /// changes. Never call the key agent while holding it (the agent takes it
+    /// so the cred agent and other atem commands don't drop each other's
+    /// changes. Never call the cred agent while holding it (the agent takes it
     /// too).
     pub fn lock(path: &Path) -> Result<TrustLock> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             use std::os::unix::io::AsRawFd;
-            let lock_path = path.with_extension("lock");
+            let lock_path = Self::lock_path(path);
             if let Some(dir) = lock_path.parent() {
-                std::fs::create_dir_all(dir)?;
+                crate::memory::verification::create_private_dir(dir)?;
             }
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -499,7 +504,7 @@ mod tests {
     fn concurrent_updates_lose_nothing() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
         let writers: Vec<_> = (0..4)
             .map(|writer| {
                 let path = path.clone();
@@ -833,7 +838,7 @@ mod tests {
     #[test]
     fn abandoned_storage_kids_are_kept_and_never_picked_again() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
         let mut store = TrustStore::default();
         store.record_abandoned("aaaaaaaa");
         store.save_to(&path).unwrap();
@@ -857,7 +862,7 @@ mod tests {
             .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
         store.save_to(&path).unwrap();
         let loaded = TrustStore::load_from(&path).unwrap();
         assert!(loaded.verified(ASTATION).is_some());
@@ -897,7 +902,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.home(), Some(ASTATION));
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
         store.save_to(&path).unwrap();
         assert_eq!(TrustStore::load_from(&path).unwrap().home(), Some(ASTATION));
     }
@@ -911,7 +916,7 @@ mod tests {
             .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cred_state.json");
+        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
         store.save_to(&path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("home_astation"), "no home is not written");

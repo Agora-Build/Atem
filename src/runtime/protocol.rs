@@ -113,6 +113,13 @@ pub enum ClientMsg {
     /// Re-read credentials and config; a link whose pairing is gone (after
     /// `atem unpair`) is dropped with its attachments.
     Reload,
+    /// → `status`: the Astation link, the session attachment, the journal
+    /// and the sessions (`atem status`, `atem --version`; read-only).
+    Status,
+    /// → `restarting`, then the runtime exits so a client can start its own
+    /// build; the sessions' workers keep running and the next runtime adopts
+    /// them. Refused while an Astation operation runs.
+    Restart,
     /// Runs an Astation operation on the runtime's link: `print`/`ask`
     /// follow, then `done`. One at a time.
     AstationOp {
@@ -212,6 +219,8 @@ impl ClientMsg {
             ClientMsg::List => "list",
             ClientMsg::Stop { .. } => "stop",
             ClientMsg::Reload => "reload",
+            ClientMsg::Status => "status",
+            ClientMsg::Restart => "restart",
             ClientMsg::AstationOp { .. } => "astation_op",
             ClientMsg::Answer { .. } => "answer",
         }
@@ -261,6 +270,75 @@ pub struct SessionSummary {
     /// The process generation: changes with every process (terminal-v1's
     /// generation).
     pub generation: String,
+    /// The atem build of the session's worker (its `hello`), when it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_build: Option<String>,
+}
+
+/// How the Astation link reached Astation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    Local,
+    Relay,
+}
+
+/// The link's session attachment was welcomed (session-v1 `hello`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Welcomed {
+    /// The atem-session revision it was welcomed under.
+    pub revision: u64,
+    /// When (wall clock, Unix ms).
+    pub at_ms: u64,
+    /// What is left of the link's authorization.
+    pub ms_left: u64,
+}
+
+/// The last `hello` the runtime refused for its revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    /// The revision that `hello` named (`None`: none).
+    pub revision: Option<u64>,
+    /// The revision the runtime needs.
+    pub needs: u64,
+    pub at_ms: u64,
+}
+
+/// What `status` reports: never a secret (no session id, token or relay
+/// code).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStatus {
+    /// The Astation link is authenticated.
+    pub astation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
+    /// Relay links: the relay host and this Atem's id in the room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// Not connected: a connect is under way or scheduled.
+    #[serde(default)]
+    pub retrying: bool,
+    /// The socket is open but Astation asked to authenticate again.
+    #[serde(default)]
+    pub reauthenticating: bool,
+    /// The link has a session attachment (a verified pairing).
+    #[serde(default)]
+    pub attachment: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcomed: Option<Welcomed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<Refusal>,
+    /// A journal write failed: nothing is admitted until a restart.
+    #[serde(default)]
+    pub journal_halted: bool,
+    /// Why remote sessions are off, if they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_error: Option<String>,
+    /// The workers found at start are still being adopted.
+    #[serde(default)]
+    pub adopting: bool,
+    #[serde(default)]
+    pub sessions: Vec<SessionSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +356,10 @@ pub enum RuntimeMsg {
         /// could not start), if they are.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_error: Option<String>,
+        /// The worker protocol its workers speak (`None`: a runtime from
+        /// before the field, which speaks worker protocol 1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_protocol: Option<u32>,
     },
     Launched {
         session: SessionSummary,
@@ -322,6 +404,12 @@ pub enum RuntimeMsg {
     Astation {
         connected: bool,
     },
+    /// The answer to `status`.
+    Status {
+        status: RuntimeStatus,
+    },
+    /// The answer to `restart`: the runtime exits after this pass.
+    Restarting,
     Notice {
         text: String,
     },
@@ -517,6 +605,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            worker_build: None,
         }
     }
 
@@ -608,6 +697,7 @@ mod tests {
                 pid: 7,
                 astation: true,
                 host_error: Some("remote sessions disabled: x".into()),
+                worker_protocol: Some(1),
             },
             RuntimeMsg::Launched { session: summary() },
             RuntimeMsg::Attached {
