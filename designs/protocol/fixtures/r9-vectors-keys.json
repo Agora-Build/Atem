@@ -1,5 +1,10 @@
 {
   "keys": {
+    "K-gen-3": {
+      "kid": "7a3c9e10",
+      "note": "a rotated account key K (test value SHA-256(enc([\"atem-r9-test-key\", \"K-gen-3\"]))), first in env4_kit1",
+      "secret_hex": "44f6bf2c49660d8025954e67cd0921095e9f17f6f754f0860127d0cdc3a8c3ae"
+    },
     "browser": {
       "alg": "p256",
       "pub_hex": "04a8ecb76c7ae4c016a4a65abc1064a76b3b13461b95f6b3428aed2a7e4ff9634b40ba605e519798b5a766317ec6cccd39aa603e6ca7b9df8a5973220449af0fbf",
@@ -64,9 +69,19 @@
     "note": "test keys only: secret = SHA-256(enc([\"atem-r9-test-key\", label])); p256 public keys are SEC1 uncompressed (65 bytes), all binary values base64url without padding in wire objects, hex here",
     "recovery": {
       "R_hex": "de7b07c173601dbcd9053ef7679fcd3a6864af071005397179134682a438dcc6",
-      "seal_key_hex": "e6fcdaf63348953d1062b8b392e102ad88c13ea7ea2b99a125083aa2ca479c35",
+      "note": "the genesis Recovery Kit (kit 1). x25519_secret = SHA-512(sign_seed)[0..32] (X25519 clamps it), x25519_pub = the Montgomery form of sign_pub: K backups are sealed to it (R9.5)",
       "sign_pub_hex": "98767c988ff0cf727ae9917811e9c4ed63b7fb48608d4c32688db79f2ed94360",
-      "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616"
+      "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616",
+      "x25519_pub_hex": "bf4e6c788975c3b940a9f5c0a51021855c6e2ddebd4da5910c5487604bccab11",
+      "x25519_secret_hex": "03024c114a38837b585e6056038e8fec266d66b393822cb9539646119c54cc95"
+    },
+    "recovery-2": {
+      "R_hex": "4a5242ed59c7082d090c9f231a12d2a9556b103487a1939f3cd247ea8c3b0ef8",
+      "note": "the replacement Recovery Kit (kit 2) of set_recovery_key (R9.5): R = SHA-256(enc([\"atem-r9-test-key\", \"recovery-kit-2\"])); x25519 forms as for kit 1",
+      "sign_pub_hex": "6ac71ad781df6ce7ed92841e5bc62f742da067719adaf123445a32160d9662e9",
+      "sign_seed_hex": "8c883c0ac87d86005eb18840dc813b4e9e667d0454972f05555413c359ae97db",
+      "x25519_pub_hex": "9cf22770ff538106fbbc159283ddb03ba7edc84af5e945366628ba5016fea506",
+      "x25519_secret_hex": "16aa17e40af75e3ad84a51dc68ac5facdb15e20749b0ab3ad0acd3252bae0e15"
     },
     "svc-discord": {
       "auth": {

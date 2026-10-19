@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.3 (Astation review 5): a failed write applies nothing; a valid removal followed by an invalid entry is committed in one write, its fences (lease revoked, queued work rejected, attachments closed) happen before any reply, then the carrier is refused with the new head and the failing index.",
+  "note": "R9.3 (Astation review 5): a valid removal followed by an invalid entry is committed in one write, its fences (lease revoked, queued work rejected, attachments closed) happen before any reply, then the carrier is refused with the new head and the failing index. (A failed write: r9-chain-membership-write-fault-*.)",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -82,29 +82,6 @@
     },
     {
       "hold_dispatch": true
-    },
-    {
-      "fail_next_membership_write": true
-    },
-    {
-      "send_membership": "phone",
-      "entries": [
-        "E7"
-      ]
-    },
-    {
-      "expect": "phone",
-      "match": {
-        "op": "error",
-        "code": "busy",
-        "detail": "device list not recorded"
-      }
-    },
-    {
-      "assert": {
-        "head": "E6",
-        "attachments": 3
-      }
     },
     {
       "connect": "mac",

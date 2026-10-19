@@ -1,0 +1,138 @@
+{
+  "name": "r9-recovery-kit-replaced-without-the-kit-then-vetoed",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5: set_recovery_key with kit lost (manager only) is pending for 24 h like a recovery_add; its own signer can't approve it; another manager's veto cancels it and the old kit stays current.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793177601000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "carry": [
+        "K7_lost"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 7,
+        "head.hash": "${hash:K7_lost}",
+        "pending_recovery": [
+          {
+            "entry_hash": "${hash:K7_lost}",
+            "seq": 7,
+            "action": "set_recovery_key",
+            "subject": "dev-phone",
+            "effective_at": 1793264001000
+          }
+        ]
+      }
+    },
+    {
+      "assert": {
+        "recovery_key": "recovery",
+        "pending": {
+          "K7_lost": "pending"
+        }
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": [
+        "A8_k_self"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 7,
+        "head.hash": "${hash:K7_lost}",
+        "index": 0,
+        "detail": "self_approval"
+      }
+    },
+    {
+      "connect": "mac",
+      "carry": [
+        "V8_k"
+      ]
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-mac",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 8,
+        "head.hash": "${hash:V8_k}",
+        "pending_recovery": []
+      }
+    },
+    {
+      "advance_ms": 86401000
+    },
+    {
+      "assert": {
+        "head": "V8_k",
+        "recovery_key": "recovery",
+        "pending": {
+          "K7_lost": "cancelled"
+        }
+      }
+    }
+  ]
+}

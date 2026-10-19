@@ -1,0 +1,82 @@
+{
+  "name": "r9-push-delayed-ingress-at-the-skew-bound",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "relay",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.9: first receipt exactly 120000 ms after created_at is inside the bound (accepted). Both stages are already due (desktop at created_at, mobile at created_at + 60000) and still before expires_at - 15000, so both are sent at once; the card's expiry is unchanged.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "relay_now": 1793264125000,
+    "desktop_connected": false
+  },
+  "steps": [
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.0}"
+    },
+    {
+      "relay_result": "accepted"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.1}"
+    },
+    {
+      "relay_result": "accepted"
+    },
+    {
+      "expect_push": {
+        "device": "dev-mac",
+        "kind": "desktop_os",
+        "due_at": 1793264125000
+      }
+    },
+    {
+      "expect_push": {
+        "device": "dev-phone",
+        "kind": "mobile",
+        "due_at": 1793264125000
+      }
+    },
+    {
+      "expect_no_push": {
+        "for_ms": 600000
+      }
+    }
+  ]
+}

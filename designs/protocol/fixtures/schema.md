@@ -216,11 +216,11 @@ and `negative`/`invalid` cases must be refused for the stated reason.
 |---|---|
 | `r9-vectors-keys` | every test key (P-256, Ed25519, X25519 secrets and publics) and the Recovery Kit `R` |
 | `r9-vectors-encoding` | `enc`, `u64`, `jcs`, a P-256 low-S signature and its refused high-S twin, an Ed25519 signature |
-| `r9-vectors-membership-log` | log L = E1–E6 (genesis, add_host, three members, a service, a removal) with signing inputs, signatures and `entry_hash`; alternatives used by the scenarios: `C6_ipad`, `C6_mac`, `S6_phone`, `E7`, `E7_retry`, `X8_badsig`, `X7_ipad`, `X5_svc91d`, `R7`, `R7_wrong_key`, `R7_roles`, `R7_remove`, `R6_conflict` |
-| `r9-vectors-recovery` | `R` → seal key, signing seed, recovery key (= E1's); the `R7` entry; an `atem-k-backup-v1` envelope with its AAD and keys |
+| `r9-vectors-membership-log` | log L = E1–E6 (genesis, add_host, three members, a service, a removal) with signing inputs, signatures and `entry_hash`; alternatives used by the scenarios: `C6_ipad`, `C6_mac`, `S6_phone`, `E7`, `E7_retry`, `X8_badsig`, `X7_ipad`, `X5_svc91d`, `R7`, `R7_wrong_key`, `R7_roles`, `R7_remove`, `R6_conflict`; recovery decisions and kits (R9.5): `R7_backdated`, `A8`, `V8`, `A8_ipad`, `V8_ipad`, `N8`, `K7_current` (with `kit_sig`), `K7_current_no_kit_sig`, `R8_oldkit`, `R8_newkit`, `K7_lost`, `V8_k`, `A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale` |
+| `r9-vectors-recovery` | `R` → signing seed, recovery key (= E1's) and its X25519 form; the `R7` entry; `atem-k-backup-v2` envelopes sealed to kit 1 (`k_backup`, version 3; `k_backup_rotated`, version 4) with `info`, `ikmE`, `backup_hash`; `kit_2` (the replacement kit) and the envelope re-sealed to it |
 | `r9-vectors-channel-handshake` | a full `atem-ch1` handshake (every input, `th2`, `sig_h`, `ss`, `hs`, `k_finish`, `th3`, `sig_c`, the `finish` ciphertext, `th4`, `channel_id`, both record keys, three records) and the negative cases |
 | `r9-vectors-browser-grant` | a signed QR grant, its hash, the browser's `th3`/`sig_c`, and two invalid grants |
-| `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, and four refused hints |
+| `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints |
 
 `kind: "scenario"` — `{name, requires, kind, side, log, note, setup,
 steps}`. `log` names the vectors file whose entry labels the scenario
@@ -267,15 +267,35 @@ stand for the client's current read / lease binding. New:
 | `{"relay_receive": hint, "tamper"?: {…}}` / `{"relay_result": r}` | relay side: a hint arrives; its verdict (`accepted`, `idempotent`, `duplicate`, `skew`, `invalid_times`, `bad_signature`, `ignored_after_resolved`) |
 | `{"expect_push": {device, kind, at_ms?, collapse_id?}}`, `{"expect_no_push": {"for_ms": n}}`, `{"client_open": {…}, "plain": {…}}` | relay side: a provider push (`desktop_os`, `mobile`, `replace`), none, a recipient opening its sealed part |
 | `{"expect_relay": {path: value}}` / `{"expect_relay_none": true}` | host side: the next relay message Atem sends (`push_hint`, `push_seen`) / none |
-| `{"host_connect": {…}}` | relay side: a device then connects to a host pinned as given |
+| `{"host_connect": {…}}` | relay side: a device then connects to a host pinned as given; client side (restore): the fixture's host answers an `init` with `accept_head` |
+| `{"expect_local_status": {"recovery_pending": bool}}` | host side: `atem status` and the agent terminal's status row show (or no longer show) that a recovery is pending; the text is the implementation's |
+| `{"fail_next_membership_write": {"at": "intent"\|"temp_write"\|"temp_fsync"\|"rename"\|"directory_fsync", "file"?: "freeze"}}` | the next device-list write fails at that step (`true` = `temp_write`); `file: "freeze"` targets the freeze file |
+| `restart_runtime` with `"disk": "as_written"\|"rename_kept"\|"rename_lost"\|"write_lost"` | what survived of the failed write: everything written, the rename kept (never directory-fsynced), the rename lost, or nothing of it |
+| `{"relay_receive_seen": seen}`, `{"expect_relay_ack": {op, acks}}`, `{"relay_restart": true}`, `{"relay_failover": {from, to}}` | relay side: a seen arrives (verdicts `applied`, `pending`, `ignored_after_resolved`); the relay's `push_ack`; the relay restarts from its durable store; another replica takes over |
+| `{"relay_lost": true}`, `{"relay_ack": {op, acks}}` | host side: the last relay message Atem sent was lost; the relay acknowledges |
+| `{"restore": {kit, relay_log, relay_blob, host_heads}, "tamper"?: {…}, "result": "restored"\|"refused", "detail"?, "freshness"?, "kids"?, "published": false\|{…}}` | client side: a Recovery Kit restore against that relay log and envelope with those host-signed heads; `published` is the `recovery_add` it then signs (none when refused) |
+| `{"client_data": {"kid": k}, "result": r}` | client side: the restored device meets data sealed under `kid` |
+
+In r9 scenarios `advance_ms` moves the host's (or relay's) monotonic
+and wall clocks together, and `set_wall_clock` the wall clock only.
+`expect_push` takes `due_at` (the stage's due time on the relay's clock,
+absolute) and optional `replica`; setup `immediate_mobile` lists the
+devices opted in to immediate mobile pushes (default: none),
+`replicas` the relay replicas. `connect` also takes `"transport":
+"direct"` (:8080).
 
 New `assert` keys: `head` (label), `membership_applied` (label),
 `frozen`, `frozen_genesis`, `evidence_count`, `evidence_reason`,
 `control_gen` (`{principal: n}`), `members`, `stored_sig` (label whose
 signature is stored), `channel_id`, `carried_ever`, `receipts`
-(`{request_id: {state, detail}}`), `host` (which host of `hosts`).
+(`{request_id: {state, detail}}`), `host` (which host of `hosts`),
+`pending` (`{label: "pending"|"active"|"cancelled"}`, R9.5),
+`recovery_key` (the `r9-vectors-keys` name of the current kit),
+`k_backup` (the newest `k_backup` record), `membership_halted` (the
+journal halted by a device-list write fault), `membership_unclean`
+(`{seq, hash}` of the intent, or `null`), `frozen_durable`.
 `assert_client`: `discarded` (prepared entries discarded),
-`log_head`.
+`log_head`, `may_rotate_k`, `may_seal_backup`, `freshness`, `refetch`.
 
 Until the r9 harness first runs them, an r9 scenario lists the
 expectations its checks need; messages of r8 ops it doesn't expect

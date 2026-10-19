@@ -1699,8 +1699,9 @@ browser grants, all over one end-to-end channel (`atem-ch1`) whose
 authority is a signed membership log pinned at pairing. It answers the
 §9 gate for those features. Design and user decisions:
 `remote-agent-api-atem.md` (r3) and `../account-trust.md`. Astation's
-review of r2 (2026-10-19) is answered point by point in
-`remote-agent-api-atem.md` §10. Fixtures: `fixtures/r9-*.json`
+reviews of r2 and of the first r9 pin `ffe840d` (its r3 review,
+2026-10-19) are answered point by point in `remote-agent-api-atem.md`
+§10. Fixtures: `fixtures/r9-*.json`
 (`requires: "r9"`; every runner reports them NOT RUN until r9 is built),
 format in `fixtures/schema.md` "r9 fixtures".
 
@@ -1725,7 +1726,7 @@ Mac is the genesis member using the same channel as every other client
 | `enc(fields)` | `src/memory/encoding.rs`: each field is a 4-byte big-endian length then its bytes, the label first. Integers inside `enc` are 8-byte big-endian (`u64(n)`); hashes inside `enc` are their 32 raw bytes, never hex |
 | JSON bodies | I-JSON parsed with `parse_strict` (`src/session_protocol/canonical.rs`: no duplicate keys, integers ≤ 2^53−1, no `null`, absent = omitted, no unknown fields in signed bodies); canonical form `jcs(body)` = RFC 8785 |
 | Binary in JSON | base64url without padding (`b64u`) for keys, signatures, nonces and ciphertexts; lowercase hex (64 chars) for hashes |
-| Signed object | wire `{"body":{…},"sig":"<b64u>"}`; signing input `enc([label, jcs(body)])` with the label of the body's `type` (table below); the verifier takes the key and `alg` from where the body names its signer, never from the object |
+| Signed object | wire `{"body":{…},"sig":"<b64u>"}` (a `set_recovery_key` entry with `kit: "current"` also carries `kit_sig`, R9.5); signing input `enc([label, jcs(body)])` with the label of the body's `type` (table below); the verifier takes the key and `alg` from where the body names its signer, never from the object |
 | `p256` | ECDSA P-256/SHA-256 over the signing input, SEC1 uncompressed 65-byte public key, 64-byte `r‖s`, **low S required** (`verify_astation`). Signers normalize S; RFC 6979 or hedged nonces are both valid |
 | `ed25519` | RFC 8032 pure Ed25519 over the signing input, 32-byte key, `verify_strict` (`verify_device`) |
 | `x25519` | 32-byte public key; encryption only, never signing |
@@ -1733,7 +1734,8 @@ Mac is the genesis member using the same channel as every other client
 
 | `type` | label (signing input) | signed by |
 |---|---|---|
-| `atem-membership-entry` | `atem-membership-entry-v1` | a manager at `seq-1`, or the genesis recovery key (R9.5) |
+| `atem-membership-entry` | `atem-membership-entry-v1` | a manager at `seq-1`, or the current recovery key (R9.5) |
+| (`kit_sig` beside a `set_recovery_key` entry with `kit: "current"`) | `atem-recovery-cosign-v1` over the same `jcs(body)` | the current recovery key (R9.5) |
 | `atem-browser-grant` | `atem-browser-grant-v1` | a native member with `control` (R9.6) |
 | `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
@@ -1743,8 +1745,8 @@ Other domain strings (never signing inputs of another kind):
 `atem-ch1-th2`, `atem-ch1-th3`, `atem-ch1-th4`, `atem-ch1-host-sig-v1`,
 `atem-ch1-client-sig-v1`, `atem-ch1 finish c2h`, `atem-ch1 ap c2h`,
 `atem-ch1 ap h2c`, `atem-ch1-finish`, `atem-ch1-rec`,
-`atem-push-seal-v1`, `atem-enc-kid-v1`, `atem-k-backup-v1`,
-`atem-recovery-seal-v1`, `atem-recovery-sign-v1`, `atem-safety-code-v2`.
+`atem-push-seal-v1`, `atem-enc-kid-v1`, `atem-k-backup-v2`,
+`atem-k-backup-hash-v1`, `atem-recovery-sign-v1`, `atem-safety-code-v2`.
 Vectors: `r9-vectors-encoding`, `r9-vectors-keys`.
 
 ### R9.2 The membership log
@@ -1775,7 +1777,11 @@ bodies differ (Astation review 2).
 | `set_roles` | `device_id`, `roles`, `scope?`, `expires_at?` | a current member; same kind rules as `add`; at least one native manager remains. **Always a revocation** (R9.3) |
 | `add_host` | `host{host_id, host_trust_gen, host_key{alg:"ed25519",pub}}` | `host_trust_gen` greater than every earlier `add_host` of that `host_id`; the newest one is the host's only valid key |
 | `remove_host` | `host_id` | a current host |
-| `recovery_add` | `member` | R9.5; `signer` is exactly `"recovery"` |
+| `recovery_add` | `member` | R9.5; `signer` is exactly `"recovery"`, verified with the current recovery key. **Pending** for 24 h on each host's clock (R9.5) |
+| `set_recovery_key` | `recovery_key{alg:"ed25519",pub}`, `kit` (`"current"` or `"lost"`) | R9.5; a manager signs; a key never used in this log before. `current`: the wire object also carries `kit_sig` by the current recovery key, in effect at once. `lost`: no `kit_sig`, **pending** like a `recovery_add` |
+| `recovery_approve` | `target` (hex `entry_hash`) | R9.5; `target` is a `recovery_add` or a `kit: "lost"` `set_recovery_key` in this log; a manager other than the target's signer. Ends the wait at once |
+| `recovery_veto` | `target` | R9.5; same `target` rule; any manager. Cancels the target if it is still pending on this host |
+| `k_backup` | `k_backup{blob_version, kids, recovery_key, backup_hash}` | R9.5; a manager; `blob_version` above every earlier one; `recovery_key` current or pending. Records the newest K backup (the restore's version floor) |
 
 `member`: `device_id` (opaque id, 1–128 bytes `[A-Za-z0-9._:-]`, never
 `recovery`), `kind`:
@@ -1795,10 +1801,15 @@ signer's display time, never authority (R9.6 says which times are).
 parse; `type`, `v`; `account_id` and `genesis_hash` equal the pin;
 `seq = n`; `prev_hash = C[n-1].entry_hash`; the action's rules above;
 the signer: `"recovery"` only for `recovery_add`, verified with the
-genesis `recovery_key`; otherwise a `native` member of `C` holding
-`manage`, verified with its `auth_key` under its pinned `alg`. Anything
-else is invalid. The `alg` of a key is fixed when it enters the log;
-a new key is a new member (or a new `add_host`).
+**current** recovery key (genesis, or the newest `set_recovery_key` in
+effect on this host; a replaced key is refused, `recovery_key_retired`);
+otherwise a `native` member of `C` holding `manage` and in effect on this
+host (a member whose `recovery_add` is pending or cancelled here holds
+nothing), verified with its `auth_key` under its pinned `alg`. Anything
+else is invalid. An entry whose only problem is that it depends on an
+entry still pending on this host is **deferred**, not invalid (R9.3,
+R9.5). The `alg` of a key is fixed when it enters the log; a new key is
+a new member (or a new `add_host`).
 
 Log limits: ≤ 1024 entries, ≤ 256 members, ≤ 64 hosts. A full log is
 `membership_invalid` "device list full; re-pair to start a new one".
@@ -1827,9 +1838,17 @@ fsync; under `pairing/trust_gen.lock`):
 ```json
 {"v":1,"account_id":"…","genesis_hash":"…","recovery_key":{"alg":"ed25519","pub":"…"},
  "host":{"host_id":"host-a","host_trust_gen":1},
- "head":{"seq":6,"hash":"…"},"entries":[{"body":{…},"sig":"…"}],
+ "retired_recovery_keys":["<b64u>"],
+ "head":{"seq":6,"hash":"…"},"entries":[{"body":{…},"sig":"…","kit_sig?":"…"}],
+ "recovery":[{"entry_hash":"…","seq":7,"state":"pending","first_seen_wall":1793177601000,
+              "boot_id":"…","mono_at_first_seen_ns":0,"mono_waited_ms":0,"decided_at_wall?":0,"reason?":"…"}],
  "evidence":{"count":0,"recent":[]},"frozen?":{"at":0,"seq":6,"ours":"<hash>","theirs":{"body":{…},"sig":"…"}}}
 ```
+
+`recovery_key` is the current one (R9.5); `recovery` holds one record per
+`recovery_add` or `kit: "lost"` `set_recovery_key` in the log, written in
+the same commit that appends the entry (its wait starts then) and on each
+state change (R9.5).
 
 `host_channel_key` (Ed25519 seed) is `pairing/host_channel_key`, 0600,
 plain like `unlock_auth_key` (it only proves the host to clients, so it
@@ -1860,14 +1879,19 @@ connections are serialized; the head may have moved since `accept`):
      `need_before: <window start>` (the client reconnects with an earlier
      window). Processing stops after a conflict.
    - `e.seq` = scratch head + 1: verify (R9.2); valid → append to the
-     scratch; invalid → stop, remember its index.
+     scratch; invalid → stop, remember its index; **deferred** (it is
+     signed by the subject of a `recovery_add` still pending on this
+     host, or verifies only with the key of a `set_recovery_key` still
+     pending here, R9.5) → stop without an error: the rest is carried
+     again once the wait ends.
    - a gap → stop, invalid.
 3. **Commit the valid prefix in one write** of `membership.json` (the
    whole bounded batch or the part before the first invalid entry, never
    entry by entry). A valid removal followed by an invalid entry is
    applied (Astation review 5): a signature is trusted whatever else its
-   carrier sent. A failed write applies nothing (memory keeps the old
-   head) and the hello gets `busy` "device list not recorded".
+   carrier sent. The write follows "Writing the device list" below; a
+   failed write **fails closed** there (in-memory fences, journal halt)
+   and the carrier gets `busy` "device list not recorded".
 4. Then the effects, in seq order, through §H: removal, `set_roles`,
    `remove_host` of this host, expiry shortening and grant fences write
    the `control_revoked` fence (raised `control_gen`) for each affected
@@ -1880,10 +1904,64 @@ connections are serialized; the head may have moved since `accept`):
    {head, index}` if an entry was invalid (the connection is refused,
    after the valid prefix took effect); `membership_incomplete{head}` if
    `more` and the sender's principal isn't in the chain yet (the client
-   reconnects with the next window); else admission is judged against
-   the committed head (R9.6, R9.8).
+   reconnects with the next window); `recovery_pending{entry_hash,
+   effective_at}` if the sender's principal is the subject of a pending
+   `recovery_add` (or is added only by an entry deferred behind one);
+   else admission is judged against the committed head (R9.6, R9.8). A
+   deferral is not an error: the carrier is admitted, and its `welcome`
+   shows the head below its own and the pending entry.
 
-**Crash recovery.** At start, before any remote admission, Atem reads
+**Writing the device list** (Astation r3 review 1). Every commit of
+`membership.json` is:
+
+1. **Intent:** `pairing/membership.intent` = `{seq, hash}` of the head
+   about to be written (temp, fsync, rename, directory fsync).
+2. **State:** `membership.json` (temp, fsync, rename, directory fsync).
+3. The effects (step 4 above), then `membership_applied`.
+4. Remove the intent (directory fsync). A leftover intent at or below
+   the stored head is harmless.
+
+A freeze first writes `pairing/membership.freeze` (both entries) the
+same way, then `frozen` in `membership.json`.
+
+**A failed write** — of the intent, the temp file, its fsync, the
+rename or the directory fsync, or of the freeze file — makes the durable
+state uncertain, and Atem fails closed in the same step, exactly as §H
+"A failed revocation write": in memory, every principal the uncommitted
+prefix would remove, strip of `control` or fence (removal, `set_roles`,
+`remove_host` of this host, expiry shortening, grant fences) — **every
+remote principal** when Atem can't tell which (a freeze, or a batch it
+couldn't evaluate) — has its attachments fenced, its lease revoked (the
+input epoch rises, so the worker drops its queued raw bytes at the
+write boundary), and its `accepted` work not yet `executing` rejected
+(`control revoked`). A freeze also takes effect in memory at once
+(R9.4). Then the journal halts (§I): every `init` gets a clear `busy`,
+every later session request but `hello` is `busy` "journal halted;
+restart Atem", nothing queued is dispatched, no remote terminal input
+is written and no new push hint is sent, until the restart. Local use
+goes on. Atem never retries the write in the same run.
+
+**Crash recovery.** At start, before any remote admission, Atem fsyncs
+`membership.json` and the `pairing/` directory (a rename that is
+visible becomes durable; a failure disables remote sessions,
+`welcome.host_error`), then reconciles:
+
+- `membership.freeze` exists, in any state, even unreadable → frozen
+  (R9.4).
+- `membership.intent` names a head beyond the stored one (a higher
+  `seq`, or the same `seq` with another hash) → **unclean**: the last
+  commit may have been lost. Carriages are applied as usual, but no
+  remote principal is admitted (each `hello` gets `busy` "device list
+  not recorded" after its carriage) until the committed head reaches
+  the intent's `seq` with the intent's hash, from any carrier or the
+  host's own relay fetch; then the intent is removed and admission
+  resumes. A different entry at that `seq` keeps the host unclean
+  (evidence `intent_mismatch`); the way out is re-pairing.
+- Pre-restart `accepted` work follows §H Recovery (a run that halted
+  never wrote a clean close, so it is `rejected`, `authorization history
+  unknown`).
+
+Then Atem reads
 `membership.json` and `membership_applied`; for every entry after the
 applied head it replays the fences (idempotent: a raised `control_gen`
 is never raised twice for one entry, the fence names the entry's `seq`)
@@ -1894,8 +1972,9 @@ an applied head ahead of the stored head disables remote sessions
 **On an open channel** a client sends `membership{id, entries}` whenever
 it learns newer entries; same algorithm; reply `membership_head{re,
 head}` or the error (the channel stays unless its own principal was
-fenced). Atem sends every attachment `membership_head{head}` (no `re`)
-when its head moves, so clients fetch. Atem may also fetch the suffix
+fenced). Atem sends every attachment `membership_head{head,
+pending_recovery}` (no `re`) when its head moves or a pending entry
+starts, takes effect or is cancelled, so clients fetch. Atem may also fetch the suffix
 from the relay over its own link; it gets no more trust than any
 carrier.
 
@@ -1916,15 +1995,22 @@ rollback after a removal was seen. That is the accepted residual risk.
 
 A **conflict** is a valid-shaped entry at `seq` ≤ Atem's head, chaining
 from Atem's entry at `seq-1`, whose `entry_hash` differs from Atem's
-entry at `seq`. Only that first divergent entry is judged:
+entry at `seq`. Only that first divergent entry is judged, by the first
+row that matches (the first three are the recovery decisions of R9.5):
 
 | the conflicting entry | outcome |
 |---|---|
+| a valid `recovery_veto` of the same target as Atem's `recovery_veto` at `seq` (two devices vetoed at once) | same effect: if Atem's veto is its head, Atem **replaces** it with the carried one in one write (no effects change), so it can follow the relay's branch; otherwise **ignored**, evidence `duplicate_veto` |
+| Atem's entry at `seq` is a `recovery_veto` it applied while the target was pending here, and the carried one is signed by that target's subject or verifies only with its key | **freeze**: the relay ordered the subject's entry ahead of a veto this host applied in time, so the kit or the relay is compromised |
+| a `recovery_approve`/`recovery_veto` of a target already in effect here, against Atem's entry signed by that target's subject | **ignored**, evidence `late_decision` (a veto after activation has no effect) |
 | invalid against `C[..seq-1]` (bad signature, signer not a manager at `seq-1`, bad action) | **ignored**, evidence `invalid` |
 | valid, signer removed or stripped of `manage` anywhere in Atem's `C[seq..head]` | **ignored**, evidence `signer_removed` (a stolen key of a removed manager can't deny service) |
 | valid, signer still a manager at Atem's head, or signed by the recovery key | **freeze** |
 
-**Freeze:** `frozen` (with both entries) is made durable first, then
+**Freeze:** `frozen` (with both entries) is made durable first (R9.3
+"Writing the device list"; if that write fails, the host is frozen in
+memory at once and the journal halts, and a freeze file that reached the
+disk in any state keeps it frozen at the restart), then
 every remote principal is fenced (§H, `control_revoked`; attachments
 closed with session `error{code:"account_frozen"}`), every `init` is
 answered `account_frozen` before any key work, membership processing
@@ -1939,12 +2025,18 @@ you trust: `atem unpair`, then `atem pair`."
 **Honest concurrency is avoided, not resolved** (Astation review 2).
 The relay serializes appends per log with a compare-and-swap:
 
-- `POST …/logs/{genesis_hash}/entries {entry, expected:{seq, hash}}`
-  appends iff the relay's head is `expected` (one transaction; unique
-  `(genesis_hash, seq)`). An entry whose `entry_hash` equals the stored
-  one at that seq answers `200` with the stored entry (idempotent retry);
-  otherwise `409 {head, entries after expected}`. The relay verifies
-  chain and signature before storing, as a convenience only.
+- `POST /api/remote/v1/logs/{genesis_hash}/entries {entry,
+  expected:{seq, hash}}` appends iff the relay's head is `expected` (one
+  transaction; unique `(genesis_hash, seq)`). An entry whose
+  `entry_hash` equals the stored one at that seq answers `200` with the
+  stored entry (idempotent retry); otherwise `409 {head, entries,
+  more?}`: the relay's entries after `expected.seq`, or, when its hash
+  at `expected.seq` differs, a window from before the divergence, at
+  most 64 entries / 256 KiB, with `more: true` and the rest from `GET
+  …/entries?after=<seq>` (Astation r3 answer). The client fetches and
+  verifies all of it before it asks for any fresh owner confirmation and
+  never changes a body under an old one. The relay verifies chain and
+  signature before storing, as a convenience only.
 
 Client (manager) rules, required of every signer:
 
@@ -1954,7 +2046,15 @@ Client (manager) rules, required of every signer:
 2. **Publish before use.** Never send the entry to a host or a device,
    and never count it in its own log, until the relay answered `200` for
    it. A host can therefore only ever see relay-committed entries from
-   honest signers.
+   honest signers. **One exception, `recovery_veto`** (R9.5): a device
+   may send a veto to any host by any route (relay channel, direct
+   :8080, the Mac's link) before or without the relay's answer, built on
+   that host's head as its `welcome` shows it (which can be behind the
+   relay while the host defers entries), and publishes it to the relay
+   in parallel. If the relay answers `409`, the device rebuilds the veto
+   on the relay's head only if the target is still undecided there; a
+   host that applied the direct veto resolves the difference by the
+   first three rows above.
 3. **Lost the race (`409`).** Discard the prepared body durably (never
    carried), verify and apply the returned entries, re-check the user's
    intent on the new head (the device may already be gone), and if still
@@ -1982,9 +2082,14 @@ a root.
 
 Fixtures: `r9-chain-*` (R9.12).
 
-### R9.5 Recovery entry and the K backup
+### R9.5 Recovery, the 24 h wait, kit replacement and the K backup
 
-**Recovery entry.** Signed only by the genesis `recovery_key` with
+User decisions of 2026-10-19 (open questions 2 and 3 of r9's first
+draft): an enrollment by the Recovery Kit waits 24 h on each host's own
+clock, during which any manager can approve or veto it; the kit is
+replaceable.
+
+**Recovery entry.** Signed only by the current recovery key with
 `signer: "recovery"` (the reserved name; no device id may equal it):
 
 ```json
@@ -1997,56 +2102,265 @@ Fixtures: `r9-chain-*` (R9.12).
 
 It uses the same `member` object as `add` (one key representation,
 Astation review 3). Rules: `member.kind` native, roles exactly
-`["control","manage","view"]`, a new `device_id`; it chains from the
-head like any entry and is carried like any suffix. The recovery signer
-can't sign any other action: it never removes a device, changes the
-recovery key (only a new genesis does), moves a head back, bypasses a
-fence or lifts a freeze; a frozen host applies nothing. Old devices stay
-members until a manager removes them. A conflicting entry signed by the
-recovery key freezes (the key is never removed). Product status: user
-decision 2026-10-19; Astation's recorded policy differs until they
-confirm (open question 2).
+`["control","manage","view"]`, a new `device_id` (reserved from then on,
+even if the entry is cancelled); it chains from the head like any entry
+and is carried like any suffix. The recovery signer can't sign any other
+action: it never removes a device, moves a head back, bypasses a fence or
+lifts a freeze; a frozen host applies nothing. Old devices stay members
+until a manager removes them. A conflicting entry signed by the recovery
+key freezes (R9.4).
+
+**Kit replacement.** A manager replaces the kit with `set_recovery_key`:
+
+```json
+{"body":{"type":"atem-membership-entry","v":1,"account_id":"acct-test-1","genesis_hash":"…",
+         "seq":7,"prev_hash":"…","action":"set_recovery_key","signer":"dev-phone",
+         "signed_at":1793177600000,"kit":"current",
+         "recovery_key":{"alg":"ed25519","pub":"<the new kit's public key>"}},
+ "sig":"<the manager's auth_key>","kit_sig":"<the current recovery key>"}
+```
+
+- `kit: "current"`: `kit_sig` = Ed25519 by the **current** recovery key
+  over `enc(["atem-recovery-cosign-v1", jcs(body)])`. Like `sig` it is
+  outside the body and not hashed; the body names the mode, so stripping
+  `kit_sig` makes the entry invalid (`kit_sig_missing`), never a
+  different entry. In effect as soon as a host applies it.
+- `kit: "lost"`: no `kit_sig`. The client requires a fresh owner
+  confirmation (R9.6 rule 4). Pending like a `recovery_add`, with the
+  same wait, approve and veto rules.
+- With no manager and no kit, there is no entry to sign: re-pair each
+  host (`atem unpair`, `atem pair`, a new genesis).
+
+The new key must never have appeared in this log. Once a replacement is
+in effect on a host, the replaced key goes on `retired_recovery_keys`
+and never signs again there: a `recovery_add` or `kit_sig` by it is
+invalid (`recovery_key_retired`), and every entry still pending that it
+signed is cancelled (reason `kit_replaced`).
+
+**Decisions.** `recovery_approve{target}` and `recovery_veto{target}`
+are ordinary entries signed by a manager (fresh owner confirmation,
+R9.6). `target` is the `entry_hash` of a `recovery_add` or a
+`kit: "lost"` `set_recovery_key` in the chain before it, otherwise
+invalid (`not_a_recovery_entry`). An approval's signer must differ from
+the target's signer (`self_approval`); a veto may come from any manager,
+the target's signer included. A removed manager signs nothing, so its
+approval or veto is invalid (`signer_not_manager`) and changes nothing.
+A decision is valid whatever its target's state; it acts only while the
+target is pending on the host applying it.
+
+**State machine** (per host, per pending-type entry `P`; every verifier
+runs it on its own clock, the host's being the one that grants access):
+
+| state | entered when | effect |
+|---|---|---|
+| `pending` | the commit that appends `P` to `membership.json` (the host's **first sight**) | the subject gets no access (below); entries that depend on `P` are deferred |
+| `active` | the first of: a `recovery_approve` of `P` applied in chain order; the wait ends with `P` still pending | `recovery_add`: the member becomes a manager; `set_recovery_key`: the key replaces the current one |
+| `cancelled` | a `recovery_veto` of `P` applied in chain order while `P` is pending; or, for an entry signed by a recovery key, that key's replacement taking effect | final: the subject never becomes a member; an entry signed by it, or by the cancelled key, is invalid |
+
+Precedence: whichever of approve, veto or the end of the wait the host
+applies first wins; decisions apply in chain order; anything after that
+is a valid entry with no effect (a late veto leaves the device a
+manager, and a manager removes it with `remove`). Activation and
+cancellation add no entry. Neither raises a fence (nothing was granted);
+each is written to `membership.json` before any effect, then announced
+in `membership_head` (R9.3).
+
+**Timing (host clock only).** The wait is 86 400 000 ms and ends when
+**both** have elapsed since first sight: the monotonic time
+(`CLOCK_MONOTONIC`, the same clock as §3's deadlines) and the wall time
+(`first_seen_wall + 86 400 000`). No timestamp inside an entry counts:
+`signed_at` is display only, so a backdated or relay-delayed entry still
+waits 24 h from when this host first saw it. `mono_waited_ms` is
+persisted at least once a minute and at shutdown; after a runtime
+restart within one boot the monotonic clock continues from
+`mono_at_first_seen_ns`; after a reboot (another `boot_id`) it continues
+from `mono_waited_ms`, so time while the machine was off or the clock
+was unreadable never counts. A forward wall-clock jump can't end the
+wait (the monotonic side hasn't elapsed); a backward one delays it.
+`effective_at` (shown in `welcome`) = `now_wall + max(86 400 000 −
+mono_waited, first_seen_wall + 86 400 000 − now_wall)`; it is an
+estimate on the host's clock, recomputed on every report. The 100 ms
+`advance` pass checks the wait; while an entry is pending the host also
+asks the relay over its link for the suffix after its head every 15
+minutes and 5 minutes before `effective_at` (a fetch never delays
+activation: a relay that fails it gains nothing).
+
+**During the wait the subject has no access** (not even `view`): a
+`hello` by it, or by a device added only by an entry deferred behind it,
+gets `recovery_pending{entry_hash, effective_at}`. An entry it signs is
+**deferred**: the carriage stops before it without an error, the
+carrier is admitted, and the entry is carried again after the wait. The
+subject's client signs nothing until the chain it verified holds an
+approval of `P`, or 24 h passed on its own clock since it first saw `P`
+committed; the relay applies the same rule on its clock as a
+convenience. Later entries, removals included, wait behind a deferred
+entry, at most until the wait ends on this host; that happens only on a
+host that first saw `P` well after the devices did. A `recovery_add` or `kit_sig` that verifies only with the
+key of a pending `set_recovery_key` is deferred the same way.
+
+**Relay suppression resistance.**
+
+- Pending entries and their decisions are log entries carried like any
+  suffix (R9.3); every carrier, and the host's own fetch, can deliver
+  them.
+- Every host lists what is pending in its `welcome`
+  (`pending_recovery`, R9.8: `entry_hash`, `seq`, `action`, `subject` —
+  the member for `recovery_add`, the requesting manager for
+  `set_recovery_key` — and `effective_at` on the host's clock),
+  authenticated by the channel (`sig_h` covers the transcript the record
+  keys derive from). Any device that reaches any host learns of it even
+  if every push and every relay fetch was dropped; clients show it
+  ("Recovery of <device> pending, takes effect <time>: approve or
+  cancel").
+- The host shows it locally: `atem status` and the agent terminal's
+  status row show that a recovery is pending (exact text is an
+  implementation detail), cleared when nothing is pending.
+- A veto can arrive by any route, including a direct LAN connection to
+  :8080, before the relay has it (R9.4 rule 2's exception; the conflict
+  rows of R9.4 settle a veto the relay ordered differently).
+- **Residual risk:** a relay that blocks every device from every host
+  for the whole 24 h, while nobody looks at a host's screen, lets a kit
+  holder's enrollment take effect. That is indistinguishable from the
+  genuine all-devices-lost case the wait exists for, and only a holder
+  of the current kit can create the entry. A host that never reaches
+  the relay and is never connected to also can't be warned; a host
+  powered off waits longer, never shorter.
 
 **Recovery Kit v2 and K** (Astation owns the kit, its UI and storage;
 the formats are shared so `atem-client` can implement them once). The
 kit holds one 256-bit secret `R` (plus account id and relay URL, as
-today); its text encoding is Astation's. Derivations, unchanged from
-`../e2e-encryption.md` "Recovery kit":
+today); its text encoding is Astation's.
 
 ```
-seal_key  = HKDF-SHA256(salt = empty, ikm = R, info = "atem-recovery-seal-v1", L = 32)
-sign_seed = HKDF-SHA256(salt = empty, ikm = R, info = "atem-recovery-sign-v1", L = 32)  -> Ed25519 key
-recovery_key (in genesis) = public key of sign_seed
+sign_seed    = HKDF-SHA256(salt = empty, ikm = R, info = "atem-recovery-sign-v1", L = 32)  -> Ed25519 key
+recovery_key = public key of sign_seed            (in genesis, or in set_recovery_key)
+kit X25519   = secret SHA-512(sign_seed)[0..32] (X25519 clamps it); public = Montgomery form of recovery_key
 ```
 
-A signing seed can't restore an independently generated `K`
-(Astation review 3), so `K` is backed up, sealed with `seal_key`, in an
-**`atem-k-backup-v1`** envelope the relay stores per log (latest and the
-one before):
+The kit's X25519 public key is computed from `recovery_key` alone
+(`u = (1 + y) / (1 − y) mod 2^255 − 19`, as libsodium's
+`crypto_sign_ed25519_pk_to_curve25519`), so any device holding the
+verified log can seal to the current kit and only a holder of `R` can
+open (Astation r3 review 3). `atem-recovery-seal-v1` and the symmetric
+`atem-k-backup-v1` of the first r9 draft are withdrawn.
+
+**The K backup, `atem-k-backup-v2`.** A signing seed can't restore an
+independently generated `K` (Astation review 3), so `K` is backed up,
+sealed to the kit, in an envelope the relay stores per log:
 
 ```json
-{"v":1,"account_id":"acct-test-1","genesis_hash":"…","blob_version":3,
- "kids":["b982533d","1f2e3d4c"],"nonce":"<b64u 24 bytes>","ct":"<b64u>"}
+{"v":2,"account_id":"acct-test-1","genesis_hash":"…","blob_version":3,
+ "kids":["b982533d","1f2e3d4c"],"recovery_key":{"alg":"ed25519","pub":"<b64u>"},
+ "enc":"<b64u>","ct":"<b64u>"}
 ```
 
-`ct = XChaCha20-Poly1305(seal_key, nonce, aad, plain)` with `aad =
-enc(["atem-k-backup-v1", account_id, genesis_hash(32 bytes),
-u64(blob_version), jcs(kids)])` and `plain = jcs({"keys":[{"k":"<b64u
-32>","kid":"…"},…]})`, the current key first, then retained previous
-generations (1–8 keys; `kids` lists the same kids in the same order).
-Rules: Astation re-seals with `blob_version + 1` and uploads it **before**
-it first uses a new `K` (rotation) and whenever the retained set
-changes; a nonce is random per seal; devices remember the highest
-`blob_version` they saw and a restore refuses a lower one. Restore:
-derive both keys; refuse unless the derived public key equals the
-genesis `recovery_key` of the account's verified log (kit/account
-binding); open the newest blob; any tag or format failure is "this kit
-doesn't match the account, or the backup is damaged" and never creates a
-new `K` or a new trust root; store `K` durably on the new device before
-reporting data recovery; then sign and publish the `recovery_add`
-(prepared durably, R9.4 rules 1–4, so an interrupted restore retries the
-same entry). `R` is fixed for the genesis lifetime (open question 3).
-Vectors: `r9-vectors-recovery`.
+RFC 9180 base mode, the suite of R9.9 (DHKEM(X25519, HKDF-SHA256),
+HKDF-SHA256, ChaCha20-Poly1305), to the kit's X25519 public key, `info
+= enc(["atem-k-backup-v2", account_id, genesis_hash(32 bytes),
+u64(blob_version), jcs(kids), recovery_key.pub(32 bytes)])`, empty AAD,
+plaintext `jcs({"keys":[{"k":"<b64u 32>","kid":"…"},…]})`: the current
+key first, then retained previous generations (1–8 keys; `kids` lists
+the same kids in the same order). Opening it authenticates the account,
+genesis, version, kids and kit (any change fails the tag). `backup_hash =
+hex(SHA-256(enc(["atem-k-backup-hash-v1", jcs(envelope)])))`.
+
+**The version floor is in the log** (Astation r3 review 3). Each backup
+is recorded by a `k_backup` entry, signed by the manager that sealed it:
+
+```json
+{"…":"common fields","action":"k_backup","signer":"dev-mac",
+ "k_backup":{"blob_version":4,"kids":["7a3c9e10","b982533d","1f2e3d4c"],
+             "recovery_key":{"alg":"ed25519","pub":"…"},"backup_hash":"<hex>"}}
+```
+
+Rules: `blob_version` greater than every earlier `k_backup` in the
+chain (`blob_version_not_increasing`); `recovery_key` is the current
+recovery key or that of a pending `set_recovery_key`. Hosts verify it
+like any entry, keep the newest record, and never fetch or open a
+backup. The relay stores envelopes keyed by `(genesis_hash,
+blob_version)`, put-if-absent (the same bytes again: `200`; other bytes:
+`409`), and keeps those named by the two newest `k_backup` entries of
+each recovery key; an envelope no entry names is garbage after an hour.
+
+**Writing a backup** (rotation, a changed retained set, a new kit):
+
+1. Seal the envelope (any manager with the `K` set; no `R` needed) at
+   `blob_version` = the newest in its verified log + 1, and store it
+   durably (envelope bytes and the prepared entry body, R9.4 rule 1).
+2. Upload the envelope (put-if-absent). Then publish the `k_backup`
+   entry with the log CAS (R9.4). Only after the relay commits the entry
+   may any device use a new `K` (Astation's rotation rule, now
+   checkable: "before first use" means "recorded in the log").
+3. `409` on the entry (another manager wrote first): discard both
+   durably, verify the returned entries; if the newest `k_backup`
+   already covers this `K` set, stop; otherwise reseal at the new
+   version + 1 (never reuse a version with other bytes) and retry.
+   `409` on the envelope means another seal took that version: the same.
+4. Interrupted (crash, timeout): resend the stored bytes in order; the
+   envelope put and the entry are idempotent. A device that finds an
+   envelope it uploaded without a committed entry publishes the entry
+   or, after a `409`, abandons it.
+
+Two managers rotating at once therefore serialize on the log; the
+loser's envelope is never named and is collected.
+
+**Restore** (Astation's restore-account flow on a new device):
+
+1. Derive `sign_seed`, `recovery_key` and the kit X25519 secret from `R`.
+2. Fetch the log from the relay and verify it from genesis. **Freshness
+   checkpoint:** send `init` to each host the log names, over any route
+   that answers; each `accept` carries a head signed by the host's key
+   (R9.7; no membership is needed for `init`). A log that doesn't reach
+   the highest such head with the same hash is refused
+   (`log_behind_host`): the relay rolled it back; retry another route.
+3. Refuse unless the derived `recovery_key` is the current one in that
+   log (`kit_not_current`: "this Recovery Kit was replaced", or not this
+   account).
+4. Take the newest `k_backup` naming this kit; fetch the envelope;
+   refuse unless its `backup_hash` matches (`backup_hash_mismatch`: an
+   older authentic backup is caught here) and it opens with `info` for
+   this account and genesis (`backup_invalid`). This authenticates the
+   account and genesis through the backup **before** anything is
+   appended. Any failure is "this kit doesn't match the account, or the
+   backup is damaged" and never creates a new `K` or a new trust root.
+5. Store the `K` set durably, then sign and publish the `recovery_add`
+   on the verified head (prepared durably, R9.4 rules 1–4, so an
+   interrupted restore retries the same entry), and show that it takes
+   effect after the wait unless another device approves it.
+
+**Residual rollback risk.** With no host reachable in step 2, the
+restore proceeds as **unconfirmed**: a relay that hides newer entries
+can hand it an older log and the backup that log names. The result is
+incomplete, never wrong: the keys it got are authentic, data sealed
+under a `kid` it lacks is reported as needing a newer backup and never
+rewritten or deleted, and the device neither rotates `K` nor seals a
+backup until a host-signed head confirms its log is current (then it
+fetches the newer backup). A `recovery_add` built on a stale head
+conflicts with what the hosts hold and, being signed by the recovery
+key, freezes them (R9.4): fail closed, re-pair.
+
+**A new kit.** After its `set_recovery_key` commits, the replacing
+device seals the retained keys to the new kit at the next version and
+records it with `k_backup` (steps above). `kit: "current"`: the old
+kit's envelopes then fall out of the newest two and are deleted.
+`kit: "lost"`: both kits keep their newest envelope until the
+replacement takes effect (Astation decides by the chain: an approval,
+or 24 h on its clock with no veto) or is vetoed. After a `kit: "lost"`
+replacement Astation also rotates `K` (`../e2e-encryption.md`
+rotation), because whoever holds the lost kit could already have opened
+every envelope sealed to it; deleting them stops only later downloads.
+Atem never sees `K` from a backup, `R`, the kit's secret or an
+envelope.
+
+Vectors: `r9-vectors-recovery` (kit 1's derivations and X25519 form;
+`k_backup` (version 3) and `k_backup_rotated` (version 4, after a
+rotation to `K-gen-3`) sealed to kit 1; `kit_2` and its
+`k_backup_resealed`; each with `info`, `ikmE` and `backup_hash`), the
+entries in `r9-vectors-membership-log` (`R7`, `R7_backdated`, `A8`,
+`V8`, `A8_ipad`, `V8_ipad`, `N8`, `K7_current` with its `kit_sig`,
+`K7_current_no_kit_sig`, `R8_oldkit`, `R8_newkit`, `K7_lost`, `V8_k`,
+`A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale`) and the
+kits in `r9-vectors-keys` (`recovery`, `recovery-2`, `K-gen-3`).
 
 ### R9.6 Principals, scope, expiry, keys
 
@@ -2114,14 +2428,19 @@ observe them; the shared core exposes signing as an effect):
 
 1. A native `auth_key` is non-exportable (Secure Enclave, Android
    Keystore/StrongBox, WebCrypto non-extractable); no software copy of a
-   manager key exists.
+   manager key exists. Astation's is its ceremony P-256 identity (the
+   key it verifies with, `astation_sign_pub`); Astation supplies the
+   fresh / 5-minute owner-auth adapter and clears reuse on lock and
+   background (Astation r3 answer).
 2. A manager's key requires owner authentication (biometrics, with the
    OS passcode/password fallback where the platform offers one).
 3. Routine channel signing (`sig_c`) may reuse one owner confirmation for
    at most 5 minutes, cleared when the device locks or the app goes to
    the background.
 4. Entry signing (`add`, `remove`, `set_roles`, `add_host`,
-   `remove_host`, enrollment approval) and recovery need a **fresh**
+   `remove_host`, enrollment approval, `recovery_approve`,
+   `recovery_veto`, `set_recovery_key` of either kind) and recovery need
+   a **fresh**
    confirmation bound to the exact body shown (account, head and `seq`,
    applicant keys, roles, scope, expiry); a confirmation never covers a
    changed body (R9.4 rule 3) and is never given in the background or a
@@ -2222,9 +2541,14 @@ trust generation), `account_frozen`, `busy` (rate). Once `finish` opens,
 the host can derive `th4` whatever `sig_c` is worth, so every refusal is
 its first record, a session `error` under `k_h2c`, then close:
 `handshake_failed` (bad `sig_c`), `unauthorized`, `membership_invalid`,
-`membership_incomplete`, `unsupported_version`, `account_frozen`. Only
-the sender of `finish` can read it; what it reveals (the head, whether a
-device id is a member) is in the relay's copy of the log anyway.
+`membership_incomplete`, `recovery_pending`, `unsupported_version`,
+`account_frozen`, `busy`. Only the sender of `finish` can read it; what
+it reveals (the head, whether a device id is a member) is in the relay's
+copy of the log anyway. A clear (pre-`finish`) error is unauthenticated:
+clients treat it as advisory, a reason to retry or show a diagnostic,
+never as authority to repin a host, change a log or persist a freeze
+(Astation r3 answer); only a host-signed `accept` head or an encrypted
+first record carries host authority.
 
 **Replay.** A replayed `init` gets a fresh `accept`; a replayed `finish`
 fails its tag (fresh `e_h`, `n_h` give another `k_fin`); a replayed or
@@ -2242,9 +2566,9 @@ secret).
 | op | dir | fields |
 |---|---|---|
 | `hello` | C→H (the `finish` plaintext) | `revision: 9` (required), `proof{principal, sig}` (`sig` = `sig_c`, b64u), `membership{head{seq,hash}, entries, more?}`, `grant?` (signed grant, browser only); no `resume` |
-| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `channel_id`, `authorization_ms_left` |
+| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left` |
 | `membership` | C→H | `entries` (R9.3) → `membership_head{re, head}` |
-| `membership_head` | H→C | `head` (event when Atem's head moves; reply with `re`) |
+| `membership_head` | H→C | `head`, `pending_recovery` (event when Atem's head moves or a pending entry changes state; reply with `re`) |
 | `revoke_grant` | C→H | `grant_id` → `grant_revoked{re}` (issuer or a member with `control`) |
 | `approval_seen` | C→H | `binding` (read form: target + `attachment_gen`), `approval_id` → `seen{re}` (R9.9) |
 
@@ -2252,7 +2576,7 @@ secret).
   revision: 9}` and nothing else (as §A). Any session message outside a
   channel, or before `welcome`, is refused as before `welcome`.
 - `features`: the nine r8 features plus `membership.carry`,
-  `push.sealed`, `approval.seen`, `grant.revoke`.
+  `push.sealed`, `approval.seen`, `grant.revoke`, `recovery.wait`.
 - One principal may have several attachments (a phone and its widget);
   each is fenced separately by `attachment_gen`, together by the
   principal's `control_gen`.
@@ -2293,30 +2617,50 @@ Open envelope (signed by `host_channel_key`):
   `expires_at` = `created_at` + the hook's wait (Claude 600 s, Codex
   300 s); both immutable: retries and reconnects resend the same signed
   bytes.
+- **Identity** of a hint or seen: `(account_id, genesis_hash, host_id,
+  host_trust_gen, session_id, process_gen, approval_id)`, plus `state`
+  and `recipient.device_id` for a hint and `device_id` for a seen. Every
+  match, deduplication and suppression below uses the whole identity
+  (Astation r3 review 4); an object from another trust generation,
+  session or process never matches.
 
 **Verification** (relay and clients; `now` is the verifier's clock):
 signature by the newest `add_host` key of `host_id` in its verified log;
 account/genesis/host binding; `expires_at > created_at`; `expires_at −
-created_at` ≤ 900 000; `created_at` ≤ `now + 300 000` (else `skew`,
-refused); a hint whose `expires_at + 300 000` ≤ `now` is stale (not sent
-or shown). Duplicates: identical bytes are idempotent; the same `(host_id,
-approval_id, state, recipient)` with other bytes is refused and logged
-(the first stays). A hint never makes an approval actionable or expired:
-the client fetches the host's state over the channel, and shows "may have
-expired" only from the host's answer.
+created_at` ≤ 900 000; clients refuse `created_at` > `now + 300 000`
+(`skew`); a hint whose `expires_at + 300 000` ≤ `now` is stale (not
+shown). Duplicates: identical bytes are idempotent; the same identity
+with other bytes is refused and logged (the first stays). A hint never
+makes an approval actionable or expired: the client fetches the host's
+state over the channel, and shows "may have expired" only from the
+host's answer.
 
-**Clients:** the notification extension opens the sealed part only with
-a key it may use while locked; if it can't, it shows a generic "Atem on
-<host> needs approval" and the app reconnects; never plaintext from
-elsewhere, never a biometric prompt in the extension.
+**Delivery to the relay is reliable** (Astation r3 review 4). The relay
+acknowledges each hint and each seen once it is durably stored
+(`{"type":"relay","op":"push_ack","acks":[identity…]}`), in every case:
+accepted, idempotent, pending, ignored or refused. Atem keeps every
+unacknowledged hint and seen of a live approval in memory and resends
+the same bytes every 10 s and at each link reconnect until acknowledged,
+the approval closes and its resolved hint is acknowledged, or the
+approval's `expires_at + 300 000` passes. A broker restart ends the
+approvals (§G) and with them the resends; the relay's own guard (below)
+bounds what it still sends.
+
+**Clients:** a notification extension that can't use the device's
+`enc_key` while the screen is locked shows a generic "Atem on <host>
+needs approval" and the app reconnects; there is no separate push key
+(Astation r3 answer: the data key keeps its unlocked-device protection);
+never plaintext from elsewhere, never a biometric prompt in the
+extension.
 
 **Seen.** A client sends `approval_seen` only when the card is rendered
 in a focused foreground window and the user was active in the last 60 s
 (not for a background delivery, an unopened notification or an
 unattended window). Atem checks the attachment has `control`, the
 approval is pending for that exact session and process, and it is the
-first seen of that device for it (others are answered `seen` and
-ignored), then signs and sends `{"type":"relay","op":"push_seen","seen":
+first seen of that device for it (later ones are answered `seen` and
+never re-signed; the first one's bytes are what Atem resends until
+acknowledged), then signs and sends `{"type":"relay","op":"push_seen","seen":
 {body, sig}}`:
 
 ```json
@@ -2326,31 +2670,57 @@ ignored), then signs and sends `{"type":"relay","op":"push_seen","seen":
 ```
 
 Host-signed, so seen needs no manager biometric: the host authenticated
-the device over `atem-ch1` at its current head. The relay accepts it
-when the signature verifies, an open for that approval names
-`device_id` as a recipient, no resolved was accepted and `seen_at` ∈
-[`created_at` − 300 000, `expires_at` + 300 000]; it deduplicates per
-`(host_id, approval_id)` across replicas (atomic set-if-absent). Seen
-never answers, acquires or renews a lease, closes, or reopens anything.
+the device over `atem-ch1` at its current head. The relay checks the
+signature, then:
 
-**Schedule (relay-owned; user decision 2026-10-19).** `t_r` = the
-relay's receipt time of the first valid open; `last = min(t_r +
-(expires_at − created_at), expires_at + 300 000) − 15 000`, all on the
-relay's clock:
+- an open with the same identity naming `device_id` as a recipient,
+  no resolved yet, and `seen_at` ∈ [`created_at` − 300 000,
+  `created_at` + 900 000 + 300 000] → **applied** (suppresses the later
+  stages for that approval);
+- no matching open yet (seen before open, or the open was lost) →
+  **pending**: stored durably (it survives relay restarts and replica
+  failover), at most 256 per account (the oldest dropped first), until
+  `created_at` + 1 200 000 on the relay's clock; an open that arrives
+  later with the same identity applies it at once;
+- a resolved already accepted for that identity → **ignored**: a seen
+  never reopens, extends or resends anything.
 
-- `t_r`: in-app cards to connected clients; a desktop OS push if no
+It deduplicates per full identity across replicas (atomic
+set-if-absent). Seen never answers, acquires or renews a lease, closes,
+or reopens anything.
+
+**Schedule (relay-owned; user decision 2026-10-19; Astation r3 review
+2).** Every stage is due at a time derived from the **signed
+`created_at`**, never from when a replica received the hint, so delayed
+ingress, retries, restarts and failover can't move a deadline. All on
+the relay's clock (`now`), with `margin` = 15 000 ms:
+
+- **Skew bound, at first receipt** (separate from delivery): an open
+  whose `created_at` differs from `now` by more than 120 000 is refused
+  (`skew`), logged, and acknowledged; it is never clamped. The host's
+  resolved hint is still accepted (it only cancels; the bound applies to
+  opens) and the approval stays answerable over the channel.
+- **Immediate stage**, due at `created_at` (in practice at receipt, which
+  is later): in-app cards to connected clients; a desktop OS push if no
   desktop Astation is connected; mobile only if the device opted in to
   immediate pushes.
-- `t_r + 60 s`: a mobile push if no resolved and no seen; an optional
-  desktop reminder.
-- Nothing after `last`; a resolved hint (any answer or closure) cancels
-  every remaining send and replaces delivered notifications (collapse id
-  / tag = `approval_id`).
-- `last` only stops sends: it never labels the approval expired or
-  disables a valid answer.
+- **Mobile stage**, due at `created_at + 60 000`: a mobile push if no
+  resolved and no seen; an optional desktop reminder.
+- **Guard:** a provider send happens only at a `now` with `now <
+  expires_at − margin`, whatever the clocks. A stage already due when
+  the open is accepted (a late receipt) is sent at once if it is still
+  before the guard; a stage due at or after the guard is never sent.
+- A resolved hint (any answer or closure) cancels every remaining send
+  and replaces delivered notifications (collapse id / tag =
+  `approval_id`).
+- The guard and the margin only stop provider sends: they never label
+  the approval expired, shorten the card, or disable a valid answer
+  (the card's expiry is the host's).
 
 Vectors: `r9-vectors-push-hint` (two recipients with their HPKE inputs,
-resolved, seen, and the refused cases: skew, `expires_at` ≤
+resolved, seen, a seen from another `process_gen`, two hints whose
+mobile stage lands exactly on the guard (`open_g75`) and 1 ms before it
+(`open_g75001`), and the refused cases: skew, `expires_at` ≤
 `created_at`, too long, conflicting duplicate).
 
 ### R9.10 Several devices at once
@@ -2368,15 +2738,16 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 
 | code | family | when |
 |---|---|---|
-| `handshake_failed` | channel (clear) | malformed handshake message, bad `sig_h`/`sig_c`, zero shared secret, failed `finish` tag, timeout |
+| `handshake_failed` | channel (clear, advisory) / session (encrypted first record) | clear before `finish` opens: malformed handshake message, zero shared secret, failed `finish` tag, timeout (a bad `sig_h` is detected by the client, which sends nothing more); encrypted after it opens: a bad `sig_c` (R9.7) |
 | `stale_target` | channel (clear) | `init` names another genesis, host id or trust generation |
-| `account_frozen` | channel and session | the host is frozen (R9.4); also closes every attachment when it freezes |
-| `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, and `need_before` when the window starts after a divergence |
+| `account_frozen` | channel (clear, advisory) and session | the host is frozen (R9.4); also closes every attachment when it freezes. A client never persists a freeze from the clear form |
+| `recovery_pending` | session | the principal is the subject of a `recovery_add` pending on this host, or is added only behind one; carries `entry_hash`, `effective_at` (R9.5) |
+| `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, `detail` (e.g. `signer_not_manager`, `recovery_key_retired`, `kit_sig_missing`, `self_approval`, `not_a_recovery_entry`, `blob_version_not_increasing`), and `need_before` when the window starts after a divergence |
 | `membership_incomplete` | session | `more` and the principal isn't in the chain yet; carries `head`; reconnect with the next window |
 | `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a failed `membership.json` write ("device list not recorded") |
+| `busy` | channel/session | also: `init` rate; a failed device-list write ("device list not recorded"), then the journal halt; an unclean device list at start ("device list not recorded") |
 | `unsupported_version` | session | also: `hello` without `revision: 9` |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 
@@ -2392,40 +2763,60 @@ the crate's own dependencies and cross-checked independently):
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,
 `invalid-tail`, `crash-between-commit-and-fences`,
-`removal-on-an-open-channel`), recovery (accepted, refused), handshake
-(success, wrong head, tampered transcript, replay), hello revision,
-service scope and expiry, browser grant, push hints, seen, and the
-multi-device set (Mac and phone online, Mac off, takeover, approval
-while another holds the lease).
+`removal-on-an-open-channel`, and the write faults:
+`membership-write-fault-fences-in-memory-and-halts`,
+`uncertain-rename-is-reconciled-at-restart`,
+`uncertain-rename-lost-stays-unclean`,
+`freeze-write-fault-stays-frozen-in-memory`), recovery (accepted,
+refused, `pending-then-in-effect-after-24h`,
+`wait-uses-the-host-clock-not-signed-at`, `approve-takes-effect-at-once`,
+`veto-cancels`, `late-veto-has-no-effect`,
+`decision-by-a-removed-manager-is-refused`,
+`kit-replaced-with-the-current-kit`,
+`kit-replaced-without-the-kit-then-vetoed`,
+`kit-replaced-without-the-kit-then-in-effect`,
+`pending-summary-in-every-welcome`, `k-backup-version-only-increases`,
+`restore-refuses-a-rolled-back-backup`), handshake (success, wrong
+head, tampered transcript, replay), hello revision, service scope and
+expiry, browser grant, push hints (sign and verify,
+`schedule-from-created-at-after-a-late-receipt`,
+`delayed-ingress-at-the-skew-bound`,
+`created-at-outside-the-skew-bound-is-refused`,
+`stage-guard-exact-boundary`, `schedule-survives-relay-failover`), seen
+(`approval-seen`, `seen-before-open-is-kept-until-the-open-arrives`,
+`seen-from-another-process-generation-suppresses-nothing`,
+`seen-after-resolution-reopens-nothing`,
+`seen-lost-delivery-is-retried-until-acked`), and the multi-device set
+(Mac and phone online, Mac off, takeover, approval while another holds
+the lease).
 
 ### R9.13 Open questions for Astation
 
-1. Product records: push schedule (0 s / 60 s with `seen`), recovery
-   enrolling a manager into the existing list, and the 5-minute
-   biometric reuse are user decisions of 2026-10-19 on Atem's side;
-   Astation's recorded policy must be updated to match (or the user asked
-   again) before r9 is pinned.
-2. Recovery: no delay or veto window on `recovery_add` (the e2e design's
-   72 h sign-rotate has one). Acceptable, given the kit is offline?
-3. `R` rotation: e2e-encryption.md issues a new kit after every
-   recovery; r9 keeps `R` for the genesis lifetime (changing the
-   recovery key needs a new genesis). Keep, or add a manager-and-recovery
-   co-signed `set_recovery_key` action?
-4. Relay CAS endpoint shape and the `409` body (R9.4) and K-backup
-   storage are Astation's to finalize; the semantics above are the
-   requirement.
-5. Notification key: may the extension use the `enc_key` itself while
-   locked, or should native members register a second, lock-available
-   `x25519` key for push only (a new optional `member.push_key`)?
-6. v0.7.2 device ids: re-verification keeps the device id; r9 never
+Decided since the first r9 draft (user, 2026-10-19): **recovery waits
+24 h with approve and veto** (was question 2) and **the kit is
+replaceable** with `set_recovery_key` (was question 3); both in R9.5.
+Answered by Astation's r3 review and adopted: the CAS endpoint and its
+bounded `409` (R9.4); no separate push key (R9.9); the native `auth_key`
+is the ceremony P-256 identity, with Astation's fresh / 5-minute
+owner-auth adapter (R9.6); clear errors are advisory (R9.7, R9.11).
+Still open:
+
+1. Product records: push schedule (stages from `created_at`: 0 s / 60 s
+   with `seen`), recovery enrolling a manager into the existing list
+   after the 24 h wait, kit replacement, and the 5-minute biometric
+   reuse are user decisions of 2026-10-19 on Atem's side; Astation's
+   recorded policy must be updated to match before r9 is pinned.
+2. K-backup blob storage (`(genesis_hash, blob_version)` put-if-absent,
+   retention of the two newest per kit) is Astation's to shape; the
+   semantics in R9.5 are the requirement.
+3. v0.7.2 device ids: re-verification keeps the device id; r9 never
    infers replacement from hostname, relay room or login. A new id is a
    new member (and the old one is removed explicitly).
-7. Is Astation's membership `auth_key` the same Secure Enclave key it
-   verifies with today (`astation_sign_pub`)? R9.2 pairing assumes so,
-   to bind the ceremony to the signer of `add_host`.
-8. Service `projects` scopes use `h1.<kid>.` hashes, which change when
+4. Service `projects` scopes use `h1.<kid>.` hashes, which change when
    `K` rotates; a rotation must re-issue service scopes (`set_roles`)
    before the old `K` generation is dropped.
-9. Cross-language conformance: Swift (CryptoKit P-256 low-S
-   normalization, HKDF, ChaCha20-Poly1305, HPKE) and WebCrypto/WASM must
-   reproduce every `r9-vectors-*` value before the pin.
+5. Cross-language conformance: Swift (CryptoKit P-256 low-S
+   normalization, HKDF, ChaCha20-Poly1305, HPKE, and the Ed25519 to
+   X25519 conversion of the kit key, which CryptoKit doesn't offer) and
+   WebCrypto/WASM must reproduce every `r9-vectors-*` value before the
+   pin.

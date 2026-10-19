@@ -4,7 +4,9 @@ Status: Atem response **r3**, 2026-10-19. r3: the exact formats now live in
 the **r9 appendix** of [atem-session-v1.md](atem-session-v1.md) ("Appendix: r9",
 §R9.1–§R9.13) with fixtures `fixtures/r9-*.json`; where this document and the
 appendix differ, the appendix wins. §10 answers Astation's review of r2 point
-by point. Earlier: r2, 2026-10-19 (r2: the user's final trust design replaces attestations, the freshness window and `resolve_fork` with a connection-carried suffix; r2.1: a stolen device is removed by a signed entry, the reset is re-pairing, and the Recovery Kit is Astation's account recovery), to Astation's "Remote agent API without
+by point and, since r3.1 (same day), Astation's r3 review of the first r9 pin
+and the user's Recovery Kit decisions (24 h wait with approve and veto; a
+replaceable kit). Earlier: r2, 2026-10-19 (r2: the user's final trust design replaces attestations, the freshness window and `resolve_fork` with a connection-carried suffix; r2.1: a stolen device is removed by a signed entry, the reset is re-pairing, and the Recovery Kit is Astation's account recovery), to Astation's "Remote agent API without
 the Mac" draft (2026-10-18, after Astation #56). Baseline: Atem `main` at
 `0801a4f`, contract [atem-session v1 r8](atem-session-v1.md) (authoritative),
 Atem's §9 proposal [account-trust.md](../account-trust.md). **Today** means in
@@ -174,13 +176,22 @@ keep working without re-pairing:
 
 r3: the exact entry is R9.5's `recovery_add` (the same `member` object as
 `add`, roles exactly `control, manage, view`, signer `"recovery"`), and `K`
-comes back from an `atem-k-backup-v1` envelope sealed with the kit's seal
-key (R9.5); the r2 example here is withdrawn.
+comes back from an `atem-k-backup-v2` envelope sealed to the kit's public
+key, whose version floor is the log's newest `k_backup` entry (R9.5); the
+r2 example here is withdrawn.
 
-Atem only verifies and applies it like any other entry: it must chain from
-Atem's head and be signed by the recovery key pinned in genesis, and it is
-carried by a connection like any suffix. It adds a device and never removes
-one, and it does not lift a freeze.
+Atem verifies it like any other entry: it must chain from Atem's head and
+be signed by the current recovery key, and it is carried by a connection
+like any suffix. It adds a device and never removes one, and it does not
+lift a freeze. **User decisions, 2026-10-19 (R9.5):** it takes effect 24 h
+after the host first sees it, measured on the host's own clock (monotonic
+and wall, whichever ends later; never a timestamp in the entry); meanwhile
+the new device has no access, any manager can approve it (in effect at
+once) or veto it (cancelled), and every host lists it in its `welcome` and
+shows it locally (`atem status`, the terminal status row). The kit is
+replaceable with `set_recovery_key`: a manager plus the current kit takes
+effect at once; a manager alone (kit lost) waits 24 h with the same approve
+and veto; with neither, re-pair. A replaced key never signs again.
 
 **Residual risks, in the user's words:** a compromised manager signing key,
 or a relay hiding revocations. A revocation reaches a host when any honest
@@ -337,8 +348,10 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
    signing key, or a relay hiding revocations. A removal reaches a host when
    any honest device next connects; a stolen *unlocked* manager can act until
    then. Re-pairing the host from a trusted device is the remedy (§3).
-2. **The Recovery Kit is the account-recovery root.** Whoever holds it can add a manager to the list; it
-   must stay offline, and losing it (with every device) leaves only re-pairing.
+2. **The Recovery Kit is the account-recovery root.** Whoever holds it can add a manager to the list
+   after a 24 h wait that any manager can veto from any host (R9.5); it must stay offline, a lost kit is
+   replaced with `set_recovery_key`, and losing it with every device leaves only re-pairing. Residual: a
+   relay that blocks every device from every host for the whole 24 h while nobody looks at a host's screen.
 3. **Biometric manager key on every channel: question for Astation.** One
    `auth` key per device means a manager signs each channel handshake with
    its biometric key. That is Astation's UX call: one Face ID / Touch ID per
@@ -380,13 +393,26 @@ order of work. Each point it raised, and where r9 answers it:
 |---|---|---|
 | 1. High: circular `channel_accept` derivation | head public in `accept`, signed by `sig_h`, bound in `th2`; no key depends on encrypted data; full transcript, HKDF salt/info, nonce/AAD, counter domains and vectors; zero-DH refusal; tamper, replay, direction and divergent-head cases; executable record/byte/time limits; erasure | R9.7, `r9-vectors-channel-handshake`, `r9-handshake-*` |
 | 2. Honest forks and P-256 re-signing | `entry_hash` covers the body only; relay CAS append with prepare-durably / publish-before-use / rebuild-on-409 / same-bytes retry rules, so honest managers never fork through an honest relay; if CAS fails, both hosts freeze (availability cost stated, neutral UI text); fixtures for honest concurrency, unknown carrier, removed signer, hosts with different successors, signature retry | R9.2, R9.4, `r9-chain-*` |
-| 3. Recovery schema and `K` | one `recovery_add` action using the `member` object, roles exactly `control, manage, view`, reserved signer `recovery`, never removes/resets/unfreezes; Recovery Kit v2 derivations; versioned `atem-k-backup-v1` envelope bound to account, genesis, `blob_version` and kids; rotation, retention, corruption and retry rules | R9.5, `r9-vectors-recovery`, `r9-recovery-*` |
+| 3. Recovery schema and `K` | one `recovery_add` action using the `member` object, roles exactly `control, manage, view`, reserved signer `recovery`, never removes/resets/unfreezes; Recovery Kit v2 derivations; versioned K backup bound to account, genesis, `blob_version`, kids and kit (now `atem-k-backup-v2`, below); rotation, retention, corruption and retry rules | R9.5, `r9-vectors-recovery`, `r9-recovery-*` |
 | 4. Sealed hints and `seen` | `enc_key` (X25519) separate from `auth_key` in the signed member; HPKE suite, info, `enc_kid`, `sealed_hash`; one signed envelope per recipient (fits APNs); resolved dominates open; immutable `created_at`/`expires_at` and clock rules; locked extension shows a generic hint; `seen` is sent over the authenticated channel only for a focused, attended card, host-signed, exact-target, deduplicated, never answers or closes; the near-expiry margin only stops sends | R9.9, `r9-vectors-push-hint`, `r9-push-hint-sign-and-verify`, `r9-approval-seen` |
 | 5. Suffix commit semantics | whole carriage validated in order; the valid prefix committed in one write, fences before any reply, then `membership_invalid` with the new head; failed write applies nothing (`busy`); crash between commit and fences replays them at start via `membership_applied`; entry, byte, signature-check and evidence bounds | R9.3, `r9-chain-invalid-tail-*`, `r9-chain-crash-*` |
 | Unbounded hidden revocation | stated as the residual risk: eventual, not bounded | R9.3 |
 | Product decisions (push timing, recovery authority, biometrics) | user decisions of 2026-10-19 written as client requirements; Astation's records still to be aligned | R9.6, R9.9, R9.13 q1 |
+| Old open question 2: delay or veto on `recovery_add` | **decided** (user, 2026-10-19): 24 h on each host's clock from first sight; no access meanwhile; manager approve (at once) or veto (cancel), naming the entry hash, first in chain order wins, a late veto has no effect, a removed manager can't decide; pending summary in every `welcome`, local status, veto by any route (direct :8080 included) | R9.5, R9.4, R9.8, `r9-recovery-pending-*`, `-approve-*`, `-veto-*`, `-late-veto-*`, `-decision-by-a-removed-manager-*`, `-wait-uses-the-host-clock-*` |
+| Old open question 3: `R` rotation | **decided** (user, 2026-10-19): `set_recovery_key`, manager + current kit (`kit_sig`) at once, manager alone after the 24 h wait with veto, neither = re-pair; a replaced key never signs again; backups re-sealed to the new kit by any manager, `K` rotated after a lost kit | R9.5, `r9-recovery-kit-*` |
 | Biometric reuse and fresh confirmation for membership edits | ≤ 5 min reuse for `sig_c` only, cleared on lock/background; fresh confirmation bound to the exact body for every entry and recovery; passcode fallback | R9.6 |
 | Removed Visualize types | agreed; removal is separate Atem work, not in r9 | — |
 | v0.7.2 device ids | re-verification keeps the id; a new id is a new member, never inferred from hostname, room or login | R9.13 q6 |
+
+**Astation's r3 review of the first r9 pin `ffe840d`** (2026-10-19, #81)
+and where the new pin answers it:
+
+| Astation point | Answer | Appendix |
+|---|---|---|
+| 1. High: failed membership/freeze writes must fence live authority | intent + state commit; any write/fsync/rename/directory-fsync fault fails closed in the same step as §H's failed revocation write (in-memory fences of the affected principals, or all, leases revoked, queued raw input dropped, queued work rejected), then the journal halts admission, dispatch and remote input until restart; at start an intent ahead of the head is unclean (no admission until a carriage re-establishes it), a freeze file in any state is frozen | R9.3, R9.4, `r9-chain-membership-write-fault-*`, `r9-chain-uncertain-rename-*`, `r9-chain-freeze-write-fault-*` |
+| 2. Medium: receipt-time push deadlines | every stage from the signed `created_at` (mobile at `created_at + 60 s`), late due stages sent at once if eligible, no send at or after `expires_at − 15 s` (never an early card expiry), ±120 s skew refused and logged at first receipt, separate from delivery | R9.9, `r9-push-schedule-*`, `r9-push-delayed-ingress-*`, `r9-push-created-at-*`, `r9-push-stage-guard-exact-boundary` |
+| 3. Medium: K backup rollback and resealing | version floor in the log (`k_backup` entry with `backup_hash`), freshness from host-signed `accept` heads, account/genesis authenticated through the backup before `recovery_add`; `atem-k-backup-v2` sealed (HPKE) to the kit's public key so any manager reseals without `R`; put-if-absent versions, CAS, concurrent and interrupted rotation; residual unconfirmed restore is incomplete, never wrong | R9.5, `r9-vectors-recovery`, `r9-recovery-restore-*`, `r9-recovery-k-backup-*` |
+| 4. Medium: `seen` reliability | relay `push_ack` for every hint and seen, Atem resends the same bytes until acknowledged; a seen before its open is kept durably (bounded) and applied when the open arrives; full-identity matching; a seen after resolution reopens nothing | R9.9, `r9-seen-*` |
+| Technical answers | adopted: `/api/remote/v1/logs/{genesis_hash}/entries` with a bounded `409` and continuation; no separate push key; native `auth_key` = the ceremony P-256 identity with Astation's owner-auth adapter; clear errors advisory, `sig_c` refusals encrypted | R9.4, R9.9, R9.6, R9.7, R9.11 |
 
 Open questions for Astation are R9.13.

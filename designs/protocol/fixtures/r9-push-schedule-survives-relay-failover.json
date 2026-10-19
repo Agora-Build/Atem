@@ -1,0 +1,110 @@
+{
+  "name": "r9-push-schedule-survives-relay-failover",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "relay",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.9: replica r1 accepts the opens at created_at and sends the desktop stage; it fails at created_at + 30000. Replica r2 resumes from the shared store and sends the mobile stage once, still at created_at + 60000 (deadlines come from the signed created_at, never from a replica's own receipt or restart); r1 sends nothing more.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "relay_now": 1793264005000,
+    "desktop_connected": false,
+    "replicas": [
+      "r1",
+      "r2"
+    ]
+  },
+  "steps": [
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.0}"
+    },
+    {
+      "relay_result": "accepted"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.1}"
+    },
+    {
+      "relay_result": "accepted"
+    },
+    {
+      "expect_push": {
+        "device": "dev-mac",
+        "kind": "desktop_os",
+        "due_at": 1793264005000
+      }
+    },
+    {
+      "advance_ms": 30000
+    },
+    {
+      "relay_failover": {
+        "from": "r1",
+        "to": "r2"
+      }
+    },
+    {
+      "expect_no_push": {
+        "for_ms": 29999
+      }
+    },
+    {
+      "advance_ms": 30000
+    },
+    {
+      "expect_push": {
+        "device": "dev-phone",
+        "kind": "mobile",
+        "due_at": 1793264065000,
+        "replica": "r2"
+      }
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.0}"
+    },
+    {
+      "relay_result": "idempotent"
+    },
+    {
+      "expect_no_push": {
+        "for_ms": 600000
+      }
+    }
+  ]
+}

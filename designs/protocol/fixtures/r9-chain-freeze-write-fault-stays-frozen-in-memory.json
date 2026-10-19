@@ -1,0 +1,155 @@
+{
+  "name": "r9-chain-freeze-write-fault-stays-frozen-in-memory",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.4 (Astation r3 review 1): the freeze record can't be made durable. Atem is frozen in memory at once (every remote principal fenced, init refused account_frozen, push hints stop) and the journal halts; local input goes on. If the machine then loses the write, the host starts unfrozen and freezes again when the conflicting window is carried again (devices keep both entries); a freeze file that reached the disk in any state, even unreadable, keeps it frozen at start. A clear account_frozen is advisory to the client: never a reason to repin or to persist a freeze.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "svc",
+        "principal": "service:svc-discord",
+        "key": "svc-discord"
+      }
+    ],
+    "connected": [
+      "phone"
+    ],
+    "holds_lease": {
+      "mac": 1
+    }
+  },
+  "steps": [
+    {
+      "fail_next_membership_write": {
+        "at": "temp_fsync",
+        "file": "freeze"
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": [
+        "C6_mac"
+      ],
+      "window": true
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "assert": {
+        "frozen": true,
+        "frozen_durable": false,
+        "membership_halted": true,
+        "attachments": 0,
+        "lease_holder": null
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": []
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "account_frozen",
+      "at": "init"
+    },
+    {
+      "local_input": "ses-aaaaaaaaaaaa",
+      "bytes": "bHMNCg=="
+    },
+    {
+      "assert": {
+        "pty_writes_local": 1,
+        "pty_writes_remote": 0
+      }
+    },
+    {
+      "restart_runtime": {
+        "runtime_gen": "44444444-4444-4444-8444-444444444444",
+        "runtime_epoch": 2
+      },
+      "disk": "write_lost"
+    },
+    {
+      "assert": {
+        "frozen": false,
+        "head": "E6"
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": [
+        "C6_mac"
+      ],
+      "window": true
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "assert": {
+        "frozen": true,
+        "frozen_durable": true
+      }
+    }
+  ]
+}

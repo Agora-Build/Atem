@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "relay",
   "log": "r9-vectors-membership-log",
-  "note": "R9.9: per-recipient signed and sealed open hints; identical bytes are idempotent, a conflicting duplicate, a created_at more than 5 min ahead, expires_at <= created_at, a lifetime over 15 min and a bad signature are refused; desktop OS push at 0 s (no desktop connected), mobile at 60 s (no seen); the resolved hint cancels the rest, replaces delivered notifications and dominates a late open. The recipient opens the sealed tool and summary.",
+  "note": "R9.9: per-recipient signed and sealed open hints; identical bytes are idempotent, a conflicting duplicate, a created_at outside the relay's ±120 s bound, expires_at <= created_at, a lifetime over 15 min and a bad signature are refused; desktop OS push at 0 s (no desktop connected), mobile at 60 s (no seen); the resolved hint cancels the rest, replaces delivered notifications and dominates a late open. The recipient opens the sealed tool and summary.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -63,7 +63,7 @@
       "expect_push": {
         "device": "dev-mac",
         "kind": "desktop_os",
-        "at_ms": 0
+        "due_at": 1793264005000
       }
     },
     {
@@ -112,7 +112,7 @@
       "expect_push": {
         "device": "dev-phone",
         "kind": "mobile",
-        "at_ms": 60000
+        "due_at": 1793264065000
       }
     },
     {

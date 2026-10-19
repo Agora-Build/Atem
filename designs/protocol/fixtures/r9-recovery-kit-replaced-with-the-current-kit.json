@@ -1,0 +1,137 @@
+{
+  "name": "r9-recovery-kit-replaced-with-the-current-kit",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5: set_recovery_key with kit current needs the manager's sig and the current kit's kit_sig (stripping kit_sig makes the same body invalid); it takes effect at once. The old recovery key can never sign again: R8_oldkit is invalid, while the same body signed by kit 2 is a valid, pending recovery_add.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793177601000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "carry": [
+        "K7_current_no_kit_sig"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 6,
+        "head.hash": "${hash:E6}",
+        "index": 0,
+        "detail": "kit_sig_missing"
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": [
+        "K7_current"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 7,
+        "head.hash": "${hash:K7_current}",
+        "pending_recovery": []
+      }
+    },
+    {
+      "assert": {
+        "head": "K7_current",
+        "recovery_key": "recovery-2",
+        "pending": {}
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": [
+        "R8_oldkit"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 7,
+        "head.hash": "${hash:K7_current}",
+        "index": 0,
+        "detail": "recovery_key_retired"
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": [
+        "R8_newkit"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 8,
+        "head.hash": "${hash:R8_newkit}",
+        "pending_recovery": [
+          {
+            "entry_hash": "${hash:R8_newkit}",
+            "seq": 8,
+            "action": "recovery_add",
+            "subject": "dev-newmac",
+            "effective_at": 1793264001000
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,193 @@
+{
+  "name": "r9-recovery-restore-refuses-a-rolled-back-backup",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "client",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5 (Astation r3 review 3): a fresh restore takes its version floor from the log's newest k_backup entry and its freshness from host-signed accept heads (an init needs no membership). A relay serving an older log than a host signed, or an older authentic backup than the newest k_backup, is refused; a backup that doesn't open for this account and genesis, or a replaced kit, is refused before any recovery_add is published. With no host reachable the restore proceeds unconfirmed: data under a missing kid is reported as needing a newer backup, never rewritten, and the device neither rotates K nor seals a backup until a host-confirmed head shows it is current.",
+  "setup": {
+    "account_id": "acct-test-1",
+    "genesis_hash": "${hash:E1}",
+    "hosts": [
+      {
+        "name": "host-a",
+        "host_id": "host-a",
+        "host_trust_gen": 1
+      }
+    ]
+  },
+  "steps": [
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "refused",
+      "detail": "log_behind_host",
+      "published": false
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7",
+          "KB8"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "refused",
+      "detail": "backup_hash_mismatch",
+      "published": false
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7",
+          "KB8"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup_rotated.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "refused",
+      "detail": "backup_invalid",
+      "published": false,
+      "tamper": {
+        "account_id": "acct-test-2"
+      }
+    },
+    {
+      "restore": {
+        "kit": "recovery-2",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7",
+          "KB8"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup_rotated.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "refused",
+      "detail": "kit_not_current",
+      "published": false
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7",
+          "KB8"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup_rotated.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "restored",
+      "freshness": "host_confirmed",
+      "kids": [
+        "7a3c9e10",
+        "b982533d",
+        "1f2e3d4c"
+      ],
+      "published": {
+        "action": "recovery_add",
+        "seq": 9,
+        "prev_hash": "${hash:KB8}"
+      }
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup.wire}",
+        "host_heads": {}
+      },
+      "result": "restored",
+      "freshness": "unconfirmed",
+      "kids": [
+        "b982533d",
+        "1f2e3d4c"
+      ],
+      "published": {
+        "action": "recovery_add",
+        "seq": 8,
+        "prev_hash": "${hash:KB7}"
+      }
+    },
+    {
+      "client_data": {
+        "kid": "7a3c9e10"
+      },
+      "result": "needs_newer_backup"
+    },
+    {
+      "assert_client": {
+        "may_rotate_k": false,
+        "may_seal_backup": false
+      }
+    },
+    {
+      "host_connect": {
+        "host": "host-a",
+        "accept_head": "KB8"
+      }
+    },
+    {
+      "assert_client": {
+        "freshness": "behind_host",
+        "refetch": true
+      }
+    }
+  ]
+}
