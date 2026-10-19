@@ -1,6 +1,6 @@
 # Remote agent API without the Mac: Atem's response
 
-Status: Atem response r1, 2026-10-19, to Astation's "Remote agent API without
+Status: Atem response r2, 2026-10-19 (r2: the user's final trust design replaces attestations, the freshness window and `resolve_fork`), to Astation's "Remote agent API without
 the Mac" draft (2026-10-18, after Astation #56). Baseline: Atem `main` at
 `0801a4f`, contract [atem-session v1 r8](atem-session-v1.md) (authoritative),
 Atem's §9 proposal [account-trust.md](../account-trust.md). **Today** means in
@@ -17,7 +17,7 @@ through the Mac; approvals are push-based and need `control`, not the lease
 
 | Decision | Atem recommends |
 |---|---|
-| 1. Freshness and forks | A head is accepted on one attestation by any manager listed at Atem's high-water head (user decision, 2026-10-19); 24 h window from the attestation, on wall and monotonic clocks, whichever ends first; any fork freezes remote access until a `resolve_fork` entry signed by any one current manager that extends Atem's high-water mark |
+| 1. Freshness and forks | Signed hash chain (`seq`, `prev_hash`, signed by a manager at `seq-1`); Atem keeps a durable head, refuses rollback and non-chaining entries; every connection carries the suffix from Atem's head, applied (removals fenced at once) before admission; no attestations, heartbeats, window or clock rules; a valid conflicting branch freezes remote access until the host is re-paired (user decision, 2026-10-19) |
 | 2. Identities | Three principal kinds, all from the log or a log member: `native` (member device), `service` (member with role `service`, scope, mandatory expiry), `browser` (≤ 1 h QR grant from a native member); r9 with `hello` inside the channel carrying the proof |
 | 3. Formats and channel | RFC 8785 JSON bodies signed over `enc(domain, jcs)`; `alg` ∈ {`p256`, `ed25519`} pinned per key in the log; one SIGMA-I suite: X25519 ephemerals, both long-term keys sign the transcript, HKDF-SHA256, ChaCha20-Poly1305, strict counters, no rekey, no resumption |
 | 4. Client core | Atem owns `crates/atem-client`: sans-I/O Rust (log verifier, channel both roles, r9 client machines, fixture runner), UniFFI for Swift/Kotlin, wasm-bindgen for browsers and JS bots; the Atem host links the same verifier and channel |
@@ -39,109 +39,100 @@ through the Mac; approvals are push-based and need `control`, not the lease
 | Shared-library precedent | `crates/atem-core{,-ffi}` | pure Rust + hand-written versioned C ABI, Swift and C consumers, xcframework release assets |
 | Crypto deps | `Cargo.toml` | `x25519-dalek`, `ed25519-dalek`, `p256` (ecdsa), `hkdf`, `chacha20poly1305`, `aes-gcm`, `hpke` |
 
-Absent today: the membership log, attestations, any principal but the paired
+Absent today: the membership log, any principal but the paired
 Astation, `service`/`browser` admission, a secure channel, r9.
 
 ## 3. Decision 1: freshness and forks
 
+User decision, 2026-10-19, final. It replaces r1's any-manager attestation,
+24 h freshness window and `resolve_fork` entry.
+
 **Threat model.** The relay is fully adversarial (withholds, reorders,
 replays, shows different parties different views). Any member key may be
-stolen, including keys of devices already removed. Clocks jump. Goals: Atem
-never acts on an older list than one it accepted; a removal Atem has seen
-is final; a fork, once any evidence reaches Atem, stops remote access.
-Accepted by the user (2026-10-19): one compromised manager can attest alone
-(including fresh attestations of a head that hides its own later removal),
-but it could already add devices on its own; removing it from the log stops
-it once Atem sees the removal.
+stolen, including keys of devices already removed. Goals: Atem never acts on
+an older list than one it accepted; a removal Atem has seen is final and takes
+effect at once; a fork, once any evidence reaches Atem, stops remote access.
 
-**Keys.** Each native member has an `auth` key (no user presence: channel
-signatures and heartbeats) and, if a manager, a `manage` key (Touch
-ID/password per signature: log entries). Today's Touch-ID-per-signature
-Secure Enclave key cannot do 6-hourly heartbeats, so the split is required.
+**Keys.** Each native member has one `auth` key in the log (Secure Enclave
+P-256 / platform keystore). A manager's key requires biometrics (Face ID /
+Touch ID) on the device; that is key policy on the device, not protocol, and
+Atem can't observe it. There is no second "routine" key, no recovery key and
+no manager authority expiry.
 
-**Attestation** (signed by a manager's `auth` key):
+**Log.** A signed hash chain: entry `seq` names `prev_hash`, the hash of entry
+`seq-1`, and is signed by a device whose roles include `manage` at `seq-1`.
+Only managers sign entries; any member (or the relay, or Atem's own link) can
+carry them, since the signatures decide.
 
-```json
-{"type":"atem-head-attestation","account_id":"…","genesis_hash":"…","seq":42,
- "head_hash":"…","issued_at":1792400000000,"signer":"dev-…"}
-```
+**Head** (`membership.json`, 0600, atomic, `flock`, beside `pairing.json`):
+`{account_id, genesis_hash, host_trust_gen, head:{seq, hash}, entries:[…],
+fork?:{evidence}}`. `entries` is Atem's copy of the log it applied (small:
+≤ 4 KiB per entry, a handful of devices), kept to judge a conflicting branch.
+The head moves only forward, one valid chaining entry at a time. A lower `seq`
+is refused (rollback); an entry that doesn't chain from the head is never
+applied.
 
-`atem_nonce` is absent (heartbeat, every 6 h by each online manager, stored
-on the relay) or Atem's handshake nonce `n_h` (on demand; counts as issued at
-Atem's own time of the nonce). Absent fields are omitted, never `null`.
+**Propagation through normal connections.** Atem's challenge on every
+connection carries its head `(seq, hash)` (in `channel_accept`, §5). The
+client's `hello` carries `membership:{head, entries}`:
 
-**Checkpoint.** One attestation for a head H by any manager listed at
-Atem's **high-water head** HW, within the window. H must equal or extend HW
-through the presented suffix. A manager removed at or before HW never counts.
-The signer must be a manager at HW, never merely at H, so a fork that adds a
-manager cannot vouch for itself. Two manager attestations for heads not on
-one chain are a fork (below). This is `account-trust.md` §3.5's "any
-manager" rule, made exact.
+- Its log contains Atem's head: `entries` is its suffix from Atem's head to
+  its own head (empty when equal). Atem verifies each entry (chain, signer a
+  manager at `seq-1`, `alg` pin, account and genesis), makes the new head and
+  entries durable (fsync), applies every effect, and only then admits the
+  device against the new head.
+- Its log is behind Atem's head and agrees with Atem's copy: no entries; Atem
+  admits it on Atem's head. `welcome.head` shows it is behind; it fetches the
+  rest from the relay.
+- Its log doesn't contain Atem's head: it sends its whole log from genesis.
+  An invalid branch (bad signature, signer not a manager at `seq-1` in that
+  branch, broken chain) is refused (`membership_invalid`) and changes nothing.
+  A valid one is a fork (below).
 
-**High-water mark** (`membership.json`, 0600, atomic, `flock`, beside
-`pairing.json`): `{account_id, genesis_hash, host_trust_gen, hw:{seq, hash},
-pending:[entries past hw], abandoned:[hash], fork?:{evidence},
-deadline_wall, last_wall_seen}`. HW moves only forward, only by a
-checkpoint, and is fsynced before any welcome or effect that depends on it.
-A suffix or checkpoint that doesn't extend HW is refused (rollback refusal);
-abandoned hashes are refused forever. Valid entries past HW are kept as
-`pending`: restrictive ones that touch no manager (`remove`, narrowing
-roles/scope of a non-manager, `revoke_grant`) apply at once — failing closed
-is safe — while additions, widenings and every manager-set change wait for a
-checkpoint.
+On an open channel the client may send `membership{entries}` whenever it
+learns newer entries; Atem applies them the same way. Atem may also fetch the
+suffix from the relay over its own link; it gets no more trust than any
+carrier. `welcome` carries Atem's head, so a client can show "up to date".
 
-**Window.** On accepting a checkpoint at Atem wall time W and monotonic M,
-let `t_old` be the attestation's `issued_at` (refused
-if more than 5 min ahead of W). `deadline_wall = t_old + 24 h`;
-`deadline_mono = M + (deadline_wall − W)`; remote authorization ends at
-whichever comes first. A newer-head checkpoint replaces the deadline; a
-same-head one may only extend it. After a restart (monotonic lost) the
-persisted `deadline_wall` is used with a new monotonic deadline from it, and a
-wall clock earlier than `last_wall_seen − 5 min` counts as expired. A
-replayed old heartbeat buys at most 24 h from when it was signed.
+**Applying a removal.** Durable head first, then: the principal's
+`control_gen` is raised (r8 §H); its attachments, leases, streams and
+conversations close; its `accepted`-not-`executing` work is `rejected`
+`control revoked`; browser grants it issued are fenced. Role loss and service
+scope narrowing apply the same way. A crash after the fsync replays the fences
+at start, before any remote admission. There are no revocation
+acknowledgements: a removal is final once in Atem's head.
 
-**While the Mac is offline.** A phone or bot fetches the log suffix from
-Atem's HW and the latest heartbeats from the relay and presents them in
-`hello` (or later in `refresh` on the open channel). Admission lasts until
-the deadline; `welcome.authorization_ms_left` says how long. At the deadline
-Atem fences every remote attachment (`paused`, §H fence for queued work);
-agents and the local terminal keep running. With one manager this is the
-approved bound: the Mac must heartbeat within 24 h.
+**Fork.** Two valid entries at one `seq`, or a valid suffix that doesn't
+chain from Atem's head while signed by managers valid in its own branch,
+freezes remote access for the account: the evidence is persisted in `fork`
+(fsync first), every remote principal is fenced (`control_revoked` per r8
+§H, attachments closed) and every remote `hello` gets
+`error{code:"account_frozen"}`. Local use is unaffected. No entry lifts it;
+resolution is re-pairing the host (`atem unpair` + `atem pair`: a new genesis
+and `host_trust_gen`, `account-trust.md` §3.6). The relay's transactional
+append makes honest races practically impossible; forks are expected only
+from an attacking relay or a stolen manager key.
 
-**Fork.** Atem holding two valid entries with the same `seq` or the same
-`prev_hash`, or two manager attestations for heads not on one chain, freezes
-remote access for the account: the evidence is persisted in `fork`, every
-remote principal is fenced (`control_revoked` per r8 §H, attachments closed),
-and every remote `hello` gets `error{code:"account_frozen"}`. Local use is
-unaffected. It lifts only with a `resolve_fork` entry that chains from
-Atem's HW through the chosen branch, names the first entry of each abandoned
-branch, and is signed by any one current manager (a manager at HW not
-removed in the chosen branch). A conflict at or below HW (a checkpointed
-entry contradicted) can't be resolved by any entry; recovery is `atem unpair` + `atem pair` (new genesis, new
-`host_trust_gen`). The relay's transactional append makes honest races
-practically impossible; forks are expected only from an attacking relay.
-
-**Removal propagation.** A manager appends `remove` (relay CAS is a
-convenience, not consensus). Atem learns it from any client's suffix, from
-its own poll of `/api/remote/v1/membership` every 5 min over its link, or
-from the next checkpoint. Applying it: the principal's `control_gen` is
-raised (r8 §H), its attachments, leases, streams and conversations close, its
-`accepted`-not-`executing` work is `rejected` `control revoked`, browser
-grants it issued are fenced. Bound: immediate once seen; a checkpoint from
-any honest manager carries it, since that manager attests the current head.
+**Residual risk.** A revocation reaches a host when any honest device next
+connects to it (or Atem fetches it). Until then a stolen *unlocked* manager
+can act: add devices, connect, control. If the relay keeps honest devices
+away from the host, re-pairing the host is the fallback. A stolen manager
+key, even one already removed, can sign a branch from before its removal and
+so freeze remote access (denial of service, never admission); re-pairing
+resolves that too.
 
 ## 4. Decision 2: identities
 
 | Kind | Proof | r8/r9 principal | Permissions |
 |---|---|---|---|
-| `native` | log `add` with `auth` key (Secure Enclave P-256 / platform keystore), roles from `view`, `control`, `manage` | `member:<device_id>` | `view`, `control` as listed; `manage` gives the host nothing (it only counts toward checkpoints) |
+| `native` | log `add` with `auth` key (Secure Enclave P-256 / platform keystore; biometric on managers), roles from `view`, `control`, `manage` | `member:<device_id>` | `view`, `control` as listed; `manage` gives the host nothing (it only signs log entries) |
 | `service` | log `add` by a manager, role `service`, own key, `scope`, mandatory `expires_at` | `service:<device_id>` | only `scope.ops` on `scope` targets; approvals only if `approval` is in `ops` |
 | `browser` | grant signed by a native member with `control`, key proven in the handshake | `browser:<grant_id>`, issuer recorded | subset of the issuer's, on the grant's target |
 | `host` | log `add_host` by the pairing manager: `atem_device_id`, `host_trust_gen`, `host_key` | — (never a client) | — |
 
 Service entry (the scope is part of the signed entry; a narrower `set_scope`
 or expiry is a revocation and raises `control_gen`; a wider one is a new
-grant and waits for a checkpoint):
+entry, applied like any other):
 
 ```json
 {"type":"atem-membership-entry","account_id":"…","seq":43,"prev_hash":"…","action":"add",
@@ -151,7 +142,7 @@ grant and waits for a checkpoint):
 ```
 
 - Service rules: expiry ≤ 90 days (renewal is a new entry); never `manage`,
-  never issues grants, never counts toward checkpoints. `projects` are `h1.`
+  never issues grants, never signs log entries. `projects` are `h1.`
   project hashes resolved against a session's working directory **at launch**
   and recorded in the descriptor, so a later `cd` or remote change can't move
   a session into scope. Out-of-scope sessions are `unknown_session` in
@@ -163,13 +154,15 @@ grant and waits for a checkpoint):
   early end. The browser key is a non-extractable WebCrypto P-256 key.
 - `control_gen`: kept per principal exactly as r8 §H; removal, role loss,
   scope narrowing, expiry and grant end are revocations.
-- Expiry uses wall and monotonic time, whichever ends first, like the window.
+- Service and grant expiry are checked against Atem's wall clock at admission
+  and by a timer while attached; there are no other clock rules. Native
+  members don't expire; they are removed.
 
 **Wire version: r9.** `hello` travels inside the channel (§5) and carries
 the proof: `{revision: 9, principal:{kind, device_id|grant}, sig, membership:
-{suffix, checkpoint}, grant?}`. `welcome` adds `principal`, `client_kind`
-(`native`/`service`/`browser`), `scope` (service/browser), `features`, and
-`authorization_ms_left` = min(window, expiry, grant). r9 keeps r8 operation
+{head, entries}, grant?}` (§3). `welcome` adds `principal`, `client_kind`
+(`native`/`service`/`browser`), `scope` (service/browser), `features`, Atem's
+`head`, and for service/browser `authorization_ms_left` = min(expiry, grant). r9 keeps r8 operation
 semantics and every r8 feature name; `hello.revision ≠ 9` is
 `unsupported_version` before any attachment. No compatibility: the r8
 "paired Astation over its link" admission is removed; the Mac is the genesis
@@ -178,7 +171,7 @@ link stays for pairing, `cred unlock`, credentialSync and key grants.
 
 ## 5. Decision 3: signed formats and the channel
 
-**Signed objects** (log entries, attestations, grants, host advertisements):
+**Signed objects** (log entries, grants, host advertisements, push hints):
 the body is I-JSON parsed with `parse_strict` (no duplicate keys, safe
 integers, no `null`, absent = omitted), at most 4 KiB; the signing input is
 `enc(["atem-<type>-v1", jcs(body)])` — `encoding.rs`'s length-prefixed
@@ -208,15 +201,18 @@ log's `add_host` entry with `host_trust_gen`. Unpair rotates it.
 1. C→H `channel_init`: `{suite:"atem-ch1", e_c, n_c, host:{atem_device_id,
    host_trust_gen}}` in clear (the relay routes on it).
 2. H→C `channel_accept`: `{e_h, n_h, ct}`. `th2 = SHA-256(enc(["atem-ch1-th2",
-   jcs(init), e_h, n_h, atem_device_id, host_trust_gen, genesis_hash, hw_seq,
-   hw_hash]))`; `ss = X25519(e, e')`; `hs = HKDF-Extract(th2, ss)`;
+   jcs(init), e_h, n_h, atem_device_id, host_trust_gen, genesis_hash, head_seq,
+   head_hash]))`; `ss = X25519(e, e')`; `hs = HKDF-Extract(th2, ss)`;
    `k_h2c_hs`, `k_c2h_hs` = HKDF-Expand(hs, "atem-ch1 h2c hs"/"… c2h hs", 32).
-   `ct` = AEAD under `k_h2c_hs` of `{head:{genesis_hash, hw_seq, hw_hash},
+   `ct` = AEAD under `k_h2c_hs` of `{head:{genesis_hash, head_seq, head_hash},
    sig_h = Sign(host_channel_key, th2)}`. The client checks `sig_h` against
    the log's `add_host` for that `atem_device_id`/`host_trust_gen` before
    sending anything that names itself.
 3. C→H, AEAD under `k_c2h_hs`: `hello{…, sig_c = Sign(auth, th3)}` with
    `th3 = SHA-256(enc(["atem-ch1-th3", th2, sig_h, jcs(principal)]))`.
+   `head` in step 2 is Atem's challenge head (§3) and is bound by `th2`;
+   `hello.membership` carries the suffix from it. Entries carry their own
+   signatures, so `sig_c` needn't cover them.
 4. `th4 = SHA-256(enc(["atem-ch1-th4", th3, sig_c]))`; `ak = HKDF-Extract(th4,
    ss)`; `k_c2h`, `k_h2c` = HKDF-Expand(ak, "atem-ch1 c2h"/"… h2c", 32); the
    host answers `welcome` (or an error) under `k_h2c`; ephemerals are wiped.
@@ -227,9 +223,10 @@ CryptoKit and WASM have it, WebCrypto doesn't need to). Nonce = 4 zero bytes ‖
 direction])`; one session-family message per record, ≤ 1 MiB + 16. The
 transport is ordered (WSS; SSE keeps the same ordered stream), so the
 receiver demands exactly the next counter: any gap, replay or failed tag
-closes the channel. No rekey: keys are fresh per channel, the counter can't
-wrap in practice, and a channel ends at the authorization deadline (`refresh`
-with a new checkpoint extends it in place). No resumption, no 0-RTT: every
+closes the channel. No rekey: keys are fresh per channel and the counter can't
+wrap in practice; a service or browser channel ends at its expiry, a native
+one when either side closes it or the member loses its roles (`membership`
+on the open channel carries newer entries, §3). No resumption, no 0-RTT: every
 connect is a full handshake, a new attachment, no lease (r8 §3 unchanged;
 `resume` stays refused). Cross-channel or cross-replica replay fails on
 `n_h` and fresh ephemerals.
@@ -239,7 +236,9 @@ sizes and timing, ephemerals and nonces; never the client identity (in
 `hello`, encrypted), messages, approvals or chat. The log on the relay holds
 keys, roles and scopes; device names are sealed with `K` (they stay out of
 the signed body). Push hints carry only `approval_id`, `atem_device_id`,
-`session_id`, `expires_at` and a host signature; the tool and summary go
+`session_id`, the approval's immutable `created_at` (its original creation,
+never a retry or send time), `expires_at` and a host signature, sent at once
+on open and on resolution; the relay owns the 60/180 s schedule; the tool and summary go
 HPKE-sealed to each `control` member's device key (today they go in clear).
 
 ## 6. Decision 4: reusable client core
@@ -252,8 +251,8 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
   key_ref, alg, input}` answered with the signature), behind a Rust
   `KeyProvider` trait for in-process use: Secure Enclave, Android Keystore,
   WebCrypto non-extractable keys, or a software file for bots.
-- **Contents.** Membership verifier (chain, alg pins, checkpoint, fork
-  evidence, window arithmetic), entry/attestation/grant builders, channel
+- **Contents.** Membership verifier (chain, alg pins, suffix application,
+  fork evidence), entry/grant/push-hint builders and verifiers, channel
   (both roles), r9 client machines moved from `session_protocol/client.rs`
   (lease with 5 s renew/15 s expiry, receipts and `receipt_query` recovery,
   registry `seq`, chat history/coverage ordering, approvals), and the fixture
@@ -263,7 +262,7 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
   not for this), wasm-bindgen for browsers and Node bots, the crate for Rust
   bots. Releases attach the xcframework like `atem-core`.
 - **Not in it:** UI, storage policy (state exports as opaque bytes the app
-  stores; only the host's high-water mark is authoritative), notifications,
+  stores; only the host's head is authoritative), notifications,
   networking, key storage.
 - The Atem host links the same verifier and channel; admission, journal and
   fences stay in `atem`. One implementation of every security-critical
@@ -273,7 +272,7 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
 
 | Item | Position |
 |---|---|
-| 5. Pairing pin and admission | **Agree, with changes:** the ceremony also reveals `host_channel_key` and covers `genesis_hash`; the pin is `membership.json` (§3), fsynced before any welcome; machine, runtime, attachment and principal ids stay distinct |
+| 5. Pairing pin and admission | **Agree, with changes:** the ceremony also reveals `host_channel_key` and covers `genesis_hash`; the pin is `membership.json`'s genesis and head (§3), fsynced before any welcome; machine, runtime, attachment and principal ids stay distinct |
 | 6. Permission/revocation boundaries | **Agree.** Scope filters reads (registry, chat, terminal) and writes; view can't prompt, answer, revoke rules or type; every fence goes through r8 §H/§I, rechecked at dispatch and after restart |
 | 7. Operations and recovery | **Agree; no resume in r9.** Transport loss = new channel, new attachment, authoritative catch-up (`sessions` snapshot, `history_end`/pages, `receipt_query`); never a restored lease or replayed prompt; cursor loss stays explicit (r8 §B/§C) |
 | 8. r8 control behavior | **Agree** verbatim: atomic Send acquire, expected-holder takeover, 5 s/15 s, local input wins, lease for interrupt/stop/terminal writes, lease-free first-answer-wins approvals |
@@ -284,41 +283,43 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
 | Independent principals for Astation's API callers | **Question:** r8 §H keeps Astation's local API callers inside Astation's principal; a bot must be its own `service` member, never a call through the Mac's local API (that would forward through the Mac) |
 | Browser companion | **Agree** it follows a code-integrity review; default grant ops `view` only |
 | Recovery after losing all managers | **Agree**: new genesis by local unpair/pair per host; account recovery never restores old host authority |
-| Tests matrix | **Agree**; add: a manager removed at or before HW attesting, checkpoint signer a manager at HW not only at H, `pending` restrictive entries applied before a checkpoint, wall clock moved back across a restart, a host whose key agent is locked still serving remote clients |
+| Tests matrix | **Agree**; add: rollback (lower `seq`) refused, a removed manager's later entry refused, an invalid non-chaining branch refused without freezing, a valid one freezing, a removal carried on an open channel fencing at once, a crash between the head fsync and the fences, a client behind Atem's head admitted on Atem's head, a host whose key agent is locked still serving remote clients |
 
 ## 8. Risks and contradictions
 
-1. **Touch ID per signature.** Astation's current signing key needs Touch ID
-   for every signature; heartbeats and channel signatures need a second,
-   no-user-presence key per device (§3 "Keys"). Otherwise either the phone
-   prompts constantly or the 6 h heartbeat can't exist.
-2. **Locked key agent.** Using `device_sign` as the host key would make remote
+1. **Residual revocation delay (accepted).** A removal reaches a host when any
+   honest device next connects to it. A stolen *unlocked* manager can act
+   until then; if the relay keeps honest devices away, re-pairing the host is
+   the fallback (§3).
+2. **Freeze by an old key.** A stolen manager key, even after its removal, can
+   sign a branch from before the removal and freeze remote access. It never
+   gains admission; re-pairing resolves it.
+3. **Biometric manager key on every channel.** One `auth` key per device means
+   a manager signs each channel handshake with its biometric key. Whether one
+   Face ID / Touch ID covers a short reuse window is Astation's key policy;
+   Atem only sees signatures.
+4. **Locked key agent.** Using `device_sign` as the host key would make remote
    access depend on the Mac unlocking the key agent after every Atem restart —
    a hidden "Mac required". Hence `host_channel_key` (§5).
-3. **One manager suffices (accepted).** A single compromised manager can
-   attest alone, but it could already add devices on its own; removing it
-   from the log stops it.
-4. **Push in clear.** Today `push_approval` gives the relay the tool and
+5. **Push in clear.** Today `push_approval` gives the relay the tool and
    summary; that is session content the E2EE channel would otherwise hide.
-5. **Stale §9 text** in `account-trust.md` §6a (approvals needing the lease)
-   is corrected in this commit to r8 §G.
-6. **No compatibility** means Atem r9 and Astation r9 ship together; an r8
+6. **Stale §9 text** in `account-trust.md` §6a (approvals needing the lease)
+   is corrected to r8 §G.
+7. **No compatibility** means Atem r9 and Astation r9 ship together; an r8
    Astation loses remote sessions until updated (local use unaffected).
-7. **Discord disclosure.** A service that posts output to Discord discloses
+8. **Discord disclosure.** A service that posts output to Discord discloses
    it to Discord; enrollment must show that, and `ops` should default to no
    approvals.
-8. **Project scope drift** if evaluated live; fixed by scoping at launch (§4).
-9. **Manager equivocation at or below HW** is unrecoverable by signatures;
-   recovery is re-pairing.
+9. **Project scope drift** if evaluated live; fixed by scoping at launch (§4).
 
 ## 9. Order of work and sizing
 
 | # | Work | Owner | Size |
 |---|---|---|---|
-| 1 | r9 contract appendix: log, checkpoint, fork, principals, scope, channel `atem-ch1`, errors (`account_frozen`), plus fixtures and cross-language vectors (signing inputs, hashes, handshake transcripts, records) | Atem drafts, Astation reviews | 1.5–2 weeks |
+| 1 | Shared signature fixtures first (signing inputs, entry hashes, push hints with `created_at`/`expires_at`), then the r9 contract appendix: log, suffix carriage, fork, principals, scope, channel `atem-ch1`, errors (`account_frozen`, `membership_invalid`), plus fixtures and cross-language vectors (handshake transcripts, records) | Atem drafts, Astation reviews | 1.5–2 weeks |
 | 2 | `atem-client`: verifier, channel, machines moved from `session_protocol/client.rs`, fixture runner, UniFFI + wasm bindings, packaging | Atem | 3 weeks |
-| 3 | Atem host: ceremony change (`host_channel_key`, genesis pin), `membership.json`, polling, channel responder on link/relay/:8080, r9 admission, principals/scope, fences, sealed push hints, harness | Atem | 3 weeks |
-| 4 | Relay `/api/remote/v1` (log store, enrollment, channel routing, ordered events) and native Astation (two SE keys, add device/service, Settings removal, heartbeats), then the Mac-off matrix | Astation | 4–6 weeks (Astation's estimate to confirm) |
+| 3 | Atem host: ceremony change (`host_channel_key`, genesis pin), `membership.json`, suffix application and fences, channel responder on link/relay/:8080, r9 admission, principals/scope, fences, sealed push hints, harness | Atem | 3 weeks |
+| 4 | Relay `/api/remote/v1` (log store, enrollment, channel routing, ordered events) and native Astation (biometric manager key, add device/service, Settings removal, the suffix on every connection), then the Mac-off matrix | Astation | 4–6 weeks (Astation's estimate to confirm) |
 | 5 | Mobile and bot clients on `atem-client`, notifications; browser companion after its review | Astation | after 4 |
 
 Steps 2 and 4's relay part can overlap once step 1's vectors are pinned.

@@ -78,7 +78,7 @@
       <div class="rule"><b>Pair</b>once per Atem, with any one trusted Astation (today's safety-code ceremony).</div>
       <div class="rule"><b>Add a device</b>once per device: an already-trusted device approves it with Touch ID / password.</div>
       <div class="rule"><b>Connect</b>any listed device reaches every Atem of the account, over relay or direct :8080.</div>
-      <div class="rule"><b>Remove</b>Settings → Devices → Remove. Atem stops accepting it within 24 h at most (usually at once).</div>
+      <div class="rule"><b>Remove</b>Settings → Devices → Remove. Atem fences it as soon as any trusted device next connects and brings the removal.</div>
       <div class="rule no"><b>Not trusted</b>the account login, the relay, presence, or a device's own claims.</div>
       <div class="rule no"><b>Not needed</b>the Mac staying online, or pairing each device with each Atem.</div>
     </div>
@@ -100,7 +100,7 @@ flowchart LR
   RELAY["Relay<br/>routes traffic + stores the log<br/>(untrusted)"]
   subgraph HOSTS["Your machines"]
     direction TB
-    A1["Atem on Genie<br/>pins: account + genesis hash<br/>+ newest seq seen"]
+    A1["Atem on Genie<br/>pins: account + genesis hash<br/>+ durable head (seq, hash)"]
     A2["Atem on laptop<br/>same pin"]
   end
   MAC -- "appends signed entries" --> LOG
@@ -133,36 +133,34 @@ sequenceDiagram
   U->>M: codes match → Touch ID / password
   M->>M: sign entry seq 2: add iPhone, roles control+view
   M->>R: append entry (relay stores, can't forge)
-  Note over A: no action on any Atem — it learns entry 2<br/>the next time any device connects or it polls the head
+  Note over A: no action on any Atem — it learns entry 2<br/>the next time any trusted device connects
     </pre></div></div>
   </section>
 
   <section>
     <h2>The iPhone connects to Atem</h2>
-    <p class="lede">Atem checks the chain from its pin, a fresh head, and that the device really holds its key — then grants exactly its roles.</p>
+    <p class="lede">Atem's challenge names its head; the device brings the entries after it. Atem applies them first, then checks the device really holds its key and grants exactly its roles.</p>
     <div class="mermaid-wrap"><div class="zoom"><button data-z="in">+</button><button data-z="out">−</button><button data-z="reset">⟲</button></div>
     <div class="mermaid-inner"><pre class="mermaid">
 sequenceDiagram
   autonumber
   participant P as iPhone Astation
   participant R as Relay
-  participant M as Any online manager
   participant A as Atem
   P->>A: hello (via relay or direct :8080)
-  A->>P: challenge nonce + Atem's newest seq (2)
-  P->>M: head attestation for nonce, please
-  M->>P: signed {seq 3, head hash, nonce, time}
-  P->>A: entries 3 + attestation + signature over (nonce, atem id, trust gen, ephemeral keys)
-  A->>A: entries chain from pinned hash? attestation by a listed manager, not older than seq 2?
+  A->>P: challenge nonce + Atem's head (seq 2, hash)
+  P->>A: entry 3 + signature over (nonce, head, atem id, trust gen, ephemeral keys)
+  A->>A: entry 3 chains from head 2, signed by a manager at seq 2?
+  A->>A: head 3 made durable, entry applied (removals fenced) — before admission
   A->>A: iPhone listed, not removed, roles control+view? signature valid?
-  A->>P: welcome — roles control+view, 24 h window starts now
+  A->>P: welcome — roles control+view, Atem's head is seq 3 (up to date)
   Note over P,A: Step 2 of the proposal: both derive session keys from the ephemeral exchange<br/>so the relay can't read terminal or chat traffic
     </pre></div></div>
   </section>
 
   <section>
-    <h2>Removing a device, and staying safe offline</h2>
-    <p class="lede">Removal is just another signed entry. Atem never moves backwards and never trusts a list older than 24 h.</p>
+    <h2>Removing a device, and forks</h2>
+    <p class="lede">Removal is just another signed entry, carried by the next connection. Atem never moves backwards; a valid conflicting branch freezes remote access until the host is re-paired.</p>
     <div class="mermaid-wrap"><div class="zoom"><button data-z="in">+</button><button data-z="out">−</button><button data-z="reset">⟲</button></div>
     <div class="mermaid-inner"><pre class="mermaid">
 flowchart TD
@@ -170,15 +168,15 @@ flowchart TD
   E4 --> REL[("Relay stores seq 4")]
   REL --> C1{"Next connection to Atem<br/>brings entries up to the head"}
   C1 -- "Atem sees seq 4" --> GONE["Old iPad refused<br/>its live attachment is fenced"]
-  C1 -- "relay withholds seq 4" --> WIN{"Attestation the iPad shows<br/>older than 24 h?"}
-  WIN -- "yes" --> PAUSE["refused / paused<br/>(no fresh proof)"]
-  WIN -- "no" --> LATE["accepted at most until the<br/>24 h window ends — the approved bound"]
-  HW["Atem keeps the highest seq it has seen<br/>— a list older than that is always refused"] -.-> C1
+  C1 -- "relay keeps honest devices away" --> LATE["Old iPad still accepted until any honest<br/>device reaches Atem — the residual risk;<br/>re-pairing the host is the fallback"]
+  C1 -- "a valid branch that doesn't chain<br/>from Atem's head" --> FORK["fork: remote access frozen<br/>(local use unaffected)"]
+  FORK --> REC
+  HW["Atem keeps a durable head (seq, hash)<br/>— a lower seq or non-chaining entry is refused"] -.-> C1
   LOST["All manager devices lost?"] --> REC["local atem unpair + atem pair<br/>→ new genesis, new trust generation<br/>(data and keys kept)"]
     </pre></div></div>
   </section>
 
-  <footer>Atem agent · draft for review with the Astation agent · 2026-10-16</footer>
+  <footer>Atem agent · draft for review with the Astation agent · 2026-10-16, trust design updated 2026-10-19</footer>
 </main>
 <script type="module">
   import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
