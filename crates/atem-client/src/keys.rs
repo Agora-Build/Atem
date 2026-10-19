@@ -67,7 +67,14 @@ impl PublicKey {
             }
             Alg::Ed25519 => {
                 let raw: [u8; 32] = bytes.try_into().map_err(|_| Error::BadKey)?;
-                ed25519_dalek::VerifyingKey::from_bytes(&raw).map_err(|_| Error::BadKey)?;
+                let key =
+                    ed25519_dalek::VerifyingKey::from_bytes(&raw).map_err(|_| Error::BadKey)?;
+                // A small-order key verifies nothing under `verify_strict` and
+                // has a weak X25519 form: refuse it where it enters (a
+                // recovery key, a host key, a member's auth key).
+                if key.is_weak() {
+                    return Err(Error::WeakKey);
+                }
             }
             Alg::X25519 => {}
         }
@@ -220,6 +227,22 @@ mod tests {
         assert_eq!(PublicKey::new(Alg::P256, &[4u8; 65]), Err(Error::BadKey));
         assert_eq!(PublicKey::new(Alg::Ed25519, &[0u8; 31]), Err(Error::BadKey));
         assert!(PublicKey::new(Alg::X25519, &[9u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn small_order_ed25519_keys_are_refused() {
+        // The identity (y = 1) and the order-2 point (y = −1).
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut minus_one = [0xffu8; 32];
+        minus_one[0] = 0xec;
+        minus_one[31] = 0x7f;
+        for key in [identity, minus_one] {
+            assert_eq!(PublicKey::new(Alg::Ed25519, &key), Err(Error::WeakKey));
+        }
+        let json = serde_json::json!({"alg": "ed25519", "pub": b64u(&identity)});
+        assert_eq!(PublicKey::from_json(&json), Err(Error::WeakKey));
+        assert_eq!(Error::WeakKey.code(), "weak_key");
     }
 
     #[test]

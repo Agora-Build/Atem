@@ -80,6 +80,41 @@ pub fn parse_strict(
     Ok(v)
 }
 
+/// A value that came out of `parse_strict` (or is a part of one): no
+/// duplicate keys, no lone surrogates, no unsafe integers. Signed objects and
+/// K-backup envelopes are built only from these, so a value that plain
+/// `serde_json` parsed (which silently keeps the last of two equal keys)
+/// can't reach them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrictValue(Value);
+
+impl StrictValue {
+    /// `parse_strict` of `bytes`, integers only.
+    pub fn parse(bytes: &[u8], max_bytes: usize) -> Result<Self, StrictError> {
+        parse_strict(bytes, max_bytes, Numbers::IntegersOnly).map(StrictValue)
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.0
+    }
+
+    /// A field of an object (a part of a strict value is strict).
+    pub fn get(&self, key: &str) -> Option<StrictValue> {
+        self.0.get(key).cloned().map(StrictValue)
+    }
+
+    /// The items of an array.
+    pub fn items(&self) -> Option<Vec<StrictValue>> {
+        self.0
+            .as_array()
+            .map(|items| items.iter().cloned().map(StrictValue).collect())
+    }
+
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
 /// Strict parse for the digest domain (integers only).
 pub fn parse_payload(bytes: &[u8]) -> Result<Value, StrictError> {
     parse_strict(bytes, MAX_INPUT_BYTES, Numbers::IntegersOnly)

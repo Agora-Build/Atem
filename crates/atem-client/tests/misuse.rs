@@ -2,6 +2,7 @@
 //! misuse a domain label, a pinned `alg` or an array rule is refused. Public
 //! API only.
 use atem_client::backup::{BackupKey, KBackupEnvelope};
+use atem_client::canonical::StrictValue;
 use atem_client::domain::{SignLabel, SigningInput};
 use atem_client::encoding::b64u;
 use atem_client::kit::RecoveryKit;
@@ -9,6 +10,11 @@ use atem_client::provider::sign;
 use atem_client::{Alg, Error, Hash32, KeyId, KeyProvider, PublicKey, SignedObject, SoftwareKeys};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
+
+/// A strictly parsed copy of `value` (what a host or client gets from the wire).
+fn strict(value: &Value) -> StrictValue {
+    StrictValue::parse(value.to_string().as_bytes(), usize::MAX).unwrap()
+}
 
 const LABELS: [SignLabel; 7] = [
     SignLabel::MembershipEntry,
@@ -85,10 +91,10 @@ fn an_entry_signature_is_not_a_kit_signature_and_back() {
     });
     let mut object = SignedObject::sign(&keys, &KeyId::new("kit"), body).unwrap();
     // `kit_sig` is required with kit: "current" before the object can go out.
-    let missing = SignedObject::from_value(&object.to_json());
+    let missing = SignedObject::from_strict(&strict(&object.to_json()));
     assert_eq!(missing, Err(Error::KitSigMissing));
     object.cosign(&keys, &KeyId::new("kit")).unwrap();
-    let wire = SignedObject::from_value(&object.to_json()).unwrap();
+    let wire = SignedObject::from_strict(&strict(&object.to_json())).unwrap();
     let kit = keys.public_key(&KeyId::new("kit")).unwrap();
     wire.verify(&kit).unwrap();
     wire.verify_kit_sig(&kit).unwrap();
@@ -97,7 +103,7 @@ fn an_entry_signature_is_not_a_kit_signature_and_back() {
     let (sig, kit_sig) = (swapped["sig"].clone(), swapped["kit_sig"].clone());
     swapped["sig"] = kit_sig;
     swapped["kit_sig"] = sig;
-    let swapped = SignedObject::from_value(&swapped).unwrap();
+    let swapped = SignedObject::from_strict(&strict(&swapped)).unwrap();
     assert_eq!(swapped.verify(&kit), Err(Error::BadSignature));
     assert_eq!(swapped.verify_kit_sig(&kit), Err(Error::BadSignature));
 }
@@ -203,7 +209,7 @@ fn sets_must_be_sorted_and_unique_when_signed_and_when_parsed() {
         let mut wire = good.to_json();
         wire["body"]["member"]["roles"] = bad.clone();
         assert_eq!(
-            SignedObject::from_value(&wire),
+            SignedObject::from_strict(&strict(&wire)),
             Err(Error::ArrayNotCanonical),
             "{bad}"
         );
@@ -252,7 +258,7 @@ fn a_sequence_keeps_its_order_and_a_reordered_one_is_another_object() {
     // the entry hash no longer match.
     let mut reordered = entry.to_json();
     reordered["body"]["k_backup"]["kids"] = json!(["1f2", "b98"]);
-    let reordered = SignedObject::from_value(&reordered).unwrap();
+    let reordered = SignedObject::from_strict(&strict(&reordered)).unwrap();
     assert_eq!(reordered.verify(&key), Err(Error::BadSignature));
     assert_ne!(reordered.entry_hash(), entry.entry_hash());
     // A duplicate kid is refused outright.
@@ -277,7 +283,7 @@ fn a_sequence_keeps_its_order_and_a_reordered_one_is_another_object() {
     assert_eq!(env.kids, ["b98", "1f2"]);
     let mut wire = env.to_json();
     wire["kids"] = json!(["1f2", "b98"]);
-    let reordered = KBackupEnvelope::from_value(&wire).unwrap();
+    let reordered = KBackupEnvelope::from_strict(&strict(&wire)).unwrap();
     assert_ne!(reordered.backup_hash(), env.backup_hash());
     assert_eq!(
         reordered.open_with_kit(&kit).unwrap_err(),
@@ -285,7 +291,7 @@ fn a_sequence_keeps_its_order_and_a_reordered_one_is_another_object() {
     );
     wire["kids"] = json!(["b98", "b98"]);
     assert_eq!(
-        KBackupEnvelope::from_value(&wire),
+        KBackupEnvelope::from_strict(&strict(&wire)),
         Err(Error::BackupInvalid)
     );
 }
@@ -305,7 +311,7 @@ fn a_body_type_signs_only_under_its_label() {
     // The same signature presented on a seen with the same other fields fails.
     let mut as_seen = hint.to_json();
     as_seen["body"]["type"] = json!("atem-seen");
-    let as_seen = SignedObject::from_value(&as_seen).unwrap();
+    let as_seen = SignedObject::from_strict(&strict(&as_seen)).unwrap();
     assert_eq!(as_seen.label(), SignLabel::Seen);
     assert_eq!(as_seen.verify(&key), Err(Error::BadSignature));
     // An unknown type has no label and can't be signed or parsed.

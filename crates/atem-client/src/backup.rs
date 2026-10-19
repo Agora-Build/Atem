@@ -15,9 +15,9 @@
 use serde_json::{Map, Value};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::canonical::{self, Numbers, jcs};
+use crate::canonical::{self, Numbers, StrictValue, jcs};
 use crate::domain;
-use crate::encoding::{Hash32, b64u, b64u_decode, b64u_decode_array, enc, u64_field};
+use crate::encoding::{Hash32, b64u, b64u_decode, b64u_decode_array, ct_eq, enc, u64_field};
 use crate::error::{Error, Result};
 use crate::hpke;
 use crate::keys::{Alg, PublicKey};
@@ -82,9 +82,18 @@ pub fn info(
     ]))
 }
 
-/// `jcs({"keys":[{"k":…,"kid":…},…]})`, built in one wiped buffer.
+/// The exact length of `plaintext(keys)`: `{"keys":[` and `]}`, then per
+/// key `{"k":"` + 43 + `","kid":"` + kid + `"}`, and the commas between.
+fn plaintext_len(keys: &[BackupKey]) -> usize {
+    11 + keys.iter().map(|key| 60 + key.kid.len()).sum::<usize>() + keys.len().saturating_sub(1)
+}
+
+/// `jcs({"keys":[{"k":…,"kid":…},…]})`, built in one wiped buffer sized
+/// exactly, so it never reallocates (a freed buffer would keep key
+/// material unwiped).
 fn plaintext(keys: &[BackupKey]) -> Zeroizing<String> {
-    let mut out = Zeroizing::new(String::with_capacity(16 + keys.len() * 72));
+    let capacity = plaintext_len(keys);
+    let mut out = Zeroizing::new(String::with_capacity(capacity));
     out.push_str(r#"{"keys":["#);
     for (i, key) in keys.iter().enumerate() {
         if i > 0 {
@@ -98,6 +107,7 @@ fn plaintext(keys: &[BackupKey]) -> Zeroizing<String> {
         out.push_str(r#""}"#);
     }
     out.push_str("]}");
+    debug_assert_eq!(out.len(), capacity);
     out
 }
 
@@ -113,7 +123,7 @@ impl KBackupEnvelope {
     ) -> Result<Self> {
         let mut ikm = Zeroizing::new([0u8; 32]);
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut *ikm);
-        Self::seal_with_ikm(
+        Self::seal_derived(
             account_id,
             genesis_hash,
             blob_version,
@@ -123,8 +133,28 @@ impl KBackupEnvelope {
         )
     }
 
-    /// `seal` with the HPKE ephemeral `DeriveKeyPair(ikm_e)` (vectors).
+    /// `seal` with the HPKE ephemeral `DeriveKeyPair(ikm_e)`: known-answer
+    /// vectors only (feature `test-vectors`, never exported).
+    #[cfg(feature = "test-vectors")]
     pub fn seal_with_ikm(
+        account_id: &str,
+        genesis_hash: Hash32,
+        blob_version: u64,
+        recovery_key: &PublicKey,
+        keys: &[BackupKey],
+        ikm_e: &[u8; 32],
+    ) -> Result<Self> {
+        Self::seal_derived(
+            account_id,
+            genesis_hash,
+            blob_version,
+            recovery_key,
+            keys,
+            ikm_e,
+        )
+    }
+
+    fn seal_derived(
         account_id: &str,
         genesis_hash: Hash32,
         blob_version: u64,
@@ -142,8 +172,7 @@ impl KBackupEnvelope {
         check_kids(&kids)?;
         let info = info(account_id, &genesis_hash, blob_version, &kids, recovery_key)?;
         let recipient = kit_x25519_public(recovery_key)?;
-        let sealed =
-            hpke::seal_with_ikm(&recipient, &info, b"", plaintext(keys).as_bytes(), ikm_e)?;
+        let sealed = hpke::seal_derived(&recipient, &info, b"", plaintext(keys).as_bytes(), ikm_e)?;
         Ok(KBackupEnvelope {
             account_id: account_id.to_owned(),
             genesis_hash,
@@ -162,7 +191,12 @@ impl KBackupEnvelope {
         Self::from_value(&value)
     }
 
-    pub fn from_value(value: &Value) -> Result<Self> {
+    /// From a part of a strictly parsed message.
+    pub fn from_strict(value: &StrictValue) -> Result<Self> {
+        Self::from_value(value.value())
+    }
+
+    pub(crate) fn from_value(value: &Value) -> Result<Self> {
         Self::from_value_inner(value).map_err(|_| Error::BackupInvalid)
     }
 
@@ -281,7 +315,15 @@ impl KBackupEnvelope {
     fn keys_of(&self, plain: &[u8]) -> Result<Vec<BackupKey>> {
         let mut value = canonical::parse_strict(plain, MAX_ENVELOPE_BYTES, Numbers::IntegersOnly)
             .map_err(|_| Error::BackupInvalid)?;
-        let keys = read_keys(&value, &self.kids);
+        let keys = read_keys(&value, &self.kids).and_then(|keys| {
+            // One encoding on read as on write: the plaintext must be exactly
+            // `jcs` of what it holds (rebuilt in a wiped buffer).
+            if ct_eq(plaintext(&keys).as_bytes(), plain) {
+                Ok(keys)
+            } else {
+                Err(Error::BackupInvalid)
+            }
+        });
         wipe_strings(&mut value);
         keys
     }
@@ -413,6 +455,80 @@ mod tests {
                 Err(Error::BackupInvalid)
             ));
         }
+    }
+
+    #[test]
+    fn the_plaintext_buffer_is_sized_exactly() {
+        let long = "k".repeat(64);
+        for keys in [
+            vec![key("b9", 1)],
+            vec![key(&long, 1), key("1f", 2), key(&"x".repeat(40), 3)],
+            (0..8)
+                .map(|i| key(&format!("{long:.60}{i:04}"), i))
+                .collect(),
+        ] {
+            let plain = plaintext(&keys);
+            assert_eq!(plain.len(), plaintext_len(&keys));
+            // Never grown past its first allocation.
+            assert_eq!(plain.capacity(), plaintext_len(&keys));
+            let value: Value = serde_json::from_str(&plain).unwrap();
+            assert_eq!(jcs(&value).unwrap(), *plain, "already canonical");
+        }
+    }
+
+    #[test]
+    fn a_plaintext_that_is_not_canonical_is_refused() {
+        let kit = kit();
+        let env = KBackupEnvelope::seal(
+            "acct",
+            kit.genesis_hash(),
+            2,
+            &kit.recovery_key(),
+            &[key("b9", 1)],
+        )
+        .unwrap();
+        let k = b64u(&[1u8; 32]);
+        let recipient = kit_x25519_public(&kit.recovery_key()).unwrap();
+        for plain in [
+            format!(r#"{{"keys":[{{"kid":"b9","k":"{k}"}}]}}"#),
+            format!(r#"{{ "keys":[{{"k":"{k}","kid":"b9"}}]}}"#),
+            format!(r#"{{"keys":[{{"k":"{k}","kid":"\u0062\u0039"}}]}}"#),
+        ] {
+            let sealed = hpke::seal_derived(
+                &recipient,
+                &env.info().unwrap(),
+                b"",
+                plain.as_bytes(),
+                &[9u8; 32],
+            )
+            .unwrap();
+            let forged = KBackupEnvelope {
+                enc: sealed.enc,
+                ct: sealed.ct,
+                ..env.clone()
+            };
+            assert_eq!(
+                forged.open_with_kit(&kit).unwrap_err(),
+                Error::BackupInvalid,
+                "{plain}"
+            );
+        }
+        // The canonical spelling of the same keys opens.
+        let canonical = format!(r#"{{"keys":[{{"k":"{k}","kid":"b9"}}]}}"#);
+        let sealed = hpke::seal_derived(
+            &recipient,
+            &env.info().unwrap(),
+            b"",
+            canonical.as_bytes(),
+            &[9u8; 32],
+        )
+        .unwrap();
+        let ok = KBackupEnvelope {
+            enc: sealed.enc,
+            ct: sealed.ct,
+            ..env
+        };
+        assert_eq!(*ok.open_with_kit(&kit).unwrap()[0].k, [1u8; 32]);
     }
 
     #[test]

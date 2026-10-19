@@ -24,7 +24,10 @@ hpke = { version = "0.12", default-features = false, features = ["alloc", "x2551
 # (`service` principals hold a software key, R9.6 rule 5). Native members
 # use a platform provider (Secure Enclave, Android Keystore, WebCrypto).
 software-keys = []
+# Deterministic HPKE ephemerals (`seal_with_ikm`) for known-answer vectors.
+# Never enabled by the bindings or by atem itself.
+test-vectors = []
 
 [dev-dependencies]
 # The vector runner signs with the software provider.
-atem-client = { path = ".", features = ["software-keys"] }
+atem-client = { path = ".", features = ["software-keys", "test-vectors"] }

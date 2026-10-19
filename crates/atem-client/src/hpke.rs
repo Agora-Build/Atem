@@ -36,12 +36,25 @@ impl Sealed {
 pub fn seal(recipient: &[u8; 32], info: &[u8], aad: &[u8], plain: &[u8]) -> Result<Sealed> {
     let mut ikm = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(&mut *ikm);
-    seal_with_ikm(recipient, info, aad, plain, &ikm)
+    seal_derived(recipient, info, aad, plain, &ikm)
 }
 
-/// Seals with the ephemeral `DeriveKeyPair(ikm_e)`. `ikm_e` must be secret
-/// and never reused outside known-answer tests.
+/// Seals with the ephemeral `DeriveKeyPair(ikm_e)`, for known-answer vectors
+/// only (feature `test-vectors`; never part of the exported API). `ikm_e`
+/// must be secret and never reused.
+#[cfg(feature = "test-vectors")]
 pub fn seal_with_ikm(
+    recipient: &[u8; 32],
+    info: &[u8],
+    aad: &[u8],
+    plain: &[u8],
+    ikm_e: &[u8; 32],
+) -> Result<Sealed> {
+    seal_derived(recipient, info, aad, plain, ikm_e)
+}
+
+/// The one seal: the ephemeral is `DeriveKeyPair(ikm_e)`.
+pub(crate) fn seal_derived(
     recipient: &[u8; 32],
     info: &[u8],
     aad: &[u8],
@@ -162,8 +175,8 @@ mod tests {
     #[test]
     fn the_same_ikm_gives_the_same_seal() {
         let public = public_of(&[7u8; 32]).unwrap();
-        let a = seal_with_ikm(&public, b"i", b"", b"p", &[1u8; 32]).unwrap();
-        let b = seal_with_ikm(&public, b"i", b"", b"p", &[1u8; 32]).unwrap();
+        let a = seal_derived(&public, b"i", b"", b"p", &[1u8; 32]).unwrap();
+        let b = seal_derived(&public, b"i", b"", b"p", &[1u8; 32]).unwrap();
         assert_eq!(a, b);
         assert_ne!(seal(&public, b"i", b"", b"p").unwrap().enc, a.enc);
     }

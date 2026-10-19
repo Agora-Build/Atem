@@ -10,7 +10,7 @@
 //! caller pins (`verify`), never one the object names.
 use serde_json::{Map, Value};
 
-use crate::canonical::{self, Numbers, jcs};
+use crate::canonical::{self, Numbers, StrictValue, jcs};
 use crate::domain::{self, SignLabel, SigningInput};
 use crate::encoding::{Hash32, b64u, b64u_decode};
 use crate::error::{Error, Result};
@@ -172,9 +172,15 @@ impl SignedObject {
         Self::from_value(&value)
     }
 
-    /// From a value already parsed strictly (e.g. an entry inside a larger
-    /// message, which `parse_strict` checked for duplicate keys).
-    pub fn from_value(value: &Value) -> Result<Self> {
+    /// From a part of a strictly parsed message (e.g. an entry inside a
+    /// `hello`).
+    pub fn from_strict(value: &StrictValue) -> Result<Self> {
+        Self::from_value(value.value())
+    }
+
+    /// From a value the caller parsed strictly. Crate-private: outside the
+    /// crate only `StrictValue` (or bytes) can build a signed object.
+    pub(crate) fn from_value(value: &Value) -> Result<Self> {
         let object = value
             .as_object()
             .ok_or(Error::Malformed("a signed object must be a JSON object"))?;

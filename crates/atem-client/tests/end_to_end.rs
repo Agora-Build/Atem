@@ -127,7 +127,7 @@ fn a_manager_seals_k_to_the_kit_and_a_restorer_opens_it() {
     tag[0] ^= 0x80;
     assert!(matches!(
         RecoveryKit::read(&r, "acct-1", Hash32([0x93u8; 32]), &tag),
-        Err(Error::KitDamaged)
+        Err(Error::KitTagMismatch)
     ));
 }
 

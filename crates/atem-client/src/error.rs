@@ -26,6 +26,8 @@ pub enum Error {
     KitSigUnexpected,
     /// A public key of the wrong length or not on its curve.
     BadKey,
+    /// A small-order (weak) Ed25519 public key.
+    WeakKey,
     /// A key used with an algorithm other than the one pinned for it.
     WrongAlg,
     /// A P-256 signature with a high S (§R9.1: low S required).
@@ -38,8 +40,9 @@ pub enum Error {
     OpenFailed,
     /// A K-backup envelope or plaintext that is malformed or doesn't open.
     BackupInvalid,
-    /// A Recovery Kit whose tag doesn't match its contents.
-    KitDamaged,
+    /// A Recovery Kit whose tag doesn't match its contents ("damaged or
+    /// mistyped"; the restore fixtures' `kit_tag_mismatch`).
+    KitTagMismatch,
     /// A log whose genesis isn't the kit's (§R9.5 restore step 2).
     GenesisMismatch,
     /// The key provider has no key by that id.
@@ -61,13 +64,14 @@ impl Error {
             Error::KitSigMissing => "kit_sig_missing",
             Error::KitSigUnexpected => "kit_sig_unexpected",
             Error::BadKey => "bad_key",
+            Error::WeakKey => "weak_key",
             Error::WrongAlg => "wrong_alg",
             Error::HighS => "high_s",
             Error::BadSignature => "bad_signature",
             Error::ZeroSharedSecret => "zero_shared_secret",
             Error::OpenFailed => "open_failed",
             Error::BackupInvalid => "backup_invalid",
-            Error::KitDamaged => "kit_damaged",
+            Error::KitTagMismatch => "kit_tag_mismatch",
             Error::GenesisMismatch => "genesis_mismatch",
             Error::UnknownKey => "unknown_key",
             Error::Provider(_) => "provider_error",

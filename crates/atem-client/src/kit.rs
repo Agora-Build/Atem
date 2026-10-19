@@ -38,7 +38,7 @@ impl RecoveryKit {
     ) -> Result<Self> {
         let kit = Self::make(r, account_id, genesis_hash);
         if !ct_eq(&kit.kit_tag, kit_tag) {
-            return Err(Error::KitDamaged);
+            return Err(Error::KitTagMismatch);
         }
         Ok(kit)
     }

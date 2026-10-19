@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use atem_client::backup::{BackupKey, KBackupEnvelope};
+use atem_client::canonical::StrictValue;
 use atem_client::canonical::{self, Numbers, jcs};
 use atem_client::domain::{SignLabel, SigningInput};
 use atem_client::encoding::{Hash32, b64u, b64u_decode, enc, hex, u64_field};
@@ -21,6 +22,11 @@ use atem_client::{Error, KeyId, KeyProvider, SignedObject, SoftwareKeys};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+/// A strictly parsed copy of `value` (what a host or client gets from the wire).
+fn strict(value: &Value) -> StrictValue {
+    StrictValue::parse(value.to_string().as_bytes(), usize::MAX).unwrap()
+}
 
 const TASK2: &str = "Task 2 (membership-log verifier: chain and action rules)";
 const TASK3: &str = "Task 3 (atem-ch1 transcript, key schedule, framing)";
@@ -317,6 +323,8 @@ fn keys() {
         ("K-gen-3/", "K-gen-3"),
         ("K-evil/", "K-evil"),
         ("recovery-2/R", "recovery-kit-2"),
+        ("recovery/R", "recovery kit R"),
+        ("not-recovery/", "not the recovery key"),
     ]
     .into_iter()
     .collect();
@@ -352,7 +360,11 @@ fn keys() {
             match labels.get(format!("{name}/R").as_str()) {
                 Some(label) => {
                     assert_eq!(test_key(label), s(entry, "R_hex"));
-                    run.pass(format!("{name}: R from its test label"));
+                    assert!(
+                        s(entry, "note").contains(&format!("\"{label}\"")),
+                        "{name}: the label is published in its note"
+                    );
+                    run.pass(format!("{name}: R from its published test label"));
                 }
                 None => run.pending(
                     format!("{name}: R from its test label"),
@@ -390,6 +402,11 @@ fn keys() {
             match labels.get(id.as_str()) {
                 Some(label) => {
                     assert_eq!(test_key(label), secret, "{id} label {label}");
+                    if let Some(note) = entry.get("note").and_then(Value::as_str)
+                        && note.contains("label")
+                    {
+                        assert!(note.contains(&format!("\"{label}\"")), "{id}: {note}");
+                    }
                     run.pass(format!("{id}: secret from label {label:?}"));
                 }
                 None => run.pending(
@@ -467,7 +484,7 @@ fn membership_log() {
         if label == "K7_current_no_kit_sig" {
             assert_eq!(s(vector, "reason"), "kit_sig_missing");
             assert_eq!(
-                SignedObject::from_value(&vector["entry"]),
+                SignedObject::from_strict(&strict(&vector["entry"])),
                 Err(Error::KitSigMissing)
             );
             assert_eq!(Error::KitSigMissing.code(), "kit_sig_missing");
@@ -484,8 +501,8 @@ fn membership_log() {
             run.pass(format!("{label}: jcs, signing input, entry_hash"));
             continue;
         }
-        let object =
-            SignedObject::from_value(&vector["entry"]).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let object = SignedObject::from_strict(&strict(&vector["entry"]))
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
         assert_eq!(object.body_type(), "atem-membership-entry");
         if let Some(expected) = vector.get("jcs") {
             assert_eq!(object.jcs(), expected.as_str().unwrap(), "{label} jcs");
@@ -623,7 +640,7 @@ fn check_backup(
     other_kit: &RecoveryKit,
     book: &Book,
 ) -> KBackupEnvelope {
-    let envelope = KBackupEnvelope::from_value(&vector["wire"]).unwrap();
+    let envelope = KBackupEnvelope::from_strict(&strict(&vector["wire"])).unwrap();
     assert_eq!(envelope.to_json(), vector["wire"], "{name} round trip");
     assert_eq!(
         envelope.backup_hash().to_hex(),
@@ -763,17 +780,17 @@ fn recovery() {
         // A kit altered without recomputing its tag is "damaged".
         assert_eq!(
             RecoveryKit::read(r, "acct-test-2", genesis, &tag).err(),
-            Some(Error::KitDamaged)
+            Some(Error::KitTagMismatch)
         );
         assert_eq!(
             RecoveryKit::read(r, account, Hash32([0u8; 32]), &tag).err(),
-            Some(Error::KitDamaged)
+            Some(Error::KitTagMismatch)
         );
         let mut flipped = tag;
         flipped[15] ^= 1;
         assert_eq!(
             RecoveryKit::read(r, account, genesis, &flipped).err(),
-            Some(Error::KitDamaged)
+            Some(Error::KitTagMismatch)
         );
         run.pass(format!(
             "{name}: tag input, tag key, kit_tag; altered kits refused"
@@ -848,7 +865,7 @@ fn recovery() {
 
     // The recovery entry (R7).
     let vector = run.get("recovery_entry");
-    let object = SignedObject::from_value(&vector["entry"]).unwrap();
+    let object = SignedObject::from_strict(&strict(&vector["entry"])).unwrap();
     assert_eq!(object.jcs(), s(&vector, "jcs"));
     assert_eq!(
         hex(object.signing_input().as_bytes()),
@@ -875,7 +892,7 @@ fn recovery() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert_eq!(labels, ["SUB1", "SUB2", "SUB3"]);
-    let sub1 = SignedObject::from_value(&entry("SUB1")["entry"]).unwrap();
+    let sub1 = SignedObject::from_strict(&strict(&entry("SUB1")["entry"])).unwrap();
     let sub_genesis = sub1.entry_hash().unwrap();
     assert_eq!(sub_genesis.to_hex(), s(&sub, "genesis_hash"));
     assert_eq!(
@@ -1070,7 +1087,7 @@ fn browser_grant() {
     let mut run = Run::new("r9-vectors-browser-grant");
     let book = Book::load();
     let grant = run.get("grant");
-    let object = SignedObject::from_value(&grant).unwrap();
+    let object = SignedObject::from_strict(&strict(&grant)).unwrap();
     assert_eq!(object.label(), SignLabel::BrowserGrant);
     assert_eq!(
         hex(object.signing_input().as_bytes()),
@@ -1114,7 +1131,7 @@ fn browser_grant() {
 
     for case in run.get("invalid").as_array().unwrap() {
         let name = s(case, "case");
-        let object = SignedObject::from_value(&case["grant"]).unwrap();
+        let object = SignedObject::from_strict(&strict(&case["grant"])).unwrap();
         let signer = s(object.body(), "issuer").to_owned();
         object.verify(&book.signer_public(&signer)).unwrap();
         run.pass(format!(
@@ -1135,7 +1152,7 @@ fn push_hint() {
     let secrets = run.get("recipient_secrets");
 
     let check_open = |run: &mut Run, name: String, hint: &Value, details: &Value| {
-        let object = SignedObject::from_value(hint).unwrap();
+        let object = SignedObject::from_strict(&strict(hint)).unwrap();
         assert_eq!(object.label(), SignLabel::PushHint);
         assert_eq!(
             hex(object.signing_input().as_bytes()),
@@ -1222,12 +1239,12 @@ fn push_hint() {
         run.pending(format!("{name}: {}", s(&details, "note")), TASK4);
     }
 
-    let resolved = SignedObject::from_value(&run.get("resolved")).unwrap();
+    let resolved = SignedObject::from_strict(&strict(&run.get("resolved"))).unwrap();
     resolved.verify(&host_key).unwrap();
     assert!(resolved.sealed().is_none());
     run.pass("resolved: host signature");
 
-    let seen = SignedObject::from_value(&run.get("seen")).unwrap();
+    let seen = SignedObject::from_strict(&strict(&run.get("seen"))).unwrap();
     assert_eq!(seen.label(), SignLabel::Seen);
     assert_eq!(
         hex(seen.signing_input().as_bytes()),
@@ -1236,9 +1253,9 @@ fn push_hint() {
     seen.verify(&host_key).unwrap();
     run.pass("seen: signing input, host signature");
     let other = run.get("seen_other_process_gen");
-    let other_object = SignedObject::from_value(&serde_json::json!({
+    let other_object = SignedObject::from_strict(&strict(&serde_json::json!({
         "body": other["body"].clone(), "sig": other["sig"].clone()
-    }))
+    })))
     .unwrap();
     assert_eq!(
         hex(other_object.signing_input().as_bytes()),
@@ -1252,7 +1269,7 @@ fn push_hint() {
     );
 
     for (i, case) in run.get("invalid").as_array().unwrap().iter().enumerate() {
-        let object = SignedObject::from_value(&case["hint"]).unwrap();
+        let object = SignedObject::from_strict(&strict(&case["hint"])).unwrap();
         object.verify(&host_key).unwrap();
         run.pass(format!("invalid[{i}]: well-formed and host-signed"));
         run.pending(format!("invalid[{i}]: {}", s(case, "reason")), TASK4);
