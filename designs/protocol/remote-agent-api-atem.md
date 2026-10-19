@@ -1,6 +1,6 @@
 # Remote agent API without the Mac: Atem's response
 
-Status: Atem response r2, 2026-10-19 (r2: the user's final trust design replaces attestations, the freshness window and `resolve_fork`), to Astation's "Remote agent API without
+Status: Atem response r2, 2026-10-19 (r2: the user's final trust design replaces attestations, the freshness window and `resolve_fork` with a connection-carried suffix and a Recovery Kit reset), to Astation's "Remote agent API without
 the Mac" draft (2026-10-18, after Astation #56). Baseline: Atem `main` at
 `0801a4f`, contract [atem-session v1 r8](atem-session-v1.md) (authoritative),
 Atem's §9 proposal [account-trust.md](../account-trust.md). **Today** means in
@@ -17,7 +17,7 @@ through the Mac; approvals are push-based and need `control`, not the lease
 
 | Decision | Atem recommends |
 |---|---|
-| 1. Freshness and forks | Signed hash chain (`seq`, `prev_hash`, signed by a manager at `seq-1`); Atem keeps a durable head, refuses rollback and non-chaining entries; every connection carries the suffix from Atem's head, applied (removals fenced at once) before admission; no attestations, heartbeats, window or clock rules; a valid conflicting branch freezes remote access until the host is re-paired (user decision, 2026-10-19) |
+| 1. Freshness and forks | Signed hash chain (`seq`, `prev_hash`, signed by a manager at `seq-1`); Atem keeps a durable head, refuses rollback and non-chaining entries; every connection carries the suffix from Atem's head, applied (removals fenced at once) before admission; no attestations, heartbeats, window or clock rules; trust the signature, not the sender; a conflicting entry signed by a still-valid manager freezes remote access (one by a removed key is ignored); a Recovery Kit `trust_reset`, through any connection or `atem trust recover`, resolves a freeze, a compromised manager or hidden revocations; re-pairing is the last resort (user decision, 2026-10-19) |
 | 2. Identities | Three principal kinds, all from the log or a log member: `native` (member device), `service` (member with role `service`, scope, mandatory expiry), `browser` (≤ 1 h QR grant from a native member); r9 with `hello` inside the channel carrying the proof |
 | 3. Formats and channel | RFC 8785 JSON bodies signed over `enc(domain, jcs)`; `alg` ∈ {`p256`, `ed25519`} pinned per key in the log; one SIGMA-I suite: X25519 ephemerals, both long-term keys sign the transcript, HKDF-SHA256, ChaCha20-Poly1305, strict counters, no rekey, no resumption |
 | 4. Client core | Atem owns `crates/atem-client`: sans-I/O Rust (log verifier, channel both roles, r9 client machines, fixture runner), UniFFI for Swift/Kotlin, wasm-bindgen for browsers and JS bots; the Atem host links the same verifier and channel |
@@ -45,49 +45,68 @@ Astation, `service`/`browser` admission, a secure channel, r9.
 ## 3. Decision 1: freshness and forks
 
 User decision, 2026-10-19, final. It replaces r1's any-manager attestation,
-24 h freshness window and `resolve_fork` entry.
+24 h freshness window and `resolve_fork` entry. Principle: **trust the
+signature, not the sender.**
+
+1. Any device can carry revocation records (and any other entries),
+   including a revoked Astation or device, or one Atem doesn't know.
+2. Only authorized managers sign device additions and removals; only the
+   Recovery Kit signs a `trust_reset`.
+3. Atem verifies signatures, device identities and the hash chain before
+   applying anything.
+4. A forged device id causes no removal and grants no access: every effect
+   needs a valid signature chaining from Atem's head.
+5. No periodic renewals: entries propagate through normal connections.
 
 **Threat model.** The relay is fully adversarial (withholds, reorders,
 replays, shows different parties different views). Any member key may be
 stolen, including keys of devices already removed. Goals: Atem never acts on
 an older list than one it accepted; a removal Atem has seen is final and takes
-effect at once; a fork, once any evidence reaches Atem, stops remote access.
+effect at once; equivocation by a current manager, once any evidence reaches
+Atem, stops remote access until a Recovery Kit reset.
 
 **Keys.** Each native member has one `auth` key in the log (Secure Enclave
 P-256 / platform keystore). A manager's key requires biometrics (Face ID /
 Touch ID) on the device; that is key policy on the device, not protocol, and
-Atem can't observe it. There is no second "routine" key, no recovery key and
-no manager authority expiry.
+Atem can't observe it. There is no second "routine" key and no manager
+authority expiry. The account also has a **Recovery Kit**: a mandatory
+offline Ed25519 key created at account setup and saved by the user (password
+manager, a printed QR plus phrase, or another device). Its public key is in
+the genesis entry, so Atem pins it with `genesis_hash` at pairing. It is
+never a member and never connects; it only signs `trust_reset`.
 
 **Log.** A signed hash chain: entry `seq` names `prev_hash`, the hash of entry
-`seq-1`, and is signed by a device whose roles include `manage` at `seq-1`.
-Only managers sign entries; any member (or the relay, or Atem's own link) can
-carry them, since the signatures decide.
+`seq-1`, and is signed by a device whose roles include `manage` at `seq-1`
+(or, for `trust_reset`, by the Recovery Kit). Anyone can carry entries; the
+signatures decide.
 
 **Head** (`membership.json`, 0600, atomic, `flock`, beside `pairing.json`):
-`{account_id, genesis_hash, host_trust_gen, head:{seq, hash}, entries:[…],
-fork?:{evidence}}`. `entries` is Atem's copy of the log it applied (small:
-≤ 4 KiB per entry, a handful of devices), kept to judge a conflicting branch.
-The head moves only forward, one valid chaining entry at a time. A lower `seq`
-is refused (rollback); an entry that doesn't chain from the head is never
-applied.
+`{account_id, genesis_hash, host_trust_gen, recovery_key, head:{seq, hash},
+entries:[…], evidence:[…], frozen?:{evidence}}`. `entries` is Atem's copy of
+the log it applied (small: ≤ 4 KiB per entry, a handful of devices), kept to
+judge a conflicting branch. **Atem's durable chain is authoritative up to its
+head.** The head moves only forward, one valid chaining entry at a time. A
+lower `seq` is refused (rollback); an entry that doesn't chain from the head
+is never applied.
 
 **Propagation through normal connections.** Atem's challenge on every
 connection carries its head `(seq, hash)` (in `channel_accept`, §5). The
-client's `hello` carries `membership:{head, entries}`:
+client's `hello` carries `membership:{head, entries}`; Atem judges the entries
+before it judges the sender, so a valid suffix applies even when the
+connection is then refused (a removed or unknown device):
 
 - Its log contains Atem's head: `entries` is its suffix from Atem's head to
   its own head (empty when equal). Atem verifies each entry (chain, signer a
   manager at `seq-1`, `alg` pin, account and genesis), makes the new head and
   entries durable (fsync), applies every effect, and only then admits the
-  device against the new head.
+  device against the new head. An invalid entry is refused
+  (`membership_invalid`) and changes nothing. Beyond the head, the first valid suffix
+  applied wins; a later conflicting one is judged by the conflict rule below.
 - Its log is behind Atem's head and agrees with Atem's copy: no entries; Atem
   admits it on Atem's head. `welcome.head` shows it is behind; it fetches the
   rest from the relay.
-- Its log doesn't contain Atem's head: it sends its whole log from genesis.
-  An invalid branch (bad signature, signer not a manager at `seq-1` in that
-  branch, broken chain) is refused (`membership_invalid`) and changes nothing.
-  A valid one is a fork (below).
+- Its log doesn't contain Atem's head: it sends its whole log from genesis
+  and Atem applies the conflict rule.
 
 On an open channel the client may send `membership{entries}` whenever it
 learns newer entries; Atem applies them the same way. Atem may also fetch the
@@ -102,24 +121,59 @@ scope narrowing apply the same way. A crash after the fsync replays the fences
 at start, before any remote admission. There are no revocation
 acknowledgements: a removal is final once in Atem's head.
 
-**Fork.** Two valid entries at one `seq`, or a valid suffix that doesn't
-chain from Atem's head while signed by managers valid in its own branch,
-freezes remote access for the account: the evidence is persisted in `fork`
-(fsync first), every remote principal is fenced (`control_revoked` per r8
-§H, attachments closed) and every remote `hello` gets
-`error{code:"account_frozen"}`. Local use is unaffected. No entry lifts it;
-resolution is re-pairing the host (`atem unpair` + `atem pair`: a new genesis
-and `host_trust_gen`, `account-trust.md` §3.6). The relay's transactional
-append makes honest races practically impossible; forks are expected only
-from an attacking relay or a stolen manager key.
+**Conflict rule.** A conflicting entry is one at `seq` ≤ Atem's head whose
+hash differs from Atem's entry at that `seq` (the first divergence of a
+branch; later entries of the branch don't matter). Its signer is judged
+against Atem's own chain:
 
-**Residual risk.** A revocation reaches a host when any honest device next
-connects to it (or Atem fetches it). Until then a stolen *unlocked* manager
-can act: add devices, connect, control. If the relay keeps honest devices
-away from the host, re-pairing the host is the fallback. A stolen manager
-key, even one already removed, can sign a branch from before its removal and
-so freeze remote access (denial of service, never admission); re-pairing
-resolves that too.
+- Bad signature, or signer not a manager at `seq-1` in Atem's chain, or
+  removed (or stripped of `manage`) anywhere later in Atem's chain up to its
+  head: **ignored** and logged in `evidence` (bounded); nothing freezes. A
+  stolen key of an already-removed manager therefore can't deny service.
+- Signer a manager at `seq-1` in Atem's chain and still a manager at Atem's
+  head: **fork**. That is real evidence a current manager key is
+  compromised. Remote access for the account freezes: the evidence is
+  persisted in `frozen` (fsync first), every remote principal is fenced
+  (`control_revoked` per r8 §H, attachments closed) and every remote `hello`
+  gets `error{code:"account_frozen"}`. Local use is unaffected.
+
+Managers can never resolve a fork or a reset: while frozen, Atem applies only
+a `trust_reset`. The relay's transactional append makes honest races
+practically impossible; forks are expected only from a stolen manager key.
+
+**Recovery Kit reset.** A `trust_reset` entry, signed by the pinned recovery
+key, starts a new chain segment from one head:
+
+```json
+{"type":"atem-membership-entry","account_id":"…","seq":43,"prev_hash":"<head 42>",
+ "action":"trust_reset","members":[{"device_id":"dev-mac","roles":["manage","view","control"]},
+ {"device_id":"dev-iphone","roles":["view","control"]}],"recovery_key?":{"alg":"ed25519","pub":"…"},
+ "signed_at":1792400000000}
+```
+
+- It names the surviving managers and devices with their roles; every member
+  not named (a compromised manager included) is removed, with the fences
+  above. `recovery_key` is present only when the kit itself is replaced.
+- It must chain from Atem's head like any entry, so it can't be replayed at
+  another head. While frozen it lifts the freeze; the conflicting branch's
+  hashes stay in `evidence` and are refused forever.
+- **Applied through any connection** (a device holding the kit signs a reset
+  for the head in that host's challenge; hosts at different heads each get
+  their own), **or locally at the host**: `atem trust recover` shows Atem's
+  head and members, the user scans the QR or types the phrase and picks the
+  survivors, and Atem signs and applies the reset itself. A hostile relay
+  can't block the local path. The relay log takes a reset as its new head; a
+  host already on that chain gets it like any entry.
+
+**Residual risks, in the user's words:** a compromised manager signing key,
+or a relay hiding revocations. A revocation reaches a host when any honest
+device next connects to it; until then a stolen *unlocked* manager can act
+(add devices, connect, control). The Recovery Kit reset is the remedy for
+both: through any connection, or locally with `atem trust recover`.
+Re-pairing the host (`atem unpair` + `atem pair`, a new genesis and
+`host_trust_gen`) stays as the last resort, e.g. when the kit is lost. The
+Recovery Kit is the account's root: whoever holds it can reset trust, so it
+stays offline.
 
 ## 4. Decision 2: identities
 
@@ -252,7 +306,7 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
   `KeyProvider` trait for in-process use: Secure Enclave, Android Keystore,
   WebCrypto non-extractable keys, or a software file for bots.
 - **Contents.** Membership verifier (chain, alg pins, suffix application,
-  fork evidence), entry/grant/push-hint builders and verifiers, channel
+  conflict rule, `trust_reset`), entry/grant/push-hint builders and verifiers, channel
   (both roles), r9 client machines moved from `session_protocol/client.rs`
   (lease with 5 s renew/15 s expiry, receipts and `receipt_query` recovery,
   registry `seq`, chat history/coverage ordering, approvals), and the fixture
@@ -282,22 +336,22 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
 | Postgres log + Valkey fanout | **Agree**; neither is a trust anchor; Atem treats both as untrusted |
 | Independent principals for Astation's API callers | **Question:** r8 §H keeps Astation's local API callers inside Astation's principal; a bot must be its own `service` member, never a call through the Mac's local API (that would forward through the Mac) |
 | Browser companion | **Agree** it follows a code-integrity review; default grant ops `view` only |
-| Recovery after losing all managers | **Agree**: new genesis by local unpair/pair per host; account recovery never restores old host authority |
-| Tests matrix | **Agree**; add: rollback (lower `seq`) refused, a removed manager's later entry refused, an invalid non-chaining branch refused without freezing, a valid one freezing, a removal carried on an open channel fencing at once, a crash between the head fsync and the fences, a client behind Atem's head admitted on Atem's head, a host whose key agent is locked still serving remote clients |
+| Recovery after losing all managers | **Change:** a Recovery Kit `trust_reset` names new managers (§3); without the kit, a new genesis by local unpair/pair per host; account login recovery never restores host authority |
+| Tests matrix | **Agree**; add: rollback (lower `seq`) refused, a removed manager's later entry refused, a conflicting entry by a removed manager ignored (no freeze), one by a still-valid manager freezing, a later conflicting suffix beyond the old head, `trust_reset` lifting a freeze over a connection and via `atem trust recover`, a reset at another head refused, a suffix from a removed device applied and the device refused, a removal carried on an open channel fencing at once, a crash between the head fsync and the fences, a client behind Atem's head admitted on Atem's head, a host whose key agent is locked still serving remote clients |
 
 ## 8. Risks and contradictions
 
-1. **Residual revocation delay (accepted).** A removal reaches a host when any
-   honest device next connects to it. A stolen *unlocked* manager can act
-   until then; if the relay keeps honest devices away, re-pairing the host is
-   the fallback (§3).
-2. **Freeze by an old key.** A stolen manager key, even after its removal, can
-   sign a branch from before the removal and freeze remote access. It never
-   gains admission; re-pairing resolves it.
-3. **Biometric manager key on every channel.** One `auth` key per device means
-   a manager signs each channel handshake with its biometric key. Whether one
-   Face ID / Touch ID covers a short reuse window is Astation's key policy;
-   Atem only sees signatures.
+1. **Residual risks (accepted), in the user's words:** a compromised manager
+   signing key, or a relay hiding revocations. A removal reaches a host when
+   any honest device next connects; a stolen *unlocked* manager can act until
+   then. The Recovery Kit reset is the remedy for both, locally if the relay
+   is hostile (§3); re-pairing is the last resort.
+2. **The Recovery Kit is the root.** Whoever holds it can reset trust; it
+   must stay offline, and losing it leaves only re-pairing.
+3. **Biometric manager key on every channel: question for Astation.** One
+   `auth` key per device means a manager signs each channel handshake with
+   its biometric key. That is Astation's UX call: one Face ID / Touch ID per
+   session, or a short reuse window? Atem only sees signatures.
 4. **Locked key agent.** Using `device_sign` as the host key would make remote
    access depend on the Mac unlocking the key agent after every Atem restart —
    a hidden "Mac required". Hence `host_channel_key` (§5).
@@ -316,10 +370,10 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
 
 | # | Work | Owner | Size |
 |---|---|---|---|
-| 1 | Shared signature fixtures first (signing inputs, entry hashes, push hints with `created_at`/`expires_at`), then the r9 contract appendix: log, suffix carriage, fork, principals, scope, channel `atem-ch1`, errors (`account_frozen`, `membership_invalid`), plus fixtures and cross-language vectors (handshake transcripts, records) | Atem drafts, Astation reviews | 1.5–2 weeks |
+| 1 | Shared signature fixtures first (signing inputs, entry hashes, `trust_reset`, push hints with `created_at`/`expires_at`), then the r9 contract appendix: log, suffix carriage, conflict rule, Recovery Kit reset, principals, scope, channel `atem-ch1`, errors (`account_frozen`, `membership_invalid`), plus fixtures and cross-language vectors (handshake transcripts, records) | Atem drafts, Astation reviews | 1.5–2 weeks |
 | 2 | `atem-client`: verifier, channel, machines moved from `session_protocol/client.rs`, fixture runner, UniFFI + wasm bindings, packaging | Atem | 3 weeks |
-| 3 | Atem host: ceremony change (`host_channel_key`, genesis pin), `membership.json`, suffix application and fences, channel responder on link/relay/:8080, r9 admission, principals/scope, fences, sealed push hints, harness | Atem | 3 weeks |
-| 4 | Relay `/api/remote/v1` (log store, enrollment, channel routing, ordered events) and native Astation (biometric manager key, add device/service, Settings removal, the suffix on every connection), then the Mac-off matrix | Astation | 4–6 weeks (Astation's estimate to confirm) |
+| 3 | Atem host: ceremony change (`host_channel_key`, genesis pin), `membership.json`, suffix application and fences, conflict rule, `atem trust recover`, channel responder on link/relay/:8080, r9 admission, principals/scope, fences, sealed push hints, harness | Atem | 3 weeks |
+| 4 | Relay `/api/remote/v1` (log store, enrollment, channel routing, ordered events) and native Astation (biometric manager key, Recovery Kit at account setup and its reset, add device/service, Settings removal, the suffix on every connection), then the Mac-off matrix | Astation | 4–6 weeks (Astation's estimate to confirm) |
 | 5 | Mobile and bot clients on `atem-client`, notifications; browser companion after its review | Astation | after 4 |
 
 Steps 2 and 4's relay part can overlap once step 1's vectors are pinned.
