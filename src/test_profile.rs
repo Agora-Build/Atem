@@ -124,13 +124,9 @@ mod tests {
             profile.is_err(),
             "config_dir resolved without an injected profile"
         );
-        assert!(std::panic::catch_unwind(crate::credentials::CredentialStore::path).is_err());
+        assert!(std::panic::catch_unwind(crate::paths::ProfilePaths::default_paths).is_err());
         assert!(std::panic::catch_unwind(crate::status::Sources::current).is_err());
-        assert!(std::panic::catch_unwind(crate::auth::SessionManager::sessions_path).is_err());
-        assert!(
-            std::panic::catch_unwind(crate::memory::verification::CredPaths::default_paths)
-                .is_err()
-        );
+        assert!(std::panic::catch_unwind(crate::paths::CredPaths::default_paths).is_err());
         assert!(std::panic::catch_unwind(crate::rtc_test_server::servers_dir).is_err());
         assert!(std::panic::catch_unwind(crate::memory::cred_agent::default_agent).is_err());
         assert!(std::panic::catch_unwind(crate::memory::cred_agent::running_agent).is_err());
@@ -140,10 +136,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _scope = use_dir(temp.path());
         assert_eq!(crate::config::AtemConfig::config_dir(), temp.path());
-        assert_eq!(
-            crate::credentials::CredentialStore::path(),
-            temp.path().join("credentials.enc")
-        );
+        assert_eq!(crate::paths::ProfilePaths::default_paths().dir, temp.path());
     }
 
     #[test]

@@ -5,7 +5,8 @@
 use crate::app::App;
 use crate::memory::cred_agent::{CredAgentApi, test_agent};
 use crate::memory::statements::{AccountState, DeviceVerified, FakeAstation, SignedWire};
-use crate::memory::verification::{CredPaths, transcript_for};
+use crate::memory::verification::transcript_for;
+use crate::paths::CredPaths;
 use crate::runtime::broker::{InProcess, Launcher};
 use crate::runtime::client::RuntimeClient;
 use crate::runtime::ops::{BUSY, OpEnv};
@@ -66,21 +67,19 @@ fn echo_agent(dir: &Path) -> PathBuf {
 /// A pairing with `ASTATION` (binding and saved session), not verified.
 fn paired(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("pairing.json"),
-        json!({"version":1,"host_trust_gen":3,"binding_id":"binding-1",
-               "astation_id":ASTATION,"created_at":1})
-        .to_string(),
-    )
-    .unwrap();
-    let mut sessions = crate::auth::SessionManager::default();
-    sessions.insert_session(crate::auth::AuthSession::new(
-        "session-1".into(),
-        "token-1".into(),
-        ASTATION.into(),
-        "test-machine".into(),
-    ));
-    sessions.save_to(&dir.join("sessions.json")).unwrap();
+    crate::pairing::tests::write_bound(dir, ASTATION, 3, "binding-1", ("session-1", "token-1"));
+}
+
+/// The shared tokens of the profile at `dir`, when fresh.
+fn fresh_shared(dir: &Path) -> Option<crate::credentials::Tokens> {
+    crate::sso_auth::fresh_shared(&crate::paths::ProfilePaths::in_dir(dir).pairing, ASTATION)
+}
+
+/// The pairing record of the profile at `dir`.
+fn record(dir: &Path) -> crate::pairing::PairingRecord {
+    crate::pairing::PairingRecord::load(&crate::paths::ProfilePaths::in_dir(dir).pairing)
+        .unwrap()
+        .unwrap()
 }
 
 /// The Astation end of a link.
@@ -379,12 +378,11 @@ impl Runtime {
             crate::test_profile::use_agent(agent.clone()),
         );
         let mut app = App::new();
-        // Never the user's sessions.json, never a real Astation.
+        // Never the user's profile, never a real Astation.
         app.last_session_refresh = Some(Instant::now());
         app.astation_reconnect = false;
         app.astation_client =
-            AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"))
-                .with_agent(agent.clone());
+            AstationClient::new_with_test_state(ATEM_ID, &profile).with_agent(agent.clone());
         if let Some(url) = peer_url {
             app.astation_client.connect_raw(url).await.unwrap();
             app.astation_client.pin_astation_for_test(ASTATION);
@@ -940,7 +938,7 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
         peer.send(&AstationMessage::CredentialSync {
             access_token: "access".into(),
             refresh_token: "refresh".into(),
-            expires_at: crate::credentials::CredentialEntry::now_secs() + 3600,
+            expires_at: crate::credentials::now_secs() + 3600,
             login_id: Some("me".into()),
             astation_id: ASTATION.into(),
             save_credentials: true,
@@ -965,12 +963,10 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
         );
 
         let src = crate::status::Sources::in_dir(&rt.profile);
-        let binding = crate::pairing_binding::load(&src).unwrap().binding.unwrap();
+        let binding = crate::pairing::load(&src).unwrap().binding.unwrap();
         assert_eq!(binding.astation_id, ASTATION);
-        assert!(crate::runtime::ops::paired_fresh(
-            &src.credentials,
-            ASTATION
-        ));
+        assert!(fresh_shared(&rt.profile).is_some());
+        assert!(record(&rt.profile).save_credentials);
         assert!(verified_as(&rt.keys(), "acct-new"));
         // The pairing connection is the runtime's link: it attaches.
         let welcome = peer.hello().await;
@@ -986,22 +982,15 @@ fn the_token_op_saves_the_credentials_astation_sends() {
         let dir = Rc::new(short_dir());
         let profile = dir.path().join("profile");
         paired(&profile);
-        let creds = profile.join("credentials.enc");
-        let mut store = crate::credentials::CredentialStore::load_from(&creds);
-        store.upsert(crate::credentials::CredentialEntry::new_paired(
-            "old".into(),
-            "old-refresh".into(),
-            crate::credentials::CredentialEntry::now_secs() + 10,
-            None,
-            ASTATION.into(),
-            true,
-            1,
-        ));
-        store.save_to(&creds).unwrap();
+        let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        crate::pairing::PairingRecord::update(&pairing, ASTATION, |record| {
+            record.shared.as_mut().unwrap().tokens.expires_at = crate::credentials::now_secs() + 10;
+        })
+        .unwrap();
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&profile);
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
-        assert!(!crate::runtime::ops::paired_fresh(&creds, ASTATION));
+        assert!(fresh_shared(&profile).is_none());
         let options = OpOptions {
             astation_id: Some(ASTATION.into()),
             ..OpOptions::default()
@@ -1011,18 +1000,13 @@ fn the_token_op_saves_the_credentials_astation_sends() {
         peer.send(&AstationMessage::CredentialSync {
             access_token: "fresh".into(),
             refresh_token: "fresh-refresh".into(),
-            expires_at: crate::credentials::CredentialEntry::now_secs() + 3600,
+            expires_at: crate::credentials::now_secs() + 3600,
             login_id: None,
             astation_id: ASTATION.into(),
             save_credentials: true,
         });
         op.done().await.unwrap();
-        assert!(crate::runtime::ops::paired_fresh(&creds, ASTATION));
-        let mut store = crate::credentials::CredentialStore::load_from(&creds);
-        assert_eq!(
-            store.find_paired_mut(ASTATION).unwrap().access_token,
-            "fresh"
-        );
+        assert_eq!(fresh_shared(&profile).unwrap().access_token, "fresh");
         // Fresh already: answered without waiting.
         let options = OpOptions {
             astation_id: Some(ASTATION.into()),
@@ -1057,8 +1041,7 @@ fn unpair_then_reload_drops_the_link_and_its_attachment() {
         .await;
         assert!(!peer.drain(Duration::from_millis(300)).await);
         // `atem unpair` commits a new trust generation, then reloads.
-        crate::pairing_binding::commit_unpair(&crate::status::Sources::in_dir(&rt.profile))
-            .unwrap();
+        crate::pairing::unpair(&crate::status::Sources::in_dir(&rt.profile)).unwrap();
         client.send(&ClientMsg::Reload).await.unwrap();
         expect(&mut client, |m| {
             matches!(m, RuntimeMsg::Notice { ref text } if text == "Reloaded").then_some(())
@@ -1264,8 +1247,8 @@ fn the_link_leaves_a_migration_to_the_operation_running_one() {
         let profile = dir.path().join("profile");
         let (device, _relay) = migrating_device(&profile).await;
         let (url, _peer) = Peer::listen().await;
-        let mut link = AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"))
-            .with_agent(device.agent.clone());
+        let mut link =
+            AstationClient::new_with_test_state(ATEM_ID, &profile).with_agent(device.agent.clone());
         link.connect_raw(&url).await.unwrap();
         link.pin_astation_for_test(ASTATION);
         // An operation (or another finish) is running one.
@@ -1305,33 +1288,28 @@ fn credentials_astation_sends_go_to_the_links_profile() {
         let mut app = App::new();
         app.last_session_refresh = Some(Instant::now());
         app.astation_reconnect = false;
-        app.astation_client =
-            AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"));
+        app.astation_client = AstationClient::new_with_test_state(ATEM_ID, &profile);
         app.astation_client.connect_raw(&url).await.unwrap();
         app.astation_client.pin_astation_for_test(ASTATION);
         app.astation_connected = true;
         app.handle_astation_message(AstationMessage::CredentialSync {
             access_token: "synced".into(),
             refresh_token: "r".into(),
-            expires_at: crate::credentials::CredentialEntry::now_secs() + 3600,
+            expires_at: crate::credentials::now_secs() + 3600,
             login_id: None,
             astation_id: ASTATION.into(),
             save_credentials: false,
         })
         .await;
-        let creds = profile.join("credentials.enc");
-        assert!(crate::runtime::ops::paired_fresh(&creds, ASTATION));
+        assert_eq!(fresh_shared(&profile).unwrap().access_token, "synced");
+        assert!(!record(&profile).save_credentials);
         app.on_astation_disconnect();
-        let mut store = crate::credentials::CredentialStore::load_from(&creds);
+        assert!(record(&profile).disconnected_at.is_some());
         assert!(
-            store
-                .find_paired_mut(ASTATION)
-                .unwrap()
-                .disconnected_at
-                .is_some()
-        );
-        assert!(
-            !elsewhere.join("credentials.enc").exists(),
+            !crate::paths::ProfilePaths::in_dir(&elsewhere)
+                .pairing
+                .record
+                .exists(),
             "only the link's profile"
         );
     });

@@ -1762,7 +1762,7 @@ use crate::memory::account_keys::{AccountKeys, CryptOp, CryptOut, SignedModes};
 use crate::memory::crypto::EncryptionMode;
 ```
 
-and change `use crate::memory::verification::CredPaths;` to `use crate::memory::verification::{CredPaths, stored_state};`.
+and change `use crate::paths::CredPaths;` to `use crate::memory::verification::{CredPaths, stored_state};`.
 
 2. In `enum Request`, add after the `OpenGrant { .. }` variant:
 
@@ -3238,7 +3238,7 @@ use std::sync::Arc;
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::model::{content_hash, skill_hash, Memory, Skill};
-use crate::memory::verification::CredPaths;
+use crate::paths::CredPaths;
 ```
 
 2. Delete the items `struct StoredMode`, `struct StoredKey`, `struct StoredKeys` (with `impl StoredKeys`), `fn store_version`, `fn key_store_path` (old lines 57–139). Keep `set_mode_600`, `unique_temp`, `is_stale_temp`, `sweep_stale_temps`, the `FAILING_WRITES` test hook, `write_private`, `valid_kid`.
@@ -3869,14 +3869,14 @@ use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 
 ```rust
     #[cfg(test)]
-    encryption_with: Option<(crate::memory::verification::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
+    encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 ```
 
 in `new`, `encryption_store: None,` → `encryption_with: None,`; replace `with_encryption_store` and `encryption` with:
 
 ```rust
     #[cfg(test)]
-    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
+    pub(crate) fn with_encryption(mut self, paths: crate::paths::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
     }
@@ -4022,14 +4022,14 @@ and the skill chunk loop's body up to `let response: BatchResponse = ...` with:
 
 ```rust
     #[cfg(test)]
-    encryption_with: Option<(crate::memory::verification::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
+    encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 ```
 
 `new`: `encryption_store: None,` → `encryption_with: None,`. Replace `with_encryption_store` and `encryption` with:
 
 ```rust
     #[cfg(test)]
-    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
+    pub(crate) fn with_encryption(mut self, paths: crate::paths::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
     }
@@ -4204,7 +4204,7 @@ use crate::memory::account_keys::CryptOp;
 use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 use crate::memory::fake_astation::UnlockedDevice;
 use crate::memory::cred_agent::{CredAgent, CredAgentApi, Reply, Request, error_of, test_agent};
-use crate::memory::verification::CredPaths;
+use crate::paths::CredPaths;
 use std::sync::atomic::{AtomicUsize, Ordering};
 ```
 
@@ -4486,7 +4486,7 @@ use crate::memory::legacy_keys::write_for_test;
 use crate::memory::project_names::ProjectNames;
 use crate::memory::statements::FakeAstation;
 use crate::memory::device_keys::DeviceKeys;
-use crate::memory::verification::CredPaths;
+use crate::paths::CredPaths;
 
 const OLD: &str = "11112222";
 

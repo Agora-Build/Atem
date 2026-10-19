@@ -19,7 +19,8 @@ use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, UnlockGrantWire, check_storage_ack, check_unlock_grant,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::{CredPaths, key_needed};
+use crate::memory::verification::key_needed;
+use crate::paths::CredPaths;
 use crate::runtime::protocol::PrintLevel;
 use crate::websocket_client::{AstationClient, AstationMessage};
 
@@ -724,7 +725,7 @@ pub async fn handle_cred(command: crate::cli::CredCommands) -> Result<()> {
 /// The home Astation `atem cred unlock` unlocks with: never pairs or
 /// verifies, so an unverified device stops here, offline.
 pub(crate) fn unlock_home(src: &crate::status::Sources) -> Result<String> {
-    let trust = TrustStore::load_from(&src.keys.trust)?;
+    let trust = TrustStore::load_from(&src.paths.cred.trust)?;
     match (trust.home(), trust.recorded_home()) {
         (Some(home), _) => Ok(home.to_string()),
         (None, Some(stale)) => bail!(
@@ -1237,7 +1238,7 @@ mod tests {
             }
             self.inner.send(message).await?;
             if unpair {
-                crate::pairing_binding::commit_unpair(&self.src)?;
+                crate::pairing::unpair(&self.src)?;
             }
             Ok(())
         }
@@ -1256,9 +1257,9 @@ mod tests {
         dir: &std::path::Path,
         agent: Arc<dyn CredAgentApi>,
     ) -> (Arc<dyn CredAgentApi>, crate::status::Sources) {
-        let capture = crate::pairing_binding::tests::bound_profile(dir, ASTATION_ID);
+        let capture = crate::pairing::tests::bound_profile(dir, ASTATION_ID);
         let src = capture.sources().clone();
-        let agent = crate::pairing_binding::BoundAgent::new(capture, agent).unwrap();
+        let agent = crate::pairing::BoundAgent::new(capture, agent).unwrap();
         (Arc::new(agent), src)
     }
 
@@ -1275,7 +1276,7 @@ mod tests {
             confirms: 0,
         };
         let error = error_of(unlock_via(&mut link, &agent, &paths, ASTATION_ID, WAIT).await);
-        assert!(error.contains(crate::pairing_binding::CHANGED), "{error}");
+        assert!(error.contains(crate::pairing::CHANGED), "{error}");
         assert!(!inner.status().unwrap().unlocked, "the grant was dropped");
     }
 
@@ -1296,7 +1297,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains(crate::pairing_binding::CHANGED),
+            format!("{error:#}").contains(crate::pairing::CHANGED),
             "{error:#}"
         );
         // Not promoted, not confirmed: the rotation stays pending for the
@@ -1570,7 +1571,7 @@ mod tests {
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&paths.trust).unwrap()).unwrap();
         raw.as_object_mut().unwrap().remove("escrowed_storage_kid");
-        crate::memory::verification::write_test_file(&paths.trust, serde_json::to_vec(&raw).unwrap());
+        crate::paths::write_test_file(&paths.trust, serde_json::to_vec(&raw).unwrap());
         assert_eq!(
             TrustStore::load_from(&paths.trust).unwrap().escrowed_kid(),
             None
@@ -1805,7 +1806,7 @@ mod tests {
         std::fs::remove_file(&paths.unlock_auth_key).unwrap();
         let problem = key_file_problem(&paths, &trust).unwrap();
         assert!(problem.contains("unlock_auth_key"), "{problem}");
-        crate::memory::verification::write_test_file(&paths.device_keys_sealed, b"junk");
+        crate::paths::write_test_file(&paths.device_keys_sealed, b"junk");
         let problem = key_file_problem(&paths, &trust).unwrap();
         assert!(problem.contains("device_keys.sealed"), "{problem}");
         std::fs::remove_file(&paths.device_keys_sealed).unwrap();

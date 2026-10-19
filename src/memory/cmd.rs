@@ -118,7 +118,7 @@ fn build_ctx(allow_tracked: bool) -> Result<Ctx> {
     })
 }
 
-const NOT_CONFIGURED_MSG: &str = "No Astation configured — set astation_relay_code (or ASTATION_RELAY_CODE); changes stay queued.";
+const NOT_CONFIGURED_MSG: &str = "Not paired with an Astation — run `atem pair`; changes stay queued.";
 const NOT_PAIRED_MSG: &str = "Not paired with your Astation — run `atem pair`; changes stay queued.";
 
 /// `NOT_PAIRED_MSG`, or for a paired profile whose session expired or was
@@ -1065,15 +1065,14 @@ mod tests {
         let offline = SyncOutcome { offline: true, ..Default::default() };
         assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotConfigured), false), NOT_CONFIGURED_MSG);
         assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired), false), NOT_PAIRED_MSG);
-        // A paired profile (temp dir with a saved session) is told to unpair first.
+        // A paired profile (temp dir with a pairing) is told to unpair first.
         let dir = tempfile::tempdir().unwrap();
-        let mut sessions = crate::auth::SessionManager::default();
-        sessions.insert_session(crate::auth::AuthSession::new("s".into(), "t".into(), "a-1".into(), "h".into()));
-        sessions.save_to(&dir.path().join("sessions.json")).unwrap();
+        let paths = crate::paths::ProfilePaths::in_dir(dir.path());
+        crate::pairing::tests::paired_record("a-1").save(&paths.pairing).unwrap();
         let paired = crate::status::profile_paired(&crate::status::Sources::in_dir(dir.path()));
         assert_eq!(sync_status_line(&offline, Some(&PairingProblem::NotPaired), paired), not_paired_msg(true));
         assert_eq!(history_unpaired(paired).to_string(), crate::status::SESSION_GONE);
-        assert!(NOT_CONFIGURED_MSG.contains("astation_relay_code") && NOT_CONFIGURED_MSG.contains("stay queued"));
+        assert!(NOT_CONFIGURED_MSG.contains("atem pair") && NOT_CONFIGURED_MSG.contains("stay queued"));
         assert!(NOT_PAIRED_MSG.contains("atem pair") && NOT_PAIRED_MSG.contains("stay queued"));
         assert_eq!(
             not_paired_msg(true),

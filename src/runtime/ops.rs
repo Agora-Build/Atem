@@ -12,8 +12,8 @@
 use super::protocol::{AnswerValue, AskKind, OpKind, OpOptions, PrintLevel, RuntimeMsg};
 use crate::memory::cred_agent::{CredAgentApi, LOCKED, blocking, default_agent};
 use crate::memory::unlock::{AstationLink, shown};
-use crate::memory::verification::CredPaths;
 use crate::pair_verify::{CodeAnswer, VerifyFailure};
+use crate::paths::CredPaths;
 use crate::status::Sources;
 use crate::websocket_client::{AstationClient, AstationMessage};
 use anyhow::{Context, Result, anyhow, bail};
@@ -443,7 +443,7 @@ async fn pair_verify<U: OpUi>(
         &format!("Verifying this device with Astation {astation_id}..."),
     );
     let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.keys, env.agent()?, ui).await,
+        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await,
         |line| ui.print(PrintLevel::Warn, line),
     );
     settle_encryption(&mut view, ui).await;
@@ -488,12 +488,12 @@ pub(crate) async fn verify_device<U: OpUi>(
     let capture = client
         .capture()
         .cloned()
-        .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
+        .ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?;
     capture.bound_to(astation_id)?;
     // The device id is this atem's relay identity (`atem_id`): Astation checks it
     // equals the id the connection authenticated as.
     let device_id = client.device_atem_id();
-    let agent: Arc<dyn CredAgentApi> = Arc::new(crate::pairing_binding::BoundAgent::new(
+    let agent: Arc<dyn CredAgentApi> = Arc::new(crate::pairing::BoundAgent::new(
         capture.clone(),
         raw_agent.clone(),
     )?);
@@ -711,7 +711,7 @@ async fn pair<U: OpUi>(
     // if nothing changed meanwhile (another atem pair or atem unpair).
     let before = {
         let src = src.clone();
-        blocking(move || crate::pairing_binding::capture_for_pairing(&src)).await?
+        blocking(move || crate::pairing::capture(&src)).await?
     };
     let config = src.config.clone();
     ui.print(PrintLevel::Info, "Connecting to Astation...");
@@ -784,22 +784,23 @@ async fn pair<U: OpUi>(
     };
     // The new pairing's binding, in the next host trust generation; the
     // connection goes on under it.
-    let after = crate::pairing_binding::bind_new(&src, &before, &astation_id)?;
+    let after = crate::pairing::bind_new(&src, &before, &astation_id)?;
     active.adopt_binding(&before, &after)?;
+    let login = shared_login(
+        &src,
+        received.login_id.clone(),
+        received.access_token.clone(),
+        received.refresh_token.clone(),
+        received.expires_at,
+    );
     active.apply_bound(&astation_id, || {
         active.remember_relay_code(&astation_id);
-        let mut store = crate::credentials::CredentialStore::load_from(&src.credentials);
-        let now = crate::credentials::CredentialEntry::now_secs();
-        store.upsert(crate::credentials::CredentialEntry::new_paired(
-            received.access_token.clone(),
-            received.refresh_token.clone(),
-            received.expires_at,
-            received.login_id.clone(),
-            astation_id.clone(),
-            save_credentials,
-            now,
-        ));
-        store.save_to(&src.credentials)
+        crate::pairing::PairingRecord::receive_login(
+            &src.paths.pairing,
+            &astation_id,
+            login,
+            Some(save_credentials),
+        )
     })?;
     ui.print(
         PrintLevel::Info,
@@ -840,7 +841,7 @@ async fn pair<U: OpUi>(
     // A failed verification is shown, then makes the result a failure; the
     // pairing stays saved.
     let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.keys, env.agent()?, ui).await,
+        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await,
         |line| ui.print(PrintLevel::Warn, line),
     );
     settle_encryption(&mut view, ui).await;
@@ -905,7 +906,7 @@ async fn cred_unlock<U: OpUi>(
         already_unlocked, migration_pending, unlock_and_rotate, unlock_home,
     };
     let src = env.sources()?;
-    let paths = &src.keys;
+    let paths = &src.paths.cred;
     let home = unlock_home(&src)?;
     let agent = env.agent()?;
     let nothing_to_do = {
@@ -938,9 +939,8 @@ async fn cred_unlock<U: OpUi>(
     let capture = view
         .capture()
         .cloned()
-        .ok_or_else(|| anyhow!(crate::pairing_binding::NO_BINDING))?;
-    let agent: Arc<dyn CredAgentApi> =
-        Arc::new(crate::pairing_binding::BoundAgent::new(capture, agent)?);
+        .ok_or_else(|| anyhow!(crate::pairing::NO_BINDING))?;
+    let agent: Arc<dyn CredAgentApi> = Arc::new(crate::pairing::BoundAgent::new(capture, agent)?);
     {
         let mut link = UiLink {
             client: &mut view,
@@ -971,7 +971,7 @@ async fn cred_projects<U: OpUi>(
     env: &OpEnv,
 ) -> Result<()> {
     let src = env.sources()?;
-    let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust)?;
+    let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)?;
     let home = trust
         .home()
         .ok_or_else(|| anyhow!("Verify this device with Astation first"))?
@@ -991,16 +991,23 @@ async fn cred_projects<U: OpUi>(
 
 // ── The paired-token refresh ──
 
-/// The paired entry for `astation_id` has time left.
-pub(crate) fn paired_fresh(credentials: &std::path::Path, astation_id: &str) -> bool {
-    crate::credentials::CredentialStore::load_from(credentials)
-        .entries
-        .iter()
-        .any(|entry| {
-            entry.source == crate::credentials::CredentialSource::AstationPaired
-                && entry.astation_id.as_deref() == Some(astation_id)
-                && !entry.needs_refresh()
-        })
+/// The login Astation shares: issued by the configured Agora SSO.
+pub(crate) fn shared_login(
+    src: &Sources,
+    login_id: Option<String>,
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+) -> crate::credentials::Login {
+    crate::credentials::Login::from_sso(
+        src.config.effective_sso_url(),
+        login_id,
+        crate::credentials::Tokens {
+            access_token,
+            refresh_token,
+            expires_at,
+        },
+    )
 }
 
 /// Fresh paired credentials for `astation_id`: Astation sends a
@@ -1014,12 +1021,13 @@ async fn token<U: OpUi>(
 ) -> Result<()> {
     let astation_id = astation_id.ok_or_else(|| anyhow!("no Astation named for the token"))?;
     let src = env.sources()?;
-    if paired_fresh(&src.credentials, &astation_id) {
+    let fresh = || crate::sso_auth::fresh_shared(&src.paths.pairing, &astation_id).is_some();
+    if fresh() {
         return Ok(());
     }
     let mut view =
         link_routing(calls, env, &astation_id, "the paired Astation", false, true).await?;
-    if paired_fresh(&src.credentials, &astation_id) {
+    if fresh() {
         return Ok(());
     }
     // The link routes `credentialSync` here from now on.
@@ -1031,22 +1039,20 @@ async fn token<U: OpUi>(
                     access_token,
                     refresh_token,
                     expires_at,
+                    login_id,
                     astation_id: from,
                     ..
                 }) if from == astation_id => {
                     // Saved only under the pairing the link authenticated with.
+                    let login =
+                        shared_login(&src, login_id, access_token, refresh_token, expires_at);
                     view.apply_bound(&from, || {
-                        let mut store =
-                            crate::credentials::CredentialStore::load_from(&src.credentials);
-                        let Some(paired) = store.find_paired_mut(&from) else {
-                            bail!(
-                                "the pairing with Astation {from} was removed meanwhile; nothing was saved"
-                            );
-                        };
-                        paired.access_token = access_token;
-                        paired.refresh_token = refresh_token;
-                        paired.expires_at = expires_at;
-                        store.save_to(&src.credentials)
+                        crate::pairing::PairingRecord::receive_login(
+                            &src.paths.pairing,
+                            &from,
+                            login,
+                            None,
+                        )
                     })?;
                     return Ok(());
                 }

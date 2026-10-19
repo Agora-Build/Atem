@@ -134,35 +134,17 @@ async fn link(
 /// Writes `config` (an atem config dir) as paired with `ASTATION` in
 /// `trust_gen` and verified as `account` / `device`, with a saved session.
 pub fn write_verified_pairing(config: &Path, account: &str, device: &str, trust_gen: u64) {
-    std::fs::create_dir_all(config).unwrap();
-    std::fs::write(
-        config.join("pairing.json"),
-        json!({"version": 1, "host_trust_gen": trust_gen, "binding_id": "binding-1",
-               "astation_id": ASTATION, "created_at": 1})
-        .to_string(),
-    )
-    .unwrap();
+    super::profile::write_pairing(config, ASTATION, trust_gen);
     let entry = json!({
         "device_id": device, "data_account": account, "sign_gen": 1,
         "astation_sign_pub": "", "astation_enc_pub": "", "recovery_sign_pub": "",
         "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
         "safety_code": "", "epoch_floor": 0, "account_state": null, "account_epoch": 0,
     });
-    std::fs::create_dir_all(super::cred::dir(config)).unwrap();
+    std::fs::create_dir_all(super::profile::cred_dir(config)).unwrap();
     std::fs::write(
-        super::cred::state(config),
+        super::profile::cred_state(config),
         json!({"version": 1, "astations": {ASTATION: entry}}).to_string(),
-    )
-    .unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    std::fs::write(
-        config.join("sessions.json"),
-        json!({"sessions": {ASTATION: {"session_id": "session-1", "token": "token-1",
-               "astation_id": ASTATION, "hostname": "h", "last_activity": now}}})
-        .to_string(),
     )
     .unwrap();
 }

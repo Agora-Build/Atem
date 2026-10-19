@@ -296,8 +296,8 @@ pub(crate) struct DeviceVerifiedReply {
 /// pair`) is dropped and nothing is pinned. `agent` must not be a
 /// `BoundAgent` (the lock is already held).
 pub(crate) fn apply_device_verified(
-    capture: &crate::pairing_binding::Captured,
-    paths: &crate::memory::verification::CredPaths,
+    capture: &crate::pairing::Captured,
+    paths: &crate::paths::CredPaths,
     agent: &dyn crate::memory::cred_agent::CredAgentApi,
     astation_id: &str,
     keys: crate::memory::verification::VerificationKeys,
@@ -648,7 +648,7 @@ mod tests {
         let failure = code_failure(CodeAnswer::Refused).unwrap();
         let error = abandon_verification(
             &client,
-            &crate::memory::verification::CredPaths::in_dir(dir.path()).trust,
+            &crate::paths::CredPaths::in_dir(dir.path()).trust,
             "a",
             failure,
         )
@@ -675,7 +675,7 @@ mod tests {
         );
         let error = abandon_verification(
             &client,
-            &crate::memory::verification::CredPaths::in_dir(dir.path()).trust,
+            &crate::paths::CredPaths::in_dir(dir.path()).trust,
             "a",
             failure,
         )
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(failure.abort_reason(), None);
         let error = abandon_verification(
             &client,
-            &crate::memory::verification::CredPaths::in_dir(dir.path()).trust,
+            &crate::paths::CredPaths::in_dir(dir.path()).trust,
             "a",
             failure,
         )
@@ -770,12 +770,12 @@ mod tests {
         };
         for re_pair in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let capture = crate::pairing_binding::tests::bound_profile(dir.path(), "astation-1");
+            let capture = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
             let src = capture.sources().clone();
-            crate::pairing_binding::commit_unpair(&src).unwrap();
+            crate::pairing::unpair(&src).unwrap();
             if re_pair {
-                let before = crate::pairing_binding::capture(&src).unwrap();
-                crate::pairing_binding::bind_new(&src, &before, "astation-1").unwrap();
+                let before = crate::pairing::capture(&src).unwrap();
+                crate::pairing::bind_new(&src, &before, "astation-1").unwrap();
             }
             let before = crate::status::tests::snapshot(dir.path());
             let reply = DeviceVerifiedReply {
@@ -786,16 +786,16 @@ mod tests {
             let keys = crate::memory::device_keys::DeviceKeys::generate().into();
             let error = apply_device_verified(
                 &capture,
-                &src.keys,
+                &src.paths.cred,
                 &NeverCalled,
                 "astation-1",
                 keys,
                 &reply,
             )
             .unwrap_err();
-            assert_eq!(error.to_string(), crate::pairing_binding::CHANGED);
+            assert_eq!(error.to_string(), crate::pairing::CHANGED);
             assert_eq!(crate::status::tests::snapshot(dir.path()), before);
-            assert!(!src.keys.trust.exists());
+            assert!(!src.paths.cred.trust.exists());
         }
     }
 }

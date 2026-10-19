@@ -38,7 +38,7 @@ atem status                             # Account, pairing, verification, creden
 atem pair                               # Pair with Astation, then verify this device (shows the status when already paired)
 atem pair --save                        # Same, and keep credentials for offline use
 atem pair verify                        # Verify this device with the paired Astation (no re-pairing)
-atem unpair [--yes]                     # Remove all Astation pairings and saved sessions (asks first)
+atem unpair [--yes]                     # Remove the Astation pairing (asks first; your own login stays)
 ```
 
 `atem login` unlocks a limited set: project list, tokens for the active
@@ -56,8 +56,11 @@ never from piped input or keys typed earlier, so run `atem pair` in an
 interactive terminal. If verification fails, the pairing stays saved, Astation
 is told, and `atem pair` exits nonzero; run `atem pair verify` to retry. A connected or SSO-paired session alone does not
 mean the device is verified; check `atem status`. With `--save`
-the credentials keep working when Astation disconnects; without it they stop
-5 minutes after the disconnect (atem asks when `--save` isn't given).
+the login Astation shares keeps working when Astation disconnects; without it
+it stops 5 minutes after the disconnect (atem asks when `--save` isn't given).
+While it may be used, Agora API calls (`atem project list`) use it; otherwise
+they use your own `atem login`. One pairing at a time: `atem unpair` removes
+it and keeps your own login.
 
 Once paired, `atem pair` only prints the status (`Already paired. Verify this
 device: atem pair verify · Replace the pairing: atem unpair, then atem pair`):

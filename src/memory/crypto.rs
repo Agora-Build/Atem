@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::model::{content_hash, skill_hash, Memory, Skill};
-use crate::memory::verification::CredPaths;
+use crate::paths::CredPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -164,7 +164,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if FAILING_WRITES.with(|failing| failing.borrow().iter().any(|failing| failing == path)) {
         bail!("injected write failure for {}", path.display());
     }
-    if let Some(parent) = path.parent() { crate::memory::verification::create_private_dir(parent)?; }
+    if let Some(parent) = path.parent() { crate::paths::create_private_dir(parent)?; }
     sweep_stale_temps(path);
     let temp = unique_temp(path);
     let mut options = fs::OpenOptions::new();
@@ -604,7 +604,7 @@ pub async fn migrate_account_in(
     src: &crate::status::Sources,
     agent: Arc<dyn CredAgentApi>,
 ) -> Result<Option<&'static str>> {
-    let encryption = EncryptionContext::for_astation_with(astation_id, &src.keys, agent.clone())?;
+    let encryption = EncryptionContext::for_astation_with(astation_id, &src.paths.cred, agent.clone())?;
     let target = match encryption.mode {
         EncryptionMode::Enabling => "on",
         EncryptionMode::Disabling => "off",
@@ -627,14 +627,14 @@ pub async fn migrate_account_in(
         paired.session_id.clone(),
         paired.astation_id.clone(),
     )
-    .with_encryption(src.keys.clone(), agent.clone());
+    .with_encryption(src.paths.cred.clone(), agent.clone());
     let vault = crate::vault_client::VaultClient::new(
         paired.relay_base,
         client_id,
         paired.session_id,
         paired.astation_id,
     )
-    .with_encryption(src.keys.clone(), agent);
+    .with_encryption(src.paths.cred.clone(), agent);
     knowledge.migrate_encryption().await
         .map_err(|error| anyhow!(error.to_string()))?;
     vault.migrate_encryption().await?;

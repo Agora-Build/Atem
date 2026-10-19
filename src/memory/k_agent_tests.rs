@@ -20,7 +20,7 @@ use crate::memory::device_keys::DeviceKeys;
 use crate::memory::fake_astation::{FakeKeyServer, pin};
 use crate::memory::legacy_keys::{Damage, damage_for_test, write_for_test};
 use crate::memory::project_names::ProjectNames;
-use crate::memory::verification::CredPaths;
+use crate::paths::CredPaths;
 
 const A: &str = "0123abcd";
 const B: &str = "89abcdef";
@@ -793,7 +793,7 @@ fn only_verified_accounts_move() {
 fn an_unreadable_data_keys_enc_is_moved_aside_at_unlock() {
     let dir = tempfile::tempdir().unwrap();
     let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
-    crate::memory::verification::write_test_file(&paths.data_keys, b"from another machine");
+    crate::paths::write_test_file(&paths.data_keys, b"from another machine");
     let agent = test_agent(&paths);
     assert!(paths.data_keys.exists(), "a locked agent leaves it");
     unlock_with(&agent, &server, &paths).unwrap();
@@ -818,7 +818,7 @@ fn an_unverified_device_deletes_data_keys_enc_and_a_locked_one_keeps_it() {
     // An unreadable one is moved aside, even there.
     let dir = tempfile::tempdir().unwrap();
     let paths = CredPaths::in_dir(dir.path());
-    crate::memory::verification::write_test_file(&paths.data_keys, b"from another machine");
+    crate::paths::write_test_file(&paths.data_keys, b"from another machine");
     let _agent = test_agent(&paths);
     assert!(!paths.data_keys.exists());
     assert_eq!(moved_aside(&paths).len(), 1);
@@ -1073,7 +1073,7 @@ fn a_verified_device_with_a_corrupt_trust_state_keeps_data_keys_enc_at_start() {
     let before = std::fs::read(&paths.data_keys).unwrap();
     // cred/state.json can't be read: the agent can't tell the device is
     // verified, so it must not take it for an unverified one.
-    crate::memory::verification::write_test_file(&paths.trust, b"not json");
+    crate::paths::write_test_file(&paths.trust, b"not json");
     let _agent = test_agent(&paths);
     assert_eq!(std::fs::read(&paths.data_keys).unwrap(), before);
     assert!(moved_aside(&paths).is_empty());

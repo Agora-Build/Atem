@@ -22,7 +22,8 @@ use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, UnlockGrantWire, new_storage_key,
 };
 use crate::memory::trust::TrustStore;
-use crate::memory::verification::{AstationKeys, CredPaths};
+use crate::memory::verification::AstationKeys;
+use crate::paths::CredPaths;
 
 pub(crate) const ASTATION_ID: &str = "astation-1";
 pub(crate) const ACCOUNT: &str = "acct";

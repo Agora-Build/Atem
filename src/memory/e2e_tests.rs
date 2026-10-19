@@ -4,7 +4,7 @@ use crate::memory::account_keys::CryptOp;
 use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 use crate::memory::fake_astation::UnlockedDevice;
 use crate::memory::cred_agent::{CredAgent, CredAgentApi, Reply, Request, error_of, test_agent};
-use crate::memory::verification::CredPaths;
+use crate::paths::CredPaths;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::memory::model::{Memory, Scope, Skill, content_hash, skill_hash};
 use crate::memory::store::{PendingOp, Store};
@@ -566,7 +566,7 @@ fn a_copied_config_directory_yields_no_k() {
         .unwrap();
     let copy = tempfile::tempdir().unwrap();
     let paths = CredPaths::in_dir(copy.path());
-    crate::memory::verification::create_private_dir(&paths.dir).unwrap();
+    crate::paths::create_private_dir(&paths.dir).unwrap();
     for entry in std::fs::read_dir(&device.paths.dir).unwrap() {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_file() {

@@ -159,7 +159,7 @@ Attachments and identity:
   unknown field `rule`)`; at most 20 per 10 s per link.
 - `welcome`: `account_id` = the verified `data_account` from
   `cred/state.json`; `atem_device_id` = this device's verified `device_id`;
-  `host_trust_gen` = `pairing.json`'s generation (moves on every
+  `host_trust_gen` = the profile's `pairing/trust_gen` (moves on every
   `atem pair`/`atem unpair`); `runtime_gen` and `runtime_epoch` change when
   the broker restarts (the epoch is a durable counter) and when the host
   rebinds to a new identity (a pairing verified after the broker started).

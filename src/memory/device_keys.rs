@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn keys_are_distinct_and_survive_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).device_keys;
         assert!(DeviceKeys::load_from(&path).unwrap().is_none());
         let keys = DeviceKeys::generate();
         assert_ne!(keys.device_sign_pub(), keys.unlock_auth_pub());
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn unlock_auth_key_round_trips_as_its_own_0600_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).unlock_auth_key;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).unlock_auth_key;
         assert!(UnlockAuthKey::load_from(&path).unwrap().is_none());
         let keys = DeviceKeys::generate();
         keys.unlock_auth_key().save_to(&path).unwrap();

@@ -74,7 +74,7 @@ pub fn read(path: &Path) -> Result<Legacy> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Legacy::Missing),
         Err(error) => return Err(error.into()),
     };
-    let parsed = crate::credentials::decrypt_machine_bound(&raw)
+    let parsed = crate::machine_key::decrypt(&raw)
         .context("data_keys.enc cannot be decrypted on this machine")
         .and_then(|plain| {
             let plain = Zeroizing::new(plain);
@@ -170,7 +170,7 @@ impl LegacyKeys {
 
     fn save_to(&self, path: &Path) -> Result<()> {
         let plain = self.plaintext()?;
-        let encrypted = crate::credentials::encrypt_machine_bound(&plain)?;
+        let encrypted = crate::machine_key::encrypt(&plain)?;
         crate::memory::crypto::write_private(path, &encrypted)
     }
 }
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn a_written_store_reads_back_and_a_missing_one_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).data_keys;
         assert!(matches!(read(&path).unwrap(), Legacy::Missing));
         write_for_test(
             &path,
@@ -342,14 +342,14 @@ mod tests {
             summary_at(&path, "acct"),
             (Some("11112222".into()), vec!["0123abcd".into()], 1)
         );
-        crate::memory::verification::write_test_file(&path, b"not machine-bound");
+        crate::paths::write_test_file(&path, b"not machine-bound");
         assert!(matches!(read(&path).unwrap(), Legacy::Unreadable(_)));
     }
 
     #[test]
     fn purge_removes_only_this_astations_legacy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",
@@ -393,8 +393,8 @@ mod tests {
     #[test]
     fn purge_moves_an_unreadable_store_aside() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
-        crate::memory::verification::write_test_file(&path, b"not machine-bound");
+        let path = crate::paths::CredPaths::in_dir(dir.path()).data_keys;
+        crate::paths::write_test_file(&path, b"not machine-bound");
         purge_unverified_at(&path, "astation", "certified", &BTreeSet::new()).unwrap();
         assert!(!path.exists());
         let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn purge_keeps_accounts_another_verified_astation_names() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn the_plaintext_is_written_into_one_exact_allocation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).data_keys;
         for account in ["a", "b", "c", "d"] {
             write_for_test(
                 &path,
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn malformed_entries_are_reported_and_the_valid_keys_still_move() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn keys_and_names_are_read_for_the_given_accounts_only() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).data_keys;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).data_keys;
         write_for_test(
             &path,
             "astation",

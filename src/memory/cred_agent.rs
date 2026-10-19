@@ -25,7 +25,8 @@ use crate::memory::storage_key::{
     check_storage_ack, check_unlock_grant, new_storage_key, new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::{CredPaths, effective_state, newest_states};
+use crate::memory::verification::{effective_state, newest_states};
+use crate::paths::CredPaths;
 
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
 /// other version with an error, so an old agent and a newer CLI fail clearly.
@@ -2053,7 +2054,7 @@ mod tests {
     fn an_unreadable_plain_file_leaves_the_agent_locked() {
         let dir = tempfile::tempdir().unwrap();
         let paths = CredPaths::in_dir(dir.path());
-        crate::memory::verification::write_test_file(&paths.device_keys, b"not json");
+        crate::paths::write_test_file(&paths.device_keys, b"not json");
         let agent = agent(&paths);
         assert!(!agent.status().unwrap().unlocked);
         assert!(paths.device_keys.exists());
@@ -3115,8 +3116,8 @@ mod tests {
     fn a_missing_current_file_or_a_damaged_spare_does_not_stop_unlock_or_status() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
-        crate::memory::verification::write_test_file(&paths.device_keys_next, b"not json");
-        crate::memory::verification::write_test_file(&paths.device_keys_prev, b"not json");
+        crate::paths::write_test_file(&paths.device_keys_next, b"not json");
+        crate::paths::write_test_file(&paths.device_keys_prev, b"not json");
         let agent = agent(&paths);
         assert!(
             agent.begin_unlock(ASTATION_ID).is_ok(),
@@ -3147,7 +3148,7 @@ mod tests {
             .unwrap()
             .save_to(&paths.device_keys_next)
             .unwrap();
-        crate::memory::verification::write_test_file(&paths.device_keys_sealed, b"not json");
+        crate::paths::write_test_file(&paths.device_keys_sealed, b"not json");
         let agent = agent(&paths);
         let message = error_of(agent.begin_unlock(ASTATION_ID));
         assert!(message.contains("unreadable"), "{message}");

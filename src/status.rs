@@ -9,17 +9,19 @@
 //! verify` (only for an existing pairing, never after a revocation) and the
 //! `atem cred unlock` gate.
 use anyhow::{Result, anyhow};
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
-use crate::auth::SessionManager;
 use crate::config::AtemConfig;
-use crate::credentials::{CredentialEntry, CredentialSource, CredentialStore};
+use crate::credentials::Login;
 use crate::memory::cred_agent::AgentStatus;
 #[cfg(test)]
 use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::trust::TrustStore;
-use crate::memory::verification::CredPaths;
+use crate::pairing::PairingRecord;
+use crate::paths::CredPaths;
+use crate::paths::ProfilePaths;
 use crate::runtime::client::Look;
 
 /// `atem pair` on a profile that is already paired (after the status).
@@ -28,9 +30,6 @@ pub const ALREADY_PAIRED: &str = "Already paired. Verify this device: atem pair 
 pub const NOT_PAIRED: &str = "Not paired. Run atem pair first.";
 /// `atem cred unlock` on a device no Astation verified.
 pub const UNVERIFIED_UNLOCK: &str = "This device isn't verified. Run atem pair verify first.";
-/// `atem pair verify` when the saved pairing doesn't name its Astation.
-pub const NO_ASTATION_ID: &str =
-    "The saved pairing has no Astation id. Run `atem unpair`, then `atem pair`.";
 /// What to do when a paired profile can't authenticate: `atem pair` alone
 /// would only print the status.
 pub const SESSION_GONE: &str =
@@ -87,14 +86,10 @@ pub struct StatusReport {
 /// `in_dir` a profile directory (tests).
 #[derive(Debug, Clone)]
 pub struct Sources {
-    /// Connection settings (`pair` and `pair verify` connect with them;
-    /// `astation_relay_code` selects the Astation `require_pairing` uses).
+    /// Connection settings (`pair` and `pair verify` connect with them).
     pub config: AtemConfig,
-    pub credentials: PathBuf,
-    pub sessions: PathBuf,
-    /// `pairing.json`: the host trust generation and the pairing binding.
-    pub pairing: PathBuf,
-    pub keys: CredPaths,
+    /// Every file of the profile.
+    pub paths: ProfilePaths,
     /// Ask an already running cred agent whether the keys are unlocked
     /// (never starts one). Off in tests, so they never reach the user's agent.
     pub query_agent: bool,
@@ -104,126 +99,61 @@ pub struct Sources {
 }
 
 impl Sources {
-    /// This user's profile: `config.toml` with its env overrides, the
-    /// credential store, the saved sessions and the key files.
+    /// This user's profile: `config.toml` with its env overrides and the
+    /// profile's files.
     pub fn current() -> Result<Self> {
         Ok(Self {
             config: AtemConfig::load()?,
-            credentials: CredentialStore::path(),
-            sessions: SessionManager::sessions_path()?,
-            pairing: AtemConfig::config_dir().join("pairing.json"),
-            keys: CredPaths::default_paths(),
+            paths: ProfilePaths::default_paths(),
             query_agent: true,
             runtime: Some(crate::runtime::client::Locator::default_paths()),
         })
     }
 
-    /// The profile's directory (where `pairing.json` and `config.toml` are).
+    /// The profile's directory.
     pub fn config_dir(&self) -> PathBuf {
-        self.pairing
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default()
+        self.paths.dir.clone()
     }
 
     /// A profile directory: its `config.toml` (no env overrides), and every
     /// file in it. Never queries a cred agent.
     #[cfg(test)]
     pub fn in_dir(dir: &Path) -> Self {
-        let config = std::fs::read_to_string(dir.join("config.toml"))
+        let paths = ProfilePaths::in_dir(dir);
+        let config = std::fs::read_to_string(&paths.config)
             .ok()
             .and_then(|content| toml::from_str(&content).ok())
             .unwrap_or_default();
         Self {
             config,
-            credentials: dir.join("credentials.enc"),
-            sessions: dir.join("sessions.json"),
-            pairing: dir.join("pairing.json"),
-            keys: CredPaths::in_dir(dir),
+            paths,
             query_agent: false,
             runtime: None,
         }
     }
 }
 
-/// The Astation this profile is paired with: the one `require_pairing`
-/// resolves when it does, else the first paired one by id (`None`: a paired
-/// credential entry that doesn't name its Astation); `others` counts the
-/// other pairings; `session_expired` when its saved session expired.
+/// The Astation this profile is paired with; `session_expired` when its
+/// saved session expired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pairing {
-    pub astation_id: Option<String>,
-    pub others: usize,
+    pub astation_id: String,
     pub session_expired: bool,
 }
 
-/// The saved sessions, read without touching the file (no permission repair).
-fn saved_sessions(path: &Path) -> SessionManager {
-    std::fs::read(path)
-        .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn paired_entries(store: &CredentialStore) -> impl Iterator<Item = &CredentialEntry> {
-    store
-        .entries
-        .iter()
-        .filter(|entry| entry.source == CredentialSource::AstationPaired)
-}
-
-/// Whether this profile is paired: any paired credential entry or saved
-/// (valid) Astation session.
+/// The pairing, if this profile has one (an unreadable record reads as
+/// none here; `atem status` shows why).
 pub fn pairing(src: &Sources) -> Option<Pairing> {
-    let store = CredentialStore::load_from(&src.credentials);
-    let sessions = saved_sessions(&src.sessions);
-    let mut ids = BTreeSet::new();
-    let mut without_id = 0;
-    for entry in paired_entries(&store) {
-        match &entry.astation_id {
-            Some(id) => {
-                ids.insert(id.clone());
-            }
-            None => without_id += 1,
-        }
-    }
-    ids.extend(
-        sessions
-            .active_sessions()
-            .into_iter()
-            .map(|s| s.astation_id.clone()),
-    );
-    // What `require_pairing` resolves: the configured Astation with a session.
-    let resolved = src
-        .config
-        .astation_relay_code
-        .as_deref()
-        .filter(|id| sessions.get(id).is_some())
-        .map(str::to_string);
-    let astation_id = resolved.or_else(|| ids.iter().next().cloned());
-    if astation_id.is_none() && without_id == 0 {
-        return None;
-    }
-    if let Some(id) = &astation_id {
-        ids.insert(id.clone());
-    }
-    let session_expired = astation_id
-        .as_deref()
-        .is_some_and(|id| sessions.expired(id));
+    let record = PairingRecord::load(&src.paths.pairing).ok()??;
     Some(Pairing {
-        astation_id,
-        others: ids.len() + without_id - 1,
-        session_expired,
+        session_expired: record.session_expired(),
+        astation_id: record.astation_id,
     })
 }
 
-/// Whether this profile holds any pairing state `atem unpair` removes: a
-/// paired credential entry or a saved session, expired ones included.
+/// Whether this profile holds a pairing record `atem unpair` removes.
 pub fn profile_paired(src: &Sources) -> bool {
-    paired_entries(&CredentialStore::load_from(&src.credentials))
-        .next()
-        .is_some()
-        || !saved_sessions(&src.sessions).astation_ids().is_empty()
+    src.paths.pairing.record.exists()
 }
 
 /// `profile_paired` for this user's profile (production entry points only;
@@ -278,13 +208,25 @@ pub fn verification(keys: &CredPaths, astation_id: &str) -> Verification {
     }
 }
 
-fn account_line(store: &CredentialStore, now: u64) -> Line {
-    Line::new(if store.entries.is_empty() {
-        "signed out"
-    } else if store.entries.iter().any(|entry| entry.expires_at > now) {
-        "signed in"
-    } else {
-        "signed in (expired)"
+/// The Account line: the user's own login, else the login Astation shares.
+fn account_line(src: &Sources, now: u64) -> Line {
+    let expired = |login: &Login| {
+        if login.tokens.expires_at > now {
+            ""
+        } else {
+            " (expired)"
+        }
+    };
+    if let Some(login) = Login::load(&src.paths.login) {
+        return Line::new(format!("signed in{}", expired(&login)));
+    }
+    let shared = PairingRecord::load(&src.paths.pairing)
+        .ok()
+        .flatten()
+        .and_then(|record| record.shared);
+    Line::new(match shared {
+        Some(login) => format!("signed in through Astation{}", expired(&login)),
+        None => "signed out".into(),
     })
 }
 
@@ -336,39 +278,34 @@ fn credentials_line(
 /// The pairing and verification lines.
 fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
     let Some(pairing) = pairing else {
+        if let Err(error) = PairingRecord::load(&src.paths.pairing) {
+            return (Line::new(format!("unknown ({error:#})")), Line::new("—"));
+        }
         return (Line::new("not paired"), Line::new("—"));
     };
-    let more = match pairing.others {
-        0 => String::new(),
-        n => format!(" (+{n} more)"),
-    };
-    let Some(astation_id) = &pairing.astation_id else {
-        let line = format!("paired (no Astation id){more}");
-        return (Line::new(line), Line::new("—"));
-    };
+    let astation_id = &pairing.astation_id;
     let expired = if pairing.session_expired {
         ", session expired"
     } else {
         ""
     };
     let trust = trust_note(src, astation_id);
-    let verification = match verification(&src.keys, astation_id) {
+    let verification = match verification(&src.paths.cred, astation_id) {
         Verification::Verified { safety_code } => format!("verified (safety code {safety_code})"),
         Verification::NotVerified => "not verified".into(),
         Verification::Revoked { by } => format!("revoked by {by}"),
         Verification::Unknown(error) => format!("unknown ({error})"),
     };
     (
-        Line::new(format!("paired ({astation_id}{trust}{expired}){more}")),
+        Line::new(format!("paired ({astation_id}{trust}{expired})")),
         Line::new(verification),
     )
 }
 
 /// The Pairing line's trust generation: `, trust gen N` for the binding with
-/// `astation_id` (a pairing from before `pairing.json` shows the generation
-/// it migrates to; nothing is written). Read-only.
+/// `astation_id`. Read-only.
 fn trust_note(src: &Sources, astation_id: &str) -> String {
-    match crate::pairing_binding::load(src) {
+    match crate::pairing::load(src) {
         Ok(state) => match state.binding {
             Some(binding) if binding.astation_id == astation_id => {
                 format!(", trust gen {}", binding.host_trust_gen)
@@ -398,15 +335,14 @@ pub fn gather_full(
     agent: Option<&Result<AgentStatus, String>>,
     runtime: &Look,
 ) -> StatusReport {
-    let store = CredentialStore::load_from(&src.credentials);
     let paired = pairing(src);
     let (pairing_line, verification_line) = pairing_lines(src, paired.as_ref());
     let runtime_differs = matches!(runtime, Look::Running { welcome, .. }
         if welcome.build != crate::memory::cred_agent::build_id());
-    let (credentials, notes) = credentials_line(&src.keys, agent, runtime_differs);
+    let (credentials, notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
     let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
     StatusReport {
-        account: account_line(&store, CredentialEntry::now_secs()),
+        account: account_line(src, crate::credentials::now_secs()),
         pairing: pairing_line,
         verification: verification_line,
         credentials,
@@ -422,7 +358,7 @@ pub fn gather_full(
 /// (blocking: socket I/O).
 pub fn gather(src: &Sources) -> StatusReport {
     let agent = if src.query_agent {
-        crate::memory::cred_agent::look(&src.keys, crate::runtime::client::LOOK_TIMEOUT)
+        crate::memory::cred_agent::look(&src.paths.cred, crate::runtime::client::LOOK_TIMEOUT)
             .map(|found| found.map(|(status, _pid)| status))
     } else {
         None
@@ -615,8 +551,8 @@ pub enum VerifyStart {
 /// not already verified with the paired Astation.
 pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
     let pairing = pairing(src).ok_or_else(|| anyhow!(NOT_PAIRED))?;
-    let astation_id = pairing.astation_id.ok_or_else(|| anyhow!(NO_ASTATION_ID))?;
-    match verification(&src.keys, &astation_id) {
+    let astation_id = pairing.astation_id;
+    match verification(&src.paths.cred, &astation_id) {
         Verification::Verified { safety_code } => Ok(VerifyStart::AlreadyVerified(
             already_verified_message(&safety_code),
         )),
@@ -629,7 +565,6 @@ pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::auth::AuthSession;
     use crate::memory::cred_agent::{Reply, Request};
     use crate::memory::trust::AstationTrust;
 
@@ -703,49 +638,31 @@ pub(crate) mod tests {
         if let Some(id) = revoked {
             store["revoked"] = serde_json::json!({"astation_id": id, "at": 1_700_000_000u64});
         }
-        crate::memory::verification::write_test_file(
-            &crate::memory::verification::CredPaths::in_dir(dir).trust,
+        crate::paths::write_test_file(
+            &crate::paths::CredPaths::in_dir(dir).trust,
             store.to_string(),
         );
     }
 
+    /// Paired and bound with `astation_id` (generation 1); the login it
+    /// shares expires at `expires_at`.
     fn write_paired(dir: &Path, astation_id: &str, expires_at: u64) {
-        let mut store = CredentialStore::load_from(&dir.join("credentials.enc"));
-        store.upsert(CredentialEntry::new_paired(
-            "access".into(),
-            "refresh".into(),
-            expires_at,
-            Some("me".into()),
-            astation_id.into(),
-            true,
-            1,
-        ));
-        store.save_to(&dir.join("credentials.enc")).unwrap();
-    }
-
-    fn write_session(dir: &Path, astation_id: &str) {
-        let path = dir.join("sessions.json");
-        let mut sessions = saved_sessions(&path);
-        sessions.insert_session(AuthSession::new(
-            format!("session-{astation_id}"),
-            "token".into(),
-            astation_id.into(),
-            "host".into(),
-        ));
-        sessions.save_to(&path).unwrap();
+        crate::pairing::tests::bound_profile(dir, astation_id);
+        let paths = ProfilePaths::in_dir(dir).pairing;
+        PairingRecord::update(&paths, astation_id, |record| {
+            record.shared.as_mut().unwrap().tokens.expires_at = expires_at;
+        })
+        .unwrap();
     }
 
     /// A plain `device_keys` file: keys on disk that `key_file_problem`
     /// accepts (the agent seals it when it starts).
     fn write_device_keys(dir: &Path) {
-        crate::memory::verification::write_test_file(
-            &crate::memory::verification::CredPaths::in_dir(dir).device_keys,
-            b"{}",
-        );
+        crate::paths::write_test_file(&crate::paths::CredPaths::in_dir(dir).device_keys, b"{}");
     }
 
     fn later() -> u64 {
-        CredentialEntry::now_secs() + 3600
+        crate::credentials::now_secs() + 3600
     }
 
     fn report(dir: &Path) -> StatusReport {
@@ -796,7 +713,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
         let report = report(dir.path());
-        assert_eq!(report.account.value, "signed in");
+        assert_eq!(report.account.value, "signed in through Astation");
         assert_eq!(report.pairing.value, "paired (astation-1, trust gen 1)");
         assert_eq!(report.verification.value, "not verified");
         assert_eq!(report.credentials.value, "not set up");
@@ -845,41 +762,52 @@ pub(crate) mod tests {
     fn expired_credentials_still_count_as_signed_in() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, 1);
-        assert_eq!(report(dir.path()).account.value, "signed in (expired)");
+        assert_eq!(
+            report(dir.path()).account.value,
+            "signed in through Astation (expired)"
+        );
+        // The user's own login comes first.
+        let login = Login::from_sso(
+            "https://sso2.agora.io",
+            Some("me".into()),
+            crate::credentials::Tokens {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at: later(),
+            },
+        );
+        login.save(&ProfilePaths::in_dir(dir.path()).login).unwrap();
+        assert_eq!(report(dir.path()).account.value, "signed in");
     }
 
     #[test]
-    fn a_saved_session_alone_is_a_pairing_and_the_configured_one_wins() {
+    fn a_pairing_in_progress_is_a_pairing_without_a_binding() {
         let dir = tempfile::tempdir().unwrap();
-        write_session(dir.path(), "astation-0");
+        crate::pairing::tests::set_session(dir.path(), "astation-0", "s", "t");
         let src = Sources::in_dir(dir.path());
         assert_eq!(
             pairing(&src),
             Some(Pairing {
-                astation_id: Some("astation-0".into()),
-                others: 0,
-                session_expired: false,
-            })
-        );
-        write_paired(dir.path(), "astation-2", later());
-        write_session(dir.path(), "astation-2");
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "astation_relay_code = \"astation-2\"\n",
-        )
-        .unwrap();
-        let src = Sources::in_dir(dir.path());
-        assert_eq!(
-            pairing(&src),
-            Some(Pairing {
-                astation_id: Some("astation-2".into()),
-                others: 1,
+                astation_id: "astation-0".into(),
                 session_expired: false,
             })
         );
         assert_eq!(
             report(dir.path()).pairing.value,
-            "paired (astation-2, trust gen 1) (+1 more)"
+            "paired (astation-0, no pairing binding; run `atem unpair`, then `atem pair`)"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_pairing_is_shown_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ProfilePaths::in_dir(dir.path());
+        crate::paths::write_test_file(&paths.pairing.record, b"another machine's");
+        let pairing = report(dir.path()).pairing.value;
+        assert!(pairing.starts_with("unknown ("), "{pairing}");
+        assert!(
+            profile_paired(&Sources::in_dir(dir.path())),
+            "unpair removes it"
         );
     }
 
@@ -887,15 +815,11 @@ pub(crate) mod tests {
     fn gathering_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
-        write_session(dir.path(), ASTATION);
         write_trust(dir.path(), Some(ASTATION), None);
         let before = snapshot(dir.path());
         let text = text(&Sources::in_dir(dir.path()));
         assert_eq!(snapshot(dir.path()), before);
-        // A pairing from before pairing.json: its generation is computed,
-        // never recorded by status.
         assert!(text.contains("paired (astation-1, trust gen 1)"), "{text}");
-        assert!(!dir.path().join("pairing.json").exists());
     }
 
     #[test]
@@ -903,18 +827,17 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = Sources::in_dir(dir.path());
         // Paired, unpaired, paired again: generation 3.
-        let before = crate::pairing_binding::capture(&src).unwrap();
-        crate::pairing_binding::bind_new(&src, &before, ASTATION).unwrap();
-        crate::pairing_binding::commit_unpair(&src).unwrap();
-        let before = crate::pairing_binding::capture(&src).unwrap();
-        crate::pairing_binding::bind_new(&src, &before, ASTATION).unwrap();
-        write_paired(dir.path(), ASTATION, later());
+        let before = crate::pairing::capture(&src).unwrap();
+        crate::pairing::bind_new(&src, &before, ASTATION).unwrap();
+        crate::pairing::unpair(&src).unwrap();
+        let before = crate::pairing::capture(&src).unwrap();
+        crate::pairing::bind_new(&src, &before, ASTATION).unwrap();
         assert_eq!(
             report(dir.path()).pairing.value,
             "paired (astation-1, trust gen 3)"
         );
         // An unpair interrupted after its commit: the old binding is gone.
-        crate::pairing_binding::commit_unpair(&src).unwrap();
+        crate::pairing::tests::interrupted_unpair(dir.path());
         assert_eq!(
             report(dir.path()).pairing.value,
             "paired (astation-1, no pairing binding; run `atem unpair`, then `atem pair`)"
@@ -979,12 +902,11 @@ pub(crate) mod tests {
     fn an_expired_session_is_shown_and_advises_unpair_then_pair() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
-        let path = dir.path().join("sessions.json");
-        let mut session = AuthSession::new("s".into(), "t".into(), ASTATION.into(), "host".into());
-        session.last_activity = 0;
-        let mut sessions = SessionManager::default();
-        sessions.insert_session(session);
-        sessions.save_to(&path).unwrap();
+        let paths = ProfilePaths::in_dir(dir.path()).pairing;
+        PairingRecord::update(&paths, ASTATION, |record| {
+            record.session.as_mut().unwrap().last_activity = 0;
+        })
+        .unwrap();
         let src = Sources::in_dir(dir.path());
         assert_eq!(
             report(dir.path()).pairing.value,
@@ -1004,46 +926,9 @@ pub(crate) mod tests {
             crate::auth::pairing_gate_message_for("Vault", false),
             crate::auth::pairing_gate_message("Vault")
         );
-        // An expired session alone (no paired credentials) is no pairing,
-        // but still a profile to unpair first.
-        let alone = tempfile::tempdir().unwrap();
-        sessions
-            .save_to(&alone.path().join("sessions.json"))
-            .unwrap();
-        let alone = Sources::in_dir(alone.path());
-        assert_eq!(pairing(&alone), None);
-        assert!(profile_paired(&alone));
         assert!(!profile_paired(&Sources::in_dir(
             tempfile::tempdir().unwrap().path()
         )));
-    }
-
-    #[test]
-    fn a_pairing_without_an_astation_id_is_never_verified_against_unknown() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("credentials.enc");
-        let mut entry = CredentialEntry::new_paired(
-            "a".into(),
-            "r".into(),
-            later(),
-            None,
-            ASTATION.into(),
-            true,
-            1,
-        );
-        entry.astation_id = None;
-        CredentialStore {
-            entries: vec![entry],
-        }
-        .save_to(&path)
-        .unwrap();
-        let src = Sources::in_dir(dir.path());
-        assert_eq!(report(dir.path()).pairing.value, "paired (no Astation id)");
-        assert_eq!(report(dir.path()).verification.value, "—");
-        assert_eq!(
-            verify_start(&src).unwrap_err().to_string(),
-            "The saved pairing has no Astation id. Run `atem unpair`, then `atem pair`."
-        );
     }
 
     #[test]

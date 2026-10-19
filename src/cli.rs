@@ -912,14 +912,12 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Login => {
             let config = crate::config::AtemConfig::load()?;
             let session = crate::sso_auth::run_login_flow(config.effective_sso_url()).await?;
-            let mut store = crate::credentials::CredentialStore::load();
-            store.upsert(crate::credentials::CredentialEntry::new_sso(
-                session.access_token.clone(),
-                session.refresh_token.clone(),
-                session.expires_at,
+            crate::credentials::Login::from_sso(
+                config.effective_sso_url(),
                 session.login_id.clone(),
-            ));
-            store.save()?;
+                session.tokens(),
+            )
+            .save(&crate::paths::ProfilePaths::default_paths().login)?;
             match &session.login_id {
                 Some(id) => println!("Logged in. (SSO: {})", id),
                 None => println!("Logged in. (SSO)"),
@@ -927,9 +925,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Logout => {
-            let mut store = crate::credentials::CredentialStore::load();
-            store.remove_sso();
-            store.save()?;
+            crate::credentials::Login::remove(&crate::paths::ProfilePaths::default_paths().login)?;
             println!("Logged out.");
             reload_runtime().await;
             Ok(())
@@ -945,15 +941,17 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         Commands::Unpair { yes } => {
             let src = crate::status::Sources::current()?;
-            let count = pairings_to_remove(&src);
-            if count == 0 && !revocation_recorded(&src) {
-                println!("No paired sessions to remove.");
+            if !crate::status::profile_paired(&src) && !revocation_recorded(&src) {
+                println!("No pairing to remove.");
                 return Ok(());
             }
-            let plural = if count == 1 { "" } else { "s" };
+            let what = match crate::status::pairing(&src) {
+                Some(pairing) => format!("the pairing with Astation {}", pairing.astation_id),
+                None => "this profile's pairing".to_string(),
+            };
             if !confirm_destructive(
                 &format!(
-                    "Remove {count} Astation pairing{plural}? This machine loses vault, memory sync and `atem cred` until you run `atem pair` again."
+                    "Remove {what}? This machine loses vault, memory sync and `atem cred` until you run `atem pair` again."
                 ),
                 yes,
             )? {
@@ -968,7 +966,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 })
                 .await?
             };
-            println!("Unpaired ({count} session{plural} removed).");
+            println!("Unpaired.");
             for notice in notices {
                 println!("{notice}");
             }
@@ -1210,33 +1208,17 @@ fn prompt_yes_no(question: &str) -> bool {
     }
 }
 
-/// How many Astation pairings `atem unpair` removes: the distinct Astations
-/// of the paired credential entries and the saved sessions.
-fn pairings_to_remove(src: &crate::status::Sources) -> usize {
-    let store = crate::credentials::CredentialStore::load_from(&src.credentials);
-    let mut ids: std::collections::BTreeSet<String> = store
-        .entries
-        .iter()
-        .filter(|e| e.source == crate::credentials::CredentialSource::AstationPaired)
-        .map(|e| e.astation_id.clone().unwrap_or_default())
-        .collect();
-    if let Ok(sessions) = crate::auth::SessionManager::load_from(&src.sessions) {
-        ids.extend(sessions.astation_ids());
-    }
-    ids.len()
-}
-
 /// Whether an Astation revoked this device (`atem unpair` sets its keys aside).
 fn revocation_recorded(src: &crate::status::Sources) -> bool {
-    crate::memory::trust::TrustStore::load_from(&src.keys.trust)
+    crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)
         .is_ok_and(|trust| trust.revoked().is_some())
 }
 
 /// `atem unpair` after the confirmation: first durably commits the next host
-/// trust generation without a pairing binding (so work started under the old
-/// pairing can't apply anything, even if what follows is interrupted), then
-/// removes the paired credential entries and the saved Astation sessions (the
-/// login, memory, vault data, trust pins and keys stay), and, when an
+/// trust generation (so work started under the old pairing can't apply
+/// anything, even if what follows is interrupted), then removes the pairing
+/// record (the user's own login, memory, vault data, trust pins and keys
+/// stay: `pairing::unpair`), and, when an
 /// Astation revoked this device and `agent` (the running cred agent, if any)
 /// doesn't hold its keys unlocked, sets the revoked keys aside so the next
 /// `atem pair` verifies with new ones. Returns the notices to print: keys set
@@ -1246,28 +1228,15 @@ fn unpair_profile(
     src: &crate::status::Sources,
     agent: Option<&dyn crate::memory::cred_agent::CredAgentApi>,
 ) -> Result<Vec<String>> {
-    crate::pairing_binding::commit_unpair(src)?;
-    let mut store = crate::credentials::CredentialStore::load_from(&src.credentials);
-    let before = store.entries.len();
-    store
-        .entries
-        .retain(|e| e.source != crate::credentials::CredentialSource::AstationPaired);
-    if store.entries.len() != before {
-        store.save_to(&src.credentials)?;
-    }
-    if src.sessions.exists() {
-        let mut sessions = crate::auth::SessionManager::load_from(&src.sessions)?;
-        sessions.clear();
-        sessions.save_to(&src.sessions)?;
-    }
+    crate::pairing::unpair(src)?;
     // Unpaired from here on: what happens to revoked keys is only reported.
     let mut notices = Vec::new();
-    match crate::memory::verification::set_aside_revoked_keys(&src.keys, agent) {
+    match crate::memory::verification::set_aside_revoked_keys(&src.paths.cred, agent) {
         Ok(Some(notice)) => notices.push(notice),
         Ok(None) => {}
         Err(error) => notices.push(format!("Couldn't set the revoked keys aside: {error:#}")),
     }
-    if let Ok(trust) = crate::memory::trust::TrustStore::load_from(&src.keys.trust)
+    if let Ok(trust) = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)
         && let Some(revoked) = trust.revoked()
     {
         let why = if trust.recorded_home() != Some(revoked.astation_id.as_str()) {
@@ -2194,19 +2163,9 @@ mod tests {
         }
     }
 
+    /// Paired and bound with astation-1 (generation 1).
     fn paired_profile(dir: &std::path::Path) {
-        let path = dir.join("credentials.enc");
-        let mut store = crate::credentials::CredentialStore::load_from(&path);
-        store.upsert(crate::credentials::CredentialEntry::new_paired(
-            "access".into(),
-            "refresh".into(),
-            crate::credentials::CredentialEntry::now_secs() + 3600,
-            None,
-            "astation-1".into(),
-            true,
-            1,
-        ));
-        store.save_to(&path).unwrap();
+        crate::pairing::tests::bound_profile(dir, "astation-1");
     }
 
     /// cred/state.json: verified with astation-1, revoked by it when `revoked`.
@@ -2235,25 +2194,11 @@ mod tests {
         if revoked {
             store["revoked"] = serde_json::json!({"astation_id": "astation-1", "at": 1_700_000_000u64});
         }
-        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir).trust, store.to_string());
-        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir).device_keys_sealed, b"{}");
+        crate::paths::write_test_file(&crate::paths::CredPaths::in_dir(dir).trust, store.to_string());
+        crate::paths::write_test_file(&crate::paths::CredPaths::in_dir(dir).device_keys_sealed, b"{}");
     }
 
-    /// Every file under `dir` (recursively) with its contents.
-    fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                files.extend(self::tests::files(&path));
-            } else {
-                let contents = std::fs::read(&path).unwrap();
-                files.push((path, contents));
-            }
-        }
-        files.sort();
-        files
-    }
+    use crate::status::tests::snapshot as files;
 
     #[tokio::test]
     async fn pair_on_a_paired_profile_changes_nothing_and_never_connects() {
@@ -2332,35 +2277,25 @@ mod tests {
     }
 
     #[test]
-    fn unpair_removes_pairings_and_saved_sessions_but_keeps_the_login() {
+    fn unpair_removes_the_pairing_but_keeps_the_login() {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
-        let creds = dir.path().join("credentials.enc");
-        let mut store = crate::credentials::CredentialStore::load_from(&creds);
-        store.upsert(crate::credentials::CredentialEntry::new_sso(
-            "a".into(),
-            "r".into(),
-            crate::credentials::CredentialEntry::now_secs() + 3600,
-            Some("me".into()),
-        ));
-        store.save_to(&creds).unwrap();
-        let sessions = dir.path().join("sessions.json");
-        let mut manager = crate::auth::SessionManager::default();
-        manager.insert_session(crate::auth::AuthSession::new(
-            "s".into(),
-            "t".into(),
-            "astation-2".into(),
-            "host".into(),
-        ));
-        manager.save_to(&sessions).unwrap();
         let src = crate::status::Sources::in_dir(dir.path());
-        assert_eq!(pairings_to_remove(&src), 2);
+        let login = crate::credentials::Login::from_sso(
+            "https://sso2.agora.io",
+            Some("me".into()),
+            crate::credentials::Tokens {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at: crate::credentials::now_secs() + 3600,
+            },
+        );
+        login.save(&src.paths.login).unwrap();
+        assert!(crate::status::profile_paired(&src));
         assert!(unpair_profile(&src, None).unwrap().is_empty());
         assert_eq!(crate::status::pairing(&src), None);
-        assert_eq!(pairings_to_remove(&src), 0);
-        let store = crate::credentials::CredentialStore::load_from(&creds);
-        assert!(store.find_sso().is_some());
-        assert_eq!(store.entries.len(), 1);
+        assert!(!crate::status::profile_paired(&src));
+        assert_eq!(crate::credentials::Login::load(&src.paths.login), Some(login));
     }
 
     #[test]
@@ -2372,8 +2307,8 @@ mod tests {
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("old keys were moved aside"), "{notices:?}");
-        assert!(!crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_sealed.exists());
-        let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust).unwrap();
+        assert!(!crate::paths::CredPaths::in_dir(dir.path()).device_keys_sealed.exists());
+        let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust).unwrap();
         assert!(trust.revoked().is_none());
         assert!(trust.verified("astation-1").is_none());
     }
@@ -2384,7 +2319,7 @@ mod tests {
         paired_profile(dir.path());
         trust_file(dir.path(), false);
         let src = crate::status::Sources::in_dir(dir.path());
-        crate::memory::trust::TrustStore::update(&src.keys.trust, |trust| {
+        crate::memory::trust::TrustStore::update(&src.paths.cred.trust, |trust| {
             trust.record_revoked("astation-9", 1_700_000_000);
             Ok(())
         })
@@ -2392,7 +2327,7 @@ mod tests {
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("Astation astation-9's revocation of this device is still recorded"), "{notices:?}");
-        assert!(crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_sealed.exists());
+        assert!(crate::paths::CredPaths::in_dir(dir.path()).device_keys_sealed.exists());
         assert_eq!(crate::status::pairing(&src), None);
     }
 
@@ -2400,7 +2335,7 @@ mod tests {
     fn unpair_still_unpairs_when_the_keys_cant_be_set_aside() {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
-        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir.path()).trust, b"not json");
+        crate::paths::write_test_file(&crate::paths::CredPaths::in_dir(dir.path()).trust, b"not json");
         let src = crate::status::Sources::in_dir(dir.path());
         let notices = unpair_profile(&src, None).unwrap();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -2411,20 +2346,21 @@ mod tests {
     #[test]
     fn unpair_commits_the_next_generation_before_removing_anything() {
         let dir = tempfile::tempdir().unwrap();
-        let old = crate::pairing_binding::tests::bound_profile(dir.path(), "astation-1");
+        let old = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
         let src = crate::status::Sources::in_dir(dir.path());
-        // Removing the sessions fails (sessions.json is a directory): the
+        // Removing the record fails (a directory is in its place): the
         // unpair is interrupted after its commit.
-        std::fs::create_dir(&src.sessions).unwrap();
+        let record = &src.paths.pairing.record;
+        std::fs::remove_file(record).unwrap();
+        std::fs::create_dir_all(record.join("occupied")).unwrap();
         assert!(unpair_profile(&src, None).is_err());
-        let state = crate::pairing_binding::load(&src).unwrap();
-        assert_eq!(state.host_trust_gen, 2);
-        assert_eq!(state.binding, None);
+        let trust_gen = std::fs::read_to_string(&src.paths.pairing.trust_gen).unwrap();
+        assert_eq!(trust_gen.trim(), "2");
         assert!(old.check().is_err(), "the old binding is invalidated");
         // Retried: the next generation again, never a repeat.
-        std::fs::remove_dir(&src.sessions).unwrap();
+        std::fs::remove_dir_all(record).unwrap();
         unpair_profile(&src, None).unwrap();
-        assert_eq!(crate::pairing_binding::load(&src).unwrap().host_trust_gen, 3);
+        assert_eq!(crate::pairing::load(&src).unwrap().host_trust_gen, 3);
         assert_eq!(crate::status::pairing(&src), None);
     }
 
@@ -2434,17 +2370,17 @@ mod tests {
         paired_profile(dir.path());
         trust_file(dir.path(), false);
         std::fs::write(dir.path().join("knowledge.db"), b"memories").unwrap();
-        crate::memory::verification::write_test_file(&crate::memory::verification::CredPaths::in_dir(dir.path()).project_names, b"{}");
+        crate::paths::write_test_file(&crate::paths::CredPaths::in_dir(dir.path()).project_names, b"{}");
         let src = crate::status::Sources::in_dir(dir.path());
-        let cred = crate::memory::verification::CredPaths::in_dir(dir.path());
+        let cred = crate::paths::CredPaths::in_dir(dir.path());
         let kept = [cred.trust, cred.device_keys_sealed, dir.path().join("knowledge.db"), cred.project_names]
             .map(|path| { let contents = std::fs::read(&path).unwrap(); (path, contents) });
         assert!(unpair_profile(&src, None).unwrap().is_empty());
         for (path, contents) in kept {
             assert_eq!(std::fs::read(&path).unwrap(), contents, "{}", path.display());
         }
-        // The migrated pairing was generation 1.
-        assert_eq!(crate::pairing_binding::load(&src).unwrap().host_trust_gen, 2);
+        // The pairing was generation 1.
+        assert_eq!(crate::pairing::load(&src).unwrap().host_trust_gen, 2);
     }
 
     #[test]

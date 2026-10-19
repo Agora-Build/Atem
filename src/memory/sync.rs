@@ -1040,7 +1040,7 @@ mod tests {
     /// never the user's.
     fn client(base: &str, account: &str) -> KnowledgeClient {
         let nowhere = std::env::temp_dir().join(format!("atem-sync-{}", uuid::Uuid::new_v4()));
-        let paths = crate::memory::verification::CredPaths::in_dir(&nowhere);
+        let paths = crate::paths::CredPaths::in_dir(&nowhere);
         let agent = std::sync::Arc::new(crate::memory::cred_agent::test_agent(&paths));
         KnowledgeClient::new(base.to_string(), "inst".into(), "sess".into(), account.into())
             .with_encryption(paths, agent)

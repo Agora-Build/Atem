@@ -33,7 +33,7 @@ use crate::memory::cred_agent::{
     CredAgent, CredAgentApi, PROTOCOL_VERSION, Reply, Request, build_id,
 };
 use crate::memory::encoding::WipingBuf;
-use crate::memory::verification::CredPaths;
+use crate::paths::CredPaths;
 
 /// Bounds a misbehaving peer. A `Crypt` batch is kept under 2 MiB of input by
 /// `EncryptionContext`, and one skill (at most 1 MiB, base64 on the wire)
@@ -287,7 +287,7 @@ static HELD_LOCKS: Mutex<Vec<(PathBuf, std::fs::File)>> = Mutex::new(Vec::new())
 /// together can't both replace the socket. Waits briefly for a starting agent.
 fn lock_agent(socket: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let lock_path = crate::memory::verification::socket_lock(socket);
+    let lock_path = crate::paths::socket_lock(socket);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1802,8 +1802,8 @@ mod tests {
         let client = CredAgentClient::at(start_v1_agent(dir.path()));
         assert!(client.is_running());
         let profile = tempfile::tempdir().unwrap();
-        crate::memory::verification::write_test_file(
-            &crate::memory::verification::CredPaths::in_dir(profile.path()).device_keys_sealed,
+        crate::paths::write_test_file(
+            &crate::paths::CredPaths::in_dir(profile.path()).device_keys_sealed,
             b"{}",
         );
         let src = crate::status::Sources::in_dir(profile.path());
@@ -2075,7 +2075,7 @@ mod tests {
         let paths = CredPaths::in_dir(dir.path());
         let target = dir.path().join("target");
         std::fs::write(&target, b"keep").unwrap();
-        crate::memory::verification::create_private_dir(&paths.dir).unwrap();
+        crate::paths::create_private_dir(&paths.dir).unwrap();
         std::os::unix::fs::symlink(&target, &paths.agent_lock).unwrap();
         let error = lock_key_dir(&paths, Duration::ZERO).err().unwrap();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
@@ -2090,8 +2090,7 @@ mod tests {
         let socket = sock(&run);
         make_private(socket.parent().unwrap());
         std::fs::write(&target, b"keep").unwrap();
-        std::os::unix::fs::symlink(&target, crate::memory::verification::socket_lock(&socket))
-            .unwrap();
+        std::os::unix::fs::symlink(&target, crate::paths::socket_lock(&socket)).unwrap();
         let error = bind(&socket).err().unwrap();
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
@@ -2255,7 +2254,7 @@ mod tests {
         // now belongs to a live, unrelated process (here: this one).
         std::fs::create_dir_all(&config).unwrap();
         let pid = std::process::id();
-        crate::memory::verification::write_test_file(&paths.agent_lock, format!("{pid}\n"));
+        crate::paths::write_test_file(&paths.agent_lock, format!("{pid}\n"));
         let text = format!(
             "{:#}",
             idle_launch_client(&config, &dir.path().join("rb"))

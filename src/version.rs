@@ -101,7 +101,7 @@ pub fn text() -> String {
     use crate::runtime::client::{LOOK_TIMEOUT, Locator, look};
     let own = crate::memory::cred_agent::build_id();
     let runtime = look(&Locator::default_paths(), LOOK_TIMEOUT);
-    let paths = crate::memory::verification::CredPaths::default_paths();
+    let paths = crate::paths::CredPaths::default_paths();
     let agent = crate::memory::cred_agent::look(&paths, LOOK_TIMEOUT);
     render(own, &runtime, &agent)
 }

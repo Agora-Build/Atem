@@ -370,8 +370,8 @@ mod tests {
     #[test]
     fn file_round_trips_0600_and_promotes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_sealed;
-        let next = crate::memory::verification::CredPaths::in_dir(dir.path()).device_keys_next;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).device_keys_sealed;
+        let next = crate::paths::CredPaths::in_dir(dir.path()).device_keys_next;
         assert!(SealedDeviceKeys::load_from(&path).unwrap().is_none());
         let file = sealed(&DeviceKeys::generate(), &new_storage_key());
         file.save_to(&next).unwrap();

@@ -195,7 +195,7 @@ impl AtemConfig {
     /// `store_astation_relay_code` into the profile in `config_dir`.
     pub fn store_astation_relay_code_in(config_dir: &std::path::Path, astation_id: &str) {
         Self::write_config_value_at(
-            &config_dir.join("config.toml"),
+            &crate::paths::ProfilePaths::in_dir(config_dir).config,
             "astation_relay_code",
             toml::Value::String(astation_id.to_string()),
         );
@@ -272,7 +272,7 @@ impl AtemConfig {
 
     /// Get the config file path: ~/.config/atem/config.toml
     pub fn config_path() -> PathBuf {
-        Self::config_dir().join("config.toml")
+        crate::paths::ProfilePaths::default_paths().config
     }
 
     /// Display config with secrets masked
@@ -321,36 +321,34 @@ impl AtemConfig {
             self.atem_id.as_deref().unwrap_or("(not set)")
         ));
 
-        // SSO + paired credentials
-        let store = crate::credentials::CredentialStore::load();
-        if let Some(sso) = store.find_sso() {
-            let id = sso.login_id.as_deref().unwrap_or("-");
-            lines.push(format!("SSO:      logged in  ({})", id));
-        } else {
-            lines.push("SSO:      not logged in".to_string());
+        // The user's own login and the pairing
+        let paths = crate::paths::ProfilePaths::default_paths();
+        match crate::credentials::Login::load(&paths.login) {
+            Some(login) => lines.push(format!(
+                "Login:    {}  ({})",
+                login.subject.as_deref().unwrap_or("-"),
+                login.issuer
+            )),
+            None => lines.push("Login:    not logged in".to_string()),
         }
-        let paired: Vec<_> = store
-            .entries
-            .iter()
-            .filter(|e| e.source == crate::credentials::CredentialSource::AstationPaired)
-            .collect();
-        if paired.is_empty() {
-            lines.push("Paired:   none".to_string());
-        } else {
-            for p in paired {
-                let aid = p.astation_id.as_deref().unwrap_or("-");
-                let login = p.login_id.as_deref().unwrap_or("-");
-                let saved = if p.save_credentials { "yes" } else { "no" };
+        match crate::pairing::PairingRecord::load(&paths.pairing) {
+            Ok(Some(record)) => {
+                let shared = record
+                    .shared
+                    .as_ref()
+                    .and_then(|login| login.subject.as_deref())
+                    .unwrap_or("-");
+                let saved = if record.save_credentials { "yes" } else { "no" };
                 lines.push(format!(
-                    "Paired:   {}  (SSO: {})  [save: {}]",
-                    aid, login, saved
+                    "Paired:   {}  (login: {})  [save: {}]",
+                    record.astation_id, shared, saved
                 ));
-                let trust = crate::memory::trust::TrustStore::load_from(
-                    &crate::memory::trust::trust_path(),
-                )
-                .unwrap_or_default();
-                lines.push(format!("          {}", trust.verification_line(aid)));
+                let trust = crate::memory::trust::TrustStore::load_from(&paths.cred.trust)
+                    .unwrap_or_default();
+                lines.push(format!("          {}", trust.verification_line(&record.astation_id)));
             }
+            Ok(None) => lines.push("Paired:   none".to_string()),
+            Err(error) => lines.push(format!("Paired:   unknown ({error:#})")),
         }
 
         // Show current project info
@@ -515,7 +513,7 @@ impl ProjectCache {
         let Ok(raw) = fs::read(path) else {
             return Self::default();
         };
-        let Ok(plain) = crate::credentials::decrypt_machine_bound(&raw) else {
+        let Ok(plain) = crate::machine_key::decrypt(&raw) else {
             return Self::default();
         };
         serde_json::from_slice(&plain).unwrap_or_default()
@@ -530,7 +528,7 @@ impl ProjectCache {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec(self)?;
-        let ct = crate::credentials::encrypt_machine_bound(&json)?;
+        let ct = crate::machine_key::encrypt(&json)?;
         fs::write(path, ct)?;
         #[cfg(unix)]
         {
@@ -687,37 +685,6 @@ fn format_unix_timestamp_hhmm(secs: u64) -> String {
     }
     let day = remaining_days + 1;
     format!("{:04}-{:02}-{:02} {:02}:{:02} UTC", year, month, day, hours, minutes)
-}
-
-/// Persisted auth session at ~/.config/atem/session.json
-impl crate::auth::AuthSession {
-    /// Session file path: ~/.config/atem/session.json
-    pub fn session_path() -> PathBuf {
-        AtemConfig::config_dir().join("session.json")
-    }
-
-    /// Load saved session from disk. Returns None if not found.
-    pub fn load_saved() -> Option<Self> {
-        Self::load_saved_from(&Self::session_path())
-    }
-
-    /// `load_saved` from `path`.
-    pub fn load_saved_from(path: &std::path::Path) -> Option<Self> {
-        let path = path.to_path_buf();
-        let content = crate::auth::read_private_file(&path).ok()??;
-        serde_json::from_slice(&content).ok()
-    }
-
-    /// Save session to `path`.
-    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
-        let path = path.to_path_buf();
-        let dir = path.parent().unwrap();
-        fs::create_dir_all(dir)?;
-        crate::auth::set_private_directory_permissions(dir)?;
-        let json = serde_json::to_string_pretty(self)?;
-        crate::auth::write_private_file(&path, json.as_bytes())?;
-        Ok(())
-    }
 }
 
 /// Read-modify-write of the `config.toml` at `path`: `edit` gets the
@@ -973,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn display_masked_shows_sso_section() {
+    fn display_masked_shows_the_login_and_the_pairing() {
         let _profile = crate::test_profile::temp();
         let config = AtemConfig {
             rtm_channel: Some("test_channel".to_string()),
@@ -981,9 +948,8 @@ mod tests {
         };
         let display = config.display_masked();
         assert!(display.contains("test_channel")); // non-secret shown
-        assert!(display.contains("SSO:"));
-        // Shows either "logged in" or "not logged in" depending on real session state
-        assert!(display.contains("logged in") || display.contains("not logged in"));
+        assert!(display.contains("Login:    not logged in"), "{display}");
+        assert!(display.contains("Paired:   none"), "{display}");
         // No credentials in config anymore
         assert!(!display.contains("customer_id"));
         assert!(!display.contains("customer_secret"));

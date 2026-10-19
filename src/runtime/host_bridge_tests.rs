@@ -173,13 +173,13 @@ fn fake_claude() -> PathBuf {
 /// `ACCOUNT`/`DEVICE` unless `verified` is false.
 fn profile(dir: &Path, verified: bool) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("pairing.json"),
-        json!({"version":1,"host_trust_gen":TRUST_GEN,"binding_id":"binding-1",
-               "astation_id":ASTATION,"created_at":1})
-        .to_string(),
-    )
-    .unwrap();
+    crate::pairing::tests::write_bound(
+        dir,
+        ASTATION,
+        TRUST_GEN,
+        "binding-1",
+        ("session-1", "token-1"),
+    );
     if verified {
         let entry = json!({
             "device_id": DEVICE, "data_account": ACCOUNT, "sign_gen": 1,
@@ -187,19 +187,11 @@ fn profile(dir: &Path, verified: bool) {
             "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
             "safety_code": "", "epoch_floor": 0, "account_state": null, "account_epoch": 0,
         });
-        crate::memory::verification::write_test_file(
-            &crate::memory::verification::CredPaths::in_dir(dir).trust,
+        crate::paths::write_test_file(
+            &crate::paths::CredPaths::in_dir(dir).trust,
             json!({"version":1,"astations":{ASTATION: entry}}).to_string(),
         );
     }
-    let mut sessions = crate::auth::SessionManager::default();
-    sessions.insert_session(crate::auth::AuthSession::new(
-        "session-1".into(),
-        "token-1".into(),
-        ASTATION.into(),
-        "test-machine".into(),
-    ));
-    sessions.save_to(&dir.join("sessions.json")).unwrap();
 }
 
 /// The Astation end of the link.
@@ -389,12 +381,9 @@ impl Runtime {
             }
         });
         let mut app = App::new();
-        // Never the user's sessions.json.
+        // Never the user's profile.
         app.last_session_refresh = Some(Instant::now());
-        app.astation_client = AstationClient::new_with_test_state(
-            "atem-host-test",
-            profile_dir.join("sessions.json"),
-        );
+        app.astation_client = AstationClient::new_with_test_state("atem-host-test", &profile_dir);
         app.astation_client
             .connect_raw(&format!("ws://{address}"))
             .await
@@ -1862,11 +1851,8 @@ fn a_changed_pairing_drops_the_link_without_a_reload() {
     local(async {
         let mut rt = Runtime::start(true).await;
         rt.peer.hello().await;
-        std::fs::write(
-            rt.dir.path().join("profile").join("pairing.json"),
-            json!({"version": 1, "host_trust_gen": TRUST_GEN + 1}).to_string(),
-        )
-        .unwrap();
+        let profile = crate::status::Sources::in_dir(&rt.dir.path().join("profile"));
+        crate::pairing::unpair(&profile).unwrap();
         tokio::time::timeout(WAIT, async {
             while rt.peer.from_atem.recv().await.is_some() {}
         })
@@ -3480,15 +3466,15 @@ async fn adopted_rules_dropped_after(change: &str) {
     let dir = rt.shutdown().await;
     let profile = dir.path().join("profile");
     match change {
-        "trust" => std::fs::write(
-            profile.join("pairing.json"),
-            json!({"version":1,"host_trust_gen":TRUST_GEN + 1,"binding_id":"binding-2",
-                   "astation_id":ASTATION,"created_at":2})
-            .to_string(),
-        )
-        .unwrap(),
+        "trust" => crate::pairing::tests::write_bound(
+            &profile,
+            ASTATION,
+            TRUST_GEN + 1,
+            "binding-2",
+            ("session-1", "token-1"),
+        ),
         _ => {
-            let path = crate::memory::verification::CredPaths::in_dir(&profile).trust;
+            let path = crate::paths::CredPaths::in_dir(&profile).trust;
             let mut state: Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             state["astations"][ASTATION]["data_account"] = json!("account-other");

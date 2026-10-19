@@ -44,7 +44,7 @@ fn the_real_agent_starts_locked_and_answers_on_its_socket() {
             .spawn()
             .unwrap(),
     );
-    let socket = support::cred::agent_sock(&runtime);
+    let socket = support::profile::agent_sock(&runtime);
     let mut stream = (0..50)
         .find_map(|_| {
             UnixStream::connect(&socket).ok().or_else(|| {
@@ -118,7 +118,7 @@ fn an_agent_whose_runtime_dir_was_removed_exits_and_a_new_one_starts() {
         std::fs::set_permissions(run, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     }
     let mut first = agent_process(&home, &run_a);
-    let socket_a = support::cred::agent_sock(&run_a);
+    let socket_a = support::profile::agent_sock(&run_a);
     assert!(
         within(5, || status_at(&socket_a).is_some()),
         "the first agent didn't start"
@@ -131,11 +131,11 @@ fn an_agent_whose_runtime_dir_was_removed_exits_and_a_new_one_starts() {
         "the orphaned agent kept running"
     );
     // A clean exit clears its pid from the lock file.
-    let lock = support::cred::agent_lock(&home.join(".config").join("atem"));
+    let lock = support::profile::agent_lock(&home.join(".config").join("atem"));
     assert_eq!(std::fs::read_to_string(&lock).unwrap().trim(), "");
     // The next session's agent takes over the key files.
     let mut second = agent_process(&home, &run_b);
-    let socket_b = support::cred::agent_sock(&run_b);
+    let socket_b = support::profile::agent_sock(&run_b);
     assert!(
         within(10, || status_at(&socket_b).is_some()),
         "the new agent didn't start"

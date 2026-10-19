@@ -47,7 +47,7 @@ atem status                             # Account, pairing, verification, creden
 atem pair                               # Pair with Astation, then verify this device (shows the status when already paired)
 atem pair --save                        # Same, and keep credentials for offline use
 atem pair verify                        # Verify this device with the paired Astation (no re-pairing)
-atem unpair [--yes]                     # Remove all Astation pairings and saved sessions (asks first)
+atem unpair [--yes]                     # Remove the Astation pairing (asks first; your own login stays)
 ```
 
 `atem login` unlocks a limited set: project list, tokens for the active
@@ -65,8 +65,11 @@ never from piped input or keys typed earlier, so run `atem pair` in an
 interactive terminal. If verification fails, the pairing stays saved, Astation
 is told, and `atem pair` exits nonzero; run `atem pair verify` to retry. A connected or SSO-paired session alone does not
 mean the device is verified; check `atem status`. With `--save`
-the credentials keep working when Astation disconnects; without it they stop
-5 minutes after the disconnect (atem asks when `--save` isn't given).
+the login Astation shares keeps working when Astation disconnects; without it
+it stops 5 minutes after the disconnect (atem asks when `--save` isn't given).
+While it may be used, Agora API calls (`atem project list`) use it; otherwise
+they use your own `atem login`. One pairing at a time: `atem unpair` removes
+it and keeps your own login.
 
 Once paired, `atem pair` only prints the status (`Already paired. Verify this
 device: atem pair verify · Replace the pairing: atem unpair, then atem pair`):
@@ -503,9 +506,9 @@ Files in `~/.config/atem/`:
 |------|----------|------------|
 | `config.toml` | Non-sensitive settings (Astation/relay URLs, extra_hostnames, SSO/BFF overrides) and this atem's generated identity (`instance_id`, `atem_id`) | None |
 | `convo.toml` | ConvoAI agent config (API keys, provider params) | None (chmod 0600) |
-| `credentials.enc` | SSO and Astation-paired tokens | AES-256-GCM (machine-bound) |
+| `login.enc` | Your own `atem login` (who issued it, your login id, its tokens) | AES-256-GCM (machine-bound) |
+| `pairing/` | The Astation pairing: `pairing.enc` (Astation id, session, the login Astation shares, the save choice) and `trust_gen` (a counter `atem unpair` moves on) | `pairing.enc` AES-256-GCM (machine-bound) |
 | `project_cache.enc` | Project list + active project selection | AES-256-GCM (machine-bound) |
-| `sessions.json` | Per-Astation device session IDs and tokens | Plaintext (chmod 0600) |
 | `knowledge.db` | Atem Memory: memories, skills, search index, pending-sync queue (no credentials) | None (chmod 0600) |
 | `cred/` | This device's keys, trust state and cred agent files (directory 0700, see below) | — |
 | `runtime.lock`, `runtime.socket`, `runtime.log`, `runtime.replaced`, `runtime/` | The background runtime: its lock, socket path, log, last replacement by another build, worker records and session journal | None (chmod 0600) |

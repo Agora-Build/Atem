@@ -3,7 +3,7 @@
 //! See designs/e2e-encryption.md "Devices → Verification".
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -13,6 +13,9 @@ use crate::memory::device_keys::{DeviceKeys, DevicePublics, PublicKeys, UnlockAu
 use crate::memory::encoding::{base32_prefix, dec, enc};
 use crate::memory::grant::{GrantWire, open_grant};
 use crate::memory::cred_agent::{CredAgentApi, LOCKED};
+use crate::paths::CredPaths;
+#[cfg(test)]
+use crate::paths::write_test_file;
 use crate::memory::statements::{AccountState, SignedWire};
 use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, new_storage_key, new_storage_kid,
@@ -189,109 +192,6 @@ impl Handshake {
 
     pub fn into_keys(self) -> VerificationKeys {
         self.keys
-    }
-}
-
-/// The cred directory's layout: every file of this device's keys, its trust
-/// state and the cred agent, under `<profile>/cred/` (0700, files 0600).
-/// The only place these names are written down; tests use it too.
-#[derive(Debug, Clone)]
-pub struct CredPaths {
-    /// `<profile>/cred`.
-    pub dir: PathBuf,
-    /// `data_keys.enc` from build steps 0–2a (`K`, project names, under the
-    /// machine-bound key). The cred agent moves it into `device_keys_sealed`
-    /// and `project_names` at the first unlock and deletes it.
-    pub data_keys: PathBuf,
-    /// `project_names.json`: `h1.` project hash → readable project key
-    /// (its lock: `project_names.lock`).
-    pub project_names: PathBuf,
-    /// `state.json`: pinned Astations, the signed account state (its lock:
-    /// `state.lock`).
-    pub trust: PathBuf,
-    /// The plain file (a step-1 device's, or a fresh device's until its
-    /// first escrow); the cred agent seals it into `device_keys_sealed` and
-    /// deletes it once Astation is known to hold the storage key.
-    pub device_keys: PathBuf,
-    pub device_keys_sealed: PathBuf,
-    /// Written in rotation phase 1, renamed over `device_keys_sealed` in phase 3.
-    pub device_keys_next: PathBuf,
-    /// The sealed file a rotation replaced, kept until an unlock proves
-    /// Astation holds the new storage key.
-    pub device_keys_prev: PathBuf,
-    pub unlock_auth_key: PathBuf,
-    /// The plain X25519 key from #36; deleted once a device is verified.
-    pub legacy_device_key: PathBuf,
-    /// Held (flock, with its pid) by the one cred agent serving these
-    /// files, for its life.
-    pub agent_lock: PathBuf,
-    /// The socket path that agent listens on, for clients whose runtime
-    /// dir differs from the agent's.
-    pub agent_socket: PathBuf,
-    /// Output of the detached cred agent.
-    pub agent_log: PathBuf,
-}
-
-impl CredPaths {
-    pub fn default_paths() -> Self {
-        Self::in_dir(&crate::config::AtemConfig::config_dir())
-    }
-
-    /// The layout under the profile directory `profile`.
-    pub fn in_dir(profile: &Path) -> Self {
-        let dir = profile.join("cred");
-        Self {
-            data_keys: dir.join("data_keys.enc"),
-            project_names: dir.join("project_names.json"),
-            trust: dir.join("state.json"),
-            device_keys: dir.join("device_keys"),
-            device_keys_sealed: dir.join("device_keys.sealed"),
-            device_keys_next: dir.join("device_keys.sealed.next"),
-            device_keys_prev: dir.join("device_keys.sealed.prev"),
-            unlock_auth_key: dir.join("unlock_auth_key"),
-            legacy_device_key: dir.join("device_key"),
-            agent_lock: dir.join("agent.lock"),
-            agent_socket: dir.join("agent.socket"),
-            agent_log: dir.join("agent.log"),
-            dir,
-        }
-    }
-
-    /// The agent's socket: `<runtime_dir>/atem/cred-agent.sock` when
-    /// `runtime_dir` is set (the caller checked it is safe), else
-    /// `cred/agent.sock`.
-    pub fn agent_sock(&self, runtime_dir: Option<&Path>) -> PathBuf {
-        match runtime_dir {
-            Some(dir) if !dir.as_os_str().is_empty() => dir.join("atem").join("cred-agent.sock"),
-            _ => self.dir.join("agent.sock"),
-        }
-    }
-}
-
-/// The lock beside an agent socket: `<socket>.lock`.
-pub fn socket_lock(socket: &Path) -> PathBuf {
-    let mut name = socket.as_os_str().to_owned();
-    name.push(".lock");
-    PathBuf::from(name)
-}
-
-/// Tests: writes `bytes` to `path`, creating its directory (the cred dir).
-#[cfg(test)]
-pub(crate) fn write_test_file(path: &Path, bytes: impl AsRef<[u8]>) {
-    create_private_dir(path.parent().expect("a file in a directory")).unwrap();
-    std::fs::write(path, bytes).unwrap();
-}
-
-/// Creates `dir` (and missing parents) private to this user (0700).
-pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(dir)
     }
 }
 
@@ -847,40 +747,6 @@ pub fn device_keys_for_verification(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_cred_layout_lives_under_cred() {
-        let paths = CredPaths::in_dir(Path::new("/home/u/.config/atem"));
-        let cred = Path::new("/home/u/.config/atem/cred");
-        assert_eq!(paths.dir, cred);
-        for (path, name) in [
-            (&paths.trust, "state.json"),
-            (&paths.project_names, "project_names.json"),
-            (&paths.device_keys, "device_keys"),
-            (&paths.device_keys_sealed, "device_keys.sealed"),
-            (&paths.device_keys_next, "device_keys.sealed.next"),
-            (&paths.device_keys_prev, "device_keys.sealed.prev"),
-            (&paths.unlock_auth_key, "unlock_auth_key"),
-            (&paths.agent_lock, "agent.lock"),
-            (&paths.agent_socket, "agent.socket"),
-            (&paths.agent_log, "agent.log"),
-        ] {
-            assert_eq!(path, &cred.join(name));
-        }
-        assert_eq!(
-            paths.agent_sock(Some(Path::new("/run/user/1000"))),
-            Path::new("/run/user/1000/atem/cred-agent.sock")
-        );
-        assert_eq!(paths.agent_sock(None), cred.join("agent.sock"));
-        assert_eq!(paths.agent_sock(Some(Path::new(""))), cred.join("agent.sock"));
-        assert_eq!(
-            socket_lock(&cred.join("agent.sock")),
-            cred.join("agent.sock.lock")
-        );
-        assert_eq!(
-            crate::memory::trust::TrustStore::lock_path(&paths.trust),
-            cred.join("state.lock")
-        );
-    }
 
     use super::*;
 
@@ -1100,7 +966,7 @@ mod tests {
         let raw = std::fs::read_to_string(&paths.trust)
             .unwrap()
             .replace("\"account_state\": {", "\"account_state_was\": {");
-        crate::memory::verification::write_test_file(&paths.trust, raw);
+        crate::paths::write_test_file(&paths.trust, raw);
         let error = format!("{:#}", account_mode(&paths.trust, ASTATION_ID).unwrap_err());
         assert!(error.contains("waiting for Astation's signed encryption state"), "{error}");
     }
@@ -1237,7 +1103,7 @@ mod tests {
         let raw = std::fs::read_to_string(&paths.trust)
             .unwrap()
             .replace("\"account_state\": {", "\"account_state_was\": {");
-        crate::memory::verification::write_test_file(&paths.trust, raw);
+        crate::paths::write_test_file(&paths.trust, raw);
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(trust.verified(ASTATION_ID).unwrap().account_state.is_none());
         let error = account_mode(&paths.trust, ASTATION_ID)
@@ -1888,7 +1754,7 @@ mod ceremony_tests {
         for path in [&paths.device_keys_next, &paths.device_keys_prev, &paths.device_keys] {
             std::fs::write(path, b"old").unwrap();
         }
-        crate::memory::verification::write_test_file(&paths.project_names, b"{}");
+        crate::paths::write_test_file(&paths.project_names, b"{}");
         TrustStore::update(&paths.trust, |store| {
             store.record_abandoned("0f0f0f0f");
             store.record_escrow_unanswered();

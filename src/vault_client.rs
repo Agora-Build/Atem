@@ -184,7 +184,7 @@ pub struct VaultClient {
     session_id: String,
     astation_id: String,
     http: reqwest::Client,
-    encryption_with: Option<(crate::memory::verification::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
+    encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 }
 
 impl VaultClient {
@@ -203,7 +203,7 @@ impl VaultClient {
     }
 
     
-    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
+    pub(crate) fn with_encryption(mut self, paths: crate::paths::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
     }

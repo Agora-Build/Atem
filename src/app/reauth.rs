@@ -119,7 +119,7 @@ impl App {
     async fn finish_astation_reauth(&mut self) {
         // A success for a pairing or session replaced meanwhile (atem unpair,
         // atem pair) is dropped: nothing is refreshed and the link stays down.
-        if let Err(error) = self.astation_client.reauthenticated() {
+        if let Err(error) = self.astation_client.refresh_session() {
             self.fail_astation_reauth(format!("Astation re-authentication ignored: {error:#}"));
             return;
         }
@@ -188,15 +188,13 @@ mod tests {
     /// temp dir; never the user's config) and a scripted Astation peer.
     async fn connected_app() -> (App, Peer) {
         let state = tempfile::tempdir().unwrap();
-        let session_path = state.path().join("sessions.json");
-        let mut sessions = crate::auth::SessionManager::default();
-        sessions.insert_session(crate::auth::AuthSession::new(
-            SESSION_ID.into(),
-            TOKEN.into(),
-            ASTATION.into(),
-            "test-machine".into(),
-        ));
-        sessions.save_to(&session_path).unwrap();
+        crate::pairing::tests::write_bound(
+            state.path(),
+            ASTATION,
+            1,
+            "binding-1",
+            (SESSION_ID, TOKEN),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -233,9 +231,9 @@ mod tests {
 
         let profile = crate::test_profile::use_dir(state.path());
         let mut app = App::new();
-        // Keep process_astation_messages away from the user's sessions.json.
+        // Keep process_astation_messages away from the user's profile.
         app.last_session_refresh = Some(Instant::now());
-        app.astation_client = AstationClient::new_with_test_state(ATEM_ID, session_path);
+        app.astation_client = AstationClient::new_with_test_state(ATEM_ID, state.path());
         app.astation_client
             .connect_raw(&format!("ws://{address}"))
             .await
@@ -533,10 +531,11 @@ mod tests {
             .unwrap();
         pump(&mut app, &mut peer).await;
         assert!(app.astation_connected);
-        let sessions =
-            crate::auth::SessionManager::load_from(&peer._state.path().join("sessions.json"))
-                .unwrap();
-        let session = sessions.get(ASTATION).expect("saved session kept");
+        let paths = crate::paths::ProfilePaths::in_dir(peer._state.path()).pairing;
+        let record = crate::pairing::PairingRecord::load(&paths)
+            .unwrap()
+            .unwrap();
+        let session = record.session_for(ASTATION).expect("saved session kept");
         assert_eq!(session.session_id, SESSION_ID);
         assert_eq!(session.token, TOKEN);
     }
@@ -559,19 +558,18 @@ mod tests {
                 next_auth(&mut app, &mut peer).await;
                 let dir = peer._state.path().to_path_buf();
                 let src = crate::status::Sources::in_dir(&dir);
-                crate::pairing_binding::commit_unpair(&src).unwrap();
-                let sessions_path = dir.join("sessions.json");
+                crate::pairing::unpair(&src).unwrap();
                 if re_pair {
-                    let before = crate::pairing_binding::capture(&src).unwrap();
-                    crate::pairing_binding::bind_new(&src, &before, ASTATION).unwrap();
-                    let mut sessions = crate::auth::SessionManager::default();
-                    sessions.insert_session(crate::auth::AuthSession::new(
-                        "new-session".into(),
-                        "new-token".into(),
-                        ASTATION.into(),
-                        "test-machine".into(),
-                    ));
-                    sessions.save_to(&sessions_path).unwrap();
+                    let before = crate::pairing::capture(&src).unwrap();
+                    crate::pairing::bind_new(&src, &before, ASTATION).unwrap();
+                    crate::pairing::PairingRecord::update(&src.paths.pairing, ASTATION, |record| {
+                        record.session = Some(crate::pairing::SavedSession::new(
+                            "new-session".into(),
+                            "new-token".into(),
+                            "test-machine".into(),
+                        ));
+                    })
+                    .unwrap();
                 }
                 let before = crate::status::tests::snapshot(&dir);
                 let link = app.astation_link_gen;
@@ -588,7 +586,7 @@ mod tests {
                 assert!(
                     app.status_message
                         .as_deref()
-                        .is_some_and(|m| m.contains(crate::pairing_binding::CHANGED)),
+                        .is_some_and(|m| m.contains(crate::pairing::CHANGED)),
                     "{:?}",
                     app.status_message
                 );
@@ -602,7 +600,7 @@ mod tests {
     async fn credentials_for_a_pairing_removed_meanwhile_are_dropped() {
         let (mut app, peer) = connected_app().await;
         let dir = peer._state.path().to_path_buf();
-        crate::pairing_binding::commit_unpair(&crate::status::Sources::in_dir(&dir)).unwrap();
+        crate::pairing::unpair(&crate::status::Sources::in_dir(&dir)).unwrap();
         let before = crate::status::tests::snapshot(&dir);
         app.handle_astation_message(AstationMessage::CredentialSync {
             access_token: "access".into(),
@@ -614,7 +612,7 @@ mod tests {
         })
         .await;
         let shown = app.status_message.clone().unwrap_or_default();
-        assert!(shown.contains(crate::pairing_binding::CHANGED), "{shown}");
+        assert!(shown.contains(crate::pairing::CHANGED), "{shown}");
         assert_eq!(crate::status::tests::snapshot(&dir), before);
     }
 

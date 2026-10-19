@@ -15,7 +15,7 @@
 //! attachment at all, so its session-family messages are answered
 //! `unauthorized`. `welcome` names the verified account (`data_account`), this
 //! device's id from its verification, and the host trust generation from
-//! `pairing.json`; a new identity (a pairing verified after the broker
+//! `pairing/trust_gen`; a new identity (a pairing verified after the broker
 //! started) restarts the host over the same journal with a new runtime
 //! generation and epoch.
 //!
@@ -124,7 +124,7 @@ const INTERRUPT_KEY: &[u8] = b"\x1b";
 /// authorized under it).
 const UNPAIRED: &str = "unpaired";
 const RUNTIME_EPOCH_FILE: &str = "runtime_epoch";
-/// How often the link's pairing capture is checked against `pairing.json`.
+/// How often the link's pairing capture is checked against the pairing.
 const CAPTURE_CHECK: Duration = Duration::from_secs(5);
 /// Session messages remembered for duplicate detection, at most.
 const MAX_SEEN: usize = 4096;
@@ -198,7 +198,7 @@ fn verified_identity(
     astation_id: &str,
     host_trust_gen: u64,
 ) -> Option<Identity> {
-    let trust = crate::memory::trust::TrustStore::load_from(&src.keys.trust).ok()?;
+    let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust).ok()?;
     let entry = trust.verified(astation_id)?;
     let identity = Identity {
         account_id: entry.data_account.clone(),
@@ -211,7 +211,7 @@ fn verified_identity(
 
 /// The identity of the profile's current pairing (at start), else none.
 fn start_identity(src: &crate::status::Sources) -> Identity {
-    let state = crate::pairing_binding::load(src).ok();
+    let state = crate::pairing::load(src).ok();
     let trust_gen = state.as_ref().map_or(0, |s| s.host_trust_gen);
     state
         .and_then(|s| s.binding)

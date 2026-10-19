@@ -99,10 +99,6 @@ fn store_version() -> u8 {
     1
 }
 
-pub fn trust_path() -> PathBuf {
-    crate::memory::verification::CredPaths::default_paths().trust
-}
-
 impl TrustStore {
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = match std::fs::read(path) {
@@ -141,7 +137,7 @@ impl TrustStore {
             use std::os::unix::io::AsRawFd;
             let lock_path = Self::lock_path(path);
             if let Some(dir) = lock_path.parent() {
-                crate::memory::verification::create_private_dir(dir)?;
+                crate::paths::create_private_dir(dir)?;
             }
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -504,7 +500,7 @@ mod tests {
     fn concurrent_updates_lose_nothing() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).trust;
         let writers: Vec<_> = (0..4)
             .map(|writer| {
                 let path = path.clone();
@@ -838,7 +834,7 @@ mod tests {
     #[test]
     fn abandoned_storage_kids_are_kept_and_never_picked_again() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).trust;
         let mut store = TrustStore::default();
         store.record_abandoned("aaaaaaaa");
         store.save_to(&path).unwrap();
@@ -862,7 +858,7 @@ mod tests {
             .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).trust;
         store.save_to(&path).unwrap();
         let loaded = TrustStore::load_from(&path).unwrap();
         assert!(loaded.verified(ASTATION).is_some());
@@ -902,7 +898,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.home(), Some(ASTATION));
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).trust;
         store.save_to(&path).unwrap();
         assert_eq!(TrustStore::load_from(&path).unwrap().home(), Some(ASTATION));
     }
@@ -916,7 +912,7 @@ mod tests {
             .confirm(ASTATION, &fake.sign(&certificate(&keys, 5).encode()))
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::memory::verification::CredPaths::in_dir(dir.path()).trust;
+        let path = crate::paths::CredPaths::in_dir(dir.path()).trust;
         store.save_to(&path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("home_astation"), "no home is not written");
