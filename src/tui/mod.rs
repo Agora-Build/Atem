@@ -340,6 +340,8 @@ mod tests {
             socket: socket.clone(),
             record: dir.path().join("none"),
             log: dir.path().join("log"),
+            lock: dir.path().join("runtime.lock"),
+            replaced: dir.path().join("runtime.replaced"),
         };
         let started = Instant::now();
         let look = look_at(locator, Duration::from_millis(300)).await;
@@ -358,6 +360,8 @@ mod tests {
             socket: dir.path().join("rt.sock"),
             record: dir.path().join("none"),
             log: dir.path().join("log"),
+            lock: dir.path().join("runtime.lock"),
+            replaced: dir.path().join("runtime.replaced"),
         };
         let look = look_at(locator, Duration::from_secs(2)).await;
         assert_eq!(look, Ok(None));

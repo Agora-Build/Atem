@@ -23,7 +23,7 @@ atem cred --help
 If `cred projects` is missing, use a release that includes it or build current
 `main`. For a source build, replace `atem` in this guide with the path to that
 binary, for example `./target/release/atem`; building alone does not replace an
-older global npm installation. An older unlocked key agent can also continue
+older global npm installation. An older unlocked cred agent can also continue
 running after the CLI has been updated; see the upgrade steps below.
 
 ## Pair from another machine
@@ -43,12 +43,12 @@ running after the CLI has been updated; see the upgrade steps below.
    command, then run `atem status`.
 
 The status must say the device is verified. **Connected** or **Paired with
-Astation** alone confirms neither device verification nor key-agent unlock.
+Astation** alone confirms neither device verification nor cred-agent unlock.
 Without saved credentials, shared sign-in has a five-minute grace period
 after disconnection. Saving credentials does not provide offline access to
 the relay or remove the Mac approval required to unlock sealed device keys.
 
-## Unlock and upgrade the key agent
+## Unlock and upgrade the cred agent
 
 ```sh
 atem status
@@ -57,7 +57,7 @@ atem cred unlock
 
 Unlock approval happens on the home Astation Mac, not on the remote Linux
 machine. Keep the unlock command open while you approve Touch ID on the Mac;
-the approval wait is bounded to five minutes. The background key agent holds
+the approval wait is bounded to five minutes. The background cred agent holds
 the unlocked device and account keys, so later CLI commands can exit normally.
 
 A status marked **started by another atem build** means the unlocked agent

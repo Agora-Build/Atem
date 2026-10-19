@@ -19,7 +19,7 @@ below disagrees, this section wins.
 
 1. **Workers own agents.** Each session runs in its own `atem worker` process
    that owns the agent process, PTY, output collection and submission journal.
-   The runtime is a broker (Astation connections, registry, key agent access,
+   The runtime is a broker (Astation connections, registry, cred agent access,
    local IPC). A runtime crash or frontend exit does not end workers; a new
    runtime adopts surviving workers through authenticated local IPC, checking
    session id, process generation and process-start metadata (never a pid
@@ -174,7 +174,7 @@ atem pair / cred / list  ─┘  (same user)    └─ one authenticated Astatio
 ### The runtime process
 
 - `atem runtime` is a hidden subcommand of the same binary, started detached
-  by a client when no runtime answers (the `atem key-agent` pattern: same
+  by a client when no runtime answers (the `atem cred-agent` pattern: same
   binary, `setsid`, `chdir($HOME)`, output to `~/.config/atem/runtime.log`).
 - One per config directory: an exclusive `flock` on
   `~/.config/atem/runtime.lock` for its life, with its pid in it; a second
@@ -246,13 +246,30 @@ started only for `atem pair` or `atem cred …`). While it runs and is paired it
 is online for Astation; when it has exited, Astation sees this device offline,
 as it does today when no Atem is running.
 
+### Replacing a runtime of another build
+
+A non-passive client (every command that uses the runtime; never `atem
+status` or `atem --version`, which only look) whose build differs from the
+runtime's replaces it by its own (`client::replace_other_build`): `restart`,
+wait until the old process is gone (its socket stops answering and
+`runtime.lock` is free), start this build, which adopts the workers, and
+print `Atem's runtime updated to <build> (was <build>); sessions kept.` A
+runtime from before `restart` gets SIGTERM instead, only when `runtime.lock`
+names its pid and that pid is confirmed as this user's `atem runtime`. The
+runtime is kept, with a message saying why, when its `worker_protocol`
+differs from this build's (the message names the running sessions that block
+it), while an Astation operation runs, or within 60 s of the last replacement
+(`runtime.replaced`), so two atem builds in use don't keep replacing each
+other. `atem runtime restart` does the same on request, without the 60 s
+guard.
+
 ### Local protocol (v1)
 
 JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.
 
 | op | from | fields |
 |---|---|---|
-| `hello` / `welcome` | client / runtime | `protocol`, `build`, `passive` (a client that never keeps an idle runtime running, e.g. the menu's look); runtime adds its pid and `astation` (link up) |
+| `hello` / `welcome` | client / runtime | `protocol`, `build`, `passive` (a client that never keeps an idle runtime running, e.g. the menu's look); runtime adds its pid, `astation` (link up), `host_error?` and `worker_protocol` |
 | `paste` | client | `session_id`, `bytes` (base64 UTF-8, ≤ 1 MiB): one local input, written whole (bracketed when the agent asked for it) |
 | `stopped` | runtime | `session_id`, `removed`: the answer to `stop` |
 | `launch` | client | `provider`, `args`, `cwd`, `env`, `rows`, `cols` → `launched {session}` |
@@ -268,6 +285,8 @@ JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.
 | `astation` | runtime | `connected`, on every change of the Astation link |
 | `reclaim` | client | `session_id`: take control back from a remote lease holder (prefix `g`) |
 | `reload` | client | re-read credentials, sessions and config (after `unpair`, `logout`, config edits); a link whose pairing is gone is dropped with its attachments |
+| `status` | client / runtime | read-only → `status {status}`: the link (`astation`, `transport` local/relay, `relay` label `<host> as <atem_id>`, `retrying`, `reauthenticating`), the attachment (`attachment`, `welcomed{revision, at_ms, ms_left}`, `refused{revision, needs, at_ms}` of the last refused `hello`), `journal_halted`, `host_error`, `adopting`, `sessions` (each with its worker's `worker_build`); never a secret |
+| `restart` / `restarting` | client / runtime | the runtime exits after this pass so the client can start its own build, which adopts the workers; refused (`error`, "An Astation operation is running…") while an operation runs |
 | `astation_op` | client | `request_id`, `kind` (`pair`, `pair_verify`, `cred_unlock`, `cred_projects`, `token`), `options` (`save` for `pair`; `astation_id` for `token`; `cwd` for `cred_projects`) |
 | `print` | runtime | `request_id`, `level` (info/warn/error), `text` |
 | `ask` / `answer` | runtime / client | `request_id`, `question_id`, `kind` (yes_no, text), `text` → `answer` `{request_id, question_id, value}`; `value` is `{"kind":"yes"}`, `{"kind":"no"}`, `{"kind":"text","text":…}`, or why there is none: `{"kind":"no_terminal","text":…}`, `{"kind":"unanswered","text":…}` |
@@ -362,7 +381,7 @@ every atem on a machine together.
 - Local socket is same-UID only, in a 0700 directory; no network listener.
   Any process of the user can already type into that user's terminals, so the
   trust boundary is unchanged.
-- The runtime never holds device keys; the key agent keeps them.
+- The runtime never holds device keys; the cred agent keeps them.
 - Launch environments may contain provider credentials: bounded, passed only
   to the spawned agent, dropped after spawn, never logged or listed.
 - Remote authorization is unchanged: Astation pairing, re-authentication and

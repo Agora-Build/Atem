@@ -9,14 +9,14 @@
 ## Global Constraints
 
 - Branch `feat/status-pair-verify` from `main`. Commits end with a blank line and `🤖 Built with SMT <smt@agora.build>`. Never push.
-- `atem status` is read-only and works offline: no network, no Astation connection, never starts the key agent (query only a running one), never writes files. Cached remote information is marked stale. User-facing label `Credentials`, never `Keys`.
+- `atem status` is read-only and works offline: no network, no Astation connection, never starts the cred agent (query only a running one), never writes files. Cached remote information is marked stale. User-facing label `Credentials`, never `Keys`.
 - `atem pair` on an already paired profile (any paired credential entry or saved Astation session) prints the status plus `Already paired. Verify this device: atem pair verify · Replace the pairing: atem unpair, then atem pair` and exits 0 without connecting, changing identity, trust, keys, sessions or files. Applies also when verification is incomplete.
 - `atem pair verify` requires an existing pairing (else: `Not paired. Run atem pair first.`, exit 1). Already validly verified with the paired Astation → `Already verified (safety code …).`, no connection, exit 0. Revoked by that Astation → no verification; message: `This device was revoked by Astation <id>. Run atem unpair, then atem pair, to set it up again.` exit 1 — verification never moves keys aside or replaces trusted keys. Otherwise run the existing verification ceremony (`src/pair_verify.rs` + the verification half of `run_pair`) on a connection authenticated with the saved session (no pairing code, `allow_pairing = false`); cancellation/interruption keeps the pairing.
 - `atem pair` (not yet paired) keeps today's pairing flow, then runs verification as today (first-time setup stays one command); the revoked-keys-moved-aside branch is removed from `atem pair` (now only reachable after `atem unpair`, where the device has no pin for that Astation).
 - `atem cred unlock` on an unverified profile: `This device isn't verified. Run atem pair verify first.` exit 1, no connection. `atem cred lock` unchanged (offline, always allowed). Neither starts pairing or verification.
 - `atem cred status` prints exactly what `atem status` prints (one implementation).
 - Never rustfmt `src/cli.rs`, `src/main.rs`, `src/websocket_client.rs`, `src/memory/mod.rs`, `src/memory/crypto.rs`, `src/memory/secrets.rs`; check others with `--check` first. Never project-wide `cargo fmt`.
-- Never run the installed `atem`, never touch the real `~/.config/atem`, the user's key agent or running atem processes; tests use temp config dirs (existing patterns in src/memory tests and `cli.rs` tests).
+- Never run the installed `atem`, never touch the real `~/.config/atem`, the user's cred agent or running atem processes; tests use temp config dirs (existing patterns in src/memory tests and `cli.rs` tests).
 - Full `cargo test` reading every `test result` line; clippy not above `main`'s count (measure first).
 
 ### Task 1: status, pair no-op, pair verify, cred gating
@@ -30,13 +30,13 @@ pub struct StatusReport {
     pub account: Line,        // "signed in" (SSO or paired credentials present and not expired) | "signed in (expired)" | "signed out"
     pub pairing: Line,        // "paired (<astation id>)" | "not paired"
     pub verification: Line,   // "verified (safety code …)" | "not verified" | "revoked by <id>" | "—" when not paired
-    pub credentials: Line,    // "unlocked" | "locked" | "no key agent running" (=locked) | "not set up"
+    pub credentials: Line,    // "unlocked" | "locked" | "no cred agent running" (=locked) | "not set up"
     pub authorization: Line,  // "unknown (stale)" until the freshness contract lands — never "fresh" without proof
     pub relay: Line,          // "unknown (offline check)" — status never connects
     pub local_agents: Line,   // "unknown" until the runtime lands (feat/agent-runtime) — or a count if a runtime answers without starting it
 }
 pub struct Line { pub value: String, pub stale: bool }
-pub fn gather(config_dir: &Path) -> StatusReport;   // reads files + a running key agent only
+pub fn gather(config_dir: &Path) -> StatusReport;   // reads files + a running cred agent only
 pub fn render(r: &StatusReport) -> String;          // the aligned block from the spec, "(stale)" suffix when stale
 ```
 

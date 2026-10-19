@@ -109,7 +109,7 @@ with, and approved by, your Astation.
   control but can't grant memory or vault access.
 - Login-based accounts are a possible future follow-up.
 - atem sends `Authorization: session <session_id>` (the pairing session for
-  the configured Astation, from `SessionManager::load()`) plus
+  the paired Astation, from the pairing record `pairing/pairing.enc`) plus
   `?id=<instance_id>`. Wire JSON is otherwise unchanged.
 
 ## Capture: how agents learn from each other

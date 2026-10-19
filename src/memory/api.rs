@@ -171,11 +171,11 @@ pub struct KnowledgeClient {
     /// The paired Astation id — the relay account this client syncs with.
     astation_id: String,
     http: reqwest::Client,
-    encryption_with: Option<(crate::memory::verification::KeyPaths, std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>)>,
+    encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 }
 
 /// The wire form of `ops`, encrypted when the account is: every memory,
-/// skill and project hash of the batch in a few key-agent round trips.
+/// skill and project hash of the batch in a few cred-agent round trips.
 fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<Value>> {
     if !encryption.should_encrypt() {
         return Ok(ops.iter().map(op_to_wire).collect());
@@ -221,7 +221,7 @@ impl KnowledgeClient {
     }
 
     
-    pub(crate) fn with_encryption(mut self, paths: crate::memory::verification::KeyPaths, agent: std::sync::Arc<dyn crate::memory::key_agent::KeyAgentApi>) -> Self {
+    pub(crate) fn with_encryption(mut self, paths: crate::paths::CredPaths, agent: std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>) -> Self {
         self.encryption_with = Some((paths, agent));
         self
     }
@@ -460,10 +460,10 @@ mod tests {
 
     #[test]
     fn an_encryption_error_keeps_its_cause() {
-        let error = anyhow::anyhow!("the key agent closed the connection").context("sealing a memory");
+        let error = anyhow::anyhow!("the cred agent closed the connection").context("sealing a memory");
         assert_eq!(
             ApiError::from(error).to_string(),
-            "end-to-end encryption: sealing a memory: the key agent closed the connection"
+            "end-to-end encryption: sealing a memory: the cred agent closed the connection"
         );
     }
 

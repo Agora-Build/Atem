@@ -1,30 +1,30 @@
 //! Tests never reach the user's real profile (`~/.config/atem`), runtime
-//! dir or key agent: under `cfg(test)` every function that resolves them
+//! dir or cred agent: under `cfg(test)` every function that resolves them
 //! asks here, and this panics unless the test injected a temp profile
-//! (`use_dir`) or a key agent (`use_agent`) on its thread. `blocking`
+//! (`use_dir`) or a cred agent (`use_agent`) on its thread. `blocking`
 //! carries them to its worker thread (`carry`/`Carried::enter`).
 
-use crate::memory::key_agent::KeyAgentApi;
+use crate::memory::cred_agent::CredAgentApi;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 thread_local! {
     static DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    static AGENT: RefCell<Option<Arc<dyn KeyAgentApi>>> = const { RefCell::new(None) };
+    static AGENT: RefCell<Option<Arc<dyn CredAgentApi>>> = const { RefCell::new(None) };
 }
 
 /// What a test's panic says.
 pub const REAL_PROFILE: &str =
     "a test reached the real atem profile; inject a temp one with test_profile::use_dir";
 pub const REAL_AGENT: &str =
-    "a test reached the real key agent; inject one with test_profile::use_agent";
+    "a test reached the real cred agent; inject one with test_profile::use_agent";
 
 /// Restores the previous injection when dropped.
 #[must_use]
 pub struct Scope {
     dir: Option<PathBuf>,
-    agent: Option<Arc<dyn KeyAgentApi>>,
+    agent: Option<Arc<dyn CredAgentApi>>,
 }
 
 impl Drop for Scope {
@@ -48,8 +48,8 @@ pub fn use_dir(dir: &Path) -> Scope {
     scope
 }
 
-/// `agent` stands in for the user's key agent on this thread.
-pub fn use_agent(agent: Arc<dyn KeyAgentApi>) -> Scope {
+/// `agent` stands in for the user's cred agent on this thread.
+pub fn use_agent(agent: Arc<dyn CredAgentApi>) -> Scope {
     let scope = scope();
     AGENT.with(|a| *a.borrow_mut() = Some(agent));
     scope
@@ -71,8 +71,8 @@ pub fn dir() -> PathBuf {
         .unwrap_or_else(|| panic!("{REAL_PROFILE}"))
 }
 
-/// The injected key agent; panics without one.
-pub fn agent() -> Arc<dyn KeyAgentApi> {
+/// The injected cred agent; panics without one.
+pub fn agent() -> Arc<dyn CredAgentApi> {
     AGENT
         .with(|a| a.borrow().clone())
         .unwrap_or_else(|| panic!("{REAL_AGENT}"))
@@ -82,7 +82,7 @@ pub fn agent() -> Arc<dyn KeyAgentApi> {
 #[derive(Clone)]
 pub struct Carried {
     dir: Option<PathBuf>,
-    agent: Option<Arc<dyn KeyAgentApi>>,
+    agent: Option<Arc<dyn CredAgentApi>>,
 }
 
 pub fn carry() -> Carried {
@@ -102,13 +102,13 @@ impl Carried {
 }
 
 /// The injected agent behind the `Box` `default_agent` returns.
-pub struct Injected(pub Arc<dyn KeyAgentApi>);
+pub struct Injected(pub Arc<dyn CredAgentApi>);
 
-impl KeyAgentApi for Injected {
+impl CredAgentApi for Injected {
     fn call(
         &self,
-        request: crate::memory::key_agent::Request,
-    ) -> anyhow::Result<crate::memory::key_agent::Reply> {
+        request: crate::memory::cred_agent::Request,
+    ) -> anyhow::Result<crate::memory::cred_agent::Reply> {
         self.0.call(request)
     }
 }
@@ -124,15 +124,12 @@ mod tests {
             profile.is_err(),
             "config_dir resolved without an injected profile"
         );
-        assert!(std::panic::catch_unwind(crate::credentials::CredentialStore::path).is_err());
-        assert!(std::panic::catch_unwind(crate::status::Sources::current).is_err());
-        assert!(std::panic::catch_unwind(crate::auth::SessionManager::sessions_path).is_err());
-        assert!(
-            std::panic::catch_unwind(crate::memory::verification::KeyPaths::default_paths).is_err()
-        );
+        assert!(std::panic::catch_unwind(crate::paths::ProfilePaths::default_paths).is_err());
+        assert!(std::panic::catch_unwind(crate::profile::Sources::current).is_err());
+        assert!(std::panic::catch_unwind(crate::paths::CredPaths::default_paths).is_err());
         assert!(std::panic::catch_unwind(crate::rtc_test_server::servers_dir).is_err());
-        assert!(std::panic::catch_unwind(crate::memory::key_agent::default_agent).is_err());
-        assert!(std::panic::catch_unwind(crate::memory::key_agent::running_agent).is_err());
+        assert!(std::panic::catch_unwind(crate::memory::cred_agent::default_agent).is_err());
+        assert!(std::panic::catch_unwind(crate::memory::cred_agent::running_agent).is_err());
         assert!(std::panic::catch_unwind(crate::memory::agent_socket::agent_socket_path).is_err());
         assert!(std::panic::catch_unwind(crate::chat::claude::hooks::session_dir_root).is_err());
         // Injected: the temp profile.
@@ -140,8 +137,8 @@ mod tests {
         let _scope = use_dir(temp.path());
         assert_eq!(crate::config::AtemConfig::config_dir(), temp.path());
         assert_eq!(
-            crate::credentials::CredentialStore::path(),
-            temp.path().join("credentials.enc")
+            crate::paths::ProfilePaths::default_paths().login,
+            crate::paths::ProfilePaths::in_dir(temp.path()).login
         );
     }
 
@@ -154,7 +151,7 @@ mod tests {
             .build()
             .unwrap();
         let dir = runtime
-            .block_on(crate::memory::key_agent::blocking(|| {
+            .block_on(crate::memory::cred_agent::blocking(|| {
                 Ok(crate::config::AtemConfig::config_dir())
             }))
             .unwrap();

@@ -1,11 +1,12 @@
 //! Astation operations in the broker, in process: a real `serve` (workers in
 //! this process, fake agents) whose App links to a fake Astation WebSocket
 //! peer, and a client that runs `astation_op` like the CLI does. The profile
-//! and the key agent are temp ones (`OpEnv`).
+//! and the cred agent are temp ones (`OpEnv`).
 use crate::app::App;
-use crate::memory::key_agent::{KeyAgentApi, test_agent};
+use crate::memory::cred_agent::{CredAgentApi, test_agent};
 use crate::memory::statements::{AccountState, DeviceVerified, FakeAstation, SignedWire};
-use crate::memory::verification::{KeyPaths, transcript_for};
+use crate::memory::verification::transcript_for;
+use crate::paths::CredPaths;
 use crate::runtime::broker::{InProcess, Launcher};
 use crate::runtime::client::RuntimeClient;
 use crate::runtime::ops::{BUSY, OpEnv};
@@ -66,21 +67,23 @@ fn echo_agent(dir: &Path) -> PathBuf {
 /// A pairing with `ASTATION` (binding and saved session), not verified.
 fn paired(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("pairing.json"),
-        json!({"version":1,"host_trust_gen":3,"binding_id":"binding-1",
-               "astation_id":ASTATION,"created_at":1})
-        .to_string(),
+    crate::pairing::tests::write_bound(dir, ASTATION, 3, "binding-1", ("session-1", "token-1"));
+}
+
+/// The shared tokens of the profile at `dir`, when fresh.
+fn fresh_shared(dir: &Path) -> Option<crate::records::Tokens> {
+    crate::sso_auth::fresh_shared(
+        &crate::paths::ProfilePaths::in_dir(dir).pairing,
+        "https://sso2.agora.io",
+        ASTATION,
     )
-    .unwrap();
-    let mut sessions = crate::auth::SessionManager::default();
-    sessions.insert_session(crate::auth::AuthSession::new(
-        "session-1".into(),
-        "token-1".into(),
-        ASTATION.into(),
-        "test-machine".into(),
-    ));
-    sessions.save_to(&dir.join("sessions.json")).unwrap();
+}
+
+/// The pairing record of the profile at `dir`.
+fn record(dir: &Path) -> crate::records::PairingRecord {
+    crate::records::PairingRecord::load(&crate::paths::ProfilePaths::in_dir(dir).pairing)
+        .unwrap()
+        .unwrap()
 }
 
 /// The Astation end of a link.
@@ -359,17 +362,17 @@ struct Runtime {
     socket: PathBuf,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
-    /// The profile and key agent stand in for the user's on this thread.
+    /// The profile and cred agent stand in for the user's on this thread.
     _scopes: (crate::test_profile::Scope, crate::test_profile::Scope),
 }
 
 impl Runtime {
     /// The App linked to `peer_url` (already authenticated with `ASTATION`)
-    /// when given; else unlinked. `agent`: the key agent of the profile.
+    /// when given; else unlinked. `agent`: the cred agent of the profile.
     async fn start(
         dir: Rc<tempfile::TempDir>,
         peer_url: Option<&str>,
-        agent: Arc<dyn KeyAgentApi>,
+        agent: Arc<dyn CredAgentApi>,
     ) -> Self {
         let root = dir.path();
         let profile = root.join("profile");
@@ -379,12 +382,11 @@ impl Runtime {
             crate::test_profile::use_agent(agent.clone()),
         );
         let mut app = App::new();
-        // Never the user's sessions.json, never a real Astation.
+        // Never the user's profile, never a real Astation.
         app.last_session_refresh = Some(Instant::now());
         app.astation_reconnect = false;
         app.astation_client =
-            AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"))
-                .with_agent(agent.clone());
+            AstationClient::new_with_test_state(ATEM_ID, &profile).with_agent(agent.clone());
         if let Some(url) = peer_url {
             app.astation_client.connect_raw(url).await.unwrap();
             app.astation_client.pin_astation_for_test(ASTATION);
@@ -401,10 +403,10 @@ impl Runtime {
                 socket_dir: root.join("ws"),
                 chat_root: root.join("run"),
             }),
-            profile: Some(crate::status::Sources::in_dir(&profile)),
+            profile: Some(crate::profile::Sources::in_dir(&profile)),
             clock: Default::default(),
             // A link that's gone is reported well within the test's wait.
-            ops: OpEnv::for_profile(crate::status::Sources::in_dir(&profile), agent)
+            ops: OpEnv::for_profile(crate::profile::Sources::in_dir(&profile), agent)
                 .with_link_wait(Duration::from_secs(3)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -421,8 +423,8 @@ impl Runtime {
         }
     }
 
-    fn keys(&self) -> KeyPaths {
-        KeyPaths::in_dir(&self.profile)
+    fn keys(&self) -> CredPaths {
+        CredPaths::in_dir(&self.profile)
     }
 
     async fn client(&self) -> RuntimeClient {
@@ -612,7 +614,7 @@ impl Op {
 }
 
 /// Verification of the profile with `ASTATION` as `account`.
-fn verified_as(keys: &KeyPaths, account: &str) -> bool {
+fn verified_as(keys: &CredPaths, account: &str) -> bool {
     crate::memory::trust::TrustStore::load_from(&keys.trust)
         .ok()
         .and_then(|trust| trust.verified(ASTATION).map(|e| e.data_account == account))
@@ -620,7 +622,7 @@ fn verified_as(keys: &KeyPaths, account: &str) -> bool {
 }
 
 /// A pending pin (a verification under way) is on disk.
-fn pending(keys: &KeyPaths) -> bool {
+fn pending(keys: &CredPaths) -> bool {
     std::fs::read_to_string(&keys.trust)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -657,7 +659,7 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut frontend = rt.client().await;
         let session = rt.attached_session(&mut frontend).await;
@@ -710,7 +712,7 @@ fn a_cli_gone_mid_verification_aborts_it_and_a_late_certificate_is_dropped() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let (mut op, question, certificate) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
@@ -738,7 +740,7 @@ fn a_lost_link_fails_the_verification_without_replay() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut frontend = rt.client().await;
         let session = rt.attached_session(&mut frontend).await;
@@ -777,7 +779,7 @@ fn a_second_operation_is_refused_while_one_runs() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
         for kind in [OpKind::CredUnlock, OpKind::Pair, OpKind::PairVerify] {
@@ -800,7 +802,7 @@ fn a_reply_without_an_operation_is_dropped() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let verifier = FakeAstation::new();
         peer.send(&AstationMessage::DeviceVerified {
@@ -829,7 +831,7 @@ fn cred_unlock_runs_on_the_runtimes_link_while_sessions_stay_attached() {
         let profile = dir.path().join("profile");
         paired(&profile);
         let (keys, mut server, _) = sealed_device(&profile, "0a1b2c3d");
-        let agent: Arc<dyn KeyAgentApi> = Arc::new(test_agent(&keys));
+        let agent: Arc<dyn CredAgentApi> = Arc::new(test_agent(&keys));
         let (url, mut peer) = Peer::listen().await;
         let rt = Runtime::start(dir, Some(&url), agent.clone()).await;
         let mut frontend = rt.client().await;
@@ -897,7 +899,7 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
             ),
         )
         .unwrap();
-        let keys = KeyPaths::in_dir(&profile);
+        let keys = CredPaths::in_dir(&profile);
         let rt = Runtime::start(dir, None, Arc::new(test_agent(&keys))).await;
         let mut op = Op::start(rt.client().await, OpKind::Pair, OpOptions::default()).await;
 
@@ -940,7 +942,7 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
         peer.send(&AstationMessage::CredentialSync {
             access_token: "access".into(),
             refresh_token: "refresh".into(),
-            expires_at: crate::credentials::CredentialEntry::now_secs() + 3600,
+            expires_at: crate::credentials::now_secs() + 3600,
             login_id: Some("me".into()),
             astation_id: ASTATION.into(),
             save_credentials: true,
@@ -964,13 +966,11 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
                 .any(|l| l.contains("Paired with Astation. (SSO: me)"))
         );
 
-        let src = crate::status::Sources::in_dir(&rt.profile);
-        let binding = crate::pairing_binding::load(&src).unwrap().binding.unwrap();
+        let src = crate::profile::Sources::in_dir(&rt.profile);
+        let binding = crate::pairing::load(&src).unwrap().binding.unwrap();
         assert_eq!(binding.astation_id, ASTATION);
-        assert!(crate::runtime::ops::paired_fresh(
-            &src.credentials,
-            ASTATION
-        ));
+        assert!(fresh_shared(&rt.profile).is_some());
+        assert!(record(&rt.profile).save_credentials);
         assert!(verified_as(&rt.keys(), "acct-new"));
         // The pairing connection is the runtime's link: it attaches.
         let welcome = peer.hello().await;
@@ -986,22 +986,13 @@ fn the_token_op_saves_the_credentials_astation_sends() {
         let dir = Rc::new(short_dir());
         let profile = dir.path().join("profile");
         paired(&profile);
-        let creds = profile.join("credentials.enc");
-        let mut store = crate::credentials::CredentialStore::load_from(&creds);
-        store.upsert(crate::credentials::CredentialEntry::new_paired(
-            "old".into(),
-            "old-refresh".into(),
-            crate::credentials::CredentialEntry::now_secs() + 10,
-            None,
-            ASTATION.into(),
-            true,
-            1,
-        ));
-        store.save_to(&creds).unwrap();
+        crate::pairing::tests::edit(&profile, |record| {
+            record.shared.as_mut().unwrap().tokens.expires_at = crate::credentials::now_secs() + 10;
+        });
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&profile);
+        let keys = CredPaths::in_dir(&profile);
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
-        assert!(!crate::runtime::ops::paired_fresh(&creds, ASTATION));
+        assert!(fresh_shared(&profile).is_none());
         let options = OpOptions {
             astation_id: Some(ASTATION.into()),
             ..OpOptions::default()
@@ -1011,18 +1002,13 @@ fn the_token_op_saves_the_credentials_astation_sends() {
         peer.send(&AstationMessage::CredentialSync {
             access_token: "fresh".into(),
             refresh_token: "fresh-refresh".into(),
-            expires_at: crate::credentials::CredentialEntry::now_secs() + 3600,
+            expires_at: crate::credentials::now_secs() + 3600,
             login_id: None,
             astation_id: ASTATION.into(),
             save_credentials: true,
         });
         op.done().await.unwrap();
-        assert!(crate::runtime::ops::paired_fresh(&creds, ASTATION));
-        let mut store = crate::credentials::CredentialStore::load_from(&creds);
-        assert_eq!(
-            store.find_paired_mut(ASTATION).unwrap().access_token,
-            "fresh"
-        );
+        assert_eq!(fresh_shared(&profile).unwrap().access_token, "fresh");
         // Fresh already: answered without waiting.
         let options = OpOptions {
             astation_id: Some(ASTATION.into()),
@@ -1057,8 +1043,7 @@ fn unpair_then_reload_drops_the_link_and_its_attachment() {
         .await;
         assert!(!peer.drain(Duration::from_millis(300)).await);
         // `atem unpair` commits a new trust generation, then reloads.
-        crate::pairing_binding::commit_unpair(&crate::status::Sources::in_dir(&rt.profile))
-            .unwrap();
+        crate::pairing::unpair(&crate::profile::Sources::in_dir(&rt.profile)).unwrap();
         client.send(&ClientMsg::Reload).await.unwrap();
         expect(&mut client, |m| {
             matches!(m, RuntimeMsg::Notice { ref text } if text == "Reloaded").then_some(())
@@ -1125,7 +1110,7 @@ fn the_cli_side_renders_answers_and_ends_with_done() {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
         let (url, mut peer) = Peer::listen().await;
-        let keys = KeyPaths::in_dir(&dir.path().join("profile"));
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let client = rt.client().await;
         let mut script = Script {
@@ -1218,9 +1203,7 @@ async fn migrating_device(
     let base = stub_relay(relay.clone()).await;
     std::fs::write(
         profile.join("config.toml"),
-        format!(
-            "astation_relay_code = \"{ASTATION}\"\nastation_relay_url = \"{base}\"\ninstance_id = \"atem-1\"\n"
-        ),
+        format!("astation_relay_url = \"{base}\"\ninstance_id = \"atem-1\"\n"),
     )
     .unwrap();
     let mut device = crate::memory::fake_astation::UnlockedDevice::new(profile);
@@ -1264,8 +1247,8 @@ fn the_link_leaves_a_migration_to_the_operation_running_one() {
         let profile = dir.path().join("profile");
         let (device, _relay) = migrating_device(&profile).await;
         let (url, _peer) = Peer::listen().await;
-        let mut link = AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"))
-            .with_agent(device.agent.clone());
+        let mut link =
+            AstationClient::new_with_test_state(ATEM_ID, &profile).with_agent(device.agent.clone());
         link.connect_raw(&url).await.unwrap();
         link.pin_astation_for_test(ASTATION);
         // An operation (or another finish) is running one.
@@ -1305,34 +1288,76 @@ fn credentials_astation_sends_go_to_the_links_profile() {
         let mut app = App::new();
         app.last_session_refresh = Some(Instant::now());
         app.astation_reconnect = false;
-        app.astation_client =
-            AstationClient::new_with_test_state(ATEM_ID, profile.join("sessions.json"));
+        app.astation_client = AstationClient::new_with_test_state(ATEM_ID, &profile);
         app.astation_client.connect_raw(&url).await.unwrap();
         app.astation_client.pin_astation_for_test(ASTATION);
         app.astation_connected = true;
         app.handle_astation_message(AstationMessage::CredentialSync {
             access_token: "synced".into(),
             refresh_token: "r".into(),
-            expires_at: crate::credentials::CredentialEntry::now_secs() + 3600,
+            expires_at: crate::credentials::now_secs() + 3600,
             login_id: None,
             astation_id: ASTATION.into(),
             save_credentials: false,
         })
         .await;
-        let creds = profile.join("credentials.enc");
-        assert!(crate::runtime::ops::paired_fresh(&creds, ASTATION));
+        assert_eq!(fresh_shared(&profile).unwrap().access_token, "synced");
+        assert!(!record(&profile).save_credentials);
         app.on_astation_disconnect();
-        let mut store = crate::credentials::CredentialStore::load_from(&creds);
+        assert!(record(&profile).disconnected_at.is_some());
         assert!(
-            store
-                .find_paired_mut(ASTATION)
-                .unwrap()
-                .disconnected_at
-                .is_some()
-        );
-        assert!(
-            !elsewhere.join("credentials.enc").exists(),
+            !crate::paths::ProfilePaths::in_dir(&elsewhere)
+                .pairing
+                .record
+                .exists(),
             "only the link's profile"
         );
+    });
+}
+
+/// A runtime of another build is never replaced while an Astation
+/// operation runs: `restart` is refused and the client keeps it, saying why.
+#[test]
+fn the_runtime_is_not_replaced_while_an_operation_runs() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir.clone(), Some(&url), Arc::new(test_agent(&keys))).await;
+        let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let mut other = rt.client().await;
+        other.send(&ClientMsg::Restart).await.unwrap();
+        let refused = expect(&mut other, |m| match m {
+            RuntimeMsg::Error { text, op } if op.as_deref() == Some("restart") => Some(text),
+            _ => None,
+        })
+        .await;
+        assert!(
+            refused.starts_with(crate::runtime::client::BUSY_RESTART),
+            "{refused}"
+        );
+        // The client's replacement keeps it and says why.
+        let locator = crate::runtime::client::Locator::in_dir(dir.path());
+        let start = || anyhow::bail!("never started while the runtime runs");
+        let mut notes = Vec::new();
+        let client = crate::runtime::client::replace_other_build(
+            rt.client().await,
+            &locator,
+            "0.0.0+another-build",
+            &start,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.welcome.pid, std::process::id());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Astation operation"), "{notes:?}");
+        assert!(!locator.replaced.exists(), "no replacement recorded");
+        // The operation goes on.
+        op.answer(question, AnswerValue::No).await;
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        rt.shutdown().await;
     });
 }

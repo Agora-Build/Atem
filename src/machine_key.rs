@@ -1,0 +1,111 @@
+//! Machine-bound encryption: AES-256-GCM under a key derived from this
+//! machine's id, so a copied file can't be opened on another machine. Used by
+//! `login.enc`, `pairing/pairing.enc` and `project_cache.enc`.
+//!
+//! Dependency-light (aes-gcm, hmac, sha2, rand), so binary tests include
+//! this file (`#[path]`) to write fixtures the binary can read.
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+use anyhow::{Result, anyhow, bail};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+fn derive_key() -> [u8; 32] {
+    let id = machine_id();
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"atem-credentials-v1").expect("hmac");
+    mac.update(id.as_bytes());
+    let out = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out[..32]);
+    key
+}
+
+fn machine_id() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/etc/machine-id") {
+            return s.trim().to_string();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+        {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for line in s.lines() {
+                if let Some((_, rest)) = line.split_once("IOPlatformUUID")
+                    && let Some(v) = rest.split('"').nth(1)
+                {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    format!("{host}-{user}")
+}
+
+/// The purpose of each machine-bound file, bound into its ciphertext as
+/// associated data: one file can't be swapped for another.
+pub const LOGIN: &str = "atem-login-v1";
+pub const PAIRING: &str = "atem-pairing-v1";
+pub const PROJECT_CACHE: &str = "atem-project-cache-v1";
+
+/// `plain` encrypted for `purpose`: a 12-byte nonce, then the ciphertext.
+pub fn encrypt(purpose: &str, plain: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+    use rand::RngCore;
+    let key = derive_key();
+    let cipher = Aes256Gcm::new((&key).into());
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plain,
+                aad: purpose.as_bytes(),
+            },
+        )
+        .map_err(|e| anyhow!("encrypt: {e}"))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// What `encrypt` made on this machine for `purpose` (an error for
+/// anything else).
+pub fn decrypt(purpose: &str, raw: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+    if raw.len() < 12 {
+        bail!("ciphertext too short");
+    }
+    let (nonce_bytes, ct) = raw.split_at(12);
+    let key = derive_key();
+    let cipher = Aes256Gcm::new((&key).into());
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ct,
+                aad: purpose.as_bytes(),
+            },
+        )
+        .map_err(|e| anyhow!("decrypt: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_opens_only_for_its_own_purpose() {
+        let sealed = encrypt(LOGIN, b"secret").unwrap();
+        assert_eq!(decrypt(LOGIN, &sealed).unwrap(), b"secret");
+        assert!(decrypt(PAIRING, &sealed).is_err());
+        assert!(decrypt(LOGIN, b"short").is_err());
+    }
+}

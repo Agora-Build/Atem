@@ -121,7 +121,7 @@ echo
 
 # ── Config ───────────────────────────────────────────────────────────
 echo "$(yellow "Config")"
-run_contains "atem config show"        "SSO"             -- "$ATEM" config show
+run_contains "atem config show"        "Login:"          -- "$ATEM" config show
 echo
 
 # ── Project ──────────────────────────────────────────────────────────
@@ -131,11 +131,11 @@ echo
 
 # ── List (requires SSO login or cache) ───────────────────────────────
 echo "$(yellow "List (requires SSO login)")"
-if [[ -f "$HOME/.config/atem/credentials.enc" ]]; then
+if [[ -f "$HOME/.config/atem/login.enc" || -f "$HOME/.config/atem/pairing/pairing.enc" ]]; then
     run "atem project list"                      -- "$ATEM" project list
     run "atem project list --show-certificates"  -- "$ATEM" project list --show-certificates
 else
-    skip "atem project list"                    "no credentials.enc — run atem login first"
+    skip "atem project list"                    "no login.enc or pairing — run atem login first"
     skip "atem project list --show-certificates" "needs SSO"
 fi
 echo

@@ -1,5 +1,7 @@
 # Atem Pair + SSO Credentials Design
 
+> **Storage superseded (2026-10-19):** the user's login is `~/.config/atem/login.enc` and the one pairing is `~/.config/atem/pairing/` (`pairing.enc`, `trust_gen`); see AGENTS.md "Configuration & Storage". This document is kept as history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Replace `sso_session.json` with a unified machine-bound encrypted `credentials.enc` that holds both own-SSO and Astation-paired credentials; re-introduce `atem pair` so pairing with Astation distributes SSO tokens to Atem.

@@ -52,7 +52,7 @@ mod tests {
     #[test]
     fn migration_agent_signs_only_the_current_verified_pending_state() {
         use crate::memory::fake_astation::{ASTATION_ID, UnlockedDevice};
-        use crate::memory::key_agent::KeyAgentApi;
+        use crate::memory::cred_agent::CredAgentApi;
         use crate::memory::statements::verify_device;
         use crate::memory::trust::TrustStore;
         let directory = tempfile::tempdir().unwrap();

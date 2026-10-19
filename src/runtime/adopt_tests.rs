@@ -510,7 +510,8 @@ fn records_and_specs_are_private_files() {
     };
     worker::write_spec(&state, &spec).unwrap();
     let text = std::fs::read_to_string(worker::spec_path(&state, &spec.session_id)).unwrap();
-    assert!(!text.contains("env"), "{text}");
+    // No `env` field (a random session id may contain the letters).
+    assert!(!text.contains("\"env\""), "{text}");
     assert_eq!(worker::read_spec(&state, &spec.session_id).unwrap(), spec);
     assert!(worker::read_spec(&state, &SessionId::new().to_string()).is_err());
 }

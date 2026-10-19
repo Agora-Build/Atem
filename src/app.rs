@@ -439,9 +439,6 @@ impl App {
             // 2. Relay (wss://station.agora.build) - remote connection
 
             let local_url = config.astation_ws();
-            let session = crate::auth::AuthSession::load_saved();
-
-            // Try local connection first
             let mut client = crate::websocket_client::AstationClient::new();
 
             // A refused or missing saved session is worth telling a
@@ -453,26 +450,9 @@ impl App {
                 }
             };
 
-            // If we have a valid session, try local with session auth
-            if let Some(ref sess) = session {
-                if sess.is_valid() {
-                    match client
-                        .connect_with_session(local_url, &sess.session_id)
-                        .await
-                    {
-                        Ok(()) => {
-                            let _ = tx.send(Ok((client, None)));
-                            return;
-                        }
-                        Err(error) => note(error),
-                    }
-                }
-            }
-
-            // No valid session: try local without pairing (loopback bootstrap proof)
-            let mut client = crate::websocket_client::AstationClient::new();
-            let local_url = config.astation_ws().to_string();
-            match client.connect_without_pairing(&local_url).await {
+            // Local first: the pairing's saved session, else the loopback
+            // bootstrap proof (never pairing).
+            match client.connect_without_pairing(local_url).await {
                 Ok(()) => {
                     let _ = tx.send(Ok((client, Some("local".to_string()))));
                     return;
@@ -480,8 +460,13 @@ impl App {
                 Err(error) => note(error),
             }
 
-            // Local unavailable — try relay identity if configured
-            if let Some(relay_code) = config.astation_relay_code.clone() {
+            // Local unavailable: the paired Astation's identity room on the
+            // relay (no pairing, no relay connection).
+            let paired = crate::profile::Sources::current()
+                .ok()
+                .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing).ok().flatten())
+                .map(|record| record.astation_id);
+            if let Some(relay_code) = paired {
                 let relay_url = config.astation_relay_url().to_string();
                 let mut relay_client = crate::websocket_client::AstationClient::new();
                 match relay_client
@@ -517,9 +502,6 @@ impl App {
                     self.pairing_code = code;
                     self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
-
-                    // Refresh session on successful connection
-                    self.refresh_saved_session();
                 }
                 Ok(Err(error)) => {
                     self.astation_connect_error = error
@@ -689,21 +671,23 @@ impl App {
                 // Only for the pairing this connection authenticated under:
                 // never re-creates a pairing removed (or replaced) meanwhile.
                 // In the link's own profile (never another one).
-                let profile = self.astation_client.profile();
-                let saved = self.astation_client.apply_bound(&astation_id, || {
-                    let path = profile?.credentials;
-                    let mut store = crate::credentials::CredentialStore::load_from(&path);
-                    let now = crate::credentials::CredentialEntry::now_secs();
-                    store.upsert(crate::credentials::CredentialEntry::new_paired(
-                        access_token,
-                        refresh_token,
-                        expires_at,
+                let saved = self.astation_client.profile().and_then(|src| {
+                    let login = crate::records::Login::shared_by_astation(
                         login_id.clone(),
-                        astation_id.clone(),
-                        save_credentials,
-                        now,
-                    ));
-                    store.save_to(&path)
+                        crate::records::Tokens {
+                            access_token,
+                            refresh_token,
+                            expires_at,
+                        },
+                    );
+                    self.astation_client.apply_bound(&astation_id, || {
+                        crate::records::PairingRecord::receive_login(
+                            &src.paths.pairing,
+                            &astation_id,
+                            login,
+                            Some(save_credentials),
+                        )
+                    })
                 });
                 if let Err(e) = saved {
                     self.status_message = Some(format!("Paired credentials not saved: {e:#}"));
@@ -722,29 +706,20 @@ impl App {
         }
     }
 
-    /// Called when the Astation WebSocket connection drops.
-    /// Marks any paired credential entries for that Astation with `disconnected_at`
-    /// so the grace-period logic in `CredentialStore::resolve` can take effect.
+    /// Called when the Astation WebSocket connection drops: the pairing
+    /// records when, so its shared login's grace period starts
+    /// (`PairingRecord::usable_shared`).
     pub fn on_astation_disconnect(&mut self) {
         // The link's own profile (never another one).
+        // Only under the pairing this link authenticated with.
         if let Some(aid) = self.connected_astation_id.take()
             && let Ok(profile) = self.astation_client.profile()
         {
-            let mut store = crate::credentials::CredentialStore::load_from(&profile.credentials);
-            if let Some(entry) = store.find_paired_mut(&aid) {
-                entry.disconnected_at = Some(crate::credentials::CredentialEntry::now_secs());
-                let _ = store.save_to(&profile.credentials);
-            }
-        }
-    }
-
-    /// Keeps the link profile's saved session (`session.json`) fresh.
-    fn refresh_saved_session(&self) {
-        if let Ok(path) = self.astation_client.saved_session_file()
-            && let Some(mut session) = crate::auth::AuthSession::load_saved_from(&path)
-        {
-            session.refresh();
-            let _ = session.save_to(&path);
+            let _ = self.astation_client.apply_bound(&aid, || {
+                crate::records::PairingRecord::update_locked(&profile.paths.pairing, &aid, |record| {
+                    record.disconnected_at = Some(crate::credentials::now_secs());
+                })
+            });
         }
     }
 
@@ -950,7 +925,7 @@ impl App {
         // Refresh session activity if we received any messages
         if message_count > 0 && self.last_session_refresh.is_none_or(|last| last.elapsed() >= Duration::from_secs(60)) {
             self.last_session_refresh = Some(Instant::now());
-            self.refresh_saved_session();
+            let _ = self.astation_client.refresh_session();
         }
     }
 
@@ -1079,6 +1054,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            worker_build: None,
         };
         app.runtime_sessions = vec![
             session("ses-aaaaaaaaaaaa", "running"),

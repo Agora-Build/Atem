@@ -1,4 +1,4 @@
-//! The key agent: this device's unlocked keys, in memory only, like
+//! The cred agent: this device's unlocked keys, in memory only, like
 //! ssh-agent. It never talks to the network: the CLI carries its requests
 //! to Astation and Astation's answers back. Keys are wiped on `Lock` and
 //! when the process exits. See designs/e2e-encryption.md "Keys on disk (atem)".
@@ -6,7 +6,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -15,7 +14,6 @@ use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey, decode32};
 use crate::memory::encoding::dec;
 use crate::memory::crypto::EncryptionMode;
 use crate::memory::grant::{GrantWire, hpke_open, hpke_seal, open_grant as open_sealed_grant};
-use crate::memory::legacy_keys::{self, Legacy};
 use crate::memory::statements::{
     SignedWire, StorageAbandon, StorageConfirm, StorageRotate, UnlockRequest, sealed_hash,
     storage_key_info, unlock_info,
@@ -25,7 +23,8 @@ use crate::memory::storage_key::{
     check_storage_ack, check_unlock_grant, new_storage_key, new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::{KeyPaths, effective_state, newest_states};
+use crate::memory::verification::{effective_state, newest_states};
+use crate::paths::CredPaths;
 
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
 /// other version with an error, so an old agent and a newer CLI fail clearly.
@@ -35,7 +34,35 @@ pub const PROTOCOL_VERSION: u64 = 2;
 pub const LOCKED: &str = "this device's keys are locked; run `atem cred unlock`";
 
 /// What to do about an unlocked agent started by an older atem build.
-pub const OLDER_BUILD: &str = "The key agent was started by another atem build; run `atem cred lock`, then `atem cred unlock` to use this one.";
+pub const OLDER_BUILD: &str = "The cred agent was started by another atem build; run `atem cred lock`, then `atem cred unlock` to use this one.";
+/// The same when Atem's runtime, which starts the agent for `atem cred
+/// unlock`, is another build too: unlocking again would start that build.
+pub const OLDER_RUNTIME: &str = "The cred agent was started by another atem build, and Atem's runtime is another build too; run `atem runtime restart`, then `atem cred lock` and `atem cred unlock` to use this one.";
+
+/// The warning for an unlocked agent of another build: `OLDER_RUNTIME`
+/// when Atem's runtime is another build too, else `OLDER_BUILD`.
+pub fn older_build_warning(runtime_differs: bool) -> &'static str {
+    if runtime_differs {
+        OLDER_RUNTIME
+    } else {
+        OLDER_BUILD
+    }
+}
+
+/// Whether a running `atem runtime` is another build than this one (a
+/// passive look within `client::LOOK_TIMEOUT`; never inside the runtime).
+pub fn runtime_differs() -> bool {
+    if crate::runtime::in_runtime() {
+        return false;
+    }
+    match crate::runtime::client::look(
+        &crate::runtime::client::Locator::default_paths(),
+        crate::runtime::client::LOOK_TIMEOUT,
+    ) {
+        crate::runtime::client::Look::Running { welcome, .. } => welcome.build != build_id(),
+        _ => false,
+    }
+}
 
 /// This build's identity: the version plus the size and modification time
 /// of the executable as it was when this process started. A rebuild (or an
@@ -47,6 +74,9 @@ pub const OLDER_BUILD: &str = "The key agent was started by another atem build; 
 pub fn build_id() -> &'static str {
     static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| {
+        if let Some(build) = crate::runtime::test_hooks::build() {
+            return build;
+        }
         #[cfg(target_os = "linux")]
         let exe = std::fs::metadata("/proc/self/exe");
         #[cfg(not(target_os = "linux"))]
@@ -68,7 +98,7 @@ pub fn build_id() -> &'static str {
 }
 
 /// Appended to key-file errors, which never stop the agent (it starts locked).
-pub const RESET: &str = "To set this device up again: move ~/.config/atem/device_keys, device_keys.sealed, device_keys.sealed.next, device_keys.sealed.prev, unlock_auth_key and cred_state.json into a backup folder (don't delete them: device_keys.sealed holds the memory encryption key and its older keys, which older data may need), then run `atem unpair` and `atem pair`. Astation grants the current memory key again; older keys come back only from that backup.";
+pub const RESET: &str = "To set this device up again: move ~/.config/atem/cred into a backup folder (don't delete it: its device_keys.sealed holds the memory encryption key and its older keys, which older data may need), then run `atem unpair` and `atem pair`. Astation grants the current memory key again; older keys come back only from that backup.";
 
 /// What the agent serves. Only the same user can reach it (agent_socket.rs).
 /// Fields that carry secrets are `Zeroizing`.
@@ -97,7 +127,7 @@ pub enum Request {
     },
     /// Opens a `K` grant from a verified Astation and stores `K` in the
     /// sealed file (it is never handed back). The grant must name the kid
-    /// of the account's newest signed state in cred_state.json (across
+    /// of the account's newest signed state in cred/state.json (across
     /// every verified Astation naming the account).
     InstallGrant {
         astation_id: String,
@@ -172,9 +202,8 @@ pub enum Reply {
         unlocked: bool,
         storage_kid: Option<String>,
         escrowed: bool,
-        /// The agent's `build_id`; absent from an agent older than the field.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        build: Option<String>,
+        /// The agent's `build_id`.
+        build: String,
     },
     PublicKeys {
         device_pub: String,
@@ -228,9 +257,10 @@ pub struct AgentStatus {
     pub storage_kid: Option<String>,
     /// Whether the home Astation holds that storage key.
     pub escrowed: bool,
-    /// The agent was started by another atem build than this one (or one
-    /// that doesn't say).
+    /// The agent was started by another atem build than this one.
     pub older_build: bool,
+    /// The agent's build.
+    pub build: String,
 }
 
 struct Unlocked {
@@ -302,8 +332,8 @@ pub fn build_unlock_request(
     unlock_auth.sign_statement(&statement)
 }
 
-pub struct KeyAgent {
-    paths: KeyPaths,
+pub struct CredAgent {
+    paths: CredPaths,
     unlocked: Option<Unlocked>,
     pending_unlock: Option<PendingUnlock>,
     pending_rotation: Option<PendingRotation>,
@@ -335,13 +365,13 @@ pub(crate) fn open_sealed_checked(
     sealed.open_with_accounts(storage_key, unlock_auth)
 }
 
-impl KeyAgent {
+impl CredAgent {
     /// An agent for the key files in `paths`: locked, unless a plain
     /// `device_keys` file is migrated (then unlocked, not yet escrowed).
     /// First it sweeps the temps crashed writers left beside those files.
     /// A migration or key-file error never stops the agent: it starts locked
     /// and logs the error and how to start over.
-    pub fn new(paths: KeyPaths) -> Result<Self> {
+    pub fn new(paths: CredPaths) -> Result<Self> {
         // Temps a crashed writer left behind can hold key material.
         for path in [
             &paths.trust,
@@ -351,7 +381,6 @@ impl KeyAgent {
             &paths.device_keys_prev,
             &paths.unlock_auth_key,
             &paths.agent_socket,
-            &paths.data_keys,
             &paths.project_names,
         ] {
             crate::memory::crypto::sweep_stale_temps(path);
@@ -366,13 +395,11 @@ impl KeyAgent {
             prune_failures_logged: 0,
         };
         if let Err(error) = agent.migrate_plain_keys() {
-            eprintln!("key agent: {error:#}");
+            eprintln!("cred agent: {error:#}");
             agent.wipe();
         }
         if agent.unlocked.is_some() {
-            agent.after_unlock();
-        } else if let Err(error) = agent.drop_unverified_data_keys() {
-            eprintln!("key agent: {error:#}");
+            agent.prune_retired();
         }
         Ok(agent)
     }
@@ -479,7 +506,7 @@ impl KeyAgent {
                 unlocked: true,
                 storage_kid: Some(unlocked.storage_kid.clone()),
                 escrowed: unlocked.escrowed,
-                build: Some(build_id().to_string()),
+                build: build_id().to_string(),
             },
             None => Reply::Status {
                 unlocked: false,
@@ -489,7 +516,7 @@ impl KeyAgent {
                     .find_map(|path| SealedDeviceKeys::load_from(path).ok().flatten())
                     .map(|sealed| sealed.storage_kid),
                 escrowed: false,
-                build: Some(build_id().to_string()),
+                build: build_id().to_string(),
             },
         }
     }
@@ -505,7 +532,7 @@ impl KeyAgent {
     ) -> Result<Reply> {
         // A concurrent pairing run must not replace keys another one loaded.
         if self.unlocked.is_some() {
-            bail!("the key agent already holds keys; run `atem cred lock` first");
+            bail!("the cred agent already holds keys; run `atem cred lock` first");
         }
         if !crate::memory::crypto::valid_kid(&storage_kid) {
             bail!("storage key id must be 8 lowercase hex characters");
@@ -643,7 +670,7 @@ impl KeyAgent {
                 let message = format!("{error:#}");
                 let retry = was_unsaved && self.last_prune_error.is_some();
                 if !retry && self.last_prune_error.as_deref() != Some(message.as_str()) {
-                    eprintln!("key agent: could not prune the account keys: {message}");
+                    eprintln!("cred agent: could not prune the account keys: {message}");
                     #[cfg(test)]
                     {
                         self.prune_failures_logged += 1;
@@ -730,142 +757,6 @@ impl KeyAgent {
         )?
         .save_to(held)?;
         Ok(())
-    }
-
-    /// Once unlocked (and at the first escrow): moves a leftover
-    /// data_keys.enc in, then drops account keys a signed state retired
-    /// while the agent was locked. Never fatal: logged, and the move is
-    /// tried again at the next unlock.
-    fn after_unlock(&mut self) {
-        if let Err(error) = self.migrate_data_keys() {
-            eprintln!(
-                "key agent: data_keys.enc not moved yet (tried again at the next unlock): {error:#}"
-            );
-        }
-        self.prune_retired();
-    }
-
-    /// Moves data_keys.enc (build steps 0–2a) into this agent: the project
-    /// names of every verified account into project_names.json, then `K`
-    /// and its previous keys into the sealed file (merged: a newer `K` the
-    /// agent holds stays current), and data_keys.enc is deleted last, only
-    /// once the home Astation is known to hold the storage key of the file
-    /// the keys now live in (escrowed, and not unlocked via `.prev`), and
-    /// only when every entry of every verified account parsed: a malformed
-    /// one keeps the file (logged at each unlock), while the account's
-    /// valid keys still move. Every crash point leaves data_keys.enc, or the
-    /// keys durably re-sealed; the next unlock repeats the merge, which
-    /// changes nothing the second time.
-    ///
-    /// Before the first escrow the file stays: an agent restarted then
-    /// re-seals the plain device_keys under a new storage key with no
-    /// account keys (the old sealed file can't be opened), and the keys come
-    /// back from data_keys.enc. A `K` granted on such a device (held only in
-    /// the sealed file) is lost by that restart, with any previous keys only
-    /// it held: atem asks Astation for the current `K` again (keyRequest),
-    /// but older keys may not be granted again.
-    ///
-    /// cred_state.json's lock is held throughout (before project_names.lock,
-    /// the order everywhere), so a first verification's purge of what the
-    /// unauthenticated path stored can't interleave with this read.
-    fn migrate_data_keys(&mut self) -> Result<()> {
-        if !exists(&self.paths.data_keys)? {
-            return Ok(());
-        }
-        let _trust_lock = TrustStore::lock(&self.paths.trust)?;
-        let legacy = match legacy_keys::read(&self.paths.data_keys)? {
-            Legacy::Missing => return Ok(()),
-            // It can never be read on this machine; K comes back by a signed
-            // grant. Kept aside, never deleted (another machine id may read it).
-            Legacy::Unreadable(error) => {
-                legacy_keys::move_aside(&self.paths.data_keys, &error)?;
-                eprintln!(
-                    "key agent: moved data_keys.enc aside: it can't be read ({error:#}); atem asks Astation for the encryption key again"
-                );
-                return Ok(());
-            }
-            Legacy::Keys(legacy) => legacy,
-        };
-        let verified: BTreeSet<String> = TrustStore::load_from(&self.paths.trust)?
-            .verified_entries()
-            .map(|entry| entry.data_account.clone())
-            .collect();
-        // The names first: no secrets, merged, so a repeat is harmless.
-        for (account, names) in legacy.names_for(&verified) {
-            crate::memory::project_names::remember(&self.paths.project_names, &account, names)?;
-        }
-        let unlocked = self.unlocked()?;
-        let (escrowed, via_prev) = (unlocked.escrowed, unlocked.via_prev);
-        let mut accounts = unlocked.accounts.clone();
-        let mut changed = false;
-        let found = legacy.keys_for(&verified);
-        for (account, current, previous) in found.keys {
-            changed |= accounts.merge(&account, current, previous);
-        }
-        if changed {
-            // Sealed (and a pending rotation's .next) before anything goes.
-            self.persist(&accounts)?;
-            self.unlocked.as_mut().expect("unlocked above").accounts = accounts;
-        }
-        // An entry that didn't parse may still be readable some other way
-        // (or by a fixed atem): the file stays, the valid keys are in.
-        if !found.unreadable.is_empty() {
-            eprintln!(
-                "key agent: kept data_keys.enc: some keys of {} can't be read (the readable ones were moved)",
-                found
-                    .unreadable
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        } else if escrowed && !via_prev {
-            remove_synced(&self.paths.data_keys)?;
-            eprintln!(
-                "key agent: moved data_keys.enc into device_keys.sealed and project_names.json"
-            );
-        }
-        Ok(())
-    }
-
-    /// An unverified device never used data_keys.enc (step 1 ignores it):
-    /// it holds only what the unauthenticated #36 path stored, so it is
-    /// deleted at agent start. An unreadable one is moved aside instead.
-    fn drop_unverified_data_keys(&self) -> Result<()> {
-        if !exists(&self.paths.data_keys)? {
-            return Ok(());
-        }
-        let _trust_lock = TrustStore::lock(&self.paths.trust)?;
-        if TrustStore::load_from(&self.paths.trust)?
-            .verified_entries()
-            .next()
-            .is_some()
-        {
-            return Ok(());
-        }
-        match legacy_keys::read(&self.paths.data_keys)? {
-            Legacy::Missing => {}
-            Legacy::Unreadable(error) => legacy_keys::move_aside(&self.paths.data_keys, &error)?,
-            Legacy::Keys(_) => {
-                remove_synced(&self.paths.data_keys)?;
-                eprintln!(
-                    "key agent: deleted data_keys.enc: this device isn't verified, so it was never used"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Test view: the current kid and previous kids held for `account`.
-    #[cfg(test)]
-    pub(crate) fn kids_for_test(&self, account: &str) -> (Option<String>, Vec<String>) {
-        match &self.unlocked {
-            Some(unlocked) => (
-                unlocked.accounts.current_kid(account).map(str::to_string),
-                unlocked.accounts.previous_kids(account),
-            ),
-            None => (None, Vec::new()),
-        }
     }
 
     /// The pins of the home Astation, which must be `astation_id`.
@@ -1049,7 +940,7 @@ impl KeyAgent {
             via_prev: source == SealedFile::Prev,
             unsaved: false,
         });
-        self.after_unlock();
+        self.prune_retired();
         Ok(Reply::Unlocked {
             storage_kid: granted.storage_kid,
         })
@@ -1173,9 +1064,8 @@ impl KeyAgent {
         unlocked.storage_kid = pending.storage_kid.clone();
         unlocked.storage_key = pending.storage_key;
         unlocked.escrowed = true;
-        // Astation now holds the key of the file data_keys.enc was moved into.
         if first_escrow {
-            self.after_unlock();
+            self.prune_retired();
         }
         Ok(Reply::Confirmed {
             storage_kid: pending.storage_kid,
@@ -1277,7 +1167,7 @@ impl KeyAgent {
         let Some(keys) = DeviceKeys::load_from(&self.paths.device_keys)? else {
             return Ok(());
         };
-        // The whole migration reads and writes cred_state.json under its lock.
+        // The whole migration reads and writes cred/state.json under its lock.
         let _trust_lock = TrustStore::lock(&self.paths.trust)?;
         let mut trust = TrustStore::load_from(&self.paths.trust)?;
         // A crash after the first escrow was recorded but before the plain
@@ -1292,10 +1182,10 @@ impl KeyAgent {
         let Some(home) = trust.home_or_first_verified() else {
             if trust.home_is_set() {
                 eprintln!(
-                    "key agent: the home Astation is no longer verified; device_keys left as it is"
+                    "cred agent: the home Astation is no longer verified; device_keys left as it is"
                 );
             } else {
-                eprintln!("key agent: device_keys belongs to no verified Astation; left as it is");
+                eprintln!("cred agent: device_keys belongs to no verified Astation; left as it is");
             }
             return Ok(());
         };
@@ -1336,7 +1226,7 @@ impl KeyAgent {
         trust.save_to(&self.paths.trust)?;
         // The plain file stays until Astation confirms the first escrow.
         eprintln!(
-            "key agent: sealed device_keys under storage key {storage_kid}; run `atem cred unlock` to hand it to Astation {home}"
+            "cred agent: sealed device_keys under storage key {storage_kid}; run `atem cred unlock` to hand it to Astation {home}"
         );
         self.unlocked = Some(Unlocked {
             keys,
@@ -1362,7 +1252,7 @@ enum SealedFile {
 
 /// Renames the current sealed file to `.prev`, then `.next` over it. A crash
 /// between the renames leaves `.prev` + `.next`, which unlock also accepts.
-fn promote_keeping_prev(paths: &KeyPaths) -> Result<()> {
+fn promote_keeping_prev(paths: &CredPaths) -> Result<()> {
     if paths.device_keys_sealed.exists() {
         std::fs::rename(&paths.device_keys_sealed, &paths.device_keys_prev)?;
     }
@@ -1378,35 +1268,17 @@ fn exists(path: &std::path::Path) -> Result<bool> {
     }
 }
 
-/// Deletes `path` (absent is fine) and syncs its directory, so the deletion
-/// survives a crash.
-fn remove_synced(path: &std::path::Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    std::fs::File::open(
-        path.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new(".")),
-    )?
-    .sync_all()?;
-    Ok(())
-}
-
 /// Deletes the plain `device_keys` file (absent is fine).
-fn remove_plain_keys(paths: &KeyPaths) -> Result<()> {
+fn remove_plain_keys(paths: &CredPaths) -> Result<()> {
     match std::fs::remove_file(&paths.device_keys) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),
     }
 }
 
-/// How callers talk to the agent: over its socket (`KeyAgentClient`), or
-/// in process (`Mutex<KeyAgent>`, used by tests and by the socket server).
-pub trait KeyAgentApi: Send + Sync {
+/// How callers talk to the agent: over its socket (`CredAgentClient`), or
+/// in process (`Mutex<CredAgent>`, used by tests and by the socket server).
+pub trait CredAgentApi: Send + Sync {
     fn call(&self, request: Request) -> Result<Reply>;
 
     fn credential_projects(&self, astation_id: &str, current_project: Option<String>) -> Result<super::credential_projects::ProjectReportWire> {
@@ -1435,7 +1307,8 @@ pub trait KeyAgentApi: Send + Sync {
                 unlocked,
                 storage_kid,
                 escrowed,
-                older_build: build.as_deref() != Some(build_id()),
+                older_build: build != build_id(),
+                build,
             }),
             _ => unexpected(),
         }
@@ -1510,7 +1383,7 @@ pub trait KeyAgentApi: Send + Sync {
         }
     }
 
-    /// The signed abandon for a pending key id (see `KeyAgent::abandon_pending`).
+    /// The signed abandon for a pending key id (see `CredAgent::abandon_pending`).
     fn abandon_pending(&self, astation_id: &str, storage_kid: &str) -> Result<SignedWire> {
         match self.call(Request::AbandonPending {
             astation_id: astation_id.into(),
@@ -1592,7 +1465,7 @@ pub trait KeyAgentApi: Send + Sync {
         })? {
             Reply::Crypted { results } if results.len() == count => Ok(results),
             Reply::Crypted { .. } => {
-                bail!("the key agent answered a different number of operations")
+                bail!("the cred agent answered a different number of operations")
             }
             _ => unexpected(),
         }
@@ -1629,19 +1502,19 @@ pub trait KeyAgentApi: Send + Sync {
 }
 
 fn unexpected<T>() -> Result<T> {
-    bail!("the key agent sent an unexpected reply")
+    bail!("the cred agent sent an unexpected reply")
 }
 
-impl KeyAgentApi for std::sync::Mutex<KeyAgent> {
+impl CredAgentApi for std::sync::Mutex<CredAgent> {
     fn call(&self, request: Request) -> Result<Reply> {
         self.lock()
-            .map_err(|_| anyhow!("the key agent's state is poisoned"))?
+            .map_err(|_| anyhow!("the cred agent's state is poisoned"))?
             .handle(request)
     }
 }
 
-/// A shared agent (`EncryptionContext` holds an `Arc<dyn KeyAgentApi>`).
-impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T> {
+/// A shared agent (`EncryptionContext` holds an `Arc<dyn CredAgentApi>`).
+impl<T: CredAgentApi + ?Sized> CredAgentApi for std::sync::Arc<T> {
     fn call(&self, request: Request) -> Result<Reply> {
         (**self).call(request)
     }
@@ -1653,13 +1526,13 @@ impl<T: KeyAgentApi + ?Sized> KeyAgentApi for std::sync::Arc<T> {
 
 /// This user's agent, started on first use (lazily: nothing connects until
 /// a request is made).
-pub fn default_agent() -> Box<dyn KeyAgentApi> {
-    // Tests never reach the user's key agent (src/test_profile.rs).
+pub fn default_agent() -> Box<dyn CredAgentApi> {
+    // Tests never reach the user's cred agent (src/test_profile.rs).
     #[cfg(test)]
     return Box::new(crate::test_profile::Injected(crate::test_profile::agent()));
     #[cfg(all(unix, not(test)))]
     {
-        Box::new(crate::memory::agent_socket::KeyAgentClient::autostart())
+        Box::new(crate::memory::agent_socket::CredAgentClient::autostart())
     }
     #[cfg(not(unix))]
     {
@@ -1683,11 +1556,40 @@ pub async fn blocking<T: Send + 'static>(
     };
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|error| anyhow!("the key agent call didn't finish: {error}"))?
+        .map_err(|error| anyhow!("the cred agent call didn't finish: {error}"))?
+}
+
+/// What a passive look at the running cred agent found: `None` when none
+/// runs, else its status and pid (from its lock), or why it didn't answer.
+pub type AgentLook = Option<Result<(AgentStatus, Option<u32>), String>>;
+
+/// Asks the running cred agent for its status within `timeout`: never
+/// starts one and never writes (`atem status`, `atem --version`).
+pub fn look(paths: &CredPaths, timeout: std::time::Duration) -> AgentLook {
+    let client = crate::memory::agent_socket::CredAgentClient::for_paths(
+        paths,
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        None,
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let found = client
+            .is_running()
+            .then(|| client.status().map_err(|e| format!("{e:#}")));
+        let _ = tx.send(found);
+    });
+    let found = match rx.recv_timeout(timeout) {
+        Ok(found) => found?,
+        Err(_) => Err("it didn't answer in time".to_string()),
+    };
+    let pid = (crate::daemon::lock_is_held(&paths.agent_lock) == Some(true))
+        .then(|| crate::daemon::read_lock_pid(&paths.agent_lock))
+        .flatten();
+    Some(found.map(|status| (status, pid)))
 }
 
 /// The running agent, without starting one.
-pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
+pub fn running_agent() -> Option<Box<dyn CredAgentApi>> {
     #[cfg(test)]
     {
         Some(Box::new(crate::test_profile::Injected(crate::test_profile::agent())))
@@ -1696,7 +1598,7 @@ pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
     {
         #[cfg(unix)]
         {
-            let client = crate::memory::agent_socket::KeyAgentClient::existing();
+            let client = crate::memory::agent_socket::CredAgentClient::existing();
             if client.is_running() {
                 return Some(Box::new(client));
             }
@@ -1709,9 +1611,9 @@ pub fn running_agent() -> Option<Box<dyn KeyAgentApi>> {
 struct NoAgent;
 
 #[cfg(not(unix))]
-impl KeyAgentApi for NoAgent {
+impl CredAgentApi for NoAgent {
     fn call(&self, _request: Request) -> Result<Reply> {
-        bail!("the key agent needs a Unix system")
+        bail!("the cred agent needs a Unix system")
     }
 }
 
@@ -1726,7 +1628,7 @@ pub(crate) fn error_of<T>(result: Result<T>) -> String {
 
 /// Whether `agent` holds `K` for `astation_id`'s account: it can seal.
 #[cfg(test)]
-pub(crate) fn holds_k(agent: &dyn KeyAgentApi, astation_id: &str) -> bool {
+pub(crate) fn holds_k(agent: &dyn CredAgentApi, astation_id: &str) -> bool {
     agent
         .crypt(astation_id, vec![CryptOp::seal("mem", "content", b"x")])
         .is_ok()
@@ -1734,8 +1636,8 @@ pub(crate) fn holds_k(agent: &dyn KeyAgentApi, astation_id: &str) -> bool {
 
 /// The one in-process agent over `paths` that tests share.
 #[cfg(test)]
-pub(crate) fn test_agent(paths: &KeyPaths) -> std::sync::Mutex<KeyAgent> {
-    std::sync::Mutex::new(KeyAgent::new(paths.clone()).unwrap())
+pub(crate) fn test_agent(paths: &CredPaths) -> std::sync::Mutex<CredAgent> {
+    std::sync::Mutex::new(CredAgent::new(paths.clone()).unwrap())
 }
 
 #[cfg(test)]
@@ -1748,7 +1650,7 @@ mod tests {
     use crate::memory::statements::FakeAstation;
     use std::sync::Mutex;
 
-    fn agent(paths: &KeyPaths) -> Mutex<KeyAgent> {
+    fn agent(paths: &CredPaths) -> Mutex<CredAgent> {
         test_agent(paths)
     }
 
@@ -1870,7 +1772,7 @@ mod tests {
         // A fresh device keeps its plain device_keys file until the first
         // escrow is confirmed, so locking never loses the only copy.
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let keys = DeviceKeys::generate();
         pin(&paths, &FakeAstation::new(), &keys, true);
         let storage_key = new_storage_key();
@@ -1909,7 +1811,7 @@ mod tests {
     #[test]
     fn a_plain_step_one_file_is_sealed_when_the_agent_starts() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let keys = DeviceKeys::generate();
         keys.save_to(&paths.device_keys).unwrap();
         pin(&paths, &FakeAstation::new(), &keys, false);
@@ -1948,7 +1850,7 @@ mod tests {
     #[test]
     fn migration_re_seals_over_a_stale_sealed_file() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         let keys = DeviceKeys::generate();
         keys.save_to(&paths.device_keys).unwrap();
         pin(&paths, &FakeAstation::new(), &keys, false);
@@ -1981,11 +1883,11 @@ mod tests {
     #[test]
     fn migration_refuses_keys_that_are_not_the_pinned_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         DeviceKeys::generate().save_to(&paths.device_keys).unwrap();
         pin(&paths, &FakeAstation::new(), &DeviceKeys::generate(), true);
         // The error doesn't stop the agent: it starts locked and says how to start over.
-        let message = error_of(KeyAgent::new(paths.clone()).unwrap().migrate_plain_keys());
+        let message = error_of(CredAgent::new(paths.clone()).unwrap().migrate_plain_keys());
         assert!(message.contains("pinned"), "{message}");
         assert!(message.contains("atem pair"), "{message}");
         let agent = agent(&paths);
@@ -1996,8 +1898,8 @@ mod tests {
     #[test]
     fn an_unreadable_plain_file_leaves_the_agent_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
-        std::fs::write(&paths.device_keys, b"not json").unwrap();
+        let paths = CredPaths::in_dir(dir.path());
+        crate::paths::write_test_file(&paths.device_keys, b"not json");
         let agent = agent(&paths);
         assert!(!agent.status().unwrap().unlocked);
         assert!(paths.device_keys.exists());
@@ -2006,7 +1908,7 @@ mod tests {
     #[test]
     fn an_unverified_plain_file_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths::in_dir(dir.path());
+        let paths = CredPaths::in_dir(dir.path());
         DeviceKeys::generate().save_to(&paths.device_keys).unwrap();
         let agent = agent(&paths);
         assert!(!agent.status().unwrap().unlocked);
@@ -2054,8 +1956,8 @@ mod tests {
 
     /// What the CLI does: take a challenge, sign the request.
     fn request(
-        agent: &Mutex<KeyAgent>,
-        paths: &KeyPaths,
+        agent: &Mutex<CredAgent>,
+        paths: &CredPaths,
         time: u64,
     ) -> (UnlockChallenge, SignedWire) {
         let challenge = agent.begin_unlock(ASTATION_ID).unwrap();
@@ -2848,7 +2750,7 @@ mod tests {
     /// agent restarted and unlocked on the still-current file A.
     fn device_with_a_stale_rotation(
         dir: &std::path::Path,
-    ) -> (KeyPaths, FakeKeyServer, DeviceKeys, Mutex<KeyAgent>, String) {
+    ) -> (CredPaths, FakeKeyServer, DeviceKeys, Mutex<CredAgent>, String) {
         let (paths, mut server, keys) = sealed_device(dir, "0a1b2c3d");
         let stale = {
             let agent = agent(&paths);
@@ -3059,8 +2961,8 @@ mod tests {
     fn a_missing_current_file_or_a_damaged_spare_does_not_stop_unlock_or_status() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, server, _) = sealed_device(dir.path(), "0a1b2c3d");
-        std::fs::write(&paths.device_keys_next, b"not json").unwrap();
-        std::fs::write(&paths.device_keys_prev, b"not json").unwrap();
+        crate::paths::write_test_file(&paths.device_keys_next, b"not json");
+        crate::paths::write_test_file(&paths.device_keys_prev, b"not json");
         let agent = agent(&paths);
         assert!(
             agent.begin_unlock(ASTATION_ID).is_ok(),
@@ -3091,7 +2993,7 @@ mod tests {
             .unwrap()
             .save_to(&paths.device_keys_next)
             .unwrap();
-        std::fs::write(&paths.device_keys_sealed, b"not json").unwrap();
+        crate::paths::write_test_file(&paths.device_keys_sealed, b"not json");
         let agent = agent(&paths);
         let message = error_of(agent.begin_unlock(ASTATION_ID));
         assert!(message.contains("unreadable"), "{message}");

@@ -110,26 +110,26 @@ pub(crate) fn paired_status_line(
 
 pub(crate) fn draw_main_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Build credential status line
-    let store = crate::credentials::CredentialStore::load();
-    let (cred_line, cred_style) = if let Some(sso) = store.find_sso() {
-        let id = sso.login_id.as_deref().unwrap_or("-");
+    let paths = crate::paths::ProfilePaths::default_paths();
+    let pairing = crate::records::PairingRecord::load(&paths.pairing).ok().flatten();
+    let (cred_line, cred_style) = if let Ok(Some(login)) = crate::records::Login::load(&paths.login)
+    {
+        let id = login.subject.as_deref().unwrap_or("-");
         (
             format!("\u{1f511} Logged in (SSO: {})", id),
             Style::default().fg(Color::Green),
         )
-    } else if let Some(p) = store
-        .entries
-        .iter()
-        .find(|e| e.source == crate::credentials::CredentialSource::AstationPaired)
-    {
-        let id = p.login_id.as_deref().unwrap_or("-");
-        // Read where the credential store is (each draw); a missing or
-        // unreadable trust file just leaves the suffix out.
-        let status = p.astation_id.as_deref().and_then(|astation_id| {
-            crate::memory::trust::TrustStore::load_from(&crate::memory::trust::trust_path())
-                .ok()
-                .map(|trust| trust.verification_status(astation_id))
-        });
+    } else if let Some(record) = pairing.as_ref().filter(|record| record.shared.is_some()) {
+        let id = record
+            .shared
+            .as_ref()
+            .and_then(|login| login.subject.as_deref())
+            .unwrap_or("-");
+        // Read each draw; a missing or unreadable trust file just leaves
+        // the suffix out.
+        let status = crate::memory::trust::TrustStore::load_from(&paths.cred.trust)
+            .ok()
+            .map(|trust| trust.verification_status(&record.astation_id));
         (
             paired_status_line(id, status),
             Style::default().fg(Color::Cyan),
@@ -499,6 +499,7 @@ mod paired_status_tests {
                 rows,
                 cols,
                 generation: "g".into(),
+                worker_build: None,
             },
             restore: String::new(),
             offset: 0,

@@ -1,5 +1,7 @@
 # Device Authentication v2
 
+> **Storage superseded (2026-10-19):** the user's login is `~/.config/atem/login.enc` and the one pairing is `~/.config/atem/pairing/` (`pairing.enc`, `trust_gen`); see AGENTS.md "Configuration & Storage". This document is kept as history.
+
 Status: implemented for direct and identity-relay connections. This document is
 the authoritative Atem-side contract. The matching Astation specification is
 `docs/specs/2026-07-21-device-authentication-v2.md` in the Astation repository.
