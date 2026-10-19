@@ -358,6 +358,10 @@ slack; a hook read after its npm-wrapper parent exited is dropped (harmless).
 
 Two runners execute `fixtures/` (format in `fixtures/schema.md`):
 
+Both runners report the 34 drafted `r9-*` fixtures (7 vector files, 27
+scenarios; appendix "r9" of `atem-session-v1.md`) as NOT RUN ("requires
+r9 …") and only check that they parse; the counts below are r8's.
+
 - **Core runner** (`src/session_protocol/fixtures.rs`, `cargo test --bin
   atem session_protocol::fixtures`): `SessionHost` through the fixtures' fake
   runtime, once with the memory journal and once with the `FileJournal`.

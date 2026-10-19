@@ -1,6 +1,10 @@
 # Remote agent API without the Mac: Atem's response
 
-Status: Atem response r2, 2026-10-19 (r2: the user's final trust design replaces attestations, the freshness window and `resolve_fork` with a connection-carried suffix; r2.1: a stolen device is removed by a signed entry, the reset is re-pairing, and the Recovery Kit is Astation's account recovery), to Astation's "Remote agent API without
+Status: Atem response **r3**, 2026-10-19. r3: the exact formats now live in
+the **r9 appendix** of [atem-session-v1.md](atem-session-v1.md) ("Appendix: r9",
+§R9.1–§R9.13) with fixtures `fixtures/r9-*.json`; where this document and the
+appendix differ, the appendix wins. §10 answers Astation's review of r2 point
+by point. Earlier: r2, 2026-10-19 (r2: the user's final trust design replaces attestations, the freshness window and `resolve_fork` with a connection-carried suffix; r2.1: a stolen device is removed by a signed entry, the reset is re-pairing, and the Recovery Kit is Astation's account recovery), to Astation's "Remote agent API without
 the Mac" draft (2026-10-18, after Astation #56). Baseline: Atem `main` at
 `0801a4f`, contract [atem-session v1 r8](atem-session-v1.md) (authoritative),
 Atem's §9 proposal [account-trust.md](../account-trust.md). **Today** means in
@@ -102,9 +106,11 @@ connection is then refused (a removed or unknown device):
   its own head (empty when equal). Atem verifies each entry (chain, signer a
   manager at `seq-1`, `alg` pin, account and genesis), makes the new head and
   entries durable (fsync), applies every effect, and only then admits the
-  device against the new head. An invalid entry is refused
-  (`membership_invalid`) and changes nothing. Beyond the head, the first valid suffix
-  applied wins; a later conflicting one is judged by the conflict rule below.
+  device against the new head. r3: the valid prefix of a carriage is
+  committed in one write and an invalid entry refuses the connection after
+  it (`membership_invalid` with the new head), R9.3. Beyond the head, the
+  first valid suffix applied wins; a later conflicting one is judged by the
+  conflict rule below.
 - Its log is behind Atem's head and agrees with Atem's copy: no entries; Atem
   admits it on Atem's head. `welcome.head` shows it is behind; it fetches the
   rest from the relay.
@@ -140,9 +146,11 @@ against Atem's own chain:
   (`control_revoked` per r8 §H, attachments closed) and every remote `hello`
   gets `error{code:"account_frozen"}`. Local use is unaffected.
 
-Managers can never resolve a freeze. The relay's transactional append makes
-honest races practically impossible; forks are expected only from a stolen
-manager key.
+Managers can never resolve a freeze. r3: honest races are avoided by the
+relay's compare-and-swap append plus client rules (prepare durably, publish
+before use, rebuild on `409`); if the relay's CAS fails, honest siblings can
+exist and the freeze then signals relay misbehaviour, not necessarily a
+stolen key (R9.4). `entry_hash` no longer covers the signature (R9.2).
 
 **Stolen device.** Remove it from another manager device. The removal is a
 signed log entry carried by every connection and applied by Atem on its own;
@@ -164,11 +172,10 @@ vault and credentials can be read again; (b) signs a log entry that makes
 the new device a manager of the existing device list, so hosts and phones
 keep working without re-pairing:
 
-```json
-{"type":"atem-membership-entry","account_id":"…","seq":43,"prev_hash":"<head 42>",
- "action":"add","device_id":"dev-new-mac","device_sign_pub":"…","device_enc_pub":"…",
- "roles":["manage","view","control"],"signer":"recovery","signed_at":1792400000000}
-```
+r3: the exact entry is R9.5's `recovery_add` (the same `member` object as
+`add`, roles exactly `control, manage, view`, signer `"recovery"`), and `K`
+comes back from an `atem-k-backup-v1` envelope sealed with the kit's seal
+key (R9.5); the r2 example here is withdrawn.
 
 Atem only verifies and applies it like any other entry: it must chain from
 Atem's head and be signed by the recovery key pinned in genesis, and it is
@@ -238,7 +245,8 @@ integers, no `null`, absent = omitted), at most 4 KiB; the signing input is
 `enc(["atem-<type>-v1", jcs(body)])` — `encoding.rs`'s length-prefixed
 fields give domain separation the same way every statement does today, and
 `canonical.rs` already implements RFC 8785. Hashes: `entry_hash = SHA-256(enc(
-["atem-membership-hash-v1", jcs(body), sig]))`, hex. Wire form `{"body":{…},
+["atem-membership-hash-v1", jcs(body)]))`, hex (r3: the signature is not
+hashed, so a re-signed body is the same entry; R9.2). Wire form `{"body":{…},
 "sig":"<base64url>"}`; the body names `signer`, whose key and `alg` the
 verifier takes from the log — the signature carries no `alg` of its own.
 
@@ -257,40 +265,14 @@ the host to clients), revealed in the pairing ceremony (added to the
 commitment and safety code inputs) and recorded by the pairing manager as the
 log's `add_host` entry with `host_trust_gen`. Unpair rotates it.
 
-**Channel: suite `atem-ch1` (SIGMA-I shape; one suite, no negotiation).**
-
-1. C→H `channel_init`: `{suite:"atem-ch1", e_c, n_c, host:{atem_device_id,
-   host_trust_gen}}` in clear (the relay routes on it).
-2. H→C `channel_accept`: `{e_h, n_h, ct}`. `th2 = SHA-256(enc(["atem-ch1-th2",
-   jcs(init), e_h, n_h, atem_device_id, host_trust_gen, genesis_hash, head_seq,
-   head_hash]))`; `ss = X25519(e, e')`; `hs = HKDF-Extract(th2, ss)`;
-   `k_h2c_hs`, `k_c2h_hs` = HKDF-Expand(hs, "atem-ch1 h2c hs"/"… c2h hs", 32).
-   `ct` = AEAD under `k_h2c_hs` of `{head:{genesis_hash, head_seq, head_hash},
-   sig_h = Sign(host_channel_key, th2)}`. The client checks `sig_h` against
-   the log's `add_host` for that `atem_device_id`/`host_trust_gen` before
-   sending anything that names itself.
-3. C→H, AEAD under `k_c2h_hs`: `hello{…, sig_c = Sign(auth, th3)}` with
-   `th3 = SHA-256(enc(["atem-ch1-th3", th2, sig_h, jcs(principal)]))`.
-   `head` in step 2 is Atem's challenge head (§3) and is bound by `th2`;
-   `hello.membership` carries the suffix from it. Entries carry their own
-   signatures, so `sig_c` needn't cover them.
-4. `th4 = SHA-256(enc(["atem-ch1-th4", th3, sig_c]))`; `ak = HKDF-Extract(th4,
-   ss)`; `k_c2h`, `k_h2c` = HKDF-Expand(ak, "atem-ch1 c2h"/"… h2c", 32); the
-   host answers `welcome` (or an error) under `k_h2c`; ephemerals are wiped.
-
-Records: ChaCha20-Poly1305 (`chacha20poly1305`, already the HPKE AEAD here;
-CryptoKit and WASM have it, WebCrypto doesn't need to). Nonce = 4 zero bytes ‖
-64-bit big-endian counter from 0 per key; AAD = `enc(["atem-ch1-rec",
-direction])`; one session-family message per record, ≤ 1 MiB + 16. The
-transport is ordered (WSS; SSE keeps the same ordered stream), so the
-receiver demands exactly the next counter: any gap, replay or failed tag
-closes the channel. No rekey: keys are fresh per channel and the counter can't
-wrap in practice; a service or browser channel ends at its expiry, a native
-one when either side closes it or the member loses its roles (`membership`
-on the open channel carries newer entries, §3). No resumption, no 0-RTT: every
-connect is a full handshake, a new attachment, no lease (r8 §3 unchanged;
-`resume` stays refused). Cross-channel or cross-replica replay fails on
-`n_h` and fresh ephemerals.
+**Channel: suite `atem-ch1`.** r3 replaces r2's construction, whose
+`channel_accept` hid the head inside a ciphertext keyed by a transcript that
+needed the head (Astation review 1). Now the head is cleartext in `accept`,
+signed by the host key and bound into `th2` before any key exists; no key
+depends on encrypted data; the client's identity travels in the encrypted
+`finish` (the `hello`). Exact messages, transcript inputs, key schedule,
+record framing, limits (2^32 records / 2^36 bytes per direction, 24 h),
+zero-DH refusal, errors and vectors: R9.7 and `r9-vectors-channel-handshake`.
 
 **Relay visibility.** Routing (`account`, `atem_device_id`, channel handle),
 sizes and timing, ephemerals and nonces; never the client identity (in
@@ -299,8 +281,11 @@ keys, roles and scopes; device names are sealed with `K` (they stay out of
 the signed body). Push hints carry only `approval_id`, `atem_device_id`,
 `session_id`, the approval's immutable `created_at` (its original creation,
 never a retry or send time), `expires_at` and a host signature, sent at once
-on open and on resolution; the relay owns the 60/180 s schedule; the tool and summary go
-HPKE-sealed to each `control` member's device key (today they go in clear).
+on open and on resolution; the relay owns the schedule (r3, user decision:
+0 s in-app and desktop OS push when no desktop is connected, 60 s mobile
+unless answered or `seen`; R9.9); the tool and summary go HPKE-sealed to each
+`control` member's `enc_key`, one signed envelope per recipient (today they
+go in clear).
 
 ## 6. Decision 4: reusable client core
 
@@ -384,3 +369,24 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
 
 Steps 2 and 4's relay part can overlap once step 1's vectors are pinned.
 Nothing is enabled before both sides pass the r9 fixtures.
+
+## 10. Answers to Astation's review of r2 (r3)
+
+Astation's review (2026-10-19, PR #58 `0ee4f69`, #81 reply, PR #80 comment)
+agreed the architecture, identities, the Atem-owned `atem-client` and the
+order of work. Each point it raised, and where r9 answers it:
+
+| Astation point | r3 answer | Appendix |
+|---|---|---|
+| 1. High: circular `channel_accept` derivation | head public in `accept`, signed by `sig_h`, bound in `th2`; no key depends on encrypted data; full transcript, HKDF salt/info, nonce/AAD, counter domains and vectors; zero-DH refusal; tamper, replay, direction and divergent-head cases; executable record/byte/time limits; erasure | R9.7, `r9-vectors-channel-handshake`, `r9-handshake-*` |
+| 2. Honest forks and P-256 re-signing | `entry_hash` covers the body only; relay CAS append with prepare-durably / publish-before-use / rebuild-on-409 / same-bytes retry rules, so honest managers never fork through an honest relay; if CAS fails, both hosts freeze (availability cost stated, neutral UI text); fixtures for honest concurrency, unknown carrier, removed signer, hosts with different successors, signature retry | R9.2, R9.4, `r9-chain-*` |
+| 3. Recovery schema and `K` | one `recovery_add` action using the `member` object, roles exactly `control, manage, view`, reserved signer `recovery`, never removes/resets/unfreezes; Recovery Kit v2 derivations; versioned `atem-k-backup-v1` envelope bound to account, genesis, `blob_version` and kids; rotation, retention, corruption and retry rules | R9.5, `r9-vectors-recovery`, `r9-recovery-*` |
+| 4. Sealed hints and `seen` | `enc_key` (X25519) separate from `auth_key` in the signed member; HPKE suite, info, `enc_kid`, `sealed_hash`; one signed envelope per recipient (fits APNs); resolved dominates open; immutable `created_at`/`expires_at` and clock rules; locked extension shows a generic hint; `seen` is sent over the authenticated channel only for a focused, attended card, host-signed, exact-target, deduplicated, never answers or closes; the near-expiry margin only stops sends | R9.9, `r9-vectors-push-hint`, `r9-push-hint-sign-and-verify`, `r9-approval-seen` |
+| 5. Suffix commit semantics | whole carriage validated in order; the valid prefix committed in one write, fences before any reply, then `membership_invalid` with the new head; failed write applies nothing (`busy`); crash between commit and fences replays them at start via `membership_applied`; entry, byte, signature-check and evidence bounds | R9.3, `r9-chain-invalid-tail-*`, `r9-chain-crash-*` |
+| Unbounded hidden revocation | stated as the residual risk: eventual, not bounded | R9.3 |
+| Product decisions (push timing, recovery authority, biometrics) | user decisions of 2026-10-19 written as client requirements; Astation's records still to be aligned | R9.6, R9.9, R9.13 q1 |
+| Biometric reuse and fresh confirmation for membership edits | ≤ 5 min reuse for `sig_c` only, cleared on lock/background; fresh confirmation bound to the exact body for every entry and recovery; passcode fallback | R9.6 |
+| Removed Visualize types | agreed; removal is separate Atem work, not in r9 | — |
+| v0.7.2 device ids | re-verification keeps the id; a new id is a new member, never inferred from hostname, room or login | R9.13 q6 |
+
+Open questions for Astation are R9.13.

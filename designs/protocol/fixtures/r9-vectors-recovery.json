@@ -1,0 +1,72 @@
+{
+  "R_hex": "de7b07c173601dbcd9053ef7679fcd3a6864af071005397179134682a438dcc6",
+  "k_backup": {
+    "K_current_hex": "5dfab500cce0ecfb4de25d8991399ed6c7c8bfe5626a108483b2236f498d5a94",
+    "K_previous_hex": "518ab1819a25bd274ef60c6af37d9b5ea5c588f727ca2ac56595d2f402112749",
+    "aad_hex": "000000106174656d2d6b2d6261636b75702d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89000000080000000000000003000000175b226239383235333364222c223166326533643463225d",
+    "opens_with_blob_version_2_in_aad": false,
+    "plain_jcs": "{\"keys\":[{\"k\":\"Xfq1AMzg7PtN4l2JkTme1sfIv-ViahCEg7Ijb0mNWpQ\",\"kid\":\"b982533d\"},{\"k\":\"UYqxgZolvSdO9gxq832bXqXFiPcnyirFZZXS9AIRJ0k\",\"kid\":\"1f2e3d4c\"}]}",
+    "wire": {
+      "account_id": "acct-test-1",
+      "blob_version": 3,
+      "ct": "g7hfNso1rXqDs9AMuRSjgvYyXW5j5G-4_WoX3t6cHYFijbmRsbRVQbt-8d_wX18c10lcmSc40FOQmhzx0ZBahNotDMxTFTGU-GW1WTYlyzUpmdkhElwfwGKACOuv-3qV4YmK_Kj-HaJWsILBQhud_yM5H7radnWzNby_JiwLlSsmHqdzeWb1J-AqoqjY71YgCqnNUCclKAO--5jA1ZBhNcCPI4M",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "kids": [
+        "b982533d",
+        "1f2e3d4c"
+      ],
+      "nonce": "bZMnfDvoHg-giEtjI4KY1kHFsqbA0Kdf",
+      "v": 1
+    }
+  },
+  "kind": "vectors",
+  "name": "r9-vectors-recovery",
+  "note": "Recovery Kit v2 (Astation-owned): one 256-bit secret R. seal_key = HKDF-SHA256(salt empty, ikm R, info \"atem-recovery-seal-v1\", 32); sign_seed = HKDF-SHA256(salt empty, ikm R, info \"atem-recovery-sign-v1\", 32) is an Ed25519 seed; its public key is the genesis recovery_key. K backup = XChaCha20-Poly1305(seal_key, nonce, aad, jcs(plain)).",
+  "recovery_entry": {
+    "entry": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "recovery_add",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BOm7i4Cu1xarfYVGVRmURoigaOOB_yt5yLlW4CnTUf9gaeHjs5A0zoKxYoYTEtio_r83Vy4pqmeshYM35j0cLOs"
+          },
+          "device_id": "dev-newmac",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "5Y2eIkg4yFW5YCV4PRTZ4IZ4HzbTcTEUjuhZv7a_wFY"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+        "seq": 7,
+        "signed_at": 1793177600000,
+        "signer": "recovery",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "9eavkSN7QKcCOtUQcDX_mOwsK6CeDdYpASz_DW1FQ2wKUjAcY0y6qvhj4cRhV755Gc1fnUkgLjes5yFnYZQOAg"
+    },
+    "entry_hash": "5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9",
+    "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"recovery_add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BOm7i4Cu1xarfYVGVRmURoigaOOB_yt5yLlW4CnTUf9gaeHjs5A0zoKxYoYTEtio_r83Vy4pqmeshYM35j0cLOs\"},\"device_id\":\"dev-newmac\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"5Y2eIkg4yFW5YCV4PRTZ4IZ4HzbTcTEUjuhZv7a_wFY\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793177600000,\"signer\":\"recovery\",\"type\":\"atem-membership-entry\",\"v\":1}",
+    "label": "R7",
+    "note": "recovery_add dev-newmac on E6, signed by the genesis recovery key",
+    "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002517b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a227265636f766572795f616464222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226d656d626572223a7b22617574685f6b6579223a7b22616c67223a2270323536222c22707562223a22424f6d3769344375317861726659564756526d55526f6967614f4f425f797435794c6c5734436e54556639676165486a733541307a6f4b78596f59544574696f5f72383356793470716d657368594d33356a30634c4f73227d2c226465766963655f6964223a226465762d6e65776d6163222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a2235593265496b673479465735594356345052545a34495a34487a6254635445556a75685a7637615f774659227d2c226b696e64223a226e6174697665222c22726f6c6573223a5b22636f6e74726f6c222c226d616e616765222c2276696577225d7d2c22707265765f68617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a372c227369676e65645f6174223a313739333137373630303030302c227369676e6572223a227265636f76657279222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+  },
+  "recovery_entry_hash": "5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9",
+  "recovery_key": {
+    "alg": "ed25519",
+    "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+  },
+  "recovery_key_matches_genesis_E1": true,
+  "requires": "r9",
+  "seal_key_hex": "e6fcdaf63348953d1062b8b392e102ad88c13ea7ea2b99a125083aa2ca479c35",
+  "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616"
+}

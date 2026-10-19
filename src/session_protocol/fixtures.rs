@@ -316,6 +316,19 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
 
 /// Runs one scenario (the parsed JSON of a fixture file).
 pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, String> {
+    // r9 fixtures (vectors and scenarios of the drafted appendix) have
+    // their own shapes; they are reported as not run until r9 is built.
+    let name = file["name"].as_str().unwrap_or_default();
+    let r9 = file["requires"].as_str() == Some("r9");
+    if revision::is_r9_fixture(name) || r9 {
+        return if revision::is_r9_fixture(name) && r9 {
+            Ok(Outcome::NotRun(revision::R9_NOT_RUN.into()))
+        } else {
+            Err(format!(
+                "{name}: an r9 fixture needs an r9- name and \"requires\": \"r9\""
+            ))
+        };
+    }
     let scenario: Scenario =
         serde_json::from_value(file.clone()).map_err(|e| format!("scenario: {e}"))?;
     let r8 = scenario.name.starts_with("r8-");
@@ -1478,7 +1491,8 @@ mod tests {
             })
             .filter(|(_, v)| {
                 let name = v["name"].as_str().unwrap();
-                !name.starts_with("r8-") || revision::r8_fixture_runnable(name).is_ok()
+                !revision::is_r9_fixture(name)
+                    && (!name.starts_with("r8-") || revision::r8_fixture_runnable(name).is_ok())
             })
             .collect()
     }
@@ -1492,6 +1506,9 @@ mod tests {
         let mut names = Vec::new();
         for p in scenario_paths(&fixtures_dir()) {
             let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            if revision::is_r9_fixture(v["name"].as_str().unwrap()) {
+                continue;
+            }
             let s: Scenario = serde_json::from_value(v.clone()).expect("fixture parses");
             if !s.name.starts_with("r8-") {
                 assert_eq!(s.requires, None, "{}", s.name);
@@ -1538,6 +1555,60 @@ mod tests {
         ] {
             assert!(report.passed.iter().any(|p| p == name), "{name} passes");
         }
+    }
+
+    /// The r9 draft's fixtures (vectors and scenarios) parse, carry
+    /// `"requires": "r9"` and a known kind, and every runner reports them as
+    /// not run until r9 is implemented.
+    #[test]
+    fn r9_fixtures_parse_and_are_not_run() {
+        let mut names = Vec::new();
+        for p in scenario_paths(&fixtures_dir()) {
+            let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            let name = v["name"].as_str().unwrap().to_string();
+            if !revision::is_r9_fixture(&name) {
+                assert_ne!(v["requires"], "r9", "{name}");
+                continue;
+            }
+            assert_eq!(
+                p.file_stem().unwrap().to_string_lossy(),
+                name.as_str(),
+                "file name"
+            );
+            assert_eq!(v["requires"], "r9", "{name}");
+            assert!(
+                ["vectors", "scenario"].contains(&v["kind"].as_str().unwrap_or_default()),
+                "{name}: kind"
+            );
+            if v["kind"] == "scenario" {
+                assert!(
+                    v["steps"].as_array().is_some_and(|s| !s.is_empty()),
+                    "{name}"
+                );
+                assert!(
+                    ["host", "client", "relay"].contains(&v["side"].as_str().unwrap_or_default()),
+                    "{name}: side"
+                );
+            }
+            for host in [Some(&fake_runtime as HostFactory), None] {
+                assert_eq!(
+                    run_scenario(&v, host),
+                    Ok(Outcome::NotRun(revision::R9_NOT_RUN.into())),
+                    "{name}"
+                );
+            }
+            names.push(name);
+        }
+        assert!(names.len() >= 30, "r9 fixtures missing: {names:?}");
+        let report = run_all(&fixtures_dir(), Some(&fake_runtime));
+        let not_run: Vec<&String> = report
+            .not_run
+            .iter()
+            .filter(|(n, _)| revision::is_r9_fixture(n))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(not_run.len(), names.len());
     }
 
     /// The admission scenario's welcome names every r8 feature in the

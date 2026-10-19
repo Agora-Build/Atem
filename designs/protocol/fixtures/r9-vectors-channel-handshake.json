@@ -1,0 +1,142 @@
+{
+  "accept": {
+    "ch": "atem-ch1",
+    "e": "L8Wq439GLx3qdATFogDeVWVlB5fzXpcMUIRJ1pSUNEA",
+    "head": {
+      "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+      "seq": 6
+    },
+    "n": "_0-i8sC3QDgT8EndqDyphgSeZ3paA0AMJw848HSKGjg",
+    "op": "accept",
+    "sig": "xFwUNITnXDq4eXGwDfCPC9T3QfnnQ8cjOWWEml-QdXwHmuc68z6lKmLJfAIyN_L1kEBu5PWu2QPNXoCTRgdLDw"
+  },
+  "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+  "finish": {
+    "ch": "atem-ch1",
+    "ct": "U0MewMih6Cwf1DpF-GTsCGydBpoPuFFeOP7Ln8tF-9sIZmFlapQnNJzW-jARgCfB3Mdg_g--ujNO4BQH3Mc2oNFeNN7brQa55_-sNecc7RiIbCp7-iSgq651EskRKvZNXR9iouKrB6W2v3TVm7Bvn9A7txQisb37YLsccTIa8pZwYLlSn1Lkn21wFUFZDGe4EPzBUm91CCrQr6Yq9951TDrrBZ9h2TVmLr7XyMJzUGHADFpaqYE85q9T9eLkNJxuxOS_Qaqk0kE2MpZlHoPg975sTdyBtaebqiKi4mzNYiVqCuh3ruUCed_d6t94rCEAXLBxLEGTY5qmCGw6jxx_5nomZ3jx2x5pkkS8dGVgpRO5Kw9fq40DCLUUuDqtmc4jL72lms7mDglCzHv1Q6TdkNXLeRl1UX8lx1roTdTSL_JPRLhoO0GGixExwT3cuMRaUwvzt6kUhhnVpa3iiIQpUquKU15miKBiDXhe3bW2ehPb0mTrDleGwry1X4EmRnjkzT7edFrkiSsWYRjjIg",
+    "op": "finish"
+  },
+  "finish_aad_hex": "0000000f6174656d2d6368312d66696e6973680000002046aac4edc1499ce74e4263c327c98e6e37d6aa1824fe432d3e8311929f5e98c8",
+  "finish_ct_hex": "53431ec0c8a1e82c1fd43a45f864ec086c9d069a0fb8515e38fecb9fcb45fbdb086661656a9427349cd6fa30118027c1dcc760fe0fbeba334ee01407dcc736a0d15e34dedbad06b9e7ffac35e71ced18886c2a7bfa24a0abae7512c9112af64d5d1f62a2e2ab07a5b6bf74d59bb06f9fd03bb71422b1bdfb60bb1c71321af2967060b9529f52e49f6d701541590c67b810fcc1526f75082ad0afa62af7de754c3aeb059f61d935662ebed7c8c2735061c00c5a5aa9813ce6af53f5e2e4349c6ec4e4bf41aaa4d241363296651e83e0f7be6c4ddc81b5a79baa22a2e26ccd62256a0ae877aee50279dfddeadf78ac21005cb0712c4193639aa6086c3a8f1c7fe67a266778f1db1e699244bc746560a513b92b0f5fab8d0308b514b83aad99ce232fbda59acee60e0942cc7bf543a4dd90d5cb791975517f25c75ae84dd4d22ff24f44b8683b41868b1131c13ddcb8c45a530bf3b7a9148619d5a5ade288842952ab8a535e6688a0620d785eddb5b67a13dbd264eb0e5786c2bcb55f81264678e4cd3ede745ae4892b166118e322",
+  "hello_jcs": "{\"data\":{\"id\":\"5f0b6a3e-8c1d-4e2f-9a7b-1c2d3e4f5a6b\",\"membership\":{\"entries\":[],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6}},\"op\":\"hello\",\"proof\":{\"principal\":{\"device_id\":\"dev-phone\",\"kind\":\"native\"},\"sig\":\"9eqNFWuo1u1rvwbaPDdACuYSgXW8uMpU3ZwZaBj5yBF-Y67WVgbX7m0C_66XtZ9LWE6GG6_7aBYa2GgEZqOAhQ\"},\"revision\":9,\"v\":1},\"type\":\"session\"}",
+  "hs_hex": "4a80e2f7e2efc7e7692a2f122dca80bcd90e89bcf50afb6fc093f2c0c87f79a4",
+  "init": {
+    "ch": "atem-ch1",
+    "e": "px8a-ejWDV7NMkaxrGU01vNDggusEpO08nMaP5eK4TY",
+    "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+    "host_id": "host-a",
+    "host_trust_gen": 1,
+    "n": "UsiRUamW-37Ducn_FAmgZIEGnAbci3XcxjNus4tTEhk",
+    "op": "init"
+  },
+  "inputs": {
+    "client_auth_pub_hex": "0465793afddbe3712352b2467a362fab07d0963abd5f84f1d117756980c89c4dbdb66372f882218081f4858f9c85e38dd1bbc0fced3211e6a1d3251b5e7c4ee524",
+    "client_auth_secret_hex": "51b44af4fe7b107f4b5522f6ab168a4b2b2b7a123a7adef8b85c9e935fe6902b",
+    "e_c_hex": "a71f1af9e8d60d5ecd3246b1ac6534d6f343820bac1293b4f2731a3f978ae136",
+    "e_c_secret_hex": "6da6f4275b4c2aa2f487eb1c70c8fd56abd12cc5b10b1ccaef801f1b0c128b2d",
+    "e_h_hex": "2fc5aae37f462f1dea7404c5a200de5565650797f35e970c508449d694943440",
+    "e_h_secret_hex": "fa509a440599f9cfe309e98b92cec3d54412e4f119073799c63bacc4fe897d94",
+    "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+    "head": {
+      "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+      "seq": 6
+    },
+    "host_id": "host-a",
+    "host_key_pub_hex": "99af375c3ab19ba105daa464ec83786bd545bf94d7f3044f01d954658ce2358e",
+    "host_key_secret_hex": "33f12d10a63332a050fc9a070b69b9b3b05f9a78f9a5c9bf9dcd8484691eaa50",
+    "host_trust_gen": 1,
+    "n_c_hex": "52c89151a996fb7ec3b9c9ff1409a06481069c06dc8b75dcc6336eb38b531219",
+    "n_h_hex": "ff4fa2f2c0b7403813f049dda83ca986049e677a5a03400c270f38f0748a1a38"
+  },
+  "k_c2h_hex": "049d84f35d8f2c309a8753f280c5ca01a3c5dfd3f411da8e16d62ac79d793a62",
+  "k_finish_hex": "0728a613e00ccc96ecb63e070c5c2add4db2968c43addf4d881750e91f2fdecc",
+  "k_h2c_hex": "f9f9c3e30209fe018a84e6b945f9eeef7b5cad343886d6c61b40897632532f65",
+  "kind": "vectors",
+  "name": "r9-vectors-channel-handshake",
+  "negative": [
+    {
+      "case": "tampered_head",
+      "head": {
+        "hash": "54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9",
+        "seq": 5
+      },
+      "note": "the relay rewrites accept.head to (5, E5); the client's th2 becomes this value and sig_h does not verify: handshake_failed",
+      "sig_h_valid": false,
+      "th2_hex": "ff02a43f1f9e8196556c0b48ed54f83ed936a500cf04e7fbe251bccae495ef7d"
+    },
+    {
+      "case": "tampered_finish",
+      "ct_hex": "d3431ec0c8a1e82c1fd43a45f864ec086c9d069a0fb8515e38fecb9fcb45fbdb086661656a9427349cd6fa30118027c1dcc760fe0fbeba334ee01407dcc736a0d15e34dedbad06b9e7ffac35e71ced18886c2a7bfa24a0abae7512c9112af64d5d1f62a2e2ab07a5b6bf74d59bb06f9fd03bb71422b1bdfb60bb1c71321af2967060b9529f52e49f6d701541590c67b810fcc1526f75082ad0afa62af7de754c3aeb059f61d935662ebed7c8c2735061c00c5a5aa9813ce6af53f5e2e4349c6ec4e4bf41aaa4d241363296651e83e0f7be6c4ddc81b5a79baa22a2e26ccd62256a0ae877aee50279dfddeadf78ac21005cb0712c4193639aa6086c3a8f1c7fe67a266778f1db1e699244bc746560a513b92b0f5fab8d0308b514b83aad99ce232fbda59acee60e0942cc7bf543a4dd90d5cb791975517f25c75ae84dd4d22ff24f44b8683b41868b1131c13ddcb8c45a530bf3b7a9148619d5a5ade288842952ab8a535e6688a0620d785eddb5b67a13dbd264eb0e5786c2bcb55f81264678e4cd3ede745ae4892b166118e322",
+      "note": "first ciphertext byte flipped: the tag fails; host closes with handshake_failed",
+      "opens": false
+    },
+    {
+      "case": "replayed_finish",
+      "e_h_hex": "b1c5d7a2b3a3002e4c48ce772cff8d1d9fcc6d0f96fbac90ee32d5cb16edf16f",
+      "k_finish_hex": "ffe1f37bc592f768ae6fa2599f20e3223d502a0c9557662bc91f4e9c5175fd1f",
+      "n_h_hex": "d7f85b3cad8fb59230b48dfaf8efce811515032de2319924b7b89899cc42b9e6",
+      "note": "the finish above replayed into a second channel (new e_h, n_h): its k_finish differs and the tag fails",
+      "opens": false,
+      "sig_h_hex": "2490878179fb08afe0da6a50150d2068237b7fef8f9ad7db04d44be4b389f97cfa9642db3fac82ee65135457596e6de170798dae9dbd1be2195fdafb3d9cd306",
+      "th2_hex": "4aac6c2b34079bb5c403631cd950d7bce6a08ec0563c7901e2d7efef871e9cc9"
+    },
+    {
+      "case": "replayed_record",
+      "ct_hex": "8ae6c20755a67f01373b512b27458c853844617ced8be99c5a88bfe66107dc09b0fc7d61c76790697edb1d9c95cceeb3acf73b6b3e82829afac5eb0cfd4a0b4860a763077d817cbc4179eeb1c2e464ce3b8dffcad5a2c0c3c316ff5945502249c7200b802bedbac569",
+      "expected_counter": 1,
+      "note": "c2h record 0 delivered again where counter 1 is expected: the tag fails (nonce differs); the receiver closes",
+      "opens": false
+    },
+    {
+      "case": "direction_confusion",
+      "ct_hex": "8ae6c20755a67f01373b512b27458c853844617ced8be99c5a88bfe66107dc09b0fc7d61c76790697edb1d9c95cceeb3acf73b6b3e82829afac5eb0cfd4a0b4860a763077d817cbc4179eeb1c2e464ce3b8dffcad5a2c0c3c316ff5945502249c7200b802bedbac569",
+      "note": "c2h record 0 fed to the h2c receiver: other key and AAD; fails",
+      "opens": false
+    },
+    {
+      "case": "zero_shared_secret",
+      "note": "peer ephemeral is the all-zero (low-order) point: X25519 output is all zero; both sides refuse before any HKDF",
+      "peer_e_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "refuse": true,
+      "ss_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "note": "atem-ch1 between dev-phone (client) and host-a at head (6, E6) of r9-vectors-membership-log. Every value is computed with the fixed secrets below; see the r9 appendix §R9.6 for each formula.",
+  "principal_jcs": "{\"device_id\":\"dev-phone\",\"kind\":\"native\"}",
+  "records": [
+    {
+      "aad_hex": "0000000c6174656d2d6368312d72656300000003683263",
+      "counter": 0,
+      "ct_hex": "d54cc3eaec90ab70e3c56c20268bafa694b2569949afdac9a6e41ef5df7c9f59a2a5cb103dfd28e0bccffa92ab3c6eca96967af9f26574a3d272fb1eb2373f8a6389114e9f23c9ce4d2583dc2f52b214365cfeadab90b689fe32b09c6ff0ad85e9760c3001504fdfd0f9c400269d535ec0fa6cb1b2612b2df4",
+      "dir": "h2c",
+      "nonce_hex": "000000000000000000000000",
+      "plain_jcs": "{\"data\":{\"op\":\"welcome\",\"re\":\"5f0b6a3e-8c1d-4e2f-9a7b-1c2d3e4f5a6b\",\"revision\":9,\"v\":1},\"type\":\"session\"}"
+    },
+    {
+      "aad_hex": "0000000c6174656d2d6368312d72656300000003633268",
+      "counter": 0,
+      "ct_hex": "8ae6c20755a67f01373b512b27458c853844617ced8be99c5a88bfe66107dc09b0fc7d61c76790697edb1d9c95cceeb3acf73b6b3e82829afac5eb0cfd4a0b4860a763077d817cbc4179eeb1c2e464ce3b8dffcad5a2c0c3c316ff5945502249c7200b802bedbac569",
+      "dir": "c2h",
+      "nonce_hex": "000000000000000000000000",
+      "plain_jcs": "{\"data\":{\"id\":\"6a1c7b4f-9d2e-4f30-8b8c-2d3e4f5a6b7c\",\"op\":\"list\",\"v\":1},\"type\":\"session\"}"
+    },
+    {
+      "aad_hex": "0000000c6174656d2d6368312d72656300000003633268",
+      "counter": 1,
+      "ct_hex": "d351f3e47745ff03fa7742518d6d02c685e12d0b62045a3913e3813915f7a923d3a5ea0194962ad08ff972d796fbf16e83e9a69124e405d0f5fcbe1e221f1c1d2dd535b0c334085a15c1967b4cc7909cbbdc273d9b2e5848323e9cc2b621472cb2cfbd17e6be231d2a",
+      "dir": "c2h",
+      "nonce_hex": "000000000000000000000001",
+      "plain_jcs": "{\"data\":{\"id\":\"6a1c7b4f-9d2e-4f30-8b8c-2d3e4f5a6b7c\",\"op\":\"list\",\"v\":1},\"type\":\"session\"}"
+    }
+  ],
+  "requires": "r9",
+  "sig_c_hex": "f5ea8d156ba8d6ed6bbf06da3c37400ae6128175bcb8ca54dd9c196818f9c8117e63aed65606d7ee6d02ffae97b59f4b584e861baffb68161ad8680466a38085",
+  "sig_c_input_hex": "000000166174656d2d6368312d636c69656e742d7369672d7631000000202a2117b9a086b40c15f204ef8bcaaf2d42a87fac701cd4ef5c3b9e50844b2156",
+  "sig_h_hex": "c45c143484e75c3ab87971b00df08f0bd4f741f9e743c7233965849a5f90757c079ae73af33ea52a62c97c023237f2f590406ee4f5aed903cd5e809346074b0f",
+  "sig_h_input_hex": "000000146174656d2d6368312d686f73742d7369672d76310000002046aac4edc1499ce74e4263c327c98e6e37d6aa1824fe432d3e8311929f5e98c8",
+  "ss_hex": "68f96a701200caf29d2ccb8d1b309e86f07aa48910a54291f0ef4d1e16de3569",
+  "th2_hex": "46aac4edc1499ce74e4263c327c98e6e37d6aa1824fe432d3e8311929f5e98c8",
+  "th2_input_hex": "0000000c6174656d2d6368312d74683200000020a71f1af9e8d60d5ecd3246b1ac6534d6f343820bac1293b4f2731a3f978ae1360000002052c89151a996fb7ec3b9c9ff1409a06481069c06dc8b75dcc6336eb38b5312190000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d61000000080000000000000001000000202fc5aae37f462f1dea7404c5a200de5565650797f35e970c508449d69494344000000020ff4fa2f2c0b7403813f049dda83ca986049e677a5a03400c270f38f0748a1a3800000008000000000000000600000020beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+  "th3_hex": "2a2117b9a086b40c15f204ef8bcaaf2d42a87fac701cd4ef5c3b9e50844b2156",
+  "th4_hex": "5666bb33cbfd2a1f6d5bafcdf76f40a9049e9c81c0f0d63c2446e27807270e87"
+}

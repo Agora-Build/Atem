@@ -1,0 +1,166 @@
+{
+  "name": "r9-chain-invalid-tail-commits-the-valid-prefix",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.3 (Astation review 5): a failed write applies nothing; a valid removal followed by an invalid entry is committed in one write, its fences (lease revoked, queued work rejected, attachments closed) happen before any reply, then the carrier is refused with the new head and the failing index.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "svc",
+        "principal": "service:svc-discord",
+        "key": "svc-discord"
+      }
+    ],
+    "connected": [
+      "phone"
+    ],
+    "holds_lease": {
+      "svc": 1
+    }
+  },
+  "steps": [
+    {
+      "send": "svc",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "submit",
+          "id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "binding": "${lease_binding:svc:ses-aaaaaaaaaaaa}",
+          "kind": "prompt",
+          "request_id": "bbbbbbbb-0000-4000-8000-000000000001",
+          "payload": {
+            "text": "run the tests"
+          }
+        }
+      }
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "receipt",
+        "state": "accepted"
+      }
+    },
+    {
+      "hold_dispatch": true
+    },
+    {
+      "fail_next_membership_write": true
+    },
+    {
+      "send_membership": "phone",
+      "entries": [
+        "E7"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not recorded"
+      }
+    },
+    {
+      "assert": {
+        "head": "E6",
+        "attachments": 3
+      }
+    },
+    {
+      "connect": "mac",
+      "carry": [
+        "E7",
+        "X8_badsig"
+      ]
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "unauthorized",
+        "detail": "removed"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "lease_changed",
+        "reason": "revoked"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "membership_head",
+        "head.seq": 7
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "index": 1,
+        "head.seq": 7,
+        "head.hash": "${hash:E7}"
+      }
+    },
+    {
+      "assert": {
+        "head": "E7",
+        "membership_applied": "E7",
+        "attachments": 1,
+        "control_gen": {
+          "service:svc-discord": 2
+        },
+        "receipts": {
+          "bbbbbbbb-0000-4000-8000-000000000001": {
+            "state": "rejected",
+            "detail": "control revoked"
+          }
+        },
+        "dispatches": 0
+      }
+    }
+  ]
+}

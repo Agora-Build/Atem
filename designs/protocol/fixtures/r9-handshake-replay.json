@@ -1,0 +1,101 @@
+{
+  "name": "r9-handshake-replay",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.7: a finish replayed into a channel with a fresh e_h/n_h fails its tag; a replayed record (counter 0 where 1 is due) and a record in the wrong direction close the channel without a reply and with no effect.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "handshake": "phone",
+      "vector": "r9-vectors-channel-handshake"
+    },
+    {
+      "expect_record": "phone",
+      "dir": "h2c",
+      "counter": 0,
+      "vector_record": 0
+    },
+    {
+      "replay": {
+        "finish_of": "previous",
+        "into_new_channel": {
+          "e_h": "${vector:r9-vectors-channel-handshake:negative.2.e_h_hex}",
+          "n_h": "${vector:r9-vectors-channel-handshake:negative.2.n_h_hex}"
+        }
+      }
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "handshake_failed",
+      "at": "finish"
+    },
+    {
+      "send_record": "phone",
+      "vector_record": 1
+    },
+    {
+      "send_record": "phone",
+      "vector_record": 1,
+      "as_counter": 1
+    },
+    {
+      "expect_closed": "phone",
+      "reply": false
+    },
+    {
+      "handshake": "phone",
+      "vector": "r9-vectors-channel-handshake"
+    },
+    {
+      "send_record": "phone",
+      "ct_from": "h2c",
+      "vector_record": 0
+    },
+    {
+      "expect_closed": "phone",
+      "reply": false
+    },
+    {
+      "assert": {
+        "pty_writes": 0,
+        "dispatches": 0,
+        "attachments": 0
+      }
+    }
+  ]
+}

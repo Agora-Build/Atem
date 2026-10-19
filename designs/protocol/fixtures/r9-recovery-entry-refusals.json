@@ -1,0 +1,137 @@
+{
+  "name": "r9-recovery-entry-refusals",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5: the recovery key signs only recovery_add with exactly control/manage/view; another key, other roles or another action are invalid; a conflicting recovery entry freezes (the key is never removed); a frozen host applies nothing, recovery included.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793177601000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "newmac",
+        "principal": "member:dev-newmac",
+        "key": "dev-newmac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "newmac",
+      "carry": [
+        "R7_wrong_key"
+      ]
+    },
+    {
+      "expect": "newmac",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "connect": "newmac",
+      "carry": [
+        "R7_roles"
+      ]
+    },
+    {
+      "expect": "newmac",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "connect": "newmac",
+      "carry": [
+        "R7_remove"
+      ]
+    },
+    {
+      "expect": "newmac",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "assert": {
+        "head": "E6",
+        "frozen": false
+      }
+    },
+    {
+      "connect": "phone",
+      "client_head": "R6_conflict",
+      "carry": [
+        "R6_conflict"
+      ],
+      "window": true
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "assert": {
+        "frozen": true
+      }
+    },
+    {
+      "connect": "newmac",
+      "carry": [
+        "R7"
+      ]
+    },
+    {
+      "expect_channel_error": "newmac",
+      "code": "account_frozen",
+      "at": "init"
+    },
+    {
+      "assert": {
+        "head": "E6",
+        "frozen": true
+      }
+    }
+  ]
+}

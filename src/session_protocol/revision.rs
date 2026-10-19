@@ -198,6 +198,18 @@ pub const R8_FIXTURE_NEEDS: &[(&str, &[&str])] = &[
     ("r8-two-simultaneous-sends-acquire-once", SEND),
 ];
 
+/// r9 (remote clients: the membership log, channel `atem-ch1`, member,
+/// service and browser principals) is drafted in the contract's appendix
+/// "r9" and not implemented: both runners report every `r9-*` fixture
+/// (`"requires": "r9"`) as not run with this reason.
+pub const R9_NOT_RUN: &str =
+    "requires r9 (atem-session-v1.md appendix r9: drafted, not implemented)";
+
+/// Whether a fixture belongs to the r9 draft (its name starts with `r9-`).
+pub fn is_r9_fixture(name: &str) -> bool {
+    name.starts_with("r9-")
+}
+
 /// Whether an `r8-*` fixture can run against the runtime now: `Ok(())`, or
 /// `Err` with the reason (the work it still needs, or that it is not
 /// listed).

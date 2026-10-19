@@ -2,7 +2,8 @@
 
 Status: Atem-side proposal for joint review, 2026-10-16; freshness and forks
 replaced by the user's final decision of 2026-10-19 (§3.5, re-pairing as the reset; exact rules in
-[protocol/remote-agent-api-atem.md](protocol/remote-agent-api-atem.md) §3). Answers
+[protocol/remote-agent-api-atem.md](protocol/remote-agent-api-atem.md) §3; exact formats in the
+r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md), §R9.1–§R9.13). Answers
 `session-multiplexing.md` §9 / atem-session §9 ("trust anchor, membership,
 freshness") for the user's decision: **Atem pairs once; the user's other
 devices on the same account (Mac, iPhone, iPad) reach it without pairing

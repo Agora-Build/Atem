@@ -1,0 +1,88 @@
+{
+  "name": "r9-hello-needs-revision-9-inside-the-channel",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.8: hello must carry revision 9 and travel inside atem-ch1; r8's link admission is gone.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "carry": [],
+      "hello": {
+        "revision": 8
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "unsupported_version",
+        "revision": 9
+      }
+    },
+    {
+      "assert": {
+        "attachments": 0
+      }
+    },
+    {
+      "plain_frame": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "hello",
+          "id": "aaaaaaaa-0000-4000-8000-000000000009",
+          "revision": 9
+        }
+      }
+    },
+    {
+      "expect_plain": "phone",
+      "match": {
+        "op": "error",
+        "code": "unsupported_version"
+      }
+    },
+    {
+      "assert": {
+        "attachments": 0
+      }
+    }
+  ]
+}

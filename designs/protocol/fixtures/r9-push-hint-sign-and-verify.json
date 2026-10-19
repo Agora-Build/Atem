@@ -1,0 +1,160 @@
+{
+  "name": "r9-push-hint-sign-and-verify",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "relay",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.9: per-recipient signed and sealed open hints; identical bytes are idempotent, a conflicting duplicate, a created_at more than 5 min ahead, expires_at <= created_at, a lifetime over 15 min and a bad signature are refused; desktop OS push at 0 s (no desktop connected), mobile at 60 s (no seen); the resolved hint cancels the rest, replaces delivered notifications and dominates a late open. The recipient opens the sealed tool and summary.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "relay_now": 1793264005000,
+    "desktop_connected": false
+  },
+  "steps": [
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.0}"
+    },
+    {
+      "relay_result": "accepted"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.1}"
+    },
+    {
+      "relay_result": "accepted"
+    },
+    {
+      "expect_push": {
+        "device": "dev-mac",
+        "kind": "desktop_os",
+        "at_ms": 0
+      }
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.0}"
+    },
+    {
+      "relay_result": "idempotent"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:invalid.3.hint}"
+    },
+    {
+      "relay_result": "duplicate"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:invalid.0.hint}"
+    },
+    {
+      "relay_result": "skew"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:invalid.1.hint}"
+    },
+    {
+      "relay_result": "invalid_times"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:invalid.2.hint}"
+    },
+    {
+      "relay_result": "invalid_times"
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.0}",
+      "tamper": {
+        "body.created_at": 1793264004000
+      }
+    },
+    {
+      "relay_result": "bad_signature"
+    },
+    {
+      "advance_ms": 60000
+    },
+    {
+      "expect_push": {
+        "device": "dev-phone",
+        "kind": "mobile",
+        "at_ms": 60000
+      }
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:resolved}"
+    },
+    {
+      "relay_result": "accepted"
+    },
+    {
+      "expect_push": {
+        "device": "dev-phone",
+        "kind": "replace",
+        "collapse_id": "8c3e9d6b-1f40-4b52-8dae-4f5a6b7c8d9e"
+      }
+    },
+    {
+      "expect_push": {
+        "device": "dev-mac",
+        "kind": "replace",
+        "collapse_id": "8c3e9d6b-1f40-4b52-8dae-4f5a6b7c8d9e"
+      }
+    },
+    {
+      "relay_receive": "${vector:r9-vectors-push-hint:open.0}"
+    },
+    {
+      "relay_result": "ignored_after_resolved"
+    },
+    {
+      "client_open": {
+        "device": "dev-phone",
+        "envelope": "${vector:r9-vectors-push-hint:open.0}"
+      },
+      "plain": {
+        "summary": "npm test",
+        "tool": "Bash"
+      }
+    },
+    {
+      "expect_no_push": {
+        "for_ms": 600000
+      }
+    }
+  ]
+}

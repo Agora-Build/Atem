@@ -1,0 +1,209 @@
+{
+  "name": "r9-approval-seen",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.9: seen comes over the authenticated channel from an attachment with control, is signed by the host once per device and approval, changes nothing on the host (no answer, no lease, still pending), is refused for view-only attachments and after closure.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "browser",
+        "principal": "browser:7b2d8c5a-0e3f-4a41-9c9d-3e4f5a6b7c8d",
+        "key": "browser",
+        "grant": "r9-vectors-browser-grant:grant"
+      }
+    ],
+    "connected": [
+      "mac",
+      "phone",
+      "browser"
+    ]
+  },
+  "steps": [
+    {
+      "open_approval": "ses-aaaaaaaaaaaa",
+      "tool": "Bash",
+      "summary": "npm test"
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "approval_request"
+      },
+      "capture": {
+        "ap": "approval.approval_id"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "approval_request"
+      }
+    },
+    {
+      "expect_relay": {
+        "op": "push_hint",
+        "hints.#": 2,
+        "hints.0.body.state": "open"
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "approval_seen",
+          "id": "aaaaaaaa-0000-4000-8000-000000000030",
+          "binding": "${binding:phone:ses-aaaaaaaaaaaa}",
+          "approval_id": "${ap}"
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "seen",
+        "re": "aaaaaaaa-0000-4000-8000-000000000030"
+      }
+    },
+    {
+      "expect_relay": {
+        "op": "push_seen",
+        "seen.body.device_id": "dev-phone",
+        "seen.body.approval_id": "${ap}"
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "approval_seen",
+          "id": "aaaaaaaa-0000-4000-8000-000000000031",
+          "binding": "${binding:phone:ses-aaaaaaaaaaaa}",
+          "approval_id": "${ap}"
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "seen",
+        "re": "aaaaaaaa-0000-4000-8000-000000000031"
+      }
+    },
+    {
+      "expect_relay_none": true
+    },
+    {
+      "send": "browser",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "approval_seen",
+          "id": "aaaaaaaa-0000-4000-8000-000000000032",
+          "binding": "${binding:browser:ses-aaaaaaaaaaaa}",
+          "approval_id": "${ap}"
+        }
+      }
+    },
+    {
+      "expect": "browser",
+      "match": {
+        "op": "error",
+        "code": "forbidden"
+      }
+    },
+    {
+      "assert": {
+        "approvals_pending": 1,
+        "lease_holder": null
+      }
+    },
+    {
+      "close_approval": "${ap}",
+      "reason": "answered_terminal"
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "approval_closed"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "approval_closed"
+      }
+    },
+    {
+      "expect_relay": {
+        "op": "push_hint",
+        "hints.0.body.state": "resolved",
+        "hints.0.body.reason": "answered_terminal"
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "approval_seen",
+          "id": "aaaaaaaa-0000-4000-8000-000000000033",
+          "binding": "${binding:phone:ses-aaaaaaaaaaaa}",
+          "approval_id": "${ap}"
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "stale_target"
+      }
+    },
+    {
+      "expect_relay_none": true
+    }
+  ]
+}
