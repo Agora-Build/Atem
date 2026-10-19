@@ -1,7 +1,7 @@
 # §9 proposal: one pairing, many devices on the same account
 
 Status: Atem-side proposal for joint review, 2026-10-16; freshness and forks
-replaced by the user's final decision of 2026-10-19 (§3.5, Recovery Kit reset; exact rules in
+replaced by the user's final decision of 2026-10-19 (§3.5, re-pairing as the reset; exact rules in
 [protocol/remote-agent-api-atem.md](protocol/remote-agent-api-atem.md) §3). Answers
 `session-multiplexing.md` §9 / atem-session §9 ("trust anchor, membership,
 freshness") for the user's decision: **Atem pairs once; the user's other
@@ -28,9 +28,9 @@ signatures that chain back to what it pinned.
 | Device key | each native Astation (Secure Enclave / platform keystore) | P-256 signing key + X25519 key; never leaves the device; on a manager the signing key requires Face ID / Touch ID (key policy, not protocol) |
 | Membership log | relay stores it (untrusted storage), every trusted device and Atem keep copies | append-only list of signed entries |
 | Log entry | in the log | `{account_id, seq, prev_hash, action: add\|remove\|set_roles, device_id, device_sign_pub, device_enc_pub, roles, signer_device_id, signed_at}` + signature by a device whose roles include `manage` at `seq-1` |
-| Genesis | entry `seq = 1` | `add` of the first Astation by itself, roles `manage, view, control`, plus the Recovery Kit's public key |
-| Recovery Kit | offline, saved by the user (password manager, printed QR + phrase, or another device) | mandatory Ed25519 key created at account setup; never a member; signs only `trust_reset` |
-| Atem pin | Atem's `membership.json`, beside `pairing.json` | `{account_id, genesis_hash, host_trust_gen, recovery_key, head:{seq, hash}, entries, evidence, frozen?}`; the head only moves forward and is made durable before anything depends on it |
+| Genesis | entry `seq = 1` | `add` of the first Astation by itself, roles `manage, view, control`, plus the Recovery Kit's public key (`recovery_sign_pub`) |
+| Recovery Kit | offline, saved by the user (password manager, printed QR + phrase, or another device) | Astation account-recovery feature: a mandatory Ed25519 key created at account setup; never a member; used only in Astation's restore-account flow when every Astation device is lost |
+| Atem pin | Atem's `membership.json`, beside `pairing.json` | `{account_id, genesis_hash, host_trust_gen, recovery_sign_pub, head:{seq, hash}, entries, evidence, frozen?}`; the head only moves forward and is made durable before anything depends on it |
 
 Roles: `view` (see sessions/output), `control` (take the lease, type, submit;
 answer the agent's permission prompts without the lease, r8 §G), `manage` (add/remove devices).
@@ -106,24 +106,38 @@ chaining from Atem's head. No periodic renewals.
   manager still valid in Atem's chain (not removed later) is real evidence
   of a compromised manager key: remote access for the account freezes. Local
   use is unaffected. Managers can never resolve a freeze.
-- **Recovery Kit reset:** a `trust_reset` entry signed by the Recovery Kit
-  starts a new chain segment from Atem's head, names the surviving managers
-  and devices, and removes the rest (a compromised manager included). It is
-  applied through any connection, or locally at the host with
-  `atem trust recover` (scan the QR or type the phrase), so a hostile relay
-  can't block it. It also lifts a freeze, without re-pairing.
+- **Stolen device:** remove it from another manager device. The removal is
+  a signed log entry carried by every connection and applied by Atem on its
+  own; nothing more is needed.
+- **Reset: re-pairing.** If a manager key was compromised, or a host shows
+  the security freeze, run `atem unpair`, then `atem pair` on each affected
+  host, from a trusted device. That pins a new genesis (a new device list
+  starting from the trusted device, with only the good devices); other
+  devices rejoin it. There is no Atem command for the Recovery Kit. Freeze message: "Remote access to <host> is paused
+  for safety. Re-pair this host from a device you trust: `atem unpair`, then
+  `atem pair`." Managers can never resolve a freeze.
 - **Residual risks, in the user's words:** a compromised manager signing key,
   or a relay hiding revocations. A revocation reaches a host when any honest
-  device next connects; a stolen *unlocked* manager can act until then. The
-  Recovery Kit reset is the remedy for both.
+  device next connects; a stolen *unlocked* manager can act until then.
+  Re-pairing is the remedy for both.
 
-### 3.6 Lost devices / recovery
+### 3.6 Lost devices / account recovery
 
-If every manager device is lost, a Recovery Kit reset names new managers
-(§3.5). Re-pairing is the last resort, e.g. if the kit is lost too: on each
-Atem host, local `atem unpair` + `atem pair` with a new Astation, which starts
-a **new genesis** (new trust generation). Account data and encryption keys
-are kept as today.
+The Recovery Kit is an Astation account-recovery feature, used only when
+every Astation device is lost. It is mandatory, created at account setup and
+kept offline (password manager, printed QR + phrase, or another device). It
+is used only in Astation's "restore account" flow on a new device, and does
+two things there: (a) restores the account key `K`, so encrypted memory,
+vault and credentials can be read again; (b) signs a log entry that makes
+the new device a manager of the existing device list, so hosts and phones
+keep working without re-pairing. Atem only verifies and applies that entry
+like any other: it chains from Atem's head and is signed by the recovery key
+pinned in genesis (`recovery_sign_pub`, as in the e2e verification design).
+Atem has no command for it, and it is not a trust reset.
+
+Without the kit, a lost-everything account re-pairs each Atem host (`atem
+unpair`, `atem pair`), a new genesis and trust generation; account data and
+encryption keys are kept as today.
 
 ## 4. Why this shape
 
@@ -139,11 +153,11 @@ are kept as today.
 
 **Astation (native):** device keys (exists for verification), membership log
 create/append/verify, the add-device approval UI (code + Touch ID), Settings →
-Devices (remove), the Recovery Kit at account setup, carrying the log suffix from Atem's head on every
+Devices (remove), the Recovery Kit at account setup and its restore-account flow, carrying the log suffix from Atem's head on every
 connection. **Relay:** store and serve the log per account (append-only,
 reject non-chaining appends as a convenience — not trusted). **Atem:** verify
 the chain, pin at pairing, a durable head, apply suffixes before admission,
-the conflict rule and freeze, `trust_reset` and `atem trust recover`, challenge/response in `hello`, roles → permissions, accept many attachments at
+the conflict rule and freeze message, applying the recovery-key entry like any entry, challenge/response in `hello`, roles → permissions, accept many attachments at
 once (the runtime already multiplexes viewers; today it only admits the paired
 Astation).
 
@@ -151,9 +165,9 @@ Astation).
 
 1. **Membership** (this proposal): log format, signatures, pairing pin,
    add/remove, the suffix carried on every connection, the conflict rule and
-   freeze, the Recovery Kit reset — plus shared fixtures (valid chain, conflict
+   freeze, re-pairing as the reset, the Recovery Kit as account recovery — plus shared fixtures (valid chain, conflict
    by a removed key, conflict by a current manager, removed device, rollback,
-   `trust_reset`, wrong account).
+   recovery-key entry, wrong account).
 1b. **Approvals from chat/mobile:** prompt-bound `approval_request` /
    `approval` submissions by any attachment with `control` (see question 3).
 2. **End-to-end channel:** ephemeral X25519 + device keys → session keys for
@@ -336,7 +350,7 @@ terminal session with an app-server conversation.
 2. **Freshness (replaced 2026-10-19):** the 6 h heartbeat, head attestations
    and the 24 h window are dropped. The log suffix travels with every
    connection; a conflict signed by a current manager freezes remote access
-   until a Recovery Kit reset (re-pairing is the last resort); manager keys
+   until the host is re-paired; manager keys
    require biometrics (§3.5).
 3. **Decided (user, 2026-10-16): approvals from chat and mobile are allowed for
    whoever holds control.** No separate `approve` role: a device with `control`

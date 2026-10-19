@@ -79,7 +79,7 @@
       <div class="rule"><b>Add a device</b>once per device: an already-trusted device approves it with Touch ID / password.</div>
       <div class="rule"><b>Connect</b>any listed device reaches every Atem of the account, over relay or direct :8080.</div>
       <div class="rule"><b>Remove</b>Settings → Devices → Remove. Atem fences it as soon as any device next connects and brings the signed removal.</div>
-      <div class="rule"><b>Reset</b>the offline Recovery Kit signs a trust reset, applied over any connection or locally with <code>atem trust recover</code>.</div>
+      <div class="rule"><b>Reset</b>after a stolen device is removed, nothing more is needed. After a compromised manager or a security freeze, re-pair each affected host from a trusted device: <code>atem unpair</code>, then <code>atem pair</code>. The Recovery Kit is Astation account recovery, only when every Astation device is lost.</div>
       <div class="rule no"><b>Not trusted</b>the account login, the relay, presence, or a device's own claims.</div>
       <div class="rule no"><b>Not needed</b>the Mac staying online, or pairing each device with each Atem.</div>
     </div>
@@ -161,7 +161,7 @@ sequenceDiagram
 
   <section>
     <h2>Removing a device, and forks</h2>
-    <p class="lede">Removal is just another signed entry, carried by the next connection — trust the signature, not the sender. Atem never moves backwards; a conflict signed by a still-valid manager freezes remote access until a Recovery Kit reset.</p>
+    <p class="lede">Removal is just another signed entry, carried by the next connection — trust the signature, not the sender. Atem never moves backwards; a conflict signed by a still-valid manager freezes remote access until the host is re-paired.</p>
     <div class="mermaid-wrap"><div class="zoom"><button data-z="in">+</button><button data-z="out">−</button><button data-z="reset">⟲</button></div>
     <div class="mermaid-inner"><pre class="mermaid">
 flowchart TD
@@ -172,12 +172,11 @@ flowchart TD
   C1 -- "relay hides seq 4" --> LATE["Old iPad still accepted until any honest<br/>device reaches Atem — residual risk"]
   C1 -- "conflict signed by a removed key" --> IGN["ignored, logged as evidence<br/>(no freeze)"]
   C1 -- "conflict signed by a still-valid manager" --> FORK["fork: remote access frozen<br/>(local use unaffected)"]
-  LATE --> KIT
-  FORK --> KIT["Recovery Kit trust_reset<br/>names surviving devices<br/>via any connection or atem trust recover"]
-  KIT -. "kit lost too" .-> REC
+  LATE --> REC
+  FORK --> REC
   HW["Atem keeps a durable head (seq, hash)<br/>— a lower seq or non-chaining entry is refused"] -.-> C1
-  LOST["All manager devices lost?"] --> KIT
-  REC["local atem unpair + atem pair<br/>→ new genesis, new trust generation<br/>(data and keys kept)"]
+  LOST["Every Astation device lost?"] --> KIT["Astation restore account (Recovery Kit)<br/>restores K and signs an entry making the<br/>new device a manager — no re-pairing"]
+  REC["Re-pair from a trusted device:<br/>atem unpair, then atem pair<br/>→ new genesis (only the good devices)"]
     </pre></div></div>
   </section>
 
