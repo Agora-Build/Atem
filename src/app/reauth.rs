@@ -5,7 +5,9 @@
 //! is accepted the socket is alive but not authenticated: Atem shows
 //! `Astation ✗`, revokes remote terminals and ignores Astation's requests.
 use super::App;
-use crate::websocket_client::{AstationClient, AstationMessage, AuthResponse, is_auth_required};
+use crate::websocket_client::{
+    AstationClient, AstationMessage, AuthResponse, GrantSave, is_auth_required,
+};
 use std::time::{Duration, Instant};
 
 /// How long Astation has to accept the proof before the socket is dropped.
@@ -33,7 +35,7 @@ impl App {
             .to_string();
         match self
             .astation_client
-            .auth_response(message, &astation_id, false)
+            .auth_response(message, &astation_id, GrantSave::Never)
         {
             // Not an auth response: nothing else is acted on until Astation
             // accepts the proof (no input, terminal, voice, task or launch).
@@ -344,6 +346,19 @@ mod tests {
     async fn authenticated_reply_restores_online_as_a_new_link() {
         let (mut app, mut peer) = connected_app().await;
         let link = app.astation_link_gen;
+        // The pairing's session was last used long ago.
+        crate::pairing::tests::edit(peer._state.path(), |record| {
+            record.session.as_mut().unwrap().last_activity -= 3600;
+        });
+        let dir = peer._state.path().to_path_buf();
+        let last_activity = || {
+            let paths = crate::paths::ProfilePaths::in_dir(&dir).pairing;
+            let record = crate::records::PairingRecord::load(&paths)
+                .unwrap()
+                .unwrap();
+            record.session.unwrap().last_activity
+        };
+        let before = last_activity();
         peer.send
             .send(auth_required(ASTATION, &"b".repeat(64)))
             .unwrap();
@@ -359,6 +374,12 @@ mod tests {
         // A new link: the session host gives it a new attachment, so clients
         // `hello` again; no lease or input resumes.
         assert_eq!(app.astation_link_gen, link + 1);
+        // The existing pairing's session is refreshed.
+        assert!(last_activity() > before);
+        assert_eq!(
+            crate::pairing::tests::session_id(&dir).as_deref(),
+            Some(SESSION_ID)
+        );
     }
 
     async fn assert_fails_closed(app: &mut App, peer: &mut Peer, notice: &str) {
