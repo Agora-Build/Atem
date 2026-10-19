@@ -1,0 +1,107 @@
+{
+  "name": "r9-recovery-k-backup-unrelated-cas-loss-keeps-the-envelope",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "client",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5 \"Writing a backup\" (Astation r4 review 3): mac uploads version 1 (no k_backup in its log yet) and loses the log CAS to an unrelated entry (E7: phone removes svc-discord). No k_backup was committed in between, so mac keeps its uploaded envelope (its bytes don't depend on the head) and rebuilds only the k_backup entry on E7: no new upload, no 409 loop.",
+  "setup": {
+    "account_id": "acct-test-1",
+    "genesis_hash": "${hash:E1}",
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "client_log": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "relay_occupied": []
+  },
+  "steps": [
+    {
+      "client_backup": {
+        "by": "mac",
+        "kids": [
+          "b982533d",
+          "1f2e3d4c"
+        ],
+        "kit": "recovery"
+      }
+    },
+    {
+      "expect_backup_put": {
+        "by": "mac",
+        "blob_version": 1
+      },
+      "name": "m1"
+    },
+    {
+      "relay_reply": {
+        "by": "mac",
+        "status": 200
+      }
+    },
+    {
+      "expect_log_append": {
+        "by": "mac",
+        "action": "k_backup",
+        "blob_version": 1,
+        "seq": 7,
+        "expected": "E6",
+        "backup_hash_of": "m1"
+      }
+    },
+    {
+      "relay_reply": {
+        "by": "mac",
+        "status": 409,
+        "head": "E7",
+        "entries": [
+          "E7"
+        ]
+      }
+    },
+    {
+      "expect_log_append": {
+        "by": "mac",
+        "action": "k_backup",
+        "blob_version": 1,
+        "seq": 8,
+        "expected": "E7",
+        "backup_hash_of": "m1"
+      }
+    },
+    {
+      "relay_reply": {
+        "by": "mac",
+        "status": 200
+      }
+    },
+    {
+      "expect_backup_put_none": {
+        "by": "mac"
+      }
+    },
+    {
+      "assert_client": {
+        "by": "mac",
+        "k_backup_committed": 1,
+        "log_head_seq": 8,
+        "discarded": []
+      }
+    }
+  ]
+}

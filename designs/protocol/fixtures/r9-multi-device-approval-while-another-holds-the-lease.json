@@ -1,0 +1,176 @@
+{
+  "name": "r9-multi-device-approval-while-another-holds-the-lease",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.10 / r8 §G: the phone answers without the lease while the Mac holds it; first admitted answer wins, the holder's later answer is stale_target, the lease never moves, and the resolved push hint follows.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "connected": [
+      "phone"
+    ],
+    "holds_lease": {
+      "mac": 1
+    }
+  },
+  "steps": [
+    {
+      "open_approval": "ses-aaaaaaaaaaaa",
+      "tool": "Bash",
+      "summary": "rm -rf build"
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "approval_request"
+      },
+      "capture": {
+        "ap": "approval.approval_id"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "approval_request"
+      }
+    },
+    {
+      "expect_relay": {
+        "op": "push_hint",
+        "hints.#": 2
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "submit",
+          "id": "aaaaaaaa-0000-4000-8000-000000000070",
+          "binding": "${binding:phone:ses-aaaaaaaaaaaa}",
+          "kind": "approval",
+          "request_id": "bbbbbbbb-0000-4000-8000-000000000070",
+          "payload": {
+            "approval_id": "${ap}",
+            "decision": "deny",
+            "message": "not now"
+          }
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "receipt",
+        "state": "accepted"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "submit",
+          "id": "aaaaaaaa-0000-4000-8000-000000000071",
+          "binding": "${lease_binding:mac:ses-aaaaaaaaaaaa}",
+          "kind": "approval",
+          "request_id": "bbbbbbbb-0000-4000-8000-000000000071",
+          "payload": {
+            "approval_id": "${ap}",
+            "decision": "allow_once"
+          }
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "error",
+        "code": "stale_target"
+      }
+    },
+    {
+      "approval_applied": "${ap}",
+      "ok": true
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "receipt",
+        "state": "completed"
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "approval_closed",
+        "reason": "answered_remote"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "approval_closed",
+        "reason": "answered_remote"
+      }
+    },
+    {
+      "expect_relay": {
+        "op": "push_hint",
+        "hints.0.body.state": "resolved",
+        "hints.0.body.reason": "answered_remote"
+      }
+    },
+    {
+      "assert": {
+        "lease_holder": "mac",
+        "approval_decisions": [
+          {
+            "approval_id": "${ap}",
+            "decision": "deny",
+            "message": "not now"
+          }
+        ]
+      }
+    }
+  ]
+}

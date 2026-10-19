@@ -1,0 +1,108 @@
+{
+  "name": "r9-recovery-k-backup-envelope-409-allocates-above-occupied",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "client",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5 \"Writing a backup\" (Astation r4 review 3): the relay holds an occupied but uncommitted version 4 (a writer crashed before its CAS). The newest committed version in phone's log is 3, so its first allocation is 4 and the upload gets 409 {max_occupied: 4}; it reseals at 5 (new bytes, never the same version with other bytes), uploads and commits. Re-reading the log alone would choose 4 forever; the 409's max_occupied is what moves it on.",
+  "setup": {
+    "account_id": "acct-test-1",
+    "genesis_hash": "${hash:E1}",
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "client_log": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6",
+      "KB7"
+    ],
+    "relay_occupied": [
+      3,
+      4
+    ]
+  },
+  "steps": [
+    {
+      "client_backup": {
+        "by": "phone",
+        "kids": [
+          "7a3c9e10",
+          "b982533d",
+          "1f2e3d4c"
+        ],
+        "kit": "recovery"
+      }
+    },
+    {
+      "expect_backup_put": {
+        "by": "phone",
+        "blob_version": 4
+      },
+      "name": "p4"
+    },
+    {
+      "relay_reply": {
+        "by": "phone",
+        "status": 409,
+        "max_occupied": 4
+      }
+    },
+    {
+      "assert_client": {
+        "by": "phone",
+        "discarded": [
+          "p4"
+        ]
+      }
+    },
+    {
+      "expect_backup_put": {
+        "by": "phone",
+        "blob_version": 5
+      },
+      "name": "p5"
+    },
+    {
+      "relay_reply": {
+        "by": "phone",
+        "status": 200
+      }
+    },
+    {
+      "expect_log_append": {
+        "by": "phone",
+        "action": "k_backup",
+        "blob_version": 5,
+        "seq": 8,
+        "expected": "KB7",
+        "backup_hash_of": "p5"
+      }
+    },
+    {
+      "relay_reply": {
+        "by": "phone",
+        "status": 200
+      }
+    },
+    {
+      "assert_client": {
+        "by": "phone",
+        "k_backup_committed": 5,
+        "may_use_k": true
+      }
+    }
+  ]
+}

@@ -1,6 +1,9 @@
 # §9 proposal: one pairing, many devices on the same account
 
-Status: Atem-side proposal for joint review, 2026-10-16. Answers
+Status: Atem-side proposal for joint review, 2026-10-16; freshness and forks
+replaced by the user's final decision of 2026-10-19 (§3.5, re-pairing as the reset; exact rules in
+[protocol/remote-agent-api-atem.md](protocol/remote-agent-api-atem.md) §3; exact formats in the
+r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md), §R9.1–§R9.13). Answers
 `session-multiplexing.md` §9 / atem-session §9 ("trust anchor, membership,
 freshness") for the user's decision: **Atem pairs once; the user's other
 devices on the same account (Mac, iPhone, iPad) reach it without pairing
@@ -23,15 +26,15 @@ signatures that chain back to what it pinned.
 
 | Piece | Where it lives | What it is |
 |---|---|---|
-| Device key | each native Astation (Secure Enclave / platform keystore) | P-256 signing key + X25519 key; never leaves the device |
+| Device key | each native Astation (Secure Enclave / platform keystore) | P-256 signing key + X25519 key; never leaves the device; on a manager the signing key requires Face ID / Touch ID (key policy, not protocol) |
 | Membership log | relay stores it (untrusted storage), every trusted device and Atem keep copies | append-only list of signed entries |
 | Log entry | in the log | `{account_id, seq, prev_hash, action: add\|remove\|set_roles, device_id, device_sign_pub, device_enc_pub, roles, signer_device_id, signed_at}` + signature by a device whose roles include `manage` at `seq-1` |
-| Genesis | entry `seq = 1` | `add` of the first Astation by itself, roles `manage, view, control` |
-| Head attestation | produced on request by any online `manage` device | `{account_id, seq, head_hash, issued_at, atem_nonce?}` signed by a manager — "this is the latest log as of now" |
-| Atem pin | Atem's `cred/state.json`, next to the existing verification pins | `{account_id, genesis_hash, high_water_seq, high_water_hash, last_fresh_at}` |
+| Genesis | entry `seq = 1` | `add` of the first Astation by itself, roles `manage, view, control`, plus the Recovery Kit's public key (`recovery_sign_pub`) |
+| Recovery Kit | offline, saved by the user (password manager, printed QR + phrase, or another device) | Astation account-recovery feature: a mandatory Ed25519 key created at account setup; never a member; used only in Astation's restore-account flow when every Astation device is lost |
+| Atem pin | Atem's `pairing/membership.json`, beside `pairing/pairing.enc` and `pairing/trust_gen` | `{account_id, genesis_hash, host_trust_gen, recovery_sign_pub, head:{seq, hash}, entries, evidence, frozen?}`; the head only moves forward and is made durable before anything depends on it |
 
-Roles: `view` (see sessions/output), `control` (take the lease, type, submit,
-answer the agent's permission prompts while holding the lease), `manage` (add/remove devices).
+Roles: `view` (see sessions/output), `control` (take the lease, type, submit;
+answer the agent's permission prompts without the lease, r8 §G), `manage` (add/remove devices).
 Viewing ≠ control ≠ enrolment, as the product design requires.
 
 ## 3. Flows
@@ -41,7 +44,7 @@ Viewing ≠ control ≠ enrolment, as the product design requires.
 Today's `atem pair` + safety-code verification, with one addition: Astation
 sends the current membership log; Atem verifies the chain from genesis, checks
 that the pairing Astation's verified key is a listed `manage` device, and pins
-`genesis_hash` and the head as its high-water mark. The safety code also covers
+`genesis_hash` and the head (`seq`, hash) as its durable head. The safety code also covers
 the genesis hash (so a relay can't swap in another account's log).
 
 ### 3.2 Adding a device (once per device, not per Atem)
@@ -58,47 +61,94 @@ the genesis hash (so a relay can't swap in another account's log).
 ### 3.3 A device connects to Atem
 
 1. Device ↔ Atem over relay or direct :8080 (same messages).
-2. Atem sends `challenge{nonce}`.
-3. Device answers with: its device id, the log entries Atem doesn't have yet
-   (from Atem's high-water seq to head), a **head attestation** that includes
-   Atem's nonce (fresh) or one issued < 24 h ago, and a signature by its device
-   key over the transcript (nonce, `atem_device_id`, `host_trust_gen`, both
-   ephemeral X25519 keys).
-4. Atem verifies: the new entries chain from its pinned high-water hash; the
-   attestation is signed by a manager listed at that seq and isn't older than
-   the head Atem already knows; the device is listed (not removed) with the
-   roles it asks for; the transcript signature is the device's.
+2. Atem sends its challenge: a nonce and its head `(seq, hash)`.
+3. Device answers with: its device id, the log entries from Atem's head to its
+   own head (none if equal or behind; its whole log if it doesn't contain
+   Atem's head), and a signature by its device key over the transcript (nonce,
+   head, `atem_device_id`, `host_trust_gen`, both ephemeral X25519 keys).
+4. Atem verifies: each new entry chains from its head and is signed by a
+   manager at `seq-1`; it makes the new head durable and applies the entries
+   (removals fence at once) **before** admitting anyone; then the device must
+   be listed (not removed) with the roles it asks for, and the transcript
+   signature must be the device's.
 5. Both sides derive session keys from the ephemeral exchange (step 2 of this
    proposal: end-to-end encryption of the session channel). `welcome` grants
-   exactly the device's roles; leases and receipts work as today.
+   exactly the device's roles and carries Atem's head, so the device can show
+   "up to date"; leases and receipts work as today.
 
 ### 3.4 Removing a device
 
 Settings → Devices → Remove "Old iPad" on any manager device → `remove` entry
-signed and appended. Atem applies it the next time any device connects (they
-must bring entries up to the head) or when Atem polls the relay for the head.
-Atem keeps the highest seq it has seen, so it never goes back to an older list.
+signed and appended. Atem applies it the next time any trusted device connects
+(every connection must bring entries up to its own head), or when Atem fetches
+the log itself. Applying it is immediate: the removed device's live
+attachments are fenced and its queued work is rejected (r8 §H, `control_gen`).
+Atem keeps its head durably, so it never goes back to an older list. There are
+no revocation acknowledgements.
 
-### 3.5 Freshness and offline
+### 3.5 Freshness and forks (user decision, 2026-10-19)
 
-- **Fresh proof:** a head attestation that echoes Atem's nonce, signed by an
-  online manager, shows the list is current *now*.
-- **Offline window (approved: 24 h):** with no online manager, Atem accepts an
-  attestation issued < 24 h ago (Atem's own clock; also bounded by the time it
-  last saw a fresh one). After 24 h without fresh proof, remote viewing/control
-  pause; agents and the local terminal keep running.
-- **A withheld removal** (relay or attacker hides the newest entries) can delay
-  revocation by at most 24 h — the approved bound — and never past any newer
-  head Atem has already seen.
-- **Clock changes:** Atem measures the 24 h with both the monotonic and the wall
-  clock and uses whichever expires first; a clock set backwards can't extend it.
+**Trust the signature, not the sender.** Any device can carry entries,
+including revocations, even a revoked Astation or device. Only authorized
+managers sign additions and removals. Atem verifies signatures, device
+identities and the hash chain before applying anything, so a forged device id
+can't remove anyone or gain access: every effect needs a valid signature
+chaining from Atem's head. No periodic renewals.
 
-### 3.6 Lost devices / recovery
+- **No attestations, heartbeats or window.** Freshness comes from normal
+  connections: every connection carries the suffix from Atem's head. There
+  are no clock rules, no manager authority expiry and no acknowledgements.
+- **Atem's chain is authoritative up to its head.** A lower seq, or an entry
+  that doesn't chain from the head, is never applied. Beyond the head, the
+  first valid suffix applied wins.
+- **Conflicts:** an entry at or below Atem's head that differs from Atem's,
+  signed by a key Atem's chain has removed or that wasn't a manager at that
+  seq, is ignored and logged as evidence, without freezing. One signed by a
+  manager still valid in Atem's chain (not removed later) is real evidence
+  of a compromised manager key: remote access for the account freezes. Local
+  use is unaffected. Managers can never resolve a freeze.
+- **Stolen device:** remove it from another manager device. The removal is
+  a signed log entry carried by every connection and applied by Atem on its
+  own; nothing more is needed.
+- **Reset: re-pairing.** If a manager key was compromised, or a host shows
+  the security freeze, run `atem unpair`, then `atem pair` on each affected
+  host, from a trusted device. That pins a new genesis (a new device list
+  starting from the trusted device, with only the good devices); other
+  devices rejoin it. There is no Atem command for the Recovery Kit. Freeze message: "Remote access to <host> is paused
+  for safety. Re-pair this host from a device you trust: `atem unpair`, then
+  `atem pair`." Managers can never resolve a freeze.
+- **Residual risks, in the user's words:** a compromised manager signing key,
+  or a relay hiding revocations. A revocation reaches a host when any honest
+  device next connects; a stolen *unlocked* manager can act until then.
+  Re-pairing is the remedy for both.
 
-If every manager device is lost, the account's log can't grow. Recovery is the
-approved one: on each Atem host, local `atem unpair` + `atem pair` with a new
-Astation, which starts a **new genesis** (new trust generation). Account data
-and encryption keys are kept as today.
+### 3.6 Lost devices / account recovery
+
+The Recovery Kit is an Astation account-recovery feature, used only when
+every Astation device is lost. It is mandatory, created at account setup and
+kept offline (password manager, printed QR + phrase, or another device). It
+is used only in Astation's "restore account" flow on a new device, and does
+two things there: (a) restores the account key `K`, so encrypted memory,
+vault and credentials can be read again; (b) signs a log entry that makes
+the new device a manager of the existing device list, so hosts and phones
+keep working without re-pairing. Atem verifies that entry like any other:
+it chains from Atem's head and is signed by the current recovery key
+(genesis `recovery_sign_pub`, or a later `set_recovery_key`). It takes
+effect 24 h after each host first sees it, on the host's own clock, unless
+a manager approves it (at once) or vetoes it (cancelled); meanwhile the
+new device has no access and every host shows the pending recovery. `K`
+comes back from an `atem-k-backup-v2` envelope sealed to the kit's public
+key. The kit also carries the account's genesis hash (bound to `R` by a
+tag), so a restore trusts only the device list it was made for, never a
+substitute list a relay built around the kit's public key; and a restore
+publishes nothing until a host-signed head confirms the list is current
+(it waits, never recovers on a stale head). The kit is replaceable (`set_recovery_key`: with the current kit at
+once, without it after the same wait and veto). Atem has no command for
+it, and it is not a trust reset. Exact rules: atem-session r9, §R9.5.
+
+Without the kit, a lost-everything account re-pairs each Atem host (`atem
+unpair`, `atem pair`), a new genesis and trust generation; account data and
+encryption keys are kept as today.
 
 ## 4. Why this shape
 
@@ -114,21 +164,23 @@ and encryption keys are kept as today.
 
 **Astation (native):** device keys (exists for verification), membership log
 create/append/verify, the add-device approval UI (code + Touch ID), Settings →
-Devices (remove), head attestations on request, connecting to Atem with the
-proof bundle. **Relay:** store and serve the log per account (append-only,
+Devices (remove), the Recovery Kit at account setup and its restore-account flow, carrying the log suffix from Atem's head on every
+connection. **Relay:** store and serve the log per account (append-only,
 reject non-chaining appends as a convenience — not trusted). **Atem:** verify
-the chain and attestations, pin at pairing, high-water + freshness state,
-challenge/response in `hello`, roles → permissions, accept many attachments at
+the chain, pin at pairing, a durable head, apply suffixes before admission,
+the conflict rule and freeze message, applying the recovery-key entry like any entry, challenge/response in `hello`, roles → permissions, accept many attachments at
 once (the runtime already multiplexes viewers; today it only admits the paired
 Astation).
 
 ## 6. Steps
 
-1. **Membership + freshness** (this proposal): log format, signatures, pairing
-   pin, add/remove, connect proof, 24 h rule — plus shared fixtures (valid
-   chain, forked chain, removed device, stale attestation, wrong account).
+1. **Membership** (this proposal): log format, signatures, pairing pin,
+   add/remove, the suffix carried on every connection, the conflict rule and
+   freeze, re-pairing as the reset, the Recovery Kit as account recovery — plus shared fixtures (valid chain, conflict
+   by a removed key, conflict by a current manager, removed device, rollback,
+   recovery-key entry, wrong account).
 1b. **Approvals from chat/mobile:** prompt-bound `approval_request` /
-   `approval` submissions for the lease holder (see question 3).
+   `approval` submissions by any attachment with `control` (see question 3).
 2. **End-to-end channel:** ephemeral X25519 + device keys → session keys for
    the atem-session channel over relay and direct; relay can no longer read
    terminal or chat traffic.
@@ -137,8 +189,9 @@ Astation).
 
 ## 6a. Approvals in chat and on mobile (step 1b)
 
-The lease holder may answer the agent's permission prompts from the chat view or
-a phone. Both agents can take an external allow/deny without simulating keys:
+Since r8 (atem-session appendix §G) any attachment with `control` may answer the
+agent's permission prompts from the chat view or a phone, for the exact pending
+request; the lease is neither needed nor moved. Both agents can take an external allow/deny without simulating keys:
 
 | | Claude Code ([hooks](https://code.claude.com/docs/en/hooks)) | Codex ([hooks](https://developers.openai.com/codex/hooks)) |
 |---|---|---|
@@ -170,21 +223,21 @@ answer. Flow:
 
 1. The hook writes the request (tool, summary, `prompt_id`) as one event file in
    the session's private directory, like the other chat hooks.
-2. **No remote lease holder** → the runtime answers "no decision" at once; the
-   hook exits; the local dialog (already visible) is the only way to answer.
-3. **A remote lease holder** → the runtime announces `approval_request{approval_id,
-   session_id, process_gen, tool, summary, created_at}`; chat shows an approval
-   card with Allow / Deny (a phone can raise a lock-screen notification); the hook
-   keeps waiting (hook `timeout` 600 s).
-4. The controller answers with a §6 submission `kind:"approval"`, payload
-   `{approval_id, decision: allow|deny}`, under its current lease epoch; the
-   runtime checks the prompt is still pending for that exact session/process and
-   writes the decision file; the hook returns it.
-5. **Answered in the terminal first**, interrupted (Esc), timed out, or the lease
-   lost → the request is closed (the runtime sees the tool run or fail via the
+2. Whoever holds the lease, the runtime announces `approval_request{approval_id,
+   session_id, process_gen, tool, summary, created_at}` to every attachment with
+   `control` (and asks the relay to push it); chat shows an approval card with
+   Allow / Deny; the hook keeps waiting (hook `timeout` 600 s).
+3. A controller answers with a §6 submission `kind:"approval"`, payload
+   `{approval_id, decision, rule_id?, message?}`, without `acquire` and with
+   no lease check (a `lease_epoch` is ignored); the runtime checks `control`
+   and that the prompt is still pending for that exact session/process, writes
+   the decision file, and the hook returns it. The first admitted answer wins;
+   the lease never moves.
+4. **Answered in the terminal first**, interrupted (Esc), timed out or
+   released → the request is closed; lease changes never close it (the runtime sees the tool run or fail via the
    PostToolUse/transcript events, or the hook's exit); a later remote answer gets
    `error{code:"stale_target"}` and is never applied. The card disappears.
-6. Receipts record the outcome as observed: `completed` when the tool ran/was
+5. Receipts record the outcome as observed: `completed` when the tool ran/was
    refused as decided by the remote answer, `outcome_unknown` if the terminal
    answer and the remote answer crossed and Atem can't tell which won.
 
@@ -243,7 +296,7 @@ What that means for Atem with Codex:
 
 
 Changes to earlier rules: chat's "no approvals from chat" becomes "approvals by
-the lease holder, bound to the exact prompt"; "hooks never decide" gains one
+any attachment with `control`, bound to the exact prompt, no lease (r8 §G)"; "hooks never decide" gains one
 exception — the `PermissionRequest` hook may return a decision it received from
 the runtime; the local terminal dialog always stays available.
 
@@ -264,9 +317,8 @@ approval requests. Notification delivery and lease ownership are independent:
    device once end-to-end encryption lands.
 4. Tapping wakes the app, which reconnects, authenticates as a member device and
    receives the pending approval; Allow once / Always allow (Claude) / Deny.
-5. The answer carries `acquire: true`: Atem takes the lease for that device
-   (takeover allowed) and applies the decision **atomically** — the lease is only
-   taken when the user acts.
+5. The answer needs `control` and the exact pending request, never the lease
+   (r8 §G): it doesn't take, renew or move the lease, and `acquire` is refused.
 6. Answered elsewhere, expired or closed → `push_resolved{approval_id}` replaces
    the notification everywhere (collapse-id / FCM tag = approval_id); a late tap
    says "already answered".
@@ -289,7 +341,7 @@ commands on a Mac/Windows host through OpenAI's relay
 |---|---|---|
 | Agent session | `codex app-server`; an already running terminal session isn't shared live | the original terminal session stays live; chat comes from the agent's hooks and transcript |
 | Phone view | structured thread items (messages, tool steps, diffs, approvals) | chat-v1 messages + terminal view |
-| Approvals | `item/…/requestApproval` → accept / acceptForSession / decline / cancel | `PermissionRequest` hook → `approval_request` → lease-bound `approval` |
+| Approvals | `item/…/requestApproval` → accept / acceptForSession / decline / cancel | `PermissionRequest` hook → `approval_request` → `approval` by `control`, lease-free |
 | Trust | QR pairing per phone per host + account MFA; list/revoke controllers per host | pair Atem once; add each device to the account once; Settings → Devices |
 | Control | multi-device / local-terminal arbitration not documented | many viewers, one lease holder, local input wins |
 | Relay | OpenAI relay; E2EE documented only by a third-party bridge | our relay; E2EE in step 2 (ephemeral X25519 + signed transcript) |
@@ -306,19 +358,20 @@ terminal session with an app-server conversation.
    first Astation (genesis, e.g. the Mac) starts as the **only** manager;
    further devices become managers only when the user marks them (confirmed by
    the user, 2026-10-16).
-2. **Freshness heartbeat:** besides on-demand attestations for Atem's nonce,
-   every online manager re-signs the current head every 6 h, so a device can
-   connect with a fresh-enough list even when no manager is reachable at that
-   moment (still bounded by the 24 h window).
+2. **Freshness (replaced 2026-10-19):** the 6 h heartbeat, head attestations
+   and the 24 h window are dropped. The log suffix travels with every
+   connection; a conflict signed by a current manager freezes remote access
+   until the host is re-paired; manager keys
+   require biometrics (§3.5).
 3. **Decided (user, 2026-10-16): approvals from chat and mobile are allowed for
    whoever holds control.** No separate `approve` role: a device with `control`
-   that currently holds the session's lease may answer the agent's permission
+   may answer (since r8 §G without the lease) the agent's permission
    prompts from the chat view or a phone, not only in the terminal. To keep a late
    or replayed tap from approving the wrong action, approvals are **bound to the
    exact prompt**: Atem announces `approval_request{approval_id, session,
    process_gen, tool, summary}` when the agent asks; the controller answers with a
    §6 submission `kind:"approval"`, payload `{approval_id, decision:
-   allow|deny}`, under its current lease epoch; Atem applies it only if that
+   allow|deny}` (r8: no lease, no `acquire`); Atem applies it only if that
    prompt is still the one pending, then records the receipt. Delivery to the
    agent (to be verified per agent): preferably the agent's own structured
    permission hook (Claude Code's permission hook answering allow/deny), else the

@@ -1,0 +1,64 @@
+{
+  "name": "r9-chain-fork-carried-by-an-unknown-device-freezes",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "Trust the signature, not the sender: a device the log doesn't know carries a current manager's conflicting entry; the host freezes and the carrier gets nothing.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "stranger",
+        "principal": "member:dev-evil",
+        "key": "dev-evil"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "stranger",
+      "carry": [
+        "C6_mac"
+      ],
+      "window": true
+    },
+    {
+      "expect": "stranger",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "assert": {
+        "frozen": true,
+        "attachments": 0
+      }
+    }
+  ]
+}

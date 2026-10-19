@@ -1,0 +1,212 @@
+{
+  "name": "r9-chain-lost-carriage-record-restart-stays-held",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.3 (Astation r4 review 2): the first device-list write, the carriage record, fails and is lost entirely, so nothing about the carriage (here a conflicting window, C6_mac) reached the disk. Atem never evaluated it: it refuses the carriage unread, fences every remote principal in memory and halts. At restart the host is not frozen (it never learnt of a conflict) but held, since the fault was recorded (the fault record is a separate write that succeeded): no remote hello is admitted, not after a day and another orderly restart, and nothing re-carries the conflict. Only a managing device whose verified log ends at the host's head reconciles it.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "svc",
+        "principal": "service:svc-discord",
+        "key": "svc-discord"
+      }
+    ],
+    "connected": [
+      "phone"
+    ],
+    "holds_lease": {
+      "mac": 1
+    }
+  },
+  "steps": [
+    {
+      "fail_next_membership_write": {
+        "at": "temp_fsync",
+        "file": "carriage"
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": [
+        "C6_mac"
+      ],
+      "window": true
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not recorded"
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not recorded"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not recorded"
+      }
+    },
+    {
+      "assert": {
+        "frozen": false,
+        "membership_halted": true,
+        "carriage_record": false,
+        "attachments": 0,
+        "lease_holder": null,
+        "evidence_count": 0
+      }
+    },
+    {
+      "local_input": "ses-aaaaaaaaaaaa",
+      "bytes": "bHMNCg=="
+    },
+    {
+      "assert": {
+        "pty_writes_local": 1,
+        "pty_writes_remote": 0
+      }
+    },
+    {
+      "restart_runtime": {
+        "runtime_gen": "44444444-4444-4444-8444-444444444444",
+        "runtime_epoch": 2
+      },
+      "disk": "write_lost"
+    },
+    {
+      "assert": {
+        "frozen": false,
+        "head": "E6",
+        "membership_held": true,
+        "carriage_record": false,
+        "fault_record": true
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": []
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not reconciled"
+      }
+    },
+    {
+      "connect": "mac",
+      "carry": [],
+      "client_head": "E5"
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not reconciled"
+      }
+    },
+    {
+      "advance_ms": 86400000
+    },
+    {
+      "restart_runtime": {
+        "runtime_gen": "55555555-5555-4555-8555-555555555555",
+        "runtime_epoch": 3
+      }
+    },
+    {
+      "assert": {
+        "frozen": false,
+        "membership_held": true
+      }
+    },
+    {
+      "connect": "svc",
+      "carry": []
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "busy",
+        "detail": "device list not reconciled"
+      }
+    },
+    {
+      "assert": {
+        "membership_held": true,
+        "attachments": 0
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": [],
+      "client_head": "E6"
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "principal": "member:dev-phone",
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "assert": {
+        "membership_held": false,
+        "fault_record": false
+      }
+    }
+  ]
+}

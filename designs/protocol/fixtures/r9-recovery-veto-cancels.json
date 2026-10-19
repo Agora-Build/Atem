@@ -1,0 +1,146 @@
+{
+  "name": "r9-recovery-veto-cancels",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5: a manager's recovery_veto naming the pending entry's hash cancels it, by any route (here direct :8080). The subject never becomes a member, even after 24 h, and an entry it signs is invalid.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793177601000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "newmac",
+        "principal": "member:dev-newmac",
+        "key": "dev-newmac"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "carry": [
+        "R7"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 7,
+        "head.hash": "${hash:R7}",
+        "pending_recovery": [
+          {
+            "entry_hash": "${hash:R7}",
+            "seq": 7,
+            "action": "recovery_add",
+            "subject": "dev-newmac",
+            "effective_at": 1793264001000
+          }
+        ]
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": [
+        "V8"
+      ],
+      "transport": "direct"
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 8,
+        "head.hash": "${hash:V8}",
+        "pending_recovery": []
+      }
+    },
+    {
+      "assert": {
+        "pending": {
+          "R7": "cancelled"
+        },
+        "members": [
+          "dev-mac",
+          "dev-phone",
+          "svc-discord"
+        ]
+      }
+    },
+    {
+      "expect_local_status": {
+        "recovery_pending": false
+      }
+    },
+    {
+      "advance_ms": 86401000
+    },
+    {
+      "connect": "newmac",
+      "carry": []
+    },
+    {
+      "expect": "newmac",
+      "match": {
+        "op": "error",
+        "code": "unauthorized"
+      }
+    },
+    {
+      "assert": {
+        "head": "V8",
+        "pending": {
+          "R7": "cancelled"
+        },
+        "members": [
+          "dev-mac",
+          "dev-phone",
+          "svc-discord"
+        ]
+      }
+    }
+  ]
+}

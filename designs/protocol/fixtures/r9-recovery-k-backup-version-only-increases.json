@@ -1,0 +1,87 @@
+{
+  "name": "r9-recovery-k-backup-version-only-increases",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5: a k_backup entry is verified like any entry (a manager signs it) and its blob_version must exceed every earlier one; the host keeps the newest record but never fetches or opens a backup.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793177601000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "carry": [
+        "KB7",
+        "KB8_stale"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 7,
+        "head.hash": "${hash:KB7}",
+        "index": 1,
+        "detail": "blob_version_not_increasing"
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": [
+        "KB8"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "principal": "member:dev-phone",
+        "head.seq": 8,
+        "head.hash": "${hash:KB8}"
+      }
+    },
+    {
+      "assert": {
+        "head": "KB8",
+        "k_backup": {
+          "blob_version": 4,
+          "backup_hash": "${vector:r9-vectors-recovery:k_backup_rotated.backup_hash}"
+        }
+      }
+    }
+  ]
+}

@@ -73,7 +73,7 @@ device key, unlock policy and recovery kit, described once below.
 | Revoked device | partial | Its pairing session is killed; `K`, the index key and its scope keys are rotated; its writes are rejected by every device. It keeps what it already read. Every value in its scopes is listed for rotation at the provider. |
 | Root or malware on a granted device | exposed | Out of scope. Limited to what that device was granted. |
 | Stolen Mac | protected | Keys are in the Keychain and Secure Enclave behind Touch ID. Restore on a new Mac from the recovery kit. |
-| Stolen recovery kit + control of the relay | delayed and visible | A signing-key replacement takes effect only after 72 hours, every atem alerts you at once, and the current Mac can veto it. |
+| Stolen recovery kit + control of the relay | delayed and visible | A recovery enrollment takes effect only 24 hours after each host first sees it (on the host's clock), every host lists it in its `welcome` and shows it locally, and any manager device can veto it from any host. |
 | Plain text from before encryption was turned on | exposed in old backups | The relay purges it, but database backups taken earlier still contain it. |
 
 ## Decisions
@@ -95,7 +95,7 @@ device key, unlock policy and recovery kit, described once below.
 | Credential names | `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. Spelling kept for display; unique and looked up case-insensitively. |
 | Forked repos | A fork is a separate project, with no credential grants until you add them. |
 | Fetch log | The relay records (device, credential, version, time) for every credential fetch. Best effort: revocation treats every value in the device's scopes as exposed. |
-| Recovery | One kit, one secret `R`. Every recovery key is derived from `R`. A replaced signing key takes effect after **72 hours**; a new `R` is issued after every recovery. |
+| Recovery | One kit, one secret `R`, Astation's account recovery. A recovery enrollment waits **24 hours** on each host's clock unless a manager approves or vetoes it; the kit is replaceable (`set_recovery_key`). See "Recovery kit". |
 | `atem cred add` | Optional, not required for v1. |
 
 ## Keys
@@ -144,7 +144,7 @@ flowchart TB
     CT["Credential rows<br/>ciphertext + signature"]
     MAN["Signed manifest per scope<br/>+ signed scope directory"]
     GR["Signed grants<br/>keys sealed to device X"]
-    BK["Backup blob<br/>sealed with recovery seal key"]
+    BK["K backup (atem-k-backup-v2)<br/>sealed to the kit's public key"]
   end
   subgraph DEV["atem device"]
     DKS["device_keys.sealed<br/>device key + device signing key"]
@@ -164,7 +164,7 @@ flowchart TB
   GR -->|opened by device key| AG
   AG -->|device signature| MEM
   PIN -->|verifies| CT
-  REC["Recovery kit secret R"] -->|derived seal key| BK
+  REC["Recovery kit public key"] -->|HPKE seal| BK
 ```
 
 **Scope keys are random, not derived.** One project's key tells you nothing
@@ -216,7 +216,7 @@ statement whose `sign_gen` isn't their pinned generation.
 | `atem-storage-confirm-v1` | device signing key | account, device_id, new_storage_kid | The device switched to the new storage key; Astation may drop the old one. |
 | `atem-storage-abandon-v1` | device signing key | account, device_id, storage_kid | The device gives up a pending storage key it holds no file for; Astation drops its pending key only if it is exactly this one. |
 | `atem-migration-complete-v1` | device signing key | account, sign_gen, device_id, target (`on` / `off`), kid, state_epoch, stores, remaining, key_proof | Attests completion of a migration under an Astation-approved pending state; see "Migration completion lifecycle". |
-| `atem-sign-rotate-v1` | recovery signing key | account, old sign pub, new sign pub, new_gen, new recovery sign pub, not_before | Replaces the signing key after a recovery; valid only after `not_before` (72 hours). |
+| `atem-sign-rotate-v1` | — | — | Withdrawn: recovery is the r9 membership-log `recovery_add` with a 24-hour wait, and the kit is replaced with `set_recovery_key` ("Recovery kit"). |
 | `atem-sign-veto-v1` | current signing key | account, sign_gen, vetoed new_gen | Cancels a pending replacement from the current Mac. |
 
 ## Devices
@@ -777,83 +777,56 @@ flowchart LR
 
 ## Recovery kit
 
-The Astation recovery kit (`RecoveryKit.swift`, branch `feat/recovery-kit`)
-holds the Astation ID and relay URL, but no secret. It gains one line:
+The Recovery Kit is **Astation's account recovery**, used only when every
+Astation device is lost, in Astation's restore-account flow on a new
+device. Its exact formats are in the r9 appendix of
+[atem-session-v1.md](protocol/atem-session-v1.md), §R9.5, which wins
+where this summary differs.
 
 ```
-Recovery key: XXXX-XXXX-XXXX-…   (256 bits, base32)
-```
-
-Every recovery key is derived from that one secret `R`:
-
-```
-recovery seal key    = HKDF-SHA256(R, info = "atem-recovery-seal-v1")
-recovery signing key = Ed25519 seed from HKDF-SHA256(R, info = "atem-recovery-sign-v1")
+Recovery key: XXXX-XXXX-XXXX-…   (one 256-bit secret R, base32)
+sign_seed    = HKDF-SHA256(R, info = "atem-recovery-sign-v1")   -> Ed25519 recovery key
+kit X25519   = the same key in Montgomery form                  -> K backups are sealed to it
 ```
 
 ```mermaid
 flowchart LR
-  R["Recovery secret R<br/>in the kit only"] -->|"HKDF atem-recovery-seal-v1"| SEAL["Recovery seal key"]
-  R -->|"HKDF atem-recovery-sign-v1"| RSIGN["Recovery signing key<br/>Ed25519"]
-  SEAL --> BLOB["Backup blob on relay, versioned:<br/>keys, pins, revocations, baselines, epochs"]
-  RSIGN -->|"public half pinned at verification"| ATEMS["every atem"]
-  RSIGN -->|"signs once per recovery"| ROT["sign-rotate: new SE key,<br/>new recovery key, not_before +72h"]
-  ROT -->|"alert now, accept after 72h<br/>unless vetoed"| ATEMS
+  R["Recovery secret R<br/>in the kit only"] -->|"HKDF atem-recovery-sign-v1"| RSIGN["Recovery key<br/>Ed25519 (+ X25519 form)"]
+  RSIGN -->|"public half in the device list"| HOSTS["every host"]
+  RSIGN -->|"public half: any manager seals to it"| BLOB["atem-k-backup-v2 on the relay,<br/>versioned by k_backup log entries"]
+  RSIGN -->|"signs recovery_add"| ADD["new device as manager,<br/>in effect 24 h after each host first sees it"]
+  ADD -->|"approve (at once) or veto (cancel)<br/>by any manager"| HOSTS
 ```
 
-**The backup blob** holds everything a new Mac needs: `K` and previous
-keys, every scope key, the index key, every device storage key, the pinned
-device keys, the revocation list, unlock baselines, the scope directory,
-and the current epochs and counters. It carries a monotonic `blob_version`
-in its associated data. Astation re-seals it after every change. Every atem
-reports the highest `blob_version` it has seen (in a device-signed message),
-and a restoring Astation refuses a blob older than the highest reported
-version.
-
-**Replacing the signing key.** On a new Mac, Astation restores from the
-kit, creates a new Secure Enclave signing key, generates a **new** `R`, and
-the old recovery signing key signs
-`atem-sign-rotate-v1 { account, old sign pub, new sign pub, new_gen, new recovery sign pub, not_before = now + 72 h }`.
-Each atem:
-- checks that `old sign pub` is its pinned key and `new_gen` is its pinned
-  generation + 1, and rejects anything else;
-- alerts you **immediately** ("signing key replacement requested via
-  recovery kit; takes effect on <time>");
-- keeps the old key and refuses credential writes and new grants until
-  `not_before`;
-- discards the replacement if it receives an `atem-sign-veto-v1` from the
-  old signing key before `not_before`;
-- after `not_before`, pins the new signing key and the new recovery signing
-  key.
-
-Reads of existing credentials and memory keep working during the 72 hours.
+- **Restore:** the new device opens the newest `atem-k-backup-v2`
+  envelope (HPKE to the kit's public key, bound to account, genesis,
+  `blob_version`, kids and kit; its version floor is the newest
+  `k_backup` entry in the device list), stores `K`, then signs a
+  `recovery_add` that makes it a manager of the existing device list.
+- **24-hour wait:** each host applies it 24 hours after it first sees it,
+  on its own clock (monotonic and wall, whichever ends later; never a
+  timestamp in the entry). Meanwhile the new device has no access, every
+  host lists the pending entry in its `welcome` and shows it locally, and
+  any manager can approve it (in effect at once) or veto it (cancelled)
+  by any route. Reads by existing devices are unaffected.
+- **Replaceable kit:** a manager replaces the kit with
+  `set_recovery_key`: co-signed by the current kit, at once; without it
+  (kit lost), after the same 24-hour wait with approve and veto. A
+  replaced key never signs again. Any manager re-seals the K backup to
+  the new kit's public key (no `R` needed); after a lost kit Astation
+  also rotates `K`. With no manager and no kit, each host is re-paired.
 
 Rules:
-1. `R` is a fresh random secret, **never `K`**. Every paired atem holds `K`,
-   so a recovery signing key derived from `K` would let any atem forge a
-   signing-key replacement.
-2. Astation never keeps `R`. After showing the kit it keeps only the
-   recovery signing *public* key and the derived seal key (Keychain, sealed
-   by the Secure Enclave), which it needs to update the backup blob. The
-   recovery signing private key exists only while setting up and during a
-   recovery, re-derived from the kit.
-3. **A new kit after every recovery.** The rotation pins a new recovery
-   signing key, so the old kit stops working once the replacement takes
-   effect. Astation shows the new kit and requires saving it.
-4. The kit is shown behind Touch ID or the Mac password. Turning on memory
-   encryption or credentials requires saving the new kit first: the button
-   stays disabled until you confirm. Kits saved before this change can't
-   recover keys.
-5. Whoever has the kit and can wait 72 hours without a veto can take over.
-   The immediate alert on every atem and the veto from the current Mac are
-   the defenses; if the Mac is really lost, nobody vetoes and recovery
-   simply completes.
-6. Any atem that still holds `K` can also re-grant it to a new Astation
-   (`keyOffer`, approved on both sides), but credentials and the signing key
-   come back only from the kit.
+1. `R` is a fresh random secret, **never `K`**.
+2. Astation never keeps `R`; it needs only the kit's public key, which is
+   in the device list.
+3. The kit is shown behind Touch ID or the Mac password, and turning on
+   memory encryption or credentials requires saving it first.
+4. Any atem that still holds `K` can also re-grant it to a new Astation
+   (`keyOffer`, approved on both sides).
 
-If you lose the Mac and the kit, and no atem holds `K`, the data is gone
-for good. That's the point of the design.
+If you lose every device and the kit, and no atem holds `K`, the data is
+gone for good. That's the point of the design.
 
 ## Memory, skills and vault notes
 
@@ -1235,7 +1208,7 @@ A plain credential value is never written to disk anywhere.
 - Signing key: Secure Enclave, can't be extracted.
 - Encryption key, `K`, scope keys, index key, storage keys (per device,
   keyed by `(device_id, device_pub)`: one current, at most one pending, and
-  every storage kid ever acked), recovery seal key: Keychain items, `WhenUnlockedThisDeviceOnly` (never synced to
+  every storage kid ever acked): Keychain items, `WhenUnlockedThisDeviceOnly` (never synced to
   iCloud), each sealed by a Secure Enclave key so a copied Keychain is
   useless on another Mac.
 - Pinned device keys (device, device signing, unlock-auth), revocation list,
@@ -1353,7 +1326,7 @@ and in the shipped #36 code; the design above includes every fix.
 | 6 | high | Relay could force global fallback, pair an old row with a new manifest, or serve a stale first manifest | Signed scope directory, row-in-manifest check, epoch floor from the device certificate ("Reading") |
 | 7 | high | Relay could swap the unlock request's key and steal the storage key forever | Unlock-auth key, reply bound to the request, storage key rotated at every unlock ("Unlock policy") |
 | 8 | high | Migration sealed a device key already in old backups and kept a possibly relay-supplied `K` | Fresh device keys at verification, `K` rotation ("Migration") |
-| 9 | medium-high | Recovery rotation unbound and replayable; old kit valid forever | Labelled statement with chain checks, 72-hour delay with veto, new `R` per recovery ("Recovery kit") |
+| 9 | medium-high | Recovery rotation unbound and replayable; old kit valid forever | Labelled statement with chain checks, 72-hour delay with veto, new `R` per recovery; superseded by r9: a 24-hour host-clock wait with manager approve/veto and a replaceable kit ("Recovery kit") |
 | 10 | medium | Backup blob lacked pins and revocations and could be rolled back | Versioned blob with pins, revocations, baselines; atems report the highest version |
 | 11 | medium | Clone detected only at the real box's next reboot | Ticket rolls every 15 minutes, crash-safe ("Unlock policy") |
 | 12 | medium | Revocation left `K`, index key and pairing session | Revocation kills the session and rotates all three ("Revoking a device") |
@@ -1760,7 +1733,7 @@ encryption key (32 × `66`) and verifies the device signature.
 | Component | Work |
 |---|---|
 | atem | Signed account state and plain-text rejection (fixes to #36); cred agent (socket, `SO_PEERCRED`, `mlock`, `zeroize`); fresh device, device signing and unlock-auth keys; `device_keys.sealed` with storage-key rotation (built, step 2a); commit-then-reveal safety code and `[y/N]` in `atem pair`; HPKE grants with signature checks; device-signed memory writes and verification; `atem cred` commands; scope directory, manifest and epoch checks; `cred/state.json`; ticket rolling; rotation delay and veto handling; device-reported checks (boot ID, TPM, cloud identity) |
-| Astation | Secure Enclave signing key and encryption key; signed account state, device certificates, grants, directory, revocations; key manager for `K`; scope, index and storage keys; Credentials and Devices tabs; verification dialog; unlock prompts, auto-unlock checks, tickets; recovery secret `R` in the kit, versioned backup blob, signing-key rotation with 72-hour delay and veto |
+| Astation | Secure Enclave signing key and encryption key; signed account state, device certificates, grants, directory, revocations; key manager for `K`; scope, index and storage keys; Credentials and Devices tabs; verification dialog; unlock prompts, auto-unlock checks, tickets; recovery secret `R` in the kit, `atem-k-backup-v2` sealed to the kit's public key, recovery with a 24-hour host-clock wait and manager approve/veto, kit replacement |
 | Relay | Store and serve signed statements; per-account plain-text refusal; `credentials`, `cred_manifests`, `cred_directory`, `cred_grants`, `cred_devices`, `cred_recovery`, `cred_fetch_log`; credential writes from the Astation session only; grant-scoped reads; device signatures on memory rows; live-twin and network observations forwarded to Astation |
 
 The Astation `feat/recovery-kit` branch has no e2e key handling yet

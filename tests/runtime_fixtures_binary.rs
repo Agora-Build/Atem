@@ -1968,7 +1968,9 @@ fn scenarios() -> Vec<Value> {
 /// implemented).
 fn waiting(scenario: &Value) -> Option<String> {
     let name = scenario["name"].as_str().unwrap();
-    if name.starts_with("r8-") {
+    if revision::is_r9_fixture(name) {
+        Some(revision::R9_NOT_RUN.to_string())
+    } else if name.starts_with("r8-") {
         revision::r8_fixture_runnable(name).err()
     } else {
         None

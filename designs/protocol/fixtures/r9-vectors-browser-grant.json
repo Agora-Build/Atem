@@ -1,0 +1,98 @@
+{
+  "browser_key_secret_hex": "dc082d0cf69d63645c354e14ab2d03d086024b29a5680312e8bbc163d6d4467b",
+  "grant": {
+    "body": {
+      "account_id": "acct-test-1",
+      "browser_key": {
+        "alg": "p256",
+        "pub": "BKjst2x65MAWpKZavBBkp2s7E0YblfazQortKn5P-WNLQLpgXlGXmLWnZjF-xszNOapgPmynud-KWXMiBEmvD78"
+      },
+      "expires_at": 1793267600000,
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "grant_id": "7b2d8c5a-0e3f-4a41-9c9d-3e4f5a6b7c8d",
+      "issued_at": 1793264000000,
+      "issuer": "dev-phone",
+      "ops": [
+        "view"
+      ],
+      "target": {
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "session_id": "ses-aaaaaaaaaaaa"
+      },
+      "type": "atem-browser-grant",
+      "v": 1
+    },
+    "sig": "ksI0_QZytn32W4j90gRNs-0_jKYacsGO9swk1Rpk7yts178GCowSgCgd_8mMPJhke0TF6IQgnlwArBiAdICEJQ"
+  },
+  "grant_hash_hex": "80bdc2f3c9b8ab44a32753ef2d8d21208f5a3030f42f05ae047af86ab85db820",
+  "invalid": [
+    {
+      "case": "longer_than_1h",
+      "grant": {
+        "body": {
+          "account_id": "acct-test-1",
+          "browser_key": {
+            "alg": "p256",
+            "pub": "BKjst2x65MAWpKZavBBkp2s7E0YblfazQortKn5P-WNLQLpgXlGXmLWnZjF-xszNOapgPmynud-KWXMiBEmvD78"
+          },
+          "expires_at": 1793267600001,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "grant_id": "7b2d8c5a-0e3f-4a41-9c9d-3e4f5a6b7c8d",
+          "issued_at": 1793264000000,
+          "issuer": "dev-phone",
+          "ops": [
+            "view"
+          ],
+          "target": {
+            "host_id": "host-a",
+            "host_trust_gen": 1,
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "type": "atem-browser-grant",
+          "v": 1
+        },
+        "sig": "MmxOi4YrWT8DYUbsvMHhsmLf-eOSohKs8-hBkA6YzlArFbKrWGTvOqlR4lKijC0sOa3P3JH69pjdFGoOk7Rk1g"
+      },
+      "reason": "expires_at - issued_at > 3600000"
+    },
+    {
+      "case": "issued_by_a_service",
+      "grant": {
+        "body": {
+          "account_id": "acct-test-1",
+          "browser_key": {
+            "alg": "p256",
+            "pub": "BKjst2x65MAWpKZavBBkp2s7E0YblfazQortKn5P-WNLQLpgXlGXmLWnZjF-xszNOapgPmynud-KWXMiBEmvD78"
+          },
+          "expires_at": 1793267600000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "grant_id": "7b2d8c5a-0e3f-4a41-9c9d-3e4f5a6b7c8d",
+          "issued_at": 1793264000000,
+          "issuer": "svc-discord",
+          "ops": [
+            "view"
+          ],
+          "target": {
+            "host_id": "host-a",
+            "host_trust_gen": 1,
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "type": "atem-browser-grant",
+          "v": 1
+        },
+        "sig": "1vFwlKAdsW74oVlCNuAFMmmHHrW_a-JayotlVWyXQ7Ft0VVIkXgwyXaSvGS19ihju7oGmUPV-gmxRiRAeIrsBg"
+      },
+      "reason": "issuer must be a native member with control at the host's head"
+    }
+  ],
+  "kind": "vectors",
+  "name": "r9-vectors-browser-grant",
+  "note": "A QR grant from dev-phone (a native member with control) for a browser key, signed over enc([\"atem-browser-grant-v1\", jcs(body)]); grant_hash = SHA-256(enc([\"atem-browser-grant-hash-v1\", jcs(body)])). The browser proves its key in atem-ch1 (th3 includes grant_hash); th2 and sig_h are those of r9-vectors-channel-handshake.",
+  "principal_jcs": "{\"grant_id\":\"7b2d8c5a-0e3f-4a41-9c9d-3e4f5a6b7c8d\",\"kind\":\"browser\"}",
+  "requires": "r9",
+  "sig_c_hex": "b8540a6338ff87d6284e25427360b2ba8e1cc740924e90700c073e990d159cdf663ad106176ba20ef5a88731c9143366b778524abe4818c1dacb97b576bfdff8",
+  "signing_input_hex": "000000156174656d2d62726f777365722d6772616e742d7631000001e97b226163636f756e745f6964223a22616363742d746573742d31222c2262726f777365725f6b6579223a7b22616c67223a2270323536222c22707562223a22424b6a7374327836354d4157704b5a617642426b70327337453059626c66617a516f72744b6e35502d574e4c514c7067586c47586d4c576e5a6a462d78737a4e4f617067506d796e75642d4b57584d6942456d76443738227d2c22657870697265735f6174223a313739333236373630303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226772616e745f6964223a2237623264386335612d306533662d346134312d396339642d336534663561366237633864222c226973737565645f6174223a313739333236343030303030302c22697373756572223a226465762d70686f6e65222c226f7073223a5b2276696577225d2c22746172676574223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c2273657373696f6e5f6964223a227365732d616161616161616161616161227d2c2274797065223a226174656d2d62726f777365722d6772616e74222c2276223a317d",
+  "th2_hex": "46aac4edc1499ce74e4263c327c98e6e37d6aa1824fe432d3e8311929f5e98c8",
+  "th3_hex": "c63914eaa788fe87d3d2697d32989dad1c0aa221ba0ed062a3a3d14783e7da09"
+}

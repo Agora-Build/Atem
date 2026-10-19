@@ -1,0 +1,81 @@
+{
+  "name": "r9-handshake-success",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.7: with the vector's fixed ephemerals and nonces both sides reproduce every value (th2, sig_h, hs, k_finish, th3, sig_c, th4, k_c2h, k_h2c) and the first records byte for byte (the welcome record in the vector is abbreviated; the harness compares the derived keys and the c2h records).",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "handshake": "phone",
+      "vector": "r9-vectors-channel-handshake"
+    },
+    {
+      "expect_record": "phone",
+      "dir": "h2c",
+      "counter": 0,
+      "vector_record": 0
+    },
+    {
+      "assert": {
+        "channel_id": "${vector:r9-vectors-channel-handshake:channel_id}",
+        "attachments": 1,
+        "head": "E6"
+      }
+    },
+    {
+      "send_record": "phone",
+      "vector_record": 1
+    },
+    {
+      "send_record": "phone",
+      "vector_record": 2
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "sessions"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "sessions"
+      }
+    }
+  ]
+}

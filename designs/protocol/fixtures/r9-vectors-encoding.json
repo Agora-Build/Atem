@@ -1,0 +1,41 @@
+{
+  "ed25519_strict": {
+    "key": "host-a",
+    "message_hex": "6174656d2d7239206564323535313920636865636b",
+    "sig_hex": "d2d1a02b234644da9b33b5d637fc957ec1f2c36d775077652ed3b7ce139c0f221bd75b35ed4cc66b4845974d647037ee4db0a34449c1dc2946e06d3d18abd705",
+    "valid": true
+  },
+  "enc": [
+    {
+      "fields_utf8": [
+        "atem-membership-entry-v1",
+        "{}"
+      ],
+      "hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000000027b7d"
+    },
+    {
+      "fields": [
+        "u64(6)"
+      ],
+      "hex": "000000080000000000000006"
+    }
+  ],
+  "jcs": [
+    {
+      "input": "{\"b\":[3,1],\"a\":{\"z\":1,\"y\":\"é\"}}",
+      "jcs": "{\"a\":{\"y\":\"é\",\"z\":1},\"b\":[3,1]}"
+    }
+  ],
+  "kind": "vectors",
+  "name": "r9-vectors-encoding",
+  "note": "enc() is src/memory/encoding.rs: each field = 4-byte big-endian length + bytes; u64 fields are 8 bytes big-endian; jcs() is RFC 8785 (src/session_protocol/canonical.rs). Signing input of a signed object = enc([label, jcs(body)]).",
+  "p256_low_s": {
+    "high_s_valid": false,
+    "key": "dev-mac",
+    "message_hex": "6174656d2d7239206c6f772d5320636865636b",
+    "sig_high_s_hex": "b9ccf7eeffc58b8a2dd6303f4a6bb718db4aa2bf850f07af9785d840e12977e8db77377bacdf593c8ec0a4107cab0301b69d6e1f56ce8152bc0bc18fc2bacdc3",
+    "sig_low_s_hex": "b9ccf7eeffc58b8a2dd6303f4a6bb718db4aa2bf850f07af9785d840e12977e82488c8835320a6c4713f5bef8354fcfe06498c8e50491d3237ae093339a8578e",
+    "valid": true
+  },
+  "requires": "r9"
+}

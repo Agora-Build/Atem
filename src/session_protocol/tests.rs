@@ -240,7 +240,9 @@ fn every_fixture_wire_message_decodes_and_round_trips() {
         let fixture_name = file["name"].as_str().unwrap_or_default();
         let r8_waiting = fixture_name.starts_with("r8-")
             && super::revision::r8_fixture_runnable(fixture_name).is_err();
-        if r8_waiting {
+        // r9 fixtures are drafts of an unimplemented revision (vectors and
+        // channel-level scenarios), reported as not run by the runners.
+        if r8_waiting || super::revision::is_r9_fixture(fixture_name) {
             continue;
         }
         let steps = file["steps"].as_array().unwrap();

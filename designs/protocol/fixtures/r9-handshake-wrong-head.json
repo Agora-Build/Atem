@@ -1,0 +1,115 @@
+{
+  "name": "r9-handshake-wrong-head",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "client",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.7 (Astation review 1): the head is cleartext and covered by sig_h, so a rewritten head fails the signature before anything that names the client is sent; a client behind the host proceeds and carries nothing; a diverged client carries its window; another trust generation or genesis is refused at init.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "client_handshake": "phone",
+      "vector": "r9-vectors-channel-handshake",
+      "tamper": {
+        "accept.head": {
+          "seq": 5,
+          "hash": "${hash:E5}"
+        }
+      }
+    },
+    {
+      "expect_client_refusal": "phone",
+      "code": "handshake_failed",
+      "sent_after_accept": 0
+    },
+    {
+      "client_handshake": "phone",
+      "client_log": [
+        "E1",
+        "E2",
+        "E3",
+        "E4"
+      ],
+      "accept_head": "E6"
+    },
+    {
+      "expect_client_sent": "phone",
+      "op": "finish",
+      "membership.entries.#": 0
+    },
+    {
+      "client_handshake": "phone",
+      "client_log": [
+        "E1",
+        "E2",
+        "E3",
+        "E4",
+        "E5",
+        "C6_ipad"
+      ],
+      "accept_head": "E6"
+    },
+    {
+      "expect_client_sent": "phone",
+      "op": "finish",
+      "membership.entries": [
+        "C6_ipad"
+      ]
+    },
+    {
+      "client_handshake": "phone",
+      "init": {
+        "host_trust_gen": 2
+      }
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "stale_target",
+      "at": "init"
+    },
+    {
+      "client_handshake": "phone",
+      "init": {
+        "genesis_hash": "0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "stale_target",
+      "at": "init"
+    }
+  ]
+}

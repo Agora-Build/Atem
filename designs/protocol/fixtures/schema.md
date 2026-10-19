@@ -192,3 +192,131 @@ The r8 scenarios:
 Astation's API-level merge fixture (a delayed HTTP page against newer SSE
 versions) is Astation's; the host side of it is
 `r8-history-page-and-live-events-share-one-ordered-stream`.
+
+## r9 fixtures (draft; not run)
+
+`r9-*.json` files carry `"requires": "r9"` and exercise the drafted
+appendix "r9" of `../atem-session-v1.md`. r9 isn't implemented: both
+runners report every one as NOT RUN ("requires r9 …",
+`revision::R9_NOT_RUN`) and only check that it parses, is named after its
+file and has a known `kind`. They become runnable in `crates/atem-client`
+(vectors, client and relay sides) and the Atem host harness (host side)
+when r9 is built; the steps below are the contract for those harnesses.
+
+`kind: "vectors"` — known-answer values computed with this crate's own
+dependencies (`p256`, `ed25519-dalek`, `x25519-dalek`, `hkdf`,
+`chacha20poly1305`, `hpke`) and the repo's `enc`/`jcs`, and cross-checked
+with an independent implementation (Python `cryptography`). Test keys:
+secret = SHA-256(enc(["atem-r9-test-key", label])) (`r9-vectors-keys`).
+Hex fields end in `_hex`; wire objects use base64url without padding.
+Every implementation must reproduce every value; `valid: false` entries
+and `negative`/`invalid` cases must be refused for the stated reason.
+
+| file | contents |
+|---|---|
+| `r9-vectors-keys` | every test key (P-256, Ed25519, X25519 secrets and publics), the Recovery Kit `R` and `kit_tag`, and the substitute chain's `host-evil` and `K-evil` |
+| `r9-vectors-encoding` | `enc`, `u64`, `jcs`, a P-256 low-S signature and its refused high-S twin, an Ed25519 signature |
+| `r9-vectors-membership-log` | log L = E1–E6 (genesis, add_host, three members, a service, a removal) with signing inputs, signatures and `entry_hash`; alternatives used by the scenarios: `C6_ipad`, `C6_mac`, `S6_phone`, `E7`, `E7_retry`, `X8_badsig`, `X7_ipad`, `X5_svc91d`, `R7`, `R7_wrong_key`, `R7_roles`, `R7_remove`, `R6_conflict`; recovery decisions and kits (R9.5): `R7_backdated`, `A8`, `V8`, `A8_ipad`, `V8_ipad`, `N8`, `K7_current` (with `kit_sig`), `K7_current_no_kit_sig`, `R8_oldkit`, `R8_newkit`, `K7_lost`, `V8_k`, `A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale`, `KB8_badct` (names an envelope that fails to open); the substitute chain `SUB1`–`SUB3` (another genesis reusing kit 1's public key, refused by a restore) |
+| `r9-vectors-recovery` | `R` → signing seed, recovery key (= E1's) and its X25519 form; the `R7` entry; `atem-k-backup-v2` envelopes sealed to kit 1 (`k_backup`, version 3; `k_backup_rotated`, version 4) with `info`, `ikmE`, `backup_hash`; `kit_2` (the replacement kit) and the envelope re-sealed to it; each kit's genesis binding (`kit`, `kit_2.kit`: `account_id`, `genesis_hash`, `kit_tag`); `substitute_chain` (its envelope sealed to kit 1, opening with kit 1, refused `genesis_mismatch`) |
+| `r9-vectors-channel-handshake` | a full `atem-ch1` handshake (every input, `th2`, `sig_h`, `ss`, `hs`, `k_finish`, `th3`, `sig_c`, the `finish` ciphertext, `th4`, `channel_id`, both record keys, three records) and the negative cases |
+| `r9-vectors-browser-grant` | a signed QR grant, its hash, the browser's `th3`/`sig_c`, and two invalid grants |
+| `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints |
+
+`kind: "scenario"` — `{name, requires, kind, side, log, note, setup,
+steps}`. `log` names the vectors file whose entry labels the scenario
+uses; `${hash:<label>}` is that entry's `entry_hash`, and
+`${vector:<file>:<path>}` a value of a vectors file (dotted path, array
+indexes as numbers). `side` is `host`, `client` (the fixture plays the
+host, or for a restore or a backup writer the relay) or `relay` (the fixture plays devices and hosts against a relay
+implementation; the relay's own HTTP shapes are Astation's).
+
+`setup`: `host` (r8's host context plus `host_id`, `wall_clock_ms`,
+optional `cred_agent: "locked"`, `astation_desktop_connected`), or
+`hosts` (several, each with a `name`); `pinned` (entry labels, genesis
+first: the host's durable chain at the start); `sessions` (r8's, plus
+`project`, the recorded launch project hash); `clients`
+(`{name, principal, key, grant?}`: `key` names the client's keys in
+`r9-vectors-keys`, `grant` a grant in a vectors file); `connected`
+(clients connected and welcomed before step 0 through a full handshake
+carrying nothing), `holds_lease` (`{client: epoch}`: connected, then a
+real `acquire`); `relay_head`, `relay_now`, `desktop_connected` for the
+relay side; `client_log` (labels: the log the client side's devices
+verified) and `relay_occupied` (envelope versions the relay already
+holds for the log) for a backup writer. No other client is connected at the start. Setup messages
+are invisible to the steps, as in r8.
+
+Steps: every r8 step (`send`, `expect`, `expect_none`, `advance_ms`,
+`local_input`, `open_approval`, `close_approval`, `approval_applied`,
+`turn_complete`, `restart_runtime`, `crash_runtime`, `reconnect`,
+`assert`, …) with r8's meaning inside the channel, where
+`${binding:<client>:<session>}` / `${lease_binding:<client>:<session>}`
+stand for the client's current read / lease binding. New:
+
+| step | meaning |
+|---|---|
+| `{"connect": c, "carry": [label], "client_head"?: label, "window"?: bool, "more"?: bool, "hello"?: {…}, "grant"?: …, "host"?: name, "transport"?: "relay"}` | a full `atem-ch1` handshake with c's key, then `hello` carrying those entries (`window`: the diverged form of R9.3); `client_head` is the head c reports; `hello` overrides hello fields |
+| `{"send_membership": c, "entries": [label]}` | a `membership` op on c's open channel |
+| `{"handshake": c, "vector": file, "tamper"?: {path: value}}` / `{"client_handshake": c, …, "client_log"?: [label], "accept_head"?: label, "init"?: {…}}` | drive the handshake from a vectors file (host side / client side), optionally changing one message field before it is sent |
+| `{"expect_record": c, "dir": d, "counter": n, "vector_record": i}`, `{"send_record": c, "vector_record": i, "as_counter"?: n, "ct_from"?: dir}` | records byte for byte against the vectors |
+| `{"expect_channel_error": c, "code": k, "at": "init"\|"finish"}`, `{"expect_client_refusal": c, "code": k, "sent_after_accept": n}`, `{"expect_closed": c, "reply": false}` | handshake errors (`at: "init"`: clear; `at: "finish"`: clear for a failed tag, else the host's first record, a session `error`); the client stops; a channel closed without a reply |
+| `{"plain_frame": c, "json": msg}` / `{"expect_plain": c, "match": {…}}` | a session message outside any channel and the host's answer |
+| `{"replay": {…}}` | resend an earlier handshake message into a new channel |
+| `{"fail_next_membership_write": true}`, `{"crash_after_membership_commit": {runtime_gen, runtime_epoch}}` | the next `membership.json` write fails / the runtime dies right after it is durable, before the fences |
+| `{"hold_dispatch": true}` | accepted work stays queued (not yet executing) until the end of the scenario |
+| `{"set_wall_clock": ms}` | the host's wall clock jumps (expiry timers fire) |
+| `{"unpair": true}`, `{"pair": {"log": [label]}, "result": "refused", "detail": d}` | `atem unpair`; a pairing that pins that log |
+| `{"relay_append": {by, entry, expected, retry?}, "status": n, "reply"?: {…}}` | relay side: a device's CAS append |
+| `{"relay_receive": hint, "tamper"?: {…}}` / `{"relay_result": r}` | relay side: a hint arrives; its verdict (`accepted`, `idempotent`, `duplicate`, `skew`, `invalid_times`, `bad_signature`, `ignored_after_resolved`) |
+| `{"expect_push": {device, kind, at_ms?, collapse_id?}}`, `{"expect_no_push": {"for_ms": n}}`, `{"client_open": {…}, "plain": {…}}` | relay side: a provider push (`desktop_os`, `mobile`, `replace`), none, a recipient opening its sealed part |
+| `{"expect_relay": {path: value}}` / `{"expect_relay_none": true}` | host side: the next relay message Atem sends (`push_hint`, `push_seen`) / none |
+| `{"host_connect": {…}}` | relay side: a device then connects to a host pinned as given; client side (restore): the fixture's host answers an `init` with `accept_head` |
+| `{"expect_local_status": {"recovery_pending": bool}}` | host side: `atem status` and the agent terminal's status row show (or no longer show) that a recovery is pending; the text is the implementation's |
+| `{"fail_next_membership_write": {"at": "intent"\|"temp_write"\|"temp_fsync"\|"rename"\|"directory_fsync", "file"?: "carriage"\|"freeze"}}` | the next device-list write fails at that step (`true` = `temp_write`); by default `membership.json`, `file: "carriage"` the carriage record (the first write of a carriage, R9.3), `file: "freeze"` the freeze file |
+| `restart_runtime` with `"disk": "as_written"\|"rename_kept"\|"rename_lost"\|"write_lost"` | what survived of the failed write: everything written, the rename kept (never directory-fsynced), the rename lost, or nothing of it. `restart_runtime` is an orderly stop (it writes §H's clean close unless the run halted); `crash_runtime` (which also takes `disk`) and `crash_after_membership_commit` don't. Held at start depends only on a fault record or an unreconcilable carriage record (R9.3), never on how the run stopped |
+| `{"restore": …, "result": "withheld", "detail": "no_host_reachable"}` | client side: no host answered `init`; the restore waits (R9.5 step 3) |
+| `{"client_backup": {by, kids, kit}}` | client side: device `by` starts writing a K backup of that sequence sealed to that kit, on its verified log |
+| `{"expect_backup_put": {by, blob_version, bytes?, same_bytes_as?}, "name"?: n}` / `{"expect_backup_put_none": {by}}` | its next envelope upload (put-if-absent), optionally byte-exact or equal to an earlier upload; `name` labels its bytes / no further upload |
+| `{"expect_log_append": {by, action, blob_version, seq, expected, backup_hash_of?, entry?}, "name"?: n}` | its next CAS append (`expected` the head label, `entry` a vector label the body must equal); `name` labels the committed entry |
+| `{"relay_reply": {by, status, max_occupied?, head?, entries?}}` | the relay's answer to `by`'s last request; `@<name>` refers to a named upload or entry |
+| `{"client_crash": c}` / `{"client_restart": c}` | the device dies / restarts from its durable state |
+| `{"relay_receive_seen": seen}`, `{"expect_relay_ack": {op, acks}}`, `{"relay_restart": true}`, `{"relay_failover": {from, to}}` | relay side: a seen arrives (verdicts `applied`, `pending`, `ignored_after_resolved`); the relay's `push_ack`; the relay restarts from its durable store; another replica takes over |
+| `{"relay_lost": true}`, `{"relay_ack": {op, acks}}` | host side: the last relay message Atem sent was lost; the relay acknowledges |
+| `{"restore": {kit, relay_log, relay_blob, host_heads}, "tamper"?: {…}, "result": "restored"\|"refused", "detail"?, "freshness"?, "kids"?, "published": false\|{…}}` | client side: a Recovery Kit restore against that relay log and envelope with those host-signed heads; `published` is the `recovery_add` it then signs (none when refused) |
+| `{"client_data": {"kid": k}, "result": r}` | client side: the restored device meets data sealed under `kid` |
+
+In r9 scenarios `advance_ms` moves the host's (or relay's) monotonic
+and wall clocks together, and `set_wall_clock` the wall clock only.
+`expect_push` takes `due_at` (the stage's due time on the relay's clock,
+absolute) and optional `replica`; setup `immediate_mobile` lists the
+devices opted in to immediate mobile pushes (default: none),
+`replicas` the relay replicas. `connect` also takes `"transport":
+"direct"` (:8080).
+
+New `assert` keys: `head` (label), `membership_applied` (label),
+`frozen`, `frozen_genesis`, `evidence_count`, `evidence_reason`,
+`control_gen` (`{principal: n}`), `members`, `stored_sig` (label whose
+signature is stored), `channel_id`, `carried_ever`, `receipts`
+(`{request_id: {state, detail}}`), `host` (which host of `hosts`),
+`pending` (`{label: "pending"|"active"|"cancelled"}`, R9.5),
+`recovery_key` (the `r9-vectors-keys` name of the current kit),
+`k_backup` (the newest `k_backup` record), `membership_halted` (the
+journal halted by a device-list write fault), `membership_unclean`
+(`{seq, hash}` of an intent beyond the head, or `null`),
+`membership_held` (no remote admission until a manager reconciles,
+R9.3), `carriage_record` (a carriage record is on disk),
+`fault_record` (a device-list fault record is on disk),
+`frozen_durable`.
+`assert_client` (optionally `by`): `discarded` (prepared entries or
+envelopes discarded), `log_head`, `log_head_seq`, `may_rotate_k`,
+`may_seal_backup`, `freshness`, `refetch`, `k_stored` (a restored `K`
+set stored as current), `user_notice` (`waiting_for_host`),
+`k_backup_committed` (the newest committed version in its log),
+`backup_done`, `backup_error` (`relay_misbehaviour`), `may_use_k`.
+A restore's `tamper` may name kit fields (`kit.account_id`,
+`kit.genesis_hash`): the kit is altered without recomputing its tag.
+
+Until the r9 harness first runs them, an r9 scenario lists the
+expectations its checks need; messages of r8 ops it doesn't expect
+(`session_changed`, `executing` receipts, `membership_head` events to
+other attachments) are tolerated at the end. Pinning r9 makes the end
+strict as in r8.

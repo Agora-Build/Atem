@@ -1,0 +1,155 @@
+{
+  "name": "r9-chain-conflict-by-a-current-manager-freezes",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.4: C6_mac is validly signed by dev-mac, still a manager at Atem's head: freeze (durable first), every remote principal fenced, init refused, local input unaffected, survives restart; re-pairing must start a new list (the frozen genesis is refused).",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "svc",
+        "principal": "service:svc-discord",
+        "key": "svc-discord"
+      }
+    ],
+    "connected": [
+      "phone"
+    ],
+    "holds_lease": {
+      "mac": 1
+    }
+  },
+  "steps": [
+    {
+      "connect": "svc",
+      "carry": [
+        "C6_mac"
+      ],
+      "window": true
+    },
+    {
+      "expect": "svc",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "account_frozen"
+      }
+    },
+    {
+      "assert": {
+        "frozen": true,
+        "head": "E6",
+        "attachments": 0,
+        "lease_holder": null,
+        "control_gen": {
+          "member:dev-mac": 2,
+          "member:dev-phone": 2,
+          "service:svc-discord": 2
+        }
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": []
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "account_frozen",
+      "at": "init"
+    },
+    {
+      "local_input": "ses-aaaaaaaaaaaa",
+      "bytes": "bHMNCg=="
+    },
+    {
+      "assert": {
+        "pty_writes_local": 1,
+        "pty_writes_remote": 0
+      }
+    },
+    {
+      "restart_runtime": {
+        "runtime_gen": "44444444-4444-4444-8444-444444444444",
+        "runtime_epoch": 2
+      }
+    },
+    {
+      "assert": {
+        "frozen": true
+      }
+    },
+    {
+      "unpair": true
+    },
+    {
+      "pair": {
+        "log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6"
+        ]
+      },
+      "result": "refused",
+      "detail": "frozen genesis"
+    },
+    {
+      "assert": {
+        "frozen_genesis": [
+          "${hash:E1}"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,124 @@
+{
+  "keys": {
+    "K-evil": {
+      "kid": "e7e7e7e7",
+      "note": "an attacker-chosen K (label \"K-evil\") sealed to kit 1's public key in the substitute backup",
+      "secret_hex": "224d394796acc76c5dd7c3c112cce0fc5b455fd45c271e2902a48d53946b9063"
+    },
+    "K-gen-3": {
+      "kid": "7a3c9e10",
+      "note": "a rotated account key K (test value SHA-256(enc([\"atem-r9-test-key\", \"K-gen-3\"]))), first in env4_kit1",
+      "secret_hex": "44f6bf2c49660d8025954e67cd0921095e9f17f6f754f0860127d0cdc3a8c3ae"
+    },
+    "browser": {
+      "alg": "p256",
+      "pub_hex": "04a8ecb76c7ae4c016a4a65abc1064a76b3b13461b95f6b3428aed2a7e4ff9634b40ba605e519798b5a766317ec6cccd39aa603e6ca7b9df8a5973220449af0fbf",
+      "secret_hex": "dc082d0cf69d63645c354e14ab2d03d086024b29a5680312e8bbc163d6d4467b"
+    },
+    "dev-evil": {
+      "auth": {
+        "alg": "p256",
+        "pub_hex": "0461ef7dcc00cd7db5b44e46fc830d3171eebe999a10c5513f1a7881b9c658611b8a78ca543374c51d996a75daf292095d895ef36a3c49d4d2fc8e030744b71895",
+        "secret_hex": "8cbd62a3bedc95f96038163205b29244bb7f132d57d7e3ada69219d03dfc4609"
+      },
+      "enc": {
+        "pub_hex": "46e4de69aa72133d182c74b9d91c7452348a7eb8a766c24d7424b94231e51270",
+        "secret_hex": "94acf97ec62bc4e8cc13049af2f0f38c776208a3e17c228d812f5c960d099121"
+      },
+      "note": "an attacker's device (never a member): labels \"dev-evil auth\" and \"dev-evil enc\"; the member keys in C6_ipad, X7_ipad and X8_badsig"
+    },
+    "dev-ipad": {
+      "auth": {
+        "alg": "p256",
+        "pub_hex": "043f145e9a6b1f708187de3994618b178624a3867929b2987875c1c8e79c484b8b5ed666f8047804c0c72dba7f85f0540badc50eb8baf3106576d0738ee5f369bb",
+        "secret_hex": "6b20bf7043d3af060b70afc5842c881ebcb4853d4764cbf6e5a90ae1301059ab"
+      },
+      "enc": {
+        "pub_hex": "4d1978fe0cbf7412830cb36c52593e42c7a2fc225e389aea950a5c6b2c91ff4f",
+        "secret_hex": "30420274eff80a8cc0a228cbbefd1c97ea65c890524d70f02ee0be7d7e717882"
+      }
+    },
+    "dev-mac": {
+      "auth": {
+        "alg": "p256",
+        "pub_hex": "0468feca590458f6fa22130bfbfdd415d641acac2f7450e5cfe41a980bb0cf6c483a35d7da6c80c2db82c5f1aef23996493cfeb401bd0a454d482891859fb4d1b1",
+        "secret_hex": "8cbb703728912bf1f36c67969cd02c31da50833b149736eebc401e593cee11b5"
+      },
+      "enc": {
+        "pub_hex": "dafd4431b8d90c2f98af234326665a6a42a028c4ed4e38c86f4b00e179cb2359",
+        "secret_hex": "bfa0664fde3222947767b3a54bc886cee232dc7a498dfdb7006862df10f6bd55"
+      }
+    },
+    "dev-newmac": {
+      "auth": {
+        "alg": "p256",
+        "pub_hex": "04e9bb8b80aed716ab7d85465519944688a068e381ff2b79c8b956e029d351ff6069e1e3b39034ce82b162861312d8a8febf37572e29aa67ac858337e63d1c2ceb",
+        "secret_hex": "73b802b92e714e2d68f0b43718d10c81afd5b1960ab075d33bf03e18c1fb2f73"
+      },
+      "enc": {
+        "pub_hex": "e58d9e224838c855b96025783d14d9e086781f36d37131148ee859bfb6bfc056",
+        "secret_hex": "afaba643a67c17fb46c4de9147555dacd6a2b843f9e625d7f548fb4f6ba36f28"
+      }
+    },
+    "dev-phone": {
+      "auth": {
+        "alg": "p256",
+        "pub_hex": "0465793afddbe3712352b2467a362fab07d0963abd5f84f1d117756980c89c4dbdb66372f882218081f4858f9c85e38dd1bbc0fced3211e6a1d3251b5e7c4ee524",
+        "secret_hex": "51b44af4fe7b107f4b5522f6ab168a4b2b2b7a123a7adef8b85c9e935fe6902b"
+      },
+      "enc": {
+        "pub_hex": "a09927dcfaf96689cb8889c17b22e2e1e37221c1e42cc473d049a61c4f998976",
+        "secret_hex": "e813b00518eedc5f85e1b036f168917ef9dc935806a410c2f73e624dbf0e0c1b"
+      }
+    },
+    "host-a": {
+      "host_key": {
+        "alg": "ed25519",
+        "pub_hex": "99af375c3ab19ba105daa464ec83786bd545bf94d7f3044f01d954658ce2358e",
+        "secret_hex": "33f12d10a63332a050fc9a070b69b9b3b05f9a78f9a5c9bf9dcd8484691eaa50"
+      }
+    },
+    "host-evil": {
+      "host_key": {
+        "alg": "ed25519",
+        "pub_hex": "dea441ca85ecdeae4a0ae82904a133b52cbcd4f227c5e79addcdca69f01ba308",
+        "secret_hex": "ca4dce8e059fce9ad26c0196eb4e8492fb19861bd7e4e394a474f224d0f060f5"
+      },
+      "note": "the substitute chain's host (label \"host-evil host_key\"): SUB2 adds it as host-a; never in log L"
+    },
+    "not-recovery": {
+      "alg": "ed25519",
+      "pub_hex": "239d75b7174b38b0d01499540b5864e9314d1e78b9bcc01fe6ba609e20ec175e",
+      "secret_hex": "642d774781dbc61f1752618e40e1e546867291aaed0a6f97d1582a04ef6a5814"
+    },
+    "note": "test keys only: secret = SHA-256(enc([\"atem-r9-test-key\", label])); p256 public keys are SEC1 uncompressed (65 bytes), all binary values base64url without padding in wire objects, hex here",
+    "recovery": {
+      "R_hex": "de7b07c173601dbcd9053ef7679fcd3a6864af071005397179134682a438dcc6",
+      "kit_tag_hex": "38d5aeaebad0af036ba7bafdc86ab259",
+      "note": "the genesis Recovery Kit (kit 1). x25519_secret = SHA-512(sign_seed)[0..32] (X25519 clamps it), x25519_pub = the Montgomery form of sign_pub: K backups are sealed to it (R9.5). The kit also carries account_id acct-test-1, genesis_hash = E1's entry_hash and kit_tag_hex (R9.5 \"Recovery Kit v2\"; r9-vectors-recovery kit)",
+      "sign_pub_hex": "98767c988ff0cf727ae9917811e9c4ed63b7fb48608d4c32688db79f2ed94360",
+      "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616",
+      "x25519_pub_hex": "bf4e6c788975c3b940a9f5c0a51021855c6e2ddebd4da5910c5487604bccab11",
+      "x25519_secret_hex": "03024c114a38837b585e6056038e8fec266d66b393822cb9539646119c54cc95"
+    },
+    "recovery-2": {
+      "R_hex": "4a5242ed59c7082d090c9f231a12d2a9556b103487a1939f3cd247ea8c3b0ef8",
+      "kit_tag_hex": "87b5c6102d2cda3b49fc4696a6e8ea6d",
+      "note": "the replacement Recovery Kit (kit 2) of set_recovery_key (R9.5): R = SHA-256(enc([\"atem-r9-test-key\", \"recovery-kit-2\"])); x25519 forms as for kit 1. Bound to the same genesis (E1) as kit 1: kit_tag_hex",
+      "sign_pub_hex": "6ac71ad781df6ce7ed92841e5bc62f742da067719adaf123445a32160d9662e9",
+      "sign_seed_hex": "8c883c0ac87d86005eb18840dc813b4e9e667d0454972f05555413c359ae97db",
+      "x25519_pub_hex": "9cf22770ff538106fbbc159283ddb03ba7edc84af5e945366628ba5016fea506",
+      "x25519_secret_hex": "16aa17e40af75e3ad84a51dc68ac5facdb15e20749b0ab3ad0acd3252bae0e15"
+    },
+    "svc-discord": {
+      "auth": {
+        "alg": "ed25519",
+        "pub_hex": "40a3e522021710b7aab45e2e311d5673f3eac28d2588b458a24202abb23f68d1",
+        "secret_hex": "fa1bed8571a892fe1c09489f44d0d352fe3e58ff7dcd80fa8f7236e649d15ca3"
+      }
+    }
+  },
+  "kind": "vectors",
+  "name": "r9-vectors-keys",
+  "requires": "r9"
+}

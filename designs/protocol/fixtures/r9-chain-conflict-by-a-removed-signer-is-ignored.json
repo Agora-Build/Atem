@@ -1,0 +1,96 @@
+{
+  "name": "r9-chain-conflict-by-a-removed-signer-is-ignored",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.4: C6_ipad differs from E6 at seq 6 and is validly signed by dev-ipad, but E6 removes dev-ipad: ignored and logged, no freeze. X7_ipad beyond the head is simply invalid (dev-ipad isn't a manager at seq 6); on an open channel the error keeps the channel.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "client_head": "C6_ipad",
+      "carry": [
+        "C6_ipad"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "assert": {
+        "head": "E6",
+        "frozen": false,
+        "evidence_count": 1,
+        "evidence_reason": "signer_removed"
+      }
+    },
+    {
+      "send_membership": "phone",
+      "entries": [
+        "X7_ipad"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "code": "membership_invalid",
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "assert": {
+        "head": "E6",
+        "frozen": false,
+        "attachments": 1
+      }
+    }
+  ]
+}

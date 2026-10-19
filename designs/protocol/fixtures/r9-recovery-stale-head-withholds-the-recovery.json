@@ -1,0 +1,106 @@
+{
+  "name": "r9-recovery-stale-head-withholds-the-recovery",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "client",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5 (user decision 2026-10-19, option A): a recovering device never publishes recovery_add before a host-signed head confirms its log is the latest. With no host reachable it waits (withheld) and tells the user why: no K stored as current, nothing signed or published, no rotation or backup. A host's head beyond the relay's log refuses the stale log; once the log reaches the host-signed head, the restore completes and publishes on it.",
+  "setup": {
+    "account_id": "acct-test-1",
+    "genesis_hash": "${hash:E1}",
+    "hosts": [
+      {
+        "name": "host-a",
+        "host_id": "host-a",
+        "host_trust_gen": 1
+      }
+    ]
+  },
+  "steps": [
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup.wire}",
+        "host_heads": {}
+      },
+      "result": "withheld",
+      "detail": "no_host_reachable",
+      "published": false
+    },
+    {
+      "assert_client": {
+        "k_stored": false,
+        "may_rotate_k": false,
+        "may_seal_backup": false,
+        "user_notice": "waiting_for_host"
+      }
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "refused",
+      "detail": "log_behind_host",
+      "published": false
+    },
+    {
+      "assert_client": {
+        "k_stored": false,
+        "refetch": true
+      }
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7",
+          "KB8"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup_rotated.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "restored",
+      "freshness": "host_confirmed",
+      "kids": [
+        "7a3c9e10",
+        "b982533d",
+        "1f2e3d4c"
+      ],
+      "published": {
+        "action": "recovery_add",
+        "seq": 9,
+        "prev_hash": "${hash:KB8}"
+      }
+    }
+  ]
+}

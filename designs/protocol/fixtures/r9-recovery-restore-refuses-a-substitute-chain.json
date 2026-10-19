@@ -1,0 +1,95 @@
+{
+  "name": "r9-recovery-restore-refuses-a-substitute-chain",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "client",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.5 (Astation r4 review 1): a hostile relay serves a substitute chain SUB1-SUB3 under kit 1's account: its own genesis reusing kit 1's public key (manager dev-evil), its own key for host-a, and a k_backup naming an envelope that seals K-evil to kit 1. Every signature verifies, the envelope opens with kit 1, and the substitute host signs a matching accept head; the restore refuses it because SUB1's entry_hash is not the genesis_hash the kit carries, before any K is stored or anything is published. Editing the kit's genesis_hash to the substitute's fails the kit tag. The real chain then restores.",
+  "setup": {
+    "account_id": "acct-test-1",
+    "genesis_hash": "${hash:E1}",
+    "hosts": [
+      {
+        "name": "host-a",
+        "host_id": "host-a",
+        "host_trust_gen": 1
+      }
+    ]
+  },
+  "steps": [
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "SUB1",
+          "SUB2",
+          "SUB3"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:substitute_chain.backup.wire}",
+        "host_heads": {
+          "host-a": "SUB3"
+        }
+      },
+      "result": "refused",
+      "detail": "genesis_mismatch",
+      "published": false
+    },
+    {
+      "assert_client": {
+        "k_stored": false,
+        "log_head": null
+      }
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "SUB1",
+          "SUB2",
+          "SUB3"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:substitute_chain.backup.wire}",
+        "host_heads": {
+          "host-a": "SUB3"
+        }
+      },
+      "tamper": {
+        "kit.genesis_hash": "${hash:SUB1}"
+      },
+      "result": "refused",
+      "detail": "kit_tag_mismatch",
+      "published": false
+    },
+    {
+      "restore": {
+        "kit": "recovery",
+        "relay_log": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "KB7",
+          "KB8"
+        ],
+        "relay_blob": "${vector:r9-vectors-recovery:k_backup_rotated.wire}",
+        "host_heads": {
+          "host-a": "KB8"
+        }
+      },
+      "result": "restored",
+      "freshness": "host_confirmed",
+      "kids": [
+        "7a3c9e10",
+        "b982533d",
+        "1f2e3d4c"
+      ],
+      "published": {
+        "action": "recovery_add",
+        "seq": 9,
+        "prev_hash": "${hash:KB8}"
+      }
+    }
+  ]
+}

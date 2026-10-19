@@ -1,0 +1,132 @@
+{
+  "name": "r9-chain-valid-suffix-applies-before-admission",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.3: the suffix is verified, committed and fenced before the carrier is judged; a removed device that carries its own removal is refused after the removal applied; an unknown device gets nothing.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "ipad",
+        "principal": "member:dev-ipad",
+        "key": "dev-ipad"
+      },
+      {
+        "name": "stranger",
+        "principal": "member:dev-evil",
+        "key": "dev-evil"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "carry": [
+        "E4",
+        "E5"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 5,
+        "head.hash": "${hash:E5}"
+      }
+    },
+    {
+      "assert": {
+        "head": "E5",
+        "membership_applied": "E5",
+        "frozen": false
+      }
+    },
+    {
+      "connect": "ipad",
+      "carry": [
+        "E6"
+      ]
+    },
+    {
+      "expect": "ipad",
+      "match": {
+        "op": "error",
+        "code": "unauthorized",
+        "detail": "removed"
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "membership_head",
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "assert": {
+        "head": "E6",
+        "membership_applied": "E6",
+        "attachments": 1,
+        "control_gen": {
+          "member:dev-ipad": 2
+        }
+      }
+    },
+    {
+      "connect": "stranger",
+      "carry": []
+    },
+    {
+      "expect": "stranger",
+      "match": {
+        "op": "error",
+        "code": "unauthorized",
+        "detail": "not a member"
+      }
+    },
+    {
+      "assert": {
+        "head": "E6",
+        "attachments": 1,
+        "pty_writes": 0,
+        "dispatches": 0
+      }
+    }
+  ]
+}

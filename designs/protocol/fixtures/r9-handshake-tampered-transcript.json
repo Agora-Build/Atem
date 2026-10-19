@@ -1,0 +1,103 @@
+{
+  "name": "r9-handshake-tampered-transcript",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.7: a flipped finish byte fails the tag; a hello naming another principal than the one sig_c was made for fails sig_c; an all-zero ephemeral gives an all-zero shared secret and is refused before HKDF; an accept signed by a key that isn't the host's newest add_host key is refused by the client.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "handshake": "phone",
+      "vector": "r9-vectors-channel-handshake",
+      "tamper": {
+        "finish.ct": "${vector:r9-vectors-channel-handshake:negative.1.ct_hex}"
+      }
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "handshake_failed",
+      "at": "finish"
+    },
+    {
+      "handshake": "phone",
+      "vector": "r9-vectors-channel-handshake",
+      "tamper": {
+        "hello.proof.principal": {
+          "kind": "service",
+          "device_id": "svc-discord"
+        }
+      }
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "handshake_failed",
+      "at": "finish"
+    },
+    {
+      "handshake": "phone",
+      "vector": "r9-vectors-channel-handshake",
+      "tamper": {
+        "init.e": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      }
+    },
+    {
+      "expect_channel_error": "phone",
+      "code": "handshake_failed",
+      "at": "init"
+    },
+    {
+      "client_handshake": "phone",
+      "vector": "r9-vectors-channel-handshake",
+      "tamper": {
+        "accept.sig_by": "not-recovery"
+      }
+    },
+    {
+      "expect_client_refusal": "phone",
+      "code": "handshake_failed",
+      "sent_after_accept": 0
+    },
+    {
+      "assert": {
+        "attachments": 0,
+        "head": "E6",
+        "pty_writes": 0,
+        "dispatches": 0
+      }
+    }
+  ]
+}
