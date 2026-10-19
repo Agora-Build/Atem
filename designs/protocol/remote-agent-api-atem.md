@@ -17,7 +17,7 @@ through the Mac; approvals are push-based and need `control`, not the lease
 
 | Decision | Atem recommends |
 |---|---|
-| 1. Freshness and forks | Majority-of-managers checkpoints over Atem's checkpointed high-water head; 24 h window from the oldest counted attestation, on wall and monotonic clocks, whichever ends first; any fork freezes remote access until a quorum-signed `resolve_fork` entry that extends Atem's high-water mark |
+| 1. Freshness and forks | A head is accepted on one attestation by any manager listed at Atem's high-water head (user decision, 2026-10-19); 24 h window from the attestation, on wall and monotonic clocks, whichever ends first; any fork freezes remote access until a `resolve_fork` entry signed by any one current manager that extends Atem's high-water mark |
 | 2. Identities | Three principal kinds, all from the log or a log member: `native` (member device), `service` (member with role `service`, scope, mandatory expiry), `browser` (≤ 1 h QR grant from a native member); r9 with `hello` inside the channel carrying the proof |
 | 3. Formats and channel | RFC 8785 JSON bodies signed over `enc(domain, jcs)`; `alg` ∈ {`p256`, `ed25519`} pinned per key in the log; one SIGMA-I suite: X25519 ephemerals, both long-term keys sign the transcript, HKDF-SHA256, ChaCha20-Poly1305, strict counters, no rekey, no resumption |
 | 4. Client core | Atem owns `crates/atem-client`: sans-I/O Rust (log verifier, channel both roles, r9 client machines, fixture runner), UniFFI for Swift/Kotlin, wasm-bindgen for browsers and JS bots; the Atem host links the same verifier and channel |
@@ -47,11 +47,12 @@ Astation, `service`/`browser` admission, a secure channel, r9.
 **Threat model.** The relay is fully adversarial (withholds, reorders,
 replays, shows different parties different views). Any member key may be
 stolen, including keys of devices already removed. Clocks jump. Goals: Atem
-never acts on an older list than one it accepted; a removal made by honest
-managers stops access within 24 h of being made even if the relay hides it;
-a fork, once any evidence reaches Atem, stops remote access. Out of scope: a
-majority of the managers at Atem's high-water head being compromised (they
-are the account's authority). Astation's removed-manager attack is in scope.
+never acts on an older list than one it accepted; a removal Atem has seen
+is final; a fork, once any evidence reaches Atem, stops remote access.
+Accepted by the user (2026-10-19): one compromised manager can attest alone
+(including fresh attestations of a head that hides its own later removal),
+but it could already add devices on its own; removing it from the log stops
+it once Atem sees the removal.
 
 **Keys.** Each native member has an `auth` key (no user presence: channel
 signatures and heartbeats) and, if a manager, a `manage` key (Touch
@@ -69,18 +70,13 @@ Secure Enclave key cannot do 6-hourly heartbeats, so the split is required.
 on the relay) or Atem's handshake nonce `n_h` (on demand; counts as issued at
 Atem's own time of the nonce). Absent fields are omitted, never `null`.
 
-**Checkpoint.** A set of attestations for one head H, each by a distinct
-manager listed at Atem's **high-water head** HW, numbering a strict majority
-of HW's managers (with one manager — the default, the genesis Mac — that is
-one). H must equal or extend HW through the presented suffix. Any two
-majorities of HW's managers intersect, so two conflicting heads can each get
-a checkpoint only if a manager signs both — attributable equivocation, and a
-fork (below). A removed manager alone is never a majority when HW lists two
-or more managers: the removed-manager fresh-nonce attack yields no
-checkpoint, and access pauses at the deadline. Checkpoints count managers at
-HW, never at H, so a fork that rewrites the manager set cannot vouch for
-itself. This changes `account-trust.md` §3.5's "any manager" rule only when
-there are two or more managers.
+**Checkpoint.** One attestation for a head H by any manager listed at
+Atem's **high-water head** HW, within the window. H must equal or extend HW
+through the presented suffix. A manager removed at or before HW never counts.
+The signer must be a manager at HW, never merely at H, so a fork that adds a
+manager cannot vouch for itself. Two manager attestations for heads not on
+one chain are a fork (below). This is `account-trust.md` §3.5's "any
+manager" rule, made exact.
 
 **High-water mark** (`membership.json`, 0600, atomic, `flock`, beside
 `pairing.json`): `{account_id, genesis_hash, host_trust_gen, hw:{seq, hash},
@@ -95,15 +91,14 @@ is safe — while additions, widenings and every manager-set change wait for a
 checkpoint.
 
 **Window.** On accepting a checkpoint at Atem wall time W and monotonic M,
-let `t_old` be the oldest `issued_at` among the counted attestations (refused
+let `t_old` be the attestation's `issued_at` (refused
 if more than 5 min ahead of W). `deadline_wall = t_old + 24 h`;
 `deadline_mono = M + (deadline_wall − W)`; remote authorization ends at
 whichever comes first. A newer-head checkpoint replaces the deadline; a
 same-head one may only extend it. After a restart (monotonic lost) the
 persisted `deadline_wall` is used with a new monotonic deadline from it, and a
-wall clock earlier than `last_wall_seen − 5 min` counts as expired. Because
-`t_old` is the oldest counted attestation, an honest manager's pre-removal
-heartbeat replayed by the relay buys at most 24 h after the removal.
+wall clock earlier than `last_wall_seen − 5 min` counts as expired. A
+replayed old heartbeat buys at most 24 h from when it was signed.
 
 **While the Mac is offline.** A phone or bot fetches the log suffix from
 Atem's HW and the latest heartbeats from the relay and presents them in
@@ -120,9 +115,9 @@ remote principal is fenced (`control_revoked` per r8 §H, attachments closed),
 and every remote `hello` gets `error{code:"account_frozen"}`. Local use is
 unaffected. It lifts only with a `resolve_fork` entry that chains from
 Atem's HW through the chosen branch, names the first entry of each abandoned
-branch, and is signed by a majority of HW's managers. A conflict at or below
-HW (a checkpointed entry contradicted) means a majority equivocated: no entry
-can resolve it; recovery is `atem unpair` + `atem pair` (new genesis, new
+branch, and is signed by any one current manager (a manager at HW not
+removed in the chosen branch). A conflict at or below HW (a checkpointed
+entry contradicted) can't be resolved by any entry; recovery is `atem unpair` + `atem pair` (new genesis, new
 `host_trust_gen`). The relay's transactional append makes honest races
 practically impossible; forks are expected only from an attacking relay.
 
@@ -132,8 +127,8 @@ its own poll of `/api/remote/v1/membership` every 5 min over its link, or
 from the next checkpoint. Applying it: the principal's `control_gen` is
 raised (r8 §H), its attachments, leases, streams and conversations close, its
 `accepted`-not-`executing` work is `rejected` `control revoked`, browser
-grants it issued are fenced. Bound: immediate once seen; otherwise the next
-checkpoint must cover it within 24 h of the removal.
+grants it issued are fenced. Bound: immediate once seen; a checkpoint from
+any honest manager carries it, since that manager attests the current head.
 
 ## 4. Decision 2: identities
 
@@ -289,7 +284,7 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
 | Independent principals for Astation's API callers | **Question:** r8 §H keeps Astation's local API callers inside Astation's principal; a bot must be its own `service` member, never a call through the Mac's local API (that would forward through the Mac) |
 | Browser companion | **Agree** it follows a code-integrity review; default grant ops `view` only |
 | Recovery after losing all managers | **Agree**: new genesis by local unpair/pair per host; account recovery never restores old host authority |
-| Tests matrix | **Agree**; add: two-manager removal with the removed key attesting, checkpoint counted at HW not H, `pending` restrictive entries applied before a checkpoint, wall clock moved back across a restart, a host whose key agent is locked still serving remote clients |
+| Tests matrix | **Agree**; add: a manager removed at or before HW attesting, checkpoint signer a manager at HW not only at H, `pending` restrictive entries applied before a checkpoint, wall clock moved back across a restart, a host whose key agent is locked still serving remote clients |
 
 ## 8. Risks and contradictions
 
@@ -300,23 +295,21 @@ Atem owns `crates/atem-client` (workspace member, like `atem-core`):
 2. **Locked key agent.** Using `device_sign` as the host key would make remote
    access depend on the Mac unlocking the key agent after every Atem restart —
    a hidden "Mac required". Hence `host_channel_key` (§5).
-3. **Two managers.** Majority checkpoints mean both must heartbeat within
-   24 h; one or three managers avoid that. The user should accept this change
-   to the "any manager" rule (it fixes the removed-manager attack; with one
-   manager nothing changes). The UI should warn when a second manager is added.
+3. **One manager suffices (accepted).** A single compromised manager can
+   attest alone, but it could already add devices on its own; removing it
+   from the log stops it.
 4. **Push in clear.** Today `push_approval` gives the relay the tool and
    summary; that is session content the E2EE channel would otherwise hide.
-5. **Stale §9 text.** `account-trust.md` §6a and its decision 3 still say
-   approvals need the lease and `acquire`; r8 §G supersedes them. Update it
-   with r9.
+5. **Stale §9 text** in `account-trust.md` §6a (approvals needing the lease)
+   is corrected in this commit to r8 §G.
 6. **No compatibility** means Atem r9 and Astation r9 ship together; an r8
    Astation loses remote sessions until updated (local use unaffected).
 7. **Discord disclosure.** A service that posts output to Discord discloses
    it to Discord; enrollment must show that, and `ops` should default to no
    approvals.
 8. **Project scope drift** if evaluated live; fixed by scoping at launch (§4).
-9. **Majority compromise** of HW's managers is unrecoverable by signatures;
-   documented as out of scope, recovery is re-pairing.
+9. **Manager equivocation at or below HW** is unrecoverable by signatures;
+   recovery is re-pairing.
 
 ## 9. Order of work and sizing
 

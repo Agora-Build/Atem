@@ -30,8 +30,8 @@ signatures that chain back to what it pinned.
 | Head attestation | produced on request by any online `manage` device | `{account_id, seq, head_hash, issued_at, atem_nonce?}` signed by a manager — "this is the latest log as of now" |
 | Atem pin | Atem's `cred_state.json`, next to the existing verification pins | `{account_id, genesis_hash, high_water_seq, high_water_hash, last_fresh_at}` |
 
-Roles: `view` (see sessions/output), `control` (take the lease, type, submit,
-answer the agent's permission prompts while holding the lease), `manage` (add/remove devices).
+Roles: `view` (see sessions/output), `control` (take the lease, type, submit;
+answer the agent's permission prompts without the lease, r8 §G), `manage` (add/remove devices).
 Viewing ≠ control ≠ enrolment, as the product design requires.
 
 ## 3. Flows
@@ -128,7 +128,7 @@ Astation).
    pin, add/remove, connect proof, 24 h rule — plus shared fixtures (valid
    chain, forked chain, removed device, stale attestation, wrong account).
 1b. **Approvals from chat/mobile:** prompt-bound `approval_request` /
-   `approval` submissions for the lease holder (see question 3).
+   `approval` submissions by any attachment with `control` (see question 3).
 2. **End-to-end channel:** ephemeral X25519 + device keys → session keys for
    the atem-session channel over relay and direct; relay can no longer read
    terminal or chat traffic.
@@ -137,8 +137,9 @@ Astation).
 
 ## 6a. Approvals in chat and on mobile (step 1b)
 
-The lease holder may answer the agent's permission prompts from the chat view or
-a phone. Both agents can take an external allow/deny without simulating keys:
+Since r8 (atem-session appendix §G) any attachment with `control` may answer the
+agent's permission prompts from the chat view or a phone, for the exact pending
+request; the lease is neither needed nor moved. Both agents can take an external allow/deny without simulating keys:
 
 | | Claude Code ([hooks](https://code.claude.com/docs/en/hooks)) | Codex ([hooks](https://developers.openai.com/codex/hooks)) |
 |---|---|---|
@@ -170,21 +171,21 @@ answer. Flow:
 
 1. The hook writes the request (tool, summary, `prompt_id`) as one event file in
    the session's private directory, like the other chat hooks.
-2. **No remote lease holder** → the runtime answers "no decision" at once; the
-   hook exits; the local dialog (already visible) is the only way to answer.
-3. **A remote lease holder** → the runtime announces `approval_request{approval_id,
-   session_id, process_gen, tool, summary, created_at}`; chat shows an approval
-   card with Allow / Deny (a phone can raise a lock-screen notification); the hook
-   keeps waiting (hook `timeout` 600 s).
-4. The controller answers with a §6 submission `kind:"approval"`, payload
-   `{approval_id, decision: allow|deny}`, under its current lease epoch; the
-   runtime checks the prompt is still pending for that exact session/process and
-   writes the decision file; the hook returns it.
-5. **Answered in the terminal first**, interrupted (Esc), timed out, or the lease
-   lost → the request is closed (the runtime sees the tool run or fail via the
+2. Whoever holds the lease, the runtime announces `approval_request{approval_id,
+   session_id, process_gen, tool, summary, created_at}` to every attachment with
+   `control` (and asks the relay to push it); chat shows an approval card with
+   Allow / Deny; the hook keeps waiting (hook `timeout` 600 s).
+3. A controller answers with a §6 submission `kind:"approval"`, payload
+   `{approval_id, decision, rule_id?, message?}`, without `acquire` and with
+   no lease check (a `lease_epoch` is ignored); the runtime checks `control`
+   and that the prompt is still pending for that exact session/process, writes
+   the decision file, and the hook returns it. The first admitted answer wins;
+   the lease never moves.
+4. **Answered in the terminal first**, interrupted (Esc), timed out or
+   released → the request is closed; lease changes never close it (the runtime sees the tool run or fail via the
    PostToolUse/transcript events, or the hook's exit); a later remote answer gets
    `error{code:"stale_target"}` and is never applied. The card disappears.
-6. Receipts record the outcome as observed: `completed` when the tool ran/was
+5. Receipts record the outcome as observed: `completed` when the tool ran/was
    refused as decided by the remote answer, `outcome_unknown` if the terminal
    answer and the remote answer crossed and Atem can't tell which won.
 
@@ -243,7 +244,7 @@ What that means for Atem with Codex:
 
 
 Changes to earlier rules: chat's "no approvals from chat" becomes "approvals by
-the lease holder, bound to the exact prompt"; "hooks never decide" gains one
+any attachment with `control`, bound to the exact prompt, no lease (r8 §G)"; "hooks never decide" gains one
 exception — the `PermissionRequest` hook may return a decision it received from
 the runtime; the local terminal dialog always stays available.
 
@@ -264,9 +265,8 @@ approval requests. Notification delivery and lease ownership are independent:
    device once end-to-end encryption lands.
 4. Tapping wakes the app, which reconnects, authenticates as a member device and
    receives the pending approval; Allow once / Always allow (Claude) / Deny.
-5. The answer carries `acquire: true`: Atem takes the lease for that device
-   (takeover allowed) and applies the decision **atomically** — the lease is only
-   taken when the user acts.
+5. The answer needs `control` and the exact pending request, never the lease
+   (r8 §G): it doesn't take, renew or move the lease, and `acquire` is refused.
 6. Answered elsewhere, expired or closed → `push_resolved{approval_id}` replaces
    the notification everywhere (collapse-id / FCM tag = approval_id); a late tap
    says "already answered".
@@ -289,7 +289,7 @@ commands on a Mac/Windows host through OpenAI's relay
 |---|---|---|
 | Agent session | `codex app-server`; an already running terminal session isn't shared live | the original terminal session stays live; chat comes from the agent's hooks and transcript |
 | Phone view | structured thread items (messages, tool steps, diffs, approvals) | chat-v1 messages + terminal view |
-| Approvals | `item/…/requestApproval` → accept / acceptForSession / decline / cancel | `PermissionRequest` hook → `approval_request` → lease-bound `approval` |
+| Approvals | `item/…/requestApproval` → accept / acceptForSession / decline / cancel | `PermissionRequest` hook → `approval_request` → `approval` by `control`, lease-free |
 | Trust | QR pairing per phone per host + account MFA; list/revoke controllers per host | pair Atem once; add each device to the account once; Settings → Devices |
 | Control | multi-device / local-terminal arbitration not documented | many viewers, one lease holder, local input wins |
 | Relay | OpenAI relay; E2EE documented only by a third-party bridge | our relay; E2EE in step 2 (ephemeral X25519 + signed transcript) |
@@ -312,13 +312,13 @@ terminal session with an app-server conversation.
    moment (still bounded by the 24 h window).
 3. **Decided (user, 2026-10-16): approvals from chat and mobile are allowed for
    whoever holds control.** No separate `approve` role: a device with `control`
-   that currently holds the session's lease may answer the agent's permission
+   may answer (since r8 §G without the lease) the agent's permission
    prompts from the chat view or a phone, not only in the terminal. To keep a late
    or replayed tap from approving the wrong action, approvals are **bound to the
    exact prompt**: Atem announces `approval_request{approval_id, session,
    process_gen, tool, summary}` when the agent asks; the controller answers with a
    §6 submission `kind:"approval"`, payload `{approval_id, decision:
-   allow|deny}`, under its current lease epoch; Atem applies it only if that
+   allow|deny}` (r8: no lease, no `acquire`); Atem applies it only if that
    prompt is still the one pending, then records the receipt. Delivery to the
    agent (to be verified per agent): preferably the agent's own structured
    permission hook (Claude Code's permission hook answering allow/deny), else the
