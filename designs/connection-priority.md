@@ -1,5 +1,7 @@
 # Astation Connection Priority
 
+> **Superseded (2026-10-19):** `astation_relay_code` is gone; the relay identity room is the paired Astation's id from `pairing/pairing.enc`.
+
 Status: implemented.
 
 ## Order

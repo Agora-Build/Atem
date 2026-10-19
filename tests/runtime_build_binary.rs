@@ -137,3 +137,38 @@ fn restart_without_a_runtime_starts_nothing() {
     assert!(ok);
     assert_eq!(out.lines().count(), 1, "{out}");
 }
+
+#[test]
+fn an_attached_frontend_reattaches_across_a_restart() {
+    let sandbox = Sandbox::new();
+    let agent = sandbox.script(
+        "agent fixture",
+        "echo AGENT_READY\nwhile IFS= read -r line; do echo \"got:$line\"; done",
+    );
+    let mut frontend = sandbox.spawn(
+        &["agent", "launch", "codex"],
+        &sandbox.home,
+        &[("CODEX_CLI_BIN", agent.to_str().unwrap())],
+    );
+    frontend.shows("AGENT_READY");
+    sandbox.track();
+    let before = sandbox.runtime_pid().unwrap();
+    // Another terminal restarts the runtime.
+    let (out, err, ok) = sandbox.atem(&["runtime", "restart"]);
+    assert!(ok, "{out}{err}");
+    within("the new runtime", || {
+        sandbox.runtime_pid().is_some_and(|pid| pid != before)
+    });
+    sandbox.track();
+    // The frontend is still on the session, through the new runtime.
+    frontend.send(b"after restart\r");
+    frontend.shows("got:after restart");
+    assert!(
+        matches!(frontend.child.try_wait(), Ok(None)),
+        "the frontend ended:\n{}",
+        frontend.written()
+    );
+    let sid = frontend.detach();
+    let (_, err, ok) = sandbox.atem(&["agent", "stop", &sid]);
+    assert!(ok, "{err}");
+}

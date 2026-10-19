@@ -455,10 +455,9 @@ Both peers must use matching encryption/geofence or audio fails silently. `enabl
 ### Astation connections
 
 Atem tries a configured direct endpoint first and then the identity relay after
-it has learned the target Astation identity. Direct and relay connections use
-the same device session, so one Atem can move between networks without pairing
-again. Successful authentication stores `astation_relay_code` automatically;
-manual configuration is only needed for an override or headless provisioning.
+it is paired: the identity room is the paired Astation's. Direct and relay
+connections use the same device session, so one Atem can move between networks
+without pairing again; `atem unpair` stops both.
 
 | Atem location | Endpoint | First connection | Internet required |
 |---------------|----------|------------------|-------------------|
@@ -536,7 +535,6 @@ Machine-bound files can't be decrypted on another machine. `device_keys.sealed` 
 ```toml
 # astation_ws = "ws://127.0.0.1:8080/ws"
 # astation_relay_url = "https://station.agora.build"
-# astation_relay_code = "astation-..." # learned automatically after authentication
 # bff_url = "https://agora-cli.agora.io"
 # sso_url = "https://sso2.agora.io"
 
@@ -554,7 +552,6 @@ ATEM_BFF_URL=...   # Override BFF API base URL
 ATEM_SSO_URL=...   # Override SSO base URL
 ASTATION_WS=...            # Direct loopback, LAN, or VPN WebSocket endpoint
 ASTATION_RELAY_URL=...     # Relay HTTP(S) base URL
-ASTATION_RELAY_CODE=...    # Target Astation identity room
 AGORA_APP_ID=...           # Override active project App ID
 AGORA_APP_CERTIFICATE=...  # Override active project certificate
 ```

@@ -1203,9 +1203,7 @@ async fn migrating_device(
     let base = stub_relay(relay.clone()).await;
     std::fs::write(
         profile.join("config.toml"),
-        format!(
-            "astation_relay_url = \"{base}\"\ninstance_id = \"atem-1\"\n"
-        ),
+        format!("astation_relay_url = \"{base}\"\ninstance_id = \"atem-1\"\n"),
     )
     .unwrap();
     let mut device = crate::memory::fake_astation::UnlockedDevice::new(profile);
@@ -1336,7 +1334,7 @@ fn the_runtime_is_not_replaced_while_an_operation_runs() {
         })
         .await;
         assert!(
-            refused.starts_with(crate::runtime::client::OP_RUNNING),
+            refused.starts_with(crate::runtime::client::BUSY_RESTART),
             "{refused}"
         );
         // The client's replacement keeps it and says why.

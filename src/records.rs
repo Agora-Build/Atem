@@ -76,4 +76,3 @@ pub struct PairingRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<u64>,
 }
-

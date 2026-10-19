@@ -4,7 +4,7 @@
 use super::protocol::{
     ClientMsg, PROTOCOL, RuntimeMsg, RuntimeStatus, SessionSummary, decode_runtime, encode_client,
 };
-pub use super::server::{OP_RUNNING, RESTARTING};
+pub use super::server::{BUSY_RESTART, RESTARTING};
 use anyhow::{Context, Result, anyhow, bail};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -141,6 +141,15 @@ impl RuntimeClient {
             crate::diagnostics::warn(line)
         })
         .await
+    }
+
+    /// A frontend's way back after its runtime restarted: the next runtime
+    /// (started by the client that asked for the restart; this build's when
+    /// none comes up), never replacing it.
+    pub async fn reconnect() -> Result<Self> {
+        let locator = Locator::default_paths();
+        let log = locator.log.clone();
+        Self::connect_or_start_with(&locator, &move || start_runtime(&log), START_WAIT).await
     }
 
     /// The runtime at `locator`, if one answers; `passive`: a client that
@@ -433,7 +442,7 @@ pub fn kept_message(kept: &Kept, theirs: &str, own: &str) -> String {
             "{head}; it was replaced by build {build} less than a minute ago, so it is kept: two atem builds seem to be in use. Use one atem, or run `atem runtime restart`."
         ),
         Kept::Busy => format!(
-            "{head}; it is kept while an Astation operation (pairing, verification or unlock) runs. Run `atem runtime restart` when it ends."
+            "{head}; it is kept while it is busy (an Astation operation runs, or a session is starting). Run `atem runtime restart` when that ends."
         ),
         Kept::Unconfirmed => format!(
             "{head} and can't be restarted from here. Stop it (`atem agent list` shows its pid), then retry; its sessions keep running."
@@ -515,7 +524,7 @@ async fn stop_for_restart(
     .map_err(|_| anyhow!("the atem runtime didn't answer the restart"))?;
     match reply {
         Ok(()) => {}
-        Err(text) if text.starts_with(OP_RUNNING) => return Ok(Err(Kept::Busy)),
+        Err(text) if text.starts_with(BUSY_RESTART) => return Ok(Err(Kept::Busy)),
         Err(_) => {
             // A runtime from before `restart`: a confirmed SIGTERM ends it
             // as cleanly (workers survive; the journal is closed).
@@ -528,9 +537,10 @@ async fn stop_for_restart(
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
         }
     }
+    let old = client.welcome.pid;
     drop(client);
     let deadline = tokio::time::Instant::now() + GONE_WAIT;
-    while dial(locator).await.is_ok() || crate::daemon::lock_is_held(&locator.lock) == Some(true) {
+    while !old_runtime_gone(locator, old).await {
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "the old atem runtime didn't exit; see {}",
@@ -540,6 +550,24 @@ async fn stop_for_restart(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(Ok(()))
+}
+
+/// Whether the runtime of pid `old` no longer serves `locator`: nothing
+/// answers and nobody holds `runtime.lock`, or another runtime already does
+/// (another client of this build replaced it first): the caller connects
+/// to that one.
+async fn old_runtime_gone(locator: &Locator, old: u32) -> bool {
+    let held = crate::daemon::lock_is_held(&locator.lock) == Some(true);
+    if held && crate::daemon::read_lock_pid(&locator.lock).is_some_and(|pid| pid != old) {
+        return true;
+    }
+    if dial(locator).await.is_err() {
+        return !held;
+    }
+    matches!(
+        RuntimeClient::existing_at(locator, true).await,
+        Ok(Some(client)) if client.welcome.pid != old
+    )
 }
 
 /// Replaces a runtime of another build by this one, keeping its sessions.

@@ -26,7 +26,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use crate::daemon::{
-    self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir,
+    self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, recorded_socket,
 };
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::{
@@ -65,11 +65,17 @@ pub fn agent_socket_path() -> PathBuf {
 /// The socket path for `config_dir` and the runtime dir `runtime_dir`
 /// (used only when it is safe).
 fn socket_path_in(config_dir: &Path, runtime_dir: Option<OsString>) -> PathBuf {
+    socket_path_for(&CredPaths::in_dir(config_dir), runtime_dir)
+}
+
+/// The socket path for the cred directory `paths` and the runtime dir
+/// `runtime_dir` (used only when it is safe).
+fn socket_path_for(paths: &CredPaths, runtime_dir: Option<OsString>) -> PathBuf {
     // A relative runtime dir would depend on the current directory: unset.
     let runtime = runtime_dir.filter(|dir| {
         Path::new(dir).is_absolute() && check_parent_dir(Path::new(dir), own_uid()).is_ok()
     });
-    CredPaths::in_dir(config_dir).agent_sock(runtime.as_deref().map(Path::new))
+    paths.agent_sock(runtime.as_deref().map(Path::new))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -497,11 +503,6 @@ impl Watch {
     }
 }
 
-/// The socket path recorded in `record` by the running agent, if any.
-fn recorded_socket(record: &Path) -> Option<PathBuf> {
-    read_record(record).ok().flatten()
-}
-
 /// `record` read: `Ok(None)` when it names no absolute path.
 fn read_record(record: &Path) -> std::io::Result<Option<PathBuf>> {
     use std::os::unix::ffi::OsStrExt;
@@ -880,9 +881,19 @@ impl CredAgentClient {
         runtime_dir: Option<OsString>,
         launcher: Option<Launcher>,
     ) -> Self {
-        let paths = CredPaths::in_dir(config_dir);
+        Self::for_paths(&CredPaths::in_dir(config_dir), runtime_dir, launcher)
+    }
+
+    /// A client for the agent of the cred directory `paths`, as seen from a
+    /// session whose runtime dir is `runtime_dir`.
+    pub(crate) fn for_paths(
+        paths: &CredPaths,
+        runtime_dir: Option<OsString>,
+        launcher: Option<Launcher>,
+    ) -> Self {
+        let paths = paths.clone();
         Self {
-            socket: socket_path_in(config_dir, runtime_dir),
+            socket: socket_path_for(&paths, runtime_dir),
             record: Some(paths.agent_socket),
             launcher,
             log: paths.agent_log,
@@ -2488,9 +2499,10 @@ mod tests {
         let status = CredAgentClient::at(socket).status().unwrap();
         assert!(!status.older_build);
         let old = short_dir();
-        let status = CredAgentClient::at(start_scripted_agent(old.path(), OTHER_LOCKED, OTHER_DONE))
-            .status()
-            .unwrap();
+        let status =
+            CredAgentClient::at(start_scripted_agent(old.path(), OTHER_LOCKED, OTHER_DONE))
+                .status()
+                .unwrap();
         assert!(status.older_build);
     }
 

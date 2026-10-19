@@ -12,14 +12,14 @@ use anyhow::{Result, anyhow};
 #[cfg(test)]
 use std::path::Path;
 
-use crate::profile::Sources;
-use crate::records::Login;
 use crate::memory::cred_agent::AgentStatus;
 #[cfg(test)]
 use crate::memory::cred_agent::CredAgentApi;
 use crate::memory::trust::TrustStore;
-use crate::records::PairingRecord;
 use crate::paths::CredPaths;
+use crate::profile::Sources;
+use crate::records::Login;
+use crate::records::PairingRecord;
 use crate::runtime::client::Look;
 
 /// `atem pair` on a profile that is already paired (after the status).
@@ -514,10 +514,10 @@ pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::paths::ProfilePaths;
-    use std::path::PathBuf;
     use crate::memory::cred_agent::{Reply, Request};
     use crate::memory::trust::AstationTrust;
+    use crate::paths::ProfilePaths;
+    use std::path::PathBuf;
 
     const ASTATION: &str = "astation-1";
 

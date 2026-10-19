@@ -388,7 +388,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   `storage_kid` to be the one Astation released.
 - The agent is the same binary, `atem cred-agent` (hidden), started on demand
   by the first command that needs keys and detached with `setsid`; it logs
-  to `~/.config/atem/cred-agent.log`. It speaks newline-delimited JSON; every
+  to `~/.config/atem/cred/agent.log`. It speaks newline-delimited JSON; every
   request carries `"v": 2` (v1 until step 2b) and any other version gets an error (an old agent
   left running after an upgrade says so; stop it and the next command starts
   the new one). It refuses peers whose UID isn't its own, sets
@@ -427,7 +427,7 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   the keys stay sealed on disk (or in the plain file before the first
   escrow).
 - **One agent per key directory.** The agent takes an exclusive `flock` on
-  `~/.config/atem/cred_agent.lock` for its whole life and exits if another
+  `~/.config/atem/cred/agent.lock` for its whole life and exits if another
   agent holds it, so two login sessions with different `$XDG_RUNTIME_DIR`s
   never run two agents over one set of key files (each would rotate the
   storage key and strand the other's sealed files). It records its socket
@@ -1268,12 +1268,12 @@ A plain credential value is never written to disk anywhere.
   latest signed account state, scope directory and revocation list, the
   home Astation that holds the storage key, the last storage kid it is
   known to hold, and every storage kid the device abandoned. Every
-  read-modify-write of it holds an `flock` on `cred/state.lock`, so the key
+  read-modify-write of it holds an `flock` on `cred/state.lock`, so the cred
   agent and other atem commands never drop each other's changes.
-- `cred-agent.log`; the agent socket `agent.sock` and its `agent.lock` (in
-  `$XDG_RUNTIME_DIR/atem/` when set, else here); `cred_agent.lock`, which
-  the one agent serving these key files holds (`flock`) for its life, and
-  `agent.socket`, the socket path it records for clients.
+- `agent.log`; the agent socket (`$XDG_RUNTIME_DIR/atem/cred-agent.sock`
+  when set, else `agent.sock` here) and its `<socket>.lock`; `agent.lock`,
+  which the one agent serving these key files holds (`flock`) for its life,
+  and `agent.socket`, the socket path it records for clients.
 - Cred agent memory: the unsealed device keys, `K` and its previous keys,
   index subkeys and scope keys.
 - Credential values: never cached. `knowledge.db` holds plain memory and

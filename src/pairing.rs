@@ -19,8 +19,8 @@
 //! a reply only while the state is still the captured one, under the
 //! `trust_gen.lock` (`Captured::apply`): a delayed reply never refreshes a
 //! replacement session or adopts a later binding.
-use anyhow::{Context, Result, anyhow, bail};
 use crate::records::{BindingRecord, Login, PairingRecord, SavedSession};
+use anyhow::{Context, Result, anyhow, bail};
 use std::sync::Arc;
 
 use crate::credentials::now_secs;
@@ -91,7 +91,8 @@ impl PairingRecord {
     /// Writes the record (machine-bound, atomically, 0600). Callers that
     /// apply Astation replies hold the lock (`Captured::apply`).
     pub fn save(&self, paths: &PairingPaths) -> Result<()> {
-        let sealed = crate::machine_key::encrypt(crate::machine_key::PAIRING, &serde_json::to_vec(self)?)?;
+        let sealed =
+            crate::machine_key::encrypt(crate::machine_key::PAIRING, &serde_json::to_vec(self)?)?;
         crate::memory::crypto::write_private(&paths.record, &sealed)
     }
 
@@ -106,9 +107,8 @@ impl PairingRecord {
         edit: impl FnOnce(&mut Self),
     ) -> Result<bool> {
         let _lock = TrustStore::lock(&paths.trust_gen)?;
-        let same_binding = |record: &Self| {
-            record.binding.as_ref().map(|b| b.binding_id.as_str()) == binding_id
-        };
+        let same_binding =
+            |record: &Self| record.binding.as_ref().map(|b| b.binding_id.as_str()) == binding_id;
         match Self::load(paths)? {
             Some(record) if !same_binding(&record) => Ok(false),
             _ => Self::update_locked(paths, astation_id, edit),
@@ -692,17 +692,19 @@ pub(crate) mod tests {
         let read = PairingRecord::load(paths).unwrap().unwrap();
         let binding = read.binding.as_ref().map(|b| b.binding_id.clone());
         unpair(src).unwrap();
-        let updated =
-            PairingRecord::update(paths, "astation-1", binding.as_deref(), |r| r.save_credentials = false)
-                .unwrap();
+        let updated = PairingRecord::update(paths, "astation-1", binding.as_deref(), |r| {
+            r.save_credentials = false
+        })
+        .unwrap();
         assert!(!updated);
         assert!(!paths.record.exists());
         // Paired again: another binding, still refused.
         let before = capture(src).unwrap();
         bind_new(src, &before, "astation-1").unwrap();
-        let updated =
-            PairingRecord::update(paths, "astation-1", binding.as_deref(), |r| r.save_credentials = false)
-                .unwrap();
+        let updated = PairingRecord::update(paths, "astation-1", binding.as_deref(), |r| {
+            r.save_credentials = false
+        })
+        .unwrap();
         assert!(!updated);
     }
 

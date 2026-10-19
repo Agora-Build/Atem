@@ -80,6 +80,9 @@ pub enum Applied {
     End(FrontendExit),
     /// The runtime refused the attach.
     Failed(String),
+    /// The runtime is restarting (another atem asked for it): reattach to
+    /// the next one.
+    Reattach,
 }
 
 impl View {
@@ -146,6 +149,10 @@ impl View {
                 } else {
                     FrontendExit::DetachedBy(reason)
                 });
+            }
+            RuntimeMsg::Restarting => {
+                self.notice("Atem's runtime is restarting; reattaching…".into());
+                return Applied::Reattach;
             }
             RuntimeMsg::Astation { connected } => self.astation = connected,
             RuntimeMsg::Notice { text } => self.notice(text),
@@ -340,31 +347,43 @@ pub async fn attach_in<B: Backend>(
         .unwrap_or_default()
         .terminal_prefix;
     let mut view = View::new(sid, client.welcome.astation, prefix.as_deref());
-    let (mut reader, mut writer) = client.split();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let reading = tokio::spawn(async move {
-        while let Ok(Some(message)) = reader.recv().await {
-            if tx.send(message).is_err() {
-                break;
+    let mut client = client;
+    loop {
+        let (mut reader, mut writer) = client.split();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reading = tokio::spawn(async move {
+            while let Ok(Some(message)) = reader.recv().await {
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        let (rows, cols) = viewport_size(terminal.size()?);
+        view.ui.viewport = (rows, cols);
+        let result = async {
+            writer
+                .send(&ClientMsg::Attach {
+                    session_id: sid.to_string(),
+                    rows,
+                    cols,
+                })
+                .await?;
+            terminal.clear()?;
+            run_loop(terminal, &mut view, &mut writer, &mut rx, diagnostics).await
+        }
+        .await;
+        reading.abort();
+        match result? {
+            Some(exit) => return Ok(exit),
+            // The runtime restarted: the same session from the next one
+            // (its worker kept running), restored on `attached`.
+            None => {
+                terminal.draw(|frame| view.draw(frame))?;
+                client = RuntimeClient::reconnect().await?;
+                view.astation = client.welcome.astation;
             }
         }
-    });
-    let (rows, cols) = viewport_size(terminal.size()?);
-    view.ui.viewport = (rows, cols);
-    let result = async {
-        writer
-            .send(&ClientMsg::Attach {
-                session_id: sid.to_string(),
-                rows,
-                cols,
-            })
-            .await?;
-        terminal.clear()?;
-        run_loop(terminal, &mut view, &mut writer, &mut rx, diagnostics).await
     }
-    .await;
-    reading.abort();
-    result
 }
 
 async fn run_loop<B: Backend>(
@@ -373,7 +392,7 @@ async fn run_loop<B: Backend>(
     writer: &mut RuntimeWriter,
     rx: &mut mpsc::UnboundedReceiver<RuntimeMsg>,
     diagnostics: &crate::diagnostics::Capture,
-) -> Result<FrontendExit> {
+) -> Result<Option<FrontendExit>> {
     loop {
         for message in diagnostics.drain() {
             view.ui.record(message);
@@ -382,15 +401,16 @@ async fn run_loop<B: Backend>(
             match rx.try_recv() {
                 Ok(message) => match view.apply(message) {
                     Applied::Continue => {}
-                    Applied::End(exit) => return Ok(exit),
+                    Applied::End(exit) => return Ok(Some(exit)),
                     Applied::Failed(text) => return Err(anyhow!(text)),
+                    Applied::Reattach => return Ok(None),
                 },
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Ok(match view.exited.take() {
+                    return Ok(Some(match view.exited.take() {
                         Some(status) => FrontendExit::Exited(status),
                         None => FrontendExit::RuntimeGone,
-                    });
+                    }));
                 }
             }
         }
@@ -404,7 +424,7 @@ async fn run_loop<B: Backend>(
         while event::poll(timeout)? {
             timeout = Duration::ZERO;
             if let Some(exit) = handle_event(view, writer, rx, event::read()?).await? {
-                return Ok(exit);
+                return Ok(Some(exit));
             }
         }
     }

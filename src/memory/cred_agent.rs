@@ -1566,9 +1566,16 @@ pub type AgentLook = Option<Result<(AgentStatus, Option<u32>), String>>;
 /// Asks the running cred agent for its status within `timeout`: never
 /// starts one and never writes (`atem status`, `atem --version`).
 pub fn look(paths: &CredPaths, timeout: std::time::Duration) -> AgentLook {
+    let client = crate::memory::agent_socket::CredAgentClient::for_paths(
+        paths,
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        None,
+    );
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let found = running_agent().map(|agent| agent.status().map_err(|e| format!("{e:#}")));
+        let found = client
+            .is_running()
+            .then(|| client.status().map_err(|e| format!("{e:#}")));
         let _ = tx.send(found);
     });
     let found = match rx.recv_timeout(timeout) {

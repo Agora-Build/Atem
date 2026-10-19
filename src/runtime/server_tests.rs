@@ -1776,3 +1776,119 @@ fn a_runtime_of_another_worker_protocol_is_kept() {
         assert!(notes[0].contains("worker protocol 9"), "{notes:?}");
     });
 }
+
+/// Two clients of this build replace the same old runtime: the slower one
+/// finds the new runtime already serving (another pid) and connects to it
+/// instead of waiting for the socket to go quiet or starting a second one.
+#[test]
+fn a_replacement_already_done_by_another_client_is_joined() {
+    use super::client::{Locator, replace_other_build};
+    local(async {
+        let dir = short_dir();
+        let locator = Locator::in_dir(dir.path());
+        let listener = tokio::net::UnixListener::bind(&locator.socket).unwrap();
+        let own = crate::memory::cred_agent::build_id().to_string();
+        // Pid 1 until it answers `restart`; then pid 2 of this build (the
+        // runtime the other client started) answers on the same socket.
+        let restarted = std::rc::Rc::new(std::cell::Cell::new(false));
+        tokio::task::spawn_local(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (restarted, own) = (restarted.clone(), own.clone());
+                tokio::task::spawn_local(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut reader = BufReader::new(read);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let reply = match super::protocol::decode_client(&line).unwrap() {
+                            ClientMsg::Hello { .. } => {
+                                let (pid, build) = if restarted.get() {
+                                    (2, own.clone())
+                                } else {
+                                    (1, "0.0.0+old".to_string())
+                                };
+                                RuntimeMsg::Welcome {
+                                    protocol: PROTOCOL,
+                                    build,
+                                    pid,
+                                    astation: false,
+                                    host_error: None,
+                                    worker_protocol: Some(1),
+                                }
+                            }
+                            ClientMsg::Restart => {
+                                restarted.set(true);
+                                RuntimeMsg::Restarting
+                            }
+                            other => panic!("unexpected {other:?}"),
+                        };
+                        let text = super::protocol::encode_runtime(&reply);
+                        write.write_all(text.as_bytes()).await.unwrap();
+                        line.clear();
+                    }
+                });
+            }
+        });
+        let client = RuntimeClient::connect_at(&locator.socket).await.unwrap();
+        assert_eq!(client.welcome.pid, 1);
+        let start = || anyhow::bail!("a second runtime was started");
+        let own = crate::memory::cred_agent::build_id();
+        let mut notes = Vec::new();
+        let client = replace_other_build(
+            client,
+            &locator,
+            own,
+            &start,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.welcome.pid, 2);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("(was 0.0.0+old)"), "{notes:?}");
+    });
+}
+
+/// Once a restart is asked for, nothing new starts in the exiting runtime
+/// (a launch is refused with `RESTARTING_NOW`), and the other frontends hear
+/// `restarting` so they reattach to the next one.
+#[test]
+fn a_restarting_runtime_starts_nothing_new_and_tells_the_frontends() {
+    local(async {
+        let mut runtime = Runtime::new();
+        let agent = echo_agent(runtime.dir.path());
+        let mut frontend = runtime.client().await;
+        frontend
+            .send(&runtime.launch("codex", "one", &agent))
+            .await
+            .unwrap();
+        let session = launched(&mut frontend).await;
+        attach(&mut frontend, &session.id).await;
+        let mut other = runtime.client().await;
+        other.send(&ClientMsg::Restart).await.unwrap();
+        other
+            .send(&runtime.launch("codex", "two", &agent))
+            .await
+            .unwrap();
+        expect(&mut other, |m| {
+            matches!(m, RuntimeMsg::Restarting).then_some(())
+        })
+        .await;
+        let refused = expect(&mut other, |m| match m {
+            RuntimeMsg::Error { text, op } if op.as_deref() == Some("launch") => Some(text),
+            _ => None,
+        })
+        .await;
+        assert_eq!(refused, super::server::RESTARTING_NOW);
+        expect(&mut frontend, |m| {
+            matches!(m, RuntimeMsg::Restarting).then_some(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), &mut runtime.server)
+            .await
+            .expect("the runtime exits for the restart")
+            .unwrap()
+            .unwrap();
+    });
+}

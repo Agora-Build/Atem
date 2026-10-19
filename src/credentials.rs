@@ -11,8 +11,8 @@
 //! `Login::agora_tokens`.
 //!
 //! Stored machine-bound (`machine_key`) and written atomically (0600).
-use anyhow::{Context, Result, anyhow};
 use crate::records::{Connections, Login, Tokens};
+use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 
 impl Tokens {
@@ -99,7 +99,9 @@ impl Login {
         let unreadable = || format!("{} is unreadable", path.display());
         let plain = crate::machine_key::decrypt(crate::machine_key::LOGIN, &raw)
             .with_context(unreadable)?;
-        Ok(Some(serde_json::from_slice(&plain).with_context(unreadable)?))
+        Ok(Some(
+            serde_json::from_slice(&plain).with_context(unreadable)?,
+        ))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -147,8 +149,14 @@ mod tests {
         assert_eq!(issuer_of("http://127.0.0.1:9/"), "127.0.0.1:9");
         assert!(issues_agora_tokens("sso2.agora.io", SSO));
         // The configured sso_url's host, and only that one besides.
-        assert!(issues_agora_tokens("sso.staging.example", "https://sso.staging.example"));
-        assert!(issues_agora_tokens("sso2.agora.io", "https://sso.staging.example"));
+        assert!(issues_agora_tokens(
+            "sso.staging.example",
+            "https://sso.staging.example"
+        ));
+        assert!(issues_agora_tokens(
+            "sso2.agora.io",
+            "https://sso.staging.example"
+        ));
         assert!(!issues_agora_tokens("sso.staging.agora.io", SSO));
         assert!(!issues_agora_tokens("auth.agora.build", SSO));
     }
