@@ -14,7 +14,7 @@
 use crate::memory::account_keys::CryptOp;
 use crate::session_protocol::r9::ProjectScope;
 use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -301,17 +301,13 @@ impl ProjectScopes {
     }
 
     /// No job out and nothing missing for `kids` (tests).
+    #[cfg(test)]
     pub fn idle(&self, kids: &BTreeSet<String>) -> bool {
         !self.pending
             && self.keys.keys().all(|sid| {
                 kids.iter()
                     .all(|kid| self.hashes.contains_key(&(sid.clone(), kid.clone())))
             })
-    }
-
-    /// The sessions with a recorded launch project.
-    pub fn sessions(&self) -> HashSet<String> {
-        self.keys.keys().cloned().collect()
     }
 }
 
