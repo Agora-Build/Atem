@@ -15,9 +15,7 @@ use std::collections::BTreeMap;
 
 use atem_client::SignedObject;
 use atem_client::backup::{BackupKey, KBackupEnvelope};
-use atem_client::backup_writer::{
-    BackupError, BackupJob, BackupWriter, Discarded, EntrySigner, PutReply, Step,
-};
+use atem_client::backup_writer::{BackupError, BackupJob, BackupWriter, Discarded, PutReply, Step};
 use atem_client::canonical::StrictValue;
 use atem_client::encoding::{Hash32, b64u_decode};
 use atem_client::kit::RecoveryKit;
@@ -295,9 +293,18 @@ impl<'a> HostSide<'a> {
     }
 
     /// The carried entries as a client sends them (some don't parse).
-    fn carry(&mut self, labels: &[String]) -> Vec<StrictValue> {
+    /// The carried entries as a client sends them (some don't parse), and
+    /// their size on the wire.
+    fn carry(&mut self, labels: &[String]) -> (Vec<StrictValue>, usize) {
         self.carried.extend(labels.iter().map(|l| self.v.hash(l)));
-        labels.iter().map(|l| strict(self.v.wire(l))).collect()
+        let bytes = labels
+            .iter()
+            .map(|l| self.v.wire(l).to_string().len())
+            .sum();
+        (
+            labels.iter().map(|l| strict(self.v.wire(l))).collect(),
+            bytes,
+        )
     }
 
     fn step(&mut self, step: &Value) {
@@ -430,8 +437,8 @@ impl<'a> HostSide<'a> {
                 let spec = &step["host_connect"];
                 let clock = self.hosts[""].clock.clone();
                 let mut m = self.pinned(&labels(&spec["host_pinned"]), &clock);
-                let carry = self.carry(&labels(&spec["carry"]));
-                let eval = m.evaluate(&carry, &clock.now);
+                let (carry, bytes) = self.carry(&labels(&spec["carry"]));
+                let eval = m.evaluate(&carry, bytes, &clock.now);
                 m = eval.next;
                 self.hosts.insert("relay-host".into(), Host { m, clock });
                 self.current = "relay-host".into();
@@ -449,7 +456,7 @@ impl<'a> HostSide<'a> {
         }
         let principal = self.clients[&client].clone();
         let device = device_of(&principal);
-        let carry = self.carry(&labels(&step["carry"]));
+        let (carry, bytes) = self.carry(&labels(&step["carry"]));
         let more = step.get("more").and_then(Value::as_bool).unwrap_or(false);
         for key in ["hello", "grant"] {
             if step.get(key).is_some() {
@@ -463,7 +470,7 @@ impl<'a> HostSide<'a> {
             return;
         }
         let now = host.clock.now.clone();
-        let eval = host.m.evaluate(&carry, &now);
+        let eval = host.m.evaluate(&carry, bytes, &now);
         let admission = eval.admission(&device, more, &now);
         host.m = eval.next;
         let fields = admission_fields(&admission, &host.m, &host.clock);
@@ -472,10 +479,10 @@ impl<'a> HostSide<'a> {
 
     fn send_membership(&mut self, step: &Value) {
         let client = step["send_membership"].as_str().unwrap().to_owned();
-        let carry = self.carry(&labels(&step["entries"]));
+        let (carry, bytes) = self.carry(&labels(&step["entries"]));
         let host = self.host();
         let now = host.clock.now.clone();
-        let eval = host.m.evaluate(&carry, &now);
+        let eval = host.m.evaluate(&carry, bytes, &now);
         let stop = eval.stop.clone();
         let admission = eval.admission("", false, &now);
         host.m = eval.next;
@@ -846,11 +853,20 @@ impl<'a> ClientSide<'a> {
         .unwrap()
     }
 
-    /// Runs a writer's steps that need no relay answer (sealing).
+    /// Runs a writer's steps that need no relay answer (sealing; signing
+    /// the stored body).
     fn drive(&mut self, name: &str) {
         let book = self.book;
         loop {
             let w = &self.writers[name];
+            if let Some(Step::Sign { body }) = w.step.clone() {
+                let w = self.writers.get_mut(name).unwrap();
+                // The writer (with this body) is stored before the key signs.
+                let writer = w.writer.as_mut().unwrap();
+                assert_eq!(writer.prepared().unwrap().body, body);
+                w.step = Some(writer.sign(&book.provider, &book.auth(&w.by)));
+                continue;
+            }
             let Some(Step::Seal { blob_version }) = w.step.clone() else {
                 return;
             };
@@ -858,15 +874,11 @@ impl<'a> ClientSide<'a> {
             let envelope = self.seal(&w.log, blob_version, &job);
             let w = self.writers.get_mut(name).unwrap();
             let signed_at = KB_SIGNED_AT + w.log.head().seq + 1;
-            let step = w.writer.as_mut().unwrap().sealed(
-                &w.log,
-                envelope,
-                &EntrySigner {
-                    provider: &book.provider,
-                    key: &book.auth(&w.by),
-                    signed_at,
-                },
-            );
+            let step = w
+                .writer
+                .as_mut()
+                .unwrap()
+                .sealed(&w.log, envelope, signed_at);
             w.step = Some(step);
         }
     }
@@ -993,6 +1005,7 @@ impl<'a> ClientSide<'a> {
                 w.step = Some(writer.restart());
                 w.writer = Some(writer);
                 w.log = log;
+                self.drive(name);
                 self.report.pass();
             }
             "assert_client" => self.assert_client(&step["assert_client"]),
@@ -1012,7 +1025,10 @@ impl<'a> ClientSide<'a> {
             let head = self.entry_ref(head.as_str().unwrap());
             assert_eq!(head_of(&head), head_of(entries.last().unwrap()));
         }
-        let book = self.book;
+        let reply_head = spec
+            .get("head")
+            .map(|h| head_of(&self.entry_ref(h.as_str().unwrap())))
+            .or_else(|| entries.last().map(head_of));
         let now = self.clock.now.clone();
         let w = self.writers.get_mut(&name).unwrap();
         let writer = w.writer.as_mut().unwrap();
@@ -1032,6 +1048,7 @@ impl<'a> ClientSide<'a> {
                     AppendReply::Stored
                 } else {
                     AppendReply::Conflict {
+                        head: reply_head.unwrap(),
                         entries: entries.clone(),
                         more: false,
                     }
@@ -1039,16 +1056,7 @@ impl<'a> ClientSide<'a> {
                 let next_seq = entries
                     .last()
                     .map_or(w.log.head().seq + 1, |e| seq_of(e) + 1);
-                writer.append_reply(
-                    &mut w.log,
-                    reply,
-                    &now,
-                    &EntrySigner {
-                        provider: &book.provider,
-                        key: &book.auth(&w.by),
-                        signed_at: KB_SIGNED_AT + next_seq,
-                    },
-                )
+                writer.append_reply(&mut w.log, reply, &now, KB_SIGNED_AT + next_seq)
             }
             other => panic!("{}: a relay reply while {other:?}", self.report.name),
         };

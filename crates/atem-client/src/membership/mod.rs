@@ -13,6 +13,34 @@
 //! [`Membership::evaluate`] runs one carriage against a scratch copy and
 //! returns the proposed next state; the caller commits it (after its durable
 //! write) or drops it. [`Membership::advance`] ends waits whose time is up.
+//!
+//! **Stored recovery fields** (for the host's `membership.json`, §R9.3; Task
+//! 6 persists them). §R9.3 sketches one `recovery[]` record per pending-type
+//! entry as `{entry_hash, seq, state, first_seen_wall, boot_id,
+//! mono_at_first_seen_ns, mono_waited_ms, decided_at_wall?, reason?}`.
+//! [`RecoveryRecord`] maps to it as follows:
+//!
+//! - `entry_hash`, `seq`: the same.
+//! - `state`: [`RecoveryRecord::state`] (`pending` without a decision).
+//! - `clock.first_seen_wall`, `clock.boot_id`, `clock.mono_waited_ms`: the
+//!   same.
+//! - `clock.mono_anchor_ms` replaces `mono_at_first_seen_ns`: milliseconds
+//!   (ns since boot exceeds 2^53, the I-JSON integer limit, after about 104
+//!   days of uptime), and signed: within one boot it is the monotonic reading
+//!   at first sight (identical meaning); after a reboot it is re-based to
+//!   `mono_now − mono_waited_ms` at the first reading of the new boot, so the
+//!   wait continues from the persisted time.
+//! - `decision.at_wall` is `decided_at_wall`, `decision.reason` is `reason`
+//!   ([`RecoveryReason::as_str`]).
+//! - Additions: `decision.at_seq` (`decided_at_seq`: the head `seq` at
+//!   which the decision took effect) and `decision.order` (the order of
+//!   decisions on this host). Judging a conflict "against `C[..seq-1]`"
+//!   (§R9.4) replays the chain with them; where a wait-ended decision took
+//!   effect isn't derivable from the chain itself.
+//!
+//! Time between a boot and the host's first clock reading in it (its first
+//! `checkpoint` or `advance`, which it should take at start) isn't counted:
+//! the wait can only get longer, never shorter.
 use std::collections::BTreeMap;
 
 use crate::canonical::StrictValue;
@@ -232,6 +260,10 @@ pub enum RecoveryReason {
     Vetoed,
     /// The recovery key that signed it was replaced (§R9.5).
     KitReplaced,
+    /// A verified host-signed head beyond an entry that depends on it shows
+    /// it took effect on that host (a restore reading a past recovery;
+    /// `Membership::verify_chain_confirmed`).
+    HostConfirmed,
 }
 
 impl RecoveryReason {
@@ -241,6 +273,7 @@ impl RecoveryReason {
             RecoveryReason::WaitEnded => "wait_ended",
             RecoveryReason::Vetoed => "vetoed",
             RecoveryReason::KitReplaced => "kit_replaced",
+            RecoveryReason::HostConfirmed => "host_confirmed",
         }
     }
 }
@@ -549,10 +582,6 @@ impl Derived {
         }
     }
 
-    fn is_retired(&self, key: &PublicKey) -> bool {
-        self.retired.contains(key)
-    }
-
     fn native_managers_except(&self, device_id: &str) -> usize {
         self.members
             .iter()
@@ -629,6 +658,29 @@ impl Membership {
         entries: &[Entry],
         now: &HostNow,
     ) -> Result<Verified, ChainError> {
+        Self::verify_chain_confirmed(account_id, genesis_hash, entries, None, now)
+    }
+
+    /// `verify_chain`, given a head a host signed (verified by the caller
+    /// with that host's key): an entry at or below it whose only problem is
+    /// that it depends on a pending entry shows the pending entry took effect
+    /// on that host (a host applies such entries only then), so it is
+    /// activated (`HostConfirmed`) instead of stopping there. Used by a
+    /// restore reading a log with a past recovery; only applied when the
+    /// chain holds `confirmed` itself.
+    pub fn verify_chain_confirmed(
+        account_id: &str,
+        genesis_hash: &Hash32,
+        entries: &[Entry],
+        confirmed: Option<Head>,
+        now: &HostNow,
+    ) -> Result<Verified, ChainError> {
+        let confirmed = confirmed.filter(|head| {
+            usize::try_from(head.seq)
+                .ok()
+                .and_then(|seq| entries.get(seq.checked_sub(1)?))
+                .is_some_and(|e| e.seq == head.seq && e.hash() == head.hash)
+        });
         let at = |index: usize| move |reason: Invalid| ChainError { index, reason };
         let genesis = entries.first().ok_or(ChainError {
             index: 0,
@@ -637,15 +689,39 @@ impl Membership {
         let mut membership =
             Membership::from_genesis(account_id, genesis_hash, genesis.clone()).map_err(at(0))?;
         for (index, entry) in entries.iter().enumerate().skip(1) {
-            match membership.check_next(entry) {
-                Check::Valid => membership.append(entry.clone(), now, &mut Vec::new()),
-                Check::Deferred(on) => {
-                    return Ok(Verified {
-                        membership,
-                        deferred: Some((index, on)),
-                    });
+            loop {
+                match membership.check_next(entry) {
+                    Check::Valid => {
+                        membership.append(entry.clone(), now, &mut Vec::new());
+                        break;
+                    }
+                    Check::Deferred(on) => {
+                        let covered = confirmed.is_some_and(|head| entry.seq <= head.seq);
+                        let pending = membership.records.iter().position(|r| {
+                            r.entry_hash == on && r.state() == RecoveryState::Pending
+                        });
+                        match (covered, pending) {
+                            (true, Some(record)) => {
+                                let head = membership.head().seq;
+                                membership.decide(
+                                    record,
+                                    RecoveryState::Active,
+                                    RecoveryReason::HostConfirmed,
+                                    head,
+                                    now,
+                                    &mut Vec::new(),
+                                );
+                            }
+                            _ => {
+                                return Ok(Verified {
+                                    membership,
+                                    deferred: Some((index, on)),
+                                });
+                            }
+                        }
+                    }
+                    Check::Invalid(reason) => return Err(at(index)(reason)),
                 }
-                Check::Invalid(reason) => return Err(at(index)(reason)),
             }
         }
         Ok(Verified {
@@ -1164,30 +1240,32 @@ impl Membership {
 
     /// Evaluates a carriage (§R9.3 "Applying a carriage", §R9.4) against a
     /// scratch copy. Nothing in `self` changes: commit `next` once it is
-    /// durable.
-    pub fn evaluate(&self, carried: &[StrictValue], now: &HostNow) -> Evaluation {
+    /// durable. `received_bytes` is the size of the carried `entries` as they
+    /// arrived on the wire (or of the whole message carrying them): the
+    /// 256 KiB bound is on what was received, not on a re-encoding.
+    pub fn evaluate(
+        &self,
+        carried: &[StrictValue],
+        received_bytes: usize,
+        now: &HostNow,
+    ) -> Evaluation {
         let parsed = carried.iter().map(Entry::from_strict).collect::<Vec<_>>();
-        let bytes = carried
-            .iter()
-            .map(|v| v.value().to_string().len())
-            .collect::<Vec<_>>();
-        self.evaluate_parsed(parsed, &bytes, now)
+        self.evaluate_parsed(parsed, received_bytes, now)
     }
 
-    /// `evaluate` of signed objects already parsed.
+    /// `evaluate` of signed objects already parsed (a client applying a
+    /// relay reply it bounded itself); the bound is checked on their wire
+    /// encoding.
     pub fn evaluate_objects(&self, carried: &[SignedObject], now: &HostNow) -> Evaluation {
-        let bytes = carried
-            .iter()
-            .map(|o| o.to_json().to_string().len())
-            .collect::<Vec<_>>();
+        let bytes = carried.iter().map(|o| o.to_json().to_string().len()).sum();
         let parsed = carried.iter().cloned().map(Entry::parse).collect();
-        self.evaluate_parsed(parsed, &bytes, now)
+        self.evaluate_parsed(parsed, bytes, now)
     }
 
     fn evaluate_parsed(
         &self,
         parsed: Vec<Result<Entry, Invalid>>,
-        bytes: &[usize],
+        received_bytes: usize,
         now: &HostNow,
     ) -> Evaluation {
         let mut eval = Evaluation {
@@ -1202,20 +1280,16 @@ impl Membership {
             return eval;
         }
         // 1. Shape: bounds, every body parses, contiguous ascending seq.
-        if parsed.len() > MAX_CARRIAGE_ENTRIES {
+        if parsed.len() > MAX_CARRIAGE_ENTRIES || received_bytes > MAX_CARRIAGE_BYTES {
             eval.stop = Some(Stop::Invalid {
-                index: MAX_CARRIAGE_ENTRIES,
+                index: parsed.len().min(MAX_CARRIAGE_ENTRIES),
                 reason: Invalid::CarriageTooLarge,
             });
             return eval;
         }
-        let mut total = 0;
-        for (index, (entry, size)) in parsed.into_iter().zip(bytes).enumerate() {
-            total += size;
+        for (index, entry) in parsed.into_iter().enumerate() {
             let checked = entry.and_then(|entry| {
-                if total > MAX_CARRIAGE_BYTES {
-                    Err(Invalid::CarriageTooLarge)
-                } else if eval
+                if eval
                     .carried
                     .last()
                     .is_some_and(|prev: &Entry| entry.seq != prev.seq + 1)
@@ -1330,7 +1404,8 @@ impl Membership {
                 .decision
                 .as_ref()
                 .is_some_and(|d| d.reason == RecoveryReason::Vetoed && d.at_seq == seq)
-            && self.signed_by_subject(theirs, &target)
+            && (against_prefix == Check::Deferred(target)
+                || self.signed_by_subject(theirs, &target))
         {
             return self.freeze(seq, &ours, theirs, now, effects);
         }
@@ -1349,9 +1424,11 @@ impl Membership {
         if against_prefix != Check::Valid {
             return self.ignore(theirs, EvidenceReason::Invalid, now, effects);
         }
-        // Row 5: the signer was removed or lost `manage` in C[seq..head];
-        // for the recovery key: it was replaced (retired) here.
-        if self.signer_removed_since(theirs, seq, &prefix) {
+        // Row 5: the signer was removed or lost `manage` in C[seq..head]. The
+        // recovery key is never "removed": a conflict it signed (it was the
+        // recovery key at that position) freezes, even if it was replaced
+        // since (§R9.4 row 6, §R9.5).
+        if self.signer_removed_since(theirs, seq) {
             return self.ignore(theirs, EvidenceReason::SignerRemoved, now, effects);
         }
         // Row 6: a manager at our head, or the recovery key.
@@ -1359,14 +1436,18 @@ impl Membership {
     }
 
     /// `entry` is signed by the subject of the pending-type entry `target`:
-    /// the recovered device itself, or (for a `kit: "lost"` replacement) the
-    /// new kit's key, alone or as `kit_sig`.
+    /// the recovered device itself (its `signer` and a signature that
+    /// verifies with its `auth_key`; the `signer` string alone proves
+    /// nothing), or (for a `kit: "lost"` replacement) the new kit's key,
+    /// alone or as `kit_sig`.
     fn signed_by_subject(&self, entry: &Entry, target: &Hash32) -> bool {
         let Some(target_entry) = self.entry_by_hash(target) else {
             return false;
         };
         match &target_entry.action {
-            Action::RecoveryAdd { member } => entry.signer == member.device_id,
+            Action::RecoveryAdd { member } => {
+                entry.signer == member.device_id && entry.object().verify(&member.auth_key).is_ok()
+            }
             Action::SetRecoveryKey { recovery_key, .. } => {
                 (entry.signer == RECOVERY_SIGNER && entry.object().verify(recovery_key).is_ok())
                     || entry.object().verify_kit_sig(recovery_key).is_ok()
@@ -1375,11 +1456,9 @@ impl Membership {
         }
     }
 
-    fn signer_removed_since(&self, theirs: &Entry, seq: u64, prefix: &Derived) -> bool {
+    fn signer_removed_since(&self, theirs: &Entry, seq: u64) -> bool {
         if theirs.signer == RECOVERY_SIGNER {
-            // The key it verified with at seq-1 is no longer current here.
-            return self.derived.is_retired(&prefix.recovery_key)
-                || self.derived.recovery_key != prefix.recovery_key;
+            return false;
         }
         let later = &self.entries[(seq - 1) as usize..];
         later.iter().any(|e| match &e.action {
@@ -1647,13 +1726,14 @@ impl Evaluation {
         if more && next.member(device_id).is_none() {
             return Admission::Incomplete { head };
         }
-        // Added only by an entry deferred behind a pending one.
+        // Added only by the entry deferred behind a pending one. That entry
+        // was verified up to its deferral (signature included); the ones
+        // after it weren't, so they prove nothing.
         if let Some(Stop::Deferred { index, on }) = &self.stop
             && next.member(device_id).is_none()
-            && self.carried[*index..].iter().any(|e| {
-                matches!(&e.action, Action::Add { member } | Action::RecoveryAdd { member }
+            && matches!(&self.carried[*index].action,
+                Action::Add { member } | Action::RecoveryAdd { member }
                     if member.device_id == device_id)
-            })
         {
             return next.pending_admission(on, now);
         }

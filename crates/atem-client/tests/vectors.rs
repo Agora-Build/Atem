@@ -561,7 +561,8 @@ fn alternatives_in_context(run: &mut Run, ctx: &Context) {
     let state = |m: &Membership, label: &str| m.record(&ctx.hash(label)).unwrap().state();
     let conflict = |base: &[&str], label: &str| {
         let m = ctx.chain(base);
-        let eval = m.evaluate(&[strict(&ctx.vectors[label]["entry"])], &ctx.now);
+        let wire = &ctx.vectors[label]["entry"];
+        let eval = m.evaluate(&[strict(wire)], wire.to_string().len(), &ctx.now);
         match eval.stop {
             Some(Stop::Conflict { outcome, .. }) => outcome,
             other => panic!("{label}: {other:?}"),

@@ -6,7 +6,7 @@
 mod support;
 
 use atem_client::backup::{BackupKey, KBackupEnvelope};
-use atem_client::backup_writer::{BackupJob, BackupWriter, EntrySigner, PutReply, Step};
+use atem_client::backup_writer::{BackupJob, BackupWriter, PutReply, Step};
 use atem_client::encoding::Hash32;
 use atem_client::kit::RecoveryKit;
 use atem_client::membership::publish::{Published, Publisher};
@@ -891,15 +891,7 @@ fn write_backup(
                 )
                 .unwrap();
                 let at = device.clock.now.wall_ms;
-                writer.sealed(
-                    &device.log,
-                    env,
-                    &EntrySigner {
-                        provider: &device.keys,
-                        key: &auth(),
-                        signed_at: at,
-                    },
-                )
+                writer.sealed(&device.log, env, at)
             }
             Step::Put {
                 blob_version,
@@ -917,18 +909,15 @@ fn write_backup(
                 let answer = relay.append(&entry, expected);
                 let at = device.clock.now.wall_ms;
                 let now = device.clock.now.clone();
-                writer.append_reply(
-                    &mut device.log,
-                    answer.reply(),
-                    &now,
-                    &EntrySigner {
-                        provider: &device.keys,
-                        key: &auth(),
-                        signed_at: at,
-                    },
-                )
+                writer.append_reply(&mut device.log, answer.reply(), &now, at)
             }
-            Step::Fetch { .. } => unreachable!("the fake relay's 409 is complete"),
+            Step::Sign { .. } => writer.sign(&device.keys, &auth()),
+            Step::Fetch { after } => {
+                let (entries, more) = relay.after_page(after);
+                let at = device.clock.now.wall_ms;
+                let now = device.clock.now.clone();
+                writer.fetched(&mut device.log, &entries, more, &now, at)
+            }
             done @ (Step::Done { .. } | Step::Failed(_)) => return (writer, done, uploads),
         };
     }
@@ -1003,15 +992,7 @@ fn k_backup_allocation_survives_repeated_409s() {
                 let env =
                     KBackupEnvelope::seal(ACCOUNT, w.genesis, blob_version, &kit_key, &rotated)
                         .unwrap();
-                writer.sealed(
-                    &w.mac.log,
-                    env,
-                    &EntrySigner {
-                        provider: &w.mac.keys,
-                        key: &auth(),
-                        signed_at: T0,
-                    },
-                )
+                writer.sealed(&w.mac.log, env, T0)
             }
             Step::Put {
                 blob_version,
@@ -1034,17 +1015,9 @@ fn k_backup_allocation_survives_repeated_409s() {
                 }
                 let answer = relay.append(&entry, expected);
                 let now = w.mac.clock.now.clone();
-                writer.append_reply(
-                    &mut w.mac.log,
-                    answer.reply(),
-                    &now,
-                    &EntrySigner {
-                        provider: &w.mac.keys,
-                        key: &auth(),
-                        signed_at: T0,
-                    },
-                )
+                writer.append_reply(&mut w.mac.log, answer.reply(), &now, T0)
             }
+            Step::Sign { .. } => writer.sign(&w.mac.keys, &auth()),
             Step::Done { committed } => break committed,
             other => panic!("{other:?}"),
         };

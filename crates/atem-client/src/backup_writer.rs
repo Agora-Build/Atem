@@ -18,6 +18,8 @@
 //!   and never trusted.
 use std::collections::BTreeSet;
 
+use serde_json::Value;
+
 use crate::backup::KBackupEnvelope;
 use crate::encoding::Hash32;
 use crate::keys::PublicKey;
@@ -31,15 +33,6 @@ use crate::signed::SignedObject;
 /// A `max_occupied` more than this above the newest committed version is
 /// relay misbehaviour.
 pub const MAX_VERSION_SKIP: u64 = 1024;
-
-/// Who signs the `k_backup` entry: the manager's key, and the display time
-/// (`signed_at`) for an entry built now.
-#[derive(Clone, Copy)]
-pub struct EntrySigner<'a> {
-    pub provider: &'a dyn KeyProvider,
-    pub key: &'a KeyId,
-    pub signed_at: u64,
-}
 
 /// What to back up: the `K` sequence (current kid first) for a kit, by a
 /// manager.
@@ -67,6 +60,9 @@ pub enum Step {
     /// Seal the job's keys to its kit at this version
     /// (`KBackupEnvelope::seal`) and pass it to [`BackupWriter::sealed`].
     Seal { blob_version: u64 },
+    /// Store the writer (it now holds this exact body: §R9.4 rule 1), then
+    /// have the manager's key sign it with [`BackupWriter::sign`].
+    Sign { body: Value },
     /// Upload these envelope bytes (put-if-absent at this version).
     Put { blob_version: u64, bytes: String },
     /// Append this entry with the log CAS (`expected` = the head it chains
@@ -94,6 +90,12 @@ pub enum BackupError {
     Diverged,
     /// Signing the entry failed.
     Sign(Invalid),
+    /// The relay's log goes beyond an entry still pending on this device's
+    /// clock: wait for it, then start again.
+    Waiting { on: Hash32 },
+    /// The relay's `409` didn't move the verified log to the head it
+    /// reported: try again later.
+    RelayInconsistent,
     /// An answer that doesn't fit the current step.
     UnexpectedReply,
 }
@@ -113,11 +115,23 @@ pub enum Discarded {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Phase {
-    Seal { blob_version: u64 },
+    Seal {
+        blob_version: u64,
+    },
+    /// The body is stored; next the signature, then the upload (a new
+    /// envelope) or the append (an entry rebuilt on a new head).
+    Sign {
+        then_upload: bool,
+    },
     Upload,
     Publish,
-    Fetch { after: u64, lost: Option<Hash32> },
-    Done { committed: u64 },
+    Fetch {
+        after: u64,
+        lost: Option<Hash32>,
+    },
+    Done {
+        committed: u64,
+    },
     Failed(BackupError),
 }
 
@@ -187,6 +201,8 @@ impl BackupWriter {
     /// upload means the relay collected the envelope and another writer took
     /// the version: allocation goes on above it.
     pub fn restart(&mut self) -> Step {
+        // A body stored without its signature is signed again (same body,
+        // same entry_hash); that is `Phase::Sign`, resumed as is.
         if self.phase == Phase::Publish && self.envelope.is_some() {
             self.phase = Phase::Upload;
         }
@@ -198,6 +214,12 @@ impl BackupWriter {
         match &self.phase {
             Phase::Seal { blob_version } => Step::Seal {
                 blob_version: *blob_version,
+            },
+            Phase::Sign { .. } => match self.publisher.prepared() {
+                Some(prepared) => Step::Sign {
+                    body: prepared.body.clone(),
+                },
+                None => Step::Failed(BackupError::UnexpectedReply),
             },
             Phase::Upload => {
                 let envelope = self.envelope.as_ref().expect("uploading an envelope");
@@ -257,12 +279,7 @@ impl BackupWriter {
 
     /// The caller sealed the asked version (step 2): the envelope and the
     /// prepared entry are stored, then the entry is signed. Next: upload.
-    pub fn sealed(
-        &mut self,
-        log: &Membership,
-        envelope: KBackupEnvelope,
-        signer: &EntrySigner,
-    ) -> Step {
+    pub fn sealed(&mut self, log: &Membership, envelope: KBackupEnvelope, signed_at: u64) -> Step {
         let Phase::Seal { blob_version } = self.phase else {
             return Step::Failed(BackupError::UnexpectedReply);
         };
@@ -274,19 +291,41 @@ impl BackupWriter {
         if !fits {
             return Step::Failed(BackupError::WrongEnvelope);
         }
-        if let Err(error) = self.prepare_entry(log, &envelope, signer) {
+        if let Err(error) = self.draft_entry(log, &envelope, signed_at) {
             return self.fail(error);
         }
         self.envelope = Some(envelope);
-        self.phase = Phase::Upload;
+        self.phase = Phase::Sign { then_upload: true };
         self.resume()
     }
 
-    fn prepare_entry(
+    /// Signs the stored body with the manager's key (§R9.4 rule 1: after the
+    /// body was stored). Next: the upload, or the append of a rebuilt entry.
+    pub fn sign(&mut self, provider: &dyn KeyProvider, key: &KeyId) -> Step {
+        let Phase::Sign { then_upload } = self.phase else {
+            return Step::Failed(BackupError::UnexpectedReply);
+        };
+        if let Err(e) = self.publisher.sign(provider, key, None) {
+            return self.fail(match e {
+                crate::membership::publish::PublishError::Sign(invalid) => {
+                    BackupError::Sign(invalid)
+                }
+                _ => BackupError::UnexpectedReply,
+            });
+        }
+        self.phase = if then_upload {
+            Phase::Upload
+        } else {
+            Phase::Publish
+        };
+        self.resume()
+    }
+
+    fn draft_entry(
         &mut self,
         log: &Membership,
         envelope: &KBackupEnvelope,
-        signer: &EntrySigner,
+        signed_at: u64,
     ) -> Result<(), BackupError> {
         let action = Action::KBackup(KBackupRecord {
             blob_version: envelope.blob_version,
@@ -294,19 +333,11 @@ impl BackupWriter {
             recovery_key: envelope.recovery_key.clone(),
             backup_hash: envelope.backup_hash(),
         });
-        let body = log.draft(&self.job.signer, signer.signed_at, &action);
+        let body = log.draft(&self.job.signer, signed_at, &action);
         self.publisher = Publisher::new();
         self.publisher
             .prepare(log, body)
             .map_err(|_| BackupError::UnexpectedReply)?;
-        self.publisher
-            .sign(signer.provider, signer.key, None)
-            .map_err(|e| match e {
-                crate::membership::publish::PublishError::Sign(invalid) => {
-                    BackupError::Sign(invalid)
-                }
-                _ => BackupError::UnexpectedReply,
-            })?;
         Ok(())
     }
 
@@ -353,7 +384,7 @@ impl BackupWriter {
         log: &mut Membership,
         reply: AppendReply,
         now: &HostNow,
-        signer: &EntrySigner,
+        signed_at: u64,
     ) -> Step {
         if self.phase != Phase::Publish {
             return Step::Failed(BackupError::UnexpectedReply);
@@ -366,7 +397,17 @@ impl BackupWriter {
                 self.envelope = None;
                 self.done(log)
             }
-            Ok(Published::LostRace { .. }) => self.after_loss(log, sent, signer),
+            Ok(Published::StoredPending { .. }) => {
+                // Committed at the relay; our log applies it once the entry it
+                // depends on takes effect here.
+                self.uploaded.remove(&ours);
+                self.envelope = None;
+                self.phase = Phase::Done { committed: ours };
+                Step::Done { committed: ours }
+            }
+            Ok(Published::LostRace { .. }) => self.after_loss(log, sent, signed_at),
+            Ok(Published::Waiting { on, .. }) => self.fail(BackupError::Waiting { on }),
+            Ok(Published::RelayInconsistent { .. }) => self.fail(BackupError::RelayInconsistent),
             Ok(Published::FetchMore { after, .. }) => {
                 self.phase = Phase::Fetch { after, lost: sent };
                 self.resume()
@@ -385,7 +426,7 @@ impl BackupWriter {
         entries: &[SignedObject],
         more: bool,
         now: &HostNow,
-        signer: &EntrySigner,
+        signed_at: u64,
     ) -> Step {
         let Phase::Fetch { lost, .. } = self.phase else {
             return Step::Failed(BackupError::UnexpectedReply);
@@ -396,10 +437,16 @@ impl BackupWriter {
         match stop {
             Some(Stop::Invalid { .. }) => return self.fail(BackupError::RelayInvalid),
             Some(Stop::Frozen)
+            | Some(Stop::NeedBefore { .. })
             | Some(Stop::Conflict {
                 outcome: Conflict::Freeze,
                 ..
             }) => return self.fail(BackupError::Diverged),
+            Some(Stop::Deferred { on, .. }) => return self.fail(BackupError::Waiting { on }),
+            Some(Stop::Conflict {
+                outcome: Conflict::Ignored(_),
+                ..
+            }) => return self.fail(BackupError::RelayInconsistent),
             _ => {}
         }
         if more {
@@ -409,11 +456,11 @@ impl BackupWriter {
             };
             return self.resume();
         }
-        self.after_loss(log, lost, signer)
+        self.after_loss(log, lost, signed_at)
     }
 
     /// Step 5 after the log moved under our entry.
-    fn after_loss(&mut self, log: &Membership, sent: Option<Hash32>, signer: &EntrySigner) -> Step {
+    fn after_loss(&mut self, log: &Membership, sent: Option<Hash32>, signed_at: u64) -> Step {
         let ours = self.envelope.as_ref().expect("publishing").blob_version;
         if Self::committed(log) >= ours {
             // A `k_backup` naming a version ≥ ours won: ours can never be
@@ -438,9 +485,9 @@ impl BackupWriter {
             return self.allocate(log);
         }
         let envelope = self.envelope.clone().expect("publishing");
-        match self.prepare_entry(log, &envelope, signer) {
+        match self.draft_entry(log, &envelope, signed_at) {
             Ok(()) => {
-                self.phase = Phase::Publish;
+                self.phase = Phase::Sign { then_upload: false };
                 self.resume()
             }
             Err(error) => self.fail(error),

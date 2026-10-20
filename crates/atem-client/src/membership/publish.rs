@@ -14,6 +14,7 @@
 //! 5. One outstanding append per device.
 use serde_json::Value;
 
+use crate::encoding::Hash32;
 use crate::provider::{KeyId, KeyProvider};
 use crate::signed::SignedObject;
 
@@ -27,9 +28,10 @@ use super::{
 pub enum AppendReply {
     /// `200`: stored (or the same `entry_hash` was already stored there).
     Stored,
-    /// `409 {head, entries, more?}`: the relay's entries after
-    /// `expected.seq` (or a window before a divergence).
+    /// `409 {head, entries, more?}`: the relay's head, and its entries after
+    /// `expected.seq` (or a window from before a divergence).
     Conflict {
+        head: Head,
         entries: Vec<SignedObject>,
         more: bool,
     },
@@ -51,6 +53,10 @@ pub struct Prepared {
 pub enum Published {
     /// `200`: the entry is in the relay's log and now in ours.
     Committed(Head),
+    /// `200`, but our own log can't apply the entry yet: it depends on an
+    /// entry still pending on this device's clock. It is committed at the
+    /// relay; it joins our log when the dependency takes effect here.
+    StoredPending { head: Head, on: Hash32 },
     /// `409`: our body was discarded; the returned entries were verified and
     /// applied (our log's head is the new one).
     LostRace { discarded: Prepared, head: Head },
@@ -60,6 +66,14 @@ pub enum Published {
     /// The relay showed conflicting signed history (two entries at one
     /// `seq`): stop signing entries and carry the window to hosts (§R9.4).
     Diverged { discarded: Prepared },
+    /// The `409`'s entries go beyond an entry still pending on this
+    /// device's clock: wait (don't rebuild on an unchanged head).
+    Waiting { discarded: Prepared, on: Hash32 },
+    /// The `409` didn't move our verified log to the head it reported (a
+    /// window that doesn't extend our log, an ignored conflicting entry, or
+    /// a head the entries don't reach): refetch later; never rebuild on the
+    /// unchanged head.
+    RelayInconsistent { discarded: Prepared, head: Head },
     /// The relay returned entries that don't verify.
     RelayInvalid {
         discarded: Prepared,
@@ -173,12 +187,18 @@ impl Publisher {
                     seq: entry.seq,
                     hash: entry.hash(),
                 };
-                if let Some(Stop::Invalid { index, reason }) = stop {
-                    return Ok(Published::RelayInvalid {
-                        discarded: prepared,
-                        index,
-                        reason,
-                    });
+                match stop {
+                    Some(Stop::Invalid { index, reason }) => {
+                        return Ok(Published::RelayInvalid {
+                            discarded: prepared,
+                            index,
+                            reason,
+                        });
+                    }
+                    Some(Stop::Deferred { on, .. }) => {
+                        return Ok(Published::StoredPending { head: ours, on });
+                    }
+                    _ => {}
                 }
                 if log.entry(ours.seq).map(|e| e.hash()) == Some(ours.hash) {
                     Ok(Published::Committed(ours))
@@ -190,16 +210,24 @@ impl Publisher {
                     })
                 }
             }
-            AppendReply::Conflict { entries, more } => {
+            AppendReply::Conflict {
+                head,
+                entries,
+                more,
+            } => {
                 let eval: Evaluation = log.evaluate_objects(&entries, now);
                 let stop = eval.stop.clone();
                 *log = eval.next;
+                let moved = log.head() != prepared.expected;
                 Ok(match stop {
                     Some(Stop::Conflict {
                         outcome: Conflict::Freeze,
                         ..
                     })
-                    | Some(Stop::Frozen) => Published::Diverged {
+                    | Some(Stop::Frozen)
+                    // The relay's entry at a seq we hold doesn't chain from
+                    // ours: it showed two histories.
+                    | Some(Stop::NeedBefore { .. }) => Published::Diverged {
                         discarded: prepared,
                     },
                     Some(Stop::Invalid { index, reason }) => Published::RelayInvalid {
@@ -207,13 +235,28 @@ impl Publisher {
                         index,
                         reason,
                     },
-                    _ if more => Published::FetchMore {
+                    Some(Stop::Deferred { on, .. }) => Published::Waiting {
+                        discarded: prepared,
+                        on,
+                    },
+                    Some(Stop::Conflict {
+                        outcome: Conflict::Ignored(_),
+                        ..
+                    }) => Published::RelayInconsistent {
+                        discarded: prepared,
+                        head,
+                    },
+                    _ if more && moved => Published::FetchMore {
                         after: log.head().seq,
                         discarded: prepared,
                     },
-                    _ => Published::LostRace {
+                    _ if !more && log.head() == head && moved => Published::LostRace {
                         discarded: prepared,
-                        head: log.head(),
+                        head,
+                    },
+                    _ => Published::RelayInconsistent {
+                        discarded: prepared,
+                        head,
                     },
                 })
             }

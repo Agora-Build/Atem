@@ -7,7 +7,10 @@
 //! §3's deadlines) with the boot they belong to. Within one boot the wait
 //! counts from its anchor; after a reboot (another `boot_id`) it continues
 //! from the last persisted `mono_waited_ms`, so time while the machine was
-//! off never counts.
+//! off never counts. Time between a boot and the first reading taken in it
+//! isn't counted either (the host takes one at start): the wait only gets
+//! longer. How these fields map to §R9.3's `membership.json` sketch is in
+//! the `membership` module docs.
 
 /// The wait: 86 400 000 ms.
 pub const RECOVERY_WAIT_MS: u64 = 86_400_000;

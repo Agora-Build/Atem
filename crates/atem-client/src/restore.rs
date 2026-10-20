@@ -121,21 +121,45 @@ pub fn restore(
     let genesis = relay_log.first().ok_or(RestoreError::GenesisMismatch)?;
     kit.check_genesis(&genesis.hash(), &genesis.account_id)
         .map_err(|_| RestoreError::GenesisMismatch)?;
-    let verified = Membership::verify_chain(kit.account_id(), &kit.genesis_hash(), relay_log, now)
-        .map_err(|e| match e.reason {
-            Invalid::GenesisMismatch => RestoreError::GenesisMismatch,
-            reason => RestoreError::ChainInvalid {
-                index: e.index,
-                reason,
-            },
-        })?;
-    let log = verified.membership;
+    let chain_error = |e: crate::membership::ChainError| match e.reason {
+        Invalid::GenesisMismatch => RestoreError::GenesisMismatch,
+        reason => RestoreError::ChainInvalid {
+            index: e.index,
+            reason,
+        },
+    };
+    let verify = |confirmed: Option<Head>| {
+        Membership::verify_chain_confirmed(
+            kit.account_id(),
+            &kit.genesis_hash(),
+            relay_log,
+            confirmed,
+            now,
+        )
+        .map_err(chain_error)
+    };
+    let mut verified = verify(None)?;
 
     // 3. Host-signed heads of hosts the chain names.
-    let confirmed: Vec<&HostHead> = host_heads
-        .iter()
-        .filter(|h| log.host(&h.host_id).is_some())
-        .collect();
+    let known = |log: &Membership| -> Vec<HostHead> {
+        host_heads
+            .iter()
+            .filter(|h| log.host(&h.host_id).is_some())
+            .cloned()
+            .collect()
+    };
+    let mut confirmed = known(&verified.membership);
+    // A chain that stops at an entry depending on a recovery still pending on
+    // this (fresh) verifier: a host's signed head beyond it shows that the
+    // recovery took effect there, so verify again up to that head.
+    if verified.deferred.is_some()
+        && let Some(highest) = confirmed.iter().map(|h| h.head).max_by_key(|h| h.seq)
+    {
+        verified = verify(Some(highest))?;
+        confirmed = known(&verified.membership);
+    }
+    let log = verified.membership;
+    let confirmed: Vec<&HostHead> = confirmed.iter().collect();
     if confirmed.is_empty() {
         let hosts: Vec<String> = log
             .entries()

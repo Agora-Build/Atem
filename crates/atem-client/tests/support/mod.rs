@@ -246,7 +246,12 @@ impl RelayAppend {
     pub fn reply(&self) -> AppendReply {
         match self {
             RelayAppend::Ok(_) => AppendReply::Stored,
-            RelayAppend::Conflict { entries, more, .. } => AppendReply::Conflict {
+            RelayAppend::Conflict {
+                head,
+                entries,
+                more,
+            } => AppendReply::Conflict {
+                head: *head,
                 entries: entries.clone(),
                 more: *more,
             },
@@ -263,6 +268,25 @@ pub fn head_of(object: &SignedObject) -> Head {
         seq: seq_of(object),
         hash: object.entry_hash().unwrap(),
     }
+}
+
+/// The relay's bounds on one reply (§R9.4): at most 64 entries and
+/// 256 KiB; `more` when entries were left out.
+pub const RELAY_MAX_ENTRIES: usize = 64;
+pub const RELAY_MAX_BYTES: usize = 256 * 1024;
+
+pub fn bounded(entries: &[SignedObject]) -> (Vec<SignedObject>, bool) {
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    for entry in entries {
+        let size = entry.to_json().to_string().len();
+        if out.len() == RELAY_MAX_ENTRIES || bytes + size > RELAY_MAX_BYTES {
+            return (out, true);
+        }
+        bytes += size;
+        out.push(entry.clone());
+    }
+    (out, false)
 }
 
 impl FakeRelay {
@@ -305,16 +329,20 @@ impl FakeRelay {
             // A window from before the divergence.
             (expected.seq as usize).saturating_sub(8).max(1)
         };
-        let rest: Vec<SignedObject> = self.log[after..].to_vec();
-        let more = rest.len() > 64;
+        let (entries, more) = bounded(&self.log[after..]);
         RelayAppend::Conflict {
             head: self.head(),
-            entries: rest.into_iter().take(64).collect(),
+            entries,
             more,
         }
     }
 
-    /// `GET …/entries?after=<seq>`.
+    /// `GET …/entries?after=<seq>`, bounded like a `409`: `(entries, more)`.
+    pub fn after_page(&self, seq: u64) -> (Vec<SignedObject>, bool) {
+        bounded(&self.log[seq as usize..])
+    }
+
+    /// Everything after `seq` (a client paging through `after_page`).
     pub fn after(&self, seq: u64) -> Vec<SignedObject> {
         self.log[seq as usize..].to_vec()
     }
