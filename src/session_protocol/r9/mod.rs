@@ -373,7 +373,9 @@ impl R9Host {
             self.limiter = InitLimiter::new();
             self.unknown.clear();
             self.unknown_order.clear();
-            // §R9.9: everything unacknowledged goes again at a reconnect.
+            // §R9.9: everything unacknowledged goes again at a reconnect
+            // (to the recipients at the head).
+            self.push_recipients(parts);
             self.push
                 .link_up(push_suppressed(parts), parts.now.host.wall_ms);
         }
@@ -882,6 +884,9 @@ impl R9Host {
         };
         if let Some(result) = &carriage {
             self.note_fences(&result.fences);
+            // §R9.9: a removed or demoted device's hints stop at once.
+            self.push
+                .sync_recipients(m.membership(), parts.now.host.wall_ms);
             if result.announce {
                 // Every live attachment learns the new head now, whatever
                 // the carrier's own admission (its welcome names it).
@@ -1301,6 +1306,9 @@ impl R9Host {
         let result = m.apply_carriage(&entries, &parts.now.host, &mut fences);
         let mut effects = fences.effects;
         self.note_fences(&result.fences);
+        // §R9.9: a removed or demoted device's hints stop at once.
+        self.push
+            .sync_recipients(m.membership(), parts.now.host.wall_ms);
         let reply = match result.carried {
             Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
                 error(code::BUSY, re, Some(DETAIL_NOT_RECORDED)).to_bytes()
@@ -1507,8 +1515,9 @@ impl R9Host {
     // ── Push (§R9.9) ──
 
     /// An approval opened (`Effect::PushApproval`): its open hints, sealed
-    /// per recipient, `expires_at` = now on the host clock + `wait_ms` (the
-    /// hook's wait: Claude 600 s, Codex 300 s).
+    /// per recipient. `created_at` is the `approval_request`'s (one clock
+    /// for the card and the hint), `expires_at` = `created_at` + `wait_ms`
+    /// (the hook's wait: Claude 600 s, Codex 300 s).
     pub fn approval_opened<J: Journal>(
         &mut self,
         request: &r8::ApprovalRequest,
@@ -1526,7 +1535,8 @@ impl R9Host {
         };
         self.push.opened(
             key,
-            wall.saturating_add(wait_ms),
+            request.created_at,
+            request.created_at.saturating_add(wait_ms),
             &plain,
             signer_of(&parts.list),
             wall,
@@ -1560,6 +1570,15 @@ impl R9Host {
         let matched = self.push.ack(&value);
         if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
             log("a push_ack acknowledged nothing pending");
+        }
+    }
+
+    /// The head may have moved: open hints of devices no longer recipients
+    /// (removed, or lost `control`) are never sent again (§R9.9, §R9.6).
+    fn push_recipients<J: Journal>(&mut self, parts: &Parts<'_, J>) {
+        let wall = parts.now.host.wall_ms;
+        if let Some(signer) = signer_of(&parts.list) {
+            self.push.sync_recipients(signer.log, wall);
         }
     }
 
@@ -1848,6 +1867,7 @@ impl R9Host {
             effects.extend(parts.host.fence_principal(&principal, 0));
         }
         self.revoked.prune(wall);
+        self.push_recipients(parts);
         self.push.tick(push_suppressed(parts), wall);
         effects
     }
@@ -1884,7 +1904,6 @@ impl R9Host {
     }
 }
 
-/// §R9.7a: the compact inner frame, or its `ct`, over the bound.
 /// Why no push hint or seen may be signed or sent now (§R9.9 with §R9.3,
 /// §R9.4 and r8 §I): no device list, a held, frozen or faulted one, or a
 /// halted session journal.
@@ -1932,6 +1951,7 @@ fn approval_key(
     ))
 }
 
+/// §R9.7a: the compact inner frame, or its `ct`, over the bound.
 fn inner_too_large(frame: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct Peek<'a> {

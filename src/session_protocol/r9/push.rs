@@ -27,8 +27,13 @@
 //!   follow; the resolved hint still goes (it only cancels);
 //! - a resolved hint ends the resends of its approval's opens and seens
 //!   (it dominates them at the relay);
+//! - recipients follow the head: an open hint not yet acknowledged whose
+//!   device is no longer a recipient (removed, or lost `control`) is never
+//!   sent again (its resolved hint still goes: it carries nothing sealed);
 //! - bounds: at most [`MAX_APPROVALS`] approvals tracked (the oldest
-//!   forgotten first), at most [`MAX_RELAY_OUT`] messages waiting for the
+//!   forgotten first); each `push_hint` at most [`MAX_MESSAGE_BYTES`]
+//!   (hints due together are split, never one frame the link or relay
+//!   refuses forever); at most [`MAX_RELAY_OUT_BYTES`] waiting for the
 //!   link (the rest go at the next resend).
 use super::HostKey;
 use atem_client::membership::Membership;
@@ -40,8 +45,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 /// Approvals whose hints are tracked at most (the oldest is forgotten).
 pub const MAX_APPROVALS: usize = 64;
-/// Relay messages waiting for the link at most (the rest are resent).
-pub const MAX_RELAY_OUT: usize = 64;
+/// Bytes of relay messages waiting for the link at most (the rest are
+/// resent at the next tick).
+pub const MAX_RELAY_OUT_BYTES: usize = 16 << 20;
+/// One `push_hint` message at most (well under the link's 2 MiB bound;
+/// one open hint is about 1.5 KiB).
+pub const MAX_MESSAGE_BYTES: usize = 256 << 10;
 /// How long after `expires_at` the outbox still resends (§R9.9).
 const RESEND_AFTER_EXPIRY_MS: u64 = push::CLIENT_SKEW_MS;
 
@@ -88,6 +97,7 @@ pub struct HostPush {
     order: VecDeque<String>,
     outbox: Outbox,
     out: VecDeque<String>,
+    out_bytes: usize,
     link: bool,
     suppressed: Option<&'static str>,
 }
@@ -99,12 +109,15 @@ pub struct Signer<'a> {
 }
 
 impl HostPush {
-    /// A new approval (`created_at` = now on the host clock, `expires_at`
-    /// = `created_at` + the hook's wait): its open hints, one per
-    /// recipient, queued and sent while the link is up.
+    /// A new approval (`created_at` its creation, the `approval_request`'s
+    /// `created_at`; `expires_at` = `created_at` + the hook's wait; `now`
+    /// the host clock): its open hints, one per recipient, queued and sent
+    /// while the link is up.
+    #[allow(clippy::too_many_arguments)]
     pub fn opened(
         &mut self,
         key: ApprovalKey,
+        created_at: u64,
         expires_at: u64,
         plain: &HintPlain,
         signer: Option<Signer<'_>>,
@@ -118,8 +131,7 @@ impl HostPush {
             ));
             return;
         };
-        let created_at = now;
-        if created_at >= push::guard(expires_at) {
+        if now.max(created_at) >= push::guard(expires_at) {
             log(&format!(
                 "approval {}: no hint (opened within {} s of its expiry)",
                 key.approval_id,
@@ -139,8 +151,8 @@ impl HostPush {
         };
         let hints: Vec<Hint> = objects
             .iter()
-            .filter_map(
-                |o| match Hint::verify(o, signer.log, created_at, Verifier::Client) {
+            .filter_map(|o| {
+                match Hint::verify(o, signer.log, now.max(created_at), Verifier::Client) {
                     Ok(h) => Some(h),
                     Err(r) => {
                         log(&format!(
@@ -149,8 +161,8 @@ impl HostPush {
                         ));
                         None
                     }
-                },
-            )
+                }
+            })
             .collect();
         if hints.is_empty() {
             // No native member with control: nobody to notify, nothing to
@@ -318,6 +330,49 @@ impl HostPush {
         matched
     }
 
+    /// The head moved (or the pass): open hints not yet acknowledged whose
+    /// device is no longer a recipient at the head (removed, or lost
+    /// `control`) are never sent again; what waits for the link is
+    /// rebuilt without them. Returns how many were dropped.
+    pub fn sync_recipients(&mut self, membership: &Membership, now: u64) -> usize {
+        let current: std::collections::BTreeSet<String> = push::recipients(membership)
+            .into_iter()
+            .map(|(device, _)| device)
+            .collect();
+        let mut gone = Vec::new();
+        for (id, t) in self.approvals.iter_mut() {
+            let stale: Vec<Identity> = t
+                .unacked
+                .keys()
+                .filter(|i| matches!(i, Identity::Open { device_id, .. } if !current.contains(device_id)))
+                .cloned()
+                .collect();
+            for i in stale {
+                if let Identity::Open { device_id, .. } = &i {
+                    log(&format!(
+                        "approval {id}: {device_id} is no longer a recipient; its hint is not sent again"
+                    ));
+                }
+                t.unacked.remove(&i);
+                gone.push(i);
+            }
+        }
+        if gone.is_empty() {
+            return 0;
+        }
+        self.outbox.on_ack(&gone);
+        if self.link && !self.out.is_empty() {
+            // Messages already waiting may hold them: rebuilt from what is
+            // still pending (a resend now is idempotent at the relay).
+            self.out.clear();
+            self.out_bytes = 0;
+            for m in self.outbox.reconnect(now) {
+                self.queue(m);
+            }
+        }
+        gone.len()
+    }
+
     /// The pass: suppression drops everything; the guard ends the opens
     /// and seens of approvals within 15 s of their expiry; what is due for
     /// a resend (every 10 s) is queued while the link is up.
@@ -351,6 +406,7 @@ impl HostPush {
     pub fn link_down(&mut self) {
         self.link = false;
         self.out.clear();
+        self.out_bytes = 0;
     }
 
     /// The device list was pinned again or removed: every approval's
@@ -371,8 +427,10 @@ impl HostPush {
     /// is full or gone) and the rest wait for the next resend.
     pub fn flush(&mut self, send: &mut dyn FnMut(String) -> bool) {
         while let Some(text) = self.out.pop_front() {
+            self.out_bytes -= text.len();
             if !send(text) {
                 self.out.clear();
+                self.out_bytes = 0;
                 return;
             }
         }
@@ -475,10 +533,48 @@ impl HostPush {
         if !self.link {
             return;
         }
-        if self.out.len() >= MAX_RELAY_OUT {
-            // Resent at the next tick (every 10 s).
-            self.out.pop_front();
+        for text in split(message) {
+            if self.out_bytes + text.len() > MAX_RELAY_OUT_BYTES {
+                // Resent at the next tick (every 10 s).
+                log("the link is backed up; the rest waits for the next resend");
+                return;
+            }
+            self.out_bytes += text.len();
+            self.out.push_back(text);
         }
-        self.out.push_back(message.to_string());
     }
+}
+
+/// A `push_hint` whose hints don't fit [`MAX_MESSAGE_BYTES`] as several,
+/// in order (one hint always fits); anything else as is.
+pub(super) fn split(message: serde_json::Value) -> Vec<String> {
+    let text = message.to_string();
+    if text.len() <= MAX_MESSAGE_BYTES || message["op"] != "push_hint" {
+        return vec![text];
+    }
+    let Some(hints) = message["hints"].as_array() else {
+        return vec![text];
+    };
+    // The message's own bytes around the array, with margin.
+    const FRAME: usize = 64;
+    let message_of = |batch: &[serde_json::Value]| {
+        serde_json::json!({"type": "relay", "op": "push_hint", "hints": batch}).to_string()
+    };
+    let mut out = Vec::new();
+    let mut batch: Vec<serde_json::Value> = Vec::new();
+    let mut bytes = 0;
+    for h in hints {
+        let n = h.to_string().len() + 1;
+        if !batch.is_empty() && FRAME + bytes + n > MAX_MESSAGE_BYTES {
+            out.push(message_of(&batch));
+            batch.clear();
+            bytes = 0;
+        }
+        bytes += n;
+        batch.push(h.clone());
+    }
+    if !batch.is_empty() {
+        out.push(message_of(&batch));
+    }
+    out
 }

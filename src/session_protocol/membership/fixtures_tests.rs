@@ -557,7 +557,13 @@ impl Runner {
                 "clients": [],
             });
             let journal = FileJournal::open(&rig.journal).unwrap();
-            let mut rt = FakeRuntime::from_json_with(r8, HostConfig::default(), journal);
+            // The session host's wall clock is the host clock, as in the
+            // runtime (one clock for an approval's `created_at`).
+            let config = HostConfig {
+                wall_offset_ms: now.wall_ms,
+                ..HostConfig::default()
+            };
+            let mut rt = FakeRuntime::from_json_with(r8, config, journal);
             rt.host.hold_dispatch(hold_dispatch);
             rt.host.set_refuse_r8(true);
             let epoch = spec["runtime_epoch"].as_u64().unwrap();

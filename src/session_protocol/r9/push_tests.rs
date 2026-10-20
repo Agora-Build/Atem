@@ -460,24 +460,38 @@ fn the_push_state_is_bounded_and_a_repin_drops_it() {
         )
     };
     for n in 0..MAX_APPROVALS + 6 {
-        push.opened(key(n), wall + WAIT_MS, &plain, Some(signer()), wall);
+        push.opened(key(n), wall, wall + WAIT_MS, &plain, Some(signer()), wall);
     }
     assert_eq!(push.status(wall).pending, MAX_APPROVALS * 2);
     assert!(!push.tracks(&key(0).approval_id));
     assert!(push.tracks(&key(MAX_APPROVALS + 5).approval_id));
-    let mut sent = 0;
-    push.flush(&mut |_| {
-        sent += 1;
+    // A reconnect resends every tracked approval's hints, once each,
+    // each message under the cap.
+    push.link_down();
+    push.link_up(None, wall + 1);
+    let mut sent = Vec::new();
+    push.flush(&mut |text| {
+        sent.push(text);
         true
     });
-    assert!(sent <= super::push::MAX_RELAY_OUT, "{sent}");
+    let mut hints = 0;
+    for text in &sent {
+        assert!(
+            text.len() <= super::push::MAX_MESSAGE_BYTES,
+            "{}",
+            text.len()
+        );
+        let v: Value = serde_json::from_str(text).unwrap();
+        hints += v["hints"].as_array().unwrap().len();
+    }
+    assert_eq!(hints, MAX_APPROVALS * 2);
     push.reset();
     assert_eq!(push.status(wall).pending, 0);
     // Opened within 15 s of its expiry: no hint at all.
-    push.opened(key(1), wall + 15_000, &plain, Some(signer()), wall);
+    push.opened(key(1), wall, wall + 15_000, &plain, Some(signer()), wall);
     assert_eq!(push.status(wall).pending, 0);
     // An approval forgotten 300 s after its expiry.
-    push.opened(key(2), wall + WAIT_MS, &plain, Some(signer()), wall);
+    push.opened(key(2), wall, wall + WAIT_MS, &plain, Some(signer()), wall);
     push.tick(None, wall + WAIT_MS + 300_000);
     assert!(!push.tracks(&key(2).approval_id));
     assert_eq!(push.status(wall).pending, 0);
@@ -509,4 +523,79 @@ fn only_native_members_with_control_at_the_head_get_hints() {
         .map(|h| recipient(h).to_string())
         .collect();
     assert_eq!(devices, [MAC, "dev-phone"]);
+}
+
+/// A batch of hints over `MAX_MESSAGE_BYTES` goes as several `push_hint`
+/// messages, each under it, every hint once and in order; a small one as
+/// is.
+#[test]
+fn an_oversize_push_hint_is_split_by_bytes() {
+    use super::push::{MAX_MESSAGE_BYTES, split};
+    let hints: Vec<Value> = (0..700)
+        .map(|i| json!({"body": {"n": i}, "sig": "x".repeat(1_000)}))
+        .collect();
+    let message = json!({"type": "relay", "op": "push_hint", "hints": hints});
+    assert!(message.to_string().len() > 2 * MAX_MESSAGE_BYTES);
+    let parts = split(message);
+    assert!(parts.len() >= 3, "{}", parts.len());
+    let mut n = 0;
+    for p in &parts {
+        assert!(p.len() <= MAX_MESSAGE_BYTES, "{}", p.len());
+        let v: Value = serde_json::from_str(p).unwrap();
+        assert_eq!(
+            (v["type"].as_str(), v["op"].as_str()),
+            (Some("relay"), Some("push_hint"))
+        );
+        for h in v["hints"].as_array().unwrap() {
+            assert_eq!(h["body"]["n"], n);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 700);
+    let small = json!({"type": "relay", "op": "push_hint", "hints": [{"a": 1}]});
+    assert_eq!(split(small.clone()), vec![small.to_string()]);
+}
+
+/// §R9.9/§R9.6: a device removed while its open hint isn't acknowledged
+/// never gets it again: the next resend and a reconnect carry the Mac's
+/// only; the resolved hint still goes.
+#[test]
+fn a_device_removed_mid_approval_gets_no_more_hints() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect(
+        "mac",
+        atem_client::connect::Identity::native(MAC, r9log::auth(MAC)),
+    );
+    let ap = open(&mut rig, SID, PGEN);
+    let first = rig.relay_out();
+    assert_eq!(hints(&rig, &first[0]).len(), 2);
+    let removal = rig.log.remove("dev-phone");
+    let mono = rig.now.host.mono_ms;
+    let entry = SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+    let (_, frame) = rig.attached("mac").send_membership(&[entry], mono).unwrap();
+    rig.send_frame_raw("mac", &frame);
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 1);
+    rig.advance(10_000);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0]["hints"],
+        json!([first[0]["hints"][0]]),
+        "the Mac's only"
+    );
+    rig.link_down();
+    rig.link_up();
+    let out = rig.relay_out();
+    let devices: Vec<String> = hints(&rig, &out[0])
+        .iter()
+        .map(|h| recipient(h).to_string())
+        .collect();
+    assert_eq!(devices, [MAC]);
+    close(&mut rig, &ap, r8::ApprovalCloseReason::AnsweredTerminal);
+    let out = rig.relay_out();
+    assert!(matches!(
+        hints(&rig, &out[0])[0].state(),
+        HintState::Resolved { .. }
+    ));
 }

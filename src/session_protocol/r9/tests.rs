@@ -131,9 +131,15 @@ impl Rig {
             "clients": [],
         });
         let file_journal = FileJournal::open(&journal).unwrap();
-        let mut rt = FakeRuntime::from_json_with(setup, HostConfig::default(), file_journal);
-        rt.host.set_refuse_r8(true);
         let now = now_at(r9log::host_now().wall_ms, 1_000);
+        // The session host's wall clock is the host clock, as in the
+        // runtime (one clock for an approval's `created_at`).
+        let config = HostConfig {
+            wall_offset_ms: now.host.wall_ms - now.mono,
+            ..HostConfig::default()
+        };
+        let mut rt = FakeRuntime::from_json_with(setup, config, file_journal);
+        rt.host.set_refuse_r8(true);
         rt.set_now(now.mono);
         let mut fences = HostFences::new(&mut rt.host);
         let opened = MembershipHost::open(&profile.pairing, &journal, 1, &now.host, &mut fences)
