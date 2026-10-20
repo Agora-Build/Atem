@@ -3,7 +3,11 @@ name: atem-client-bindings
 # atem-client's bindings (crates/atem-client-ffi): the shared r9 vectors
 # through Kotlin (UniFFI + JNA), WASM (Node) and Swift, the binding end-to-end
 # test (a Kotlin phone and a Node/WASM browser against a test host over
-# loopback TCP), and a dry run of the Apple package.
+# loopback TCP), and the production packages for Astation (no test
+# features), uploaded as workflow artifacts, each with its SHA-256 sums and
+# source pin: the SwiftPM package with its xcframework, the WASM package and
+# the Kotlin/JVM bindings (designs/protocol/atem-client-bindings.md §7).
+# Nothing is published to a registry; no secret is used.
 
 on:
   push:
@@ -15,6 +19,9 @@ on:
       - "designs/protocol/fixtures/**"
       - "scripts/check-atem-client-bindings.sh"
       - "scripts/package-atem-client-apple.sh"
+      - "scripts/package-atem-client-bindings.sh"
+      - "scripts/check-atem-client-packages.sh"
+      - "scripts/atem-client-source-pin.sh"
       - ".github/workflows/atem-client-bindings.yml"
   pull_request:
     paths:
@@ -24,6 +31,9 @@ on:
       - "designs/protocol/fixtures/**"
       - "scripts/check-atem-client-bindings.sh"
       - "scripts/package-atem-client-apple.sh"
+      - "scripts/package-atem-client-bindings.sh"
+      - "scripts/check-atem-client-packages.sh"
+      - "scripts/atem-client-source-pin.sh"
       - ".github/workflows/atem-client-bindings.yml"
   workflow_dispatch:
 
@@ -93,6 +103,43 @@ jobs:
           WASM_BINDGEN="$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen" \
           ./scripts/check-atem-client-bindings.sh kotlin wasm e2e
 
+      - name: Package version
+        run: |
+          set -euo pipefail
+          CRATE=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Production packages (WASM, Kotlin/JVM; no test features)
+        run: |
+          set -euo pipefail
+          export WASM_BINDGEN="$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"
+          export KOTLINC="$RUNNER_TEMP/kotlin/kotlinc/bin/kotlinc" JNA_JAR="$RUNNER_TEMP/jna/jna.jar"
+          ./scripts/package-atem-client-bindings.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-wasm" wasm
+          ./scripts/package-atem-client-bindings.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-kotlin" kotlin
+
+      - name: Check the packages as Astation does (sums, pin, exports, a call each)
+        run: |
+          set -euo pipefail
+          export JNA_JAR="$RUNNER_TEMP/jna/jna.jar" JAVA="$JAVA_HOME/bin/java" JAVAC="$JAVA_HOME/bin/javac"
+          export KOTLIN_STDLIB="$RUNNER_TEMP/kotlin/kotlinc/lib/kotlin-stdlib.jar"
+          ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-wasm"
+          ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-kotlin"
+
+      - name: Upload the WASM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-wasm-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-wasm/
+          if-no-files-found: error
+
+      - name: Upload the Kotlin/JVM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-kotlin-jvm-linux-x86-64-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-kotlin/
+          if-no-files-found: error
+
   macos:
     name: Swift conformance, Apple package (macOS)
     runs-on: macos-latest
@@ -105,10 +152,35 @@ jobs:
       - name: Swift conformance (CryptoKit provider through the foreign trait)
         run: ./scripts/check-atem-client-bindings.sh swift
 
-      - name: Package dry run (xcframework + SwiftPM, no test features)
+      - name: Package version
         run: |
-          ./scripts/package-atem-client-apple.sh dev target/atem-client-package
-          test -s target/atem-client-package/atem-client-dev-apple-swiftpm.zip
-          (cd target/atem-client-package && shasum -a 256 -c atem-client-dev-SHA256SUMS.txt)
-          # The shipped package builds without the test features.
-          (cd target/atem-client-package/AtemClient && swift build)
+          set -euo pipefail
+          CRATE=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Production package (xcframework + SwiftPM, no test features)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/pkg-apple"
+          ./scripts/package-atem-client-apple.sh "$ATEM_CLIENT_VERSION" "$OUT"
+          test -s "$OUT/atem-client-$ATEM_CLIENT_VERSION-apple-swiftpm.zip"
+          (cd "$OUT" && shasum -a 256 -c "atem-client-$ATEM_CLIENT_VERSION-SHA256SUMS.txt")
+          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert len(p["commit"]) == 40 and p["crates"]["uniffi"], p' \
+            "$OUT/atem-client-$ATEM_CLIENT_VERSION-SOURCE.json"
+          # The shipped package builds without the test features, and
+          # carries no test-only or host-role export.
+          (cd "$OUT/AtemClient" && swift build)
+          if grep -qE 'SoftwareKeyStore|signSeen|admitCarrier|AdmissionInfo' "$OUT/AtemClient/Sources/AtemClient/atem_client_ffi.swift"; then
+            echo "a test-only or host-role export is in the package" >&2
+            exit 1
+          fi
+          # Only what Astation downloads goes up (not the unzipped package).
+          rm -rf "$OUT/AtemClient"
+
+      - name: Upload the SwiftPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-apple-swiftpm-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-apple/
+          if-no-files-found: error

@@ -475,6 +475,51 @@ conformance builds add `software-keys,test-vectors,host`.
   --no-default-features --features wasm`; `wasm-bindgen --target web` (or
   `nodejs`, `bundler`) with wasm-bindgen-cli 0.2.101 exactly.
 
+### Getting the packages (CI artifacts)
+
+Every run of `.github/workflows/atem-client-bindings.yml` (pushes to main,
+pull requests touching the crates, fixtures or these scripts, and manual
+runs) uploads the production packages as workflow artifacts. They are
+built with the default features only (`wasm` alone for JS): no
+`software-keys`, `test-vectors` or `host` code is in them. Nothing is
+published to a registry. `<version>` is the crate version and the commit's
+first 12 hex digits (`0.1.0-9bb4a932183e`).
+
+| artifact | built on | files |
+|---|---|---|
+| `atem-client-apple-swiftpm-<version>` | macos-latest (`scripts/package-atem-client-apple.sh`) | `atem-client-<version>-apple-swiftpm.zip` (the SwiftPM package `AtemClient` with `atem_client_ffiFFI.xcframework`), `atem-client-<version>-atem_client_ffiFFI.h`, `-SOURCE.json`, `-SHA256SUMS.txt` |
+| `atem-client-wasm-<version>` | ubuntu-latest (`scripts/package-atem-client-bindings.sh … wasm`) | `atem-client-<version>-wasm.tar.gz` (`atem-client-wasm/{web,nodejs,bundler}/`: `atem_client_ffi.js`, `atem_client_ffi_bg.wasm`, `.d.ts`), `-SOURCE.json`, `-SHA256SUMS.txt` |
+| `atem-client-kotlin-jvm-linux-x86-64-<version>` | ubuntu-latest (`… kotlin`) | `atem-client-<version>-kotlin-jvm-linux-x86-64.tar.gz` (`src/uniffi/atem_client_ffi/atem_client_ffi.kt`, `linux-x86-64/libatem_client_ffi.so`, `atem-client-ffi-<version>.jar`: the compiled bindings with the library inside, for JNA on a Linux JVM), `-SOURCE.json`, `-SHA256SUMS.txt` |
+
+Android's per-ABI `.so` files are not built by CI yet: build them as
+above, with the Kotlin from the JVM package (the same generated source).
+
+`atem-client-<version>-SOURCE.json` is the source pin: `commit` (full SHA)
+and `tree_dirty`, `crates` (`atem-client`, `atem-client-ffi`, and
+`uniffi`, `wasm-bindgen` from `Cargo.lock`), `features`, and `toolchain`
+(`rustc`, `cargo`, and per package `wasm-bindgen-cli`, `kotlinc`, `jna`,
+`xcodebuild`, `swift`).
+
+To take one (`gh` with read access to the repository; artifacts expire
+after GitHub's retention, 90 days):
+
+```sh
+gh run list -R Agora-Build/Atem -w atem-client-bindings -b <branch> -L 5   # pick the run of the commit you want
+gh run download <run-id> -R Agora-Build/Atem -n atem-client-wasm-<version> -D atem-client-wasm
+cd atem-client-wasm
+shasum -a 256 -c atem-client-<version>-SHA256SUMS.txt        # every file: OK
+python3 -c 'import json; print(json.load(open("atem-client-<version>-SOURCE.json"))["commit"])'
+```
+
+Then check that `commit` is the commit you meant (the PR's head, or the
+pinned commit on #80/#81) and that `tree_dirty` is `false`; only then
+unpack (`unzip` / `tar xzf`) and use it. A mismatching sum or commit means
+the download is not the build you asked for: don't use it.
+`scripts/check-atem-client-packages.sh <version> <dir>` is what CI runs on
+the Linux packages (sums, pin, no test-only or host-role export, and one
+call through the Node build and the JVM jar); it can be run on a download
+the same way.
+
 ## 8. Tests
 
 `scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e]`
@@ -496,5 +541,8 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   the other session requests, a browser grant, push hints (verified,
   opened, seen), a membership entry carried on the channel, the grant's
   revocation and the browser's fence. The host is built from atem-client's
-  responder role (`atem-client/tests/support/host.rs`); the real runtime
-  host is Task 7.
+  responder role (`atem-client/tests/support/host.rs`). The real runtime
+  host runs the shared r9 host fixtures in
+  `src/session_protocol/membership/fixtures_tests.rs` (real engine, store
+  and session host) and `tests/r9_*_binary.rs` (the `atem runtime`
+  process).
