@@ -106,7 +106,8 @@ struct Rig {
 impl Rig {
     /// A verified pairing as `HOST` and its device list: the Mac (genesis,
     /// control and manage), this host, a phone (control) and a bot
-    /// (`prompt` and `view`: no `approval`). `held`: a recorded device-list
+    /// (`prompt` and `view`: no `approval`) and an approver service
+    /// (`approval` and `view`). `held`: a recorded device-list
     /// write fault (the start is held, §R9.3). `host_clock`: the runtime
     /// reads the test's host clock.
     fn new(held: bool, host_clock: bool) -> Rig {
@@ -121,6 +122,13 @@ impl Rig {
             &[HOST],
             None,
             &["prompt", "view"],
+            r9log::host_now().wall_ms + 3_600_000,
+        );
+        log.add_service(
+            "svc-appr",
+            &[HOST],
+            None,
+            &["approval", "view"],
             r9log::host_now().wall_ms + 3_600_000,
         );
         write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
@@ -311,6 +319,9 @@ fn data_of(e: &CEvent) -> Option<Value> {
             serde_json::from_slice::<Value>(&e.to_bytes()).ok()?["data"].clone()
         }
         CEvent::Seen { re, .. } => json!({"op": "seen", "re": re}),
+        CEvent::MembershipHead { re, head, .. } => {
+            json!({"op": "membership_head", "re": re, "head": {"seq": head.seq}})
+        }
         _ => return None,
     };
     v["__type"] = json!("session");
@@ -393,7 +404,13 @@ impl Dev {
 
 /// The phone and the Mac (and the bot) connected, the agent's tool call
 /// asked: the approval id the Mac saw, and the first `push_hint`.
-fn approval(rig: &Rig, router: &mut Router, sid: &str, fake: &Path) -> (Dev, Dev, String, Value) {
+/// (Also the Mac's `approval_request`.)
+fn approval(
+    rig: &Rig,
+    router: &mut Router,
+    sid: &str,
+    fake: &Path,
+) -> (Dev, Dev, String, Value, Value) {
     let log = &rig.log;
     let mut m = Dev::connect(router, "mac", "direct", log, &mac());
     next_init();
@@ -405,7 +422,7 @@ fn approval(rig: &Rig, router: &mut Router, sid: &str, fake: &Path) -> (Dev, Dev
     let ap = request["approval_id"].as_str().unwrap().to_string();
     p.wait(router, |v| v["op"] == "approval_request");
     let hint = expect_relay(router, WAIT);
-    (m, p, ap, hint)
+    (m, p, ap, hint, request)
 }
 
 /// §R9.9: an approval opens and one `push_hint` reaches the relay over
@@ -422,8 +439,7 @@ fn an_approval_reaches_the_relay_sealed_for_the_phone_and_the_mac() {
     let (sid, fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
     next_init();
-    let before = r9log::host_now().wall_ms;
-    let (_m, _p, ap, message) = {
+    let (_m, _p, ap, message, request) = {
         let log = &rig.log;
         let mut bt = Dev::connect(&mut router, "bot", "relay", log, &bot());
         next_init();
@@ -431,7 +447,6 @@ fn an_approval_reaches_the_relay_sealed_for_the_phone_and_the_mac() {
         bt.list(&mut router, &sid);
         r
     };
-    let after = r9log::host_now().wall_ms;
     let text = message.to_string();
     assert!(!text.contains("npm test"), "clear text on the wire: {text}");
     assert!(!text.contains("push_approval"));
@@ -455,7 +470,8 @@ fn an_approval_reaches_the_relay_sealed_for_the_phone_and_the_mac() {
             (k.session_id.as_str(), k.approval_id.as_str()),
             (sid.as_str(), ap.as_str())
         );
-        assert!(before <= h.created_at() && h.created_at() <= after);
+        // One clock: the card's `created_at` is the hint's.
+        assert_eq!(json!(h.created_at()), request["created_at"]);
         assert_eq!(h.expires_at() - h.created_at(), 600_000);
     }
     let keys = &rig.log.keys;
@@ -473,11 +489,11 @@ fn an_approval_reaches_the_relay_sealed_for_the_phone_and_the_mac() {
         r[0].state(),
         HintState::Resolved { reason, .. } if reason == "answered_terminal"
     ));
-    assert!(
-        rig.runtime_log().contains("sealed hint(s)"),
-        "{}",
-        rig.runtime_log()
-    );
+    let log = rig.runtime_log();
+    assert!(log.contains("sealed hint(s)"), "{log}");
+    // Nothing of the tool call is logged in clear.
+    assert!(!log.contains("npm test"), "{log}");
+    assert!(!log.contains(&phone_plain.summary), "{log}");
 }
 
 /// §R9.9 reliable delivery: a lost `push_ack` means the same bytes again
@@ -489,7 +505,7 @@ fn a_lost_ack_is_resent_and_a_reconnect_resends() {
     let rig = Rig::new(false, false);
     let (sid, fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
-    let (_m, _p, _ap, first) = approval(&rig, &mut router, &sid, &fake);
+    let (_m, _p, _ap, first, _) = approval(&rig, &mut router, &sid, &fake);
     let at = Instant::now();
     // The ack is lost: the same bytes after 10 s.
     let again = expect_relay(&mut router, Duration::from_secs(15));
@@ -531,7 +547,7 @@ fn a_seen_from_the_phone_is_delivered_once_and_deduplicated() {
     let rig = Rig::new(false, false);
     let (sid, fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
-    let (_m, mut p, ap, first) = approval(&rig, &mut router, &sid, &fake);
+    let (_m, mut p, ap, first, _) = approval(&rig, &mut router, &sid, &fake);
     let hs = rig.hints(&first);
     ack(&router, &hs.iter().map(Hint::identity).collect::<Vec<_>>());
     let reply = p.seen(&mut router, &sid, &ap);
@@ -562,7 +578,7 @@ fn a_seen_after_resolution_changes_nothing() {
     let rig = Rig::new(false, false);
     let (sid, fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
-    let (_m, mut p, ap, first) = approval(&rig, &mut router, &sid, &fake);
+    let (_m, mut p, ap, first, _) = approval(&rig, &mut router, &sid, &fake);
     let hs = rig.hints(&first);
     ack(&router, &hs.iter().map(Hint::identity).collect::<Vec<_>>());
     p.send(
@@ -639,7 +655,7 @@ fn a_late_approval_within_15_s_of_expiry_is_suppressed() {
     let rig = Rig::new(false, true);
     let (sid, fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
-    let (_m, mut p, ap, first) = approval(&rig, &mut router, &sid, &fake);
+    let (_m, mut p, ap, first, _) = approval(&rig, &mut router, &sid, &fake);
     let hs = rig.hints(&first);
     // 585 s after its creation: at the guard (600 s − 15 s), past the
     // 10 s resend.
@@ -667,6 +683,88 @@ fn a_late_approval_within_15_s_of_expiry_is_suppressed() {
     assert!(
         rig.runtime_log()
             .contains("no longer sent (within 15 s of its expiry)"),
+        "{}",
+        rig.runtime_log()
+    );
+    std::fs::write(fake.join("terminal-yes-1"), "").unwrap();
+    let resolved = expect_relay(&mut router, WAIT);
+    assert!(matches!(
+        rig.hints(&resolved)[0].state(),
+        HintState::Resolved { .. }
+    ));
+}
+
+/// §R9.9 (contract clarification): a service with the `approval` op sees
+/// the approval and may say it saw it — answered `seen` — but it is never
+/// a hint recipient, so no hint is sealed to it and its seen signs
+/// nothing.
+#[test]
+fn a_services_seen_is_answered_and_it_gets_no_hint() {
+    let rig = Rig::new(false, false);
+    let (sid, fake) = rig.agent();
+    let mut router = Router::new(&rig.astation);
+    let mut svc = Dev::connect(
+        &mut router,
+        "svc",
+        "relay",
+        &rig.log,
+        &Identity::service("svc-appr", auth("svc-appr")),
+    );
+    svc.list(&mut router, &sid);
+    next_init();
+    let (_m, _p, ap, first, _) = approval(&rig, &mut router, &sid, &fake);
+    svc.wait(&mut router, |v| v["op"] == "approval_request");
+    let hs = rig.hints(&first);
+    let devices: Vec<String> = hs
+        .iter()
+        .map(|h| match h.state() {
+            HintState::Open { device_id, .. } => device_id.clone(),
+            _ => panic!("an open hint"),
+        })
+        .collect();
+    assert_eq!(devices, [MAC, "dev-phone"], "no hint for a service");
+    ack(&router, &hs.iter().map(Hint::identity).collect::<Vec<_>>());
+    let reply = svc.seen(&mut router, &sid, &ap);
+    assert_eq!(reply["op"], "seen", "{reply}");
+    assert_eq!(
+        relay(&mut router, Duration::from_secs(12)),
+        None,
+        "a service's seen is never signed"
+    );
+}
+
+/// §R9.9/§R9.6: the Mac removes the phone while the phone's open hint is
+/// unacknowledged: the phone's sealed part is never sent again (the next
+/// resend and a reconnect carry the Mac's only); the resolved hint still
+/// goes.
+#[test]
+fn a_device_removed_mid_approval_gets_no_more_hints() {
+    let mut rig = Rig::new(false, false);
+    let (sid, fake) = rig.agent();
+    let mut router = Router::new(&rig.astation);
+    let (mut m, _p, _ap, first, _) = approval(&rig, &mut router, &sid, &fake);
+    assert_eq!(rig.hints(&first).len(), 2);
+    let removal = rig.log.remove("dev-phone");
+    let entry = SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+    let (_, frame) = m.a.send_membership(&[entry], client_ms()).unwrap();
+    router.frame(&m.h, &frame);
+    m.wait(&mut router, |v| {
+        v["op"] == "membership_head" && !v["re"].is_null()
+    });
+    let again = expect_relay(&mut router, Duration::from_secs(15));
+    assert_eq!(again["hints"], json!([first["hints"][0]]), "the Mac's only");
+    rig.astation.close(router.link);
+    drop(router);
+    let mut router = Router::new(&rig.astation);
+    let resent = expect_relay(&mut router, Duration::from_secs(15));
+    assert_eq!(
+        resent["hints"],
+        json!([first["hints"][0]]),
+        "the Mac's only"
+    );
+    assert!(
+        rig.runtime_log()
+            .contains("dev-phone is no longer a recipient; its hint is not sent again"),
         "{}",
         rig.runtime_log()
     );
