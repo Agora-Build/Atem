@@ -323,6 +323,7 @@ impl Dev {
             .clone()
     }
 
+    /// Terminal input under the lease `epoch` (each stream's first chunk).
     fn input(
         &mut self,
         router: &mut Router,
@@ -330,7 +331,6 @@ impl Dev {
         pg: &str,
         stream: &Value,
         epoch: u64,
-        seq: u64,
         bytes: &[u8],
     ) {
         use base64::Engine as _;
@@ -338,7 +338,7 @@ impl Dev {
         self.send(
             router,
             json!({"type": "terminal", "data": {"v": 1, "op": "input", "terminal_id": sid,
-                "generation": pg, "stream_id": stream, "sequence": seq, "bytes": b64,
+                "generation": pg, "stream_id": stream, "sequence": 0, "bytes": b64,
                 "binding": self.lease(sid, epoch)}}),
         );
     }
@@ -509,7 +509,7 @@ fn a_confirmed_takeover_moves_the_lease_between_devices_and_an_unrenewed_one_exp
     });
     assert_eq!(lost["reason"], "takeover", "{lost}");
 
-    m.input(&mut router, &sid, &pg, &m_stream, 1, 0, b"OLD-HOLDER\r");
+    m.input(&mut router, &sid, &pg, &m_stream, 1, b"OLD-HOLDER\r");
     let stale = m.wait(&mut router, |v| {
         v["__type"] == "terminal" && v["op"] == "error"
     });
@@ -517,7 +517,7 @@ fn a_confirmed_takeover_moves_the_lease_between_devices_and_an_unrenewed_one_exp
     m.list(&mut router, &sid);
 
     let p_stream = p.subscribe(&mut router, &sid, &pg);
-    p.input(&mut router, &sid, &pg, &p_stream, 2, 0, b"NEW-HOLDER\r");
+    p.input(&mut router, &sid, &pg, &p_stream, 2, b"NEW-HOLDER\r");
     p.wait(&mut router, |v| {
         v["__type"] == "terminal" && v["op"] == "written"
     });
@@ -661,7 +661,7 @@ fn a_removal_carried_by_one_device_fences_anothers_attachments_and_drops_its_que
     let stream = p1.subscribe(&mut router, &sid, &pg);
     // The phone types; the worker holds the write before its epoch check.
     std::fs::write(rig.faults.join("hold"), "").unwrap();
-    p1.input(&mut router, &sid, &pg, &stream, 1, 0, b"QUEUED-BYTES\r");
+    p1.input(&mut router, &sid, &pg, &stream, 1, b"QUEUED-BYTES\r");
     std::thread::sleep(Duration::from_millis(500));
 
     let removal = rig.log.remove("dev-phone");
@@ -752,7 +752,6 @@ fn the_macs_link_drops_and_the_phone_goes_on_over_the_relay() {
         &pg,
         &stream,
         lease["binding"]["lease_epoch"].as_u64().unwrap(),
-        0,
         b"FROM-PHONE\r",
     );
     p.wait(&mut router, |v| {

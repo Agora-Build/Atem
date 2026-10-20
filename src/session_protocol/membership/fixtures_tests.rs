@@ -1620,7 +1620,7 @@ impl Runner {
         chan.handle = handle.clone();
         chan.raw.clear();
         chan.closed = None;
-        let previous = std::mem::replace(&mut chan.channel, None);
+        let previous = chan.channel.take();
         host.chans.insert(client.clone(), chan);
         host.engine.reset_init_limiter();
         host.envelope_in(&envelope::open(&handle, Transport::Relay));
