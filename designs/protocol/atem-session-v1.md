@@ -18,6 +18,14 @@ scoped services, browser grants) over the end-to-end channel `atem-ch1`,
 authorized by a signed membership log pinned at pairing; its fixtures
 (`fixtures/r9-*.json`, `requires: "r9"`) are reported NOT RUN. r8 stays
 authoritative until r9 ships on both sides.
+r9 note (2026-10-20), a clarification of signed-off r8 text, not a
+change: §3's replaced-attachment sentence read "its leases end (none is
+carried over)", which a reader could take to mean a dropped or
+re-authenticated attachment's lease ends at once too, against §5 (left to
+expire). It now says a replaced attachment's leases end at once while after
+a drop or re-authentication they expire (§5), which is what r8 Atem does;
+no wire, fixture or behavior changed. Agreed with Astation (PR #80,
+comment 6291951066).
 r8 (2026-10-18) changelog: implemented in Atem (`src/session_protocol/`,
 `src/chat/history.rs`, `src/runtime/host_bridge.rs`); welcome advertises all
 nine features. The implementation corrected the appendix where it was
@@ -209,7 +217,8 @@ Every request that targets a session carries one **binding** object:
   replaces it (r7.1): the host fences the old attachment as a transport drop
   or re-authentication would, except that its leases end at once (after a
   drop or re-authentication a lease is left to expire, §5; either way none
-  is carried over) — its
+  is carried over; *clarification of the signed-off r8 text, see the r9
+  note in the header*) — its
   subscriptions, streams and chat conversations close, its pending replies
   are dropped — and answers `welcome` on a new attachment over the same
   authenticated transport: new `attachment_gen` and `controller_session`,
