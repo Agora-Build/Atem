@@ -1843,6 +1843,59 @@ fn the_link_is_fenced_and_dropped_at_its_authorization_deadline() {
     });
 }
 
+/// Review I1 of Task 9a: an r8 host (no device list) whose link was never
+/// welcomed (no `hello` yet) still loses it at the 24 h authorization
+/// deadline, so the reconnect gets a fresh attachment (never a link whose
+/// every `hello` is `paused`).
+#[test]
+fn an_r8_link_never_welcomed_is_still_dropped_at_its_deadline() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        // The link authenticated; Astation never says hello.
+        rt.peer.drain(Duration::from_millis(300)).await;
+        rt.clock.skip(super::LINK_AUTHORIZATION_MS + 1);
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("an unwelcomed r8 link stayed open past its authorization");
+        rt.shutdown().await;
+    });
+}
+
+/// §R9, §R9.7a: an r9 host's link carries no session authority (r8 is
+/// refused, its attachment never welcomed); 24 h on either clock doesn't
+/// drop it (each r9 channel has its own lifetime).
+#[test]
+fn an_r9_hosts_link_outlives_the_r8_authorization() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+        log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.dir.path().join("profile")).pairing;
+        let journal = rt.dir.path().join("state").join("journal");
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: TRUST_GEN,
+        };
+        MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+        let peer = &mut rt.peer;
+        let id = peer.request("hello", json!({"revision": 8}));
+        let refused = peer.reply(&id).await;
+        assert_eq!(refused["revision"], 9, "the list is in force: {refused}");
+        rt.clock.skip(super::LINK_AUTHORIZATION_MS + 1);
+        rt.clock.skip_wall(super::LINK_AUTHORIZATION_MS + 1);
+        let closed = tokio::time::timeout(Duration::from_millis(1_500), async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_err(), "the r9 host dropped its link at 24 h");
+        rt.shutdown().await;
+    });
+}
+
 /// `atem unpair` took effect without telling the runtime (no `reload`
 /// delivered): the broker notices the changed pairing on its own and drops
 /// the link with its attachment.

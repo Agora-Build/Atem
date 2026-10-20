@@ -151,8 +151,8 @@ mod imp {
         Some((wall, mono, boot))
     }
 
-    pub fn hold_dispatch() -> bool {
-        faults_dir().is_some_and(|dir| dir.join("hold_dispatch").exists())
+    pub fn hold_dispatch() -> Option<bool> {
+        faults_dir().map(|dir| dir.join("hold_dispatch").exists())
     }
 
     pub fn no_init_limit() -> bool {
@@ -274,13 +274,14 @@ pub fn membership_hooks() -> bool {
     false
 }
 
-/// Accepted work stays queued (`<pty faults>/hold_dispatch`).
+/// Whether accepted work stays queued (`<pty faults>/hold_dispatch`);
+/// `None` when the PTY fault hooks aren't set (the host's own hold stays).
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
-pub fn hold_dispatch() -> bool {
+pub fn hold_dispatch() -> Option<bool> {
     #[cfg(debug_assertions)]
     return imp::hold_dispatch();
     #[cfg(not(debug_assertions))]
-    false
+    None
 }
 
 /// `init`s aren't rate-limited per link (`ATEM_TEST_NO_INIT_LIMIT`).

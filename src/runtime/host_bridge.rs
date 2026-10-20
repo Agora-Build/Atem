@@ -1256,13 +1256,16 @@ impl HostBridge {
         self.host
             .set_wall_offset(host_now().wall_ms.saturating_sub(self.clock.now()));
         #[cfg(debug_assertions)]
-        self.host.hold_dispatch(super::test_hooks::hold_dispatch());
-        // Only a welcomed attachment's authorization ends the link: on an
-        // r9 host (r8 refused) the link's attachment is never welcomed, and
-        // dropping the link would close every r9 channel on it daily.
+        if let Some(hold) = super::test_hooks::hold_dispatch() {
+            self.host.hold_dispatch(hold);
+        }
+        // An r9 host (r8 refused, §R9) never welcomes the link's attachment
+        // and its link carries no session authority: its end would only
+        // close every r9 channel on the link daily (each channel has its
+        // own lifetime, §R9.7a). An r8 host's link ends as before.
+        let r8 = !self.host.refuses_r8();
         if self.link.as_ref().is_some_and(|l| {
-            l.welcomed_at.is_some()
-                && (self.clock.now() >= l.deadline || self.clock.wall() >= l.wall_deadline)
+            r8 && (self.clock.now() >= l.deadline || self.clock.wall() >= l.wall_deadline)
         }) {
             // Its authorization ended: the attachment is fenced and the link
             // dropped, so the normal reconnect authenticates it again.
