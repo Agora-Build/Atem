@@ -4106,3 +4106,78 @@ fn a_pinned_host_sends_no_clear_push_even_for_an_earlier_approval() {
         rt.shutdown().await;
     });
 }
+
+/// M-b (66ea556): a pin seen half written (its key and applied head, the
+/// list not yet) is opened once it is finished, even when the list lands
+/// right after the reopen read the files: the stamp kept is the one read
+/// before opening, so the next pass sees the change. With the stamp read
+/// again after the open, the list landing in that window would never be
+/// opened.
+#[test]
+fn a_pin_finished_right_after_a_reopen_is_opened_on_the_next_pass() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        rt.peer.hello().await;
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.dir.path().join("profile")).pairing;
+        let journal = rt.dir.path().join("state").join("journal");
+        // The whole pin, written elsewhere first.
+        let staging = rt.dir.path().join("staging");
+        let staged = crate::paths::ProfilePaths::in_dir(&staging).pairing;
+        let staged_journal = staging.join("journal");
+        crate::session_protocol::membership::store::private_dir(&staged_journal).unwrap();
+        let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+        log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: TRUST_GEN,
+        };
+        MembershipHost::pin(
+            &staged,
+            &staged_journal,
+            &pin,
+            &log.log,
+            &secret("bridge host"),
+        )
+        .unwrap();
+        // The list lands right after the reopen that saw the rest.
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let (list_from, list_to, flag) = (
+            staged.membership.clone(),
+            pairing.membership.clone(),
+            fired.clone(),
+        );
+        super::AFTER_REOPEN.lock().unwrap().push((
+            pairing.dir().to_path_buf(),
+            Box::new(move || {
+                std::fs::copy(&list_from, &list_to).unwrap();
+                flag.store(true, Ordering::SeqCst);
+            }),
+        ));
+        // The key and the applied head first, as the pin writes them.
+        crate::session_protocol::membership::store::private_dir(pairing.dir()).unwrap();
+        std::fs::copy(&staged.host_channel_key, &pairing.host_channel_key).unwrap();
+        std::fs::copy(
+            staged_journal.join("membership_applied"),
+            journal.join("membership_applied"),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = status(&mut client).await.device_list.map(|d| d.state);
+            if fired.load(Ordering::SeqCst) && state.as_deref() == Some("open") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the finished pin was never opened (hook fired: {}, state {state:?})",
+                fired.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        rt.shutdown().await;
+    });
+}

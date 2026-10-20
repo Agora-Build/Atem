@@ -967,13 +967,15 @@ impl HostBridge {
         }
         // A re-authentication (or a new generation) on a socket that is
         // still up: the router learns each channel ended (§R9.7a 6), the
-        // closes queued in the engine and flushed on that socket. A socket
-        // that is gone takes everything with it.
+        // closes handed to that socket now, before anything of the new
+        // generation; what it can't take now is dropped and counted (N9).
+        // A socket that is gone takes everything with it.
         let before = self.r9_attachments();
         let live = !cx.client.is_ws_closed();
+        let client = cx.client;
         let mut effects = self.r9_call(|r9, parts| {
             if live {
-                r9.restart(parts)
+                r9.end_generation(parts, &mut |text| client.try_send_channel(text))
             } else {
                 r9.link_down(parts)
             }
@@ -1061,6 +1063,8 @@ impl HostBridge {
             let epoch = self.host.context().runtime_epoch;
             let mut fences = HostFences::new(&mut self.host);
             let opened = MembershipHost::open(&pairing, &self.dir, epoch, &host_now(), &mut fences);
+            #[cfg(test)]
+            after_reopen(&pairing);
             let effects = fences.effects;
             match opened {
                 Ok(Some((m, _))) => {
@@ -3452,6 +3456,30 @@ fn close_text(reason: CloseReason) -> &'static str {
         CloseReason::Switched => super::broker::CHAT_SWITCHED,
         CloseReason::Restarted => RESTARTED,
         CloseReason::Evicted => "a newer conversation replaced this one",
+    }
+}
+
+/// Tests only: something to run right after a device-list reopen read the
+/// files (keyed by the pairing directory, so parallel tests never fire
+/// each other's), e.g. a pin's last file landing in that window.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(super) static AFTER_REOPEN: std::sync::Mutex<
+    Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn after_reopen(pairing: &crate::paths::PairingPaths) {
+    let dir = pairing.dir().to_path_buf();
+    let hook = {
+        let mut hooks = AFTER_REOPEN.lock().unwrap();
+        hooks
+            .iter()
+            .position(|(d, _)| *d == dir)
+            .map(|i| hooks.remove(i).1)
+    };
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

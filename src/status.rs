@@ -795,9 +795,28 @@ pub(crate) mod tests {
         .unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
         assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        // An unfinished write after a plain crash: replayed at the next
+        // start, no managing device asked for (Astation's review of
+        // 66ea556).
+        for file in [&src.paths.pairing.carriage, &src.paths.pairing.intent] {
+            std::fs::write(file, b"{}").unwrap();
+            let line = report(dir.path()).device_list.unwrap().value;
+            assert!(
+                line.starts_with(
+                    "pinned at seq 3; an unfinished device-list write is replayed at the next start"
+                ),
+                "{line}"
+            );
+            assert!(!line.starts_with("held"), "{line}");
+            std::fs::remove_file(file).unwrap();
+        }
+        // A recorded fault holds for a managing device, with or without an
+        // unfinished write.
+        std::fs::write(&src.paths.pairing.carriage, b"{}").unwrap();
         std::fs::write(&src.paths.pairing.fault, b"{}").unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
         assert!(line.starts_with("held ("), "{line}");
+        assert!(line.contains("managing device"), "{line}");
         std::fs::write(&src.paths.pairing.membership, b"{}").unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
         assert!(line.starts_with("failed ("), "{line}");

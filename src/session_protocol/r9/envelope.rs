@@ -142,18 +142,24 @@ fn peek_handle(text: &str) -> Option<String> {
 const OVERSIZE_PEEK: usize = 4096;
 
 /// What the first bytes of an oversize message (over
-/// [`MAX_ENVELOPE_BYTES`], never parsed) say.
+/// [`MAX_ENVELOPE_BYTES`], never parsed) say. Every outcome is decided
+/// from the first 4 KiB alone: nothing over the bound is ever parsed in
+/// full, whatever its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Oversize {
-    /// Its top-level `type` isn't `channel` (or isn't in its first bytes):
-    /// not an envelope as far as can be told.
-    NotAnEnvelope,
+    /// Its top-level `type` (a plain string within the first bytes) is
+    /// this, not `channel`.
+    Other(String),
     /// A channel envelope whose top-level `channel` (before any `frame`)
     /// names this handle: closed `too_large`.
     Channel(String),
     /// A channel envelope whose handle can't be told cheaply: dropped and
     /// logged, no channel closed.
     Unaddressed,
+    /// Its type can't be told from the first bytes (not an object, an
+    /// escaped key or value, or a nested value running past the first
+    /// bytes before `type`): dropped and logged.
+    Unreadable,
 }
 
 /// The top-level string members of a JSON object's first bytes, in order,
@@ -225,7 +231,10 @@ fn top_level_strings(head: &[u8]) -> Option<Vec<(String, String)>> {
                 while i < head.len() {
                     match head[i] {
                         b'"' => {
-                            string(&mut i)?;
+                            if string(&mut i).is_none() {
+                                // The head ends inside it: what was read stands.
+                                return Some(out);
+                            }
                             continue;
                         }
                         b'{' | b'[' => depth += 1,
@@ -261,11 +270,14 @@ fn top_level_strings(head: &[u8]) -> Option<Vec<(String, String)>> {
 pub fn oversize_envelope(text: &str) -> Oversize {
     let head = &text.as_bytes()[..text.len().min(OVERSIZE_PEEK)];
     let Some(members) = top_level_strings(head) else {
-        return Oversize::NotAnEnvelope;
+        return Oversize::Unreadable;
     };
     let value = |k: &str| members.iter().find(|(key, _)| key == k).map(|(_, v)| v);
-    if value("type").map(String::as_str) != Some("channel") {
-        return Oversize::NotAnEnvelope;
+    match value("type").map(String::as_str) {
+        Some("channel") => {}
+        Some(other) => return Oversize::Other(other.to_string()),
+        // The head ran out (or reached `frame`) before a readable `type`.
+        None => return Oversize::Unreadable,
     }
     match value("channel").filter(|h| is_handle(h)) {
         Some(handle) => Oversize::Channel(handle.clone()),
@@ -518,14 +530,50 @@ mod tests {
             )),
             Oversize::Unaddressed
         );
-        // Not an envelope, or the type out of reach.
+        // Not an envelope: its type is read from the head only.
         assert_eq!(
             oversize_envelope(&big(r#"{"type":"session","data":{"x":""#)),
-            Oversize::NotAnEnvelope
+            Oversize::Other("session".into())
         );
+        // The type out of reach: never parsed further.
         assert_eq!(
             oversize_envelope(&big(r#"{"frame":{"ct":""#)),
-            Oversize::NotAnEnvelope
+            Oversize::Unreadable
+        );
+    }
+
+    /// N10: a message whose first 4 KiB end inside a nested value before
+    /// any `type` is unreadable (dropped and logged), never handed to a
+    /// parser that would read all of it; so are other heads that name no
+    /// readable type.
+    #[test]
+    fn an_oversize_head_ending_mid_value_is_unreadable() {
+        let pad = "A".repeat(MAX_ENVELOPE_BYTES);
+        let big = |head: &str| format!("{head}{pad}\"}}}}");
+        let nested = format!(r#"{{"x":{{"y":"{}"#, "z".repeat(OVERSIZE_PEEK));
+        assert_eq!(oversize_envelope(&big(&nested)), Oversize::Unreadable);
+        // A nested value over the head, then `type` past it.
+        let late_type = format!(
+            r#"{{"x":["{}"],"type":"channel","channel":"h1","#,
+            "z".repeat(OVERSIZE_PEEK)
+        );
+        assert_eq!(oversize_envelope(&big(&late_type)), Oversize::Unreadable);
+        assert_eq!(oversize_envelope(&big(r#"["#)), Oversize::Unreadable);
+        assert_eq!(
+            oversize_envelope(&big(r#"{"ty\u0070e":"channel","#)),
+            Oversize::Unreadable
+        );
+        assert_eq!(
+            oversize_envelope(&big(r#"{"type":"chan\u006eel","#)),
+            Oversize::Unreadable
+        );
+        // A long top-level string value before `type` runs past the head.
+        let long_value = format!(r#"{{"note":"{}"#, "n".repeat(OVERSIZE_PEEK));
+        assert_eq!(oversize_envelope(&big(&long_value)), Oversize::Unreadable);
+        // Within the head, a readable other type is named.
+        assert_eq!(
+            oversize_envelope(&big(r#"{"type":"terminal","data":{"bytes":""#)),
+            Oversize::Other("terminal".into())
         );
     }
 

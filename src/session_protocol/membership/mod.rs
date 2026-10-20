@@ -1942,7 +1942,10 @@ pub fn passive_status(
     let Some((m, _, _)) = parsed else {
         return Some((
             "failed",
-            format!("failed ({} is damaged); {REPAIR}", pairing.membership.display()),
+            format!(
+                "failed ({} is damaged); {REPAIR}",
+                pairing.membership.display()
+            ),
             Vec::new(),
         ));
     };
@@ -1962,21 +1965,27 @@ pub fn passive_status(
             pending,
         ));
     }
-    if store::present(&pairing.fault)
-        || store::present(&pairing.carriage)
-        || store::present(&pairing.intent)
-    {
+    // Only a recorded fault needs a managing device; an unfinished write
+    // left by a plain crash is replayed at the next start, which decides
+    // (§R9.3: replay and resume, unless it can't be reconciled).
+    if store::present(&pairing.fault) {
         return Some((
             "held",
-            "held (a device-list write fault or an unfinished write is recorded); remote access waits until a managing device connects to reconcile".into(),
+            "held (a device-list write fault is recorded); remote access waits until a managing device connects to reconcile".into(),
             pending,
         ));
     }
-    Some((
-        "open",
-        format!("pinned at seq {}", m.head().seq),
-        pending,
-    ))
+    if store::present(&pairing.carriage) || store::present(&pairing.intent) {
+        return Some((
+            "replay",
+            format!(
+                "pinned at seq {}; an unfinished device-list write is replayed at the next start (only one that can't be reconciled then waits for a managing device)",
+                m.head().seq
+            ),
+            pending,
+        ));
+    }
+    Some(("open", format!("pinned at seq {}", m.head().seq), pending))
 }
 
 /// The public half `host_channel_key` names (b64u), read without checks.

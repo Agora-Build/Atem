@@ -1208,6 +1208,66 @@ fn a_restart_closes_every_live_handle() {
     assert_eq!(rig.rt.host.welcomed_attachments(), 0);
 }
 
+/// N9: a new link generation on a live socket hands the old generation's
+/// closes to the socket first; what a backed-up writer doesn't take is
+/// dropped and counted, never sent on the new generation (a handle is
+/// scoped to its generation).
+#[test]
+fn closes_never_cross_a_link_generation() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("a", phone());
+    rig.advance(1000);
+    rig.connect("b", bot());
+    rig.stalled = true;
+    rig.envelope_in(&envelope::frame(
+        "ghost",
+        br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#,
+    ));
+    rig.closes.clear();
+    // The writer takes one envelope, then is backed up.
+    let mut sent = Vec::new();
+    rig.run(|e, p| {
+        let fx = e.end_generation(p, &mut |text| {
+            if sent.is_empty() {
+                sent.push(text);
+                true
+            } else {
+                false
+            }
+        });
+        ((), fx)
+    });
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("ghost") && sent[0].contains("unknown_channel"));
+    assert_eq!(rig.engine.queued_closes(), 0, "the rest was dropped");
+    assert_eq!(rig.rt.host.welcomed_attachments(), 0);
+    // The new generation: a client reuses handle "a"; nothing of the old
+    // one reaches it.
+    rig.stalled = false;
+    rig.link_up();
+    rig.connect("a", phone());
+    rig.pump();
+    assert!(
+        rig.closes.iter().all(|(h, _)| h != "a" && h != "b"),
+        "{:?}",
+        rig.closes
+    );
+    assert!(!rig.list("a").is_empty());
+    // An idle writer takes every close before the new generation.
+    rig.closes.clear();
+    let mut all = Vec::new();
+    rig.run(|e, p| {
+        let fx = e.end_generation(p, &mut |text| {
+            all.push(text);
+            true
+        });
+        ((), fx)
+    });
+    assert_eq!(all.len(), 1);
+    assert!(all[0].contains("\"a\"") && all[0].contains("closed"));
+}
+
 /// `approval_closed` reaches a scoped service only for an approval of a
 /// session in its scope (and only with the `approval` op).
 #[test]
@@ -1291,6 +1351,95 @@ fn opens_and_unknown_frames_flooding_with_output_blocked_stay_bounded() {
         rig.now.host.wall_ms += 1000;
     }
     assert_eq!(rig.engine.queued_closes(), 1024);
+}
+
+/// Astation's review of 66ea556: repeated restarts on a live socket with
+/// output blocked never grow the queue past a fixed ceiling. A restart's
+/// `close{closed}` holds its channel's slot until the link takes it, so
+/// opens are refused while 64 are pending; when the link takes again the
+/// refusals queued first go first, then every restarted handle's close,
+/// once each, in restart order.
+#[test]
+fn repeated_restarts_with_output_blocked_keep_a_fixed_ceiling() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let link = rig.link_gen;
+    rig.stalled = true;
+    let ghost = br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#;
+    // The refusal queue full (1024 at 16 a second).
+    for second in 0..64u64 {
+        for i in 0..16 {
+            rig.envelope_in(&envelope::frame(&format!("u-{second}-{i}"), ghost));
+        }
+        rig.now.mono += 1000;
+        rig.now.host.mono_ms += 1000;
+        rig.now.host.wall_ms += 1000;
+    }
+    assert_eq!(rig.engine.queued_closes(), 1024);
+    let widest = envelope::close(&"x".repeat(64), Some("unknown_channel")).len();
+    let mut restarted: Vec<String> = Vec::new();
+    for cycle in 0..12 {
+        for i in 0..16 {
+            rig.envelope_in(&envelope::open(&format!("c{cycle}-{i}"), Transport::Relay));
+        }
+        let live: Vec<String> = (0..16)
+            .map(|i| format!("c{cycle}-{i}"))
+            .filter(|h| rig.engine.chans.contains_key(h))
+            .collect();
+        restarted.extend(live);
+        rig.run(|e, p| {
+            let mut fx = e.restart(p);
+            fx.extend(e.link_up(link, p));
+            ((), fx)
+        });
+        let queued = rig.engine.queued_closes();
+        assert!(queued <= 1024 + 64, "cycle {cycle}: {queued} queued");
+        assert!(rig.engine.pending_lifecycle_closes() <= 64);
+        assert!(rig.engine.queued_close_bytes() <= (1024 + 64) * widest);
+    }
+    assert_eq!(
+        restarted.len(),
+        64,
+        "four cycles fill the slots, then opens wait"
+    );
+    assert_eq!(rig.engine.queued_closes(), 1024 + 64);
+    rig.closes.clear();
+    rig.stalled = false;
+    rig.pump();
+    let (refusals, lifecycle) = rig.closes.split_at(1024);
+    assert!(
+        refusals
+            .iter()
+            .all(|(h, r)| h.starts_with("u-") && r.as_deref() == Some("unknown_channel"))
+    );
+    let closed: Vec<String> = lifecycle
+        .iter()
+        .map(|(h, r)| {
+            assert_eq!(r.as_deref(), Some("closed"), "{h}");
+            h.clone()
+        })
+        .collect();
+    let mut want = restarted.clone();
+    want.sort_by_key(|h| {
+        let (c, i) = h[1..].split_once('-').unwrap();
+        (c.parse::<u32>().unwrap(), i.parse::<u32>().unwrap())
+    });
+    let mut got = closed.clone();
+    got.sort_by_key(|h| {
+        let (c, i) = h[1..].split_once('-').unwrap();
+        (c.parse::<u32>().unwrap(), i.parse::<u32>().unwrap())
+    });
+    assert_eq!(got, want, "every restarted handle closed once");
+    // In restart order: a cycle's closes before the next cycle's.
+    let cycles: Vec<u32> = closed
+        .iter()
+        .map(|h| h[1..].split_once('-').unwrap().0.parse().unwrap())
+        .collect();
+    assert!(cycles.windows(2).all(|w| w[0] <= w[1]), "{cycles:?}");
+    assert_eq!(rig.engine.pending_lifecycle_closes(), 0);
+    // The slots are free again.
+    rig.connect("p", phone());
+    assert!(!rig.list("p").is_empty());
 }
 
 /// One `unknown_channel` per handle per link generation, then drop: the

@@ -228,8 +228,13 @@ pub struct R9Host {
     /// approval id → its session, from the requests delivered (in order).
     approval_sessions: HashMap<String, String>,
     approval_order: VecDeque<String>,
-    /// `unknown_channel` closes for the link, in order.
-    global: VecDeque<String>,
+    /// `close`s queued outside any channel, in order: refusals (bounded by
+    /// `global_closes` and the rate) and the `close{closed}`s of a restart
+    /// (lifecycle closes, counted in `lifecycle`).
+    global: VecDeque<(String, bool)>,
+    /// Lifecycle closes in `global` (flagged `true` there): each holds its channel's slot until it
+    /// is sent, so open channels plus these never pass `open_channels`.
+    lifecycle: usize,
     revoked: RevokedGrants,
     revoked_until: BTreeMap<String, u64>,
     revoked_path: Option<PathBuf>,
@@ -310,6 +315,7 @@ impl R9Host {
             approval_sessions: HashMap::new(),
             approval_order: VecDeque::new(),
             global: VecDeque::new(),
+            lifecycle: 0,
             revoked: RevokedGrants::new(),
             revoked_until: BTreeMap::new(),
             revoked_path,
@@ -368,6 +374,19 @@ impl R9Host {
     /// Atem's link dropped: every channel on it closes and its attachment
     /// is fenced (no lease is carried; §R9.7a 6). Nothing is sent.
     pub fn link_down<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let had_link = self.link.is_some();
+        let effects = self.end_channels(parts);
+        self.global.clear();
+        self.lifecycle = 0;
+        if had_link {
+            log("the link dropped; every channel on it closed");
+        }
+        effects
+    }
+
+    /// Every channel ends and its attachment is fenced; the link is no
+    /// longer up. What is queued outside a channel is the caller's.
+    fn end_channels<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
         let mut effects = Vec::new();
         for (_, chan) in std::mem::take(&mut self.chans) {
             if let Phase::Open(a) = chan.phase {
@@ -375,11 +394,34 @@ impl R9Host {
             }
         }
         self.by_attachment.clear();
-        self.global.clear();
         self.unknown.clear();
         self.unknown_order.clear();
-        if self.link.take().is_some() {
-            log("the link dropped; every channel on it closed");
+        self.link = None;
+        effects
+    }
+
+    /// The link generation ends while the socket stays up (a
+    /// re-authentication, or a link no longer authenticated): every
+    /// channel ends as in [`R9Host::restart`], and its closes (with those
+    /// already queued) are handed to `send` now, before anything of a new
+    /// generation. Whatever the socket doesn't take now is dropped and
+    /// counted: a handle is scoped to its generation (§R9.7a "Scope of a
+    /// handle"), so a late close could end a new channel that reused it.
+    /// The caller brings the new generation up ([`R9Host::link_up`]).
+    pub fn end_generation<J: Journal>(
+        &mut self,
+        parts: &mut Parts<'_, J>,
+        send: &mut dyn FnMut(String) -> bool,
+    ) -> Vec<Effect> {
+        let effects = self.restart(parts);
+        self.flush_closes(send);
+        let left = std::mem::take(&mut self.global).len();
+        self.lifecycle = 0;
+        if left > 0 {
+            self.unknown_dropped += left as u64;
+            log(&format!(
+                "{left} close(s) of an ended link generation dropped (the link was backed up)"
+            ));
         }
         effects
     }
@@ -427,7 +469,11 @@ impl R9Host {
             return;
         }
         let handshakes = self.chans.values().filter(|c| c.handshaking()).count();
-        if self.chans.len() >= self.limits.open_channels || handshakes >= self.limits.handshakes {
+        // A restart's pending `close{closed}` still holds its channel's
+        // slot (§R9.7a "Overload"): opens wait for the link to take it.
+        if self.chans.len() + self.lifecycle >= self.limits.open_channels
+            || handshakes >= self.limits.handshakes
+        {
             self.refuse_outside(&handle, reason::BUSY, parts.now.host.mono_ms);
             return;
         }
@@ -489,13 +535,14 @@ impl R9Host {
             self.unknown_rate = (second, 0);
         }
         if self.unknown_rate.1 >= self.limits.unknown_closes_per_second
-            || self.global.len() >= self.limits.global_closes
+            || self.global.len() - self.lifecycle >= self.limits.global_closes
         {
             self.dropped("refusals outside a channel");
             return false;
         }
         self.unknown_rate.1 += 1;
-        self.global.push_back(envelope::close(handle, Some(why)));
+        self.global
+            .push_back((envelope::close(handle, Some(why)), false));
         true
     }
 
@@ -511,21 +558,56 @@ impl R9Host {
         self.global.len()
     }
 
+    /// Bytes of the `close`s queued outside any channel (tests: the bound
+    /// holds).
+    pub fn queued_close_bytes(&self) -> usize {
+        self.global.iter().map(|(t, _)| t.len()).sum()
+    }
+
+    /// Restart closes not yet taken by the link (tests).
+    pub fn pending_lifecycle_closes(&self) -> usize {
+        self.lifecycle
+    }
+
+    /// Hands the closes queued outside a channel to `send`, in order;
+    /// false when it refused one (the rest waits).
+    fn flush_closes(&mut self, send: &mut dyn FnMut(String) -> bool) -> bool {
+        while let Some((text, lifecycle)) = self.global.pop_front() {
+            if !send(text.clone()) {
+                self.global.push_front((text, lifecycle));
+                return false;
+            }
+            if lifecycle {
+                self.lifecycle -= 1;
+            }
+        }
+        true
+    }
+
     /// Ends every channel while the socket stays up (a re-pin, an unpair, a
     /// re-authentication): as [`R9Host::link_down`], but the closes already
     /// queued stay and a `close{closed}` is queued for each live handle
-    /// (at most 64, past the outside-channel bounds: they end channels the
-    /// router holds open), all sent on the same socket (§R9.7a 6). The
-    /// caller brings the link up again.
+    /// (past the outside-channel bounds: they end channels the router holds
+    /// open), all sent on the same socket (§R9.7a 6). Each such close holds
+    /// its channel's slot until the link takes it, so across any number of
+    /// restarts at most 64 are pending (opens are refused `busy` while the
+    /// slots are taken). The caller brings the link up again.
     pub fn restart<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
-        let mut queued = std::mem::take(&mut self.global);
-        queued.extend(
-            self.chans
-                .keys()
-                .map(|h| envelope::close(h, Some(reason::CLOSED))),
+        let live: Vec<String> = self.chans.keys().cloned().collect();
+        let effects = self.end_channels(parts);
+        if !live.is_empty() {
+            log(&format!(
+                "every channel ended ({}); the link stays up",
+                live.len()
+            ));
+        }
+        // Each holds its channel's slot until sent (see `open`): at most
+        // `open_channels` are ever pending, however many restarts come.
+        self.lifecycle += live.len();
+        self.global.extend(
+            live.iter()
+                .map(|h| (envelope::close(h, Some(reason::CLOSED)), true)),
         );
-        let effects = self.link_down(parts);
-        self.global = queued;
         effects
     }
 
@@ -1540,11 +1622,8 @@ impl R9Host {
     /// once its queue drained. `send` refuses when the link is full; the
     /// rest waits.
     pub fn flush(&mut self, send: &mut dyn FnMut(String) -> bool) {
-        while let Some(text) = self.global.pop_front() {
-            if !send(text.clone()) {
-                self.global.push_front(text);
-                return;
-            }
+        if !self.flush_closes(send) {
+            return;
         }
         // Fair service: one message per channel per round, the rounds
         // starting with the channel the link last refused, so a busy

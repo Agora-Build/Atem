@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 
 use crate::config::AtemConfig;
 
@@ -118,6 +118,20 @@ pub(crate) fn is_removed_op(text: &str) -> bool {
 }
 
 /// The `data.id` of a `session` message, when it has one (no other check).
+/// The link's WebSocket limits: no message (or frame) larger than the
+/// §R9.7a envelope bound plus a margin is ever buffered; a larger one
+/// ends the link (tungstenite's default would be 64 MiB).
+pub(crate) const MAX_LINK_MESSAGE_BYTES: usize =
+    crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES + (2 << 20);
+
+pub(crate) fn link_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_LINK_MESSAGE_BYTES),
+        max_frame_size: Some(MAX_LINK_MESSAGE_BYTES),
+        ..Default::default()
+    }
+}
+
 fn session_message_id(text: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Data {
@@ -915,7 +929,7 @@ impl AstationClient {
     /// Used by relay flow where auth happens separately after code exchange.
     pub async fn connect_raw(&mut self, url: &str) -> Result<()> {
         self.abort_transport();
-        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
+        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async_with_config(url, Some(link_ws_config()), false))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
             .map_err(|e| anyhow!("Failed to connect to WebSocket: {}", e))?;
@@ -975,7 +989,18 @@ impl AstationClient {
                                     eprintln!("atem: r9: an oversize channel envelope without a readable handle was dropped ({} bytes)", text.len());
                                     continue;
                                 }
-                                Oversize::NotAnEnvelope => {}
+                                // Over every bound of its family too: answered
+                                // as oversize, its id unread (never parsed).
+                                Oversize::Other(family) if matches!(family.as_str(), "session" | "terminal" | "agentChat") => {
+                                    if tx.send(AstationMessage::SessionOversize { id: None, family }).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Oversize::Other(_) | Oversize::Unreadable => {
+                                    eprintln!("atem: an oversize message whose type its first bytes don't name as a session family was dropped unread ({} bytes)", text.len());
+                                    continue;
+                                }
                             }
                         } else if crate::session_protocol::r9::envelope::is_envelope(&text) {
                             if tx.send(AstationMessage::Channel(text)).await.is_err() {
@@ -2125,6 +2150,53 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+
+    /// N10 and the reader's cap: over the 2 MiB envelope bound nothing is
+    /// parsed (a handle from the first bytes, a session family answered
+    /// as oversize, anything else dropped), and a message over the link's
+    /// cap ends the link instead of being buffered.
+    #[tokio::test]
+    async fn oversize_messages_are_never_parsed_and_the_reader_is_capped() {
+        use crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pad = |head: &str, total: usize| format!("{head}{}\"}}}}", "A".repeat(total - head.len() - 3));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let config = super::link_ws_config();
+            let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig { max_message_size: Some(64 << 20), max_frame_size: Some(64 << 20), ..config };
+            let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(config)).await.unwrap();
+            let big = MAX_ENVELOPE_BYTES + 1000;
+            // A channel envelope with its handle in its first bytes.
+            socket.send(Message::Text(pad(r#"{"type":"channel","event":"frame","channel":"h1","frame":{"ct":""#, big))).await.unwrap();
+            // Its first 4 KiB end inside a nested value before any type.
+            socket.send(Message::Text(pad(&format!(r#"{{"x":{{"y":"{}"#, "z".repeat(5000)), big))).await.unwrap();
+            // A session message over every bound: answered, never parsed.
+            socket.send(Message::Text(pad(r#"{"type":"session","data":{"x":""#, big))).await.unwrap();
+            // Another type: dropped.
+            socket.send(Message::Text(pad(r#"{"type":"heartbeat","data":{"x":""#, big))).await.unwrap();
+            socket.send(Message::Text(r#"{"type":"channel","event":"open","channel":"h2","transport":"relay"}"#.into())).await.unwrap();
+            // Over the reader's cap: the link ends.
+            let _ = socket.send(Message::Text(pad(r#"{"type":"channel","event":"frame","channel":"h3","frame":{"ct":""#, super::MAX_LINK_MESSAGE_BYTES + 1))).await;
+            let _ = socket.next().await;
+        });
+        let mut client = AstationClient::new();
+        client.connect_raw(&format!("ws://{address}")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !client.is_ws_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the link ends at a message over its cap");
+        let mut got = Vec::new();
+        while let Some(message) = client.recv_message() {
+            got.push(message);
+        }
+        assert!(matches!(&got[0], AstationMessage::ChannelTooLarge(h) if h == "h1"), "{got:?}");
+        assert!(matches!(&got[1], AstationMessage::SessionOversize { id: None, family } if family == "session"), "{got:?}");
+        assert!(matches!(&got[2], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
+        assert_eq!(got.len(), 3, "nothing else was delivered: {got:?}");
+        server.abort();
     }
 
     #[tokio::test]
