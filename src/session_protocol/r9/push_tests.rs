@@ -26,7 +26,11 @@ fn info() -> ApprovalInfo {
 /// The session host opens an approval on `sid`/`pg` (as the runtime's
 /// worker report does); its push effects reach the engine.
 fn open(rig: &mut Rig, sid: &str, pg: &str) -> String {
-    let (opened, fx) = rig.rt.host.open_approval(sid, pg, info(), rig.now.mono);
+    // Stamped with the host clock, as the runtime's bridge does.
+    let (opened, fx) =
+        rig.rt
+            .host
+            .open_approval_at(sid, pg, info(), rig.now.mono, rig.now.host.wall_ms);
     rig.rt.apply(fx);
     rig.route();
     opened.unwrap()
@@ -598,4 +602,117 @@ fn a_device_removed_mid_approval_gets_no_more_hints() {
         hints(&rig, &out[0])[0].state(),
         HintState::Resolved { .. }
     ));
+}
+
+/// Carries `entry` (a signed membership entry, as JSON) on `handle`'s
+/// channel.
+fn carry(rig: &mut Rig, handle: &str, entry: &Value) {
+    let mono = rig.now.host.mono_ms;
+    let entry = SignedObject::parse(entry.to_string().as_bytes()).unwrap();
+    let (_, frame) = rig
+        .attached(handle)
+        .send_membership(&[entry], mono)
+        .unwrap();
+    rig.send_frame_raw(handle, &frame);
+}
+
+/// §R9.9/§R9.6: a device demoted (`set_roles` without `control`) while its
+/// open hint waits never gets it again; the Mac's goes on.
+#[test]
+fn a_device_demoted_mid_approval_gets_no_more_hints() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect(
+        "mac",
+        atem_client::connect::Identity::native(MAC, r9log::auth(MAC)),
+    );
+    open(&mut rig, SID, PGEN);
+    let first = rig.relay_out();
+    assert_eq!(hints(&rig, &first[0]).len(), 2);
+    let demotion = rig.log.set_native_roles("dev-phone", &["view"]);
+    carry(&mut rig, "mac", &demotion);
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 1);
+    rig.advance(10_000);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0]["hints"],
+        json!([first[0]["hints"][0]]),
+        "the Mac's only"
+    );
+}
+
+/// §R9.9: a device added with `control` after the open got no hint, so its
+/// `approval_seen` is answered `seen` and nothing is signed; a recipient's
+/// still is.
+#[test]
+fn a_device_added_after_the_open_is_answered_but_its_seen_not_signed() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect(
+        "mac",
+        atem_client::connect::Identity::native(MAC, r9log::auth(MAC)),
+    );
+    let ap = open(&mut rig, SID, PGEN);
+    rig.relay_out();
+    let added = rig.log.add_native("dev-tab", &["control", "view"]);
+    carry(&mut rig, "mac", &added);
+    rig.advance(1_000);
+    rig.connect(
+        "tab",
+        atem_client::connect::Identity::native("dev-tab", r9log::auth("dev-tab")),
+    );
+    let b = rig.binding("tab", SID);
+    let events = seen(&mut rig, "tab", &b, &ap);
+    assert!(
+        events.iter().any(|e| matches!(e, CEvent::Seen { .. })),
+        "{events:?}"
+    );
+    assert!(
+        rig.relay_out().is_empty(),
+        "not a recipient: nothing signed"
+    );
+    let b = rig.binding("mac", SID);
+    seen(&mut rig, "mac", &b, &ap);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["seen"]["body"]["device_id"], MAC);
+}
+
+/// The session host's own wall clock stands still while the machine
+/// sleeps (an offset plus a monotonic clock); the host clock moves. An
+/// approval opened after a "suspend" (the host wall 700 s ahead, the
+/// monotonic clock not) is stamped with the host clock: hints go, with
+/// `created_at` the card's and now.
+#[test]
+fn after_a_suspend_hints_carry_the_host_clock() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("phone", phone());
+    rig.binding("phone", SID);
+    rig.now.host.wall_ms += 700_000;
+    let wall = rig.now.host.wall_ms;
+    assert!(
+        rig.rt.host.wall_ms() + 600_000 < wall,
+        "the session host lags"
+    );
+    let ap = open(&mut rig, SID, PGEN);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1, "hints still go");
+    for h in hints(&rig, &out[0]) {
+        assert_eq!(h.created_at(), wall);
+        assert_eq!(h.expires_at(), wall + WAIT_MS);
+    }
+    let card = rig
+        .events("phone")
+        .into_iter()
+        .find_map(|e| match e {
+            CEvent::Session(m) => match m.op {
+                r8::Op::ApprovalRequest(r) if r.approval_id == ap => Some(r),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the card");
+    assert_eq!(card.created_at, wall, "one created_at for card and hint");
 }

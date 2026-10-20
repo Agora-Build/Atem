@@ -17,9 +17,11 @@ use std::time::Instant;
 
 /// Messages kept for the session host per pass, at most.
 pub const INBOX_LIMIT: usize = 1024;
-/// A relay message larger than this is dropped (a `push_ack` of a few
-/// hundred identities is well under it).
-pub const RELAY_MESSAGE_BYTES: usize = 64 * 1024;
+/// A relay message larger than this is dropped and counted in runtime.log
+/// (§R9.9: a relay message to Atem is at most 256 KiB, the `push_hint`
+/// bound; the relay splits a larger `push_ack`, about 337 bytes an
+/// identity).
+pub const RELAY_MESSAGE_BYTES: usize = 256 * 1024;
 /// Relay messages kept for the broker per pass, at most (the rest are
 /// dropped: what they acknowledged is resent and acknowledged again).
 pub const RELAY_LIMIT: usize = 64;
@@ -64,6 +66,8 @@ pub struct Hosted {
     /// Relay messages from the link (§R9.9: `push_ack`), with the link
     /// generation they arrived on, in order (at most `RELAY_LIMIT`).
     pub relay: VecDeque<(u64, String)>,
+    /// Relay messages dropped (over a bound), for runtime.log.
+    pub relay_dropped: u64,
 }
 
 impl Hosted {
@@ -159,11 +163,23 @@ impl App {
             return;
         }
         let link = self.astation_link_gen;
-        if let Some(hosted) = self.hosted.as_mut()
-            && hosted.relay.len() < RELAY_LIMIT
-            && text.len() <= RELAY_MESSAGE_BYTES
-        {
+        let Some(hosted) = self.hosted.as_mut() else {
+            return;
+        };
+        if hosted.relay.len() < RELAY_LIMIT && text.len() <= RELAY_MESSAGE_BYTES {
             hosted.relay.push_back((link, text));
+            return;
+        }
+        // Counted, never its content; rate-limited to powers of two.
+        hosted.relay_dropped += 1;
+        if hosted.relay_dropped.is_power_of_two() {
+            eprintln!(
+                "atem runtime: r9: {} relay message(s) dropped (over {} KiB or {} a pass; the last {} bytes)",
+                hosted.relay_dropped,
+                RELAY_MESSAGE_BYTES / 1024,
+                RELAY_LIMIT,
+                text.len()
+            );
         }
     }
 

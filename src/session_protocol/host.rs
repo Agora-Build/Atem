@@ -768,6 +768,12 @@ impl<J: Journal> SessionHost<J> {
         std::mem::take(&mut self.out)
     }
 
+    /// The session host's wall clock (ms): its start's offset plus its
+    /// monotonic clock (r8 receipts and descriptors).
+    pub fn wall_ms(&self) -> u64 {
+        self.wall()
+    }
+
     fn wall(&self) -> u64 {
         self.config
             .wall_offset_ms
@@ -3252,7 +3258,26 @@ impl<J: Journal> SessionHost<J> {
         now: u64,
     ) -> (Result<String, String>, Vec<Effect>) {
         self.tick(now);
-        let opened = self.open_checked(session_id, process_gen, info);
+        let wall = self.wall();
+        let opened = self.open_checked(session_id, process_gen, info, wall);
+        (opened, self.take())
+    }
+
+    /// [`SessionHost::open_approval`] with its `created_at` taken from the
+    /// caller's wall clock `wall` (the runtime's host clock, §R9.5: the
+    /// session host's own wall is an offset fixed at its start plus a
+    /// monotonic clock that stands still while the machine sleeps; the
+    /// approval's `created_at` is the card's and its push hints', §R9.9).
+    pub fn open_approval_at(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+        info: ApprovalInfo,
+        now: u64,
+        wall: u64,
+    ) -> (Result<String, String>, Vec<Effect>) {
+        self.tick(now);
+        let opened = self.open_checked(session_id, process_gen, info, wall);
         (opened, self.take())
     }
 
@@ -3261,6 +3286,7 @@ impl<J: Journal> SessionHost<J> {
         session_id: &str,
         process_gen: &str,
         info: ApprovalInfo,
+        wall: u64,
     ) -> Result<String, String> {
         wire::validate_approval_info(&info.tool, &info.summary, &info.always_rules)?;
         if self.halted || self.journal_halted {
@@ -3286,7 +3312,7 @@ impl<J: Journal> SessionHost<J> {
             process_gen: process_gen.to_string(),
             tool: info.tool,
             summary: info.summary,
-            created_at: self.wall(),
+            created_at: wall.min(MAX_SAFE_INTEGER),
             always_rules: info.always_rules,
         };
         self.approvals_opened += 1;

@@ -2674,7 +2674,12 @@ impl HostBridge {
         let opened = match process_gen.filter(|_| registered) {
             Some(process_gen) => {
                 let now = self.clock.now();
-                let (opened, effects) = self.host.open_approval(sid, &process_gen, info, now);
+                // §R9.9: created_at (the card's and the hints') on the host
+                // clock, which moves while the machine sleeps.
+                let wall = host_now().wall_ms;
+                let (opened, effects) =
+                    self.host
+                        .open_approval_at(sid, &process_gen, info, now, wall);
                 if let Ok(id) = &opened {
                     self.approvals.insert(
                         id.clone(),

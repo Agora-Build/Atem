@@ -132,13 +132,7 @@ impl Rig {
         });
         let file_journal = FileJournal::open(&journal).unwrap();
         let now = now_at(r9log::host_now().wall_ms, 1_000);
-        // The session host's wall clock is the host clock, as in the
-        // runtime (one clock for an approval's `created_at`).
-        let config = HostConfig {
-            wall_offset_ms: now.host.wall_ms - now.mono,
-            ..HostConfig::default()
-        };
-        let mut rt = FakeRuntime::from_json_with(setup, config, file_journal);
+        let mut rt = FakeRuntime::from_json_with(setup, HostConfig::default(), file_journal);
         rt.host.set_refuse_r8(true);
         rt.set_now(now.mono);
         let mut fences = HostFences::new(&mut rt.host);
@@ -1110,7 +1104,10 @@ fn approval_seen_is_answered_on_the_host_side() {
         summary: "ls".into(),
         always_rules: Vec::new(),
     };
-    let (opened, fx) = rig.rt.host.open_approval(SID, PGEN, info, rig.now.mono);
+    let (opened, fx) =
+        rig.rt
+            .host
+            .open_approval_at(SID, PGEN, info, rig.now.mono, rig.now.host.wall_ms);
     rig.rt.apply(fx);
     rig.route();
     let approval = opened.unwrap();
@@ -1356,7 +1353,10 @@ fn approval_closed_is_scope_checked() {
     };
     let mut ids = Vec::new();
     for (sid, pgen) in [(SID, PGEN), (SID_B, PGEN_B)] {
-        let (opened, fx) = rig.rt.host.open_approval(sid, pgen, info(), rig.now.mono);
+        let (opened, fx) =
+            rig.rt
+                .host
+                .open_approval_at(sid, pgen, info(), rig.now.mono, rig.now.host.wall_ms);
         rig.rt.apply(fx);
         ids.push(opened.unwrap());
     }

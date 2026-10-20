@@ -172,6 +172,10 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     /// channels, served by `session_protocol::r9`), and the push requests
     /// (r9's sealed push), in order.
     pub foreign: Vec<Effect>,
+    /// The runtime's host clock (wall ms) when the harness plays one (r9):
+    /// approvals are stamped with it, as the runtime's are. `None`: the
+    /// session host's own wall clock.
+    pub host_wall: Option<u64>,
     now: u64,
     /// r8: the chat of each session with `chat`, and its conversations.
     chats: HashMap<String, FakeChat>,
@@ -321,6 +325,7 @@ impl<J: Journal> FakeRuntime<J> {
             out: Vec::new(),
             effects: Vec::new(),
             foreign: Vec::new(),
+            host_wall: None,
             now: 0,
             chats: HashMap::new(),
             history_key: HistoryKey::random(),
@@ -1363,10 +1368,11 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                     always_rules: always_rules.clone(),
                 };
                 let process_gen = self.process_gen(session_id);
+                let wall = self.host_wall.unwrap_or_else(|| self.host.wall_ms());
                 // Refused: the agent's own prompt asks; nothing is sent.
-                let (opened, fx) = self
-                    .host
-                    .open_approval(session_id, &process_gen, info, now_ms);
+                let (opened, fx) =
+                    self.host
+                        .open_approval_at(session_id, &process_gen, info, now_ms, wall);
                 self.apply(fx);
                 if let (Ok(approval_id), true) = (opened, self.chats.contains_key(session_id)) {
                     let card = ApprovalCard {

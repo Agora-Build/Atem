@@ -62,6 +62,9 @@ fn log(line: &str) {
 
 struct Tracked {
     approval: HostApproval,
+    /// The devices its open hints went to (fixed at the open): only their
+    /// seen is signed (§R9.9).
+    recipients: std::collections::BTreeSet<String>,
     /// Each unacknowledged hint or seen and when it was first queued.
     unacked: BTreeMap<Identity, u64>,
 }
@@ -180,6 +183,13 @@ impl HostPush {
         }
         let mut tracked = Tracked {
             approval,
+            recipients: hints
+                .iter()
+                .filter_map(|h| match h.identity() {
+                    Identity::Open { device_id, .. } => Some(device_id),
+                    _ => None,
+                })
+                .collect(),
             unacked: BTreeMap::new(),
         };
         for h in &hints {
@@ -272,6 +282,14 @@ impl HostPush {
         if t.guard_passed(now) {
             return;
         }
+        if !t.recipients.contains(device_id) {
+            // Added or given `control` after the open: no hint went to it,
+            // so its seen could only wait as pending at the relay.
+            log(&format!(
+                "approval {approval_id}: {device_id} is not a recipient; its seen is not signed"
+            ));
+            return;
+        }
         let outcome = t.approval.seen(
             &signer.key.keys,
             &signer.key.id,
@@ -354,6 +372,9 @@ impl HostPush {
                     log(&format!(
                         "approval {id}: {device_id} is no longer a recipient; its hint is not sent again"
                     ));
+                }
+                if let Identity::Open { device_id, .. } = &i {
+                    t.recipients.remove(device_id);
                 }
                 t.unacked.remove(&i);
                 gone.push(i);
