@@ -50,6 +50,7 @@ pub(super) struct Rig {
     /// The link takes nothing (output builds up in the engine).
     pub stalled: bool,
     pub link_gen: u64,
+    pub host_id: String,
 }
 
 pub(super) fn now_at(wall: u64, mono: u64) -> Now {
@@ -88,16 +89,35 @@ impl Rig {
             r9log::host_now().wall_ms + 3_600_000,
         );
         more(&mut log);
+        drop(profile);
+        let sessions = json!([{"session_id": SID, "process_gen": PGEN, "chat": true},
+                              {"session_id": SID_B, "process_gen": PGEN_B, "chat": true}]);
+        Self::build(dir, log, HOST, 1, host_seed, sessions)
+    }
+
+    /// A rig whose device list is `log`, pinned for `host_id` at
+    /// `host_trust_gen` with `host_seed`, and these sessions.
+    pub fn build(
+        dir: tempfile::TempDir,
+        log: TestLog,
+        host_id: &str,
+        host_trust_gen: u64,
+        host_seed: [u8; 32],
+        sessions: Value,
+    ) -> Rig {
+        let profile = crate::paths::ProfilePaths::in_dir(dir.path());
+        let journal = dir.path().join("runtime").join("journal");
+        store::private_dir(&journal).unwrap();
         let pin = HostPin {
-            host_id: HOST.into(),
-            host_trust_gen: 1,
+            host_id: host_id.into(),
+            host_trust_gen,
         };
         MembershipHost::pin(&profile.pairing, &journal, &pin, &log.log, &host_seed).unwrap();
         let setup = json!({
-            "host": {"account_id": ACCOUNT, "atem_device_id": HOST, "host_trust_gen": 1,
+            "host": {"account_id": log.account, "atem_device_id": host_id,
+                     "host_trust_gen": host_trust_gen,
                      "runtime_gen": "11111111-1111-4111-8111-111111111111", "runtime_epoch": 1},
-            "sessions": [{"session_id": SID, "process_gen": PGEN, "chat": true},
-                         {"session_id": SID_B, "process_gen": PGEN_B, "chat": true}],
+            "sessions": sessions,
             "clients": [],
         });
         let file_journal = FileJournal::open(&journal).unwrap();
@@ -124,6 +144,7 @@ impl Rig {
             closes: Vec::new(),
             stalled: false,
             link_gen: 0,
+            host_id: host_id.to_string(),
         }
     }
 
@@ -167,7 +188,7 @@ impl Rig {
                         &attachment,
                         &message,
                         &NoProjects,
-                        HOST,
+                        &self.host_id,
                         self.now.host.mono_ms,
                     ),
                     Effect::Close { attachment } => self
@@ -208,6 +229,9 @@ impl Rig {
 
     /// Delivers what Atem sent to the clients.
     pub fn pump(&mut self) {
+        // As the runtime's pass: channels closed on Atem's side (overflow)
+        // leave the session host.
+        self.run(|e, p| ((), e.reap(p)));
         if self.stalled {
             return;
         }
@@ -284,6 +308,10 @@ impl Rig {
         IDS.with(|ids| ids.borrow().get(handle).cloned().expect("an identity"))
     }
 
+    pub fn send_frame_raw(&mut self, handle: &str, frame: &[u8]) {
+        self.send_frame(handle, frame);
+    }
+
     fn send_frame(&mut self, handle: &str, frame: &[u8]) {
         let text = envelope::frame(handle, frame);
         self.run(|e, p| ((), e.on_envelope(&text, p)));
@@ -297,10 +325,25 @@ impl Rig {
 
     /// As [`Rig::connect`], with `log` as the client's verified log.
     pub fn connect_with(&mut self, handle: &str, identity: Identity, log: Option<&Membership>) {
+        self.connect_full(handle, identity, log, Transport::Relay);
+    }
+
+    /// As [`Rig::connect`], opened with `transport`.
+    pub fn connect_via(&mut self, handle: &str, identity: Identity, transport: Transport) {
+        self.connect_full(handle, identity, None, transport);
+    }
+
+    fn connect_full(
+        &mut self,
+        handle: &str,
+        identity: Identity,
+        log: Option<&Membership>,
+        transport: Transport,
+    ) {
         IDS.with(|ids| ids.borrow_mut().insert(handle.to_string(), identity));
-        self.envelope_in(&envelope::open(handle, Transport::Relay));
+        self.envelope_in(&envelope::open(handle, transport));
         let log = log.unwrap_or(&self.log.log).clone();
-        let (connecting, init) = Connector::new(HOST)
+        let (connecting, init) = Connector::new(&self.host_id)
             .start(&log, self.now.host.mono_ms)
             .unwrap();
         self.clients

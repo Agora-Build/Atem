@@ -28,6 +28,8 @@
 //! filtered by scope, sealed and queued.
 pub mod envelope;
 #[cfg(test)]
+mod fixtures_tests;
+#[cfg(test)]
 mod tests;
 
 use super::host::{Attach, Effect, SessionHost};
