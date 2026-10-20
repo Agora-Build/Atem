@@ -436,8 +436,9 @@ fn no_open_or_seen_is_sent_at_or_after_the_guard() {
     ));
 }
 
-/// Bounded: at most `MAX_APPROVALS` approvals tracked (the oldest
-/// forgotten with what it still had to send); a re-pin drops everything.
+/// Bounded: at most `MAX_APPROVALS` approvals tracked (every
+/// published lifecycle kept, newer approvals unhinted); a re-pin drops
+/// everything.
 #[test]
 fn the_push_state_is_bounded_and_a_repin_drops_it() {
     let rig = Rig::new();
@@ -466,9 +467,12 @@ fn the_push_state_is_bounded_and_a_repin_drops_it() {
     for n in 0..MAX_APPROVALS + 6 {
         push.opened(key(n), wall, wall + WAIT_MS, &plain, Some(signer()), wall);
     }
+    // Every one published (the link is up): the first 64 are kept, the
+    // newer 6 go unhinted.
     assert_eq!(push.status(wall).pending, MAX_APPROVALS * 2);
-    assert!(!push.tracks(&key(0).approval_id));
-    assert!(push.tracks(&key(MAX_APPROVALS + 5).approval_id));
+    assert!(push.tracks(&key(0).approval_id));
+    assert!(!push.tracks(&key(MAX_APPROVALS).approval_id));
+    assert_eq!(push.unhinted(), 6);
     // A reconnect resends every tracked approval's hints, once each,
     // each message under the cap.
     push.link_down();
@@ -715,4 +719,155 @@ fn after_a_suspend_hints_carry_the_host_clock() {
         })
         .expect("the card");
     assert_eq!(card.created_at, wall, "one created_at for card and hint");
+}
+
+// ── Capacity: published lifecycles are kept (Astation's Task 8 review) ──
+
+/// Five sessions (the session host allows 16 pending approvals each).
+fn five_sessions() -> (Rig, Vec<(String, String)>) {
+    let sessions: Vec<(String, String)> = ["c", "d", "e", "f", "g"]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            (
+                format!("ses-{}", c.repeat(12)),
+                format!("4444444{i}-4444-4444-8444-444444444444"),
+            )
+        })
+        .collect();
+    let json = Value::Array(
+        sessions
+            .iter()
+            .map(|(s, p)| json!({"session_id": s, "process_gen": p, "chat": true}))
+            .collect(),
+    );
+    (Rig::with_sessions(|_| {}, json), sessions)
+}
+
+/// The resolved hint of `ap` among what Atem sent the relay now, if any.
+fn resolved_of(rig: &mut Rig, ap: &str) -> Option<Value> {
+    let messages = rig.relay_out();
+    let rig = &*rig;
+    messages.iter().find_map(|m| {
+        if m["op"] != "push_hint" {
+            return None;
+        }
+        hints(rig, m).iter().find_map(|h| {
+            (h.key().approval_id == ap && matches!(h.state(), HintState::Resolved { .. }))
+                .then(|| h.object().to_json())
+        })
+    })
+}
+
+/// Approval A's open is delivered and acknowledged, then 63 more fill the
+/// 64 tracked; the 65th gets no hint (counted), never at A's expense. A
+/// is answered: its resolved hint goes, is resent byte-identical while
+/// unacknowledged, and stops once acknowledged.
+#[test]
+fn a_published_approval_keeps_its_cancellation_past_capacity() {
+    let (mut rig, s) = five_sessions();
+    rig.link_up();
+    let a = open(&mut rig, &s[0].0, &s[0].1);
+    let out = rig.relay_out();
+    let hs = hints(&rig, &out[0]);
+    rig.relay_in(&ack(&hs.iter().map(Hint::identity).collect::<Vec<_>>()));
+    for i in 0..63 {
+        let (sid, pg) = &s[(i + 1) / 16];
+        open(&mut rig, sid, pg);
+    }
+    assert_eq!(rig.relay_out().len(), 63);
+    assert_eq!(rig.engine.push.unhinted(), 0);
+    // The 65th: no room (every tracked approval was published).
+    let late = open(&mut rig, &s[4].0, &s[4].1);
+    assert!(rig.relay_out().is_empty(), "no hint for the 65th");
+    assert_eq!(rig.engine.push.unhinted(), 1);
+    assert!(!rig.engine.push.tracks(&late));
+    assert!(rig.engine.push.tracks(&a), "A's lifecycle is kept");
+    // A is answered: its resolved hint, retried unchanged until acked.
+    close(&mut rig, &a, r8::ApprovalCloseReason::AnsweredTerminal);
+    let first = resolved_of(&mut rig, &a).expect("A's resolved hint");
+    rig.advance(10_000);
+    let again = resolved_of(&mut rig, &a).expect("resent");
+    assert_eq!(again, first, "byte-identical");
+    let r = Hint::verify(
+        &object(&first),
+        &rig.log.log,
+        rig.now.host.wall_ms,
+        Verifier::Client,
+    )
+    .unwrap();
+    rig.relay_in(&ack(&[r.identity()]));
+    rig.advance(10_000);
+    assert_eq!(resolved_of(&mut rig, &a), None);
+    assert!(!rig.engine.push.tracks(&a));
+}
+
+/// Capacity pressure while A's resolved acknowledgment is lost: A's
+/// resolved hint is kept (never evicted) and resent unchanged; the new
+/// approval that finds no room goes unhinted; once A's resolution is
+/// acknowledged, the next one gets its hints.
+#[test]
+fn an_unacknowledged_resolution_survives_capacity_pressure() {
+    let (mut rig, s) = five_sessions();
+    rig.link_up();
+    let a = open(&mut rig, &s[4].0, &s[4].1);
+    rig.relay_out();
+    close(&mut rig, &a, r8::ApprovalCloseReason::Interrupted);
+    let first = resolved_of(&mut rig, &a).expect("A's resolved hint");
+    // Its ack is lost; 63 published approvals fill the rest.
+    for i in 0..63 {
+        let (sid, pg) = &s[i / 16];
+        open(&mut rig, sid, pg);
+    }
+    rig.relay_out();
+    let late = open(&mut rig, &s[3].0, &s[3].1);
+    assert!(rig.relay_out().is_empty(), "no room: no hint");
+    assert!(!rig.engine.push.tracks(&late));
+    assert_eq!(rig.engine.push.unhinted(), 1);
+    rig.advance(10_000);
+    let again = resolved_of(&mut rig, &a).expect("A's resolution is resent");
+    assert_eq!(again, first, "byte-identical");
+    let r = Hint::verify(
+        &object(&first),
+        &rig.log.log,
+        rig.now.host.wall_ms,
+        Verifier::Client,
+    )
+    .unwrap();
+    rig.relay_in(&ack(&[r.identity()]));
+    // Room again: the next approval gets its hints.
+    let next = open(&mut rig, &s[4].0, &s[4].1);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1);
+    assert!(
+        hints(&rig, &out[0])
+            .iter()
+            .all(|h| h.key().approval_id == next)
+    );
+}
+
+/// Opens never published (the link was down) make room first: the oldest
+/// of them is forgotten for a 65th, and the reconnect sends the other 64.
+#[test]
+fn unpublished_opens_make_room_first() {
+    let (mut rig, s) = five_sessions();
+    rig.link_up();
+    rig.link_down();
+    let mut ids = Vec::new();
+    for i in 0..65 {
+        let (sid, pg) = &s[i / 16];
+        ids.push(open(&mut rig, sid, pg));
+    }
+    assert!(!rig.engine.push.tracks(&ids[0]), "the oldest unpublished");
+    assert_eq!(rig.engine.push.unhinted(), 0);
+    rig.link_up();
+    let sent: std::collections::BTreeSet<String> = rig
+        .relay_out()
+        .iter()
+        .flat_map(|m| hints(&rig, m))
+        .map(|h| h.key().approval_id.clone())
+        .collect();
+    assert_eq!(sent.len(), 64);
+    assert!(!sent.contains(&ids[0]));
+    assert!(sent.contains(&ids[64]));
 }

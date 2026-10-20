@@ -1558,6 +1558,14 @@ impl R9Host {
         reason: r8::ApprovalCloseReason,
         parts: &mut Parts<'_, J>,
     ) {
+        // Its `approval_closed` went out before this (the session host's
+        // order): the scope check needs its session no longer, so the
+        // bounded map only ever drops ended approvals' entries first.
+        if self.approval_sessions.remove(approval_id).is_some() {
+            self.approval_order.retain(|a| a != approval_id);
+        }
+        // Its first-seen marks too (a seen after it is `stale_target`).
+        self.seen.retain(|(a, _)| a != approval_id);
         self.push.suppress(push_suppressed(parts));
         let reason = serde_json::to_value(reason)
             .ok()

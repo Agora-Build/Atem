@@ -83,6 +83,14 @@ impl Rig {
     }
 
     pub fn with(more: impl FnOnce(&mut TestLog)) -> Rig {
+        let sessions = json!([{"session_id": SID, "process_gen": PGEN, "chat": true},
+                              {"session_id": SID_B, "process_gen": PGEN_B, "chat": true}]);
+        Self::with_sessions(more, sessions)
+    }
+
+    /// [`Rig::with`] running `sessions` (`[{session_id, process_gen,
+    /// chat}]`) instead of the two.
+    pub fn with_sessions(more: impl FnOnce(&mut TestLog), sessions: Value) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let profile = crate::paths::ProfilePaths::in_dir(dir.path());
         let journal = dir.path().join("runtime").join("journal");
@@ -100,8 +108,6 @@ impl Rig {
         );
         more(&mut log);
         drop(profile);
-        let sessions = json!([{"session_id": SID, "process_gen": PGEN, "chat": true},
-                              {"session_id": SID_B, "process_gen": PGEN_B, "chat": true}]);
         Self::build(dir, log, HOST, 1, host_seed, sessions)
     }
 

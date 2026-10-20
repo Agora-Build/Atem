@@ -30,8 +30,14 @@
 //! - recipients follow the head: an open hint not yet acknowledged whose
 //!   device is no longer a recipient (removed, or lost `control`) is never
 //!   sent again (its resolved hint still goes: it carries nothing sealed);
-//! - bounds: at most [`MAX_APPROVALS`] approvals tracked (the oldest
-//!   forgotten first); each `push_hint` at most [`MAX_MESSAGE_BYTES`]
+//! - bounds: at most [`MAX_APPROVALS`] approvals tracked. A published
+//!   lifecycle is never evicted: an approval whose open hints went out
+//!   keeps them until it resolves, and its resolved hint until the relay
+//!   acknowledges it (or `expires_at + 300 s`). To make room only an
+//!   approval with nothing left to send, then one whose opens were never
+//!   published, is forgotten; when nothing can go, the new approval gets
+//!   no hint (a counted runtime.log line) and works on the host as
+//!   always (§R9.9). Each `push_hint` at most [`MAX_MESSAGE_BYTES`]
 //!   (hints due together are split, never one frame the link or relay
 //!   refuses forever); at most [`MAX_RELAY_OUT_BYTES`] waiting for the
 //!   link (the rest go at the next resend).
@@ -43,7 +49,8 @@ use atem_client::push::{
 };
 use std::collections::{BTreeMap, VecDeque};
 
-/// Approvals whose hints are tracked at most (the oldest is forgotten).
+/// Approvals whose hints are tracked at most (see the module docs for
+/// what makes room).
 pub const MAX_APPROVALS: usize = 64;
 /// Bytes of relay messages waiting for the link at most (the rest are
 /// resent at the next tick).
@@ -67,6 +74,9 @@ struct Tracked {
     recipients: std::collections::BTreeSet<String>,
     /// Each unacknowledged hint or seen and when it was first queued.
     unacked: BTreeMap<Identity, u64>,
+    /// Its open hints were handed to the link (or acknowledged): the
+    /// relay may hold them, so its lifecycle is kept to the end.
+    published: bool,
 }
 
 impl Tracked {
@@ -105,6 +115,9 @@ pub struct HostPush {
     out_bytes: usize,
     link: bool,
     suppressed: Option<&'static str>,
+    /// New approvals that got no hint because every tracked one holds a
+    /// published lifecycle.
+    unhinted: u64,
 }
 
 /// What signing needs: the verified log, the host's key.
@@ -175,11 +188,17 @@ impl HostPush {
             log(&format!("approval {approval_id}: no recipient"));
             return;
         }
-        while self.approvals.len() >= MAX_APPROVALS
-            && let Some(old) = self.order.pop_front()
-        {
-            log(&format!("approval {old}: forgotten (too many tracked)"));
-            self.forget(&old);
+        if self.approvals.len() >= MAX_APPROVALS && !self.make_room() {
+            // Every tracked approval holds a published lifecycle: the new
+            // one goes unhinted (its card and answers work as always).
+            self.unhinted += 1;
+            if self.unhinted.is_power_of_two() {
+                log(&format!(
+                    "approval {approval_id}: no hint ({MAX_APPROVALS} published approvals pending or resolving; {} unhinted so far)",
+                    self.unhinted
+                ));
+            }
+            return;
         }
         let mut tracked = Tracked {
             approval,
@@ -191,6 +210,7 @@ impl HostPush {
                 })
                 .collect(),
             unacked: BTreeMap::new(),
+            published: self.link,
         };
         for h in &hints {
             tracked.unacked.insert(h.identity(), now);
@@ -338,6 +358,7 @@ impl HostPush {
             for (id, t) in self.approvals.iter_mut() {
                 if t.unacked.remove(ack).is_some() {
                     matched += 1;
+                    t.published = true;
                 }
                 if matches!(ack, Identity::Resolved { key } if *key == t.approval.key) {
                     ended.push(id.clone());
@@ -420,6 +441,12 @@ impl HostPush {
             return;
         }
         self.prune(now);
+        // Everything still pending goes now: published from here on.
+        for t in self.approvals.values_mut() {
+            if !t.unacked.is_empty() {
+                t.published = true;
+            }
+        }
         for m in self.outbox.reconnect(now) {
             self.queue(m);
         }
@@ -471,6 +498,12 @@ impl HostPush {
             oldest_ms: oldest.map(|at| now.saturating_sub(at)),
             suppressed: self.suppressed,
         }
+    }
+
+    /// New approvals that got no hint for want of room (tests).
+    #[cfg(test)]
+    pub fn unhinted(&self) -> u64 {
+        self.unhinted
     }
 
     /// Whether `approval_id` has push state (tests).
@@ -544,6 +577,30 @@ impl HostPush {
         for id in gone {
             self.forget(&id);
         }
+    }
+
+    /// Forgets one tracked approval to make room, never a published
+    /// lifecycle: first one with nothing left to send (its resolution
+    /// acknowledged, or none ever owed), then one pending whose opens were
+    /// never published. False when there is none.
+    fn make_room(&mut self) -> bool {
+        let pick = |want: &dyn Fn(&Tracked) -> bool| {
+            self.order
+                .iter()
+                .find(|id| self.approvals.get(*id).is_some_and(want))
+                .cloned()
+        };
+        let victim =
+            pick(&|t: &Tracked| t.unacked.is_empty() && (t.approval.is_closed() || !t.published))
+                .or_else(|| pick(&|t: &Tracked| !t.approval.is_closed() && !t.published));
+        let Some(victim) = victim else {
+            return false;
+        };
+        log(&format!(
+            "approval {victim}: forgotten to make room (nothing published left to finish)"
+        ));
+        self.forget(&victim);
+        true
     }
 
     /// Drops an approval and everything of it still waiting.
