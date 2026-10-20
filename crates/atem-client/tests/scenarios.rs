@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 use support::*;
 use zeroize::Zeroizing;
 
-const T6: &str = "Task 6 (host durable membership state: carriage record, intent, fault record, held, restart replay)";
+const T6: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: durable state, faults, restart replay, held, on the real store)";
 const T7: &str = "Task 7 (host admission and effects: welcome fields, fences, attachments, leases, receipts, events)";
 
 /// Display clock of the backup writers: the fixtures' `k_backup` entries
@@ -500,10 +500,22 @@ impl<'a> HostSide<'a> {
                     self.faulted = true;
                     self.report.pending(format!("{kind} with disk state"), T6);
                 } else {
-                    // The verifier state is kept as written; making it
-                    // durable and reading it back is the host's.
-                    self.report
-                        .pending("restart_runtime: membership.json survives the restart", T6);
+                    // An orderly restart: every host's log goes through its
+                    // durable form (`membership.json`) and back. The host's
+                    // files, fsyncs and faults are checked by its own runner
+                    // (`src/session_protocol/membership`).
+                    for host in self.hosts.values_mut() {
+                        let stored = host.m.to_stored();
+                        let back = Membership::from_stored(
+                            host.m.account_id(),
+                            &host.m.genesis_hash(),
+                            &stored,
+                        )
+                        .unwrap_or_else(|e| panic!("stored log refused: {e}"));
+                        assert_eq!(back, host.m, "the stored log reads back unchanged");
+                        host.m = back;
+                    }
+                    self.report.pass();
                     self.replies.clear();
                 }
             }

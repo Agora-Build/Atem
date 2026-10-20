@@ -52,6 +52,7 @@ use crate::signed::SignedObject;
 pub mod draft;
 pub mod entry;
 pub mod publish;
+pub mod stored;
 pub mod wait;
 
 pub use draft::{draft_on, sign_entry, sign_entry_cosigned};
@@ -1877,6 +1878,11 @@ mod tests {
     /// the one built incrementally (conflicts are judged on replays).
     fn assert_replay(m: &Membership) {
         assert_eq!(m.derived_at(m.entries.len()), m.derived);
+        // The durable form reads back as the same state (§R9.3).
+        let stored = m.to_stored();
+        let back = Membership::from_stored(&m.account_id, &m.genesis_hash, &stored)
+            .unwrap_or_else(|e| panic!("stored form refused: {e}"));
+        assert_eq!(&back, m);
     }
 
     fn append(
