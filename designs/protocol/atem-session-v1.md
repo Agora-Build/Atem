@@ -2980,6 +2980,14 @@ approval's `expires_at + 300 000` passes. A broker restart ends the
 approvals (§G) and with them the resends; the relay's own guard (below)
 bounds what it still sends.
 
+Every relay message on Atem's link, in either direction, is at most
+262 144 bytes (256 KiB) as sent: Atem splits the hints due together over
+several `push_hint` messages (one hint, about 0.8–1.5 KiB, always fits),
+and the relay splits its acknowledgments over several `push_ack`
+messages (about 340 bytes an identity). Atem drops a larger relay
+message unread (counted in its log); what it would have acknowledged is
+resent and acknowledged again.
+
 **Clients:** a notification extension that can't use the device's
 `enc_key` while the screen is locked shows a generic "Atem on <host>
 needs approval" and the app reconnects; there is no separate push key
