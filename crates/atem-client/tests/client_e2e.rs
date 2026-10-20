@@ -599,7 +599,9 @@ fn a_phone_a_desktop_a_bot_and_a_browser_use_the_host() {
     world.set_wall(1_793_267_600_000);
     let mut ew = world.tcp();
     let browser_again = Device::browser(&world, grant_vector(), log.clone());
-    world.core.lock().unwrap().revoked.clear();
+    // (The revocation was journaled until the grant's expiry: it is gone
+    // now, and the grant is refused for its expiry.)
+    assert!(world.core.lock().unwrap().revoked.is_empty());
     assert_eq!(
         refused(browser_again.connect(&mut ew)),
         ("unauthorized".into(), Some("expired".into()))
@@ -616,19 +618,6 @@ fn a_phone_a_desktop_a_bot_and_a_browser_use_the_host() {
     // The natives never expire.
     let mut pw2 = world.tcp();
     assert!(phone.connect(&mut pw2).is_ok());
-    // The host journals revoked grant ids until their expiry, at most 256.
-    {
-        let mut core = world.core.lock().unwrap();
-        for i in 0..300 {
-            core.revoke(&format!("7b2d8c5a-0e3f-4a41-9c9d-{i:012}"));
-        }
-        assert_eq!(core.revoked.len(), 256);
-    }
-    world.advance(3_900_001);
-    assert!(
-        world.core.lock().unwrap().revoked.is_empty(),
-        "expired ids are dropped"
-    );
 }
 
 /// A phone carries a suffix (E7: it removes the bot); the host applies it
@@ -1395,4 +1384,69 @@ fn a_new_phone_restores_k_from_the_kit() {
         "{result:?}"
     );
     assert!(!flow.k_stored() && appended.is_empty());
+}
+
+/// The revoked-grant journal holds 256 unexpired revocations and refuses
+/// the next one with `busy` rather than evicting one: 256 junk
+/// `revoke_grant`s from a member with control (here the bot, which §R9.6
+/// allows to revoke) can't re-enable a real revoked grant. Ids drop out at
+/// their grant's expiry. A request the authority map doesn't know (a
+/// second `hello` inside the channel) is refused, never let through.
+#[test]
+fn junk_revocations_cannot_reenable_a_revoked_grant() {
+    let world = World::new(&L);
+    let log = world.log(&L);
+    let now = || world.mono();
+    let browser = Device::browser(&world, grant_vector(), log.clone());
+    let mut rw = world.tcp();
+    let mut r = browser.connect(&mut rw).unwrap();
+    let phone = Device::native(&world, "dev-phone", log.clone());
+    let mut pw = world.tcp();
+    let mut p = phone.connect(&mut pw).unwrap();
+    let (_, frame) = p
+        .revoke_grant("7b2d8c5a-0e3f-4a41-9c9d-3e4f5a6b7c8d", now())
+        .unwrap();
+    exchange(&mut p, &mut pw, &frame, now(), |e| {
+        e.iter().any(|e| matches!(e, Event::GrantRevoked { .. }))
+    });
+    let fence = rw.recv().unwrap();
+    assert!(matches!(
+        &r.on_frame(&fence, now()).unwrap()[..],
+        [Event::Fenced(_)]
+    ));
+    // The bot floods the journal: 255 more fit, the 256th is busy.
+    let bot = Device::service(&world, "svc-discord", log.clone());
+    let mut bw = world.unix();
+    let mut b = bot.connect(&mut bw).unwrap();
+    let mut busy = 0;
+    for i in 0..256 {
+        let (_, frame) = b
+            .revoke_grant(&format!("00000000-0000-4000-8000-{i:012}"), now())
+            .unwrap();
+        let ev = exchange(&mut b, &mut bw, &frame, now(), |e| !e.is_empty());
+        match &ev[..] {
+            [Event::GrantRevoked { .. }] => {}
+            [Event::Error(e)] if e.code == "busy" => busy += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(busy, 1, "only the 257th revocation is refused");
+    assert_eq!(world.core.lock().unwrap().revoked.len(), 256);
+    let mut rw2 = world.tcp();
+    assert_eq!(
+        refused(browser.connect(&mut rw2)),
+        ("unauthorized".into(), Some("grant revoked".into()))
+    );
+    // A second hello inside the channel isn't a request the map knows.
+    let hello = json!({"type": "session", "data": {"v": 1, "op": "hello",
+        "id": "aaaaaaaa-0000-4000-8000-0000000000c1", "revision": 9}});
+    let frame = p.send(&hello, now()).unwrap();
+    let ev = exchange(&mut p, &mut pw, &frame, now(), |e| !e.is_empty());
+    assert_eq!(error_code(&ev).as_deref(), Some("invalid_request"));
+    // At the grant's expiry its revocation drops out (the grant is refused
+    // for its expiry then); the junk ids stay until their own (1 h 5 min).
+    world.set_wall(1_793_267_600_000);
+    assert_eq!(world.core.lock().unwrap().revoked.len(), 255);
+    world.advance(3_900_001);
+    assert!(world.core.lock().unwrap().revoked.is_empty());
 }

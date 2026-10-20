@@ -119,28 +119,34 @@ pub enum Need {
 impl Need {
     /// What one request needs, from its family and `data` as received
     /// (before the strict field decode, so a principal outside its ops gets
-    /// `forbidden` and learns nothing from field validation). `None` for a
-    /// message a client may always send (`hello`) or one that isn't a
-    /// request (the host's own messages); the caller refuses those as before.
-    pub fn of_request(family: &str, data: &Value) -> Option<Need> {
-        let op = data.get("op").and_then(Value::as_str)?;
-        Some(match (family, op) {
+    /// `forbidden` and learns nothing from field validation).
+    ///
+    /// Fails closed: an op, family or submit kind this map doesn't name
+    /// (a host message, a second `hello` inside the channel, a removed
+    /// family, a new op) is `Err(Denied::InvalidRequest)`; the caller
+    /// refuses it, never lets it past unchecked.
+    pub fn of_request(family: &str, data: &Value) -> std::result::Result<Need, Denied> {
+        let unknown = Err(Denied::InvalidRequest);
+        let Some(op) = data.get("op").and_then(Value::as_str) else {
+            return unknown;
+        };
+        Ok(match (family, op) {
             ("session", "list" | "receipt_query") => Need::Op(Op::View),
             ("session", "acquire" | "renew" | "release") => Need::Lease,
-            ("session", "submit") => Need::Op(match data.get("kind").and_then(Value::as_str)? {
-                "prompt" => Op::Prompt,
-                "interrupt" => Op::Interrupt,
-                "stop" => Op::Stop,
-                "approval" => Op::Approval,
-                "approval_rule_revoke" => Op::RuleRevoke,
-                _ => return None,
+            ("session", "submit") => Need::Op(match data.get("kind").and_then(Value::as_str) {
+                Some("prompt") => Op::Prompt,
+                Some("interrupt") => Op::Interrupt,
+                Some("stop") => Op::Stop,
+                Some("approval") => Op::Approval,
+                Some("approval_rule_revoke") => Op::RuleRevoke,
+                _ => return unknown,
             }),
             ("session", "approval_seen") => Need::Seen,
             ("session", "revoke_grant") => Need::RevokeGrant,
             ("session", "membership") => Need::Op(Op::View),
             ("terminal", "input" | "resize") => Need::Op(Op::Terminal),
             ("terminal", "stop") => Need::Op(Op::Stop),
-            ("terminal", _) => Need::Op(Op::View),
+            ("terminal", "subscribe" | "unsubscribe" | "ack") => Need::Op(Op::View),
             ("agentChat", "submit") => {
                 if data.get("approval").is_some() {
                     Need::Op(Op::Approval)
@@ -150,8 +156,8 @@ impl Need {
                     Need::Op(Op::Prompt)
                 }
             }
-            ("agentChat", _) => Need::Op(Op::View),
-            _ => return None,
+            ("agentChat", "open" | "close" | "history") => Need::Op(Op::View),
+            _ => return unknown,
         })
     }
 
@@ -172,6 +178,8 @@ pub enum Denied {
     /// The session is outside its scope (or doesn't exist): the same answer
     /// in registry, chat, terminal and receipts alike (§R9.6).
     UnknownSession,
+    /// Not a request a client may send ([`Need::of_request`] fails closed).
+    InvalidRequest,
 }
 
 impl Denied {
@@ -179,6 +187,7 @@ impl Denied {
         match self {
             Denied::Forbidden => "forbidden",
             Denied::UnknownSession => "unknown_session",
+            Denied::InvalidRequest => "invalid_request",
         }
     }
 }
@@ -869,5 +878,66 @@ impl Refusal {
                 admission_error(admission, re).expect("a refusal is never a member")
             }
         }
+    }
+}
+
+/// The host's journal of revoked grant ids (§R9.6: "Atem journals revoked
+/// ids until their expiry, ≤ 256"). An id stays until its grant's expiry;
+/// when the journal is full of unexpired revocations a new one is refused
+/// (`busy`), never made room for: evicting an unexpired revocation would
+/// re-enable that grant, so junk revocations can't undo a real one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevokedGrants {
+    until: std::collections::BTreeMap<String, u64>,
+}
+
+/// The journal holds 256 unexpired revocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalFull;
+
+impl RevokedGrants {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `grant_id` as revoked until `until_wall_ms` (its grant's
+    /// expiry, or the latest a grant of that id could still live). Expired
+    /// entries are dropped first; a revocation already journaled keeps the
+    /// later of the two times.
+    pub fn revoke(
+        &mut self,
+        grant_id: &str,
+        until_wall_ms: u64,
+        now_wall_ms: u64,
+    ) -> std::result::Result<(), JournalFull> {
+        self.prune(now_wall_ms);
+        if let Some(t) = self.until.get_mut(grant_id) {
+            *t = (*t).max(until_wall_ms);
+            return Ok(());
+        }
+        if self.until.len() >= MAX_REVOKED_GRANTS {
+            return Err(JournalFull);
+        }
+        self.until.insert(grant_id.to_owned(), until_wall_ms);
+        Ok(())
+    }
+
+    /// Whether `grant_id` is revoked at `now_wall_ms`.
+    pub fn contains(&self, grant_id: &str, now_wall_ms: u64) -> bool {
+        self.until.get(grant_id).is_some_and(|t| now_wall_ms < *t)
+    }
+
+    /// Drops revocations whose grant has expired (an expired grant is
+    /// refused for its expiry anyway).
+    pub fn prune(&mut self, now_wall_ms: u64) {
+        self.until.retain(|_, t| now_wall_ms < *t);
+    }
+
+    pub fn len(&self) -> usize {
+        self.until.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.until.is_empty()
     }
 }

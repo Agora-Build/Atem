@@ -19,8 +19,8 @@ use atem_client::channel::wire::{self as chwire, Frame, Parsed};
 use atem_client::channel::{Channel, Principal};
 use atem_client::membership::{Effect, HostNow, Membership};
 use atem_client::principal::{
-    Authority, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS, MAX_REVOKED_GRANTS, Need,
-    Refusal, SessionRef, admission_error,
+    Authority, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS, JournalFull, Need, Refusal,
+    RevokedGrants, SessionRef, admission_error,
 };
 use atem_client::push::{self, HintPlain, HostApproval, Outbox, SeenOutcome};
 use atem_client::session::r9::{
@@ -73,9 +73,8 @@ pub struct HostCore {
     pub keys: SoftwareKeys,
     pub host_key: KeyId,
     pub sessions: Vec<HostSession>,
-    /// Revoked grant ids until their grant's expiry (wall ms), at most
-    /// `MAX_REVOKED_GRANTS` (§R9.6).
-    pub revoked: BTreeMap<String, u64>,
+    /// Revoked grant ids until their grant's expiry, at most 256 (§R9.6).
+    pub revoked: RevokedGrants,
     pub runtime_gen: String,
     attachments: BTreeMap<u64, Attachment>,
     leases: BTreeMap<String, Lease>,
@@ -114,7 +113,7 @@ impl HostCore {
             keys,
             host_key,
             sessions,
-            revoked: BTreeMap::new(),
+            revoked: RevokedGrants::new(),
             runtime_gen: "11111111-1111-4111-8111-111111111111".into(),
             attachments: BTreeMap::new(),
             leases: BTreeMap::new(),
@@ -136,7 +135,7 @@ impl HostCore {
     /// The host's wall clock jumps / time passes: expiry timers fence, and
     /// the outbox resends.
     pub fn tick(&mut self) {
-        self.prune_revoked();
+        self.revoked.prune(self.now.wall_ms);
         let now = self.now.wall_ms;
         let expired: Vec<u64> = self
             .attachments
@@ -152,9 +151,10 @@ impl HostCore {
     }
 
     /// Journals a revoked grant id until its grant's expiry: the expiry of
-    /// an attached browser holding it, else the longest a grant can still
-    /// live (1 h). At most 256 ids: the one expiring first goes.
-    pub fn revoke(&mut self, grant_id: &str) {
+    /// an attached browser holding it, else the latest a grant can still
+    /// live (1 h + 300 s of `issued_at` lead). Full of unexpired
+    /// revocations: refused (the caller answers `busy`).
+    pub fn revoke(&mut self, grant_id: &str) -> Result<(), JournalFull> {
         let now = self.now.wall_ms;
         let until = self
             .attachments
@@ -162,22 +162,7 @@ impl HostCore {
             .filter(|a| a.authority.name() == format!("browser:{grant_id}"))
             .find_map(|a| a.authority.expires_at)
             .unwrap_or(now + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
-        self.revoked.insert(grant_id.into(), until);
-        self.prune_revoked();
-        while self.revoked.len() > MAX_REVOKED_GRANTS {
-            let first = self
-                .revoked
-                .iter()
-                .min_by_key(|(_, until)| **until)
-                .map(|(id, _)| id.clone())
-                .unwrap();
-            self.revoked.remove(&first);
-        }
-    }
-
-    fn prune_revoked(&mut self) {
-        let now = self.now.wall_ms;
-        self.revoked.retain(|_, until| now < *until);
+        self.revoked.revoke(grant_id, until, now)
     }
 
     fn fence(&mut self, conn: u64, detail: &str) {
@@ -462,6 +447,7 @@ impl HostConn {
             }
             Principal::Browser { .. } => {
                 let revoked = core.revoked.clone();
+                let wall = now.wall_ms;
                 Authority::resolve(
                     &core.log,
                     &hello.proof.principal,
@@ -469,7 +455,7 @@ impl HostConn {
                     &core.host_id,
                     core.trust_gen,
                     &now,
-                    &|id| revoked.contains_key(id),
+                    &|id| revoked.contains(id, wall),
                 )
             }
         };
@@ -566,7 +552,16 @@ impl HostConn {
         // field decoding: the named session first (out of scope or unknown:
         // `unknown_session`), then the op (`forbidden`).
         let family = value["type"].as_str().unwrap_or_default().to_owned();
-        if let Some(need) = Need::of_request(&family, data) {
+        let need = match Need::of_request(&family, data) {
+            Ok(need) => need,
+            Err(denied) => {
+                return vec![match family.as_str() {
+                    "session" => error(denied.code(), None),
+                    _ => family_error(&family, data, denied.code()),
+                }];
+            }
+        };
+        {
             let named = Need::session_of(data)
                 .map(|sid| core.sessions.iter().find(|s| s.session_id == sid).cloned());
             let host_id = core.host_id.clone();
@@ -597,7 +592,9 @@ impl HostConn {
             match data["op"].as_str() {
                 Some("revoke_grant") => {
                     let grant_id = data["grant_id"].as_str().unwrap_or_default().to_owned();
-                    core.revoke(&grant_id);
+                    if core.revoke(&grant_id).is_err() {
+                        return vec![error(code::BUSY, Some("revoked grants journal full"))];
+                    }
                     core.fence_principal(&format!("browser:{grant_id}"), "grant revoked");
                     return vec![
                         r9::grant_revoked(&uuid(0x9000), &id)

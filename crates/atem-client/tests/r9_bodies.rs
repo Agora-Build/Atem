@@ -410,6 +410,26 @@ fn one_authority_check_per_request() {
         need("agentChat", json!({"op": "submit", "text": "x"})),
         Need::Op(Op::Prompt)
     );
+    // Fails closed: anything the map doesn't name is refused, never
+    // skipped (ops the r8 decoder accepts from a client, like `hello`,
+    // host messages, unknown kinds and families).
+    for (family, data) in [
+        ("session", json!({"op": "hello"})),
+        ("session", json!({"op": "welcome"})),
+        ("session", json!({"op": "submit", "kind": "reboot"})),
+        ("session", json!({"op": "submit"})),
+        ("session", json!({})),
+        ("terminal", json!({"op": "frame"})),
+        ("agentChat", json!({"op": "opened"})),
+        ("voiceCommand", json!({"op": "start"})),
+    ] {
+        assert_eq!(
+            Need::of_request(family, &data),
+            Err(Denied::InvalidRequest),
+            "{family} {data}"
+        );
+    }
+    assert_eq!(Denied::InvalidRequest.code(), "invalid_request");
     assert_eq!(
         Need::session_of(&json!({"binding": {"target": {"session_id": "ses-aaaaaaaaaaaa"}}})),
         Some("ses-aaaaaaaaaaaa")

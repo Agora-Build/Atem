@@ -34,7 +34,6 @@ use support::*;
 const T7: &str =
     "Task 7 (the runtime host: r8 events to other attachments, receipts, attachments, control_gen)";
 const T8: &str = "Task 8 (the runtime host's approvals and sealed push: approval cards, approval_closed, approvals_pending)";
-const LOST_ACK: &str = "Task 8, and a fixture question (report): the open hints are never acknowledged, so §R9.9 resends them every 10 s, yet the steps expect only push_seen at +10 s and nothing at +30 s";
 
 fn resolve(value: &Value, v: &Vectors, captured: &BTreeMap<String, Value>) -> Value {
     match value {
@@ -390,7 +389,6 @@ struct HostRun<'a> {
     /// Only connect/welcome are checked; the rest is pending (the
     /// multi-device arbitration is the real host's r8 machinery).
     connect_only: bool,
-    lost_ack: bool,
     report: Report,
 }
 
@@ -666,11 +664,6 @@ impl HostRun<'_> {
                 self.report.pass();
             }
             "expect_relay" => {
-                if self.lost_ack {
-                    self.report
-                        .pending("expect_relay after the lost ack", LOST_ACK);
-                    return;
-                }
                 let m = self
                     .core
                     .relay_sent
@@ -698,11 +691,6 @@ impl HostRun<'_> {
                 self.report.pass();
             }
             "expect_relay_none" => {
-                if self.lost_ack {
-                    self.report
-                        .pending("expect_relay_none after the lost ack", LOST_ACK);
-                    return;
-                }
                 assert_eq!(
                     self.core.relay_sent.len(),
                     self.relay_cursor,
@@ -711,15 +699,34 @@ impl HostRun<'_> {
                 );
                 self.report.pass();
             }
-            "relay_lost" | "relay_ack" => {
-                self.lost_ack = true;
-                self.report.pending(kind.to_string(), LOST_ACK);
+            "relay_lost" => {
+                // The last relay message never reached the relay: no ack
+                // comes, so it stays in the host's outbox (resent below).
+                assert!(
+                    !self.core.outbox.is_empty(),
+                    "{}: nothing unacknowledged",
+                    self.report.name
+                );
+                self.report.pass();
+            }
+            "relay_ack" => {
+                assert_eq!(step["relay_ack"]["op"], "push_ack");
+                let acks: Vec<push::Identity> = step["relay_ack"]["acks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| push::Identity::from_ack(a).expect("an ack entry names an identity"))
+                    .collect();
+                let before = self.core.outbox.len();
+                self.core.outbox.on_ack(&acks);
+                assert!(
+                    self.core.outbox.len() < before,
+                    "{}: the ack matched nothing",
+                    self.report.name
+                );
+                self.report.pass();
             }
             "advance_ms" => {
-                if self.lost_ack {
-                    self.report.pending("advance_ms (outbox resends)", LOST_ACK);
-                    return;
-                }
                 let ms = step["advance_ms"].as_u64().unwrap();
                 self.core.now.wall_ms += ms;
                 self.core.now.mono_ms += ms;
@@ -801,7 +808,6 @@ fn run_host(file: &Value, v: &Vectors, book: &Book) -> Report {
         captured: BTreeMap::new(),
         relay_cursor: 0,
         connect_only: name.starts_with("r9-multi-device-"),
-        lost_ack: false,
         report: Report {
             name: name.into(),
             ..Default::default()

@@ -2096,7 +2096,9 @@ fn push_hint() {
         run.pass(format!("invalid[{i}]: well-formed and host-signed"));
         // Every rule runs on the verifier's clock (verifier_now = the good
         // hint's created_at); the time rules and the duplicate check come
-        // before the sealed part (these hints carry none).
+        // before the sealed part, so each is refused for its stated reason
+        // whatever it carries (since ec54a5c they carry the sealed envelope
+        // like any open hint; their sealed part is checked below).
         let client = Hint::verify(&object, &log, now, Verifier::Client);
         let relay = Hint::verify(&object, &log, now, Verifier::Relay);
         match i {
@@ -2111,7 +2113,9 @@ fn push_hint() {
             3 => {
                 let mut book = HintBook::new();
                 assert_eq!(book.offer(open0.clone()), Ok(Accepted::Accepted));
-                assert_eq!(book.offer(client.unwrap()), Err(PushRefusal::Duplicate));
+                let dup = client.unwrap();
+                assert_eq!(dup.check_sealed(), Ok(()), "a well-sealed envelope");
+                assert_eq!(book.offer(dup), Err(PushRefusal::Duplicate));
                 assert_eq!(book.opens(open0.key())[0], &open0, "the first stays");
             }
             _ => panic!("an unexpected invalid hint"),
