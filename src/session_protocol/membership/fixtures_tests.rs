@@ -22,13 +22,14 @@
 use super::store::{DlFile, Injected, Step};
 use super::tests::{Rig, Vectors, clock, fixtures_dir, pinned, vectors};
 use super::*;
+use crate::runtime::project_scope::{CredAgentHasher, ProjectScopes, TableAgent};
 use crate::session_protocol::fake_runtime::FakeRuntime;
 use crate::session_protocol::file_journal::FileJournal;
 use crate::session_protocol::fixtures::{HostEvent, HostUnderTest};
 use crate::session_protocol::host::HostConfig;
 use crate::session_protocol::r9::envelope::{self, Event as EnvEvent, Transport};
 use crate::session_protocol::r9::{
-    DeviceList as R9List, HostKey, Limits, Now as R9Now, Parts as R9Parts, ProjectScope, R9Host,
+    DeviceList as R9List, HostKey, Limits, Now as R9Now, Parts as R9Parts, R9Host,
 };
 use crate::session_protocol::wire::Permission;
 use atem_client::channel::wire::{self as chwire, Frame};
@@ -38,19 +39,57 @@ use atem_client::membership::PairingRefusal;
 use atem_client::{KeyId, SignedObject, SoftwareKeys};
 use base64::Engine as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 const T8: &str = "Task 8 (sealed push: push_hint/push_seen to the relay, the relay's acks)";
 const CRATE: &str = "atem-client runners (keys, the client side, exact vector bytes)";
 const CHAIN_ONLY: &str = "the fixture's note: this host is outside the vectors (chain handling only; no atem-ch1 client can reach a host missing from its log)";
 const AUTH_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// What the fixture's sessions recorded as their launch project (the
-/// service `projects` scope, §R9.6).
-struct Projects(BTreeMap<String, String>);
+/// The service `projects` scopes (§R9.6) on the runtime's own path
+/// (`ProjectScopes`: the launch project recorded per session, its keyed
+/// hash per scope kid asked of a cred agent in `Crypt` requests, cached).
+/// The cred agent is a table agent answering with the fixture's recorded
+/// launch project hash (the fixtures name no `K`), unlocked.
+fn fixture_projects(projects: &BTreeMap<String, String>) -> ProjectScopes {
+    let agent = TableAgent::new(true);
+    let mut scopes = ProjectScopes::new(Arc::new(CredAgentHasher {
+        agent: agent.clone(),
+        astation_id: "astation-fixture".into(),
+    }));
+    let mut table = agent.table.lock().unwrap();
+    for (sid, hash) in projects {
+        let key = format!("fixture-project:{sid}");
+        if let Some(kid) = hash.strip_prefix("h1.").and_then(|r| r.split_once('.')) {
+            table.insert((key.clone(), kid.0.to_string()), hash.clone());
+        }
+        scopes.session(sid, Some(key));
+    }
+    drop(table);
+    scopes
+}
 
-impl ProjectScope for Projects {
-    fn matches(&self, session_id: &str, entry: &str) -> Option<bool> {
-        self.0.get(session_id).map(|p| p == entry)
+/// Runs the project scopes' hash jobs until nothing is pending.
+fn settle_projects(host: &mut HostRt) {
+    let mut kids = host.engine.scope_project_kids();
+    if let Some(m) = &host.m {
+        kids.extend(crate::runtime::project_scope::project_kids_of(
+            m.membership(),
+        ));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let fresh = host.projects.pass(&kids, std::time::Instant::now());
+        for sid in fresh {
+            host.rt.host.registry_resend(&sid);
+            let effects = host.rt.host.take_effects();
+            host.rt.apply(effects);
+            host.route();
+        }
+        if host.projects.idle(&kids) || std::time::Instant::now() > deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -84,7 +123,7 @@ struct HostRt {
     key: HostKey,
     link: u64,
     host_id: String,
-    projects: Projects,
+    projects: ProjectScopes,
     /// Client → its newest channel.
     chans: BTreeMap<String, Chan>,
     handles: u64,
@@ -495,13 +534,14 @@ impl Runner {
                 key: HostKey::new(&seed),
                 link: 1,
                 host_id,
-                projects: Projects(projects.clone()),
+                projects: fixture_projects(&projects),
                 chans: BTreeMap::new(),
                 handles: 0,
                 link_attached: false,
                 chain_only: BTreeSet::new(),
             };
             host.call(|e, p| ((), e.link_up(1, p)));
+            settle_projects(&mut host);
             self.hosts.insert(name, host);
         }
         let connected: Vec<String> = setup.get("connected").map(labels).unwrap_or_default();

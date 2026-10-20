@@ -51,6 +51,9 @@ pub(super) struct Rig {
     pub stalled: bool,
     pub link_gen: u64,
     pub host_id: String,
+    /// The runtime's project scopes (none: `NoProjects`, a rig that needs
+    /// no cred agent).
+    pub projects: Option<crate::runtime::project_scope::ProjectScopes>,
 }
 
 pub(super) fn now_at(wall: u64, mono: u64) -> Now {
@@ -145,6 +148,7 @@ impl Rig {
             stalled: false,
             link_gen: 0,
             host_id: host_id.to_string(),
+            projects: None,
         }
     }
 
@@ -163,7 +167,10 @@ impl Rig {
             host: &mut self.rt.host,
             list,
             now: self.now.clone(),
-            projects: &NoProjects,
+            projects: match &self.projects {
+                Some(p) => p,
+                None => &NoProjects,
+            },
         };
         let (out, effects) = f(&mut self.engine, &mut parts);
         self.rt.apply(effects);
@@ -187,7 +194,10 @@ impl Rig {
                     } => self.engine.deliver(
                         &attachment,
                         &message,
-                        &NoProjects,
+                        match &self.projects {
+                            Some(p) => p as &dyn ProjectScope,
+                            None => &NoProjects,
+                        },
                         &self.host_id,
                         self.now.host.mono_ms,
                     ),
@@ -1662,4 +1672,107 @@ fn a_removed_phones_queued_terminal_input_is_dropped_at_the_write_boundary() {
     assert_eq!(rig.rt.counter("pty_writes_remote").unwrap(), json!(0));
     assert_eq!(rig.rt.host.lease_holder(SID), None);
     assert_eq!(rig.rt.host.control_gen("member:dev-phone"), 2);
+}
+
+/// §R9.6 project scopes on the real path (`ProjectScopes` asking a cred
+/// agent through `Crypt`, here a table agent): a project-scoped bot sees
+/// nothing while the agent is locked (pending, out of scope), and once an
+/// unlock makes the hashes known it gets `session_changed` for its
+/// project's session only; its `list` then shows exactly that session.
+#[test]
+fn a_project_scoped_bot_sees_its_projects_sessions_only_after_an_unlock() {
+    use crate::runtime::project_scope::{CredAgentHasher, ProjectScopes, TableAgent};
+    let wall = r9log::host_now().wall_ms;
+    let mine = "h1.0a0b0c0d.1111111111111111111111111111111111111111111111111111111111111111";
+    let mut rig = Rig::with(|log| {
+        log.add_service_projects(
+            "svc-proj",
+            &[HOST],
+            Some(&[mine]),
+            None,
+            &["prompt", "view"],
+            wall + 3_600_000,
+        );
+    });
+    let agent = TableAgent::new(false);
+    {
+        let mut t = agent.table.lock().unwrap();
+        t.insert(
+            ("github.com/agora/mine".into(), "0a0b0c0d".into()),
+            mine.into(),
+        );
+        t.insert(
+            ("github.com/agora/other".into(), "0a0b0c0d".into()),
+            "h1.0a0b0c0d.2222222222222222222222222222222222222222222222222222222222222222".into(),
+        );
+    }
+    let mut scopes = ProjectScopes::new(std::sync::Arc::new(CredAgentHasher {
+        agent: agent.clone(),
+        astation_id: "astation-1".into(),
+    }));
+    scopes.session(SID, Some("github.com/agora/mine".into()));
+    scopes.session(SID_B, Some("github.com/agora/other".into()));
+    rig.projects = Some(scopes);
+    let settle = |rig: &mut Rig| -> Vec<String> {
+        let kids = rig.engine.scope_project_kids();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let fresh = rig
+                .projects
+                .as_mut()
+                .unwrap()
+                .pass(&kids, std::time::Instant::now());
+            if !fresh.is_empty() {
+                return fresh;
+            }
+            if std::time::Instant::now() > deadline {
+                return Vec::new();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    rig.link_up();
+    rig.connect(
+        "ch-proj",
+        Identity::service("svc-proj", r9log::auth("svc-proj")),
+    );
+    assert_eq!(rig.engine.scope_project_kids().len(), 1);
+    // Locked: nothing is in scope.
+    assert!(settle(&mut rig).is_empty());
+    assert!(*agent.requests.lock().unwrap() >= 1, "the agent was asked");
+    assert!(rig.list("ch-proj").is_empty());
+    // Unlocked: the hashes come, the descriptors go out again.
+    *agent.unlocked.lock().unwrap() = true;
+    let mut fresh = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fresh.is_empty() && std::time::Instant::now() < deadline {
+        // The retry after a locked answer is RETRY later.
+        let kids = rig.engine.scope_project_kids();
+        fresh = rig.projects.as_mut().unwrap().pass(
+            &kids,
+            std::time::Instant::now() + crate::runtime::project_scope::RETRY,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fresh.sort();
+    assert_eq!(fresh, vec![SID.to_string(), SID_B.to_string()]);
+    for sid in fresh {
+        rig.rt.host.registry_resend(&sid);
+        let effects = rig.rt.host.take_effects();
+        rig.run(|_, _| ((), effects));
+    }
+    rig.pump();
+    let changed: Vec<String> = rig
+        .events("ch-proj")
+        .into_iter()
+        .filter_map(|e| match e {
+            CEvent::Session(m) => match m.op {
+                R8Op::SessionChanged { descriptor, .. } => Some(descriptor.session_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(changed, vec![SID.to_string()], "only its project's session");
+    assert_eq!(rig.list("ch-proj"), vec![SID.to_string()]);
 }

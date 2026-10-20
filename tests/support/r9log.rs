@@ -176,6 +176,20 @@ impl TestLog {
         ops: &[&str],
         expires_at: u64,
     ) -> Value {
+        self.add_service_projects(device, hosts, None, sessions, ops, expires_at)
+    }
+
+    /// [`TestLog::add_service`] with a `projects` scope (`h1.<kid>.<hash>`
+    /// entries, §R9.6).
+    pub fn add_service_projects(
+        &mut self,
+        device: &str,
+        hosts: &[&str],
+        projects: Option<&[&str]>,
+        sessions: Option<&[&str]>,
+        ops: &[&str],
+        expires_at: u64,
+    ) -> Value {
         let s = secret(&format!("{device} auth"));
         self.keys.insert_ed25519(auth(device), &s);
         let mut ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
@@ -186,7 +200,11 @@ impl TestLog {
             kind: MemberKind::Service {
                 scope: Scope {
                     hosts: hosts.iter().map(|h| h.to_string()).collect(),
-                    projects: None,
+                    projects: projects.map(|p| {
+                        let mut v: Vec<String> = p.iter().map(|x| x.to_string()).collect();
+                        v.sort();
+                        v
+                    }),
                     sessions: sessions.map(|s| {
                         let mut v: Vec<String> = s.iter().map(|x| x.to_string()).collect();
                         v.sort();
