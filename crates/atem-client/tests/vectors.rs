@@ -22,7 +22,7 @@ use atem_client::membership::{
     RecoveryState, Role, Stop,
 };
 use atem_client::provider::sign;
-use atem_client::restore::{HostHead, restore};
+use atem_client::restore::{HeadError, HostAccept, restore};
 use atem_client::{Error, KeyId, KeyProvider, SignedObject, SoftwareKeys};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1133,13 +1133,30 @@ fn recovery() {
     };
     let full = entries(&["E1", "E2", "E3", "E4", "E5", "E6", "KB7", "KB8"]);
     let kb8 = full.last().unwrap();
-    let host_head = |entry: &Entry| HostHead {
-        host_id: "host-a".into(),
-        head: Head {
-            seq: entry.seq,
-            hash: entry.hash(),
-        },
+    // Each host's head as restore gets it: an init/accept pair signed with
+    // the host key (host-a's real key, or host-evil's for the substitute).
+    let accept_by = |key: &str, entry: &Entry| {
+        let mut pair = HostAccept {
+            e_c: [1; 32],
+            n_c: [2; 32],
+            genesis_hash: entries(&["E1"])[0].hash(),
+            host_id: "host-a".into(),
+            host_trust_gen: 1,
+            e_h: [3; 32],
+            n_h: [4; 32],
+            head: Head {
+                seq: entry.seq,
+                hash: entry.hash(),
+            },
+            sig: Vec::new(),
+        };
+        if key == "host-evil" {
+            pair.genesis_hash = entries(&["SUB1"])[0].hash();
+        }
+        pair.sig = sign(&book.provider, &book.signer(key), &pair.signing_input()).unwrap();
+        pair
     };
+    let host_head = |entry: &Entry| accept_by("host-a", entry);
     let now = HostNow {
         wall_ms: 1_793_264_200_000,
         mono_ms: 1,
@@ -1150,7 +1167,7 @@ fn recovery() {
     let restored = restore(&kit1, &full, env4.as_bytes(), &[host_head(kb8)], &now).unwrap();
     assert_eq!(restored.keys.len(), 3);
     assert_eq!(restored.keys[0].kid, s(&book.keys["K-gen-3"], "kid"));
-    let fail = |kit: &RecoveryKit, log: &[Entry], blob: &str, heads: &[HostHead]| {
+    let fail = |kit: &RecoveryKit, log: &[Entry], blob: &str, heads: &[HostAccept]| {
         restore(kit, log, blob.as_bytes(), heads, &now)
             .err()
             .unwrap()
@@ -1172,7 +1189,7 @@ fn recovery() {
     let sub = entries(&["SUB1", "SUB2", "SUB3"]);
     let sub_blob = sub_env.jcs();
     assert_eq!(
-        fail(&kit1, &sub, &sub_blob, &[host_head(&sub[2])]),
+        fail(&kit1, &sub, &sub_blob, &[accept_by("host-evil", &sub[2])]),
         "genesis_mismatch"
     );
     let member = Member {
@@ -1304,7 +1321,6 @@ fn channel_handshake() {
                 let input = SigningInput::new(SignLabel::ChannelHost, &unhex(s(case, "th2_hex")));
                 assert_eq!(host_key.verify(&input, &sig_h), Err(Error::BadSignature));
                 run.pass("negative tampered_head: sig_h fails over the rewritten th2");
-                run.pending("negative tampered_head: th2 from the rewritten head", TASK3);
             }
             "replayed_finish" => {
                 let input = SigningInput::new(SignLabel::ChannelHost, &unhex(s(case, "th2_hex")));
@@ -1340,8 +1356,38 @@ fn channel_handshake() {
         ],
         TASK3,
     );
-    run.pending("th2 from its transcript input (th2_input_hex)", TASK3);
-    run.get("th2_input_hex");
+    // th2 and sig_h from the init/accept messages, verified with host-a's
+    // key from log L (restore's HostAccept, §R9.7 steps 2–3).
+    let ml = load("r9-vectors-membership-log");
+    let ctx = Context::new(&ml["log"], &ml["others"], genesis_hash());
+    let log_l = ctx.chain(&[]);
+    let init = run.get("init");
+    let accept = run.get("accept");
+    let pair = HostAccept::from_messages(&strict(&init), &strict(&accept)).unwrap();
+    assert_eq!(pair.th2().to_hex(), run.get("th2_hex").as_str().unwrap());
+    let th2_input = run.get("th2_input_hex");
+    assert_eq!(Hash32::of(&unhex(th2_input.as_str().unwrap())), pair.th2());
+    assert_eq!(
+        hex(pair.signing_input().as_bytes()),
+        run.get("sig_h_input_hex").as_str().unwrap()
+    );
+    let verified = pair.verify(&log_l).unwrap();
+    assert_eq!(verified.head(), log_l.head());
+    run.pass("th2 from its transcript input, and sig_h verified with host-a's key from log L");
+    // The tampered head: the client's th2 changes and sig_h fails.
+    let tampered = &run.file["negative"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["case"] == "tampered_head")
+        .unwrap()
+        .clone();
+    let mut rewritten = accept.clone();
+    rewritten["head"] = tampered["head"].clone();
+    let forged = HostAccept::from_messages(&strict(&init), &strict(&rewritten)).unwrap();
+    assert_eq!(forged.th2().to_hex(), s(tampered, "th2_hex"));
+    assert_eq!(forged.verify(&log_l), Err(HeadError::BadSignature));
+    run.pass("negative tampered_head: th2 from the rewritten head; sig_h refused");
     run.finish();
 }
 

@@ -21,7 +21,7 @@ use atem_client::encoding::{Hash32, b64u_decode};
 use atem_client::kit::RecoveryKit;
 use atem_client::membership::publish::{AppendReply, Published, Publisher};
 use atem_client::membership::{Admission, Conflict, Member, MemberKind, Membership, Role, Stop};
-use atem_client::restore::{HostHead, RestoreError, restore};
+use atem_client::restore::{HostAccept, RestoreError, restore};
 use serde_json::{Map, Value, json};
 use support::*;
 use zeroize::Zeroizing;
@@ -1182,19 +1182,43 @@ impl<'a> ClientSide<'a> {
                 let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
                 let blob = resolve(&spec["relay_blob"], self.v, &self.named);
                 let blob = KBackupEnvelope::from_strict(&strict(&blob)).unwrap().jcs();
-                let heads: Vec<HostHead> = spec["host_heads"]
+                // Each host answers the device's init with an accept signed
+                // by the host key the served chain records for it (the real
+                // host-a, or the substitute chain's own host).
+                let served = self.v.entries(&refs);
+                let host_key = |host: &str| {
+                    let record = served
+                        .iter()
+                        .rev()
+                        .find_map(|e| match &e.action {
+                            atem_client::membership::Action::AddHost { host: h }
+                                if h.host_id == host =>
+                            {
+                                Some(h.host_key.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    ["host-a/host_key", "host-evil/host_key"]
+                        .into_iter()
+                        .find(|id| self.book.public(id) == record)
+                        .map(atem_client::KeyId::new)
+                        .unwrap()
+                };
+                let heads: Vec<HostAccept> = spec["host_heads"]
                     .as_object()
                     .unwrap()
                     .iter()
-                    .map(|(host, label)| HostHead {
-                        host_id: host.clone(),
-                        head: self.v.head(label.as_str().unwrap()),
+                    .map(|(host, label)| {
+                        signed_accept(
+                            &self.book.provider,
+                            &host_key(host),
+                            served[0].hash(),
+                            host,
+                            self.v.head(label.as_str().unwrap()),
+                        )
                     })
                     .collect();
-                if !heads.is_empty() {
-                    self.report
-                        .pending("restore: verify each accept head's sig_h", T3);
-                }
                 let result = restore(
                     &kit,
                     &self.v.entries(&refs),

@@ -370,3 +370,28 @@ impl FakeRelay {
         self.blobs.keys().copied().collect()
     }
 }
+
+/// A host's `init`/`accept` pair as a restoring device gets it (§R9.7):
+/// `head` signed by `key` (the host's `host_channel_key`) over `th2` for the
+/// log `genesis_hash`, `host_id` at trust generation 1.
+pub fn signed_accept(
+    provider: &dyn KeyProvider,
+    key: &KeyId,
+    genesis_hash: Hash32,
+    host_id: &str,
+    head: Head,
+) -> atem_client::restore::HostAccept {
+    let mut pair = atem_client::restore::HostAccept {
+        e_c: [1; 32],
+        n_c: [2; 32],
+        genesis_hash,
+        host_id: host_id.into(),
+        host_trust_gen: 1,
+        e_h: [3; 32],
+        n_h: [4; 32],
+        head,
+        sig: Vec::new(),
+    };
+    pair.sig = atem_client::provider::sign(provider, key, &pair.signing_input()).unwrap();
+    pair
+}

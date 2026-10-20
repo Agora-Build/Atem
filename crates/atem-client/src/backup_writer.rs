@@ -431,13 +431,16 @@ impl BackupWriter {
         let Phase::Fetch { lost, .. } = self.phase else {
             return Step::Failed(BackupError::UnexpectedReply);
         };
+        let before = log.head();
         let eval = log.evaluate_objects(entries, now);
         let stop = eval.stop.clone();
         *log = eval.next;
         match stop {
             Some(Stop::Invalid { .. }) => return self.fail(BackupError::RelayInvalid),
+            // Unverified entries that don't chain from ours: not signed
+            // conflicting history; give up for now and refetch later.
+            Some(Stop::NeedBefore { .. }) => return self.fail(BackupError::RelayInconsistent),
             Some(Stop::Frozen)
-            | Some(Stop::NeedBefore { .. })
             | Some(Stop::Conflict {
                 outcome: Conflict::Freeze,
                 ..
@@ -450,6 +453,11 @@ impl BackupWriter {
             _ => {}
         }
         if more {
+            // A page that says more follow must move the log; otherwise the
+            // relay could keep us fetching forever.
+            if log.head() == before {
+                return self.fail(BackupError::RelayInconsistent);
+            }
             self.phase = Phase::Fetch {
                 after: log.head().seq,
                 lost,

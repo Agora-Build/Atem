@@ -15,9 +15,9 @@ use atem_client::membership::{
     KitMode, Member, MemberKind, Membership, RECOVERY_SIGNER, RECOVERY_WAIT_MS, RecoveryState,
     Role, RolesChange, Scope, Stop, draft_on, sign_entry,
 };
-use atem_client::restore::{HostHead, restore};
+use atem_client::restore::restore;
 use atem_client::{Alg, KeyId, KeyProvider, PublicKey, SignedObject, SoftwareKeys};
-use support::{Clock, FakeRelay, RelayAppend};
+use support::{Clock, FakeRelay, RelayAppend, signed_accept};
 use zeroize::Zeroizing;
 
 const ACCOUNT: &str = "acct-e2e";
@@ -188,6 +188,8 @@ struct World {
     ipad: Device,
     bot_key: PublicKey,
     kit: RecoveryKit,
+    /// host-a's `host_channel_key` (it signs `accept` heads).
+    host_keys: SoftwareKeys,
 }
 
 fn world() -> World {
@@ -248,6 +250,7 @@ fn world() -> World {
         ipad,
         bot_key,
         kit,
+        host_keys,
     }
 }
 
@@ -1033,10 +1036,13 @@ fn k_backup_allocation_survives_repeated_409s() {
         .map(|o| Entry::parse(o.clone()).unwrap())
         .collect();
     let blob = relay.blobs[&6].clone();
-    let host_head = HostHead {
-        host_id: "host-a".into(),
-        head: relay.head(),
-    };
+    let host_head = signed_accept(
+        &w.host_keys,
+        &KeyId::new("host"),
+        w.genesis,
+        "host-a",
+        relay.head(),
+    );
     let restored = restore(
         &w.kit,
         &entries,
@@ -1090,13 +1096,16 @@ fn a_restore_waits_for_a_host_head_and_publishes_a_pending_enrollment() {
         .unwrap();
     assert!(withheld.is_withheld());
     // A host signed a newer head than the relay showed: refused.
-    let ahead = HostHead {
-        host_id: "host-a".into(),
-        head: Head {
+    let ahead = signed_accept(
+        &w.host_keys,
+        &KeyId::new("host"),
+        w.genesis,
+        "host-a",
+        Head {
             seq: 99,
             hash: Hash32([1; 32]),
         },
-    };
+    );
     assert_eq!(
         restore(&w.kit, &entries, blob.as_bytes(), &[ahead], &now)
             .err()
@@ -1105,10 +1114,13 @@ fn a_restore_waits_for_a_host_head_and_publishes_a_pending_enrollment() {
         "log_behind_host"
     );
     // A head from a host the chain doesn't name proves nothing.
-    let stranger = HostHead {
-        host_id: "host-z".into(),
-        head: host.m.head(),
-    };
+    let stranger = signed_accept(
+        &w.host_keys,
+        &KeyId::new("host"),
+        w.genesis,
+        "host-z",
+        host.m.head(),
+    );
     assert!(
         restore(&w.kit, &entries, blob.as_bytes(), &[stranger], &now)
             .err()
@@ -1116,10 +1128,13 @@ fn a_restore_waits_for_a_host_head_and_publishes_a_pending_enrollment() {
             .is_withheld()
     );
     // Confirmed by host-a: restored, and the enrollment chains from it.
-    let confirmed = HostHead {
-        host_id: "host-a".into(),
-        head: host.m.head(),
-    };
+    let confirmed = signed_accept(
+        &w.host_keys,
+        &KeyId::new("host"),
+        w.genesis,
+        "host-a",
+        host.m.head(),
+    );
     let restored = restore(&w.kit, &entries, blob.as_bytes(), &[confirmed], &now).unwrap();
     assert_eq!(*restored.keys[0].k, [1; 32]);
     let mut new_keys = SoftwareKeys::new();
@@ -1134,10 +1149,13 @@ fn a_restore_waits_for_a_host_head_and_publishes_a_pending_enrollment() {
     assert!(matches!(adm, Admission::RecoveryPending { .. }));
     // Another kit (replaced or foreign) can't restore this account.
     let other = RecoveryKit::make(&[8; 32], ACCOUNT, w.genesis);
-    let confirmed = HostHead {
-        host_id: "host-a".into(),
-        head: w.relay.head(),
-    };
+    let confirmed = signed_accept(
+        &w.host_keys,
+        &KeyId::new("host"),
+        w.genesis,
+        "host-a",
+        w.relay.head(),
+    );
     let entries: Vec<Entry> = w
         .relay
         .log

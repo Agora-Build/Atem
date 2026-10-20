@@ -5,7 +5,7 @@
 mod support;
 
 use atem_client::backup::{BackupKey, KBackupEnvelope};
-use atem_client::backup_writer::{BackupError, BackupJob, BackupWriter, Step};
+use atem_client::backup_writer::{BackupError, BackupJob, BackupWriter, PutReply, Step};
 use atem_client::encoding::Hash32;
 use atem_client::kit::RecoveryKit;
 use atem_client::membership::publish::{AppendReply, Published, Publisher};
@@ -14,9 +14,9 @@ use atem_client::membership::{
     KBackupRecord, KitMode, Member, MemberKind, Membership, RECOVERY_SIGNER, RECOVERY_WAIT_MS,
     Role, Stop, draft_on, sign_entry, sign_entry_cosigned,
 };
-use atem_client::restore::{HostHead, restore};
+use atem_client::restore::{HeadError, HostAccept, restore};
 use atem_client::{Alg, KeyId, SignedObject, SoftwareKeys};
-use support::{FakeRelay, strict};
+use support::{FakeRelay, signed_accept, strict};
 use zeroize::Zeroizing;
 
 const ACCOUNT: &str = "acct-review";
@@ -338,9 +338,11 @@ fn the_publisher_never_rebuilds_on_an_unchanged_head() {
         entries: vec![y_entry.object().clone()],
         more: false,
     };
+    // Its signature was never checked: not signed conflicting history, so
+    // refetch an earlier window rather than stop signing (m-2).
     assert!(matches!(
         p.reply(reply, &mut log, &now(4)).unwrap(),
-        Published::Diverged { .. }
+        Published::RelayInconsistent { .. }
     ));
 
     // A window beyond an entry pending on this device's clock: wait.
@@ -479,32 +481,81 @@ fn a_restore_reads_through_a_past_recovery() {
         3 + RECOVERY_WAIT_MS,
     );
     let entries: Vec<Entry> = log.entries().to_vec();
-    let head = HostHead {
-        host_id: "host-a".into(),
-        head: log.head(),
-    };
+    let h = KeyId::new("h");
+    let head = signed_accept(&host_keys, &h, genesis_hash, "host-a", log.head());
     let fresh = now(10 + RECOVERY_WAIT_MS);
     // A fresh verifier alone stops at the subject's entry.
     let alone = Membership::verify_chain(ACCOUNT, &genesis_hash, &entries, &fresh).unwrap();
     assert!(alone.deferred.is_some());
     // With the host-signed head the restore reads through it.
-    let restored = restore(&kit1, &entries, env.jcs().as_bytes(), &[head], &fresh).unwrap();
+    let restored = restore(
+        &kit1,
+        &entries,
+        env.jcs().as_bytes(),
+        std::slice::from_ref(&head),
+        &fresh,
+    )
+    .unwrap();
     assert_eq!(restored.head, log.head());
     assert_eq!(*restored.keys[0].k, [7; 32]);
     // A head before the subject's entry confirms nothing beyond it.
-    let early = HostHead {
-        host_id: "host-a".into(),
-        head: Head {
+    let early = signed_accept(
+        &host_keys,
+        &h,
+        genesis_hash,
+        "host-a",
+        Head {
             seq: 3,
             hash: entries[2].hash(),
         },
-    };
+    );
     assert_eq!(
         restore(&kit1, &entries, env.jcs().as_bytes(), &[early], &fresh)
             .err()
             .unwrap()
             .code(),
         "no_backup"
+    );
+
+    // M-1: restore is fail-closed on host heads. A head whose sig_h doesn't
+    // verify with the chain's key for that host, or that names another log,
+    // proves nothing: the restore waits (withheld) instead of reading through.
+    let blob = env.jcs();
+    let mut other_keys = SoftwareKeys::new();
+    other_keys.generate(h.clone(), Alg::Ed25519).unwrap();
+    let wrong_key = signed_accept(&other_keys, &h, genesis_hash, "host-a", log.head());
+    let mut forged = head.clone();
+    forged.sig[0] ^= 1;
+    let other_log = signed_accept(&host_keys, &h, Hash32([9; 32]), "host-a", log.head());
+    let mut other_gen = head.clone();
+    other_gen.host_trust_gen = 2;
+    other_gen.sig =
+        atem_client::provider::sign(&host_keys, &h, &other_gen.signing_input()).unwrap();
+    let prefix = Membership::verify_chain(ACCOUNT, &genesis_hash, &entries, &fresh)
+        .unwrap()
+        .membership;
+    assert_eq!(wrong_key.verify(&prefix), Err(HeadError::BadSignature));
+    assert_eq!(forged.verify(&prefix), Err(HeadError::BadSignature));
+    assert_eq!(other_log.verify(&prefix), Err(HeadError::OtherGenesis));
+    assert_eq!(other_gen.verify(&prefix), Err(HeadError::UnknownHost));
+    assert_eq!(head.verify(&prefix).unwrap().head(), log.head());
+    for bad in [wrong_key, forged, other_log, other_gen] {
+        let refused = restore(&kit1, &entries, blob.as_bytes(), &[bad], &fresh)
+            .err()
+            .unwrap();
+        assert!(refused.is_withheld(), "{refused:?}");
+    }
+    // The pair also round-trips through its wire messages.
+    let init = serde_json::json!({"ch": "atem-ch1", "op": "init",
+        "e": atem_client::encoding::b64u(&head.e_c), "n": atem_client::encoding::b64u(&head.n_c),
+        "genesis_hash": genesis_hash.to_hex(), "host_id": "host-a", "host_trust_gen": 1});
+    let accept = serde_json::json!({"ch": "atem-ch1", "op": "accept",
+        "e": atem_client::encoding::b64u(&head.e_h), "n": atem_client::encoding::b64u(&head.n_h),
+        "head": {"seq": log.head().seq, "hash": log.head().hash.to_hex()},
+        "sig": atem_client::encoding::b64u(&head.sig)});
+    assert_eq!(
+        HostAccept::from_messages(&strict(&init), &strict(&accept)).unwrap(),
+        head
     );
 }
 
@@ -624,7 +675,7 @@ fn the_carriage_bound_is_on_the_received_bytes() {
     assert_eq!(
         eval.stop,
         Some(Stop::Invalid {
-            index: 1,
+            index: 0,
             reason: Invalid::CarriageTooLarge
         })
     );
@@ -632,4 +683,222 @@ fn the_carriage_bound_is_on_the_received_bytes() {
     let eval = host.evaluate(&carried, wire.to_string().len(), &now(2));
     assert_eq!(eval.stop, None);
     assert_eq!(eval.appended, 1);
+}
+
+/// I-1: a since-removed manager's stolen key signing a conflict aimed at the
+/// vetoed subject is ignored (row 5), not a freeze through row 2; a current
+/// manager's conflicting entry at the same seq still freezes (row 6).
+#[test]
+fn a_removed_managers_conflict_on_the_subject_is_ignored() {
+    let kit1 = kit(1);
+    let (mut host, mac_keys) = genesis(&kit1);
+    let (phone_keys, phone) = device("dev-phone", &ALL);
+    apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Add { member: phone },
+        1,
+    );
+    let (laptop_keys, laptop) = device("dev-laptop", &ALL);
+    apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Add { member: laptop },
+        2,
+    );
+    let (_, newmac) = device("dev-newmac", &ALL);
+    let recovery = apply(
+        &mut host,
+        RECOVERY_SIGNER,
+        &kit1,
+        &RecoveryKit::sign_id(),
+        Action::RecoveryAdd { member: newmac },
+        3,
+    );
+    let before_veto = host.clone();
+    apply(
+        &mut host,
+        "dev-phone",
+        &phone_keys,
+        &auth(),
+        Action::RecoveryVeto {
+            target: recovery.hash(),
+        },
+        4,
+    );
+    apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Remove {
+            device_id: "dev-laptop".into(),
+        },
+        5,
+    );
+    let remove_newmac = Action::Remove {
+        device_id: "dev-newmac".into(),
+    };
+    // The laptop (removed after the veto) at the veto's seq: ignored.
+    let body = before_veto.draft("dev-laptop", 6, &remove_newmac);
+    let stolen = sign_entry(&laptop_keys, &auth(), body).unwrap();
+    assert_eq!(
+        conflict_of(&host, &stolen, 7),
+        Some(Stop::Conflict {
+            index: 0,
+            outcome: Conflict::Ignored(EvidenceReason::SignerRemoved)
+        })
+    );
+    assert!(
+        host.evaluate_objects(&[stolen.object().clone()], &now(7))
+            .next
+            .frozen()
+            .is_none()
+    );
+    // The Mac, still a manager at the head: rows 4–6 apply, and row 6
+    // freezes.
+    let body = before_veto.draft("dev-mac", 6, &remove_newmac);
+    let current = sign_entry(&mac_keys, &auth(), body).unwrap();
+    assert_eq!(
+        conflict_of(&host, &current, 7),
+        Some(Stop::Conflict {
+            index: 0,
+            outcome: Conflict::Freeze
+        })
+    );
+}
+
+/// m-1: the byte bound can't be lifted by a wrong count (the entries' own
+/// encoding counts too), and `index` names the entry that crosses it.
+#[test]
+fn a_wrong_byte_count_cannot_lift_the_bound() {
+    let kit1 = kit(1);
+    let (host, mac_keys) = genesis(&kit1);
+    // Entries whose encodings add up past 256 KiB, built on a scratch log.
+    let mut scratch = host.clone();
+    let mut carried = Vec::new();
+    let mut total = 0;
+    let mut i = 0;
+    while total <= 256 * 1024 {
+        let (_, member) = device(&format!("dev-{i}"), &[Role::View]);
+        let entry = apply(
+            &mut scratch,
+            "dev-mac",
+            &mac_keys,
+            &auth(),
+            Action::Add { member },
+            i,
+        );
+        total += entry.object().to_json().to_string().len();
+        carried.push(strict(&entry.object().to_json()));
+        i += 1;
+        if carried.len() == 64 {
+            break;
+        }
+    }
+    if total > 256 * 1024 {
+        let eval = host.evaluate(&carried, 0, &now(1));
+        assert_eq!(
+            eval.stop,
+            Some(Stop::Invalid {
+                index: carried.len() - 1,
+                reason: Invalid::CarriageTooLarge
+            })
+        );
+    }
+    // 65 entries: the 65th (index 64) is named.
+    let mut many = Vec::new();
+    let mut scratch = host.clone();
+    for i in 0..65 {
+        let (_, member) = device(&format!("dev-m{i}"), &[Role::View]);
+        let entry = apply(
+            &mut scratch,
+            "dev-mac",
+            &mac_keys,
+            &auth(),
+            Action::Add { member },
+            i,
+        );
+        many.push(strict(&entry.object().to_json()));
+    }
+    let eval = host.evaluate(&many, 0, &now(1));
+    assert_eq!(
+        eval.stop,
+        Some(Stop::Invalid {
+            index: 64,
+            reason: Invalid::CarriageTooLarge
+        })
+    );
+}
+
+/// m-3: a fetched page that says more follow but doesn't move the log stops
+/// the writer as relay-inconsistent instead of fetching forever.
+#[test]
+fn a_fetch_without_progress_stops_the_writer() {
+    let kit1 = kit(1);
+    let (mut log, mac_keys) = genesis(&kit1);
+    let (phone_keys, phone) = device("dev-phone", &ALL);
+    apply(
+        &mut log,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Add { member: phone },
+        1,
+    );
+    let kit1 = RecoveryKit::make(&[1; 32], ACCOUNT, log.genesis_hash());
+    let mut relay = FakeRelay::with_log(object_list(&log, 0));
+    let keys = vec![BackupKey {
+        kid: "k1".into(),
+        k: Zeroizing::new([7; 32]),
+    }];
+    let (mut writer, step) = BackupWriter::start(
+        &log,
+        BackupJob {
+            kids: vec!["k1".into()],
+            kit: kit1.recovery_key(),
+            signer: "dev-mac".into(),
+        },
+    );
+    assert_eq!(step, Step::Seal { blob_version: 1 });
+    let env =
+        KBackupEnvelope::seal(ACCOUNT, log.genesis_hash(), 1, &kit1.recovery_key(), &keys).unwrap();
+    assert!(matches!(writer.sealed(&log, env, 1), Step::Sign { .. }));
+    let Step::Put { .. } = writer.sign(&mac_keys, &auth()) else {
+        panic!()
+    };
+    let Step::Append { entry, expected } = writer.put_reply(&log, PutReply::Stored) else {
+        panic!()
+    };
+    // The phone wins the seq; the relay's 409 says more follow.
+    let mut phone_log = log.clone();
+    let (_, tv) = device("dev-tv", &[Role::View]);
+    let won = apply(
+        &mut phone_log,
+        "dev-phone",
+        &phone_keys,
+        &auth(),
+        Action::Add { member: tv },
+        2,
+    );
+    relay.log.push(won.object().clone());
+    let reply = AppendReply::Conflict {
+        head: phone_log.head(),
+        entries: vec![won.object().clone()],
+        more: true,
+    };
+    let _ = (entry, expected);
+    let Step::Fetch { after } = writer.append_reply(&mut log, reply, &now(3), 3) else {
+        panic!()
+    };
+    assert_eq!(after, phone_log.head().seq);
+    // The next page is empty yet claims more: no progress.
+    assert_eq!(
+        writer.fetched(&mut log, &[], true, &now(4), 4),
+        Step::Failed(BackupError::RelayInconsistent)
+    );
 }

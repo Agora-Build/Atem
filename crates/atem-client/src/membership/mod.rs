@@ -665,10 +665,11 @@ impl Membership {
     /// with that host's key): an entry at or below it whose only problem is
     /// that it depends on a pending entry shows the pending entry took effect
     /// on that host (a host applies such entries only then), so it is
-    /// activated (`HostConfirmed`) instead of stopping there. Used by a
-    /// restore reading a log with a past recovery; only applied when the
-    /// chain holds `confirmed` itself.
-    pub fn verify_chain_confirmed(
+    /// activated (`HostConfirmed`) instead of stopping there. Restore-only
+    /// (an Atem interpretation, see `restore`): a host never verifies this
+    /// way, so it never records that reason. Only applied when the chain
+    /// holds `confirmed` itself.
+    pub(crate) fn verify_chain_confirmed(
         account_id: &str,
         genesis_hash: &Hash32,
         entries: &[Entry],
@@ -1250,21 +1251,29 @@ impl Membership {
         now: &HostNow,
     ) -> Evaluation {
         let parsed = carried.iter().map(Entry::from_strict).collect::<Vec<_>>();
-        self.evaluate_parsed(parsed, received_bytes, now)
+        let sizes = carried
+            .iter()
+            .map(|v| v.value().to_string().len())
+            .collect::<Vec<_>>();
+        self.evaluate_parsed(parsed, &sizes, received_bytes, now)
     }
 
     /// `evaluate` of signed objects already parsed (a client applying a
     /// relay reply it bounded itself); the bound is checked on their wire
     /// encoding.
     pub fn evaluate_objects(&self, carried: &[SignedObject], now: &HostNow) -> Evaluation {
-        let bytes = carried.iter().map(|o| o.to_json().to_string().len()).sum();
+        let sizes = carried
+            .iter()
+            .map(|o| o.to_json().to_string().len())
+            .collect::<Vec<_>>();
         let parsed = carried.iter().cloned().map(Entry::parse).collect();
-        self.evaluate_parsed(parsed, bytes, now)
+        self.evaluate_parsed(parsed, &sizes, 0, now)
     }
 
     fn evaluate_parsed(
         &self,
         parsed: Vec<Result<Entry, Invalid>>,
+        sizes: &[usize],
         received_bytes: usize,
         now: &HostNow,
     ) -> Evaluation {
@@ -1280,9 +1289,28 @@ impl Membership {
             return eval;
         }
         // 1. Shape: bounds, every body parses, contiguous ascending seq.
-        if parsed.len() > MAX_CARRIAGE_ENTRIES || received_bytes > MAX_CARRIAGE_BYTES {
+        // The byte bound is on the larger of the count the caller measured
+        // on the wire and the entries' own encoding, so a wrong count can't
+        // lift it. `index` names the entry that crosses the bound (the 65th,
+        // or the one whose bytes cross 256 KiB; the last one when only the
+        // received count does).
+        let mut total = 0;
+        let crossing = sizes.iter().position(|size| {
+            total += size;
+            total > MAX_CARRIAGE_BYTES
+        });
+        let too_large = if parsed.len() > MAX_CARRIAGE_ENTRIES {
+            Some(MAX_CARRIAGE_ENTRIES)
+        } else if let Some(index) = crossing {
+            Some(index)
+        } else if received_bytes > MAX_CARRIAGE_BYTES {
+            Some(parsed.len().saturating_sub(1))
+        } else {
+            None
+        };
+        if let Some(index) = too_large {
             eval.stop = Some(Stop::Invalid {
-                index: parsed.len().min(MAX_CARRIAGE_ENTRIES),
+                index,
                 reason: Invalid::CarriageTooLarge,
             });
             return eval;
@@ -1404,8 +1432,7 @@ impl Membership {
                 .decision
                 .as_ref()
                 .is_some_and(|d| d.reason == RecoveryReason::Vetoed && d.at_seq == seq)
-            && (against_prefix == Check::Deferred(target)
-                || self.signed_by_subject(theirs, &target))
+            && self.signed_by_subject(theirs, &target)
         {
             return self.freeze(seq, &ours, theirs, now, effects);
         }
@@ -1419,9 +1446,14 @@ impl Membership {
         {
             return self.ignore(theirs, EvidenceReason::LateDecision, now, effects);
         }
-        // Row 4: invalid against C[..seq-1] (a deferral there is no more
-        // valid than a bad signature: the signer held nothing here).
-        if against_prefix != Check::Valid {
+        // Row 4: invalid against C[..seq-1]. An entry that is only deferred
+        // there (validly signed; it waits on an entry pending at that
+        // position) is not invalid (§R9.2); rows 5 and 6 judge its signer.
+        // A deferred recovery-key signature (only a pending kit's key
+        // verifies it) is no current recovery key's: ignored as invalid.
+        let deferred_recovery =
+            theirs.signer == RECOVERY_SIGNER && matches!(against_prefix, Check::Deferred(_));
+        if matches!(against_prefix, Check::Invalid(_)) || deferred_recovery {
             return self.ignore(theirs, EvidenceReason::Invalid, now, effects);
         }
         // Row 5: the signer was removed or lost `manage` in C[seq..head]. The
@@ -1431,8 +1463,16 @@ impl Membership {
         if self.signer_removed_since(theirs, seq) {
             return self.ignore(theirs, EvidenceReason::SignerRemoved, now, effects);
         }
-        // Row 6: a manager at our head, or the recovery key.
-        self.freeze(seq, &ours, theirs, now, effects)
+        // Row 6: signed by the recovery key, or by a manager in effect at our
+        // head. A signer that holds nothing here (a recovery subject still
+        // pending or cancelled) is not a manager at the head: ignored.
+        let manager_at_head = self
+            .member(&theirs.signer)
+            .is_some_and(|m| m.status == MemberStatus::Active && m.member.is_manager());
+        if theirs.signer == RECOVERY_SIGNER || manager_at_head {
+            return self.freeze(seq, &ours, theirs, now, effects);
+        }
+        self.ignore(theirs, EvidenceReason::SignerRemoved, now, effects)
     }
 
     /// `entry` is signed by the subject of the pending-type entry `target`:

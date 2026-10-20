@@ -70,9 +70,10 @@ pub enum Published {
     /// device's clock: wait (don't rebuild on an unchanged head).
     Waiting { discarded: Prepared, on: Hash32 },
     /// The `409` didn't move our verified log to the head it reported (a
-    /// window that doesn't extend our log, an ignored conflicting entry, or
-    /// a head the entries don't reach): refetch later; never rebuild on the
-    /// unchanged head.
+    /// window that doesn't chain from our log, whose entries were therefore
+    /// never verified: refetch an earlier window; an ignored conflicting
+    /// entry; or a head the entries don't reach): refetch later; never
+    /// rebuild on the unchanged head.
     RelayInconsistent { discarded: Prepared, head: Head },
     /// The relay returned entries that don't verify.
     RelayInvalid {
@@ -224,11 +225,16 @@ impl Publisher {
                         outcome: Conflict::Freeze,
                         ..
                     })
-                    | Some(Stop::Frozen)
-                    // The relay's entry at a seq we hold doesn't chain from
-                    // ours: it showed two histories.
-                    | Some(Stop::NeedBefore { .. }) => Published::Diverged {
+                    | Some(Stop::Frozen) => Published::Diverged {
                         discarded: prepared,
+                    },
+                    // The window's entry at a seq we hold doesn't chain from
+                    // ours. Its signature was never checked, so this isn't
+                    // signed conflicting history (which stops signing):
+                    // refetch an earlier window.
+                    Some(Stop::NeedBefore { .. }) => Published::RelayInconsistent {
+                        discarded: prepared,
+                        head,
                     },
                     Some(Stop::Invalid { index, reason }) => Published::RelayInvalid {
                         discarded: prepared,
