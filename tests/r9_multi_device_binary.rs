@@ -640,6 +640,7 @@ fn an_approval_is_answered_by_one_device_while_another_holds_the_lease() {
 /// revoked, the bot is untouched, and the queued input is dropped at the
 /// write boundary, never written. The phone can't come back.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
 fn a_removal_carried_by_one_device_fences_anothers_attachments_and_drops_its_queued_input() {
     let mut rig = Rig::new();
     let (sid, fake) = rig.agent();
