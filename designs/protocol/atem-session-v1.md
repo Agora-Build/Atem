@@ -2840,20 +2840,23 @@ dropped and queues never grow without bound):
 |---|---|---|
 | record plaintext (R9.7) | 1 048 576 bytes | the sender refuses it locally; a peer past it fails the channel |
 | inner frame (compact) | a `ct` of at most 1 398 123 base64url characters (1 MiB + the 16-byte tag): the largest legal `rec` is 1 398 159 bytes, the largest `finish` 1 398 162 | `close{reason:"too_large"}` |
-| envelope as received | 2 097 152 bytes (2 MiB); the largest legal record with a 64-character handle is 1 398 279 bytes compact | `close{reason:"too_large"}` when the handle is readable, else dropped and logged |
+| envelope as received | 2 097 152 bytes (2 MiB); the largest legal record with a 64-character handle is 1 398 279 bytes compact | `close{reason:"too_large"}` when its first 4 KiB name its top-level `type` `channel` and `channel` (before `frame`; the message is never parsed), else dropped and logged |
 | open channels per link | 64 | the new channel: `close{reason:"busy"}` |
 | handshakes in progress per link (opened, not yet welcomed) | 16 | the new channel: `close{reason:"busy"}` |
 | bytes queued from Atem per channel (not yet taken by the link) | 4 MiB | that channel: `close{reason:"busy"}` |
-| `close`s Atem queues outside any channel (refused `open`s, `unknown_channel`) | 1024 queued, 16 a second | dropped and counted in runtime.log |
+| `close`s Atem queues outside any channel (refused `open`s, `unknown_channel`, and envelopes refused unread: `busy` when the broker's inbox is full, `too_large` over the envelope bound) | 1024 queued, 16 a second together, on one clock | dropped and counted in runtime.log |
+| `init`s per link (R9.7 "per transport") | 1 a second | clear `busy` error frame, then `close{reason:"busy"}` |
 
 **Overload.** When the link takes nothing (its writer is backed up), Atem
 keeps only what the bounds above allow: each channel's queue (4 MiB, then
 that channel is closed `busy`) and the closes queued outside a channel
 (1024; more are dropped and counted, never queued). When the link takes
 again, the queued closes go first, then the channels in turn, one
-message per channel per round, starting after the channel the link last
-refused, so one busy channel can't hold the others back.
-| `init`s per link (R9.7 "per transport") | 1 a second | clear `busy` error frame, then `close{reason:"busy"}` |
+message per channel per round, each round starting with the channel the
+link last refused, so one busy channel can't hold the others back and
+none is skipped. Restarting the channels on a live socket (6 above)
+keeps the closes already queued and queues a `close{closed}` per live
+handle (at most 64) behind them.
 
 Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
 fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
