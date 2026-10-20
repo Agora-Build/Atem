@@ -5,8 +5,9 @@ name: atem-client-bindings
 # test (a Kotlin phone and a Node/WASM browser against a test host over
 # loopback TCP), and the production packages for Astation (no test
 # features), uploaded as workflow artifacts, each with its SHA-256 sums and
-# source pin: the SwiftPM package with its xcframework, the WASM package and
-# the Kotlin/JVM bindings (designs/protocol/atem-client-bindings.md §7).
+# source pin: the SwiftPM package with its xcframework, the WASM package, the
+# Kotlin/JVM bindings and the Android libraries (arm64-v8a, armeabi-v7a,
+# x86_64) with their Kotlin (designs/protocol/atem-client-bindings.md §7).
 # Nothing is published to a registry; no secret is used.
 
 on:
@@ -57,6 +58,11 @@ env:
   JNA_SHA256: "4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae"
   # Must equal the wasm-bindgen version crates/atem-client-ffi pins.
   WASM_BINDGEN_VERSION: "0.2.101"
+  # The Android NDK (r28c), installed by the runner's sdkmanager, which
+  # verifies the package's checksum; the packaging script checks its
+  # Pkg.Revision. minSdk of the Android libraries.
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  ANDROID_API: "24"
 
 jobs:
   linux:
@@ -151,6 +157,63 @@ jobs:
         with:
           name: atem-client-kotlin-jvm-linux-x86-64-${{ env.ATEM_CLIENT_VERSION }}
           path: ${{ runner.temp }}/pkg-kotlin/
+          if-no-files-found: error
+
+  android:
+    name: Android libraries (arm64-v8a, armeabi-v7a, x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The packages are built from (and their pin names) the commit under
+          # review: a pull request's head, never GitHub's synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Android NDK (pinned)
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          (yes || true) | "$SDKMANAGER" --install "ndk;${ANDROID_NDK_VERSION}" >/dev/null
+          NDK="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
+          grep -qx "Pkg.Revision = ${ANDROID_NDK_VERSION}" "$NDK/source.properties"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      - name: Package version
+        run: |
+          set -euo pipefail
+          CRATE=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "ATEM_CLIENT_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Production package (Android libraries + Kotlin; no test features, no host)
+        run: |
+          set -euo pipefail
+          EXPECT_NDK="$ANDROID_NDK_VERSION" \
+            ./scripts/package-atem-client-bindings.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-android" android
+
+      - name: Check the package as Astation does (sums, pin, ELF machine, 16 KB alignment, exports)
+        run: |
+          set -euo pipefail
+          file "$RUNNER_TEMP"/pkg-android/*.zip
+          EXPECT_COMMIT="$ATEM_CLIENT_HEAD" READELF=readelf \
+            ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-android"
+          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["toolchain"]["android-ndk"] == sys.argv[2], p' \
+            "$RUNNER_TEMP/pkg-android/atem-client-$ATEM_CLIENT_VERSION-SOURCE.json" "$ANDROID_NDK_VERSION"
+          mkdir -p "$RUNNER_TEMP/android-x"
+          unzip -q "$RUNNER_TEMP/pkg-android/atem-client-$ATEM_CLIENT_VERSION-android.zip" -d "$RUNNER_TEMP/android-x"
+          file "$RUNNER_TEMP"/android-x/atem-client-android/jniLibs/*/libatem_client_ffi.so
+
+      - name: Upload the Android package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-android-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-android/
           if-no-files-found: error
 
   macos:

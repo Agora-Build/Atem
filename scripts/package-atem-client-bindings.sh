@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Usage: scripts/package-atem-client-bindings.sh <version> <output-dir> [wasm] [kotlin]
-#        (no kind: both)
+# Usage: scripts/package-atem-client-bindings.sh <version> <output-dir> [wasm] [kotlin] [android]
+#        (no kind: wasm and kotlin)
 #
 # The production atem-client binding packages for Astation (no test
 # features: `software-keys`, `test-vectors` and `host` are never in them),
@@ -15,6 +15,15 @@
 #           (<platform>/libatem_client_ffi.so|.dylib, platform as JNA names
 #           it), and atem-client-ffi-<version>.jar (the compiled bindings with
 #           the library inside, when KOTLINC and JNA_JAR are given)
+#   android atem-client-<version>-android.zip: atem-client-android/
+#           jniLibs/<abi>/libatem_client_ffi.so for arm64-v8a, armeabi-v7a
+#           and x86_64 (release cdylib, default features, linked by the
+#           NDK's clang for API level ANDROID_API, 16 KB LOAD alignment),
+#           kotlin/uniffi/atem_client_ffi/atem_client_ffi.kt (the same
+#           UniFFI Kotlin as the JVM package; it loads the library through
+#           JNA, so the app adds net.java.dev.jna:jna:<v>@aar) and
+#           README.txt. Each library's ELF class, machine and LOAD alignment
+#           are checked before it is packaged.
 #
 # Next to them: atem-client-<version>-SOURCE.json (commit, crate versions,
 # features, toolchains; scripts/atem-client-source-pin.sh) and
@@ -26,6 +35,10 @@
 # Toolchains are passed in, as for the conformance script:
 #   WASM_BINDGEN  wasm-bindgen CLI, exactly the version the crate pins
 #   KOTLINC, JNA_JAR  optional: the jar is built only with both
+#   ANDROID_NDK_HOME  android: the NDK; EXPECT_NDK (optional): the
+#                     Pkg.Revision it must have (CI pins it)
+#   ANDROID_API       android: the minimum API level (default 24)
+#   JNA_VERSION       android: the JNA version README.txt names (optional)
 set -euo pipefail
 VERSION="$1"
 OUT="$2"
@@ -101,6 +114,71 @@ if want kotlin; then
   fi
   FEATURES+=("kotlin: default (uniffi)")
   archive "atem-client-${VERSION}-kotlin-jvm-${PLATFORM}.tar.gz" "$WORK" atem-client-kotlin-jvm
+fi
+
+if want android; then
+  : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to the Android NDK}"
+  API=${ANDROID_API:-24}
+  NDK_REV=$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_NDK_HOME/source.properties")
+  [ -n "$NDK_REV" ] || { echo "android: no Pkg.Revision in $ANDROID_NDK_HOME/source.properties" >&2; exit 1; }
+  if [ -n "${EXPECT_NDK:-}" ] && [ "$NDK_REV" != "$EXPECT_NDK" ]; then
+    echo "android: NDK $NDK_REV, expected $EXPECT_NDK" >&2
+    exit 1
+  fi
+  [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] \
+    || { echo "android: packaged on Linux x86_64 only" >&2; exit 1; }
+  TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+  READELF="$TC/llvm-readelf"
+  # The Kotlin is generated from the host build, as for the JVM package.
+  cargo build -p atem-client-ffi --features bindgen
+  PKG="$WORK/atem-client-android"
+  mkdir -p "$PKG/kotlin"
+  "$TARGET/debug/uniffi-bindgen" generate --no-format --library "$TARGET/debug/libatem_client_ffi.so" \
+    --language kotlin --out-dir "$PKG/kotlin"
+  # abi, Rust target, NDK clang prefix, ELF class, ELF machine (readelf -h)
+  while read -r ABI TRIPLE CLANG CLASS MACHINE; do
+    T_UP=$(echo "$TRIPLE" | tr 'a-z-' 'A-Z_')
+    T_LO=$(echo "$TRIPLE" | tr '-' '_')
+    export "CARGO_TARGET_${T_UP}_LINKER=$TC/${CLANG}${API}-clang"
+    export "CC_${T_LO}=$TC/${CLANG}${API}-clang" "AR_${T_LO}=$TC/llvm-ar"
+    # Only the cdylib, its LOAD segments 16 KB aligned (Google Play requires
+    # it for 64-bit libraries; it also loads on 4 KB devices).
+    cargo rustc -p atem-client-ffi --lib --release --target "$TRIPLE" --crate-type cdylib \
+      -- -C link-arg=-Wl,-z,max-page-size=16384
+    SO="$TARGET/$TRIPLE/release/libatem_client_ffi.so"
+    HDR=$("$READELF" -hW "$SO")
+    echo "$HDR" | grep -Eq "^ *Class: +$CLASS\$" \
+      || { echo "android $ABI: not $CLASS" >&2; echo "$HDR" >&2; exit 1; }
+    echo "$HDR" | grep -Eq "^ *Machine: +$MACHINE\$" \
+      || { echo "android $ABI: not $MACHINE" >&2; echo "$HDR" >&2; exit 1; }
+    ALIGNS=$("$READELF" -lW "$SO" | awk '$1 == "LOAD" {print $NF}' | sort -u)
+    [ "$ALIGNS" = 0x4000 ] \
+      || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000 (16 KB)" >&2; exit 1; }
+    mkdir -p "$PKG/jniLibs/$ABI"
+    cp "$SO" "$PKG/jniLibs/$ABI/"
+  done <<'ABIS'
+arm64-v8a aarch64-linux-android aarch64-linux-android ELF64 AArch64
+armeabi-v7a armv7-linux-androideabi armv7a-linux-androideabi ELF32 ARM
+x86_64 x86_64-linux-android x86_64-linux-android ELF64 Advanced.Micro.Devices.X86-64
+ABIS
+  cat >"$PKG/README.txt" <<README
+atem-client ${VERSION} for Android (the atem-session r9 client core).
+jniLibs/  libatem_client_ffi.so for arm64-v8a, armeabi-v7a and x86_64
+          (minSdk ${API}, LOAD segments 16 KB aligned): src/main/jniLibs/.
+kotlin/   the UniFFI Kotlin bindings (package uniffi.atem_client_ffi), added
+          to the app's sources. They load the library through JNA:
+          implementation("net.java.dev.jna:jna:${JNA_VERSION:-<version>}@aar")
+Check this archive against atem-client-${VERSION}-SHA256SUMS.txt and the
+source pin atem-client-${VERSION}-SOURCE.json.
+README
+  # Deterministic zip: sorted entries, one fixed time, no extra attributes.
+  (cd "$WORK" && find atem-client-android -type f | LC_ALL=C sort >"$WORK/android-entries" \
+    && TZ=UTC touch -d '1980-01-01 00:00:00' $(cat "$WORK/android-entries") \
+    && rm -f "$OUT/atem-client-${VERSION}-android.zip" \
+    && TZ=UTC zip -q -X -D "$OUT/atem-client-${VERSION}-android.zip" -@ <"$WORK/android-entries")
+  FILES+=("atem-client-${VERSION}-android.zip")
+  TOOLS+=("android-ndk=$NDK_REV")
+  FEATURES+=("android: default (uniffi), cdylib, minSdk $API, -z max-page-size=16384")
 fi
 
 PIN="atem-client-${VERSION}-SOURCE.json"

@@ -6,7 +6,9 @@
 # §7): the SHA-256 sums, the source pin, no test-only or host-role export
 # in the shipped bindings, and each package used once: the Node build of
 # the WASM package and the JVM jar (through JNA) both read the r9 pairing
-# vectors' verifyCommit messages with the shared parser.
+# vectors' verifyCommit messages with the shared parser. The Android zip:
+# each ABI's ELF class, machine, 16 KB LOAD alignment and exports (READELF,
+# default readelf).
 #   EXPECT_COMMIT  the full SHA the packages must pin (with a clean tree)
 #   NODE  node (default: node on PATH)
 #   JAVA, JAVAC  java and javac (default: on PATH), and JNA_JAR: the jar check
@@ -109,4 +111,34 @@ EOF
     "${JAVA:-java}" -cp "$WORK/java:$JAR:$JNA_JAR$STDLIB" Smoke "$VECTORS"
   fi
 done
+ANDROID="$DIR/atem-client-${VERSION}-android.zip"
+if [ -f "$ANDROID" ]; then
+  mkdir -p "$WORK/a"
+  unzip -q "$ANDROID" -d "$WORK/a"
+  PKG="$WORK/a/atem-client-android"
+  if grep -RqE "$FORBIDDEN" "$PKG/kotlin"; then
+    echo "android: a test-only or host-role export is in the package" >&2
+    exit 1
+  fi
+  READELF=${READELF:-readelf}
+  for spec in "arm64-v8a ELF64 AArch64" "armeabi-v7a ELF32 ARM" \
+    "x86_64 ELF64 Advanced.Micro.Devices.X86-64"; do
+    read -r ABI CLASS MACHINE <<<"$spec"
+    SO="$PKG/jniLibs/$ABI/libatem_client_ffi.so"
+    test -s "$SO" || { echo "android: no $ABI library" >&2; exit 1; }
+    HDR=$("$READELF" -hW "$SO")
+    echo "$HDR" | grep -Eq "^ *Class: +$CLASS\$" || { echo "android $ABI: not $CLASS" >&2; exit 1; }
+    echo "$HDR" | grep -Eq "^ *Machine: +$MACHINE\$" || { echo "android $ABI: not $MACHINE" >&2; exit 1; }
+    ALIGNS=$("$READELF" -lW "$SO" | awk '$1 == "LOAD" {print $NF}' | sort -u)
+    [ "$ALIGNS" = 0x4000 ] || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000" >&2; exit 1; }
+    if "$READELF" --dyn-syms -W "$SO" | grep -qiE 'sign_seen|admit_carrier|software_?key'; then
+      echo "android $ABI: a test-only or host-role symbol is exported" >&2
+      exit 1
+    fi
+    "$READELF" --dyn-syms -W "$SO" | grep -q 'uniffi_atem_client_ffi_fn_func_verify_commit_host_trust_gen' \
+      || { echo "android $ABI: the UniFFI exports are missing" >&2; exit 1; }
+    echo "android $ABI: $CLASS $MACHINE, LOAD aligned 16 KB"
+  done
+fi
+
 echo "atem-client packages ${VERSION}: ok"

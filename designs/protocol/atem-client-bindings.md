@@ -466,13 +466,18 @@ conformance builds add `software-keys,test-vectors,host`.
   the C header and `SHA256SUMS`. Add the package (local path, or the
   unzipped release asset) and `import AtemClient`. Platforms: macOS 14,
   iOS 17 (CryptoKit HPKE).
-- **Android/JVM:** build `libatem_client_ffi.so` per ABI (`cargo ndk -t
-  arm64-v8a -t armeabi-v7a -t x86_64 build -p atem-client-ffi --release`,
-  or `cargo build --target <android triple>` with the NDK linker), generate
-  Kotlin with `cargo run -p atem-client-ffi --features bindgen --bin
-  uniffi-bindgen -- generate --library <host lib> --language kotlin
-  --out-dir <dir>`, add `net.java.dev.jna:jna:5.19.1@aar` (Android) or the
-  JNA jar (JVM), put the `.so` files under `jniLibs/<abi>/`.
+- **Android:** `ANDROID_NDK_HOME=<ndk> scripts/package-atem-client-bindings.sh
+  <version> <out> android` (Linux x86_64; `rustup target add
+  aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`)
+  links the release cdylib for arm64-v8a, armeabi-v7a and x86_64 with the
+  NDK's clang (`ANDROID_API`, default 24) and `-z max-page-size=16384`,
+  checks each library's ELF class, machine and 16 KB LOAD alignment, and
+  zips them with the generated Kotlin. In the app: the `.so` files under
+  `src/main/jniLibs/<abi>/`, the Kotlin in its sources, and
+  `net.java.dev.jna:jna:5.19.1@aar`.
+- **JVM:** generate Kotlin with `cargo run -p atem-client-ffi --features
+  bindgen --bin uniffi-bindgen -- generate --library <host lib> --language
+  kotlin --out-dir <dir>` and use it with the JNA jar.
 - **WASM:** `rustup target add wasm32-unknown-unknown`; `cargo build -p
   atem-client-ffi --target wasm32-unknown-unknown --release
   --no-default-features --features wasm`; `wasm-bindgen --target web` (or
@@ -497,15 +502,18 @@ pin names exactly that commit with `tree_dirty: false`.
 | `atem-client-apple-swiftpm-<version>` | macos-latest (`scripts/package-atem-client-apple.sh`) | `atem-client-<version>-apple-swiftpm.zip` (the SwiftPM package `AtemClient` with `atem_client_ffiFFI.xcframework`), `atem-client-<version>-atem_client_ffiFFI.h`, `-SOURCE.json`, `-SHA256SUMS.txt` |
 | `atem-client-wasm-<version>` | ubuntu-latest (`scripts/package-atem-client-bindings.sh … wasm`) | `atem-client-<version>-wasm.tar.gz` (`atem-client-wasm/{web,nodejs,bundler}/`: `atem_client_ffi.js`, `atem_client_ffi_bg.wasm`, `.d.ts`), `-SOURCE.json`, `-SHA256SUMS.txt` |
 | `atem-client-kotlin-jvm-linux-x86-64-<version>` | ubuntu-latest (`… kotlin`) | `atem-client-<version>-kotlin-jvm-linux-x86-64.tar.gz` (`src/uniffi/atem_client_ffi/atem_client_ffi.kt`, `linux-x86-64/libatem_client_ffi.so`, `atem-client-ffi-<version>.jar`: the compiled bindings with the library inside, for JNA on a Linux JVM), `-SOURCE.json`, `-SHA256SUMS.txt` |
+| `atem-client-android-<version>` | ubuntu-latest, NDK r28c `28.2.13676358` (`… android`) | `atem-client-<version>-android.zip` (`atem-client-android/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libatem_client_ffi.so`: minSdk 24, LOAD segments 16 KB aligned; `kotlin/uniffi/atem_client_ffi/atem_client_ffi.kt`, the same source as the JVM package; `README.txt`), `-SOURCE.json`, `-SHA256SUMS.txt` |
 
-Android's per-ABI `.so` files are not built by CI yet: build them as
-above, with the Kotlin from the JVM package (the same generated source).
+CI checks the Android libraries the way `scripts/check-atem-client-packages.sh`
+does after a download: each ABI's ELF class and machine, every LOAD
+segment aligned to 16 KB, the UniFFI exports present and no test-only or
+host-role symbol. They are not run on a device or emulator in CI.
 
 `atem-client-<version>-SOURCE.json` is the source pin: `commit` (full SHA)
 and `tree_dirty`, `crates` (`atem-client`, `atem-client-ffi`, and
 `uniffi`, `wasm-bindgen` from `Cargo.lock`), `features`, and `toolchain`
 (`rustc`, `cargo`, and per package `wasm-bindgen-cli`, `kotlinc`, `jna`,
-`xcodebuild`, `swift`).
+`android-ndk`, `xcodebuild`, `swift`).
 
 To take one (`gh` with read access to the repository; artifacts expire
 after GitHub's retention, 90 days). `<sha>` is the full commit you were
