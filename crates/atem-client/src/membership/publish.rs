@@ -48,6 +48,58 @@ pub struct Prepared {
     pub signed: Option<Entry>,
 }
 
+impl Prepared {
+    /// The durable form: `{"body", "expected": {seq, hash}, "signed": <signed
+    /// entry> | null}` (store it in trusted local storage).
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "body": self.body,
+            "expected": self.expected.to_json(),
+            "signed": self.signed.as_ref().map(|e| e.object().to_json()),
+        })
+    }
+
+    /// Reads `to_json`'s form back: exactly those fields, and a signed entry
+    /// that is the stored body (the signature is checked against the chain
+    /// when the entry is applied).
+    pub fn from_json(value: &Value) -> Result<Prepared, Invalid> {
+        let o = value
+            .as_object()
+            .filter(|o| o.len() == 3)
+            .ok_or(Invalid::Malformed("prepared state"))?;
+        let (Some(body), Some(expected), Some(signed)) =
+            (o.get("body"), o.get("expected"), o.get("signed"))
+        else {
+            return Err(Invalid::Malformed("prepared state"));
+        };
+        let expected =
+            Head::from_json(expected).ok_or(Invalid::Malformed("prepared expected head"))?;
+        let signed = match signed {
+            Value::Null => None,
+            v => {
+                let bytes =
+                    crate::canonical::jcs(v).map_err(|_| Invalid::Malformed("prepared entry"))?;
+                Some(Entry::parse_bytes(bytes.as_bytes())?)
+            }
+        };
+        if let Some(entry) = &signed
+            && entry.object().body() != body
+        {
+            return Err(Invalid::Malformed(
+                "the signed entry is not the prepared body",
+            ));
+        }
+        if !body.is_object() {
+            return Err(Invalid::Malformed("prepared body"));
+        }
+        Ok(Prepared {
+            body: body.clone(),
+            expected,
+            signed,
+        })
+    }
+}
+
 /// What an append came to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Published {

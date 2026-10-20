@@ -315,6 +315,25 @@ impl RestoreFlow {
         }
     }
 
+    /// After a restart with an enrollment in flight (its persisted
+    /// [`RestoreFlow::prepared`]): the kit read again and the prepared
+    /// `recovery_add`, which is resent as is ([`RestoreFlow::outstanding`])
+    /// once [`RestoreFlow::attempt`] has confirmed the log again; `enroll`
+    /// refuses a new body while it is outstanding.
+    pub fn resume(kit: RecoveryKit, prepared: Prepared) -> Self {
+        RestoreFlow {
+            kit,
+            last: None,
+            restored: None,
+            publisher: Publisher::resume(Some(prepared)),
+        }
+    }
+
+    /// The enrollment to send (and resend after an uncertain outcome).
+    pub fn outstanding(&self) -> Option<(&Entry, Head)> {
+        self.publisher.outstanding()
+    }
+
     pub fn kit(&self) -> &RecoveryKit {
         &self.kit
     }

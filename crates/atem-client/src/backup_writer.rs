@@ -18,7 +18,7 @@
 //!   and never trusted.
 use std::collections::BTreeSet;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::backup::KBackupEnvelope;
 use crate::encoding::Hash32;
@@ -505,5 +505,180 @@ impl BackupWriter {
     /// The prepared entry (durable).
     pub fn prepared(&self) -> Option<&Prepared> {
         self.publisher.prepared()
+    }
+
+    /// The writer's durable form (§R9.5 "Writing a backup" step 2, §R9.4
+    /// rules 1 and 4): the job, the phase, the envelope and its version, the
+    /// versions uploaded and not committed, the last `max_occupied`, the
+    /// prepared entry and what was discarded. Store it after every call that
+    /// returns a step, before acting on the step. `None` once nothing is in
+    /// flight (`Done`, `Failed`).
+    pub fn to_json(&self) -> Option<Value> {
+        let phase = match &self.phase {
+            Phase::Seal { blob_version } => json!({"name": "seal", "blob_version": blob_version}),
+            Phase::Sign { then_upload } => json!({"name": "sign", "then_upload": then_upload}),
+            Phase::Upload => json!({"name": "upload"}),
+            Phase::Publish => json!({"name": "publish"}),
+            Phase::Fetch { after, lost } => {
+                json!({"name": "fetch", "after": after, "lost": lost.map(|h| h.to_hex())})
+            }
+            Phase::Done { .. } | Phase::Failed(_) => return None,
+        };
+        let discarded: Vec<Value> = self
+            .discarded
+            .iter()
+            .map(|d| match d {
+                Discarded::Envelope {
+                    blob_version,
+                    backup_hash,
+                } => json!({"envelope": {"blob_version": blob_version, "backup_hash": backup_hash.to_hex()}}),
+                Discarded::Entry { entry_hash } => json!({"entry": entry_hash.to_hex()}),
+            })
+            .collect();
+        Some(json!({
+            "v": 1,
+            "job": {"kids": self.job.kids, "kit": self.job.kit.to_json(), "signer": self.job.signer},
+            "phase": phase,
+            "envelope": self.envelope.as_ref().map(KBackupEnvelope::to_json),
+            "uploaded": self.uploaded.iter().collect::<Vec<_>>(),
+            "last_max_occupied": self.last_max_occupied,
+            "prepared": self.publisher.prepared().map(Prepared::to_json),
+            "discarded": discarded,
+        }))
+    }
+
+    /// A writer resumed from [`BackupWriter::to_json`] after a restart, and
+    /// the step to perform (the same one it stood at: the same body is
+    /// signed again, never a sibling).
+    pub fn from_json(value: &Value) -> Result<(BackupWriter, Step), Invalid> {
+        let bad = |what: &'static str| Invalid::Malformed(what);
+        let o = value.as_object().ok_or(bad("writer state"))?;
+        if o.get("v").and_then(Value::as_u64) != Some(1) || o.len() != 8 {
+            return Err(bad("writer state"));
+        }
+        let job = o.get("job").and_then(Value::as_object).ok_or(bad("job"))?;
+        let kids = job
+            .get("kids")
+            .and_then(Value::as_array)
+            .ok_or(bad("job kids"))?
+            .iter()
+            .map(|k| k.as_str().map(str::to_owned).ok_or(bad("job kids")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kit = PublicKey::from_json_as(
+            job.get("kit").ok_or(bad("job kit"))?,
+            crate::keys::Alg::Ed25519,
+        )
+        .map_err(|_| bad("job kit"))?;
+        let signer = job
+            .get("signer")
+            .and_then(Value::as_str)
+            .ok_or(bad("job signer"))?
+            .to_owned();
+        let u64_of = |v: Option<&Value>, what| v.and_then(Value::as_u64).ok_or(bad(what));
+        let phase_v = o
+            .get("phase")
+            .and_then(Value::as_object)
+            .ok_or(bad("phase"))?;
+        let phase = match phase_v.get("name").and_then(Value::as_str) {
+            Some("seal") => Phase::Seal {
+                blob_version: u64_of(phase_v.get("blob_version"), "phase")?,
+            },
+            Some("sign") => Phase::Sign {
+                then_upload: phase_v
+                    .get("then_upload")
+                    .and_then(Value::as_bool)
+                    .ok_or(bad("phase"))?,
+            },
+            Some("upload") => Phase::Upload,
+            Some("publish") => Phase::Publish,
+            Some("fetch") => Phase::Fetch {
+                after: u64_of(phase_v.get("after"), "phase")?,
+                lost: match phase_v.get("lost") {
+                    Some(Value::String(h)) => Some(Hash32::from_hex(h).map_err(|_| bad("phase"))?),
+                    _ => None,
+                },
+            },
+            _ => return Err(bad("phase")),
+        };
+        let envelope = match o.get("envelope") {
+            Some(Value::Null) | None => None,
+            Some(v) => {
+                let bytes = crate::canonical::jcs(v).map_err(|_| bad("envelope"))?;
+                Some(KBackupEnvelope::parse(bytes.as_bytes()).map_err(|_| bad("envelope"))?)
+            }
+        };
+        let uploaded = o
+            .get("uploaded")
+            .and_then(Value::as_array)
+            .ok_or(bad("uploaded"))?
+            .iter()
+            .map(|v| v.as_u64().ok_or(bad("uploaded")))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let last_max_occupied = match o.get("last_max_occupied") {
+            Some(Value::Null) | None => None,
+            v => Some(u64_of(v, "last_max_occupied")?),
+        };
+        let prepared = match o.get("prepared") {
+            Some(Value::Null) | None => None,
+            Some(v) => Some(Prepared::from_json(v)?),
+        };
+        let discarded = o
+            .get("discarded")
+            .and_then(Value::as_array)
+            .ok_or(bad("discarded"))?
+            .iter()
+            .map(|d| {
+                if let Some(e) = d.get("envelope") {
+                    Ok(Discarded::Envelope {
+                        blob_version: u64_of(e.get("blob_version"), "discarded")?,
+                        backup_hash: Hash32::from_hex(
+                            e.get("backup_hash")
+                                .and_then(Value::as_str)
+                                .ok_or(bad("discarded"))?,
+                        )
+                        .map_err(|_| bad("discarded"))?,
+                    })
+                } else {
+                    Ok(Discarded::Entry {
+                        entry_hash: Hash32::from_hex(
+                            d.get("entry")
+                                .and_then(Value::as_str)
+                                .ok_or(bad("discarded"))?,
+                        )
+                        .map_err(|_| bad("discarded"))?,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, Invalid>>()?;
+        // What each phase needs to go on.
+        let ok = match &phase {
+            Phase::Seal { .. } => prepared.is_none(),
+            Phase::Sign { .. } => prepared.is_some() && envelope.is_some(),
+            Phase::Upload => envelope.is_some(),
+            Phase::Publish => {
+                envelope.is_some() && prepared.as_ref().is_some_and(|p| p.signed.is_some())
+            }
+            Phase::Fetch { .. } => envelope.is_some(),
+            Phase::Done { .. } | Phase::Failed(_) => false,
+        };
+        if !ok {
+            return Err(bad("writer state for its phase"));
+        }
+        if let Some(e) = &envelope
+            && (e.kids != kids || e.recovery_key != kit)
+        {
+            return Err(bad("the envelope is not the job's"));
+        }
+        let writer = BackupWriter {
+            job: BackupJob { kids, kit, signer },
+            phase,
+            envelope,
+            uploaded,
+            last_max_occupied,
+            publisher: Publisher::resume(prepared),
+            discarded,
+        };
+        let step = writer.resume();
+        Ok((writer, step))
     }
 }
