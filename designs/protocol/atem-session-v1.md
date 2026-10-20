@@ -2865,7 +2865,16 @@ message per channel per round, each round starting with the channel the
 link last refused, so one busy channel can't hold the others back and
 none is skipped. Restarting the channels on a live socket (6 above)
 keeps the closes already queued and queues a `close{closed}` per live
-handle (at most 64) behind them.
+handle behind them. Each such close holds its channel's slot until the
+link takes it: while open channels plus these pending closes number 64, a
+new `open` is refused `busy` (a close outside a channel, under its bounds
+above), so however many restarts come, at most 64 of them are pending and
+at most 1024 + 64 closes are queued in all; none of them is dropped while
+the link generation lasts. A new link generation on the same socket hands
+the old generation's queued closes to the socket before anything of the
+new one; what the socket doesn't take then is dropped and counted (a
+handle is scoped to its generation, so a late close could end a new
+channel).
 
 Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
 fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
