@@ -2845,6 +2845,14 @@ dropped and queues never grow without bound):
 | handshakes in progress per link (opened, not yet welcomed) | 16 | the new channel: `close{reason:"busy"}` |
 | bytes queued from Atem per channel (not yet taken by the link) | 4 MiB | that channel: `close{reason:"busy"}` |
 | `close`s Atem queues outside any channel (refused `open`s, `unknown_channel`) | 1024 queued, 16 a second | dropped and counted in runtime.log |
+
+**Overload.** When the link takes nothing (its writer is backed up), Atem
+keeps only what the bounds above allow: each channel's queue (4 MiB, then
+that channel is closed `busy`) and the closes queued outside a channel
+(1024; more are dropped and counted, never queued). When the link takes
+again, the queued closes go first, then the channels in turn, one
+message per channel per round, starting after the channel the link last
+refused, so one busy channel can't hold the others back.
 | `init`s per link (R9.7 "per transport") | 1 a second | clear `busy` error frame, then `close{reason:"busy"}` |
 
 Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
