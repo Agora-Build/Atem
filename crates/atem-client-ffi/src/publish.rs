@@ -446,19 +446,39 @@ impl KBackupWriter {
     /// at the step it was at (`step()`).
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn resume(saved_json: String) -> Result<Arc<Self>> {
+        // `{"account_id", "writer"}`: the account is kept beside the crate's
+        // writer state so the device's claim names it even before a body is
+        // prepared.
         let value = strict(&saved_json)?;
-        let (writer, step) =
-            BackupWriter::from_json(&value).map_err(|r| AtemError::membership(&r, None))?;
-        let account_id = match writer.prepared() {
-            Some(p) => {
-                structural_entry(&p.body)?;
-                body_owner(&p.body)?.0
+        let o = value
+            .as_object()
+            .filter(|o| o.len() == 2)
+            .ok_or_else(|| AtemError::malformed("saved writer state"))?;
+        let account_id = o
+            .get("account_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| AtemError::malformed("saved writer account_id"))?
+            .to_owned();
+        let (writer, step) = BackupWriter::from_json(
+            o.get("writer")
+                .ok_or_else(|| AtemError::malformed("saved writer state"))?,
+        )
+        .map_err(|r| AtemError::membership(&r, None))?;
+        let owned_by_account = |a: &str| a == account_id;
+        if let Some(p) = writer.prepared() {
+            structural_entry(&p.body)?;
+            if !owned_by_account(&body_owner(&p.body)?.0) {
+                return Err(AtemError::malformed(
+                    "the prepared entry is another account's",
+                ));
             }
-            None => writer
-                .envelope()
-                .map(|e| e.account_id.clone())
-                .unwrap_or_default(),
-        };
+        }
+        if let Some(e) = writer.envelope()
+            && !owned_by_account(&e.account_id)
+        {
+            return Err(AtemError::malformed("the envelope is another account's"));
+        }
         let mut state = WriterState {
             writer: writer.clone(),
             step: step.clone(),
@@ -471,10 +491,14 @@ impl KBackupWriter {
         }))
     }
 
-    /// The durable state to persist after every call (none once nothing is
-    /// in flight: `Done`, `Failed`).
+    /// The durable state to persist after every call, before performing the
+    /// step (none once nothing is in flight: `Done`, `Failed`).
     pub fn prepared_json(&self) -> Option<String> {
-        self.lock().writer.to_json().map(|v| canonical_lossy(&v))
+        let state = self.lock();
+        let writer = state.writer.to_json()?;
+        Some(canonical_lossy(
+            &serde_json::json!({"account_id": state.account_id, "writer": writer}),
+        ))
     }
 
     /// The current step (what to do now).
@@ -493,6 +517,9 @@ impl KBackupWriter {
         let signed_at = safe_int(signed_at, "signed_at")?;
         let envelope = KBackupEnvelope::parse(envelope_json.as_bytes())?;
         let log = log.lock().clone();
+        if log.account_id() != self.lock().account_id {
+            return Err(AtemError::malformed("the log is another account's"));
+        }
         self.update(|w| w.sealed(&log, envelope, signed_at))
     }
 

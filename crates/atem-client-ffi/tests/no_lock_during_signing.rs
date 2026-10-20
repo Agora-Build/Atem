@@ -4,6 +4,9 @@
 //! (`ClientConnection::on_accept`), a browser grant, an entry and a K-backup
 //! entry. Before the fix, the grant and the handshake held the log's lock
 //! through the prompt and a UI thread reading the log blocked.
+// The provider-taking calls are the UniFFI layer's (default feature).
+#![cfg(feature = "uniffi")]
+
 #[path = "../../atem-client/tests/support/mod.rs"]
 #[allow(unused_imports)]
 mod support;

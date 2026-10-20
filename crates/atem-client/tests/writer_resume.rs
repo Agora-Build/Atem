@@ -79,8 +79,17 @@ fn a_restarted_writer_signs_the_same_body_and_resends_the_same_bytes() {
         panic!("append next");
     };
     let (mut again, step) = roundtrip(&resumed);
+    // §R9.5 step 6: the upload first (the same bytes), then the same entry.
     assert_eq!(
         step,
+        Step::Put {
+            blob_version: 1,
+            bytes: bb.clone()
+        },
+        "the upload is resent first"
+    );
+    assert_eq!(
+        again.put_reply(&log, PutReply::Stored),
         Step::Append {
             entry: entry.clone(),
             expected
@@ -120,6 +129,26 @@ fn damaged_or_inconsistent_writer_state_is_refused() {
     assert!(
         BackupWriter::from_json(&other_body).is_err(),
         "signed entry != body"
+    );
+    // Parts that don't belong together are refused.
+    let mut other_signer = saved.clone();
+    other_signer["job"]["signer"] = serde_json::json!("dev-phone");
+    assert!(
+        BackupWriter::from_json(&other_signer).is_err(),
+        "signer != job's"
+    );
+    let mut other_version = saved.clone();
+    other_version["envelope"]["blob_version"] = serde_json::json!(2);
+    assert!(
+        BackupWriter::from_json(&other_version).is_err(),
+        "body names another envelope"
+    );
+    let mut unsigned_upload = saved.clone();
+    unsigned_upload["prepared"]["signed"] = serde_json::Value::Null;
+    assert_eq!(unsigned_upload["phase"]["name"], "upload");
+    assert!(
+        BackupWriter::from_json(&unsigned_upload).is_err(),
+        "an upload needs its entry"
     );
     let mut extra = saved.clone();
     extra["x"] = serde_json::json!(1);

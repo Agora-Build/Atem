@@ -299,6 +299,17 @@ impl RestoreSession {
         let r = r32(&Zeroizing::new(r))?;
         let kit = RecoveryKit::read(&r, &account_id, hash_of(&genesis_hash)?, &tag16(&kit_tag)?)?;
         let prepared = prepared_from_json(&prepared_json)?;
+        // The kit's own `recovery_add` on this account's chain.
+        let body = &prepared.body;
+        if body["action"] != "recovery_add"
+            || body["signer"] != atem_client::membership::RECOVERY_SIGNER
+            || body["account_id"].as_str() != Some(kit.account_id())
+            || body["genesis_hash"].as_str() != Some(kit.genesis_hash().to_hex().as_str())
+        {
+            return Err(AtemError::malformed(
+                "the prepared entry is not this kit's recovery_add",
+            ));
+        }
         Ok(Arc::new(RestoreSession {
             inner: Mutex::new(RestoreFlow::resume(kit, prepared)),
         }))

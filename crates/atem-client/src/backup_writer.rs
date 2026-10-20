@@ -548,8 +548,10 @@ impl BackupWriter {
     }
 
     /// A writer resumed from [`BackupWriter::to_json`] after a restart, and
-    /// the step to perform (the same one it stood at: the same body is
-    /// signed again, never a sibling).
+    /// the step to perform: the one it stood at (the same body is signed
+    /// again, never a sibling), except that an append in flight resends the
+    /// upload first (§R9.5 step 6). Refuses parts that don't belong
+    /// together (phase, envelope, prepared entry, job).
     pub fn from_json(value: &Value) -> Result<(BackupWriter, Step), Invalid> {
         let bad = |what: &'static str| Invalid::Malformed(what);
         let o = value.as_object().ok_or(bad("writer state"))?;
@@ -654,7 +656,9 @@ impl BackupWriter {
         let ok = match &phase {
             Phase::Seal { .. } => prepared.is_none(),
             Phase::Sign { .. } => prepared.is_some() && envelope.is_some(),
-            Phase::Upload => envelope.is_some(),
+            Phase::Upload => {
+                envelope.is_some() && prepared.as_ref().is_some_and(|p| p.signed.is_some())
+            }
             Phase::Publish => {
                 envelope.is_some() && prepared.as_ref().is_some_and(|p| p.signed.is_some())
             }
@@ -669,6 +673,30 @@ impl BackupWriter {
         {
             return Err(bad("the envelope is not the job's"));
         }
+        // The prepared body is the job's signer's `k_backup` naming the
+        // stored envelope.
+        if let Some(p) = &prepared {
+            let record = &p.body["k_backup"];
+            let names_envelope = envelope.as_ref().is_some_and(|e| {
+                record["blob_version"].as_u64() == Some(e.blob_version)
+                    && record["backup_hash"].as_str() == Some(e.backup_hash().to_hex().as_str())
+            });
+            if p.body["action"] != "k_backup"
+                || p.body["signer"].as_str() != Some(signer.as_str())
+                || !names_envelope
+            {
+                return Err(bad(
+                    "the prepared entry is not the job's k_backup of the envelope",
+                ));
+            }
+        }
+        // §R9.5 step 6: after a restart the upload is resent before the
+        // entry (the relay may have collected an envelope it never saw
+        // named), as `restart` does.
+        let phase = match phase {
+            Phase::Publish => Phase::Upload,
+            other => other,
+        };
         let writer = BackupWriter {
             job: BackupJob { kids, kit, signer },
             phase,

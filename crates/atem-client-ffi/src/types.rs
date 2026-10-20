@@ -263,7 +263,9 @@ unit_enum! {
 }
 
 data_enum! {
-    /// The membership side of admitting a carrier (host role).
+    /// The membership side of admitting a carrier (host role, feature
+    /// `host`).
+    #[cfg(feature = "host")]
     pub enum AdmissionInfo {
         Frozen,
         Invalid { head: LogHead, index: u64, code: String, need_before: Option<u64> },

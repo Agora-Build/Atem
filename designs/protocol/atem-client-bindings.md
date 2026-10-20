@@ -172,6 +172,11 @@ After a restart: `EntryPublisher::resume(saved)`, then resend
 `outstanding()`, or `sign` again (a lost signature is re-made over the same
 body, the same `entry_hash`).
 
+The publisher gives up the device's claim (§5) as soon as the relay's
+answer is applied (`reply_stored` / `reply_conflict`), whatever the
+outcome: the body is then committed or discarded, and the next write may
+start.
+
 ### KBackupWriter (§R9.5 "Writing a backup")
 
 `KBackupWriter::start(log, kids, kit_recovery_key, signer)`, then perform
@@ -196,8 +201,18 @@ versions uploaded and not committed, the last `max_occupied`, the prepared
 `k_backup` body (and its signature once signed) and what was discarded;
 `None` once nothing is in flight (`Done`, `Failed`). After a restart,
 `KBackupWriter::resume(saved)` stands at the same step: it signs the same
-body again (same `entry_hash`, never a sibling), resends the same envelope
-and entry. Don't `start` a new backup while a saved one exists.
+body again (same `entry_hash`, never a sibling); a writer saved with its
+append in flight resends the same envelope first (`Put`, §R9.5 step 6),
+then the same signed entry (`Append`). Don't `start` a new backup while a
+saved one exists. `resume` refuses state whose parts don't belong together
+(the phase and what it needs, the prepared body naming the stored
+envelope's `blob_version` and `backup_hash`, the job's signer, the
+account).
+
+`sealed`, `sign`, `put_reply`, `append_*`, `fetched` and `restart` can
+also fail with `Publish{code: outstanding}`: applying the step would give
+the device a second prepared body while another publisher or writer of the
+same device holds one (§5).
 
 ### RecoveryKitHandle, K backups
 
@@ -227,7 +242,9 @@ and entry. Don't `start` a new backup while a saved one exists.
    After a restart in between: `RestoreSession::resume(r, account, genesis,
    tag, saved)`, `attempt(…)` with a new fetch, resend `outstanding()`, then
    `append_stored` / `append_conflict`; `enroll` is refused (`outstanding`)
-   while that `recovery_add` is in flight.
+   while that `recovery_add` is in flight. `resume` refuses a saved body
+   that isn't this kit's `recovery_add` (signer `recovery`, the kit's
+   account and genesis).
 4. `may_rotate_k(device)` / `may_seal_backup(device)` stay false until the
    recovery took effect.
 
@@ -416,7 +433,7 @@ Feature flags of `atem-client-ffi`:
 | `wasm` | the wasm-bindgen surface (`--no-default-features --features wasm`) |
 | `software-keys` | `SoftwareKeyStore` (bots, tests) |
 | `test-vectors` | raw primitive verification for the vectors (implies `software-keys`) |
-| `host` | host-role functions (`sign_seen`, `admit_carrier`), for the conformance and host-side tests |
+| `host` | host-role functions and types (`sign_seen`, `admit_carrier`, `AdmissionInfo`), for the conformance and host-side tests |
 
 Shipped artifacts use the defaults only (`wasm` alone for JS); the
 conformance builds add `software-keys,test-vectors,host`.
