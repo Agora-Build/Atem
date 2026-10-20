@@ -292,6 +292,17 @@ struct Verifier {
     device_id: String,
     nonce_s: [u8; 32],
     account: String,
+    /// r9: the account's device list (the Mac genesis, signed by `fake`).
+    log: std::cell::RefCell<crate::session_protocol::membership::r9log::TestLog>,
+}
+
+/// The host trust generation of the profile at `dir`.
+fn trust_gen(dir: &Path) -> u64 {
+    crate::pairing::load(&crate::profile::Sources::in_dir(dir))
+        .unwrap()
+        .binding
+        .unwrap()
+        .host_trust_gen
 }
 
 impl Verifier {
@@ -305,11 +316,16 @@ impl Verifier {
             .unwrap();
         let fake = FakeAstation::new();
         let nonce_s = [7u8; 32];
+        let log = crate::session_protocol::membership::r9log::TestLog::genesis(
+            account,
+            &fake.sign_secret_bytes(),
+        );
         peer.send(&AstationMessage::VerifyKeys {
             sign_pub: STANDARD.encode(fake.sign_pub()),
             enc_pub: STANDARD.encode(fake.enc_pub()),
             recovery_sign_pub: STANDARD.encode([6u8; 32]),
             nonce: STANDARD.encode(nonce_s),
+            genesis_hash: Some(log.genesis_hash().to_hex()),
         });
         Self {
             fake,
@@ -317,12 +333,12 @@ impl Verifier {
             device_id: commit["data"]["device_id"].as_str().unwrap().to_string(),
             nonce_s,
             account: account.to_string(),
+            log: std::cell::RefCell::new(log),
         }
     }
 
-    /// Waits for `verifyReveal`; the signed `deviceVerified` for it.
-    async fn certificate(&self, peer: &mut Peer) -> AstationMessage {
-        let reveal = peer.next("verifyReveal").await;
+    /// The signed `deviceVerified` for `reveal` (its list as it stands).
+    fn certificate_for(&self, reveal: &Value) -> AstationMessage {
         let key = |name: &str| -> [u8; 32] {
             STANDARD
                 .decode(reveal["data"][name].as_str().unwrap())
@@ -351,6 +367,53 @@ impl Verifier {
             device_verified: self.fake.sign(&certificate.encode()),
             account_state: self.fake.sign(&state.encode()),
             grants: Vec::new(),
+            membership: Some(json!({"entries": self.log.borrow().wire()})),
+        }
+    }
+
+    /// Waits for `verifyReveal`; the signed `deviceVerified` for it, with
+    /// the device list ending at this host's `add_host` (trust generation
+    /// `host_trust_gen`, the revealed host channel key).
+    async fn certificate(&self, peer: &mut Peer, host_trust_gen: u64) -> AstationMessage {
+        let reveal = peer.next("verifyReveal").await;
+        let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
+            reveal["data"]["host_channel_pub"].as_str().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        self.log
+            .borrow_mut()
+            .add_host_pub(&self.device_id, host_trust_gen, &host_pub);
+        let key = |name: &str| -> [u8; 32] {
+            STANDARD
+                .decode(reveal["data"][name].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let certificate = DeviceVerified {
+            account: self.account.clone(),
+            sign_gen: 1,
+            device_id: self.device_id.clone(),
+            device_pub: key("device_pub"),
+            device_sign_pub: key("device_sign_pub"),
+            unlock_auth_pub: key("unlock_auth_pub"),
+            transcript: transcript_for(&self.commitment, &key("nonce"), &self.nonce_s),
+            epoch: 1,
+        };
+        let state = AccountState {
+            account: self.account.clone(),
+            sign_gen: 1,
+            mode: crate::memory::crypto::EncryptionMode::Off,
+            kid: None,
+            epoch: 1,
+        };
+        AstationMessage::DeviceVerified {
+            device_verified: self.fake.sign(&certificate.encode()),
+            account_state: self.fake.sign(&state.encode()),
+            grants: Vec::new(),
+            membership: Some(json!({"entries": self.log.borrow().wire()})),
         }
     }
 }
@@ -638,7 +701,7 @@ async fn verify_until_the_question(
 ) -> (Op, u64, AstationMessage) {
     let op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
     let verifier = Verifier::keys(peer, account).await;
-    let certificate = verifier.certificate(peer).await;
+    let certificate = verifier.certificate(peer, trust_gen(&rt.profile)).await;
     let mut op = op;
     let (question, kind, text) = op.ask().await;
     assert_eq!(kind, AskKind::YesNo);
@@ -684,6 +747,14 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
             op.printed
         );
         assert!(verified_as(&rt.keys(), "acct-op"));
+        // r9: the ceremony pinned the account's device list and this host's
+        // channel key.
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(pairing.membership.exists(), "the device list is pinned");
+        assert!(
+            pairing.host_channel_key.exists(),
+            "with the host channel key"
+        );
 
         // The same link (never reconnected) is now a verified pairing: it
         // attaches, and sees the session the local frontend kept attached.
@@ -809,6 +880,7 @@ fn a_reply_without_an_operation_is_dropped() {
             device_verified: verifier.sign(b"x"),
             account_state: verifier.sign(b"y"),
             grants: Vec::new(),
+            membership: None,
         });
         peer.send(&AstationMessage::UnlockDenied {
             reason: "no".into(),
@@ -964,7 +1036,9 @@ fn first_pairing(leftover: Option<&str>) {
         });
         // Verification on the same connection, now the runtime's link.
         let verifier = Verifier::keys(&mut peer, "acct-new").await;
-        let certificate = verifier.certificate(&mut peer).await;
+        let certificate = verifier
+            .certificate(&mut peer, trust_gen(&rt.profile))
+            .await;
         let (question, _, _) = op.ask().await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -1379,6 +1453,93 @@ fn the_runtime_is_not_replaced_while_an_operation_runs() {
         // The operation goes on.
         op.answer(question, AnswerValue::No).await;
         assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        rt.shutdown().await;
+    });
+}
+
+/// r9 (no compatibility): an Astation whose `verifyKeys` names no device
+/// list can't pair; Atem aborts the verification and pins nothing.
+#[test]
+fn a_verify_keys_without_a_genesis_is_refused() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        peer.next("verifyCommit").await;
+        let fake = FakeAstation::new();
+        peer.send(&AstationMessage::VerifyKeys {
+            sign_pub: STANDARD.encode(fake.sign_pub()),
+            enc_pub: STANDARD.encode(fake.enc_pub()),
+            recovery_sign_pub: STANDARD.encode([6u8; 32]),
+            nonce: STANDARD.encode([7u8; 32]),
+            genesis_hash: None,
+        });
+        let abort = peer.next("verifyAbort").await;
+        assert_eq!(
+            abort["data"]["reason"],
+            "Atem needs a device list (atem-session r9)"
+        );
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!pending(&rt.keys()), "no pending pin");
+        rt.shutdown().await;
+    });
+}
+
+/// r9: a device list whose `add_host` names another key than the one this
+/// ceremony revealed is refused; the verification fails and nothing is
+/// pinned or trusted.
+#[test]
+fn a_device_list_for_another_host_key_fails_the_verification() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let verifier = Verifier::keys(&mut peer, "acct-op").await;
+        let reveal = peer.next("verifyReveal").await;
+        assert!(reveal["data"]["host_channel_pub"].is_string());
+        verifier.log.borrow_mut().add_host_pub(
+            &verifier.device_id,
+            trust_gen(&rt.profile),
+            &[9; 32],
+        );
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        let certificate = match verifier.certificate_for(&reveal) {
+            AstationMessage::DeviceVerified {
+                device_verified,
+                account_state,
+                grants,
+                ..
+            } => AstationMessage::DeviceVerified {
+                device_verified,
+                account_state,
+                grants,
+                membership: Some(json!({"entries": verifier.log.borrow().wire()})),
+            },
+            _ => unreachable!(),
+        };
+        peer.send(&certificate);
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            abort["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("host key or trust generation"),
+            "{abort}"
+        );
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
         rt.shutdown().await;
     });
 }

@@ -93,6 +93,16 @@ pub(super) fn pinned(labels: &[&str], now: &HostNow) -> Membership {
         .membership
 }
 
+/// host-a's `host_channel_key` seed (`r9-vectors-keys`).
+pub(super) fn host_a_seed() -> [u8; 32] {
+    let bytes = std::fs::read(fixtures_dir().join("r9-vectors-keys.json")).unwrap();
+    let file: Value = serde_json::from_slice(&bytes).unwrap();
+    let hex = file["keys"]["host-a"]["host_key"]["secret_hex"]
+        .as_str()
+        .unwrap();
+    Hash32::from_hex(hex).unwrap().0
+}
+
 pub(super) fn pin_a() -> HostPin {
     HostPin {
         host_id: "host-a".into(),
@@ -122,7 +132,7 @@ impl Rig {
 
     pub fn pin(&self, labels: &[&str]) {
         let m = pinned(labels, &clock(WALL0, 1_000, "boot-1"));
-        MembershipHost::pin(&self.pairing, &self.journal, &pin_a(), &m).unwrap();
+        MembershipHost::pin(&self.pairing, &self.journal, &pin_a(), &m, &host_a_seed()).unwrap();
     }
 
     pub fn open(
@@ -923,7 +933,7 @@ fn an_old_host_never_overwrites_a_new_pin() {
         host_id: "host-a".into(),
         host_trust_gen: 2,
     };
-    MembershipHost::pin(&rig.pairing, &rig.journal, &new_pin, &m).unwrap();
+    MembershipHost::pin(&rig.pairing, &rig.journal, &new_pin, &m, &host_a_seed()).unwrap();
     let before = std::fs::read(&rig.pairing.membership).unwrap();
     let later = clock(WALL0 + 120_000, 121_000, "boot-1");
     host.advance(&later, &mut f);
@@ -1168,7 +1178,7 @@ fn an_old_host_never_clears_a_newer_pins_fault() {
         host_id: "host-a".into(),
         host_trust_gen: 2,
     };
-    MembershipHost::pin(&rig.pairing, &rig.journal, &new_pin, &m).unwrap();
+    MembershipHost::pin(&rig.pairing, &rig.journal, &new_pin, &m, &host_a_seed()).unwrap();
     std::fs::write(&rig.pairing.fault, b"{}").unwrap();
     assert_eq!(
         host.hello("dev-phone", Some(v.head("E6")), None, false, &t0()),

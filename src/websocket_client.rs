@@ -314,12 +314,29 @@ pub enum AstationMessage {
 
     /// Astation → Atem: Astation's public keys and nonce, sent only after it
     /// stored the commitment. `sign_pub` is a 65-byte SEC1 P-256 point.
+    /// r9 (§R9.2 "Pairing"): `genesis_hash` (hex) names the account's
+    /// device list; a verifyKeys without it can't pin one and is refused.
     #[serde(rename = "verifyKeys")]
-    VerifyKeys { sign_pub: String, enc_pub: String, recovery_sign_pub: String, nonce: String },
+    VerifyKeys {
+        sign_pub: String,
+        enc_pub: String,
+        recovery_sign_pub: String,
+        nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        genesis_hash: Option<String>,
+    },
 
     /// Atem → Astation: the keys and nonce behind the commitment.
+    /// r9: `host_channel_pub` (base64url, §R9.1) is this host's new
+    /// `host_channel_key`, inside the commitment.
     #[serde(rename = "verifyReveal")]
-    VerifyReveal { device_pub: String, device_sign_pub: String, unlock_auth_pub: String, nonce: String },
+    VerifyReveal {
+        device_pub: String,
+        device_sign_pub: String,
+        unlock_auth_pub: String,
+        host_channel_pub: String,
+        nonce: String,
+    },
 
     /// Astation → Atem: after Touch ID, the signed device certificate, the
     /// signed account state, and signed grants (`K` when it exists).
@@ -329,6 +346,10 @@ pub enum AstationMessage {
         account_state: crate::memory::statements::SignedWire,
         #[serde(default)]
         grants: Vec<crate::memory::grant::GrantWire>,
+        /// r9: `{"entries": [...]}`, the device list from its genesis to
+        /// the `add_host` naming this host (§R9.2 "Pairing").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        membership: Option<serde_json::Value>,
     },
 
     /// Either side: verification was cancelled; discard everything from it.

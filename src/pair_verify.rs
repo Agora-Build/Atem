@@ -288,13 +288,28 @@ pub(crate) struct DeviceVerifiedReply {
     pub device_verified: SignedWire,
     pub account_state: SignedWire,
     pub grants: Vec<GrantWire>,
+    /// r9: the device list, genesis to this host's `add_host`.
+    pub membership: Option<serde_json::Value>,
 }
 
-/// Applies Astation's `deviceVerified` (`complete_verification`) only while
-/// the pairing the verification started under is current, under the pairing
-/// lock: a certificate that arrives after `atem unpair` (or a new `atem
-/// pair`) is dropped and nothing is pinned. `agent` must not be a
-/// `BoundAgent` (the lock is already held).
+/// What the ceremony pins for this host (r9 §R9.2 "Pairing").
+pub(crate) struct HostPinning<'a> {
+    /// Astation's keys from `verifyKeys` (its signing key and the genesis).
+    pub astation: &'a crate::memory::verification::AstationKeys,
+    /// This host's id (`atem_device_id`, the `device_id` of `verifyCommit`).
+    pub host_id: &'a str,
+    /// The `host_channel_key` seed this ceremony revealed.
+    pub host_seed: &'a [u8; 32],
+}
+
+/// Applies Astation's `deviceVerified` only while the pairing the
+/// verification started under is current, under the pairing lock: a
+/// certificate that arrives after `atem unpair` (or a new `atem pair`) is
+/// dropped and nothing is pinned. First the device list it carries is
+/// verified (r9 §R9.2: the whole chain, this host's `add_host` signed by the
+/// verified Astation, a genesis never frozen here) and pinned with the host
+/// channel key; then `complete_verification`; if that fails, the pin is
+/// taken back. `agent` must not be a `BoundAgent` (the lock is already held).
 pub(crate) fn apply_device_verified(
     capture: &crate::pairing::Captured,
     paths: &crate::paths::CredPaths,
@@ -302,9 +317,35 @@ pub(crate) fn apply_device_verified(
     astation_id: &str,
     keys: crate::memory::verification::VerificationKeys,
     reply: &DeviceVerifiedReply,
+    host: &HostPinning<'_>,
 ) -> Result<crate::memory::verification::VerificationOutcome> {
-    capture.bound_to(astation_id)?;
+    use crate::session_protocol::membership::{host_now, pairing as pin};
+    let binding = capture.bound_to(astation_id)?;
+    let host_trust_gen = binding.host_trust_gen;
+    let pairing = &capture.sources().paths.pairing;
     capture.apply(|| {
+        // The account the signed certificate names (checked again, with
+        // everything else, by `complete_verification`).
+        let fields = crate::memory::statements::verify_astation(
+            &host.astation.sign_pub,
+            &reply.device_verified,
+        )?;
+        let account = crate::memory::statements::DeviceVerified::parse(&fields)?.account;
+        let host_pub = ed25519_dalek::SigningKey::from_bytes(host.host_seed)
+            .verifying_key()
+            .to_bytes();
+        let inputs = pin::PairingInputs {
+            account_id: &account,
+            genesis_hash: host.astation.genesis_hash,
+            astation_sign_pub: &host.astation.sign_pub,
+            host_id: host.host_id,
+            host_trust_gen,
+            host_pub,
+        };
+        let log = pin::verify_pairing_log(reply.membership.as_ref(), &inputs, pairing, &host_now())
+            .map_err(|e| anyhow!("{e}"))?;
+        pin::pin_at_pairing_locked(pairing, &log, host.host_id, host_trust_gen, host.host_seed)
+            .map_err(|e| anyhow!("couldn't pin the device list: {e}"))?;
         crate::memory::verification::complete_verification(
             paths,
             agent,
@@ -314,6 +355,7 @@ pub(crate) fn apply_device_verified(
             &reply.account_state,
             &reply.grants,
         )
+        .inspect_err(|_| pin::unpin_locked(pairing))
     })
 }
 
@@ -332,10 +374,12 @@ pub(crate) async fn await_device_verified(
             device_verified,
             account_state,
             grants,
+            membership,
         })) => Ok(DeviceVerifiedReply {
             device_verified,
             account_state,
             grants,
+            membership,
         }),
         Ok(Ok(AstationMessage::VerifyAbort { reason })) => Err(VerifyFailure::by_astation(
             anyhow!("Astation declined device verification: {reason}"),
@@ -782,8 +826,21 @@ mod tests {
                 device_verified: wire(),
                 account_state: wire(),
                 grants: Vec::new(),
+                membership: None,
             };
             let keys = crate::memory::device_keys::DeviceKeys::generate().into();
+            let astation = crate::memory::verification::AstationKeys {
+                sign_pub: vec![4; 65],
+                enc_pub: [5; 32],
+                recovery_sign_pub: [6; 32],
+                nonce_s: [7; 32],
+                genesis_hash: [8; 32],
+            };
+            let host = HostPinning {
+                astation: &astation,
+                host_id: "host-1",
+                host_seed: &[9; 32],
+            };
             let error = apply_device_verified(
                 &capture,
                 &src.paths.cred,
@@ -791,11 +848,13 @@ mod tests {
                 "astation-1",
                 keys,
                 &reply,
+                &host,
             )
             .unwrap_err();
             assert_eq!(error.to_string(), crate::pairing::CHANGED);
             assert_eq!(crate::status::tests::snapshot(dir.path()), before);
             assert!(!src.paths.cred.trust.exists());
+            assert!(!src.paths.pairing.membership.exists(), "nothing pinned");
         }
     }
 }

@@ -539,7 +539,44 @@ pub(crate) async fn verify_device<U: OpUi>(
                 enc_pub,
                 recovery_sign_pub,
                 nonce,
-            } => AstationKeys::from_wire(&sign_pub, &enc_pub, &recovery_sign_pub, &nonce)?,
+                genesis_hash,
+            } => {
+                // r9 (no compatibility): the ceremony pins the account's
+                // device list; an Astation that names none can't pair.
+                let Some(genesis_hash) = genesis_hash else {
+                    let failure = VerifyFailure::local(
+                        "Atem needs a device list (atem-session r9)",
+                        anyhow!(
+                            "This Astation doesn't send a device list yet (atem-session r9). Update Astation, then run `atem pair verify`."
+                        ),
+                    );
+                    return Err(
+                        abandon_verification(client, &paths.trust, astation_id, failure).await,
+                    );
+                };
+                match AstationKeys::from_wire(
+                    &sign_pub,
+                    &enc_pub,
+                    &recovery_sign_pub,
+                    &nonce,
+                    &genesis_hash,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        let failure = VerifyFailure::local(
+                            format!("atem refused verifyKeys: {error:#}"),
+                            error,
+                        );
+                        return Err(abandon_verification(
+                            client,
+                            &paths.trust,
+                            astation_id,
+                            failure,
+                        )
+                        .await);
+                    }
+                }
+            }
             AstationMessage::VerifyAbort { reason } => {
                 bail!("Astation stopped device verification: {}", shown(&reason))
             }
@@ -553,6 +590,7 @@ pub(crate) async fn verify_device<U: OpUi>(
             device_pub: STANDARD.encode(reveal.device_pub),
             device_sign_pub: STANDARD.encode(reveal.device_sign_pub),
             unlock_auth_pub: STANDARD.encode(reveal.unlock_auth_pub),
+            host_channel_pub: atem_client::encoding::b64u(&reveal.host_channel_pub),
             nonce: STANDARD.encode(reveal.nonce_a),
         })
         .await?;
@@ -610,8 +648,14 @@ pub(crate) async fn verify_device<U: OpUi>(
         // The raw agent: the whole apply holds the pairing lock already.
         let (paths, agent, capture) = (paths.clone(), raw_agent.clone(), capture.clone());
         let astation_id = astation_id.to_string();
-        let keys = handshake.into_keys();
+        let (keys, host_seed) = handshake.into_parts();
+        let (astation, host_id) = (astation.clone(), device_id.clone());
         blocking(move || {
+            let host = crate::pair_verify::HostPinning {
+                astation: &astation,
+                host_id: &host_id,
+                host_seed: &host_seed,
+            };
             crate::pair_verify::apply_device_verified(
                 &capture,
                 &paths,
@@ -619,6 +663,7 @@ pub(crate) async fn verify_device<U: OpUi>(
                 &astation_id,
                 keys,
                 &reply,
+                &host,
             )
         })
         .await

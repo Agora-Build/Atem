@@ -60,12 +60,19 @@
 //! persists the time waited at least once a minute; [`MembershipHost::close`]
 //! at an orderly stop writes it with the clean checkpoint naming the run's
 //! `runtime_epoch`.
+pub mod pairing;
 pub mod store;
 
 #[cfg(test)]
 mod e2e_tests;
 #[cfg(test)]
 mod fixtures_tests;
+#[cfg(test)]
+mod pairing_tests;
+/// The test account's device list builder, shared with the binary tests.
+#[cfg(test)]
+#[path = "../../../tests/support/r9log.rs"]
+pub(crate) mod r9log;
 #[cfg(test)]
 mod tests;
 
@@ -470,26 +477,45 @@ impl Scope {
 impl MembershipHost {
     // ── Pairing and start ──
 
-    /// Writes a pinned, verified log (pairing, R9.2) and `membership_applied`
-    /// at its head. Replaces any earlier device list.
+    /// Writes a pinned, verified log (pairing, R9.2), its
+    /// `host_channel_key` and `membership_applied` at its head, under
+    /// `trust_gen.lock`. Replaces any earlier device list: every r9 file
+    /// left from an earlier one goes first (a stale carriage record, fault,
+    /// freeze, key or applied head never survives a new pin).
     pub fn pin(
         pairing: &PairingPaths,
         journal_dir: &Path,
         pin: &HostPin,
         m: &Membership,
+        host_seed: &[u8; 32],
+    ) -> Result<(), String> {
+        let store = Store::new(pairing, journal_dir);
+        let _lock = store.lock().map_err(|e| e.to_string())?;
+        Self::pin_locked(pairing, journal_dir, pin, m, host_seed)
+    }
+
+    /// [`MembershipHost::pin`] for a caller already holding
+    /// `trust_gen.lock` (the pairing ceremony's apply).
+    pub fn pin_locked(
+        pairing: &PairingPaths,
+        journal_dir: &Path,
+        pin: &HostPin,
+        m: &Membership,
+        host_seed: &[u8; 32],
     ) -> Result<(), String> {
         let mut store = Store::new(pairing, journal_dir);
-        let _lock = store.lock().map_err(|e| e.to_string())?;
-        for file in [
-            DlFile::Carriage,
-            DlFile::Intent,
-            DlFile::Freeze,
-            DlFile::Fault,
-        ] {
+        #[cfg(test)]
+        if let Some(injected) = PIN_FAULT.with(|f| f.take()) {
+            store.inject(injected);
+        }
+        // `membership.json` first: a pin interrupted after it fails closed
+        // (a leftover without the list) until the next pin or unpair.
+        store.remove(DlFile::State).map_err(|e| e.to_string())?;
+        for file in LEFTOVERS {
             store.remove(file).map_err(|e| e.to_string())?;
         }
         store
-            .replace(DlFile::State, &state_bytes(m, pin, None))
+            .replace(DlFile::HostChannelKey, &host_key_bytes(host_seed))
             .map_err(|e| e.to_string())?;
         let applied = Applied {
             head: m.head(),
@@ -497,6 +523,11 @@ impl MembershipHost {
         };
         store
             .replace(DlFile::Applied, &applied_bytes(&applied))
+            .map_err(|e| e.to_string())?;
+        // The list last: until it is there, whatever was written is a
+        // leftover that fails closed.
+        store
+            .replace(DlFile::State, &state_bytes(m, pin, None))
             .map_err(|e| e.to_string())
     }
 
@@ -1680,6 +1711,72 @@ impl std::fmt::Display for ForgetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next `pin` step that fails.
+    pub(crate) static PIN_FAULT: std::cell::Cell<Option<store::Injected>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `host_channel_key` (§R9.3): the Ed25519 seed and its public key,
+/// base64url (§R9.1). Plain 0600 like `unlock_auth_key`: it only proves
+/// the host to clients, so it works while the cred agent is locked.
+fn host_key_bytes(seed: &[u8; 32]) -> Vec<u8> {
+    let public = ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes();
+    json!({"v": 1, "seed": atem_client::encoding::b64u(seed),
+           "pub": atem_client::encoding::b64u(&public)})
+    .to_string()
+    .into_bytes()
+}
+
+/// The pinned host's `host_channel_key` seed, checked against the newest
+/// `add_host` key of `host_id` in the device list. A missing, unreadable or
+/// other key is an error (the device list then fails to open).
+pub fn host_channel_seed(
+    pairing: &PairingPaths,
+    m: &Membership,
+    host_id: &str,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    let path = &pairing.host_channel_key;
+    let bytes = store::read_private(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "{} is missing; re-pair this host (atem unpair, then atem pair)",
+                path.display()
+            )
+        })?;
+    let bytes = zeroize::Zeroizing::new(bytes);
+    let damaged = || {
+        format!(
+            "{} is damaged; re-pair this host (atem unpair, then atem pair)",
+            path.display()
+        )
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| damaged())?;
+    let seed = value
+        .get("seed")
+        .and_then(Value::as_str)
+        .and_then(|t| atem_client::encoding::b64u_decode(t).ok())
+        .map(zeroize::Zeroizing::new)
+        .ok_or_else(damaged)?;
+    let seed: zeroize::Zeroizing<[u8; 32]> =
+        zeroize::Zeroizing::new(seed.as_slice().try_into().map_err(|_| damaged())?);
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes();
+    let pinned = m.host(host_id).map(|h| h.host_key.as_bytes().to_vec());
+    if pinned.as_deref() != Some(&public[..]) {
+        return Err(format!(
+            "{} isn't the key the device list names for {host_id}; re-pair this host (atem unpair, then atem pair)",
+            path.display()
+        ));
+    }
+    Ok(seed)
 }
 
 #[cfg(test)]

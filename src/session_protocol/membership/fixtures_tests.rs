@@ -224,7 +224,14 @@ impl Runner {
                 host_id: spec["host_id"].as_str().unwrap().to_owned(),
                 host_trust_gen: spec["host_trust_gen"].as_u64().unwrap(),
             };
-            MembershipHost::pin(&rig.pairing, &rig.journal, &pin, &m).unwrap();
+            MembershipHost::pin(
+                &rig.pairing,
+                &rig.journal,
+                &pin,
+                &m,
+                &super::tests::host_a_seed(),
+            )
+            .unwrap();
             let mut clients = Vec::new();
             let mut attached = BTreeSet::new();
             for (c, principal) in &self.clients {

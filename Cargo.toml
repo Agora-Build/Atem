@@ -45,7 +45,7 @@ rustls-pemfile = "2"
 ctrlc = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 atem-core = { path = "crates/atem-core" }
-atem-client = { path = "crates/atem-client" }
+atem-client = { path = "crates/atem-client", features = ["software-keys"] }
 urlencoding = "2"
 pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
 p256 = { version = "0.13", features = ["ecdsa"] }

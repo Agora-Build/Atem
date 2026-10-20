@@ -542,6 +542,7 @@ mod tests {
             enc_pub: [5; 32],
             recovery_sign_pub: [6; 32],
             nonce_s: [7; 32],
+            genesis_hash: [9; 32],
         };
         let mut store = TrustStore::default();
         store.set_pending(
@@ -769,6 +770,7 @@ mod tests {
             enc_pub: [5; 32],
             recovery_sign_pub: [6; 32],
             nonce_s: [7; 32],
+            genesis_hash: [9; 32],
         };
         store.set_pending(
             ASTATION,
