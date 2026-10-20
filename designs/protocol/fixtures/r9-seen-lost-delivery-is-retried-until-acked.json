@@ -96,7 +96,20 @@
             "session_id": "ses-aaaaaaaaaaaa",
             "process_gen": "22222222-2222-4222-8222-222222222222",
             "approval_id": "${ap}",
-            "state": "open"
+            "state": "open",
+            "device_id": "dev-mac"
+          },
+          {
+            "kind": "hint",
+            "account_id": "acct-test-1",
+            "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+            "host_id": "host-a",
+            "host_trust_gen": 1,
+            "session_id": "ses-aaaaaaaaaaaa",
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "approval_id": "${ap}",
+            "state": "open",
+            "device_id": "dev-phone"
           }
         ]
       }
