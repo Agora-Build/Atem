@@ -439,8 +439,9 @@ pub struct HostBridge {
     last_refusal: Option<(Option<u64>, u64)>,
     /// r9 admission over the link's channel envelopes (§R9.7a).
     r9: R9Host,
-    /// The link generation the r9 host runs on.
+    /// The link generation the r9 host runs on, and the socket it runs on.
     r9_link: Option<u64>,
+    r9_socket: u64,
     /// The profile's pairing files (the device list is reopened from them).
     pairing: Option<crate::paths::PairingPaths>,
     /// The pinned host's `host_channel_key`; r9 can't serve without it.
@@ -576,6 +577,7 @@ impl HostBridge {
         Ok(Self {
             r9: R9Host::new(r9host::Limits::default(), Some(dir)),
             r9_link: None,
+            r9_socket: 0,
             pairing,
             host_key,
             host_pub,
@@ -913,7 +915,9 @@ impl HostBridge {
         // generation; what it can't take now is dropped and counted (N9).
         // A socket that is gone takes everything with it.
         let before = self.r9_attachments();
-        let live = !cx.client.is_ws_closed();
+        // Live: the generation's own socket is still up (a reconnect made a
+        // new socket, and the old generation's closes never go on it).
+        let live = !cx.client.is_ws_closed() && cx.client.socket_gen() == self.r9_socket;
         let client = cx.client;
         let mut effects = self.r9_call(|r9, parts| {
             if live {
@@ -929,6 +933,7 @@ impl HostBridge {
             effects.extend(self.r9_call(|r9, parts| r9.link_up(link_gen, parts)));
         }
         self.r9_link = want;
+        self.r9_socket = cx.client.socket_gen();
         self.r9_exec(effects, cx);
     }
 

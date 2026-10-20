@@ -474,6 +474,9 @@ pub struct AstationClient {
     local_token_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
+    /// Counts the sockets this client opened (`connect_raw`): a link
+    /// generation's channels live on one socket only (§R9.7a).
+    socket_gen: u64,
     connected_astation_id: Option<String>,
     /// The newest challenge answered on this socket, as (astation_id,
     /// challenge): a repeat of it is spent and is not answered again.
@@ -587,6 +590,7 @@ impl AstationClient {
             #[cfg(test)]
             local_token_path_override: None,
             ws_closed: false,
+            socket_gen: 0,
             connected_astation_id: None,
             answered_challenge: None,
             held_encryption: Vec::new(),
@@ -1038,8 +1042,14 @@ impl AstationClient {
         self.receiver = Some(rx);
         self.transport_tasks = vec![writer_task, reader_task];
         self.ws_closed = false;
+        self.socket_gen += 1;
 
         Ok(())
+    }
+
+    /// The socket the client uses now (a new one after every reconnect).
+    pub fn socket_gen(&self) -> u64 {
+        self.socket_gen
     }
 
     /// Authenticate with Astation after WebSocket connection.
