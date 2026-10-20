@@ -52,6 +52,7 @@ pub mod kit;
 pub mod membership;
 pub mod provider;
 pub mod restore;
+pub mod session;
 pub mod signed;
 #[cfg(feature = "software-keys")]
 pub mod software;

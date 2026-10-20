@@ -214,6 +214,24 @@ pub struct Head {
     pub hash: Hash32,
 }
 
+impl Head {
+    /// `{"seq": n, "hash": "<hex>"}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"seq": self.seq, "hash": self.hash.to_hex()})
+    }
+
+    /// Exactly `{seq, hash}`, `seq` ≥ 1, `hash` 64 lowercase hex.
+    pub fn from_json(value: &serde_json::Value) -> Option<Head> {
+        let object = value.as_object()?;
+        if object.len() != 2 {
+            return None;
+        }
+        let seq = object.get("seq")?.as_u64().filter(|s| *s >= 1)?;
+        let hash = Hash32::from_hex(object.get("hash")?.as_str()?).ok()?;
+        Some(Head { seq, hash })
+    }
+}
+
 /// A member's standing on this verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberStatus {
@@ -1245,21 +1263,17 @@ impl Membership {
 
     /// Evaluates a carriage (§R9.3 "Applying a carriage", §R9.4) against a
     /// scratch copy. Nothing in `self` changes: commit `next` once it is
-    /// durable. `received_bytes` is the size of the carried `entries` as they
-    /// arrived on the wire (or of the whole message carrying them): the
-    /// 256 KiB bound is on what was received, not on a re-encoding.
-    pub fn evaluate(
-        &self,
-        carried: &[StrictValue],
-        received_bytes: usize,
-        now: &HostNow,
-    ) -> Evaluation {
+    /// durable. The 256 KiB bound is measured with
+    /// [`crate::channel::carriage::carried_bytes`], the measure the client's
+    /// planner budgets: the compact JSON of the `entries` array (what the
+    /// crate's hello builder sends).
+    pub fn evaluate(&self, carried: &[StrictValue], now: &HostNow) -> Evaluation {
         let parsed = carried.iter().map(Entry::from_strict).collect::<Vec<_>>();
         let sizes = carried
             .iter()
             .map(|v| v.value().to_string().len())
             .collect::<Vec<_>>();
-        self.evaluate_parsed(parsed, &sizes, received_bytes, now)
+        self.evaluate_parsed(parsed, &sizes, now)
     }
 
     /// `evaluate` of signed objects already parsed (a client applying a
@@ -1271,14 +1285,13 @@ impl Membership {
             .map(|o| o.to_json().to_string().len())
             .collect::<Vec<_>>();
         let parsed = carried.iter().cloned().map(Entry::parse).collect();
-        self.evaluate_parsed(parsed, &sizes, 0, now)
+        self.evaluate_parsed(parsed, &sizes, now)
     }
 
     fn evaluate_parsed(
         &self,
         parsed: Vec<Result<Entry, Invalid>>,
         sizes: &[usize],
-        received_bytes: usize,
         now: &HostNow,
     ) -> Evaluation {
         let mut eval = Evaluation {
@@ -1293,24 +1306,19 @@ impl Membership {
             return eval;
         }
         // 1. Shape: bounds, every body parses, contiguous ascending seq.
-        // The byte bound is on the larger of the count the caller measured
-        // on the wire and the entries' own encoding, so a wrong count can't
-        // lift it. `index` names the entry that crosses the bound (the 65th,
-        // or the one whose bytes cross 256 KiB; the last one when only the
-        // received count does).
-        let mut total = 0;
+        // The byte bound is `carried_bytes` (the compact `entries` array:
+        // `[`, then each entry followed by `,` or `]`), the same measure the
+        // client's planner budgets. `index` names the entry that crosses the
+        // bound (the 65th, or the one whose bytes cross 256 KiB).
+        let mut total = 1;
         let crossing = sizes.iter().position(|size| {
-            total += size;
+            total += size + 1;
             total > MAX_CARRIAGE_BYTES
         });
         let too_large = if parsed.len() > MAX_CARRIAGE_ENTRIES {
             Some(MAX_CARRIAGE_ENTRIES)
-        } else if let Some(index) = crossing {
-            Some(index)
-        } else if received_bytes > MAX_CARRIAGE_BYTES {
-            Some(parsed.len().saturating_sub(1))
         } else {
-            None
+            crossing
         };
         if let Some(index) = too_large {
             eval.stop = Some(Stop::Invalid {

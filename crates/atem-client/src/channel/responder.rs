@@ -300,9 +300,19 @@ impl Keyed {
     /// Verifies `sig_c` with the key the committed head gives the principal
     /// (a member's `auth_key`, a grant's `browser_key`). On success the
     /// channel is open and its first record must be the `welcome`.
-    pub fn admit(self, key: &PublicKey) -> Result<Channel, Refusal> {
+    ///
+    /// `deadline_ms` (monotonic) is when the channel ends, required so a
+    /// service's or browser's expiry can't be forgotten (§R9.7 "Limits": 24 h
+    /// for a native principal, the expiry for service/browser):
+    /// [`crate::principal::Authority::channel_deadline_ms`] computes it. It
+    /// only shortens the 24 h the channel started with.
+    pub fn admit(self, key: &PublicKey, deadline_ms: u64) -> Result<Channel, Refusal> {
         match key.verify(&client_signing_input(&self.th3), &self.sig_c) {
-            Ok(()) => Ok(self.channel),
+            Ok(()) => {
+                let mut channel = self.channel;
+                channel.limit_lifetime(deadline_ms);
+                Ok(channel)
+            }
             Err(_) => Err(Refusal {
                 channel: Box::new(self.channel),
             }),

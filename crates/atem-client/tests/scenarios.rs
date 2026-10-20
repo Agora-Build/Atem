@@ -257,7 +257,9 @@ impl Shake {
         } = self;
         let first = match admission {
             Admission::Member { state, .. } => {
-                let mut host = keyed.admit(&state.member.auth_key).expect("sig_c verifies");
+                let mut host = keyed
+                    .admit(&state.member.auth_key, u64::MAX)
+                    .expect("sig_c verifies");
                 assert_eq!(host.channel_id(), client.channel_id());
                 host.seal(br#"{"type":"session","data":{"v":1,"op":"welcome"}}"#, 0)
                     .unwrap()
@@ -403,10 +405,8 @@ impl<'a> HostSide<'a> {
     /// their size on the wire.
     fn carry(&mut self, labels: &[String]) -> (Vec<StrictValue>, usize) {
         self.carried.extend(labels.iter().map(|l| self.v.hash(l)));
-        let bytes = labels
-            .iter()
-            .map(|l| self.v.wire(l).to_string().len())
-            .sum();
+        let bytes =
+            atem_client::channel::carriage::carried_bytes(labels.iter().map(|l| self.v.wire(l)));
         (
             labels.iter().map(|l| strict(self.v.wire(l))).collect(),
             bytes,
@@ -549,7 +549,7 @@ impl<'a> HostSide<'a> {
                 let shake =
                     channel_handshake(self.book, &m, &principal, &self.client_keys[client], &carry)
                         .unwrap();
-                let eval = m.evaluate(&shake.entries, shake.bytes, &clock.now);
+                let eval = m.evaluate(&shake.entries, &clock.now);
                 let admission =
                     eval.admission(&device_of(&self.clients[client]), false, &clock.now);
                 m = eval.next;
@@ -597,11 +597,11 @@ impl<'a> HostSide<'a> {
             shake.entries, carry,
             "carried through the channel unchanged"
         );
-        // What arrived: the entries array as received (its items plus the
-        // brackets and commas).
-        assert!(shake.bytes >= bytes);
+        // What arrived is the entries array, measured as the planner and
+        // the host measure it (`carried_bytes`).
+        assert_eq!(shake.bytes, bytes);
         let now = host.clock.now.clone();
-        let eval = host.m.evaluate(&shake.entries, shake.bytes, &now);
+        let eval = host.m.evaluate(&shake.entries, &now);
         let admission = eval.admission(&device, more, &now);
         host.m = eval.next;
         shake.complete(&admission);
@@ -613,10 +613,10 @@ impl<'a> HostSide<'a> {
 
     fn send_membership(&mut self, step: &Value) {
         let client = step["send_membership"].as_str().unwrap().to_owned();
-        let (carry, bytes) = self.carry(&labels(&step["entries"]));
+        let (carry, _) = self.carry(&labels(&step["entries"]));
         let host = self.host();
         let now = host.clock.now.clone();
-        let eval = host.m.evaluate(&carry, bytes, &now);
+        let eval = host.m.evaluate(&carry, &now);
         let stop = eval.stop.clone();
         let admission = eval.admission("", false, &now);
         host.m = eval.next;

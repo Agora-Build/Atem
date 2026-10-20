@@ -269,6 +269,14 @@ pub enum ChannelError {
     TooLarge,
     /// The channel is closed.
     Closed,
+    /// The hello can't be built as asked (a grant that isn't the browser
+    /// principal's, or a grant beside a native/service principal). Local:
+    /// nothing was sent.
+    InvalidHello(&'static str),
+    /// The platform didn't sign `sig_c` (a cancelled owner confirmation, a
+    /// locked key, a provider error). Local: nothing was sent, the peer
+    /// did nothing wrong; the app may retry with a new handshake.
+    Signing(crate::Error),
 }
 
 impl ChannelError {
@@ -285,6 +293,8 @@ impl ChannelError {
             ChannelError::Limit(_) => "limit",
             ChannelError::TooLarge => "too_large",
             ChannelError::Closed => "closed",
+            ChannelError::Signing(_) => "signing_failed",
+            ChannelError::InvalidHello(_) => "invalid_hello",
         }
     }
 }
@@ -295,6 +305,7 @@ impl std::fmt::Display for ChannelError {
             ChannelError::HandshakeFailed(why) => write!(f, "handshake_failed ({why:?})"),
             ChannelError::Advisory { code } => write!(f, "the peer said {code} (advisory)"),
             ChannelError::Limit(limit) => write!(f, "channel limit reached: {limit:?}"),
+            ChannelError::Signing(e) => write!(f, "signing failed locally: {e}"),
             other => f.write_str(other.code()),
         }
     }

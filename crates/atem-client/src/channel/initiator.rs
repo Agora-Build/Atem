@@ -7,7 +7,7 @@
 //! (or any other refusal) the client sends nothing more.
 use rand_core::{OsRng, RngCore};
 
-use super::carriage::HeadRelation;
+use super::carriage::{Carriage, HeadRelation};
 use super::record::{Channel, Role};
 use super::transcript::{
     HeadError, HostAccept, HostHead, Schedule, channel_id, client_signing_input, shared_secret,
@@ -17,10 +17,12 @@ use super::wire::{Frame, Init, parse_frame};
 use super::{
     ChannelError, Failure, HANDSHAKE_STEP_MS, MAX_PLAINTEXT, NATIVE_LIFETIME_MS, Principal,
 };
+use crate::SignedObject;
 use crate::encoding::Hash32;
 use crate::membership::Membership;
 use crate::membership::entry::HostRecord;
 use crate::provider::{KeyId, KeyProvider, sign};
+use crate::session::r9::hello_bytes;
 
 /// Starts a handshake.
 pub struct Initiator;
@@ -187,9 +189,10 @@ impl Accepted {
         key: &KeyId,
     ) -> Result<Signed, ChannelError> {
         let th3 = th3(&self.schedule.th2(), &self.sig_h, &principal);
-        // A provider failure (a cancelled confirmation) ends the handshake.
-        let sig_c = sign(provider, key, &client_signing_input(&th3))
-            .map_err(|_| ChannelError::HandshakeFailed(Failure::BadClientSignature))?;
+        // A provider failure (a cancelled confirmation) ends the handshake
+        // locally: nothing is sent.
+        let sig_c =
+            sign(provider, key, &client_signing_input(&th3)).map_err(ChannelError::Signing)?;
         Ok(Signed {
             schedule: self.schedule,
             th3,
@@ -235,12 +238,43 @@ impl Signed {
         self.th3
     }
 
-    /// Steps 5 and 7: seals `hello` (its bytes exactly as they will be
-    /// hashed into `th4`) under `k_fin` and derives the record keys. Returns
-    /// the channel (native lifetime; shorten it with
-    /// [`Channel::limit_lifetime`] from `welcome.authorization_ms_left`) and
-    /// the `finish` frame. `hs` and `k_fin` are wiped when this returns.
+    /// Steps 5 and 7 with the crate's own `hello` (§R9.8): `revision: 9`,
+    /// `proof{principal, sig}` with exactly the principal and `sig_c` of this
+    /// handshake, the `membership` carriage, and the grant for a browser (its
+    /// `grant_hash` must be the one bound into `th3`). Seals it under `k_fin`
+    /// and derives the record keys. Returns the channel (native lifetime
+    /// until the `welcome` shortens it to `authorization_ms_left`) and the
+    /// `finish` frame. `hs` and `k_fin` are wiped when this returns.
+    pub fn finish_hello(
+        self,
+        id: &str,
+        carriage: &Carriage,
+        grant: Option<&SignedObject>,
+        now_ms: u64,
+    ) -> Result<(Channel, Vec<u8>), ChannelError> {
+        let grant_hash = grant.map(|g| g.grant_hash());
+        match (self.principal.grant_hash(), grant_hash) {
+            (None, None) => {}
+            (Some(bound), Some(Some(given))) if bound == given => {}
+            _ => {
+                return Err(ChannelError::InvalidHello(
+                    "the grant is not the principal's",
+                ));
+            }
+        }
+        let hello = hello_bytes(id, &self.principal, &self.sig_c, carriage, grant);
+        self.seal(&hello, now_ms)
+    }
+
+    /// Seals arbitrary `hello` bytes (known-answer vectors and fixtures that
+    /// send a malformed or mismatched hello on purpose). Apps use
+    /// [`Signed::finish_hello`].
+    #[cfg(any(test, feature = "test-vectors"))]
     pub fn finish(self, hello: &[u8], now_ms: u64) -> Result<(Channel, Vec<u8>), ChannelError> {
+        self.seal(hello, now_ms)
+    }
+
+    fn seal(self, hello: &[u8], now_ms: u64) -> Result<(Channel, Vec<u8>), ChannelError> {
         if hello.len() > MAX_PLAINTEXT {
             return Err(ChannelError::TooLarge);
         }

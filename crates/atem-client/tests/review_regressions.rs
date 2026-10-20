@@ -660,30 +660,124 @@ fn the_backup_writer_stores_the_body_before_signing() {
     );
 }
 
-/// Minor 7: the 256 KiB carriage bound is on the bytes received.
+/// Task 3 review Minor 2: one measure of carriage bytes. The client's
+/// planner fills a suffix up to 256 KiB of `carried_bytes`, exactly what the
+/// crate's hello puts on the wire, and the host's `evaluate` bounds the same
+/// measure: the planned carriage is accepted, one more entry is refused.
 #[test]
-fn the_carriage_bound_is_on_the_received_bytes() {
+fn the_planner_and_the_host_measure_carriage_bytes_the_same_way() {
+    use atem_client::channel::carriage::{Carriage, MAX_CARRIED_BYTES, carried_bytes};
+    use atem_client::membership::Scope;
     let kit1 = kit(1);
-    let (host, mac_keys) = genesis(&kit1);
-    let (_, phone) = device("dev-phone", &ALL);
-    let body = host.draft("dev-mac", 1, &Action::Add { member: phone });
-    let entry = sign_entry(&mac_keys, &auth(), body).unwrap();
-    let wire = entry.object().to_json();
-    let carried = [strict(&wire)];
-    // The same entry, received padded past 256 KiB (whitespace): refused,
-    // nothing applied.
-    let eval = host.evaluate(&carried, 256 * 1024 + 1, &now(2));
+    let (mut client, mac_keys) = genesis(&kit1);
+    let host = client.clone();
+    // Large entries (~4 KiB each: a service scope listing many projects),
+    // so the byte bound binds before the 64-entry one.
+    let projects: Vec<String> = (0..45).map(|i| format!("h1.b982533d.{:064x}", i)).collect();
+    for i in 0..70u64 {
+        let mut svc_keys = SoftwareKeys::new();
+        let auth_key = svc_keys.generate(auth(), Alg::Ed25519).unwrap();
+        let member = Member {
+            device_id: format!("svc-{i:03}"),
+            auth_key,
+            kind: MemberKind::Service {
+                scope: Scope {
+                    hosts: vec!["host-a".into()],
+                    projects: Some(projects.clone()),
+                    sessions: None,
+                    ops: vec!["view".into()],
+                },
+                expires_at: 1 + i + 1000,
+            },
+        };
+        apply(
+            &mut client,
+            "dev-mac",
+            &mac_keys,
+            &auth(),
+            Action::Add { member },
+            1 + i,
+        );
+    }
+    let carriage = Carriage::plan(&client, host.head(), None).unwrap();
+    assert!(carriage.more, "the suffix is longer than one carriage");
+    assert!(carriage.entries.len() < 64, "the byte bound binds first");
+    let wire: Vec<_> = carriage.entries.iter().map(SignedObject::to_json).collect();
+    let bytes = carried_bytes(&wire);
+    assert_eq!(bytes, carriage.bytes());
+    assert!(bytes <= MAX_CARRIED_BYTES);
+    // The next entry would cross the bound.
+    let next = client
+        .entry(host.head().seq + carriage.entries.len() as u64 + 1)
+        .unwrap()
+        .object()
+        .to_json();
+    assert!(bytes + next.to_string().len() + 1 > MAX_CARRIED_BYTES);
+    // What the hello sends is exactly that array.
+    let hello = atem_client::session::r9::hello_bytes(
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        &atem_client::channel::Principal::Native {
+            device_id: "dev-mac".into(),
+        },
+        &[0u8; 64],
+        &carriage,
+        None,
+    );
+    let text = String::from_utf8(hello).unwrap();
+    assert!(text.contains(&serde_json::Value::Array(wire.clone()).to_string()));
+    // The host accepts the planned carriage and refuses one entry more.
+    let carried: Vec<_> = wire.iter().map(strict).collect();
+    let eval = host.evaluate(&carried, &now(100));
+    assert_eq!(eval.stop, None);
+    assert_eq!(eval.appended, carriage.entries.len());
+    let mut over = carried.clone();
+    over.push(strict(&next));
     assert_eq!(
-        eval.stop,
+        host.evaluate(&over, &now(100)).stop,
         Some(Stop::Invalid {
-            index: 0,
+            index: carriage.entries.len(),
             reason: Invalid::CarriageTooLarge
         })
     );
-    assert_eq!(eval.next.head(), host.head());
-    let eval = host.evaluate(&carried, wire.to_string().len(), &now(2));
-    assert_eq!(eval.stop, None);
-    assert_eq!(eval.appended, 1);
+}
+
+/// The exact boundary of the host's measure: an `entries` array of exactly
+/// 262 144 bytes passes the byte bound (and is judged on its contents), one
+/// byte more is `carriage_too_large`.
+#[test]
+fn the_carriage_byte_bound_is_exact() {
+    use atem_client::channel::carriage::{MAX_CARRIED_BYTES, carried_bytes};
+    let kit1 = kit(1);
+    let (host, _) = genesis(&kit1);
+    // Two objects: `[` + a + `,` + b + `]`.
+    let make = |total: usize| {
+        let a = serde_json::json!({ "pad": "x".repeat(100_000) });
+        let fixed = 1 + a.to_string().len() + 1 + 1 + r#"{"pad":""}"#.len();
+        let b = serde_json::json!({ "pad": "y".repeat(total - fixed) });
+        vec![a, b]
+    };
+    let at = make(MAX_CARRIED_BYTES);
+    assert_eq!(carried_bytes(&at), MAX_CARRIED_BYTES);
+    let stop = host
+        .evaluate(&at.iter().map(strict).collect::<Vec<_>>(), &now(1))
+        .stop;
+    assert!(!matches!(
+        stop,
+        Some(Stop::Invalid {
+            reason: Invalid::CarriageTooLarge,
+            ..
+        })
+    ));
+    let over = make(MAX_CARRIED_BYTES + 1);
+    assert_eq!(carried_bytes(&over), MAX_CARRIED_BYTES + 1);
+    assert_eq!(
+        host.evaluate(&over.iter().map(strict).collect::<Vec<_>>(), &now(1))
+            .stop,
+        Some(Stop::Invalid {
+            index: 1,
+            reason: Invalid::CarriageTooLarge
+        })
+    );
 }
 
 /// I-1: a since-removed manager's stolen key signing a conflict aimed at the
@@ -779,15 +873,14 @@ fn a_removed_managers_conflict_on_the_subject_is_ignored() {
 fn a_wrong_byte_count_cannot_lift_the_bound() {
     let kit1 = kit(1);
     let (host, mac_keys) = genesis(&kit1);
-    // Objects whose own encoding crosses 256 KiB with the second one, passed
-    // with a received count of 0: the bound runs before parsing and names
-    // the crossing entry.
+    // Objects whose encoding crosses 256 KiB with the second one: the bound
+    // runs before parsing and names the crossing entry.
     let big = "x".repeat(200 * 1024);
     let junk: Vec<_> = (0..3)
         .map(|_| strict(&serde_json::json!({ "pad": big })))
         .collect();
     assert_eq!(
-        host.evaluate(&junk, 0, &now(1)).stop,
+        host.evaluate(&junk, &now(1)).stop,
         Some(Stop::Invalid {
             index: 1,
             reason: Invalid::CarriageTooLarge
@@ -796,7 +889,7 @@ fn a_wrong_byte_count_cannot_lift_the_bound() {
     // One such object is under the bound: the shape check runs (and refuses
     // it as malformed, at its own index), not the byte bound.
     assert!(!matches!(
-        host.evaluate(&junk[..1], 0, &now(1)).stop,
+        host.evaluate(&junk[..1], &now(1)).stop,
         Some(Stop::Invalid {
             reason: Invalid::CarriageTooLarge,
             ..
@@ -817,7 +910,7 @@ fn a_wrong_byte_count_cannot_lift_the_bound() {
         );
         many.push(strict(&entry.object().to_json()));
     }
-    let eval = host.evaluate(&many, 0, &now(1));
+    let eval = host.evaluate(&many, &now(1));
     assert_eq!(
         eval.stop,
         Some(Stop::Invalid {

@@ -563,7 +563,7 @@ fn alternatives_in_context(run: &mut Run, ctx: &Context) {
     let conflict = |base: &[&str], label: &str| {
         let m = ctx.chain(base);
         let wire = &ctx.vectors[label]["entry"];
-        let eval = m.evaluate(&[strict(wire)], wire.to_string().len(), &ctx.now);
+        let eval = m.evaluate(&[strict(wire)], &ctx.now);
         match eval.stop {
             Some(Stop::Conflict { outcome, .. }) => outcome,
             other => panic!("{label}: {other:?}"),
@@ -1394,7 +1394,27 @@ fn channel_handshake() {
         hello_value["data"]["proof"]["principal"],
         principal.to_json()
     );
-    let (mut client_channel, finish_frame) = signed.finish(hello, 2).unwrap();
+    // The crate's own hello builder (Task 3 review Minor 5) reproduces the
+    // vector's hello byte for byte around the sig_c it made.
+    let carriage = atem_client::channel::Carriage {
+        head: log_l.head(),
+        entries: Vec::new(),
+        more: false,
+        fetch_to: None,
+    };
+    let hello_id = hello_value["data"]["id"].as_str().unwrap();
+    assert_eq!(
+        atem_client::session::r9::hello_bytes(
+            hello_id,
+            &principal,
+            signed.sig_c(),
+            &carriage,
+            None
+        ),
+        hello
+    );
+    let (mut client_channel, finish_frame) =
+        signed.finish_hello(hello_id, &carriage, None, 2).unwrap();
     let finish = run.get("finish");
     assert_eq!(
         wire::parse_frame(&finish_frame).unwrap(),
@@ -1404,7 +1424,7 @@ fn channel_handshake() {
         unreachable!()
     };
     assert_eq!(hex(&ct), run.get("finish_ct_hex").as_str().unwrap());
-    run.pass("finish: the hello sealed under k_fin, byte for byte");
+    run.pass("finish: the crate's hello (hello_jcs) sealed under k_fin, byte for byte");
 
     let th4_value = th4(&signed_th3(&run), &unhex(s(&run.file, "sig_c_hex")), hello);
     assert_eq!(
@@ -1428,7 +1448,7 @@ fn channel_handshake() {
         sig_c: unhex(s(&run.file, "sig_c_hex")),
     });
     assert_eq!(keyed.channel_id(), s(&run.file, "channel_id"));
-    let mut host_channel = keyed.admit(&client_key).unwrap();
+    let mut host_channel = keyed.admit(&client_key, u64::MAX).unwrap();
     run.pass("the responder opens the finish, derives th4 and admits sig_c with dev-phone's key");
 
     let records = run.get("records");
@@ -1479,7 +1499,7 @@ fn channel_handshake() {
                 principal: principal.clone(),
                 sig_c: sig_c_vector.clone(),
             })
-            .admit(&client_key)
+            .admit(&client_key, u64::MAX)
             .unwrap();
         (client_channel, host_channel, finish_frame)
     };

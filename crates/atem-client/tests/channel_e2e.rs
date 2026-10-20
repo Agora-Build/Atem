@@ -255,7 +255,7 @@ impl HostSide {
         let now = &self.world.clock.now;
         let admission = {
             let mut log = self.log.lock().unwrap();
-            let eval = log.evaluate(&hello.entries, hello.entries_bytes, now);
+            let eval = log.evaluate(&hello.entries, now);
             let device = match &hello.proof.principal {
                 Principal::Native { device_id } | Principal::Service { device_id } => {
                     device_id.clone()
@@ -286,7 +286,7 @@ impl HostSide {
             }
         };
         let principal = hello.proof.principal.name();
-        let mut channel = match keyed.admit(&auth_key) {
+        let mut channel = match keyed.admit(&auth_key, u64::MAX) {
             Ok(channel) => channel,
             Err(refusal) => {
                 let reply = refusal
@@ -372,7 +372,6 @@ fn session_error(code: &str) -> Vec<u8> {
 struct Hello {
     proof: ClientProof,
     entries: Vec<StrictValue>,
-    entries_bytes: usize,
     more: bool,
 }
 
@@ -403,7 +402,6 @@ impl Hello {
         let entries = membership.get("entries")?;
         Some(Hello {
             proof: ClientProof { principal, sig_c },
-            entries_bytes: entries.value().to_string().len(),
             entries: entries.items()?,
             more: membership.value().get("more") == Some(&Value::Bool(true)),
         })
@@ -479,7 +477,7 @@ impl Device<'_> {
         // The host's head is reported, never adopted.
         assert_eq!(self.log, before);
         let relation = accepted.relation();
-        let carriage = Carriage::plan(&self.log, accepted.host_head().head(), None);
+        let carriage = Carriage::plan(&self.log, accepted.host_head().head(), None).unwrap();
         let signed = accepted.sign(self.principal.clone(), self.keys, &self.key)?;
         let hello = Hello::build(&self.principal, signed.sig_c(), &carriage);
         let (mut channel, finish) = signed.finish(&hello, mono.now())?;
@@ -1390,7 +1388,7 @@ fn handshake_steps_time_out_after_10_s() {
         .unwrap()
         .sign(principal.clone(), &world.book.provider, &phone_key)
         .unwrap();
-    let carriage = Carriage::plan(&log, log.head(), None);
+    let carriage = Carriage::plan(&log, log.head(), None).unwrap();
     let hello = Hello::build(&principal, signed.sig_c(), &carriage);
     let (_, finish) = signed.finish(&hello, 300).unwrap();
     let refused = host
@@ -1508,13 +1506,13 @@ fn a_bit_flip_in_every_byte_of_the_handshake_fails() {
     let hello = Hello::build(
         &principal,
         signed.sig_c(),
-        &Carriage::plan(&log, log.head(), None),
+        &Carriage::plan(&log, log.head(), None).unwrap(),
     );
     let (_, finish) = signed.finish(&hello, 0).unwrap();
     let opened = host.on_finish(&finish, 0).unwrap();
     let proof = Hello::parse(opened.hello()).unwrap().proof;
     assert!(
-        opened.key(&proof).admit(&phone_auth).is_ok(),
+        opened.key(&proof).admit(&phone_auth, u64::MAX).is_ok(),
         "unflipped, it works"
     );
     for bit in (0..accept.len()).map(|i| i * 8 + i % 8) {

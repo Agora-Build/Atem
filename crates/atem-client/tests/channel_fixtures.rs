@@ -315,7 +315,7 @@ impl<'a> Fixture<'a> {
         let Admission::Member { state, .. } = self.host_log.admit(&device, &self.clock.now) else {
             panic!("{device} is a member at E6");
         };
-        match keyed.admit(&state.member.auth_key) {
+        match keyed.admit(&state.member.auth_key, u64::MAX) {
             Ok(host_channel) => {
                 assert_eq!(host_channel.channel_id(), s(&self.vec, "channel_id"));
                 self.channels.insert(client, (host_channel, client_channel));
@@ -484,7 +484,8 @@ impl<'a> Fixture<'a> {
             }
             Ok(accepted) => {
                 let relation = accepted.relation();
-                let carriage = Carriage::plan(&client_log, accepted.host_head().head(), None);
+                let carriage =
+                    Carriage::plan(&client_log, accepted.host_head().head(), None).unwrap();
                 match relation {
                     HeadRelation::HostAhead => assert_eq!(carriage.fetch_to, Some(host_log.head())),
                     HeadRelation::Diverged | HeadRelation::Same | HeadRelation::HostBehind => {}
@@ -795,7 +796,7 @@ impl<'a> Fixture<'a> {
         let (initiator, init) = Initiator::start(&log, "host-a", 0).unwrap();
         let (host, accept) = Responder::on_init(&self.ctx(), &init, 0).unwrap();
         let accepted = initiator.on_frame(&accept, &log, 0).unwrap();
-        let carriage = Carriage::plan(&log, accepted.host_head().head(), None);
+        let carriage = Carriage::plan(&log, accepted.host_head().head(), None).unwrap();
         let signed = accepted
             .sign(
                 Self::principal(),
