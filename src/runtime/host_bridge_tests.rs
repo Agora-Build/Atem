@@ -3991,3 +3991,24 @@ fn status_reports_the_attachment_its_refusals_and_its_welcome() {
         rt.shutdown().await;
     });
 }
+
+/// r9 §R9.3: a device list that can't be opened is a typed state (Task 7
+/// refuses r9 admission on it), distinct from "no device list", and leaves
+/// r8 alone (no `host_error`).
+#[test]
+fn a_device_list_that_cant_be_opened_is_reported_apart_from_none() {
+    use crate::session_protocol::membership::DeviceList;
+    let dir = short_dir();
+    let profile = dir.path().join("profile");
+    let sources = crate::profile::Sources::in_dir(&profile);
+    let journal = dir.path().join("journal");
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(bridge.device_list(), DeviceList::None));
+    drop(bridge);
+    let pairing = &sources.paths.pairing;
+    crate::session_protocol::membership::store::private_dir(pairing.dir()).unwrap();
+    std::fs::write(&pairing.membership, b"{damaged").unwrap();
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(bridge.device_list(), DeviceList::Failed(_)));
+    assert!(bridge.host_error().is_none(), "r8 is unaffected");
+}

@@ -290,18 +290,20 @@ pub fn capture(src: &Sources) -> Result<TrustState> {
     load(src)
 }
 
-/// `atem unpair`: durably commits the next generation (so every capture of
-/// the old binding goes stale), then removes the pairing record. Returns
-/// the new generation.
+/// `atem unpair`: removes the r9 device list, durably commits the next
+/// generation (so every capture of the old binding goes stale), then
+/// removes the pairing record. Returns the new generation. All under
+/// `trust_gen.lock`; the device list goes first, so a failure there leaves
+/// the host paired as it was, never an unpaired host with a device list.
 pub fn unpair(src: &Sources) -> Result<u64> {
     let _lock = lock(src)?;
     let next = read_trust_gen(&src.paths.pairing)? + 1;
-    write_trust_gen(&src.paths.pairing, next)?;
-    remove_record(&src.paths.pairing)?;
-    // r9 §R9.3: the device list goes with the pairing (a frozen one's
-    // genesis is kept on `frozen_genesis`, so it can't be re-paired to).
+    // r9 §R9.3: a frozen list's genesis is kept on `frozen_genesis`, so it
+    // can't be re-paired to.
     crate::session_protocol::membership::forget_on_unpair(&src.paths.pairing)
         .map_err(|e| anyhow::anyhow!("could not remove the device list: {e}"))?;
+    write_trust_gen(&src.paths.pairing, next)?;
+    remove_record(&src.paths.pairing)?;
     Ok(next)
 }
 
@@ -648,6 +650,45 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .to_string(),
             CHANGED
+        );
+    }
+
+    /// r9: the device list is removed first, under the lock; when that
+    /// fails the pairing is left as it was (no unpaired host keeps a list).
+    #[test]
+    fn unpair_removes_the_device_list_before_the_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        bound_profile(dir.path(), "astation-a");
+        let paths = &src.paths.pairing;
+        let gen_before = read_trust_gen(paths).unwrap();
+        // A frozen list whose genesis can't be kept: frozen_genesis is a
+        // directory, so its write fails.
+        std::fs::write(
+            &paths.membership,
+            format!(r#"{{"genesis_hash":"{}"}}"#, "a".repeat(64)),
+        )
+        .unwrap();
+        std::fs::write(&paths.freeze, b"x").unwrap();
+        std::fs::create_dir(&paths.frozen_genesis).unwrap();
+        assert!(unpair(&src).is_err());
+        assert_eq!(
+            read_trust_gen(paths).unwrap(),
+            gen_before,
+            "nothing committed"
+        );
+        assert!(
+            PairingRecord::load(paths).unwrap().is_some(),
+            "still paired"
+        );
+        assert!(paths.membership.exists(), "the list stays with the pairing");
+        std::fs::remove_dir(&paths.frozen_genesis).unwrap();
+        assert_eq!(unpair(&src).unwrap(), gen_before + 1);
+        assert!(!paths.membership.exists() && !paths.freeze.exists());
+        assert!(PairingRecord::load(paths).unwrap().is_none());
+        assert_eq!(
+            crate::session_protocol::membership::frozen_genesis(paths).len(),
+            1
         );
     }
 

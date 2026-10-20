@@ -225,3 +225,11 @@ pub fn host_clock() -> Option<(u64, u64, String)> {
     #[cfg(not(debug_assertions))]
     None
 }
+
+/// The device-list hooks are set (`ATEM_TEST_MEMBERSHIP_FAULTS`).
+pub fn membership_hooks() -> bool {
+    #[cfg(debug_assertions)]
+    return std::env::var_os("ATEM_TEST_MEMBERSHIP_FAULTS").is_some();
+    #[cfg(not(debug_assertions))]
+    false
+}

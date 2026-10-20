@@ -418,26 +418,49 @@ fn an_uncertain_rename_is_reconciled_whether_or_not_it_survived() {
 }
 
 /// The fences survive a crash at any point between the commit and
-/// `membership_applied`, and are raised once per entry: the applied record
-/// fails, the journal halts; the restart replays the fence without raising
-/// the bot's generation again.
+/// `membership_applied`, and are raised once per entry. A failed
+/// `membership_applied` write is a write fault like any other: the journal
+/// halts and the run is faulted (`init` busy, `hello` and later carriages
+/// refused, no clean checkpoint); the restart replays the fence without
+/// raising the bot's generation again, and is held (the fault is recorded).
 #[test]
-fn a_replayed_fence_is_never_raised_twice_for_one_entry() {
+fn a_failed_applied_write_faults_the_run_and_never_raises_a_fence_twice() {
+    let v = vectors();
     let mut r = Runtime::start();
     r.m.store_mut().inject(Injected {
         file: DlFile::Applied,
         step: Step::TempWrite,
     });
     let result = r.carry(&["E7"]);
-    assert_eq!(result.carried, Carried::Committed);
+    assert_eq!(
+        result.carried,
+        Carried::Committed,
+        "the list itself is durable"
+    );
     assert!(r.rt.host.journal_halted(), "a failed journal write halts");
+    assert!(r.m.faulted().is_some());
+    assert_eq!(r.m.init(), Init::Busy);
+    let now = r.now.clone();
+    assert_eq!(
+        r.m.hello("dev-phone", Some(v.head("E7")), None, false, &now),
+        Hello::NotRecorded
+    );
+    assert_eq!(r.carry(&["E7"]).carried, Carried::Refused);
     assert_eq!(r.rt.host.control_gen(SVC), 2);
-    assert_eq!(r.m.applied().head, vectors().head("E6"));
+    assert_eq!(r.m.applied().head, v.head("E6"));
+    assert!(!r.m.close(&now), "no clean checkpoint after a fault");
+    assert!(
+        r.rig
+            .read(DlFile::State)
+            .unwrap()
+            .get("checkpoint")
+            .is_none()
+    );
     let r = r.restart(false);
-    assert_eq!(r.m.applied().head, vectors().head("E7"));
+    assert_eq!(r.m.applied().head, v.head("E7"));
     assert_eq!(r.rt.host.control_gen(SVC), 2, "fence_seq 7 already durable");
     assert_eq!(r.rt.host.fence_seq(SVC), 7);
-    assert!(r.m.held().is_none(), "no device-list fault");
+    assert_eq!(r.m.held(), Some(&Held::Fault), "the fault was recorded");
 }
 
 /// A pending recovery keeps waiting across runtime restarts and a reboot,

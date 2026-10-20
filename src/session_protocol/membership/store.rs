@@ -85,8 +85,10 @@ pub enum Step {
     TempFsync,
     /// The rename over the file.
     Rename,
-    /// The directory fsync after the rename (or after a removal).
+    /// The directory fsync after the rename.
     DirectoryFsync,
+    /// A removal's directory fsync (the unlink may not be durable).
+    Remove,
 }
 
 impl Step {
@@ -96,6 +98,7 @@ impl Step {
             "temp_fsync" => Step::TempFsync,
             "rename" => Step::Rename,
             "directory_fsync" => Step::DirectoryFsync,
+            "remove" => Step::Remove,
             _ => return None,
         })
     }
@@ -106,6 +109,7 @@ impl Step {
             Step::TempFsync => "temp_fsync",
             Step::Rename => "rename",
             Step::DirectoryFsync => "directory_fsync",
+            Step::Remove => "remove",
         }
     }
 }
@@ -199,9 +203,9 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
                     dir.display()
                 )));
             }
-            if meta.uid() != euid() || meta.mode() & 0o022 != 0 {
+            if meta.uid() != euid() || meta.mode() & 0o077 != 0 {
                 return Err(io::Error::other(format!(
-                    "{} is not a private directory of this user",
+                    "{} is not a private directory of this user (0700)",
                     dir.display()
                 )));
             }
@@ -373,7 +377,14 @@ impl Store {
             let _ = remove_entry(&tmp);
             return Err(e);
         }
-        let before = read_private(&path).ok().flatten();
+        // The bytes a lost rename would bring back: kept only for tests
+        // (in-process, or a debug build with the hooks set), never read on
+        // a release write path.
+        let before = if cfg!(test) || crate::runtime::test_hooks::membership_hooks() {
+            read_private(&path).ok().flatten()
+        } else {
+            None
+        };
         fs::rename(&tmp, &path).map_err(|e| {
             let _ = remove_entry(&tmp);
             io(Step::Rename, e)
@@ -399,14 +410,14 @@ impl Store {
         remove_entry(&temp_of(&path))
             .and_then(|()| remove_entry(&path))
             .map_err(|e| Self::failure(file, Step::Rename, e.to_string()))?;
-        if self.fails(file, Step::DirectoryFsync) {
+        if self.fails(file, Step::Remove) {
             return Err(Self::failure(
                 file,
-                Step::DirectoryFsync,
+                Step::Remove,
                 "injected directory fsync failure",
             ));
         }
-        sync_dir(&dir).map_err(|e| Self::failure(file, Step::DirectoryFsync, e.to_string()))
+        sync_dir(&dir).map_err(|e| Self::failure(file, Step::Remove, e.to_string()))
     }
 
     /// The file's bytes (`None`: absent). A file that can't be read is an
@@ -426,6 +437,7 @@ impl Store {
     /// pairing directory are fsynced, so a rename that is visible is
     /// durable (§R9.3 "Crash recovery").
     pub fn sync_at_start(&self) -> io::Result<()> {
+        private_dir(self.pairing.dir())?;
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)

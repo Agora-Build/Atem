@@ -23,7 +23,25 @@
 //! freeze, a carriage record that couldn't be written) are fenced in
 //! memory, a freeze takes effect in memory, the journal halts, the fault is
 //! recorded (`membership.fault`) and every later carriage of the run is
-//! refused unread. Nothing is retried in the run.
+//! refused unread. Nothing is retried in the run. A failed
+//! `membership_applied` write, or `trust_gen.lock` that can't be taken, is
+//! such a fault too. A satisfied intent or committed carriage record that
+//! can't be removed is a harmless leftover (§R9.3): no fault, no hold; the
+//! next start removes it.
+//!
+//! **Fences are stricter than §R9.3's wording on purpose:** every r9 fence
+//! (removal, `set_roles` of roles, scope or expiry, `remove_host` of this
+//! host, a freeze) closes all of the principal's attachments, view ones
+//! included, not only those with `control`; the client is re-admitted under
+//! its new standing. "Every remote principal" is the session host's known
+//! principals plus every member of the log.
+//!
+//! A host writes only while `membership.json` still names the pin it
+//! opened (account, genesis, host and trust generation): after `atem
+//! unpair` (which removes the list first, under `trust_gen.lock`) or a new
+//! pin, the old host never writes again. A list that exists but can't be
+//! opened is [`DeviceList::Failed`], distinct from no list: r9 admission is
+//! refused on it (Task 7); r8 is unaffected.
 //!
 //! **At start** ([`MembershipHost::open`], before any remote admission and
 //! before the session host resolves recovered work): `membership.json` and
@@ -113,6 +131,8 @@ fn boot_id() -> String {
         if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
             return id.trim().to_string();
         }
+        // macOS: `kern.boottime` can shift when the wall clock is stepped;
+        // that reads as a reboot, which only lengthens a wait (safe).
         #[cfg(target_os = "macos")]
         {
             let mut tv = libc::timeval {
@@ -302,6 +322,18 @@ pub enum Init {
     Busy,
 }
 
+/// The runtime's device list as opened at start (§R9.3 "Crash recovery").
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceList<'a> {
+    /// No device list: this host isn't paired for r9.
+    None,
+    Open(&'a MembershipHost),
+    /// It exists but couldn't be opened (damaged, unsynced, an applied head
+    /// it doesn't hold): r9 admission must be refused (Task 7); r8 is
+    /// unaffected.
+    Failed(&'a str),
+}
+
 /// `membership_applied`: the head whose fences are durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
@@ -376,11 +408,50 @@ fn log(line: &str) {
 }
 
 /// What a failed step makes uncertain: which principals it would fence.
-enum Scope {
-    /// These principals (possibly none).
-    Some(Vec<Fence>),
-    /// Every remote principal (with this reason).
-    All(FenceReason),
+struct Scope {
+    /// These principals, each with its own reason and entry.
+    list: Vec<Fence>,
+    /// And every other remote principal, with this reason and entry (a
+    /// `remove_host` of this host, a freeze, a carriage nobody evaluated).
+    all: Option<(FenceReason, u64)>,
+}
+
+impl Scope {
+    fn none() -> Scope {
+        Scope {
+            list: Vec::new(),
+            all: None,
+        }
+    }
+
+    fn all(reason: FenceReason) -> Scope {
+        Scope {
+            list: Vec::new(),
+            all: Some((reason, 0)),
+        }
+    }
+
+    /// The fences, in order: the listed ones, then everyone else.
+    fn fences(self, host: &MembershipHost, fences: &dyn Fences, durable: bool) -> Vec<Fence> {
+        let mut out: Vec<Fence> = self
+            .list
+            .into_iter()
+            .map(|f| Fence { durable, ..f })
+            .collect();
+        if let Some((reason, seq)) = self.all {
+            for principal in host.all_remote(fences) {
+                if !out.iter().any(|f| f.principal == principal) {
+                    out.push(Fence {
+                        principal,
+                        reason,
+                        seq,
+                        durable,
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
 impl MembershipHost {
@@ -542,14 +613,18 @@ impl MembershipHost {
                         let result = host.commit_carriage(&entries, now, fences, true);
                         fenced.extend(result.fences);
                     } else {
-                        host.remove_or_fail(DlFile::Carriage, now, fences, &mut fenced);
+                        host.remove_leftover(DlFile::Carriage);
                     }
                 }
                 None => {
                     log("the carriage record can't be read; held until a manager reconciles");
                     host.held = Some(Held::CarriageUnreadable);
                     host.record_fault(DlFile::Carriage, None, now);
-                    let _ = host.store.remove(DlFile::Carriage);
+                    // Removed only once the fault record holds the host;
+                    // else the record itself holds it at the next start.
+                    if host.store.present(DlFile::Fault) {
+                        let _ = host.store.remove(DlFile::Carriage);
+                    }
                 }
             }
         }
@@ -560,7 +635,7 @@ impl MembershipHost {
 
         // 3. Fences after `membership_applied`.
         if host.faulted.is_none() {
-            host.replay_fences(fences, &mut fenced);
+            host.replay_fences(now, fences, &mut fenced);
         }
 
         // 4. Held: a fault record, an unreadable record, an intent left over.
@@ -703,6 +778,53 @@ impl MembershipHost {
         !self.unpaired
     }
 
+    /// Before a write: `trust_gen.lock`, then the pinned identity checked
+    /// against `membership.json` (account, genesis, host and its trust
+    /// generation, as this host opened them). `Ok(None)`: the list was
+    /// removed or replaced by another pin (`atem unpair`, `atem pair`)
+    /// while this runtime ran, so this host never writes again. `Err`: the
+    /// lock couldn't be taken (a write fault of `file`).
+    fn lock_for_write(
+        &mut self,
+        file: DlFile,
+    ) -> Result<Option<crate::memory::trust::TrustLock>, WriteError> {
+        let lock = self.store.lock().map_err(|e| WriteError {
+            file,
+            step: store::Step::TempWrite,
+            message: format!("cannot take trust_gen.lock: {e}"),
+        })?;
+        if !self.unpaired && !self.same_pin() {
+            log("the device list was removed or re-pinned; this host no longer writes it");
+            self.unpaired = true;
+        }
+        Ok((!self.unpaired).then_some(lock))
+    }
+
+    /// `membership.json` still names this host's pin.
+    fn same_pin(&self) -> bool {
+        #[derive(serde::Deserialize)]
+        struct Pin {
+            account_id: String,
+            genesis_hash: String,
+            host: HostField,
+        }
+        #[derive(serde::Deserialize)]
+        struct HostField {
+            host_id: String,
+            host_trust_gen: u64,
+        }
+        let Ok(Some(bytes)) = self.store.read(DlFile::State) else {
+            return false;
+        };
+        let Ok(pin) = serde_json::from_slice::<Pin>(&bytes) else {
+            return false;
+        };
+        pin.account_id == self.m.account_id()
+            && pin.genesis_hash == self.m.genesis_hash().to_hex()
+            && pin.host.host_id == self.pin.host_id
+            && pin.host.host_trust_gen == self.pin.host_trust_gen
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }
@@ -764,27 +886,19 @@ impl MembershipHost {
             return result;
         }
         let record = carriage_bytes(self.runtime_epoch, &self.m.head(), carried);
-        let lock = self.store.lock().map_err(|e| WriteError {
-            file: DlFile::Carriage,
-            step: store::Step::TempWrite,
-            message: format!("cannot take trust_gen.lock: {e}"),
-        });
-        let written =
-            lock.and_then(|lock| self.store.replace(DlFile::Carriage, &record).map(|()| lock));
+        let written = match self.lock_for_write(DlFile::Carriage) {
+            Ok(None) => return CarriageResult::plain(Carried::Unpaired),
+            Ok(Some(lock)) => self.store.replace(DlFile::Carriage, &record).map(|()| lock),
+            Err(e) => Err(e),
+        };
         let _lock = match written {
-            Ok(lock) if !self.still_paired() => {
-                // Unpaired meanwhile: the record goes too.
-                let _ = self.store.remove(DlFile::Carriage);
-                drop(lock);
-                return CarriageResult::plain(Carried::Unpaired);
-            }
             Ok(lock) => lock,
             Err(e) => {
                 // Never evaluated: every remote principal, refused unread.
                 log(&format!("cannot record a carriage: {e}"));
                 self.fail(
                     e,
-                    Scope::All(FenceReason::NotRecorded),
+                    Scope::all(FenceReason::NotRecorded),
                     now,
                     fences,
                     &mut early,
@@ -829,7 +943,7 @@ impl MembershipHost {
             return self.commit_freeze(eval, now, fences, replay);
         }
         if !eval.changed(&self.m) {
-            self.remove_or_fail(DlFile::Carriage, now, fences, &mut fenced);
+            self.remove_leftover(DlFile::Carriage);
             return CarriageResult {
                 carried: Carried::Unchanged,
                 evaluation: Some(eval),
@@ -853,7 +967,7 @@ impl MembershipHost {
             log("ignored conflicting history (evidence counted in memory)");
             self.m = eval.next.clone();
             self.evidence_dirty = true;
-            self.remove_or_fail(DlFile::Carriage, now, fences, &mut fenced);
+            self.remove_leftover(DlFile::Carriage);
             return CarriageResult {
                 carried: Carried::Committed,
                 evaluation: Some(eval),
@@ -904,31 +1018,16 @@ impl MembershipHost {
             };
         }
         // Fences, then `membership_applied`.
-        match planned {
-            Scope::Some(list) => {
-                for f in list {
-                    fences.fence(&f.principal, f.seq);
-                    fenced.push(f);
-                }
-            }
-            Scope::All(reason) => {
-                for p in self.all_remote(fences) {
-                    fences.fence(&p, self.m.head().seq);
-                    fenced.push(Fence {
-                        principal: p,
-                        reason,
-                        seq: self.m.head().seq,
-                        durable: true,
-                    });
-                }
-            }
+        for f in planned.fences(self, fences, true) {
+            fences.fence(&f.principal, f.seq);
+            fenced.push(f);
         }
-        self.write_applied(fences);
+        self.write_applied(now, fences, &mut fenced);
         if head_moves {
             self.satisfy_intent();
-            self.remove_or_fail(DlFile::Intent, now, fences, &mut fenced);
+            self.remove_leftover(DlFile::Intent);
         }
-        self.remove_or_fail(DlFile::Carriage, now, fences, &mut fenced);
+        self.remove_leftover(DlFile::Carriage);
         let announce = head_moves
             || eval.effects.iter().any(|e| {
                 matches!(
@@ -977,7 +1076,7 @@ impl MembershipHost {
         self.m = eval.next.clone();
         if let Err(e) = written {
             log(&format!("cannot record the freeze: {e}"));
-            self.fail(e, Scope::All(FenceReason::Frozen), now, fences, &mut fenced);
+            self.fail(e, Scope::all(FenceReason::Frozen), now, fences, &mut fenced);
             return CarriageResult {
                 carried: Carried::Frozen,
                 evaluation: Some(eval),
@@ -993,9 +1092,9 @@ impl MembershipHost {
                 announce: false,
             };
         }
-        self.fence_all_frozen(fences, &mut fenced);
+        self.fence_all_frozen(now, fences, &mut fenced);
         let _ = replay;
-        self.remove_or_fail(DlFile::Carriage, now, fences, &mut fenced);
+        self.remove_leftover(DlFile::Carriage);
         CarriageResult {
             carried: Carried::Frozen,
             evaluation: Some(eval),
@@ -1018,7 +1117,12 @@ impl MembershipHost {
         all.into_iter().collect()
     }
 
-    fn fence_all_frozen(&mut self, fences: &mut dyn Fences, fenced: &mut Vec<Fence>) {
+    fn fence_all_frozen(
+        &mut self,
+        now: &HostNow,
+        fences: &mut dyn Fences,
+        fenced: &mut Vec<Fence>,
+    ) {
         for p in self.all_remote(fences) {
             fences.fence(&p, 0);
             fenced.push(Fence {
@@ -1029,7 +1133,7 @@ impl MembershipHost {
             });
         }
         self.applied.frozen = true;
-        self.write_applied(fences);
+        self.write_applied(now, fences, fenced);
     }
 
     #[cfg(test)]
@@ -1050,6 +1154,7 @@ impl MembershipHost {
     /// The fences a committed evaluation brings, in `seq` order.
     fn planned_fences(&self, eval: &Evaluation) -> Scope {
         let mut list = Vec::new();
+        let mut all = None;
         let mut seq = 0;
         for effect in &eval.effects {
             let (device, reason) = match effect {
@@ -1060,7 +1165,10 @@ impl MembershipHost {
                 Change::MemberRemoved { device_id } => (device_id, FenceReason::Removed),
                 Change::RolesChanged { device_id } => (device_id, FenceReason::Revoked),
                 Change::HostRemoved { host_id } if *host_id == self.pin.host_id => {
-                    return Scope::All(FenceReason::HostRemoved);
+                    // Everyone else, at this entry; the other entries'
+                    // fences keep their own reasons and seqs.
+                    all.get_or_insert((FenceReason::HostRemoved, seq));
+                    continue;
                 }
                 _ => continue,
             };
@@ -1073,12 +1181,12 @@ impl MembershipHost {
                 });
             }
         }
-        Scope::Some(list)
+        Scope { list, all }
     }
 
     /// The fences of the stored entries after `membership_applied` (and of a
     /// freeze not yet applied), replayed at start; then the record.
-    fn replay_fences(&mut self, fences: &mut dyn Fences, fenced: &mut Vec<Fence>) {
+    fn replay_fences(&mut self, now: &HostNow, fences: &mut dyn Fences, fenced: &mut Vec<Fence>) {
         let head = self.m.head();
         let from = self.applied.head.seq + 1;
         let mut all = None;
@@ -1119,13 +1227,13 @@ impl MembershipHost {
         }
         let freeze_pending = self.is_frozen() && !self.applied.frozen;
         if freeze_pending {
-            self.fence_all_frozen(fences, fenced);
+            self.fence_all_frozen(now, fences, fenced);
         } else if self.applied.head != head {
-            self.write_applied(fences);
+            self.write_applied(now, fences, fenced);
         }
     }
 
-    fn write_applied(&mut self, fences: &mut dyn Fences) {
+    fn write_applied(&mut self, now: &HostNow, fences: &mut dyn Fences, fenced: &mut Vec<Fence>) {
         let applied = Applied {
             head: self.m.head(),
             frozen: self.applied.frozen || self.is_frozen(),
@@ -1136,10 +1244,12 @@ impl MembershipHost {
         {
             Ok(()) => self.applied = applied,
             Err(e) => {
-                // A journal write: the journal halts (r8 §I); the restart
-                // replays the fences after the old record.
+                // A write fault like any other: fail closed (the journal
+                // halts, the run is faulted, the fault is recorded); the
+                // restart replays the fences after the old record. The
+                // fences themselves were written (or are in memory).
                 log(&format!("cannot record the applied head: {e}"));
-                fences.halt();
+                self.fail(e, Scope::none(), now, fences, fenced);
             }
         }
     }
@@ -1157,16 +1267,16 @@ impl MembershipHost {
         }
     }
 
-    fn remove_or_fail(
-        &mut self,
-        file: DlFile,
-        now: &HostNow,
-        fences: &mut dyn Fences,
-        fenced: &mut Vec<Fence>,
-    ) {
+    /// Removes a satisfied intent or a carriage record whose content is
+    /// committed. A failed removal leaves a harmless leftover (§R9.3: its
+    /// entries are at or below the stored head and equal to it): no fault,
+    /// no hold; the next start removes it.
+    fn remove_leftover(&mut self, file: DlFile) {
         if let Err(e) = self.store.remove(file) {
-            log(&format!("cannot remove {}: {e}", file.name()));
-            self.fail(e, Scope::Some(Vec::new()), now, fences, fenced);
+            log(&format!(
+                "cannot remove {} ({e}); harmless, removed at the next start",
+                file.name()
+            ));
         }
     }
 
@@ -1178,9 +1288,9 @@ impl MembershipHost {
         {
             log(&format!("cannot write the device list: {e}"));
             let scope = if self.is_frozen() {
-                Scope::All(FenceReason::Frozen)
+                Scope::all(FenceReason::Frozen)
             } else {
-                Scope::Some(Vec::new())
+                Scope::none()
             };
             self.fail(e, scope, now, fences, fenced);
         }
@@ -1196,25 +1306,7 @@ impl MembershipHost {
         fences: &mut dyn Fences,
         fenced: &mut Vec<Fence>,
     ) {
-        let list: Vec<Fence> = match scope {
-            Scope::Some(list) => list
-                .into_iter()
-                .map(|f| Fence {
-                    durable: false,
-                    ..f
-                })
-                .collect(),
-            Scope::All(reason) => self
-                .all_remote(fences)
-                .into_iter()
-                .map(|principal| Fence {
-                    principal,
-                    reason,
-                    seq: 0,
-                    durable: false,
-                })
-                .collect(),
-        };
+        let list = scope.fences(self, fences, false);
         let principals: Vec<String> = list.iter().map(|f| f.principal.clone()).collect();
         fences.fault(Some(&principals));
         fenced.extend(list);
@@ -1280,6 +1372,16 @@ impl MembershipHost {
         if !(manager && clean && satisfied && client_head == Some(self.m.head())) {
             return Hello::NotReconciled;
         }
+        // An unreadable carriage record left because its fault record
+        // couldn't be written goes too (the manager confirmed the head).
+        if held == Held::CarriageUnreadable
+            && let Err(e) = self.store.remove(DlFile::Carriage)
+        {
+            log(&format!(
+                "cannot remove the carriage record: {e}; still held"
+            ));
+            return Hello::NotReconciled;
+        }
         if let Err(e) = self.store.remove(DlFile::Fault) {
             log(&format!("cannot remove the fault record: {e}; still held"));
             return Hello::NotReconciled;
@@ -1309,10 +1411,14 @@ impl MembershipHost {
             .iter()
             .any(|r| r.state() == RecoveryState::Pending && r.clock.elapsed(now));
         if due {
-            let _lock = self.store.lock().ok();
-            if !self.still_paired() {
-                return Vec::new();
-            }
+            let _lock = match self.lock_for_write(DlFile::State) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => return Vec::new(),
+                Err(e) => {
+                    self.fail(e, Scope::none(), now, fences, &mut fenced);
+                    return Vec::new();
+                }
+            };
             let mut next = self.m.clone();
             let changes = next.advance(now);
             if let Err(e) = self
@@ -1320,7 +1426,7 @@ impl MembershipHost {
                 .replace(DlFile::State, &state_bytes(&next, &self.pin, None))
             {
                 log(&format!("cannot record a recovery decision: {e}"));
-                self.fail(e, Scope::Some(Vec::new()), now, fences, &mut fenced);
+                self.fail(e, Scope::none(), now, fences, &mut fenced);
                 return Vec::new();
             }
             self.m = next;
@@ -1338,16 +1444,20 @@ impl MembershipHost {
         {
             self.m.checkpoint(now);
             self.checkpoint_at = now.mono_ms;
-            let _lock = self.store.lock().ok();
-            if !self.still_paired() {
-                return Vec::new();
-            }
+            let _lock = match self.lock_for_write(DlFile::State) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => return Vec::new(),
+                Err(e) => {
+                    self.fail(e, Scope::none(), now, fences, &mut fenced);
+                    return Vec::new();
+                }
+            };
             if let Err(e) = self
                 .store
                 .replace(DlFile::State, &state_bytes(&self.m, &self.pin, None))
             {
                 log(&format!("cannot record the time waited: {e}"));
-                self.fail(e, Scope::Some(Vec::new()), now, fences, &mut fenced);
+                self.fail(e, Scope::none(), now, fences, &mut fenced);
             } else {
                 self.evidence_dirty = false;
             }
@@ -1363,10 +1473,16 @@ impl MembershipHost {
             return false;
         }
         self.m.checkpoint(now);
-        let _lock = self.store.lock().ok();
-        if !self.still_paired() {
-            return false;
-        }
+        // No lock, no write: without a clean checkpoint the next start
+        // relies on the last persisted time (the wait only gets longer).
+        let _lock = match self.lock_for_write(DlFile::State) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return false,
+            Err(e) => {
+                log(&format!("no clean checkpoint: {e}"));
+                return false;
+            }
+        };
         let checkpoint = json!({"runtime_epoch": self.runtime_epoch, "at_wall": now.wall_ms});
         match self.store.replace(
             DlFile::State,

@@ -79,7 +79,9 @@ use crate::session_protocol::host::{
     Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
     HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
 };
-use crate::session_protocol::membership::{CarriageResult, HostFences, MembershipHost, host_now};
+use crate::session_protocol::membership::{
+    CarriageResult, DeviceList, HostFences, MembershipHost, host_now,
+};
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
     FamilyMessage, Permission, ReceiptKind, SessionState,
@@ -488,7 +490,9 @@ impl HostBridge {
                     }
                     Ok(None) => (None, None, effects),
                     Err(error) => {
-                        eprintln!("atem runtime: device list: {error}");
+                        eprintln!(
+                            "atem runtime: device list: {error}; r9 remote access is refused"
+                        );
                         (None, Some(error), effects)
                     }
                 }
@@ -600,18 +604,21 @@ impl HostBridge {
     /// Why remote sessions are disabled since the start, if they are (the
     /// recovered requests couldn't be resolved durably).
     pub fn host_error(&self) -> Option<String> {
-        if let Some(error) = &self.membership_error {
-            return Some(format!("remote sessions disabled: {error}"));
-        }
         self.host
             .start_error()
             .map(|e| format!("remote sessions disabled: {e}; restart Atem"))
     }
 
-    /// The r9 device list, when this host has one (Task 7 admits through it).
+    /// The r9 device list: none (not paired for r9), open (Task 7 admits
+    /// through it), or failed to open (Task 7 refuses r9 admission; r8 is
+    /// unaffected, so `host_error` doesn't report it).
     #[allow(dead_code)]
-    pub fn membership(&self) -> Option<&MembershipHost> {
-        self.membership.as_ref()
+    pub fn device_list(&self) -> DeviceList<'_> {
+        match (&self.membership, &self.membership_error) {
+            (Some(m), _) => DeviceList::Open(m),
+            (None, Some(error)) => DeviceList::Failed(error),
+            (None, None) => DeviceList::None,
+        }
     }
 
     /// Applies a carried suffix or window to the device list (§R9.3: one
@@ -624,11 +631,13 @@ impl HostBridge {
         let mut fences = HostFences::new(&mut self.host);
         let result = membership.apply_carriage(carried, &host_now(), &mut fences);
         let effects = fences.effects;
-        if !result.fences.is_empty() {
+        let closing = self.close_link;
+        self.exec(effects, cx);
+        // The reason goes with this carriage's own link drop only.
+        if !closing && self.close_link {
             self.close_reason =
                 Some("Remote access to this host changed (device list); the link was dropped");
         }
-        self.exec(effects, cx);
         self.sync_all(cx);
         Some(result)
     }
@@ -850,10 +859,9 @@ impl HostBridge {
                 })
                 .collect();
         }
+        let reason = self.close_reason.take();
         if std::mem::take(&mut self.close_link) {
-            let reason = self
-                .close_reason
-                .take()
+            let reason = reason
                 .unwrap_or("The session journal couldn't record a refusal; the link was dropped");
             app.drop_astation_link(reason.into());
         }

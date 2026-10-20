@@ -828,3 +828,198 @@ fn an_unpaired_list_is_never_written_again() {
         assert!(!rig.exists(file), "{file:?} came back");
     }
 }
+
+/// Important 1: the carriage record can't be read and the fault record
+/// can't be written either: the record stays, so the host is held at this
+/// start and the next ones; a reconciling manager removes both.
+#[test]
+fn an_unreadable_record_whose_fault_cant_be_recorded_holds_across_restarts() {
+    use std::os::unix::fs::PermissionsExt;
+    let v = vectors();
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    std::fs::write(&rig.pairing.carriage, b"\x00garbage").unwrap();
+    let dir = rig.pairing.dir().to_path_buf();
+    let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+    // Nothing can be created in pairing/: the fault record's write fails.
+    mode(0o500);
+    for epoch in [1, 2] {
+        let (host, _) = rig.open(epoch, &t0(), &mut remote()).unwrap();
+        assert_eq!(
+            host.held(),
+            Some(&Held::CarriageUnreadable),
+            "start {epoch}"
+        );
+        assert!(!rig.exists(DlFile::Fault));
+        assert!(
+            rig.exists(DlFile::Carriage),
+            "kept: it alone holds the host"
+        );
+    }
+    mode(0o700);
+    // Writable again: the third start records the fault, then removes the
+    // record; a reconciling manager ends the hold.
+    let (mut host, _) = rig.open(3, &t0(), &mut remote()).unwrap();
+    assert!(host.held().is_some());
+    assert!(rig.exists(DlFile::Fault) && !rig.exists(DlFile::Carriage));
+    assert!(matches!(
+        host.hello("dev-phone", Some(v.head("E6")), None, false, &t0()),
+        Hello::Admit(Admission::Member { .. })
+    ));
+    drop(host);
+    let (host, _) = rig.open(4, &t0(), &mut remote()).unwrap();
+    assert!(host.held().is_none());
+}
+
+/// Minor 1: a satisfied intent or committed carriage record that can't be
+/// removed is a harmless leftover: no fault, no hold; the next start
+/// removes it.
+#[test]
+fn a_leftover_that_cant_be_removed_is_harmless() {
+    let v = vectors();
+    for file in [DlFile::Intent, DlFile::Carriage] {
+        let rig = Rig::new();
+        rig.pin(&LOG6);
+        let (mut host, mut f) = opened(&rig, 1);
+        host.store_mut().inject(Injected {
+            file,
+            step: Step::Remove,
+        });
+        let result = host.apply_carriage(&v.carry(&["E7"]), &t0(), &mut f);
+        assert_eq!(result.carried, Carried::Committed, "{file:?}");
+        assert!(host.faulted().is_none(), "{file:?}");
+        assert!(f.faults.is_empty(), "{file:?}");
+        assert!(!rig.exists(DlFile::Fault), "{file:?}");
+        // The unsynced unlink "came back".
+        let leftover = match file {
+            DlFile::Intent => v.head("E7").to_json().to_string(),
+            _ => json!({"v": 1, "runtime_epoch": 1, "base": v.head("E6").to_json(),
+                        "entries": [v.wire("E7")]})
+            .to_string(),
+        };
+        std::fs::write(Store::new(&rig.pairing, &rig.journal).path(file), leftover).unwrap();
+        drop(host);
+        let mut f2 = remote();
+        let (host, _) = rig.open(2, &t0(), &mut f2).unwrap();
+        assert!(host.held().is_none(), "{file:?}");
+        assert!(!rig.exists(file), "{file:?}: removed at the next start");
+        assert_eq!(host.head(), v.head("E7"));
+    }
+}
+
+/// Minor 4: unpair, then a new pin of the same files: the old host (still
+/// running) can't overwrite the new list.
+#[test]
+fn an_old_host_never_overwrites_a_new_pin() {
+    let v = vectors();
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (mut host, mut f) = opened(&rig, 1);
+    host.apply_carriage(&v.carry(&["R7"]), &t0(), &mut f);
+    forget_on_unpair(&rig.pairing).unwrap();
+    // A new pairing pins the list again, in a newer trust generation.
+    let m = pinned(&["E1", "E2", "E3", "E4", "E5"], &t0());
+    let new_pin = HostPin {
+        host_id: "host-a".into(),
+        host_trust_gen: 2,
+    };
+    MembershipHost::pin(&rig.pairing, &rig.journal, &new_pin, &m).unwrap();
+    let before = std::fs::read(&rig.pairing.membership).unwrap();
+    let later = clock(WALL0 + 120_000, 121_000, "boot-1");
+    host.advance(&later, &mut f);
+    assert!(host.unpaired());
+    assert_eq!(
+        host.apply_carriage(&v.carry(&["E6"]), &later, &mut f)
+            .carried,
+        Carried::Unpaired
+    );
+    assert!(!host.close(&later));
+    assert_eq!(std::fs::read(&rig.pairing.membership).unwrap(), before);
+    assert!(!rig.exists(DlFile::Carriage));
+}
+
+/// Minor 8: `trust_gen.lock` can't be taken: the pass fails closed (no
+/// write without the lock), the clean checkpoint is skipped.
+#[test]
+fn no_write_without_the_lock() {
+    let v = vectors();
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (mut host, mut f) = opened(&rig, 1);
+    host.apply_carriage(&v.carry(&["R7"]), &t0(), &mut f);
+    let before = std::fs::read(&rig.pairing.membership).unwrap();
+    // A symlink where the lock is: refused (O_NOFOLLOW).
+    let lock = rig.pairing.dir().join("trust_gen.lock");
+    let _ = std::fs::remove_file(&lock);
+    std::os::unix::fs::symlink("/nonexistent", &lock).unwrap();
+    let later = clock(WALL0 + 120_000, 121_000, "boot-1");
+    assert!(!host.close(&later));
+    assert_eq!(std::fs::read(&rig.pairing.membership).unwrap(), before);
+    host.advance(&later, &mut f);
+    assert!(host.faulted().is_some(), "the checkpoint failed closed");
+    assert_eq!(f.faults.len(), 1);
+    assert_eq!(std::fs::read(&rig.pairing.membership).unwrap(), before);
+}
+
+/// Minor 10: a group- or world-readable pairing directory is refused, as
+/// for the journal.
+#[test]
+fn a_device_list_dir_that_isnt_0700_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    std::fs::set_permissions(rig.pairing.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(rig.open(1, &t0(), &mut remote()).is_err());
+    assert!(store::private_dir(rig.pairing.dir()).is_err());
+}
+
+/// Minor 9: a `remove_host` of this host in a batch fences everyone else,
+/// at its own entry; the other entries' fences keep their reasons and seqs.
+#[test]
+fn a_host_removal_in_a_batch_keeps_the_other_fences() {
+    let v = vectors();
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (host, _) = opened(&rig, 1);
+    let eval = Evaluation {
+        next: pinned(&LOG6, &t0()),
+        carried: Vec::new(),
+        appended: 2,
+        effects: vec![
+            Change::Appended(v.head("E6")),
+            Change::MemberRemoved {
+                device_id: "dev-ipad".into(),
+            },
+            Change::Appended(Head {
+                seq: 7,
+                hash: Hash32([7; 32]),
+            }),
+            Change::HostRemoved {
+                host_id: "host-a".into(),
+            },
+        ],
+        stop: None,
+    };
+    let fences = host.planned_fences(&eval).fences(&host, &remote(), true);
+    assert_eq!(fences[0].principal, "member:dev-ipad");
+    assert_eq!(fences[0].reason, FenceReason::Removed);
+    assert_eq!(fences[0].seq, 6);
+    assert!(
+        fences[1..]
+            .iter()
+            .all(|f| f.reason == FenceReason::HostRemoved && f.seq == 7)
+    );
+    assert!(
+        fences[1..]
+            .iter()
+            .any(|f| f.principal == "service:svc-discord")
+    );
+    assert_eq!(
+        fences
+            .iter()
+            .filter(|f| f.principal == "member:dev-ipad")
+            .count(),
+        1,
+        "each principal once"
+    );
+}
