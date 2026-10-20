@@ -778,38 +778,29 @@ fn a_removed_managers_conflict_on_the_subject_is_ignored() {
 fn a_wrong_byte_count_cannot_lift_the_bound() {
     let kit1 = kit(1);
     let (host, mac_keys) = genesis(&kit1);
-    // Entries whose encodings add up past 256 KiB, built on a scratch log.
-    let mut scratch = host.clone();
-    let mut carried = Vec::new();
-    let mut total = 0;
-    let mut i = 0;
-    while total <= 256 * 1024 {
-        let (_, member) = device(&format!("dev-{i}"), &[Role::View]);
-        let entry = apply(
-            &mut scratch,
-            "dev-mac",
-            &mac_keys,
-            &auth(),
-            Action::Add { member },
-            i,
-        );
-        total += entry.object().to_json().to_string().len();
-        carried.push(strict(&entry.object().to_json()));
-        i += 1;
-        if carried.len() == 64 {
-            break;
-        }
-    }
-    if total > 256 * 1024 {
-        let eval = host.evaluate(&carried, 0, &now(1));
-        assert_eq!(
-            eval.stop,
-            Some(Stop::Invalid {
-                index: carried.len() - 1,
-                reason: Invalid::CarriageTooLarge
-            })
-        );
-    }
+    // Objects whose own encoding crosses 256 KiB with the second one, passed
+    // with a received count of 0: the bound runs before parsing and names
+    // the crossing entry.
+    let big = "x".repeat(200 * 1024);
+    let junk: Vec<_> = (0..3)
+        .map(|_| strict(&serde_json::json!({ "pad": big })))
+        .collect();
+    assert_eq!(
+        host.evaluate(&junk, 0, &now(1)).stop,
+        Some(Stop::Invalid {
+            index: 1,
+            reason: Invalid::CarriageTooLarge
+        })
+    );
+    // One such object is under the bound: the shape check runs (and refuses
+    // it as malformed, at its own index), not the byte bound.
+    assert!(!matches!(
+        host.evaluate(&junk[..1], 0, &now(1)).stop,
+        Some(Stop::Invalid {
+            reason: Invalid::CarriageTooLarge,
+            ..
+        })
+    ));
     // 65 entries: the 65th (index 64) is named.
     let mut many = Vec::new();
     let mut scratch = host.clone();
@@ -900,5 +891,243 @@ fn a_fetch_without_progress_stops_the_writer() {
     assert_eq!(
         writer.fetched(&mut log, &[], true, &now(4), 4),
         Step::Failed(BackupError::RelayInconsistent)
+    );
+}
+
+/// I-2: a host removed (or re-keyed) beyond the deferral point can't confirm
+/// the head a restore reads through (§R9.7 step 1): every head is checked
+/// again against the extended chain.
+#[test]
+fn restore_head_from_host_removed_beyond_deferral() {
+    let kit0 = kit(1);
+    let (mut log, mac_keys) = genesis(&kit0);
+    let gh = log.genesis_hash();
+    let kit1 = RecoveryKit::make(&[1; 32], ACCOUNT, gh);
+    let mut hk = SoftwareKeys::new();
+    let h = KeyId::new("h");
+    let host_key = hk.generate(h.clone(), Alg::Ed25519).unwrap();
+    apply(
+        &mut log,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::AddHost {
+            host: HostRecord {
+                host_id: "host-a".into(),
+                host_trust_gen: 1,
+                host_key,
+            },
+        },
+        1,
+    );
+    let (nk, newmac) = device("dev-newmac", &ALL);
+    apply(
+        &mut log,
+        RECOVERY_SIGNER,
+        &kit1,
+        &RecoveryKit::sign_id(),
+        Action::RecoveryAdd { member: newmac },
+        2,
+    );
+    log.advance(&now(2 + RECOVERY_WAIT_MS));
+    let keys = vec![BackupKey {
+        kid: "k1".into(),
+        k: Zeroizing::new([7; 32]),
+    }];
+    let env = KBackupEnvelope::seal(ACCOUNT, gh, 1, &kit1.recovery_key(), &keys).unwrap();
+    apply(
+        &mut log,
+        "dev-newmac",
+        &nk,
+        &auth(),
+        Action::KBackup(KBackupRecord {
+            blob_version: 1,
+            kids: vec!["k1".into()],
+            recovery_key: kit1.recovery_key(),
+            backup_hash: env.backup_hash(),
+        }),
+        3 + RECOVERY_WAIT_MS,
+    );
+    let before_removal = log.clone();
+    apply(
+        &mut log,
+        "dev-newmac",
+        &nk,
+        &auth(),
+        Action::RemoveHost {
+            host_id: "host-a".into(),
+        },
+        4 + RECOVERY_WAIT_MS,
+    );
+    let entries = log.entries().to_vec();
+    let tip = signed_accept(&hk, &h, gh, "host-a", log.head());
+    assert_eq!(tip.verify(&log), Err(HeadError::UnknownHost));
+    let fresh = now(10 + RECOVERY_WAIT_MS);
+    let refused = restore(
+        &kit1,
+        &entries,
+        env.jcs().as_bytes(),
+        std::slice::from_ref(&tip),
+        &fresh,
+    )
+    .err()
+    .expect("never Ok on a removed host's head");
+    assert!(refused.is_withheld(), "{refused:?}");
+    // A lower head of the same host, before its removal, is still no
+    // confirmation: the extended chain removes the host.
+    let earlier = signed_accept(&hk, &h, gh, "host-a", before_removal.head());
+    let refused = restore(
+        &kit1,
+        &entries,
+        env.jcs().as_bytes(),
+        &[tip, earlier],
+        &fresh,
+    )
+    .err()
+    .unwrap();
+    assert!(refused.is_withheld(), "{refused:?}");
+}
+
+/// m-a: a deferred signer is judged by where it stands at our head. A
+/// `kit: "lost"` key K2 pending at seq-1 and current at our head freezes; one
+/// vetoed since is ignored (signer_not_in_effect). The same for a recovered
+/// subject: active now freezes; cancelled now is ignored.
+#[test]
+fn a_deferred_signer_is_judged_at_our_head() {
+    let (kit1, kit2) = (kit(1), kit(2));
+    let (mut host, mac_keys) = genesis(&kit1);
+    let (phone_keys, phone) = device("dev-phone", &ALL);
+    apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Add { member: phone },
+        1,
+    );
+    let lost = apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::SetRecoveryKey {
+            recovery_key: kit2.recovery_key(),
+            kit: KitMode::Lost,
+        },
+        2,
+    );
+    let before = host.clone();
+    let (_, x) = device("dev-x", &[Role::View]);
+    apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Add { member: x },
+        3,
+    );
+    let (_, z) = device("dev-z", &ALL);
+    let body = before.draft(RECOVERY_SIGNER, 4, &Action::RecoveryAdd { member: z });
+    let by_k2 = sign_entry(&kit2, &RecoveryKit::sign_id(), body).unwrap();
+    // K2 vetoed: not in effect at our head.
+    let mut vetoed = host.clone();
+    apply(
+        &mut vetoed,
+        "dev-phone",
+        &phone_keys,
+        &auth(),
+        Action::RecoveryVeto {
+            target: lost.hash(),
+        },
+        4,
+    );
+    assert_eq!(
+        conflict_of(&vetoed, &by_k2, 5),
+        Some(Stop::Conflict {
+            index: 0,
+            outcome: Conflict::Ignored(EvidenceReason::SignerNotInEffect)
+        })
+    );
+    // K2 in effect (its wait ended): freeze.
+    let mut active = host.clone();
+    active.advance(&now(2 + RECOVERY_WAIT_MS + 5));
+    assert_eq!(*active.recovery_key(), kit2.recovery_key());
+    assert_eq!(
+        conflict_of(&active, &by_k2, 3 + RECOVERY_WAIT_MS + 10),
+        Some(Stop::Conflict {
+            index: 0,
+            outcome: Conflict::Freeze
+        })
+    );
+
+    // A recovered subject signing at a seq that isn't a veto.
+    let (mut host, mac_keys) = genesis(&kit1);
+    let (phone_keys, phone) = device("dev-phone", &ALL);
+    apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Add { member: phone },
+        1,
+    );
+    let (newmac_keys, newmac) = device("dev-newmac", &ALL);
+    let r = apply(
+        &mut host,
+        RECOVERY_SIGNER,
+        &kit1,
+        &RecoveryKit::sign_id(),
+        Action::RecoveryAdd { member: newmac },
+        2,
+    );
+    let before = host.clone();
+    let (_, x) = device("dev-x", &[Role::View]);
+    apply(
+        &mut host,
+        "dev-mac",
+        &mac_keys,
+        &auth(),
+        Action::Add { member: x },
+        3,
+    );
+    let body = before.draft(
+        "dev-newmac",
+        4,
+        &Action::Remove {
+            device_id: "dev-phone".into(),
+        },
+    );
+    let by_subject = sign_entry(&newmac_keys, &auth(), body).unwrap();
+    // Cancelled since: ignored, with its own evidence label (m-c).
+    let mut cancelled = host.clone();
+    apply(
+        &mut cancelled,
+        "dev-phone",
+        &phone_keys,
+        &auth(),
+        Action::RecoveryVeto { target: r.hash() },
+        4,
+    );
+    let eval = cancelled.evaluate_objects(&[by_subject.object().clone()], &now(5));
+    assert_eq!(
+        eval.stop,
+        Some(Stop::Conflict {
+            index: 0,
+            outcome: Conflict::Ignored(EvidenceReason::SignerNotInEffect)
+        })
+    );
+    assert_eq!(
+        eval.next.evidence().recent.last().unwrap().reason.as_str(),
+        "signer_not_in_effect"
+    );
+    // Active since: a manager at our head, freeze.
+    let mut active = host.clone();
+    active.advance(&now(2 + RECOVERY_WAIT_MS + 5));
+    assert_eq!(
+        conflict_of(&active, &by_subject, 3 + RECOVERY_WAIT_MS + 10),
+        Some(Stop::Conflict {
+            index: 0,
+            outcome: Conflict::Freeze
+        })
     );
 }

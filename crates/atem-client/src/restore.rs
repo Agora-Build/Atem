@@ -288,17 +288,36 @@ pub fn restore(
 
     // 3. Host-signed heads, each verified with its host's key from the
     // chain prefix verified so far (a forged or foreign one proves nothing).
-    let confirmed: Vec<HostHead> = host_accepts
-        .iter()
-        .filter_map(|accept| accept.verify(&verified.membership).ok())
-        .collect();
+    let verify_heads = |log: &Membership| -> Vec<HostHead> {
+        host_accepts
+            .iter()
+            .filter_map(|accept| accept.verify(log).ok())
+            .collect()
+    };
+    let mut confirmed = verify_heads(&verified.membership);
     // A chain that stops at an entry depending on a recovery still pending on
     // this (fresh) verifier: a verified host head beyond it shows that the
-    // recovery took effect there, so verify again up to that head.
-    if verified.deferred.is_some()
-        && let Some(highest) = confirmed.iter().map(|h| h.head).max_by_key(|h| h.seq)
-    {
-        verified = verify(Some(highest))?;
+    // recovery took effect there, so verify again up to that head. The
+    // longer chain may remove or re-key that host (§R9.7 step 1: current, at
+    // its newest generation, in the verified log), so every head is checked
+    // again against it; if the head read through no longer verifies, the
+    // next highest is tried, and with none left the restore waits.
+    if verified.deferred.is_some() {
+        let mut candidates = confirmed.clone();
+        loop {
+            let Some(highest) = candidates.iter().max_by_key(|h| h.head.seq).cloned() else {
+                confirmed = Vec::new();
+                break;
+            };
+            let extended = verify(Some(highest.head))?;
+            let survivors = verify_heads(&extended.membership);
+            if survivors.contains(&highest) {
+                verified = extended;
+                confirmed = survivors;
+                break;
+            }
+            candidates.retain(|h| *h != highest);
+        }
     }
     let log = verified.membership;
     let confirmed: Vec<&HostHead> = confirmed.iter().collect();

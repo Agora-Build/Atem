@@ -330,6 +330,9 @@ pub enum EvidenceReason {
     LateDecision,
     Invalid,
     SignerRemoved,
+    /// Validly signed by a device that holds nothing at our head (a
+    /// recovery subject still pending or cancelled here).
+    SignerNotInEffect,
 }
 
 impl EvidenceReason {
@@ -339,6 +342,7 @@ impl EvidenceReason {
             EvidenceReason::LateDecision => "late_decision",
             EvidenceReason::Invalid => "invalid",
             EvidenceReason::SignerRemoved => "signer_removed",
+            EvidenceReason::SignerNotInEffect => "signer_not_in_effect",
         }
     }
 }
@@ -1449,11 +1453,13 @@ impl Membership {
         // Row 4: invalid against C[..seq-1]. An entry that is only deferred
         // there (validly signed; it waits on an entry pending at that
         // position) is not invalid (§R9.2); rows 5 and 6 judge its signer.
-        // A deferred recovery-key signature (only a pending kit's key
-        // verifies it) is no current recovery key's: ignored as invalid.
-        let deferred_recovery =
-            theirs.signer == RECOVERY_SIGNER && matches!(against_prefix, Check::Deferred(_));
-        if matches!(against_prefix, Check::Invalid(_)) || deferred_recovery {
+        //
+        // Deferred signers are judged by where they stand at our head, the
+        // same way for both kinds: a key that was pending at seq-1 and is in
+        // effect at our head freezes (a recovered subject now active, or a
+        // `kit: "lost"` key K2 now the current recovery key); otherwise the
+        // entry is ignored (the key was vetoed, cancelled or replaced).
+        if matches!(against_prefix, Check::Invalid(_)) {
             return self.ignore(theirs, EvidenceReason::Invalid, now, effects);
         }
         // Row 5: the signer was removed or lost `manage` in C[seq..head]. The
@@ -1464,15 +1470,28 @@ impl Membership {
             return self.ignore(theirs, EvidenceReason::SignerRemoved, now, effects);
         }
         // Row 6: signed by the recovery key, or by a manager in effect at our
-        // head. A signer that holds nothing here (a recovery subject still
-        // pending or cancelled) is not a manager at the head: ignored.
+        // head.
+        if theirs.signer == RECOVERY_SIGNER {
+            let current_at_head = match against_prefix {
+                Check::Deferred(on) => matches!(
+                    self.entry_by_hash(&on).map(|e| &e.action),
+                    Some(Action::SetRecoveryKey { recovery_key, .. })
+                        if recovery_key == self.recovery_key()
+                ),
+                _ => true,
+            };
+            if current_at_head {
+                return self.freeze(seq, &ours, theirs, now, effects);
+            }
+            return self.ignore(theirs, EvidenceReason::SignerNotInEffect, now, effects);
+        }
         let manager_at_head = self
             .member(&theirs.signer)
             .is_some_and(|m| m.status == MemberStatus::Active && m.member.is_manager());
-        if theirs.signer == RECOVERY_SIGNER || manager_at_head {
+        if manager_at_head {
             return self.freeze(seq, &ours, theirs, now, effects);
         }
-        self.ignore(theirs, EvidenceReason::SignerRemoved, now, effects)
+        self.ignore(theirs, EvidenceReason::SignerNotInEffect, now, effects)
     }
 
     /// `entry` is signed by the subject of the pending-type entry `target`:
