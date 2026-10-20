@@ -390,6 +390,10 @@ pub struct HostBridge {
     considered: Option<u64>,
     link: Option<Link>,
     last_advance: u64,
+    /// The host clock (§R9.5) at the last 100 ms pass: a pass also runs
+    /// when it moved 100 ms (the device list's waits, service expiry and
+    /// push resends are on it; the fixtures move it alone).
+    last_host: (u64, u64),
     /// When the link's pairing capture was last checked.
     capture_checked: Instant,
     recovered: bool,
@@ -602,6 +606,7 @@ impl HostBridge {
             considered: None,
             link: None,
             last_advance: 0,
+            last_host: (0, 0),
             capture_checked: Instant::now(),
             recovered: false,
             seen: HashMap::new(),
@@ -1237,11 +1242,13 @@ impl HostBridge {
         // follow the host clock, which moves while the machine sleeps.
         self.host
             .set_wall_offset(host_now().wall_ms.saturating_sub(self.clock.now()));
-        if self
-            .link
-            .as_ref()
-            .is_some_and(|l| self.clock.now() >= l.deadline || self.clock.wall() >= l.wall_deadline)
-        {
+        // Only a welcomed attachment's authorization ends the link: on an
+        // r9 host (r8 refused) the link's attachment is never welcomed, and
+        // dropping the link would close every r9 channel on it daily.
+        if self.link.as_ref().is_some_and(|l| {
+            l.welcomed_at.is_some()
+                && (self.clock.now() >= l.deadline || self.clock.wall() >= l.wall_deadline)
+        }) {
             // Its authorization ended: the attachment is fenced and the link
             // dropped, so the normal reconnect authenticates it again.
             app.drop_astation_link("Astation link authorization expired; reconnecting".into());
@@ -1318,8 +1325,13 @@ impl HostBridge {
         self.worker_reports(&mut cx);
         self.app_refusals(&mut app.hosted);
         let now = self.clock.now();
-        if now >= self.last_advance + ADVANCE_EVERY {
+        let host = host_now();
+        let host_moved = host.wall_ms >= self.last_host.0 + ADVANCE_EVERY
+            || host.mono_ms >= self.last_host.1 + ADVANCE_EVERY
+            || host.mono_ms < self.last_host.1;
+        if now >= self.last_advance + ADVANCE_EVERY || host_moved {
             self.last_advance = now;
+            self.last_host = (host.wall_ms, host.mono_ms);
             let effects = self.host.advance(now);
             self.exec(effects, &mut cx);
             self.finished_hand_offs(&mut cx);
