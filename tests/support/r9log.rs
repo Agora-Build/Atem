@@ -195,6 +195,64 @@ impl TestLog {
         self.append(MAC, Action::Add { member })
     }
 
+    fn native_member(&mut self, device: &str, roles: &[&str]) -> Member {
+        let s = secret(&format!("{device} auth"));
+        self.keys.insert_p256(auth(device), &s).unwrap();
+        Member {
+            device_id: device.into(),
+            auth_key: PublicKey::new(Alg::P256, &p256_pub(&s)).unwrap(),
+            kind: MemberKind::Native {
+                enc_key: PublicKey::new(Alg::X25519, &secret(&format!("{device} enc")))
+                    .unwrap(),
+                roles: roles.iter().map(|r| Role::parse(r).unwrap()).collect(),
+            },
+        }
+    }
+
+    /// A `recovery_add` of a new native manager, signed by the genesis
+    /// recovery key (pending 24 h on each host, §R9.5).
+    pub fn recovery_add(&mut self, device: &str) -> Value {
+        let member = self.native_member(device, &["control", "manage", "view"]);
+        let key = KeyId::new("recovery");
+        self.keys.insert_ed25519(key.clone(), &secret("recovery"));
+        let body = self
+            .log
+            .draft("recovery", now_wall(), &Action::RecoveryAdd { member });
+        let entry = sign_entry(&self.keys, &key, body).unwrap();
+        self.entries.push(entry.clone());
+        self.log = Membership::verify_chain(
+            &self.account,
+            &self.genesis_hash(),
+            &self.entries,
+            &self.now,
+        )
+        .unwrap()
+        .membership;
+        entry.object().to_json()
+    }
+
+    /// An entry by the Mac (a current manager) at the head's own `seq`
+    /// with another body: carried to a host that holds the head, it is a
+    /// conflict that freezes (§R9.4). Not appended here.
+    pub fn conflicting_add(&mut self, device: &str) -> Value {
+        let member = self.native_member(device, &["view"]);
+        let head = self.log.head();
+        let prev = self.log.entry(head.seq - 1).unwrap().hash();
+        let body = atem_client::membership::draft_on(
+            &self.account,
+            &self.genesis_hash(),
+            head.seq,
+            &prev,
+            MAC,
+            now_wall(),
+            &Action::Add { member },
+        );
+        sign_entry(&self.keys, &auth(MAC), body)
+            .unwrap()
+            .object()
+            .to_json()
+    }
+
     pub fn remove(&mut self, device: &str) -> Value {
         self.append(
             MAC,

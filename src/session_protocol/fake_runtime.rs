@@ -168,6 +168,9 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     out: Vec<(String, Envelope)>,
     /// Every effect the host produced, in order.
     pub effects: Vec<Effect>,
+    /// Sends and closes for attachments this runtime doesn't play (r9
+    /// channels, served by `session_protocol::r9`), in order.
+    pub foreign: Vec<Effect>,
     now: u64,
     /// r8: the chat of each session with `chat`, and its conversations.
     chats: HashMap<String, FakeChat>,
@@ -316,6 +319,7 @@ impl<J: Journal> FakeRuntime<J> {
             sessions: Vec::new(),
             out: Vec::new(),
             effects: Vec::new(),
+            foreign: Vec::new(),
             now: 0,
             chats: HashMap::new(),
             history_key: HistoryKey::random(),
@@ -572,10 +576,17 @@ impl<J: Journal> FakeRuntime<J> {
                     });
                     if let Some(name) = self.live.get(&attachment) {
                         self.out.push((name.clone(), message));
+                    } else {
+                        self.foreign.push(Effect::Send {
+                            attachment,
+                            message,
+                        });
                     }
                 }
                 Effect::Close { attachment } => {
-                    self.live.remove(&attachment);
+                    if self.live.remove(&attachment).is_none() {
+                        self.foreign.push(Effect::Close { attachment });
+                    }
                 }
                 // A second `hello` replaced the client's attachment on the
                 // same transport: its messages go to the new one.

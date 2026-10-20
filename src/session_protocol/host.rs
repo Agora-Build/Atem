@@ -154,6 +154,8 @@ pub const DETAIL_REPAIR: &str = "host counters exhausted; pair again";
 /// A completed `prompt` receipt's `detail`: its turn's outcome (chat-v1
 /// `complete.outcome`), kept in the journal as one of these two words.
 pub const DETAIL_TURN_DONE: &str = "done";
+/// An r8 `hello` on a host with a device list (r9 "No compatibility").
+pub const R8_REFUSED: &str = "this host has a device list: connect with atem-session revision 9";
 pub const DETAIL_TURN_INTERRUPTED: &str = "interrupted";
 
 // ── Inputs and outputs ────────────────────────────────────────────────────
@@ -594,6 +596,10 @@ pub struct SessionHost<J: Journal> {
     /// How the request being refused is answered beyond its code.
     refused: Refused,
     out: Vec<Effect>,
+    /// r9 (§R9.7a 7, "No compatibility"): a device list exists, so an r8
+    /// `hello` is refused (`unsupported_version`, `revision: 9`) and no
+    /// attachment is welcomed outside the channel.
+    refuse_r8: bool,
     /// Fixtures (`hold_dispatch`): accepted work stays queued.
     #[cfg(test)]
     dispatch_held: bool,
@@ -655,6 +661,7 @@ impl<J: Journal> SessionHost<J> {
             waiting: BTreeSet::new(),
             refused: Refused::default(),
             out: Vec::new(),
+            refuse_r8: false,
             #[cfg(test)]
             dispatch_held: false,
         };
@@ -2185,6 +2192,70 @@ impl<J: Journal> SessionHost<J> {
         self.send(attachment, re, op);
     }
 
+    /// r9 "No compatibility": once a device list exists, an r8 `hello` (any
+    /// revision) is `unsupported_version` naming revision 9, and nothing
+    /// else happens: r9 clients come through `atem-ch1` (§R9.7a).
+    fn refuse_r8_hello(&mut self, attachment: &str, re: Option<String>) {
+        let op = Op::Error {
+            code: ErrorCode::UnsupportedVersion,
+            detail: Some(R8_REFUSED.to_string()),
+            revision: Some(atem_client::session::r9::REVISION),
+            controller: None,
+        };
+        self.send(attachment, re, op);
+    }
+
+    /// r9: refuse (true) or allow r8 admission (a device list appeared or
+    /// went away while the runtime runs).
+    pub fn set_refuse_r8(&mut self, refuse: bool) {
+        self.refuse_r8 = refuse;
+    }
+
+    pub fn refuses_r8(&self) -> bool {
+        self.refuse_r8
+    }
+
+    /// r9 (§R9.8): welcomes the connected attachment `att` admitted through
+    /// `atem-ch1` (no r8 `hello`: the channel's `hello` was judged by the
+    /// r9 admission). Returns its new `controller_session` and the
+    /// authorization left. Refused like an r8 `hello`: `busy` once the
+    /// journal halted (r8 §I), `paused` past the authorization deadline.
+    /// A principal welcomed with `control` is confirmed (r8 §H).
+    pub fn welcome_r9(&mut self, att: &str, now: u64) -> Result<(String, u64), ErrorCode> {
+        self.tick(now);
+        let Some(a) = self.attachments.get(att) else {
+            return Err(ErrorCode::Unauthorized);
+        };
+        if self.journal_halted || self.halted {
+            return Err(ErrorCode::Busy);
+        }
+        if a.welcomed() {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        if self.now >= a.authorization_deadline {
+            return Err(ErrorCode::Paused);
+        }
+        let ms_left = a.authorization_deadline - self.now;
+        let controller_session = self.new_id();
+        self.attachments.get_mut(att).unwrap().controller_session =
+            Some(controller_session.clone());
+        if self.attachments[att].can(Permission::Control) {
+            let principal = self.attachments[att].principal.clone();
+            self.confirm(&principal);
+        }
+        Ok((controller_session, ms_left))
+    }
+
+    /// The principal attachment `att` speaks for.
+    pub fn attachment_principal(&self, att: &str) -> Option<&str> {
+        self.attachments.get(att).map(|a| a.principal.as_str())
+    }
+
+    /// The pending effects (r9 admission's `welcome_r9` and fences).
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        self.take()
+    }
+
     /// Checks shared by every request after `welcome`. After a journal halt
     /// every request is `busy`, on a welcomed attachment or not (r8 §I).
     fn admit_request(&self, att: &str) -> Checked {
@@ -2208,6 +2279,10 @@ impl<J: Journal> SessionHost<J> {
     fn on_session(&mut self, att: &str, m: SessionMessage) {
         let re = Some(m.id.clone());
         let result = match m.op {
+            Op::Hello { .. } if self.refuse_r8 => {
+                self.refuse_r8_hello(att, re);
+                return;
+            }
             Op::Hello { revision, .. } if revision != Some(REVISION) => {
                 self.refuse_hello(att, re);
                 return;
