@@ -643,6 +643,9 @@ impl App {
             AstationMessage::Channel(text) => {
                 self.channel_envelope(text);
             }
+            AstationMessage::ChannelTooLarge(handle) => {
+                self.channel_refused(handle, crate::session_protocol::r9::envelope::reason::TOO_LARGE);
+            }
             AstationMessage::SessionOversize { id, family } => {
                 self.session_oversize(id, &family);
             }

@@ -51,9 +51,10 @@ pub struct Hosted {
     pub channels: VecDeque<(u64, String)>,
     /// Their bytes.
     pub channel_bytes: usize,
-    /// Channels whose envelope didn't fit the inbox: (link generation,
-    /// handle), closed `busy` by the broker.
-    pub channel_overflow: Vec<(u64, String)>,
+    /// Channels whose envelope was refused unread: (link generation,
+    /// handle, close reason): `busy` when it didn't fit the inbox,
+    /// `too_large` over the envelope bound.
+    pub channel_overflow: Vec<(u64, String, &'static str)>,
 }
 
 impl Hosted {
@@ -133,7 +134,25 @@ impl App {
             .filter(|h| crate::session_protocol::r9::envelope::is_handle(h))
             && hosted.channel_overflow.len() < INBOX_LIMIT
         {
-            hosted.channel_overflow.push((link, handle));
+            hosted.channel_overflow.push((
+                link,
+                handle,
+                crate::session_protocol::r9::envelope::reason::BUSY,
+            ));
+        }
+    }
+
+    /// An r9 channel envelope refused unread (over its bound): its channel
+    /// is closed with `why` by the broker.
+    pub(super) fn channel_refused(&mut self, handle: String, why: &'static str) {
+        if !self.astation_connected || self.astation_client.is_ws_closed() {
+            return;
+        }
+        let link = self.astation_link_gen;
+        if let Some(hosted) = self.hosted.as_mut()
+            && hosted.channel_overflow.len() < INBOX_LIMIT
+        {
+            hosted.channel_overflow.push((link, handle, why));
         }
     }
 

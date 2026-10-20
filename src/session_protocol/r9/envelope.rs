@@ -138,11 +138,32 @@ fn peek_handle(text: &str) -> Option<String> {
         .filter(|h| is_handle(h))
 }
 
+/// Only this much of an oversize message is looked at, never parsed.
+const OVERSIZE_PEEK: usize = 4096;
+
+/// An oversize message (over [`MAX_ENVELOPE_BYTES`], never parsed): whether
+/// its first bytes say it is a channel envelope, and its handle when they
+/// name one (`"channel":"<h>"`, compact form), to address the
+/// `close{too_large}`.
+pub fn oversize_envelope(text: &str) -> Option<Option<String>> {
+    let head = &text.as_bytes()[..text.len().min(OVERSIZE_PEEK)];
+    let head = String::from_utf8_lossy(head);
+    if !head.contains(r#""type":"channel""#) {
+        return None;
+    }
+    let handle = head.find(r#""channel":""#).and_then(|at| {
+        let rest = &head[at + r#""channel":""#.len()..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string()).filter(|h| is_handle(h))
+    });
+    Some(handle)
+}
+
 /// Parses one envelope (§R9.7a "Fields").
 pub fn parse(text: &str) -> Result<Event, Refused> {
     if text.len() > MAX_ENVELOPE_BYTES {
         return Err(Refused::TooLarge {
-            channel: peek_handle(text),
+            channel: oversize_envelope(text).flatten(),
         });
     }
     let malformed = |why| Refused::Malformed {

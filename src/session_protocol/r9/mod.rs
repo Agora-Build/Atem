@@ -64,7 +64,11 @@ pub struct Limits {
     pub handshakes: usize,
     pub queued_bytes: usize,
     pub unknown_handles: usize,
+    /// `close`s refusing an `open` or a frame for an unknown handle, a
+    /// second (together).
     pub unknown_closes_per_second: u32,
+    /// `close`s queued outside any channel, at most.
+    pub global_closes: usize,
 }
 
 impl Default for Limits {
@@ -75,9 +79,18 @@ impl Default for Limits {
             queued_bytes: 4 << 20,
             unknown_handles: 1024,
             unknown_closes_per_second: 16,
+            global_closes: 1024,
         }
     }
 }
+
+/// The largest legal inner frame (a `finish`; a `rec` is 3 bytes shorter)
+/// and `ct` (1 MiB + the 16-byte tag, base64url), §R9.7a.
+pub const MAX_INNER_FRAME: usize = 1_398_162;
+pub const MAX_CT_CHARS: usize = 1_398_123;
+/// Approval ids remembered with their session (scope checks of
+/// `approval_closed`).
+const MAX_APPROVAL_SESSIONS: usize = 1024;
 
 /// An opened channel waits this long for its `init` (as `accept` → `finish`).
 const INIT_WAIT_MS: u64 = atem_client::channel::HANDSHAKE_STEP_MS;
@@ -212,6 +225,9 @@ pub struct R9Host {
     /// (second, closes sent in it) for `unknown_channel`.
     unknown_rate: (u64, u32),
     unknown_dropped: u64,
+    /// approval id → its session, from the requests delivered (in order).
+    approval_sessions: HashMap<String, String>,
+    approval_order: VecDeque<String>,
     /// `unknown_channel` closes for the link, in order.
     global: VecDeque<String>,
     revoked: RevokedGrants,
@@ -289,6 +305,8 @@ impl R9Host {
             unknown_order: VecDeque::new(),
             unknown_rate: (0, 0),
             unknown_dropped: 0,
+            approval_sessions: HashMap::new(),
+            approval_order: VecDeque::new(),
             global: VecDeque::new(),
             revoked: RevokedGrants::new(),
             revoked_until: BTreeMap::new(),
@@ -407,8 +425,7 @@ impl R9Host {
         }
         let handshakes = self.chans.values().filter(|c| c.handshaking()).count();
         if self.chans.len() >= self.limits.open_channels || handshakes >= self.limits.handshakes {
-            self.global
-                .push_back(envelope::close(&handle, Some(reason::BUSY)));
+            self.refuse_outside(&handle, reason::BUSY, parts.now.host.mono_ms);
             return;
         }
         self.unknown.remove(&handle);
@@ -447,30 +464,59 @@ impl R9Host {
         if self.unknown.contains(handle) {
             return;
         }
+        if self.unknown_order.len() >= self.limits.unknown_handles {
+            // Remembers no more: dropped, never a second close (§R9.7a 3).
+            self.dropped("frames for unknown channels");
+            return;
+        }
+        if self.refuse_outside(handle, reason::UNKNOWN_CHANNEL, now_mono) {
+            self.unknown.insert(handle.to_string());
+            self.unknown_order.push_back(handle.to_string());
+        }
+    }
+
+    /// A `close` outside any channel (a refused `open`, an unknown handle):
+    /// at most 16 a second and 1024 queued (§R9.7a "Bounds"); beyond either
+    /// dropped and counted. Whether it was queued.
+    fn refuse_outside(&mut self, handle: &str, why: &'static str, now_mono: u64) -> bool {
         let second = now_mono / 1000;
         if self.unknown_rate.0 != second {
             self.unknown_rate = (second, 0);
         }
-        if self.unknown_rate.1 >= self.limits.unknown_closes_per_second {
-            self.unknown_dropped += 1;
-            if self.unknown_dropped.is_power_of_two() {
-                log(&format!(
-                    "{} frames for unknown channels dropped",
-                    self.unknown_dropped
-                ));
-            }
-            return;
+        if self.unknown_rate.1 >= self.limits.unknown_closes_per_second
+            || self.global.len() >= self.limits.global_closes
+        {
+            self.dropped("refusals outside a channel");
+            return false;
         }
         self.unknown_rate.1 += 1;
-        if self.unknown_order.len() >= self.limits.unknown_handles
-            && let Some(old) = self.unknown_order.pop_front()
-        {
-            self.unknown.remove(&old);
+        self.global.push_back(envelope::close(handle, Some(why)));
+        true
+    }
+
+    fn dropped(&mut self, what: &str) {
+        self.unknown_dropped += 1;
+        if self.unknown_dropped.is_power_of_two() {
+            log(&format!("{} {what} dropped so far", self.unknown_dropped));
         }
-        self.unknown.insert(handle.to_string());
-        self.unknown_order.push_back(handle.to_string());
-        self.global
-            .push_back(envelope::close(handle, Some(reason::UNKNOWN_CHANNEL)));
+    }
+
+    /// `close`s queued outside any channel (tests: the bound holds).
+    pub fn queued_closes(&self) -> usize {
+        self.global.len()
+    }
+
+    /// Ends every channel while the socket stays up (a re-pin, an unpair, a
+    /// re-authentication): as [`R9Host::link_down`], and returns a
+    /// `close{closed}` for each live handle, for the caller to send on the
+    /// still-open socket (§R9.7a 6).
+    pub fn restart<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> (Vec<Effect>, Vec<String>) {
+        let closes = self
+            .chans
+            .keys()
+            .map(|h| envelope::close(h, Some(reason::CLOSED)))
+            .collect();
+        (self.link_down(parts), closes)
     }
 
     /// Closes `handle` now with `reason` (no record first); its attachment,
@@ -498,18 +544,19 @@ impl R9Host {
         }
     }
 
-    /// The link couldn't keep an envelope of `handle` (the broker's inbox
-    /// was full): that channel closes `busy`, never short of a frame.
-    pub fn refuse_busy<J: Journal>(
+    /// An envelope of `handle` was refused unread (the broker's inbox was
+    /// full: `busy`; over its bound: `too_large`): that channel closes,
+    /// never short of a frame.
+    pub fn refuse_unread<J: Journal>(
         &mut self,
         handle: &str,
+        why: &'static str,
         parts: &mut Parts<'_, J>,
     ) -> Vec<Effect> {
         if self.chans.contains_key(handle) {
-            return self.fail(handle, reason::BUSY, parts);
+            return self.fail(handle, why, parts);
         }
-        self.global
-            .push_back(envelope::close(handle, Some(reason::BUSY)));
+        self.refuse_outside(handle, why, parts.now.host.mono_ms);
         Vec::new()
     }
 
@@ -533,6 +580,10 @@ impl R9Host {
         frame: &[u8],
         parts: &mut Parts<'_, J>,
     ) -> Vec<Effect> {
+        if inner_too_large(frame) {
+            log("a channel's frame is over the inner-frame bound; closed (too_large)");
+            return self.fail(handle, reason::TOO_LARGE, parts);
+        }
         let chan = self.chans.get_mut(handle).expect("checked");
         let phase = std::mem::replace(&mut chan.phase, Phase::Closing);
         match phase {
@@ -1332,10 +1383,25 @@ impl R9Host {
         host_id: &str,
         now_mono: u64,
     ) {
+        if let R8Envelope::Session(m) = message
+            && let R8Op::ApprovalRequest(r) = &m.op
+            && !self.approval_sessions.contains_key(&r.approval_id)
+        {
+            if self.approval_order.len() >= MAX_APPROVAL_SESSIONS
+                && let Some(old) = self.approval_order.pop_front()
+            {
+                self.approval_sessions.remove(&old);
+            }
+            self.approval_order.push_back(r.approval_id.clone());
+            self.approval_sessions
+                .insert(r.approval_id.clone(), r.session_id.clone());
+        }
         let Some(authority) = self.authority_of(att).cloned() else {
             return;
         };
-        let Some(message) = scoped(&authority, message, projects, host_id) else {
+        let approvals = &self.approval_sessions;
+        let session_of = |id: &str| approvals.get(id).cloned();
+        let Some(message) = scoped(&authority, message, projects, host_id, &session_of) else {
             return;
         };
         let bytes = r8::encode(&message);
@@ -1568,6 +1634,22 @@ impl R9Host {
     }
 }
 
+/// §R9.7a: the compact inner frame, or its `ct`, over the bound.
+fn inner_too_large(frame: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Peek<'a> {
+        #[serde(borrow, default)]
+        ct: Option<&'a str>,
+    }
+    if frame.len() > MAX_INNER_FRAME {
+        return true;
+    }
+    serde_json::from_slice::<Peek>(frame)
+        .ok()
+        .and_then(|p| p.ct)
+        .is_some_and(|ct| ct.len() > MAX_CT_CHARS)
+}
+
 /// `membership_invalid`/`membership_incomplete` of a `membership` op's
 /// evaluation (its stop), if any.
 fn invalid_of(
@@ -1600,6 +1682,7 @@ fn scoped(
     message: &R8Envelope,
     projects: &dyn ProjectScope,
     host_id: &str,
+    approval_session: &dyn Fn(&str) -> Option<String>,
 ) -> Option<R8Envelope> {
     let Some(scope) = &authority.scope else {
         return Some(message.clone());
@@ -1621,7 +1704,12 @@ fn scoped(
             return None;
         }
         R8Op::ApprovalRequest(r) if !approvals || !in_scope(&r.session_id) => return None,
-        R8Op::ApprovalClosed { .. } if !approvals => return None,
+        // Its session from the request it closes; unknown: left out.
+        R8Op::ApprovalClosed { approval_id, .. }
+            if !approvals || !approval_session(approval_id).is_some_and(|s| in_scope(&s)) =>
+        {
+            return None;
+        }
         R8Op::Receipt(r) if !in_scope(&r.target.session_id) => return None,
         R8Op::Receipts { receipts } => receipts.retain(|r| in_scope(&r.target.session_id)),
         _ => {}

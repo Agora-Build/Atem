@@ -1886,9 +1886,15 @@ pub fn forget_leftovers(pairing: &PairingPaths) -> Result<(), String> {
 /// the log (the runtime's session host takes this identity; `open`
 /// verifies everything). `None` without a readable list.
 pub fn peek_pin(pairing: &PairingPaths) -> Option<(String, HostPin)> {
+    peek_pin_genesis(pairing).map(|(account, pin, _)| (account, pin))
+}
+
+/// [`peek_pin`] with the pinned genesis hash (hex).
+pub fn peek_pin_genesis(pairing: &PairingPaths) -> Option<(String, HostPin, String)> {
     #[derive(serde::Deserialize)]
     struct Pin {
         account_id: String,
+        genesis_hash: String,
         host: HostField,
     }
     #[derive(serde::Deserialize)]
@@ -1904,7 +1910,80 @@ pub fn peek_pin(pairing: &PairingPaths) -> Option<(String, HostPin)> {
             host_id: pin.host.host_id,
             host_trust_gen: pin.host.host_trust_gen,
         },
+        pin.genesis_hash,
     ))
+}
+
+/// The device list as the files say, read without writing anything (for
+/// `atem status` with no runtime running): `None` without any r9 file;
+/// else (state, what it means, pending recoveries as (subject, action,
+/// effective_at)). A held state is told by the files that hold it (the
+/// runtime decides at its start).
+#[allow(clippy::type_complexity)]
+pub fn passive_status(
+    pairing: &PairingPaths,
+) -> Option<(&'static str, String, Vec<(String, String, u64)>)> {
+    if !has_device_list_files(pairing) {
+        return None;
+    }
+    const REPAIR: &str = "re-pair this host: atem unpair, then atem pair";
+    if !store::present(&pairing.membership) {
+        return Some((
+            "failed",
+            format!("failed (device-list files without the list); {REPAIR}"),
+            Vec::new(),
+        ));
+    }
+    let parsed = store::read_private(&pairing.membership)
+        .ok()
+        .flatten()
+        .and_then(|b| parse_json(&b))
+        .and_then(|v| parse_state(&v));
+    let Some((m, _, _)) = parsed else {
+        return Some((
+            "failed",
+            format!("failed ({} is damaged); {REPAIR}", pairing.membership.display()),
+            Vec::new(),
+        ));
+    };
+    let now = host_now();
+    let pending = m
+        .pending_recovery(&now)
+        .iter()
+        .map(|p| {
+            let p = atem_client::session::r9::PendingRecovery::of(p);
+            (p.subject, p.action, p.effective_at)
+        })
+        .collect();
+    if m.frozen().is_some() || store::present(&pairing.freeze) {
+        return Some((
+            "frozen",
+            format!("frozen (conflicting signed history); {REPAIR}"),
+            pending,
+        ));
+    }
+    if store::present(&pairing.fault)
+        || store::present(&pairing.carriage)
+        || store::present(&pairing.intent)
+    {
+        return Some((
+            "held",
+            "held (a device-list write fault or an unfinished write is recorded); remote access waits until a managing device connects to reconcile".into(),
+            pending,
+        ));
+    }
+    Some((
+        "open",
+        format!("pinned at seq {}", m.head().seq),
+        pending,
+    ))
+}
+
+/// The public half `host_channel_key` names (b64u), read without checks.
+pub fn peek_host_pub(pairing: &PairingPaths) -> Option<String> {
+    let bytes = store::read_private(&pairing.host_channel_key).ok()??;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("pub")?.as_str().map(str::to_string)
 }
 
 /// What identifies the device-list files on disk now (inode, size, mtime

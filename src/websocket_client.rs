@@ -168,6 +168,11 @@ pub enum AstationMessage {
     #[serde(skip)]
     Channel(String),
 
+    /// An r9 channel envelope over its 2 MiB bound (not kept, not
+    /// parsed): its handle, closed `too_large`.
+    #[serde(skip)]
+    ChannelTooLarge(String),
+
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
 
@@ -951,8 +956,19 @@ impl AstationClient {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
-                        // §R9.7a 7: channel traffic is demultiplexed first.
-                        if crate::session_protocol::r9::envelope::is_envelope(&text) {
+                        // §R9.7a 7: channel traffic is demultiplexed first;
+                        // one over its bound is never parsed (its handle only,
+                        // from its first bytes, for the `too_large` close).
+                        if text.len() > crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES {
+                            if let Some(handle) = crate::session_protocol::r9::envelope::oversize_envelope(&text) {
+                                if let Some(handle) = handle
+                                    && tx.send(AstationMessage::ChannelTooLarge(handle)).await.is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        } else if crate::session_protocol::r9::envelope::is_envelope(&text) {
                             if tx.send(AstationMessage::Channel(text)).await.is_err() {
                                 break;
                             }

@@ -430,21 +430,17 @@ fn a_pin_while_the_runtime_runs_is_picked_up() {
     );
     assert_eq!(router.next_other()["data"]["op"], "welcome");
     write_pin(&rig.sandbox.config(), &rig.log, HOST, 1, &rig.host_seed);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut attempt = 0;
-    let ph = loop {
-        next_init();
-        // A router never reuses a handle while the link lives (§R9.7a).
-        attempt += 1;
-        match router.connect(&format!("c2-{attempt}"), &rig.log, HOST, &phone()) {
-            Ok(ph) => break ph,
-            Err(e) => assert!(
-                Instant::now() < deadline,
-                "never admitted: {e:?}\n{}",
-                rig.runtime_log()
-            ),
-        }
-    };
+    // The very first connect after the pin is served: the pin is seen
+    // before the envelopes of that pass, which are never dropped.
+    let started = Instant::now();
+    let mut ph = router
+        .connect("c2", &rig.log, HOST, &phone())
+        .unwrap_or_else(|e| panic!("refused: {e:?}\n{}", rig.runtime_log()));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
     assert_eq!(ph.welcome().principal, "member:dev-phone");
     router.send_raw(
         json!({"type": "session", "data": {"v": 1, "op": "hello",
@@ -458,6 +454,24 @@ fn a_pin_while_the_runtime_runs_is_picked_up() {
         }
     };
     assert_eq!(refused["data"]["code"], "unsupported_version", "{refused}");
+    // A re-pin (another list, same host and generation) ends the live
+    // channel: the router gets its close.
+    let mut other = TestLog::genesis(ACCOUNT, &secret("another astation"));
+    other.add_host(HOST, 1, &rig.host_seed);
+    other.add_native("dev-phone", &["control", "view"]);
+    write_pin(&rig.sandbox.config(), &other, HOST, 1, &rig.host_seed);
+    match router.next("c2") {
+        Out::Close(reason) => assert_eq!(reason.as_deref(), Some("closed")),
+        Out::Frame(f) => {
+            let events = ph.on_frame(&f, client_ms());
+            panic!("a record instead of the close: {events:?}");
+        }
+    }
+    next_init();
+    let ph2 = router
+        .connect("c3", &other, HOST, &phone())
+        .expect("admitted on the new list");
+    assert_eq!(ph2.welcome().head, other.log.head());
     let runtime_log = rig.runtime_log();
     assert!(
         runtime_log.contains("device list: opened at seq 4"),

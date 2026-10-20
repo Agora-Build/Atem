@@ -314,7 +314,11 @@ pub fn gather_full(
         if welcome.build != crate::memory::cred_agent::build_id());
     let (credentials, notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
     let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
-    let device_list = device_list_line(runtime, local_datetime);
+    let device_list = match runtime {
+        Look::Running { .. } => device_list_line(runtime, local_datetime),
+        // No runtime: what the files say (read only).
+        _ => passive_device_list_line(&src.paths.pairing, local_datetime),
+    };
     StatusReport {
         account: account_line(src, crate::credentials::now_secs()),
         pairing: pairing_line,
@@ -326,6 +330,23 @@ pub fn gather_full(
         device_list,
         notes,
     }
+}
+
+/// `Device list:` from the files when no runtime runs (read only; held is
+/// as the files record it, the runtime decides at its start).
+pub fn passive_device_list_line(
+    pairing: &crate::paths::PairingPaths,
+    datetime: impl Fn(u64) -> String,
+) -> Option<Line> {
+    let (_, text, pending) = crate::session_protocol::membership::passive_status(pairing)?;
+    let mut text = format!("{text} (from disk; no runtime running)");
+    for (subject, action, at) in pending {
+        text.push_str(&format!(
+            "; recovery pending: {subject} ({action}) takes effect at {} unless a managing device vetoes it",
+            datetime(at)
+        ));
+    }
+    Some(Line::new(text))
 }
 
 /// `Device list:` from the running runtime (r9, §R9.3, §R9.5): pinned,
@@ -744,6 +765,43 @@ pub(crate) mod tests {
         report.device_list = None;
         assert!(!render(&report).contains("Device list"));
         assert_eq!(device_list_line(&Look::NotRunning, |_| "?".into()), None);
+    }
+
+    /// With no runtime running, the device list is read from the files
+    /// (read only): pinned with a pending recovery, held, failed.
+    #[test]
+    fn the_device_list_line_without_a_runtime_reads_the_files() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::membership::{HostPin, MembershipHost};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(report(dir.path()).device_list, None);
+        let mut log = TestLog::genesis("acct-s", &secret("s astation"));
+        log.add_host("host-s", 1, &secret("s host"));
+        log.recovery_add("dev-new");
+        let journal = crate::runtime::state_dir(dir.path()).join("journal");
+        crate::session_protocol::membership::store::private_dir(&journal).unwrap();
+        let pin = HostPin {
+            host_id: "host-s".into(),
+            host_trust_gen: 1,
+        };
+        MembershipHost::pin(
+            &src.paths.pairing,
+            &journal,
+            &pin,
+            &log.log,
+            &secret("s host"),
+        )
+        .unwrap();
+        let line = report(dir.path()).device_list.unwrap().value;
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        std::fs::write(&src.paths.pairing.fault, b"{}").unwrap();
+        let line = report(dir.path()).device_list.unwrap().value;
+        assert!(line.starts_with("held ("), "{line}");
+        std::fs::write(&src.paths.pairing.membership, b"{}").unwrap();
+        let line = report(dir.path()).device_list.unwrap().value;
+        assert!(line.starts_with("failed ("), "{line}");
+        assert!(line.contains("atem unpair, then atem pair"), "{line}");
     }
 
     #[test]

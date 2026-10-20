@@ -446,6 +446,8 @@ pub struct HostBridge {
     /// The pinned host's `host_channel_key`; r9 can't serve without it.
     host_key: Option<HostKey>,
     host_key_error: Option<String>,
+    /// The loaded key's public half (b64u), to tell a re-pin's new key.
+    host_pub: Option<String>,
     /// The device-list files as last opened (a change reopens them).
     list_stamp: Vec<Option<(u64, u64, i64, i64)>>,
 }
@@ -561,6 +563,10 @@ impl HostBridge {
                 "atem runtime: device list: the previous run (epoch {previous}) left no clean checkpoint; recovery waits resume from the last persisted time"
             );
         }
+        let host_pub = host_key
+            .as_ref()
+            .and(pairing.as_ref())
+            .and_then(membership::peek_host_pub);
         let list_stamp = pairing
             .as_ref()
             .map(membership::list_stamp)
@@ -570,6 +576,7 @@ impl HostBridge {
             r9_link: None,
             pairing,
             host_key,
+            host_pub,
             host_key_error,
             list_stamp,
             host,
@@ -756,9 +763,12 @@ impl HostBridge {
             .as_ref()
             .is_some_and(MembershipHost::unpaired)
         {
-            // `atem unpair` removed the device list: this host has none now.
+            // `atem unpair` removed the device list: this host has none now,
+            // and every channel ends.
             self.membership = None;
             self.host_key = None;
+            self.host_pub = None;
+            self.restart_channels(cx);
             self.sync_refuse_r8(cx);
         }
         let Some(membership) = self.membership.as_mut() else {
@@ -777,6 +787,27 @@ impl HostBridge {
     }
 
     // ── r9 (§R9.7a) ──
+
+    /// Every channel ends while the socket stays up (a re-pin or unpair):
+    /// each live handle gets `close{closed}` on the link, the link
+    /// generation goes on (envelopes of this pass are still served).
+    fn restart_channels(&mut self, cx: &mut Cx) {
+        let before = self.r9_attachments();
+        let (effects, closes) = self.r9_call(|r9, parts| r9.restart(parts));
+        for gone in &before {
+            self.forget_r9(gone);
+        }
+        if !cx.client.is_ws_closed() {
+            for close in closes {
+                let _ = cx.client.try_send_channel(close);
+            }
+        }
+        if let Some(link_gen) = self.r9_link {
+            let up = self.r9_call(|r9, parts| r9.link_up(link_gen, parts));
+            self.r9_exec(up, cx);
+        }
+        self.r9_exec(effects, cx);
+    }
 
     /// The device list for `atem status`, `atem agent list` and the status
     /// row: `None` without one. Failed is shown too (`host_error` doesn't
@@ -921,7 +952,18 @@ impl HostBridge {
         if want == self.r9_link {
             return;
         }
-        let mut effects = self.r9_call(|r9, parts| r9.link_down(parts));
+        // A re-authentication (or a new generation) on a socket that is
+        // still up: the router learns each channel ended (§R9.7a 6).
+        let before = self.r9_attachments();
+        let (mut effects, closes) = self.r9_call(|r9, parts| r9.restart(parts));
+        for gone in &before {
+            self.forget_r9(gone);
+        }
+        if !cx.client.is_ws_closed() {
+            for close in closes {
+                let _ = cx.client.try_send_channel(close);
+            }
+        }
         if let Some(link_gen) = want {
             effects.extend(self.r9_call(|r9, parts| r9.link_up(link_gen, parts)));
         }
@@ -944,10 +986,15 @@ impl HostBridge {
         }
         self.list_stamp = stamp;
         // Our own writes move the stamp too: only another pin matters.
-        let pinned = membership::peek_pin(&pairing);
+        let pinned = membership::peek_pin_genesis(&pairing);
+        let host_pub = membership::peek_host_pub(&pairing);
         let same = match (&self.membership, &pinned) {
-            (Some(m), Some((account, pin))) => {
-                !m.unpaired() && m.membership().account_id() == account && m.pin_of() == pin
+            (Some(m), Some((account, pin, genesis))) => {
+                !m.unpaired()
+                    && m.membership().account_id() == account
+                    && m.pin_of() == pin
+                    && m.membership().genesis_hash().to_hex() == *genesis
+                    && (self.host_key.is_none() || host_pub == self.host_pub)
             }
             (None, None) => {
                 self.membership_error.is_none() && !membership::has_device_list_files(&pairing)
@@ -972,9 +1019,8 @@ impl HostBridge {
             return;
         }
         eprintln!("atem runtime: device list: changed on disk; opening it again");
-        let effects = self.r9_call(|r9, parts| r9.link_down(parts));
-        self.r9_exec(effects, cx);
-        self.r9_link = None;
+        self.restart_channels(cx);
+        let pinned = pinned.map(|(account, pin, _)| (account, pin));
         self.membership = None;
         self.membership_error = None;
         self.host_key = None;
@@ -1005,7 +1051,10 @@ impl HostBridge {
                         m.membership(),
                         &m.pin_of().host_id,
                     ) {
-                        Ok(seed) => self.host_key = Some(HostKey::new(&seed)),
+                        Ok(seed) => {
+                            self.host_key = Some(HostKey::new(&seed));
+                            self.host_pub = membership::peek_host_pub(&pairing);
+                        }
                         Err(error) => {
                             eprintln!("atem runtime: device list: {error}");
                             self.host_key_error = Some(error);
@@ -1204,9 +1253,9 @@ impl HostBridge {
                     self.r9_exec(effects, &mut cx);
                 }
             }
-            for (link_gen, handle) in overflow {
+            for (link_gen, handle, why) in overflow {
                 if Some(link_gen) == self.r9_link {
-                    let effects = self.r9_call(|r9, parts| r9.refuse_busy(&handle, parts));
+                    let effects = self.r9_call(|r9, parts| r9.refuse_unread(&handle, why, parts));
                     self.r9_exec(effects, &mut cx);
                 }
             }
@@ -2667,6 +2716,15 @@ impl HostBridge {
                 ApprovalCardState::Pending,
                 cx,
             );
+        }
+        if self.host.refuses_r8() {
+            // r9 (§R9.9): never the tool or summary in clear to the relay;
+            // sealed push hints are Task 8's. Until then nothing is pushed.
+            eprintln!(
+                "atem runtime: approval {}: no push (an r9 host sends sealed hints only)",
+                request.approval_id
+            );
+            return;
         }
         let data = json!({
             "v": 1,

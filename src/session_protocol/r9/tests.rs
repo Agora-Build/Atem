@@ -1093,3 +1093,216 @@ fn approval_seen_is_answered_on_the_host_side() {
         Some("forbidden".into())
     );
 }
+
+// ── Review round 1 ──
+
+/// A flood of refused opens (over the channel bounds, the link stalled)
+/// never grows the close queue past its rate and cap; the rest is dropped
+/// and counted (§R9.7a "Bounds").
+#[test]
+fn a_flood_of_refused_opens_cant_grow_the_close_queue() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(
+        Limits {
+            open_channels: 2,
+            global_closes: 40,
+            ..Limits::default()
+        },
+        None,
+    );
+    rig.link_up();
+    rig.stalled = true;
+    for second in 0..10 {
+        for i in 0..500 {
+            rig.envelope_in(&envelope::open(
+                &format!("f-{second}-{i}"),
+                Transport::Relay,
+            ));
+        }
+        let queued = rig.engine.queued_closes();
+        assert!(
+            queued <= (second + 1) * 16 + 2 && queued <= 40,
+            "{queued} closes queued after {second} s"
+        );
+        rig.advance(1000);
+    }
+    assert_eq!(rig.engine.queued_closes(), 40, "capped");
+    // Unknown handles beyond the remembered ones are dropped, never answered.
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(
+        Limits {
+            unknown_handles: 3,
+            ..Limits::default()
+        },
+        None,
+    );
+    rig.link_up();
+    for i in 0..10 {
+        rig.envelope_in(&envelope::frame(
+            &format!("ghost-{i}"),
+            br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#,
+        ));
+    }
+    assert_eq!(rig.closes.len(), 3);
+}
+
+/// An inner frame over the bound closes its channel `too_large`, before
+/// any key work; a frame at the bound is the channel's to judge.
+#[test]
+fn an_oversize_inner_frame_is_too_large() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("big", phone());
+    let ct = atem_client::encoding::b64u(&vec![0u8; (1 << 20) + 17]);
+    let frame = json!({"ch": "atem-ch1", "op": "rec", "ct": ct}).to_string();
+    assert_eq!(frame.len(), 1_398_160, "a ct one character over");
+    rig.send_frame_raw("big", frame.as_bytes());
+    assert!(
+        rig.closes
+            .iter()
+            .any(|(h, r)| h == "big" && r.as_deref() == Some("too_large"))
+    );
+    assert_eq!(rig.engine.status().attachments, 0);
+}
+
+/// Restarting the channels on a live socket (a re-pin, an unpair, a
+/// re-authentication) gives each live handle a close{closed}.
+#[test]
+fn a_restart_closes_every_live_handle() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("a", phone());
+    rig.advance(1000);
+    rig.connect("b", bot());
+    rig.envelope_in(&envelope::open("c", Transport::Relay));
+    let closes = rig.run(|e, p| {
+        let (fx, closes) = e.restart(p);
+        (closes, fx)
+    });
+    let mut handles: Vec<String> = closes
+        .iter()
+        .map(|c| match envelope::parse(c).unwrap() {
+            Event::Close { channel, reason } => {
+                assert_eq!(reason.as_deref(), Some("closed"));
+                channel
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    handles.sort();
+    assert_eq!(handles, ["a", "b", "c"]);
+    assert_eq!(rig.rt.host.welcomed_attachments(), 0);
+}
+
+/// `approval_closed` reaches a scoped service only for an approval of a
+/// session in its scope (and only with the `approval` op).
+#[test]
+fn approval_closed_is_scope_checked() {
+    let wall = r9log::host_now().wall_ms;
+    let mut rig = Rig::with(|log| {
+        log.add_service(
+            "svc-ap",
+            &[HOST],
+            Some(&[SID]),
+            &["approval", "view"],
+            wall + 3_600_000,
+        );
+    });
+    rig.link_up();
+    rig.connect("ap", Identity::service("svc-ap", r9log::auth("svc-ap")));
+    rig.list("ap");
+    let info = || crate::session_protocol::host::ApprovalInfo {
+        tool: "Bash".into(),
+        summary: "ls".into(),
+        always_rules: Vec::new(),
+    };
+    let mut ids = Vec::new();
+    for (sid, pgen) in [(SID, PGEN), (SID_B, PGEN_B)] {
+        let (opened, fx) = rig.rt.host.open_approval(sid, pgen, info(), rig.now.mono);
+        rig.rt.apply(fx);
+        ids.push(opened.unwrap());
+    }
+    for id in &ids {
+        let fx = rig
+            .rt
+            .host
+            .close_approval(id, r8::ApprovalCloseReason::Released);
+        rig.rt.apply(fx);
+    }
+    rig.run(|_, _| ((), Vec::new()));
+    rig.pump();
+    let closed: Vec<String> = rig
+        .events("ap")
+        .into_iter()
+        .filter_map(|e| match e {
+            CEvent::Session(m) => match m.op {
+                R8Op::ApprovalClosed { approval_id, .. } => Some(approval_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, vec![ids[0].clone()], "only its own session's");
+}
+
+/// Astation's overload case: the 16 handshake slots are full, output is
+/// blocked, and opens and frames for unknown handles keep coming for
+/// minutes. The closes queued outside a channel stay within 16 a second
+/// and 1024 in all; the rest is dropped and counted.
+#[test]
+fn opens_and_unknown_frames_flooding_with_output_blocked_stay_bounded() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    for i in 0..16 {
+        rig.envelope_in(&envelope::open(&format!("pending-{i}"), Transport::Relay));
+    }
+    rig.stalled = true;
+    let ghost = br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#;
+    for second in 0..120u64 {
+        for i in 0..50 {
+            rig.envelope_in(&envelope::open(
+                &format!("x-{second}-{i}"),
+                Transport::Relay,
+            ));
+            rig.envelope_in(&envelope::frame(&format!("u-{second}-{i}"), ghost));
+        }
+        let queued = rig.engine.queued_closes();
+        assert!(
+            queued <= 1024 && queued as u64 <= (second + 1) * 16,
+            "{queued} after {second} s"
+        );
+        // Keep the handshakes pending (their 10 s step not reached).
+        rig.now.mono += 1000;
+        rig.now.host.mono_ms += 1000;
+        rig.now.host.wall_ms += 1000;
+    }
+    assert_eq!(rig.engine.queued_closes(), 1024);
+}
+
+/// One `unknown_channel` per handle per link generation, then drop: the
+/// 1025th handle gets nothing, and the first, replayed in a later rate
+/// window, gets nothing either.
+#[test]
+fn unknown_handles_get_one_close_each_and_the_1025th_none() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let ghost = br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#;
+    for i in 0..1025 {
+        if i % 16 == 0 {
+            rig.advance(1000);
+        }
+        rig.envelope_in(&envelope::frame(&format!("ghost-{i}"), ghost));
+    }
+    let unknown = |rig: &Rig| {
+        rig.closes
+            .iter()
+            .filter(|(_, r)| r.as_deref() == Some("unknown_channel"))
+            .count()
+    };
+    assert_eq!(unknown(&rig), 1024);
+    assert!(!rig.closes.iter().any(|(h, _)| h == "ghost-1024"));
+    rig.advance(5000);
+    rig.envelope_in(&envelope::frame("ghost-0", ghost));
+    rig.envelope_in(&envelope::frame("ghost-1024", ghost));
+    assert_eq!(unknown(&rig), 1024, "no second close, no eviction");
+}
