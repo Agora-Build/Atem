@@ -1041,8 +1041,11 @@ impl HostBridge {
         self.host.set_refuse_r8(refuse);
         if refuse && let Some(link) = self.link.take() {
             eprintln!("atem runtime: {DEVICE_LIST_PINNED}");
+            let want = self.considered;
             self.drop_attachment(&link.attachment, cx);
+            // At once a new, unwelcomed attachment: its r8 hello is refused.
             self.considered = None;
+            self.sync_link(want, cx);
         }
     }
 
@@ -1176,6 +1179,17 @@ impl HostBridge {
             }
         }
         self.sync_r9_link(app_link(app), &mut cx);
+        if !adopting
+            && app
+                .hosted
+                .as_ref()
+                .is_some_and(|h| !h.inbox.is_empty() || !h.channels.is_empty())
+        {
+            // A pin made just now (by a pairing in this runtime) is seen by
+            // the very next request, never after it: an r8 hello is never
+            // welcomed on a host that has a device list.
+            self.reopen_list_if_changed(&mut cx);
+        }
         if !adopting && let Some(hosted) = app.hosted.as_mut() {
             let inbox: Vec<(u64, String)> = hosted.inbox.drain(..).collect();
             for (link_gen, text) in inbox {
@@ -1655,8 +1669,10 @@ impl HostBridge {
                         // transport: an r8 fence (a freeze fences every
                         // remote principal) never drops it. Its unwelcomed
                         // attachment goes; the next pass makes a new one.
+                        let want = self.considered;
                         self.link = None;
                         self.considered = None;
+                        self.sync_link(want, cx);
                     } else if self.current(&attachment) {
                         self.close_link = true;
                     }
