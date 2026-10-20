@@ -18,7 +18,9 @@ use super::{
     ChannelError, Failure, HANDSHAKE_STEP_MS, MAX_PLAINTEXT, NATIVE_LIFETIME_MS, Principal,
 };
 use crate::SignedObject;
+use crate::domain::SigningInput;
 use crate::encoding::Hash32;
+use crate::keys::{Alg, PublicKey, normalize_signature};
 use crate::membership::Membership;
 use crate::membership::entry::HostRecord;
 use crate::provider::{KeyId, KeyProvider, sign};
@@ -193,7 +195,40 @@ impl Accepted {
         // locally: nothing is sent.
         let sig_c =
             sign(provider, key, &client_signing_input(&th3)).map_err(ChannelError::Signing)?;
-        Ok(Signed {
+        Ok(self.into_signed(principal, th3, sig_c))
+    }
+
+    /// The input `sig_c` signs for `principal`: what an asynchronous
+    /// platform signer (WebCrypto, an owner-auth prompt answered later)
+    /// signs before [`Accepted::signed_with`].
+    pub fn signing_input(&self, principal: &Principal) -> SigningInput {
+        client_signing_input(&th3(&self.schedule.th2(), &self.sig_h, principal))
+    }
+
+    /// Step 5 with a signature made outside the crate over
+    /// [`Accepted::signing_input`]: a P-256 signature is normalized to low S,
+    /// then it must verify with `public` (the principal's key) before it is
+    /// used; anything else is `ChannelError::Signing` and nothing is sent.
+    pub fn signed_with(
+        self,
+        principal: Principal,
+        public: &PublicKey,
+        sig: &[u8],
+    ) -> Result<Signed, ChannelError> {
+        let th3 = th3(&self.schedule.th2(), &self.sig_h, &principal);
+        if public.alg() == Alg::X25519 {
+            return Err(ChannelError::Signing(crate::Error::WrongAlg));
+        }
+        let sig_c =
+            normalize_signature(public.alg(), sig.to_vec()).map_err(ChannelError::Signing)?;
+        public
+            .verify(&client_signing_input(&th3), &sig_c)
+            .map_err(ChannelError::Signing)?;
+        Ok(self.into_signed(principal, th3, sig_c))
+    }
+
+    fn into_signed(self, principal: Principal, th3: Hash32, sig_c: Vec<u8>) -> Signed {
+        Signed {
             schedule: self.schedule,
             th3,
             sig_c,
@@ -201,7 +236,7 @@ impl Accepted {
             host_head: self.host_head,
             relation: self.relation,
             accepted_ms: self.accepted_ms,
-        })
+        }
     }
 }
 

@@ -28,9 +28,12 @@ use serde_json::{Value, json};
 use crate::SignedObject;
 use crate::channel::carriage::{Carriage, CarryError, HeadRelation};
 use crate::channel::{
-    AwaitAccept, Channel, ChannelError, HostHead, Initiator, NATIVE_LIFETIME_MS, Principal,
+    Accepted, AwaitAccept, Channel, ChannelError, HostHead, Initiator, NATIVE_LIFETIME_MS,
+    Principal, Signed,
 };
+use crate::domain::SigningInput;
 use crate::error::Error;
+use crate::keys::PublicKey;
 use crate::membership::{Head, Membership};
 use crate::principal::{BrowserGrant, ClientKind};
 use crate::provider::{KeyId, KeyProvider};
@@ -228,13 +231,125 @@ impl Connecting {
         identity: &Identity,
         now_ms: u64,
     ) -> Result<(AwaitWelcome, Vec<u8>), ConnectError> {
+        self.on_accept_unsigned(frame, log, identity, now_ms)?
+            .sign(provider, now_ms)
+    }
+
+    /// [`Connecting::on_accept`] for a signer that answers later (signing
+    /// as an effect: WebCrypto's promise, an owner-auth prompt): verifies
+    /// `accept` and plans the carriage, then stops at `sig_c`. The caller
+    /// signs [`PendingSignature::signing_input`] with the identity's key
+    /// and calls [`PendingSignature::finish`] (within the 10 s handshake
+    /// step).
+    pub fn on_accept_unsigned(
+        self,
+        frame: &[u8],
+        log: &Membership,
+        identity: &Identity,
+        now_ms: u64,
+    ) -> Result<PendingSignature, ConnectError> {
         let host_trust_gen = self.state.init().host_trust_gen;
         let accepted = self.state.on_frame(frame, log, now_ms)?;
         let host_head = accepted.host_head().clone();
         let relation = accepted.relation();
         let carriage =
             Carriage::plan(log, host_head.head(), self.need_before).map_err(ConnectError::Carry)?;
-        let signed = accepted.sign(identity.principal.clone(), provider, &identity.key)?;
+        let input = accepted.signing_input(&identity.principal);
+        Ok(PendingSignature {
+            accepted,
+            identity: identity.clone(),
+            input,
+            host_head,
+            host_trust_gen,
+            relation,
+            carriage,
+        })
+    }
+}
+
+/// `accept` verified and the carriage planned; `sig_c` not made yet.
+pub struct PendingSignature {
+    accepted: Accepted,
+    identity: Identity,
+    input: SigningInput,
+    host_head: HostHead,
+    host_trust_gen: u64,
+    relation: HeadRelation,
+    carriage: Carriage,
+}
+
+impl PendingSignature {
+    /// Exactly what the identity's key signs (`enc(["atem-ch1-client-sig-v1",
+    /// th3])`; P-256 over SHA-256 of these bytes, Ed25519 over them).
+    pub fn signing_input(&self) -> &SigningInput {
+        &self.input
+    }
+
+    /// The key that must sign (the identity's).
+    pub fn key(&self) -> &KeyId {
+        &self.identity.key
+    }
+
+    /// What the `hello` will carry.
+    pub fn carriage(&self) -> &Carriage {
+        &self.carriage
+    }
+
+    /// Signs through `provider` and builds the `finish`.
+    pub fn sign(
+        self,
+        provider: &dyn KeyProvider,
+        now_ms: u64,
+    ) -> Result<(AwaitWelcome, Vec<u8>), ConnectError> {
+        let signed = self.accepted.sign(
+            self.identity.principal.clone(),
+            provider,
+            &self.identity.key,
+        )?;
+        Self::hello(
+            signed,
+            self.identity,
+            self.host_head,
+            self.host_trust_gen,
+            self.relation,
+            self.carriage,
+            now_ms,
+        )
+    }
+
+    /// Builds the `finish` around a signature made elsewhere over
+    /// [`PendingSignature::signing_input`]. `public` is the identity's
+    /// public key: the signature (P-256 normalized to low S) must verify
+    /// with it, else `ConnectError::Channel(Signing)` and nothing is sent.
+    pub fn finish(
+        self,
+        public: &PublicKey,
+        sig: &[u8],
+        now_ms: u64,
+    ) -> Result<(AwaitWelcome, Vec<u8>), ConnectError> {
+        let signed = self
+            .accepted
+            .signed_with(self.identity.principal.clone(), public, sig)?;
+        Self::hello(
+            signed,
+            self.identity,
+            self.host_head,
+            self.host_trust_gen,
+            self.relation,
+            self.carriage,
+            now_ms,
+        )
+    }
+
+    fn hello(
+        signed: Signed,
+        identity: Identity,
+        host_head: HostHead,
+        host_trust_gen: u64,
+        relation: HeadRelation,
+        carriage: Carriage,
+        now_ms: u64,
+    ) -> Result<(AwaitWelcome, Vec<u8>), ConnectError> {
         let id = new_id();
         let (channel, finish) =
             signed.finish_hello(&id, &carriage, identity.grant.as_ref(), now_ms)?;
@@ -242,7 +357,7 @@ impl Connecting {
             AwaitWelcome {
                 channel,
                 hello_id: id,
-                principal: identity.principal.clone(),
+                principal: identity.principal,
                 host_head,
                 host_trust_gen,
                 relation,
@@ -250,6 +365,12 @@ impl Connecting {
             },
             finish,
         ))
+    }
+}
+
+impl std::fmt::Debug for PendingSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingSignature").finish_non_exhaustive()
     }
 }
 
