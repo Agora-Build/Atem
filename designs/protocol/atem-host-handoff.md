@@ -547,6 +547,28 @@ Items not expressible against real processes (each printed by the run):
 | 8 client scenarios: `r9-handshake-wrong-head`, `r9-recovery-k-backup-*` (4), `r9-recovery-restore-*` (2), `r9-recovery-stale-head-withholds-the-recovery` | the client's machines, no host acts: `channel_fixtures.rs`, `scenarios.rs` |
 | 10 relay scenarios: `r9-chain-honest-concurrent-appends-never-fork`, `r9-push-*` (6), `r9-seen-after-…`, `r9-seen-before-…`, `r9-seen-from-another-…` | the relay's side (Astation's relay); Atem runs them against atem-client's reference relay (`r9_fixtures.rs`, `scenarios.rs`) |
 
+**Supplementary: two hosts both enrolled** (`cargo test --test
+r9_two_hosts_binary`; a separate test, not a fixture change, no vector
+bytes). It covers what the table above leaves out for
+`r9-chain-relay-cas-failure-freezes-both-hosts`, as additional evidence
+only: the fixture's host-B items stay listed as not expressible. A device
+list signed in the test with `atem-client` and test keys names `host-a`
+and `host-b`, each with its own `host_channel_key`, plus the Mac (manager)
+and a phone; two real runtimes on two temp profiles, each with its own
+link and a fake-Claude session. Checked on **both** hosts: live r9
+admission of the Mac and the phone and their welcomes (principal,
+account, `atem_device_id`, trust generation, head, permissions); a
+channel addressed to the other host is refused; a prompt that acquires
+the lease and stays queued (dispatch held); then the relay's CAS fails
+(two entries by the Mac at the same `seq`), each host applies its own
+branch first, the other branch arrives and each freezes: every channel
+there gets `account_frozen` and is closed, the queued prompt is
+`rejected` "control revoked" and never reaches the agent, the head stays
+on the host's own branch, `membership.freeze` is written, `atem status`
+says frozen, the session keeps running and a new channel is refused
+`account_frozen`. The link-writer stall of `r9-envelope-bounds` stays
+engine-only.
+
 Found by this run and fixed (not fixture changes):
 - the link's r8 attachment, never welcomed on an r9 host, dropped the whole
   link at 24 h, closing every r9 channel daily: a host that refuses r8

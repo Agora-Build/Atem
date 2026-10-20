@@ -187,7 +187,7 @@ native/                  # RTM C++ (kept, unused: nothing in the App calls rtm_c
 tests/                   # binary tests on temp HOME/XDG_RUNTIME_DIR (never the real profile)
 ├── runtime_fixtures_binary.rs # the shared atem-session host fixtures (r8 and, through r9_runner/, every r9 host scenario) against the real runtime, workers and a fake Astation
 ├── r9_harness.rs        # headless multi-device harness (test target only): one real host, simulated phones/bots/browsers through atem-client
-├── r9_admission_binary.rs, r9_multi_device_binary.rs, r9_push_binary.rs, membership_binary.rs # r9 in the real runtime: admission/fences, several devices, sealed push/seen, the device list's durability and faults
+├── r9_admission_binary.rs, r9_multi_device_binary.rs, r9_push_binary.rs, r9_two_hosts_binary.rs, membership_binary.rs # r9 in the real runtime: admission/fences, several devices, sealed push/seen, two enrolled hosts freezing on a forked list, the device list's durability and faults
 ├── approvals_real_agents.rs # #[ignore], ATEM_REAL_AGENTS=1: approvals answered from a fake Astation with the real Claude Code and Codex in temp HOME/CODEX_HOME
 ├── runtime_binary.rs, worker_binary.rs, agent_launch_binary.rs, terminal_ui_binary.rs, astation_op_binary.rs, cred_agent_binary.rs, runtime_build_binary.rs
 └── support/             # Sandbox: temp profile, `atem` in a PTY, cleanup of what it started; astation.rs: fake Astation peer + verified pairing profile; r9.rs/r9log.rs: a pinned, signed test device list and r9 clients
