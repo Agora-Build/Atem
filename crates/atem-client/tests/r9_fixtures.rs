@@ -31,9 +31,8 @@ use serde_json::{Value, json};
 use support::host::{HostConn, HostCore, HostSession};
 use support::*;
 
-const T7: &str =
-    "Task 7 (the runtime host: r8 events to other attachments, receipts, attachments, control_gen)";
-const T8: &str = "Task 8 (the runtime host's approvals and sealed push: approval cards, approval_closed, approvals_pending)";
+const T7: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
+const T8: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
 
 fn resolve(value: &Value, v: &Vectors, captured: &BTreeMap<String, Value>) -> Value {
     match value {

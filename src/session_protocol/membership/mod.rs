@@ -922,6 +922,13 @@ impl MembershipHost {
         self.crash_after_commit = true;
     }
 
+    /// Tests: a crash armed with [`MembershipHost::crash_after_commit`]
+    /// hasn't happened yet.
+    #[cfg(test)]
+    pub fn crash_armed(&self) -> bool {
+        self.crash_after_commit
+    }
+
     /// `init` (§R9.3, §R9.4): frozen first, then a fault of this run.
     pub fn init(&self) -> Init {
         if self.is_frozen() {

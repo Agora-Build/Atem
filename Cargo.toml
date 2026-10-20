@@ -53,6 +53,11 @@ ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
 zeroize = { version = "1", features = ["serde"] }
 
+[dev-dependencies]
+# Tests only: the host fixture runner seals hellos a fixture overrides
+# (`Signed::finish`); never part of atem's build.
+atem-client = { path = "crates/atem-client", features = ["software-keys", "test-vectors"] }
+
 [features]
 real_rtm = []
 openssl-vendored = ["openssl-sys/vendored"]

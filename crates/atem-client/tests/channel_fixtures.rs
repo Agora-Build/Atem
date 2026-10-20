@@ -30,7 +30,8 @@ use atem_client::{KeyId, SoftwareKeys};
 use serde_json::{Value, json};
 use support::*;
 
-const T7: &str = "Task 7 (host admission and effects: welcome content, attachments, dispatches, PTY writes, session replies)";
+const CONTEXT: &str = "context only (a client scenario: no host runs it)";
+const T7: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
 
 const FILES: [&str; 5] = [
     "r9-handshake-success",
@@ -176,8 +177,13 @@ impl<'a> Fixture<'a> {
             passed: 0,
             pending: Vec::new(),
         };
-        // Sessions (r8 setup) belong to the host harness.
-        report.pending("setup sessions", T7);
+        // Sessions (r8 setup) belong to the host harness; a client
+        // scenario has no host, so there they are context only.
+        if file["side"] == "host" {
+            report.pending("setup sessions", T7);
+        } else {
+            report.pending("setup sessions", CONTEXT);
+        }
         for client in setup["clients"].as_array().unwrap() {
             assert_eq!(client["principal"], "member:dev-phone");
             assert_eq!(client["key"], "dev-phone");

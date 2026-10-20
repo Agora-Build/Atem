@@ -31,8 +31,8 @@ use serde_json::{Map, Value, json};
 use support::*;
 use zeroize::Zeroizing;
 
-const T6: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: durable state, faults, restart replay, held, on the real store)";
-const T7: &str = "Task 7 (host admission and effects: welcome fields, fences, attachments, leases, receipts, events)";
+const T6: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
+const T7: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
 
 /// Display clock of the backup writers: the fixtures' `k_backup` entries
 /// are signed at 1793264100000 + seq (KB7, KB8).

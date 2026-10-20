@@ -27,7 +27,8 @@ hpke = { version = "0.12", default-features = false, features = ["alloc", "x2551
 # use a platform provider (Secure Enclave, Android Keystore, WebCrypto).
 software-keys = []
 # Deterministic HPKE ephemerals (`seal_with_ikm`) for known-answer vectors.
-# Never enabled by the bindings or by atem itself.
+# Never enabled by the bindings or by atem's build (atem's tests only:
+# its host fixture runner seals the hellos a fixture overrides).
 test-vectors = []
 
 [dev-dependencies]
