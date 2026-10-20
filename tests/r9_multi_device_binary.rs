@@ -33,6 +33,9 @@ struct Rig {
     log: TestLog,
     /// The workers' PTY write faults (`ATEM_TEST_PTY_FAULTS`): `hold`.
     faults: PathBuf,
+    /// The project-hash table in place of the cred agent
+    /// (`ATEM_TEST_PROJECT_HASHES`, debug builds), when set.
+    projects: Option<PathBuf>,
 }
 
 impl Rig {
@@ -44,6 +47,12 @@ impl Rig {
 
     /// [`Rig::new`] with more entries in the device list.
     fn with(more: impl FnOnce(&mut TestLog)) -> Rig {
+        Self::build(more, None)
+    }
+
+    /// [`Rig::with`], the project-hash table `projects` standing in for
+    /// the cred agent.
+    fn build(more: impl FnOnce(&mut TestLog), projects: Option<PathBuf>) -> Rig {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let host_seed = secret("multi-device host seed");
@@ -67,6 +76,7 @@ impl Rig {
             runtime: None,
             log,
             faults,
+            projects,
         };
         rig.start();
         rig
@@ -83,6 +93,11 @@ impl Rig {
             .env("ASTATION_WS", &self.astation.url)
             .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
             .env("ATEM_TEST_PTY_FAULTS", &self.faults)
+            .envs(
+                self.projects
+                    .iter()
+                    .map(|p| ("ATEM_TEST_PROJECT_HASHES", p)),
+            )
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -877,4 +892,81 @@ fn a_project_scoped_bot_sees_nothing_while_the_cred_agent_is_locked() {
         assert!(Instant::now() < deadline, "{}", rig.runtime_log());
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Astation's N1 regression on the real runtime (§R9.6, PR #80 comment
+/// 6296544817): a project-scoped bot's scope names a kid no key is held
+/// for yet, so its first `list` shows nothing (pending, out of scope, the
+/// runtime logs it); once the key is there (here: the project-hash table
+/// stands in for the cred agent, `ATEM_TEST_PROJECT_HASHES`), the next try
+/// after `RETRY` (5 s) learns the hash, the runtime resends the registry
+/// and the bot's `list` shows the session. The in-process version on the
+/// real cred agent is
+/// `memory::k_agent_tests::project_scopes_learn_a_kid_installed_later_and_keep_matches_after_a_lock`.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn a_project_scope_learns_its_hash_once_the_key_is_there() {
+    const HASH: &str =
+        "h1.0a0b0c0d.2222222222222222222222222222222222222222222222222222222222222222";
+    let wall = r9log::host_now().wall_ms;
+    // An empty table: no key for 0a0b0c0d yet.
+    let dir = tempfile::tempdir().unwrap();
+    let table = dir.path().join("projects.json");
+    std::fs::write(&table, "{}").unwrap();
+    let rig = Rig::build(
+        |log| {
+            log.add_service_projects(
+                "svc-proj",
+                &[HOST],
+                Some(&[HASH]),
+                None,
+                &["prompt", "view"],
+                wall + 3_600_000,
+            );
+        },
+        Some(table.clone()),
+    );
+    let (sid, _fake) = rig.agent();
+    let mut router = Router::new(&rig.astation);
+    let mut proj = Dev::connect(
+        &mut router,
+        "proj",
+        "relay",
+        &rig.log,
+        &Identity::service("svc-proj", auth("svc-proj")),
+    );
+    proj.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "list", "id": uuid()}}),
+    );
+    let sessions = proj.wait(&mut router, |v| v["op"] == "sessions");
+    assert_eq!(sessions["sessions"], json!([]), "{sessions}");
+    within("the runtime to log the pending scope", || {
+        rig.runtime_log()
+            .contains("project scopes under 0a0b0c0d pending")
+    });
+    // The key is there now (the session's launch project, `local:home`).
+    std::fs::write(
+        &table,
+        json!({"local:home": {"0a0b0c0d": HASH}}).to_string(),
+    )
+    .unwrap();
+    let changed = proj.wait(&mut router, |v| {
+        v["op"] == "session_changed" && v["descriptor"]["session_id"] == sid.as_str()
+    });
+    assert_eq!(
+        changed["descriptor"]["session_id"],
+        sid.as_str(),
+        "{changed}"
+    );
+    proj.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "list", "id": uuid()}}),
+    );
+    let sessions = proj.wait(&mut router, |v| v["op"] == "sessions");
+    assert_eq!(
+        sessions["sessions"][0]["session_id"],
+        sid.as_str(),
+        "{sessions}"
+    );
 }
