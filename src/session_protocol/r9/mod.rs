@@ -178,6 +178,10 @@ struct Attached {
     channel: Channel,
     attachment: String,
     authority: Authority,
+    /// The channel's end on the host's wall clock (§R9.6, §3: wall and
+    /// monotonic, whichever first): the monotonic one stands still while
+    /// the machine sleeps.
+    wall_deadline: u64,
 }
 
 enum Phase {
@@ -1102,6 +1106,7 @@ impl R9Host {
             channel,
             attachment: attachment.clone(),
             authority,
+            wall_deadline: wall.saturating_add(channel_ms_left),
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -1846,7 +1851,8 @@ impl R9Host {
     // ── Time ──
 
     /// The pass: handshakes past their step (10 s), channels past their
-    /// lifetime (24 h, or the expiry), and principals whose expiry passed
+    /// lifetime (24 h, or the expiry; monotonic and wall, whichever first),
+    /// and principals whose expiry passed
     /// (fenced through §H: a revocation, §R9.6).
     pub fn tick<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
         let mono = parts.now.host.mono_ms;
@@ -1860,7 +1866,9 @@ impl R9Host {
                 Phase::AwaitInit { deadline } if mono > *deadline => timeouts.push(handle.clone()),
                 Phase::AwaitFinish(f) if mono > f.deadline_ms() => timeouts.push(handle.clone()),
                 Phase::Open(a) if a.authority.expired(wall) => expired.push(a.authority.name()),
-                Phase::Open(a) if mono >= a.channel.deadline_ms() => ended.push(handle.clone()),
+                Phase::Open(a) if mono >= a.channel.deadline_ms() || wall >= a.wall_deadline => {
+                    ended.push(handle.clone())
+                }
                 _ => {}
             }
         }
