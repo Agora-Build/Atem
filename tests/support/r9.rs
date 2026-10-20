@@ -164,6 +164,21 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// The next non-envelope message on the link within `wait`, if any.
+    pub fn other_within(&mut self, wait: Duration) -> Option<Value> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(v) = self.other.pop_front() {
+                return Some(v);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            self.pump(left.min(Duration::from_millis(100)));
+        }
+    }
+
     pub fn send_raw(&self, text: String) {
         self.astation.send(self.link, text);
     }
