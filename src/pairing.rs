@@ -298,6 +298,10 @@ pub fn unpair(src: &Sources) -> Result<u64> {
     let next = read_trust_gen(&src.paths.pairing)? + 1;
     write_trust_gen(&src.paths.pairing, next)?;
     remove_record(&src.paths.pairing)?;
+    // r9 §R9.3: the device list goes with the pairing (a frozen one's
+    // genesis is kept on `frozen_genesis`, so it can't be re-paired to).
+    crate::session_protocol::membership::forget_on_unpair(&src.paths.pairing)
+        .map_err(|e| anyhow::anyhow!("could not remove the device list: {e}"))?;
     Ok(next)
 }
 

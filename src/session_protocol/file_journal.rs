@@ -92,6 +92,13 @@ struct FloorsFile {
 struct DiskControl {
     control: bool,
     control_gen: u64,
+    /// r9: the newest membership entry that fenced the principal.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    fence_seq: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -891,6 +898,11 @@ impl FileJournal {
         if current.is_some_and(|c| c.control_gen > state.control_gen) {
             return Err(JournalError("a control generation never goes down".into()));
         }
+        // The fenced entry never goes down either.
+        let state = DiskControl {
+            fence_seq: state.fence_seq.max(current.map_or(0, |c| c.fence_seq)),
+            ..state
+        };
         if current == Some(state) {
             return Ok(()); // already durable
         }
@@ -1268,11 +1280,13 @@ impl FileJournal {
             principal,
             control,
             control_gen,
+            fence_seq,
         } = record
         {
             let state = DiskControl {
                 control,
                 control_gen,
+                fence_seq,
             };
             return self.append_control(principal, state);
         }
@@ -1462,6 +1476,7 @@ impl Journal for FileJournal {
                 principal: principal.clone(),
                 control: c.control,
                 control_gen: c.control_gen,
+                fence_seq: c.fence_seq,
             };
             (0, record)
         }));

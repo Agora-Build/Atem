@@ -28,6 +28,8 @@ pub mod host;
 #[allow(dead_code)]
 pub mod journal;
 #[allow(dead_code)]
+pub mod membership;
+#[allow(dead_code)]
 pub mod revision;
 #[allow(dead_code)]
 pub mod wire;

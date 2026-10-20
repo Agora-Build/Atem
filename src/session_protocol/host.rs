@@ -440,6 +440,8 @@ struct PrincipalState {
     control: bool,
     control_gen: u64,
     confirmed: bool,
+    /// r9: the newest membership entry whose fence raised `control_gen`.
+    fence_seq: u64,
 }
 
 /// What §F's admission planned for the lease.
@@ -592,6 +594,9 @@ pub struct SessionHost<J: Journal> {
     /// How the request being refused is answered beyond its code.
     refused: Refused,
     out: Vec<Effect>,
+    /// Fixtures (`hold_dispatch`): accepted work stays queued.
+    #[cfg(test)]
+    dispatch_held: bool,
 }
 
 type Checked<T = ()> = Result<T, ErrorCode>;
@@ -650,6 +655,8 @@ impl<J: Journal> SessionHost<J> {
             waiting: BTreeSet::new(),
             refused: Refused::default(),
             out: Vec::new(),
+            #[cfg(test)]
+            dispatch_held: false,
         };
         host.reload()?;
         Ok(host)
@@ -720,6 +727,7 @@ impl<J: Journal> SessionHost<J> {
                 control: false,
                 control_gen: 1,
                 confirmed: false,
+                fence_seq: 0,
             })
     }
 
@@ -880,6 +888,7 @@ impl<J: Journal> SessionHost<J> {
                 principal: principal.to_string(),
                 control: true,
                 control_gen: st.control_gen,
+                fence_seq: st.fence_seq,
             });
             self.principals.insert(
                 principal.to_string(),
@@ -901,25 +910,47 @@ impl<J: Journal> SessionHost<J> {
     /// restart rejects the same requests (no clean close). Executing work
     /// isn't cancelled.
     fn revoke_control(&mut self, principal: &str) {
+        self.fence(principal, true, 0, false);
+    }
+
+    /// The §H fence of `principal`: when `raise`, its raised `control_gen`
+    /// (naming membership entry `fence_seq`, 0 for none) is written durably
+    /// (in memory only once the journal halted); its live attachments are
+    /// fenced (all of them with `all_attachments`, else those with
+    /// `control`), every lease held by one of its attachments (live or
+    /// gone) is revoked, and each of its accepted requests not yet executing
+    /// is rejected (`control revoked`), in memory when a write fails.
+    fn fence(&mut self, principal: &str, raise: bool, fence_seq: u64, all_attachments: bool) {
         let st = self.principal(principal);
-        let raised = st.control_gen.saturating_add(1).min(MAX_SAFE_INTEGER);
-        let mut durable = self.append(Record::Control {
-            principal: principal.to_string(),
-            control: false,
-            control_gen: raised,
-        });
-        self.principals.insert(
-            principal.to_string(),
-            PrincipalState {
+        let mut durable = true;
+        if raise {
+            let raised = st.control_gen.saturating_add(1).min(MAX_SAFE_INTEGER);
+            let fence_seq = fence_seq.max(st.fence_seq);
+            durable = self.append(Record::Control {
+                principal: principal.to_string(),
                 control: false,
                 control_gen: raised,
-                confirmed: false,
-            },
-        );
+                fence_seq,
+            });
+            self.principals.insert(
+                principal.to_string(),
+                PrincipalState {
+                    control: false,
+                    control_gen: raised,
+                    confirmed: false,
+                    fence_seq,
+                },
+            );
+        } else if let Some(p) = self.principals.get_mut(principal) {
+            p.control = false;
+            p.confirmed = false;
+        }
         let fenced: Vec<String> = self
             .attachments
             .iter()
-            .filter(|(_, a)| a.principal == principal && a.can(Permission::Control))
+            .filter(|(_, a)| {
+                a.principal == principal && (all_attachments || a.can(Permission::Control))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in fenced {
@@ -950,6 +981,108 @@ impl<J: Journal> SessionHost<J> {
                 self.reject_in_memory(&rid, DETAIL_CONTROL_REVOKED);
             }
         }
+    }
+
+    // ── r9 membership fences (§R9.3, §R9.4) ──
+
+    /// The newest membership entry that fenced `principal` (0: none).
+    pub fn fence_seq(&self, principal: &str) -> u64 {
+        self.principal(principal).fence_seq
+    }
+
+    /// The durable `control_gen` of `principal` (1 for one never seen).
+    pub fn control_gen(&self, principal: &str) -> u64 {
+        self.principal(principal).control_gen
+    }
+
+    /// r9 §R9.3 step 4: membership entry `seq` (a removal, `set_roles`,
+    /// `remove_host` of this host, an expiry shortening; 0 for a freeze,
+    /// which names no entry) fences `principal` through §H: the
+    /// `control_revoked` fence (its raised `control_gen`, naming `seq`) is
+    /// written, every attachment of the principal is fenced (view ones too),
+    /// its leases revoked and its accepted work not yet executing rejected
+    /// (`control revoked`). Idempotent per entry: a principal already fenced
+    /// by `seq` (or a later entry) isn't raised again, its live attachments
+    /// are still fenced. Before the start's resolution (`recover`) only the
+    /// fence is written: recovered work is then resolved by §H's start rules
+    /// (no clean close → `authorization history unknown`, an older
+    /// `control_gen` → `control revoked`). A failed write follows §H "A
+    /// failed revocation write" (in memory, the journal halts).
+    pub fn fence_principal(&mut self, principal: &str, seq: u64) -> Vec<Effect> {
+        let raise = seq == 0 || self.principal(principal).fence_seq < seq;
+        if !self.resolved {
+            if raise {
+                let st = self.principal(principal);
+                let raised = st.control_gen.saturating_add(1).min(MAX_SAFE_INTEGER);
+                let fence_seq = seq.max(st.fence_seq);
+                self.append(Record::Control {
+                    principal: principal.to_string(),
+                    control: false,
+                    control_gen: raised,
+                    fence_seq,
+                });
+                self.principals.insert(
+                    principal.to_string(),
+                    PrincipalState {
+                        control: false,
+                        control_gen: raised,
+                        confirmed: false,
+                        fence_seq,
+                    },
+                );
+            }
+            return self.take();
+        }
+        self.fence(principal, raise, seq, true);
+        self.take()
+    }
+
+    /// Every principal the host knows to be remote: attachments, lease
+    /// holders, accepted work and principals holding `control` (§R9.3
+    /// "every remote principal").
+    pub fn remote_principals(&self) -> Vec<String> {
+        let mut all: BTreeSet<String> = self
+            .attachments
+            .values()
+            .map(|a| a.principal.clone())
+            .collect();
+        for s in self.sessions.values() {
+            if let Some(lease) = &s.lease {
+                all.insert(lease.principal.clone());
+            }
+        }
+        for e in self.receipts.values() {
+            if e.stored.state == ReceiptState::Accepted && !e.stored.principal.is_empty() {
+                all.insert(e.stored.principal.clone());
+            }
+        }
+        for (p, st) in &self.principals {
+            if st.control {
+                all.insert(p.clone());
+            }
+        }
+        all.into_iter().collect()
+    }
+
+    /// r9 §R9.3 "A failed write": a device-list write failed, so the durable
+    /// state is uncertain. In the same step, in memory: each of
+    /// `principals` (every remote principal when `None`: Atem can't tell
+    /// which) has its attachments fenced, its leases revoked (the input
+    /// epoch rises, so queued raw bytes are dropped at the write boundary)
+    /// and its accepted work not yet executing rejected (`control
+    /// revoked`); then the journal halts (§I) until the restart, which
+    /// replays the carriage record and the fences.
+    pub fn membership_fault(&mut self, principals: Option<&[String]>) -> Vec<Effect> {
+        self.resolve_once();
+        self.halt_journal();
+        let list = match principals {
+            Some(list) => list.to_vec(),
+            None => self.remote_principals(),
+        };
+        for p in list {
+            self.fence(&p, true, 0, true);
+        }
+        self.take()
     }
 
     /// A rejection the journal couldn't take (it halted): the request is
@@ -1628,12 +1761,14 @@ impl<J: Journal> SessionHost<J> {
                     ControlState {
                         control,
                         control_gen,
+                        fence_seq,
                     },
                 )| {
                     let st = PrincipalState {
                         control,
                         control_gen,
                         confirmed: false,
+                        fence_seq,
                     };
                     (p, st)
                 },
@@ -2890,9 +3025,25 @@ impl<J: Journal> SessionHost<J> {
         })
     }
 
+    /// Fixtures (`hold_dispatch`): accepted work stays queued, not executing.
+    #[cfg(test)]
+    pub fn hold_dispatch(&mut self, hold: bool) {
+        self.dispatch_held = hold;
+    }
+
+    #[cfg(test)]
+    fn dispatch_held(&self) -> bool {
+        self.dispatch_held
+    }
+
+    #[cfg(not(test))]
+    fn dispatch_held(&self) -> bool {
+        false
+    }
+
     fn pump_queue(&mut self, sid: &str) {
         // r8 §H: nothing queued is dispatched after a journal halt.
-        while !self.journal_halted && !self.prompt_executing(sid) {
+        while !self.journal_halted && !self.dispatch_held() && !self.prompt_executing(sid) {
             let Some(rid) = self
                 .sessions
                 .get_mut(sid)

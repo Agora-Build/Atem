@@ -418,11 +418,13 @@ fn a_failed_fence_write_leaves_either_state_and_the_same_outcome() {
             ControlState {
                 control: false,
                 control_gen: 2,
+                fence_seq: 0,
             }
         } else {
             ControlState {
                 control: true,
                 control_gen: 1,
+                fence_seq: 0,
             }
         };
         assert_eq!(control, Some(expected), "undo_fails {undo_fails}");
@@ -582,6 +584,7 @@ fn recovered_work_is_resolved_before_a_connect_changes_control() {
         principal: "c1".into(),
         control: true,
         control_gen: 1,
+        fence_seq: 0,
     })
     .unwrap();
     j.append(journal::Record::Accepted {

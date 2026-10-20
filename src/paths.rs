@@ -46,6 +46,22 @@ pub struct PairingPaths {
     /// `trust_gen`: the host trust generation; its lock (`trust_gen.lock`)
     /// guards every pairing change and every bound apply.
     pub trust_gen: PathBuf,
+    /// r9 device list (§R9.3; `session_protocol::membership`):
+    /// `membership.json` (the verified log, head, recovery, evidence, freeze).
+    pub membership: PathBuf,
+    /// `membership.carriage`: a carriage, durable before it is evaluated.
+    pub carriage: PathBuf,
+    /// `membership.intent`: the head about to be written.
+    pub intent: PathBuf,
+    /// `membership.freeze`: both conflicting entries of a freeze.
+    pub freeze: PathBuf,
+    /// `membership.fault`: a device-list write fault was observed.
+    pub fault: PathBuf,
+    /// `frozen_genesis`: genesis hashes this host was frozen on (kept by
+    /// `atem unpair`; ≤ 16).
+    pub frozen_genesis: PathBuf,
+    /// `host_channel_key`: the host's atem-ch1 key (deleted by `atem unpair`).
+    pub host_channel_key: PathBuf,
 }
 
 impl PairingPaths {
@@ -54,7 +70,21 @@ impl PairingPaths {
         Self {
             record: dir.join("pairing.enc"),
             trust_gen: dir.join("trust_gen"),
+            membership: dir.join("membership.json"),
+            carriage: dir.join("membership.carriage"),
+            intent: dir.join("membership.intent"),
+            freeze: dir.join("membership.freeze"),
+            fault: dir.join("membership.fault"),
+            frozen_genesis: dir.join("frozen_genesis"),
+            host_channel_key: dir.join("host_channel_key"),
         }
+    }
+
+    /// `<profile>/pairing`.
+    pub fn dir(&self) -> &Path {
+        self.trust_gen
+            .parent()
+            .expect("trust_gen is in the pairing dir")
     }
 }
 

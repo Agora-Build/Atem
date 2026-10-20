@@ -79,12 +79,14 @@ use crate::session_protocol::host::{
     Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
     HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
 };
+use crate::session_protocol::membership::{CarriageResult, HostFences, MembershipHost, host_now};
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
     FamilyMessage, Permission, ReceiptKind, SessionState,
 };
 use crate::terminal_share::{FrameStream, Message as TerminalMessage};
 use crate::websocket_client::{AstationClient, AstationMessage};
+use atem_client::canonical::StrictValue;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -408,6 +410,15 @@ pub struct HostBridge {
     refusing: Option<(u64, Request, Option<String>)>,
     /// The host closed the link's attachment: drop the link after this pass.
     close_link: bool,
+    /// Why the link is dropped, when not a refusal that couldn't be recorded.
+    close_reason: Option<&'static str>,
+    /// The r9 device list (§R9.3; `session_protocol::membership`), when this
+    /// host has one.
+    membership: Option<MembershipHost>,
+    /// Why the device list couldn't be opened (remote sessions disabled).
+    membership_error: Option<String>,
+    /// Fence effects of the device list's start, for the first pass.
+    membership_effects: Vec<Effect>,
     /// The last `hello` refused for its revision (`atem status`): the
     /// revision it named and when (wall ms). A welcome clears it.
     last_refusal: Option<(Option<u64>, u64)>,
@@ -449,7 +460,41 @@ impl HostBridge {
             atem_device_id: UNPAIRED.into(),
             host_trust_gen: 0,
         });
-        let host = Self::build(journal, &identity, epoch, previous, &clock)?;
+        let mut host = Self::build(journal, &identity, epoch, previous, &clock)?;
+        // r9 §R9.3: the device list is opened before any remote admission
+        // and before recovered work is resolved; its start fences go
+        // through the host's §H fence now (only durable generations: no
+        // attachment exists yet).
+        let (membership, membership_error, membership_effects) = match profile {
+            Some(profile) => {
+                let mut fences = HostFences::new(&mut host);
+                let opened = MembershipHost::open(
+                    &profile.paths.pairing,
+                    dir,
+                    epoch,
+                    &host_now(),
+                    &mut fences,
+                );
+                let effects = fences.effects;
+                match opened {
+                    Ok(Some((membership, fenced))) => {
+                        if !fenced.is_empty() {
+                            eprintln!(
+                                "atem runtime: device list: replayed {} fence(s) at start",
+                                fenced.len()
+                            );
+                        }
+                        (Some(membership), None, effects)
+                    }
+                    Ok(None) => (None, None, effects),
+                    Err(error) => {
+                        eprintln!("atem runtime: device list: {error}");
+                        (None, Some(error), effects)
+                    }
+                }
+            }
+            None => (None, None, Vec::new()),
+        };
         Ok(Self {
             host,
             dir: dir.to_path_buf(),
@@ -477,6 +522,10 @@ impl HostBridge {
             refusal_log: RefusalLog::default(),
             refusing: None,
             close_link: false,
+            close_reason: None,
+            membership,
+            membership_error,
+            membership_effects,
             last_refusal: None,
         })
     }
@@ -498,13 +547,11 @@ impl HostBridge {
         });
         LinkStatus {
             attachment: self.link.is_some(),
-            refused: self
-                .last_refusal
-                .map(|(revision, at_ms)| Refusal {
-                    revision,
-                    needs: crate::session_protocol::revision::REVISION,
-                    at_ms,
-                }),
+            refused: self.last_refusal.map(|(revision, at_ms)| Refusal {
+                revision,
+                needs: crate::session_protocol::revision::REVISION,
+                at_ms,
+            }),
             welcomed,
             journal_halted: self.host.journal_halted(),
         }
@@ -536,6 +583,11 @@ impl HostBridge {
     /// At an orderly stop (signal, idle exit, replacement), after the last
     /// pass: the journal's clean-close record, if it is healthy (r8 §H).
     pub fn close_cleanly(&mut self) {
+        if let Some(membership) = self.membership.as_mut()
+            && membership.close(&host_now())
+        {
+            eprintln!("atem runtime: device list checkpointed");
+        }
         if self.host.close_cleanly() {
             eprintln!("atem runtime: session journal closed cleanly");
         } else {
@@ -548,9 +600,88 @@ impl HostBridge {
     /// Why remote sessions are disabled since the start, if they are (the
     /// recovered requests couldn't be resolved durably).
     pub fn host_error(&self) -> Option<String> {
+        if let Some(error) = &self.membership_error {
+            return Some(format!("remote sessions disabled: {error}"));
+        }
         self.host
             .start_error()
             .map(|e| format!("remote sessions disabled: {e}; restart Atem"))
+    }
+
+    /// The r9 device list, when this host has one (Task 7 admits through it).
+    #[allow(dead_code)]
+    pub fn membership(&self) -> Option<&MembershipHost> {
+        self.membership.as_ref()
+    }
+
+    /// Applies a carried suffix or window to the device list (§R9.3: one
+    /// step of the pass, before the carrier's admission) and performs its
+    /// fences: removed principals' attachments fenced, leases revoked,
+    /// queued work rejected (r8 §H); on a write fault the same in memory and
+    /// the journal halts. `None` without a device list.
+    fn carry(&mut self, carried: &[StrictValue], cx: &mut Cx) -> Option<CarriageResult> {
+        let membership = self.membership.as_mut()?;
+        let mut fences = HostFences::new(&mut self.host);
+        let result = membership.apply_carriage(carried, &host_now(), &mut fences);
+        let effects = fences.effects;
+        if !result.fences.is_empty() {
+            self.close_reason =
+                Some("Remote access to this host changed (device list); the link was dropped");
+        }
+        self.exec(effects, cx);
+        self.sync_all(cx);
+        Some(result)
+    }
+
+    /// The device list's 100 ms pass: recovery waits on the host clock, the
+    /// time waited persisted; and, in debug builds, a test carriage
+    /// (`ATEM_TEST_MEMBERSHIP_FAULTS/carry.json`, as the host's own relay
+    /// fetch).
+    fn membership_pass(&mut self, cx: &mut Cx) {
+        if self.membership.is_none() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.membership_effects);
+        if !pending.is_empty() {
+            self.exec(pending, cx);
+        }
+        if let Some(text) = super::test_hooks::membership_carry() {
+            let entries = StrictValue::parse(text.as_bytes(), usize::MAX)
+                .ok()
+                .and_then(|v| v.get("entries"))
+                .and_then(|e| e.items());
+            let line = match entries {
+                Some(entries) => match self.carry(&entries, cx) {
+                    Some(result) => format!(
+                        "{:?} head={} fences={}",
+                        result.carried,
+                        self.membership.as_ref().map_or(0, |m| m.head().seq),
+                        result.fences.len()
+                    ),
+                    None => "no device list".into(),
+                },
+                None => "unreadable carry.json".into(),
+            };
+            super::test_hooks::membership_carried(&line);
+        }
+        if self
+            .membership
+            .as_ref()
+            .is_some_and(MembershipHost::unpaired)
+        {
+            // `atem unpair` removed the device list: this host has none now.
+            self.membership = None;
+        }
+        let Some(membership) = self.membership.as_mut() else {
+            return;
+        };
+        let mut fences = HostFences::new(&mut self.host);
+        let _changes = membership.advance(&host_now(), &mut fences);
+        let effects = fences.effects;
+        if !effects.is_empty() {
+            self.exec(effects, cx);
+            self.sync_all(cx);
+        }
     }
 
     /// The link may attach now (its pairing was just verified): it is
@@ -696,6 +827,7 @@ impl HostBridge {
             let effects = self.host.advance(now);
             self.exec(effects, &mut cx);
             self.finished_hand_offs(&mut cx);
+            self.membership_pass(&mut cx);
         }
         self.sync_all(&mut cx);
         self.drain_remote(&mut cx);
@@ -719,9 +851,11 @@ impl HostBridge {
                 .collect();
         }
         if std::mem::take(&mut self.close_link) {
-            app.drop_astation_link(
-                "The session journal couldn't record a refusal; the link was dropped".into(),
-            );
+            let reason = self
+                .close_reason
+                .take()
+                .unwrap_or("The session journal couldn't record a refusal; the link was dropped");
+            app.drop_astation_link(reason.into());
         }
     }
 
