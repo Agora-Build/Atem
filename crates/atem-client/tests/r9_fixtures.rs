@@ -32,6 +32,7 @@ use support::host::{HostConn, HostCore, HostSession};
 use support::*;
 
 const T7: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
+const PUSH: &str = "Task 8 (sealed push: the host's push_hint/push_seen to the relay)";
 const T8: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
 
 fn resolve(value: &Value, v: &Vectors, captured: &BTreeMap<String, Value>) -> Value {
@@ -591,7 +592,14 @@ impl HostRun<'_> {
             && kind != "connect"
             && !(kind == "expect" && step["match"]["op"] == "welcome")
         {
-            self.report.pending(format!("{kind}: {}", raw), T7);
+            // What Atem sends the relay is sealed push (Task 8); the rest
+            // runs on the real host.
+            let owner = if kind.starts_with("expect_relay") || kind.starts_with("relay_") {
+                PUSH
+            } else {
+                T7
+            };
+            self.report.pending(format!("{kind}: {}", raw), owner);
             return;
         }
         match kind.as_str() {
