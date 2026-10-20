@@ -2034,7 +2034,7 @@ fn r9_fixtures_run_against_the_real_runtime() {
                 .iter()
                 .map(|s| {
                     let name = s["name"].as_str().unwrap().to_string();
-                    (name, scope.spawn(move || r9_runner::run(s)))
+                    (name, scope.spawn(|| r9_runner::run(s)))
                 })
                 .collect();
             for (name, h) in handles {
@@ -2349,7 +2349,7 @@ fn r9_changed_expectations_fail_against_the_real_runtime() {
             .as_array()
             .unwrap()
             .iter()
-            .position(|st| pick(st))
+            .position(pick)
             .unwrap()
     };
     let mut cases = Vec::new();
@@ -2389,7 +2389,7 @@ fn r9_changed_expectations_fail_against_the_real_runtime() {
             .map(|s| {
                 (
                     s["name"].as_str().unwrap(),
-                    scope.spawn(move || r9_runner::run(s)),
+                    scope.spawn(|| r9_runner::run(s)),
                 )
             })
             .collect();

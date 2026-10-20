@@ -2832,27 +2832,31 @@ pub fn run(scenario: &Value) -> Result<Outcome, String> {
             outside: BTreeMap::new(),
         };
         let steps = scenario["steps"].as_array().unwrap().clone();
-        let outcome = (|| {
-            r.setup(scenario);
-            for (i, step) in steps.iter().enumerate() {
-                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.step(step)));
-                if let Err(e) = out {
-                    let message = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_default();
-                    let mut text = format!("step {i} {step}: {message}");
-                    for h in r.hosts.values() {
-                        text.push_str(&format!("\n--- {} runtime log ---\n{}", h.name, h.logs()));
-                    }
-                    *logs.lock().unwrap() = Some(text);
-                    std::panic::resume_unwind(Box::new("step failed"));
-                }
+        let message = |e: Box<dyn std::any::Any + Send>| {
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        };
+        let fail = |r: &Runner, what: String| {
+            let mut text = what;
+            for h in r.hosts.values() {
+                text.push_str(&format!("\n--- {} runtime log ---\n{}", h.name, h.logs()));
             }
-            std::mem::take(&mut r.outcome)
-        })();
-        outcome
+            *logs.lock().unwrap() = Some(text);
+            std::panic::resume_unwind(Box::new("failed"));
+        };
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.setup(scenario)))
+        {
+            fail(&r, format!("setup: {}", message(e)));
+        }
+        for (i, step) in steps.iter().enumerate() {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.step(step)));
+            if let Err(e) = out {
+                fail(&r, format!("step {i} {step}: {}", message(e)));
+            }
+        }
+        std::mem::take(&mut r.outcome)
     }));
     match result {
         Ok(outcome) => Ok(outcome),
