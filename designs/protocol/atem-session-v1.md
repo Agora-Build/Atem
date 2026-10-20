@@ -3003,6 +3003,15 @@ acknowledged), then signs and sends `{"type":"relay","op":"push_seen","seen":
  "device_id":"dev-phone","seen_at":1793264425000}
 ```
 
+Atem signs a seen only for a device that is a recipient of the
+approval's open hints (a native member with `control` at its head). A
+service with `approval` (or a browser grant) may send `approval_seen`
+under the same checks and is answered `seen`, but nothing is signed or
+sent: it is never a hint recipient, so its seen could only wait as
+pending at the relay, taking room from real devices' seens (the 256 per
+account below). The relay never gets a `push_seen` naming a service or
+grant.
+
 Host-signed, so seen needs no manager biometric: the host authenticated
 the device over `atem-ch1` at its current head. The relay checks the
 signature, then:
