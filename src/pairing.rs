@@ -293,15 +293,25 @@ pub fn capture(src: &Sources) -> Result<TrustState> {
 /// `atem unpair`: removes the r9 device list, durably commits the next
 /// generation (so every capture of the old binding goes stale), then
 /// removes the pairing record. Returns the new generation. All under
-/// `trust_gen.lock`; the device list goes first, so a failure there leaves
-/// the host paired as it was, never an unpaired host with a device list.
+/// `trust_gen.lock`. The device list goes first: a failure before its
+/// removal began leaves the host paired as it was; once it began, the
+/// unpair completes (never a paired host without its list).
 pub fn unpair(src: &Sources) -> Result<u64> {
     let _lock = lock(src)?;
     let next = read_trust_gen(&src.paths.pairing)? + 1;
     // r9 §R9.3: a frozen list's genesis is kept on `frozen_genesis`, so it
-    // can't be re-paired to.
-    crate::session_protocol::membership::forget_on_unpair(&src.paths.pairing)
-        .map_err(|e| anyhow::anyhow!("could not remove the device list: {e}"))?;
+    // can't be re-paired to. A failure before the list's removal began
+    // changes nothing; one after it finishes the unpair (the files left
+    // make the next runtime start fail closed, and `atem pair` removes
+    // them): a paired host is never left without its list.
+    if let Err(e) = crate::session_protocol::membership::forget_on_unpair(&src.paths.pairing) {
+        if !e.begun {
+            anyhow::bail!("could not remove the device list: {e}");
+        }
+        eprintln!(
+            "atem: some device-list files couldn't be removed ({e}); remote access stays off until the next atem pair"
+        );
+    }
     write_trust_gen(&src.paths.pairing, next)?;
     remove_record(&src.paths.pairing)?;
     Ok(next)
@@ -690,6 +700,113 @@ pub(crate) mod tests {
             crate::session_protocol::membership::frozen_genesis(paths).len(),
             1
         );
+    }
+
+    /// r9 (re-review New Important 2): each step of the device list's
+    /// removal fails in turn; afterwards the host is either still paired
+    /// with its whole list, or unpaired. Never paired without a list that
+    /// opens as "no device list".
+    #[test]
+    fn a_failed_device_list_removal_never_leaves_a_paired_host_without_its_list() {
+        use crate::session_protocol::membership::store::{DlFile, Injected, Step, Store};
+        use crate::session_protocol::membership::{FORGET_FAULT, MembershipHost};
+        let steps = [
+            (DlFile::State, Step::Remove),
+            (DlFile::Carriage, Step::Remove),
+            (DlFile::Intent, Step::Remove),
+            (DlFile::Freeze, Step::Remove),
+            (DlFile::Fault, Step::Remove),
+            (DlFile::HostChannelKey, Step::Remove),
+            (DlFile::Applied, Step::Remove),
+        ];
+        for (file, step) in steps {
+            let dir = tempfile::tempdir().unwrap();
+            let src = Sources::in_dir(dir.path());
+            bound_profile(dir.path(), "astation-a");
+            let paths = &src.paths.pairing;
+            let journal = crate::runtime::state_dir(dir.path()).join("journal");
+            crate::session_protocol::membership::store::private_dir(&journal).unwrap();
+            let store = Store::new(paths, &journal);
+            // A held r9 host with every file a list can have.
+            std::fs::write(&paths.membership, b"{}").unwrap();
+            for f in [
+                DlFile::Carriage,
+                DlFile::Intent,
+                DlFile::Fault,
+                DlFile::HostChannelKey,
+                DlFile::Applied,
+            ] {
+                std::fs::write(store.path(f), b"x").unwrap();
+            }
+            FORGET_FAULT.with(|f| f.set(Some(Injected { file, step })));
+            let unpaired = unpair(&src).is_ok();
+            let paired = PairingRecord::load(paths).unwrap().is_some();
+            assert_eq!(paired, !unpaired, "{file:?}");
+            let opened = MembershipHost::open(
+                paths,
+                &journal,
+                9,
+                &atem_client::membership::HostNow {
+                    wall_ms: 1,
+                    mono_ms: 1,
+                    boot_id: "b".into(),
+                },
+                &mut NoFences,
+            );
+            // The removal had begun (the unlink is done; only its directory
+            // fsync failed): the unpair completes.
+            assert!(unpaired, "{file:?}");
+            assert!(!paired && !paths.membership.exists(), "{file:?}");
+            let left = [
+                DlFile::Carriage,
+                DlFile::Intent,
+                DlFile::Fault,
+                DlFile::HostChannelKey,
+                DlFile::Applied,
+            ]
+            .into_iter()
+            .any(|f| store.present(f));
+            // Whatever is left fails closed until `atem pair`.
+            assert_eq!(matches!(opened, Ok(None)), !left, "{file:?}");
+        }
+        // The list's own unlink fails (a directory is in its way): nothing
+        // changed, the host stays paired and its list never opens as none.
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        bound_profile(dir.path(), "astation-a");
+        let paths = &src.paths.pairing;
+        std::fs::create_dir(&paths.membership).unwrap();
+        std::fs::write(paths.membership.join("x"), b"x").unwrap();
+        std::fs::write(&paths.fault, b"x").unwrap();
+        assert!(unpair(&src).is_err());
+        assert!(
+            PairingRecord::load(paths).unwrap().is_some(),
+            "still paired"
+        );
+        assert!(paths.fault.exists(), "its fault record kept");
+        let journal = crate::runtime::state_dir(dir.path()).join("journal");
+        let opened = MembershipHost::open(
+            paths,
+            &journal,
+            9,
+            &atem_client::membership::HostNow {
+                wall_ms: 1,
+                mono_ms: 1,
+                boot_id: "b".into(),
+            },
+            &mut NoFences,
+        );
+        assert!(opened.is_err(), "Failed, never None");
+    }
+
+    struct NoFences;
+    impl crate::session_protocol::membership::Fences for NoFences {
+        fn fence(&mut self, _: &str, _: u64) {}
+        fn fault(&mut self, _: Option<&[String]>) {}
+        fn halt(&mut self) {}
+        fn remote_principals(&self) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[test]

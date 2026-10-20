@@ -1023,3 +1023,156 @@ fn a_host_removal_in_a_batch_keeps_the_other_fences() {
         "each principal once"
     );
 }
+
+/// Re-review P1: held on an unreadable record whose fault record couldn't
+/// be written; with `pairing/` writable again a carriage first records the
+/// fault, then may replace the record: the restart stays held. While the
+/// fault record still can't be written, the carriage is refused and the
+/// record kept.
+#[test]
+fn a_carriage_never_clears_a_hold_held_by_its_record_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let v = vectors();
+    for writable in [false, true] {
+        let rig = Rig::new();
+        rig.pin(&LOG6);
+        std::fs::write(&rig.pairing.carriage, b"\x00garbage").unwrap();
+        let dir = rig.pairing.dir().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o500);
+        let (mut host, _) = rig.open(1, &t0(), &mut remote()).unwrap();
+        assert_eq!(host.held(), Some(&Held::CarriageUnreadable));
+        if writable {
+            mode(0o700);
+        }
+        let mut f = remote();
+        let r = host.apply_carriage(&v.carry(&["E7"]), &t0(), &mut f);
+        if writable {
+            assert_eq!(r.carried, Carried::Committed);
+            assert!(rig.exists(DlFile::Fault), "recorded before the record went");
+        } else {
+            assert_eq!(r.carried, Carried::NotRecorded, "fail closed");
+            assert_eq!(
+                std::fs::read(&rig.pairing.carriage).unwrap(),
+                b"\x00garbage",
+                "the evidence is untouched"
+            );
+        }
+        assert!(host.held().is_some());
+        drop(host);
+        mode(0o700);
+        let (host, _) = rig.open(2, &t0(), &mut remote()).unwrap();
+        assert!(host.held().is_some(), "writable {writable}: still held");
+    }
+}
+
+/// Re-review P1b: the same with an intent beyond the head (seq 9).
+#[test]
+fn a_carriage_never_clears_a_hold_held_by_its_intent_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let v = vectors();
+    let far = Head {
+        seq: 9,
+        hash: Hash32([9; 32]),
+    };
+    for writable in [false, true] {
+        let rig = Rig::new();
+        rig.pin(&LOG6);
+        let intent = Store::new(&rig.pairing, &rig.journal).path(DlFile::Intent);
+        std::fs::write(&intent, far.to_json().to_string()).unwrap();
+        let dir = rig.pairing.dir().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o500);
+        let (mut host, _) = rig.open(1, &t0(), &mut remote()).unwrap();
+        assert_eq!(host.held(), Some(&Held::Unclean(far)));
+        assert!(rig.exists(DlFile::Intent) && !rig.exists(DlFile::Fault));
+        if writable {
+            mode(0o700);
+        }
+        let mut f = remote();
+        let r = host.apply_carriage(&v.carry(&["E7"]), &t0(), &mut f);
+        if writable {
+            assert_eq!(r.carried, Carried::Committed);
+            let fault = rig.read(DlFile::Fault).unwrap();
+            assert_eq!(
+                Head::from_json(&fault["intent"]),
+                Some(far),
+                "the intent kept"
+            );
+        } else {
+            assert_eq!(r.carried, Carried::NotRecorded);
+            assert_eq!(
+                std::fs::read_to_string(&intent).unwrap(),
+                far.to_json().to_string()
+            );
+        }
+        drop(host);
+        mode(0o700);
+        let (host, _) = rig.open(2, &t0(), &mut remote()).unwrap();
+        assert_eq!(
+            host.held(),
+            Some(&Held::Unclean(far)),
+            "writable {writable}"
+        );
+    }
+}
+
+/// Re-review P3 / New Important 2: an r9 leftover without `membership.json`
+/// opens as a failure, never as "no device list".
+#[test]
+fn a_leftover_without_the_list_fails_closed() {
+    for file in [
+        DlFile::Carriage,
+        DlFile::Intent,
+        DlFile::Freeze,
+        DlFile::Fault,
+        DlFile::HostChannelKey,
+        DlFile::Applied,
+    ] {
+        let rig = Rig::new();
+        rig.pin(&LOG6);
+        let store = Store::new(&rig.pairing, &rig.journal);
+        std::fs::write(store.path(file), b"x").unwrap();
+        std::fs::remove_file(&rig.pairing.membership).unwrap();
+        let opened = MembershipHost::open(&rig.pairing, &rig.journal, 2, &t0(), &mut remote());
+        let error = opened
+            .err()
+            .unwrap_or_else(|| panic!("{file:?}: not a failure"));
+        assert!(error.contains("atem unpair"), "{error}");
+    }
+}
+
+/// Re-review Minor 1: the 0700 error says how to fix it.
+#[test]
+fn the_private_dir_error_says_how_to_fix_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    std::fs::set_permissions(rig.pairing.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = rig.open(1, &t0(), &mut remote()).unwrap_err();
+    assert!(error.contains("chmod 700"), "{error}");
+}
+
+/// Re-review Minor 2: an old host's reconciliation never clears a newer
+/// pin's fault record.
+#[test]
+fn an_old_host_never_clears_a_newer_pins_fault() {
+    let v = vectors();
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    std::fs::write(&rig.pairing.fault, b"{}").unwrap();
+    let (mut host, _) = rig.open(1, &t0(), &mut remote()).unwrap();
+    assert_eq!(host.held(), Some(&Held::Fault));
+    let m = pinned(&LOG6, &t0());
+    let new_pin = HostPin {
+        host_id: "host-a".into(),
+        host_trust_gen: 2,
+    };
+    MembershipHost::pin(&rig.pairing, &rig.journal, &new_pin, &m).unwrap();
+    std::fs::write(&rig.pairing.fault, b"{}").unwrap();
+    assert_eq!(
+        host.hello("dev-phone", Some(v.head("E6")), None, false, &t0()),
+        Hello::NotReconciled
+    );
+    assert!(rig.exists(DlFile::Fault), "the newer pin's fault stays");
+}

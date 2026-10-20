@@ -130,6 +130,11 @@ const UNPAIRED: &str = "unpaired";
 const RUNTIME_EPOCH_FILE: &str = "runtime_epoch";
 /// How often the link's pairing capture is checked against the pairing.
 const CAPTURE_CHECK: Duration = Duration::from_secs(5);
+/// Why the link was dropped: a carriage fenced its attachment.
+const DEVICE_LIST_DROP: &str =
+    "Remote access to this host changed (device list); the link was dropped";
+/// Why the link was dropped: a refusal couldn't be recorded.
+const REFUSAL_DROP: &str = "The session journal couldn't record a refusal; the link was dropped";
 /// Session messages remembered for duplicate detection, at most.
 const MAX_SEEN: usize = 4096;
 
@@ -633,11 +638,7 @@ impl HostBridge {
         let effects = fences.effects;
         let closing = self.close_link;
         self.exec(effects, cx);
-        // The reason goes with this carriage's own link drop only.
-        if !closing && self.close_link {
-            self.close_reason =
-                Some("Remote access to this host changed (device list); the link was dropped");
-        }
+        self.carriage_closed(closing);
         self.sync_all(cx);
         Some(result)
     }
@@ -859,12 +860,24 @@ impl HostBridge {
                 })
                 .collect();
         }
-        let reason = self.close_reason.take();
-        if std::mem::take(&mut self.close_link) {
-            let reason = reason
-                .unwrap_or("The session journal couldn't record a refusal; the link was dropped");
+        if let Some(reason) = self.take_close() {
             app.drop_astation_link(reason.into());
         }
+    }
+
+    /// After a carriage's effects: the device-list reason goes with this
+    /// carriage's own link drop only (`closing`: a drop was already due).
+    fn carriage_closed(&mut self, closing: bool) {
+        if !closing && self.close_link {
+            self.close_reason = Some(DEVICE_LIST_DROP);
+        }
+    }
+
+    /// The link drop due after this pass, with its reason; the reason never
+    /// outlives the pass.
+    fn take_close(&mut self) -> Option<&'static str> {
+        let reason = self.close_reason.take();
+        std::mem::take(&mut self.close_link).then(|| reason.unwrap_or(REFUSAL_DROP))
     }
 
     // ── The link ──

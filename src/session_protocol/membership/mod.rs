@@ -91,6 +91,16 @@ pub const DETAIL_NOT_RECONCILED: &str = "device list not reconciled";
 const EVIDENCE_PERSIST_MS: u64 = 60_000;
 /// The time waited is persisted at least this often (§R9.5).
 const CHECKPOINT_MS: u64 = 60_000;
+/// r9 files that exist only with a device list (§R9.3): one of them
+/// without `membership.json` is a damaged or half-removed list.
+const LEFTOVERS: [DlFile; 6] = [
+    DlFile::Carriage,
+    DlFile::Intent,
+    DlFile::Freeze,
+    DlFile::Fault,
+    DlFile::HostChannelKey,
+    DlFile::Applied,
+];
 /// `frozen_genesis` keeps at most this many hashes.
 const MAX_FROZEN_GENESIS: usize = 16;
 
@@ -502,14 +512,17 @@ impl MembershipHost {
         let store = Store::new(pairing, journal_dir);
         let state_path = store.path(DlFile::State);
         if !store::present(&state_path) {
-            let leftovers: Vec<&str> = [DlFile::Carriage, DlFile::Intent, DlFile::Freeze]
+            // Any r9 leftover without the list (an `atem unpair` that
+            // stopped midway, a damaged profile) fails closed: never "not
+            // an r9 host" on a host that was one.
+            let leftovers: Vec<&str> = LEFTOVERS
                 .into_iter()
                 .filter(|f| store.present(*f))
                 .map(DlFile::name)
                 .collect();
             if !leftovers.is_empty() {
                 return Err(format!(
-                    "the device list is missing but {} is there",
+                    "the device list is missing but {} is there; run atem unpair, then atem pair",
                     leftovers.join(", ")
                 ));
             }
@@ -800,6 +813,35 @@ impl MembershipHost {
         Ok((!self.unpaired).then_some(lock))
     }
 
+    /// While held, the evidence that holds the host (a kept carriage record
+    /// or intent) may be overwritten or removed only once the fault record
+    /// is durable: it is written again here if it is missing. Still
+    /// missing: a fault of the carriage (refused unread, fail closed), and
+    /// nothing of the evidence is touched.
+    fn hold_is_durable(&mut self, now: &HostNow) -> Result<(), WriteError> {
+        let Some(held) = self.held.clone() else {
+            return Ok(());
+        };
+        if self.store.present(DlFile::Fault) {
+            return Ok(());
+        }
+        let (file, intent) = match held {
+            Held::Unclean(intent) | Held::IntentMismatch(intent) => (DlFile::Intent, Some(intent)),
+            Held::CarriageUnreadable => (DlFile::Carriage, None),
+            Held::Fault => (DlFile::Fault, None),
+        };
+        self.record_fault(file, intent, now);
+        if self.store.present(DlFile::Fault) {
+            Ok(())
+        } else {
+            Err(WriteError {
+                file: DlFile::Carriage,
+                step: store::Step::TempWrite,
+                message: "the hold's fault record can't be written; the carriage is refused".into(),
+            })
+        }
+    }
+
     /// `membership.json` still names this host's pin.
     fn same_pin(&self) -> bool {
         #[derive(serde::Deserialize)]
@@ -888,7 +930,10 @@ impl MembershipHost {
         let record = carriage_bytes(self.runtime_epoch, &self.m.head(), carried);
         let written = match self.lock_for_write(DlFile::Carriage) {
             Ok(None) => return CarriageResult::plain(Carried::Unpaired),
-            Ok(Some(lock)) => self.store.replace(DlFile::Carriage, &record).map(|()| lock),
+            Ok(Some(lock)) => self
+                .hold_is_durable(now)
+                .and_then(|()| self.store.replace(DlFile::Carriage, &record))
+                .map(|()| lock),
             Err(e) => Err(e),
         };
         let _lock = match written {
@@ -1319,6 +1364,12 @@ impl MembershipHost {
 
     /// `membership.fault` (user option 2): its failure is logged; the
     /// restart then relies on the carriage record alone.
+    ///
+    /// It doesn't take `trust_gen.lock` itself: its callers hold it, except
+    /// after a failed lock (`fail` from `lock_for_write`), where a fault
+    /// record written without it is harmless: at worst a stray record after
+    /// an unpair, which makes the next start fail closed (a leftover) and
+    /// which `pin` removes.
     fn record_fault(&mut self, file: DlFile, intent: Option<Head>, now: &HostNow) {
         let mut record = json!({"v": 1, "runtime_epoch": self.runtime_epoch,
                                 "file": file.name(), "at": now.wall_ms});
@@ -1372,6 +1423,12 @@ impl MembershipHost {
         if !(manager && clean && satisfied && client_head == Some(self.m.head())) {
             return Hello::NotReconciled;
         }
+        // Under `trust_gen.lock`, and only while the list is still this
+        // host's pin (an old host never clears a newer pin's fault).
+        let _lock = match self.lock_for_write(DlFile::Fault) {
+            Ok(Some(lock)) => lock,
+            Ok(None) | Err(_) => return Hello::NotReconciled,
+        };
         // An unreadable carriage record left because its fault record
         // couldn't be written goes too (the manager confirmed the head).
         if held == Held::CarriageUnreadable
@@ -1600,18 +1657,57 @@ pub fn frozen_genesis(pairing: &PairingPaths) -> Vec<Hash32> {
         .unwrap_or_default()
 }
 
+/// Why `forget_on_unpair` failed, and whether the removal had begun.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetError {
+    pub message: String,
+    /// `membership.json` is (or may be) gone already: the unpair must go on
+    /// (the leftovers are inert: `open` fails closed on them and `pin`
+    /// removes them), never leave a paired host without its list.
+    pub begun: bool,
+}
+
+impl std::fmt::Display for ForgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next `forget_on_unpair` step that fails.
+    pub(crate) static FORGET_FAULT: std::cell::Cell<Option<store::Injected>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// `atem unpair` (§R9.3): a frozen list's genesis goes on
-/// `frozen_genesis` (≤ 16, oldest dropped), then the device list, its
-/// carriage record, intent, freeze and fault records and the host channel
-/// key are deleted. `frozen_genesis` stays.
-pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), String> {
+/// `frozen_genesis` (≤ 16, oldest dropped), then `membership.json` is
+/// removed first, then every other r9 file (the carriage record, intent,
+/// freeze and fault records, the host channel key, the journal's
+/// `membership_applied`). `frozen_genesis` stays. Until `membership.json`
+/// is gone nothing changed (an error leaves the host paired as it was);
+/// after that, any file left makes the next start fail closed.
+pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
     let state = store::read_private(&pairing.membership)
         .ok()
         .flatten()
         .and_then(|b| parse_json(&b));
     let frozen = store::present(&pairing.freeze)
         || state.as_ref().is_some_and(|v| v.get("frozen").is_some());
-    let mut store = Store::new(pairing, pairing.dir());
+    let journal = pairing
+        .dir()
+        .parent()
+        .map(|config| crate::runtime::state_dir(config).join("journal"))
+        .unwrap_or_else(|| pairing.dir().to_path_buf());
+    let mut store = Store::new(pairing, &journal);
+    #[cfg(test)]
+    if let Some(injected) = FORGET_FAULT.with(|f| f.take()) {
+        store.inject(injected);
+    }
+    let not_begun = |e: WriteError| ForgetError {
+        message: e.to_string(),
+        begun: false,
+    };
     if frozen
         && let Some(genesis) = state
             .as_ref()
@@ -1627,19 +1723,19 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), String> {
         let file = json!({"v": 1, "genesis": list.iter().map(Hash32::to_hex).collect::<Vec<_>>()});
         store
             .replace(DlFile::FrozenGenesis, file.to_string().as_bytes())
-            .map_err(|e| e.to_string())?;
+            .map_err(not_begun)?;
     }
-    for file in [
-        DlFile::State,
-        DlFile::Carriage,
-        DlFile::Intent,
-        DlFile::Freeze,
-        DlFile::Fault,
-    ] {
-        store.remove(file).map_err(|e| e.to_string())?;
+    store.remove(DlFile::State).map_err(|e| ForgetError {
+        // A failed unlink changed nothing; a failed directory fsync after
+        // it may have.
+        begun: e.step == store::Step::Remove || !store::present(&pairing.membership),
+        message: e.to_string(),
+    })?;
+    for file in LEFTOVERS {
+        store.remove(file).map_err(|e| ForgetError {
+            message: e.to_string(),
+            begun: true,
+        })?;
     }
-    match std::fs::remove_file(&pairing.host_channel_key) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
-        _ => Ok(()),
-    }
+    Ok(())
 }

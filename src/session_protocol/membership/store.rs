@@ -47,6 +47,8 @@ pub enum DlFile {
     Applied,
     /// `frozen_genesis`.
     FrozenGenesis,
+    /// `host_channel_key`.
+    HostChannelKey,
 }
 
 impl DlFile {
@@ -59,6 +61,7 @@ impl DlFile {
             DlFile::Fault => "membership.fault",
             DlFile::Applied => "membership_applied",
             DlFile::FrozenGenesis => "frozen_genesis",
+            DlFile::HostChannelKey => "host_channel_key",
         }
     }
 
@@ -205,7 +208,8 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
             }
             if meta.uid() != euid() || meta.mode() & 0o077 != 0 {
                 return Err(io::Error::other(format!(
-                    "{} is not a private directory of this user (0700)",
+                    "{} is not a private directory of this user (0700); run chmod 700 {}",
+                    dir.display(),
                     dir.display()
                 )));
             }
@@ -291,6 +295,7 @@ impl Store {
             DlFile::Fault => self.pairing.fault.clone(),
             DlFile::Applied => self.journal_dir.join("membership_applied"),
             DlFile::FrozenGenesis => self.pairing.frozen_genesis.clone(),
+            DlFile::HostChannelKey => self.pairing.host_channel_key.clone(),
         }
     }
 
@@ -407,6 +412,9 @@ impl Store {
     pub fn remove(&mut self, file: DlFile) -> Result<(), WriteError> {
         let path = self.path(file);
         let dir = self.dir_of(file);
+        if !present(&path) && !present(&temp_of(&path)) {
+            return Ok(()); // nothing to remove, nothing to sync
+        }
         remove_entry(&temp_of(&path))
             .and_then(|()| remove_entry(&path))
             .map_err(|e| Self::failure(file, Step::Rename, e.to_string()))?;

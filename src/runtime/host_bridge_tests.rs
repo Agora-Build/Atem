@@ -4012,3 +4012,30 @@ fn a_device_list_that_cant_be_opened_is_reported_apart_from_none() {
     assert!(matches!(bridge.device_list(), DeviceList::Failed(_)));
     assert!(bridge.host_error().is_none(), "r8 is unaffected");
 }
+
+/// Re-review Minor 4: the device-list reason goes with the carriage's own
+/// link drop only, never with a later, unrelated one.
+#[test]
+fn a_device_list_drop_reason_never_outlives_its_drop() {
+    let dir = short_dir();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    // A carriage that dropped nothing: no reason, no drop.
+    bridge.carriage_closed(false);
+    assert_eq!(bridge.take_close(), None);
+    // A later refusal drop keeps its own reason.
+    bridge.close_link = true;
+    assert_eq!(bridge.take_close(), Some(super::REFUSAL_DROP));
+    // A drop already due before the carriage keeps its reason.
+    bridge.close_link = true;
+    bridge.carriage_closed(true);
+    assert_eq!(bridge.take_close(), Some(super::REFUSAL_DROP));
+    // The carriage's own drop: its reason, once.
+    bridge.carriage_closed(false);
+    bridge.close_link = true;
+    bridge.carriage_closed(false);
+    assert_eq!(bridge.take_close(), Some(super::DEVICE_LIST_DROP));
+    bridge.close_link = true;
+    assert_eq!(bridge.take_close(), Some(super::REFUSAL_DROP));
+    assert_eq!(bridge.take_close(), None);
+}
