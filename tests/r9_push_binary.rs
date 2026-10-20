@@ -809,3 +809,87 @@ fn after_a_suspend_an_approval_still_gets_its_hints() {
         rig.runtime_log()
     );
 }
+
+/// The r8 display times after a suspend: the host clock's wall time jumps
+/// an hour while its monotonic clock goes on (`ATEM_TEST_HOST_CLOCK`, as
+/// after a laptop's lid was closed). The session host's wall is the host
+/// clock's at every pass, so `welcome.server_time`, a receipt's
+/// `updated_at` and a descriptor's `activity_since` show the time now, not
+/// an hour behind; a descriptor's `created_at` keeps the time it was
+/// registered.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn after_a_suspend_displayed_times_follow_the_wall_clock() {
+    let rig = Rig::new(false, true);
+    let (sid, _fake) = rig.agent();
+    let mut router = Router::new(&rig.astation);
+    let clock = rig.clock.as_ref().unwrap();
+    let within = |got: &Value, before: u64, after: u64, what: &str| {
+        let got = got.as_u64().unwrap_or_else(|| panic!("{what}: {got}"));
+        // The session host's monotonic clock is read at most one pass
+        // (100 ms) before the wall it is added to.
+        assert!(
+            before.saturating_sub(1_000) <= got && got <= after + 1_000,
+            "{what}: {before} <= {got} <= {after}"
+        );
+        got
+    };
+    let started = clock.wall();
+    let before = clock.wall();
+    let mut m = Dev::connect(&mut router, "mac", "direct", &rig.log, &mac());
+    let after = clock.wall();
+    within(
+        &json!(m.a.welcome().server_time),
+        before,
+        after,
+        "server_time before the suspend",
+    );
+    m.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "list", "id": uuid()}}),
+    );
+    let sessions = m.wait(&mut router, |v| v["op"] == "sessions");
+    let created = sessions["sessions"][0]["created_at"].clone();
+    within(&created, started - 120_000, after, "created_at");
+
+    clock.jump(3_600_000);
+    next_init();
+    let before = clock.wall();
+    let mut p = Dev::connect(&mut router, "phone", "relay", &rig.log, &phone());
+    let after = clock.wall();
+    within(
+        &json!(p.a.welcome().server_time),
+        before,
+        after,
+        "server_time after the suspend",
+    );
+    p.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "list", "id": uuid()}}),
+    );
+    let sessions = p.wait(&mut router, |v| v["op"] == "sessions");
+    assert_eq!(
+        sessions["sessions"][0]["created_at"], created,
+        "created_at keeps the registration's time"
+    );
+    let before = clock.wall();
+    p.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "submit", "id": uuid(),
+            "binding": p.read(&sid), "kind": "prompt", "request_id": uuid(), "acquire": true,
+            "payload": {"text": "run the tests"}}}),
+    );
+    let receipt = p.wait(&mut router, |v| v["op"] == "receipt");
+    let after = clock.wall();
+    assert_eq!(receipt["state"], "accepted", "{receipt}");
+    within(&receipt["updated_at"], before, after, "receipt updated_at");
+    let working = p.wait(&mut router, |v| {
+        v["op"] == "session_changed" && v["descriptor"]["activity"] == "working"
+    });
+    within(
+        &working["descriptor"]["activity_since"],
+        before,
+        clock.wall(),
+        "activity_since",
+    );
+}

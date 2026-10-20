@@ -673,7 +673,7 @@ impl HostBridge {
         };
         let default = HostConfig::default();
         let config = HostConfig {
-            wall_offset_ms: wall_ms().saturating_sub(clock.now()),
+            wall_offset_ms: host_now().wall_ms.saturating_sub(clock.now()),
             ..default
         };
         SessionHost::open(ctx, config, journal, random_ids(), Some(previous_epoch))
@@ -1233,6 +1233,10 @@ impl HostBridge {
         sessions: &mut BTreeMap<SessionId, BrokerSession>,
         adopting: bool,
     ) {
+        // Displayed times (descriptors, receipts, `welcome.server_time`)
+        // follow the host clock, which moves while the machine sleeps.
+        self.host
+            .set_wall_offset(host_now().wall_ms.saturating_sub(self.clock.now()));
         if self
             .link
             .as_ref()
@@ -2170,9 +2174,9 @@ impl HostBridge {
         }
         if state == BrokerState::Running && per.activity != Some(activity) {
             per.activity = Some(activity);
-            if let Ok(effects) = self
-                .host
-                .set_activity(sid, host_activity(activity), wall_ms())
+            if let Ok(effects) =
+                self.host
+                    .set_activity(sid, host_activity(activity), host_now().wall_ms)
             {
                 self.exec(effects, cx);
             }

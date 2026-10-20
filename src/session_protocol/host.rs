@@ -768,10 +768,18 @@ impl<J: Journal> SessionHost<J> {
         std::mem::take(&mut self.out)
     }
 
-    /// The session host's wall clock (ms): its start's offset plus its
-    /// monotonic clock (r8 receipts and descriptors).
+    /// The session host's wall clock (ms): an offset plus its monotonic
+    /// clock (r8 receipts and descriptors, `welcome.server_time`).
     pub fn wall_ms(&self) -> u64 {
         self.wall()
+    }
+
+    /// Sets the wall clock's offset (`wall - monotonic`). The runtime
+    /// recomputes it from the host clock every pass: the monotonic clock
+    /// stands still while the machine sleeps, so an offset fixed at the
+    /// start would leave every displayed time behind by the time slept.
+    pub fn set_wall_offset(&mut self, offset_ms: u64) {
+        self.config.wall_offset_ms = offset_ms;
     }
 
     fn wall(&self) -> u64 {
