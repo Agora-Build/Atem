@@ -1357,6 +1357,15 @@ impl Runner {
                     self.advance(ms, false);
                 }
                 self.drain();
+                // Nothing arrived for it in this step (the advance
+                // included). Messages left from earlier steps aren't
+                // counted: the r9 fixtures don't expect every r8 event
+                // (`session_changed`, intermediate receipts), and this
+                // runner's `expect` takes a message by its op rather than
+                // requiring each in turn, so earlier unexpected events stay
+                // queued by design; a strict "nothing queued" would fail on
+                // them (r9-service-scope-and-expiry leaves a
+                // `session_changed` and an `executing` receipt).
                 let got = self.fresh.get(&client).copied().unwrap_or(0);
                 assert_eq!(
                     got,

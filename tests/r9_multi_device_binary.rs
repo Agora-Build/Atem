@@ -39,6 +39,11 @@ impl Rig {
     /// A verified pairing as `HOST` and its device list: the Mac (genesis),
     /// this host, a phone (control) and a bot (prompt and view, an hour).
     fn new() -> Rig {
+        Self::with(|_| {})
+    }
+
+    /// [`Rig::new`] with more entries in the device list.
+    fn with(more: impl FnOnce(&mut TestLog)) -> Rig {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let host_seed = secret("multi-device host seed");
@@ -52,6 +57,7 @@ impl Rig {
             &["prompt", "view"],
             r9log::host_now().wall_ms + 3_600_000,
         );
+        more(&mut log);
         write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
         let faults = sandbox.dir.path().join("pty-faults");
         std::fs::create_dir_all(&faults).unwrap();
@@ -545,24 +551,46 @@ fn a_confirmed_takeover_moves_the_lease_between_devices_and_an_unrenewed_one_exp
 /// approval and no card in its chat, and can't answer (`forbidden`).
 #[test]
 fn an_approval_is_answered_by_one_device_while_another_holds_the_lease() {
-    let rig = Rig::new();
+    let mut rig = Rig::new();
     let (sid, fake) = rig.agent();
+    let wall = r9log::host_now().wall_ms;
+    let (grant, key) = rig.log.grant(
+        "dev-phone",
+        "aaaaaaaa-2222-4222-8222-000000000002",
+        HOST,
+        1,
+        None,
+        &["view"],
+        wall,
+        wall + 600_000,
+    );
     let mut router = Router::new(&rig.astation);
     let log = &rig.log;
+    // The Mac, the phone, the bot and the browser, all at once.
     let mut m = Dev::connect(&mut router, "mac", "direct", log, &mac());
     next_init();
     let mut p = Dev::connect(&mut router, "phone", "relay", log, &phone());
     next_init();
     let mut bt = Dev::connect(&mut router, "bot", "relay", log, &bot());
-    for d in [&mut m, &mut p, &mut bt] {
+    next_init();
+    let mut br = Dev::connect(
+        &mut router,
+        "browser",
+        "relay",
+        log,
+        &Identity::browser(grant, key).unwrap(),
+    );
+    for d in [&mut m, &mut p, &mut bt, &mut br] {
         d.list(&mut router, &sid);
     }
     let lease = m.acquire(&mut router, &sid, None);
     assert_eq!(lease["binding"]["lease_epoch"], 1, "{lease}");
     p.open_chat(&mut router, &sid);
     bt.open_chat(&mut router, &sid);
+    br.open_chat(&mut router, &sid);
     p.gather(&mut router, Duration::from_millis(300));
     bt.gather(&mut router, Duration::from_millis(300));
+    br.gather(&mut router, Duration::from_millis(300));
 
     ask(&fake, 1);
     let request = m.wait(&mut router, |v| v["op"] == "approval_request");
@@ -574,22 +602,26 @@ fn an_approval_is_answered_by_one_device_while_another_holds_the_lease() {
     p.wait(&mut router, move |v| {
         v["__type"] == "agentChat" && v["op"] == "message" && v["messageId"] == c.as_str()
     });
-    // The bot: no approval, no card.
-    let seen = bt.gather(&mut router, Duration::from_millis(1_500));
-    assert!(
-        !seen
-            .iter()
-            .any(|v| v["op"] == "approval_request" || v.to_string().contains(&card)),
-        "{seen:?}"
-    );
-    bt.send(
-        &mut router,
-        json!({"type": "session", "data": {"v": 1, "op": "submit", "id": uuid(),
-            "binding": bt.read(&sid), "kind": "approval", "request_id": uuid(),
-            "payload": {"approval_id": ap, "decision": "allow_once"}}}),
-    );
-    let forbidden = bt.wait(&mut router, |v| v["op"] == "error");
-    assert_eq!(forbidden["code"], "forbidden", "{forbidden}");
+    // The bot (no approval op) and the browser (a view grant): no
+    // approval, no card, and an answer is forbidden.
+    for d in [&mut bt, &mut br] {
+        let seen = d.gather(&mut router, Duration::from_millis(1_500));
+        assert!(
+            !seen
+                .iter()
+                .any(|v| v["op"] == "approval_request" || v.to_string().contains(&card)),
+            "{}: {seen:?}",
+            d.h
+        );
+        d.send(
+            &mut router,
+            json!({"type": "session", "data": {"v": 1, "op": "submit", "id": uuid(),
+                "binding": d.read(&sid), "kind": "approval", "request_id": uuid(),
+                "payload": {"approval_id": ap, "decision": "allow_once"}}}),
+        );
+        let forbidden = d.wait(&mut router, |v| v["op"] == "error");
+        assert_eq!(forbidden["code"], "forbidden", "{}: {forbidden}", d.h);
+    }
 
     // The phone answers, lease-free.
     let rid = uuid();
@@ -729,6 +761,7 @@ fn the_macs_link_drops_and_the_phone_goes_on_over_the_relay() {
     // The Mac's Astation goes away with Atem's link.
     rig.astation.close(router.link);
     drop(router);
+    let mut p_old = p;
     let mut router = Router::new(&rig.astation);
     let mut p = Dev::connect(&mut router, "phone-relay", "relay", log, &phone());
     p.list(&mut router, &sid);
@@ -739,6 +772,11 @@ fn the_macs_link_drops_and_the_phone_goes_on_over_the_relay() {
         br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#,
     );
     assert!(matches!(router.next("mac"), Out::Close(Some(r)) if r == "unknown_channel"));
+    // The phone's old channel ended with the link too: its handle is
+    // unknown on the new link, and its old keys open nothing here.
+    let (_, stale) = p_old.a.list(client_ms()).unwrap();
+    router.frame("phone", &stale);
+    assert!(matches!(router.next("phone"), Out::Close(Some(r)) if r == "unknown_channel"));
     // The Mac's lease isn't restored to anyone; it expires.
     let held = p.acquire(&mut router, &sid, None);
     assert_eq!(held["code"], "lease_held", "{held}");
@@ -765,4 +803,64 @@ fn the_macs_link_drops_and_the_phone_goes_on_over_the_relay() {
         rt.contains("the link dropped; every channel on it closed"),
         "{rt}"
     );
+}
+
+/// §R9.6 in the real runtime: a service whose scope names a launch
+/// project hash sees no session while no cred agent can make the hash
+/// (here none runs: "locked"), and its requests about the session are
+/// `unknown_session`, while an unscoped service sees the session. The
+/// runtime logs that project scopes are pending.
+#[test]
+fn a_project_scoped_bot_sees_nothing_while_the_cred_agent_is_locked() {
+    let wall = r9log::host_now().wall_ms;
+    let rig = Rig::with(|log| {
+        log.add_service_projects(
+            "svc-proj",
+            &[HOST],
+            Some(&["h1.0a0b0c0d.1111111111111111111111111111111111111111111111111111111111111111"]),
+            None,
+            &["prompt", "view"],
+            wall + 3_600_000,
+        );
+    });
+    let (sid, _fake) = rig.agent();
+    let mut router = Router::new(&rig.astation);
+    let log = &rig.log;
+    let mut proj = Dev::connect(
+        &mut router,
+        "proj",
+        "relay",
+        log,
+        &Identity::service("svc-proj", auth("svc-proj")),
+    );
+    next_init();
+    let mut bt = Dev::connect(&mut router, "bot", "relay", log, &bot());
+    bt.list(&mut router, &sid);
+    proj.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "list", "id": uuid()}}),
+    );
+    let sessions = proj.wait(&mut router, |v| v["op"] == "sessions");
+    assert_eq!(sessions["sessions"], json!([]), "{sessions}");
+    // A target it can't see: unknown_session, as for any out-of-scope one.
+    let mut target = bt.read(&sid);
+    target["attachment_gen"] = json!(proj.a.welcome().attachment_gen);
+    proj.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "receipt_query", "id": uuid(),
+            "binding": target, "request_ids": [uuid()]}}),
+    );
+    let refused = proj.wait(&mut router, |v| v["op"] == "error");
+    assert_eq!(refused["code"], "unknown_session", "{refused}");
+    // Nothing comes later either (still locked).
+    let later = proj.gather(&mut router, Duration::from_millis(1_500));
+    assert!(
+        !later.iter().any(|v| v.to_string().contains(&sid)),
+        "{later:?}"
+    );
+    let deadline = Instant::now() + WAIT;
+    while !rig.runtime_log().contains("project scopes pending") {
+        assert!(Instant::now() < deadline, "{}", rig.runtime_log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
