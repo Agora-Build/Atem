@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.7a bounds: the largest legal record (1 MiB of plaintext, a 1 398 279-byte envelope with a 64-character handle) passes; one plaintext byte more is refused by the sender, and a peer that sends it anyway fails only its channel; an envelope over 2 MiB closes its channel (too_large); a second init within a second on the link is busy; a channel whose queued output passes 4 MiB is closed (busy) while another channel stays.",
+  "note": "R9.7a bounds: the largest legal record (1 MiB of plaintext, a 1 398 279-byte envelope with a 64-character handle) passes; one plaintext byte more is refused by the sender, and a peer that sends it anyway (a 1 398 160-byte `rec` whose `ct` is over the bound) gets close{too_large} for its channel only; an envelope over 2 MiB closes its channel (too_large); a second init within a second on the link is busy; a channel whose queued output passes 4 MiB is closed (busy) while another channel stays.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -129,7 +129,7 @@
         "match": {
           "event": "close",
           "channel": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
-          "reason": "closed"
+          "reason": "too_large"
         }
       }
     },
