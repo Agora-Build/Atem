@@ -67,7 +67,7 @@
         "op": "approval_request"
       },
       "capture": {
-        "ap": "approval.approval_id"
+        "ap": "approval_id"
       }
     },
     {
