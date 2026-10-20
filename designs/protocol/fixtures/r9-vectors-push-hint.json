@@ -21,6 +21,8 @@
           "type": "atem-push-hint",
           "v": 1
         },
+        "enc": "jvpPwt0-OYGdUjl9QlT9PqgXsmySwvcTvH1JIHXUNkQ",
+        "ct": "GPwcrdmchVLz2CRKuFMMraaQ4oiShgMdj_EvA1hzcS15PiCy7CcT4sL_1uejen04pE8yIQ",
         "sig": "n8WX6nqu4a8pFXU9A05FQ7LHDCzfvCnjso4Vl4fC_jnS2oXUayL708bc7-_NbdAxAniYSdXmpi8Y28WlAr1JBg"
       },
       "reason": "created_at 600000 ms after the verifier's clock (verifier now = created_at of the good hint): refused by clients (more than 300000 ms ahead) and by the relay (outside its ±120000 ms bound)"
@@ -46,6 +48,8 @@
           "type": "atem-push-hint",
           "v": 1
         },
+        "enc": "jvpPwt0-OYGdUjl9QlT9PqgXsmySwvcTvH1JIHXUNkQ",
+        "ct": "GPwcrdmchVLz2CRKuFMMraaQ4oiShgMdj_EvA1hzcS15PiCy7CcT4sL_1uejen04pE8yIQ",
         "sig": "W_WLDCmiYkB3y8qjR7uZ-u9xZGcho6zlv4SITBSjiA_wEVBqTA8dxEYx3bz5Liidcr8rIGkC56HbjaNGdYKBAg"
       },
       "reason": "expires_at <= created_at"
@@ -71,6 +75,8 @@
           "type": "atem-push-hint",
           "v": 1
         },
+        "enc": "jvpPwt0-OYGdUjl9QlT9PqgXsmySwvcTvH1JIHXUNkQ",
+        "ct": "GPwcrdmchVLz2CRKuFMMraaQ4oiShgMdj_EvA1hzcS15PiCy7CcT4sL_1uejen04pE8yIQ",
         "sig": "xRvh-stCgW_1Pcxpd1FlX3kCXWumogQmqiI2uGaFpck0jnR6b0S6MEDoQAn1I-TqiJ0DzlxkXzfphtbyTQUMDQ"
       },
       "reason": "expires_at - created_at > 900000"
@@ -96,6 +102,8 @@
           "type": "atem-push-hint",
           "v": 1
         },
+        "enc": "jvpPwt0-OYGdUjl9QlT9PqgXsmySwvcTvH1JIHXUNkQ",
+        "ct": "GPwcrdmchVLz2CRKuFMMraaQ4oiShgMdj_EvA1hzcS15PiCy7CcT4sL_1uejen04pE8yIQ",
         "sig": "5DtnXvptk_sGFAtM1is1gXQZtHOXbn64Fj1Kb09rX1H6n_6S5Oo_n0achNg7rdLtFqt1TTEQMIvymYzp5zMTBw"
       },
       "reason": "same approval_id and recipient as the good hint with another created_at: a conflicting duplicate; the first accepted stays, this one is refused and logged"
@@ -103,7 +111,7 @@
   ],
   "kind": "vectors",
   "name": "r9-vectors-push-hint",
-  "note": "Signed by host-a's host_channel_key over enc([\"atem-push-hint-v1\", jcs(body)]) / enc([\"atem-seen-v1\", jcs(body)]). Sealed part: RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, info as given; the sender's ephemeral is DeriveKeyPair(ikmE). sealed_hash = SHA-256(enc([enc, ct])). enc_kid = hex(SHA-256(enc([\"atem-enc-kid-v1\", x25519_pub]))[0..8]).",
+  "note": "Signed by host-a's host_channel_key over enc([\"atem-push-hint-v1\", jcs(body)]) / enc([\"atem-seen-v1\", jcs(body)]). Sealed part: RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, info as given; the sender's ephemeral is DeriveKeyPair(ikmE). sealed_hash = SHA-256(enc([enc, ct])). enc_kid = hex(SHA-256(enc([\"atem-enc-kid-v1\", x25519_pub]))[0..8]). The invalid hints carry open[0]'s enc/ct so only their stated reason refuses them (amended).",
   "open": [
     {
       "body": {
