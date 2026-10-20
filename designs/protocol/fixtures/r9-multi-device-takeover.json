@@ -114,7 +114,7 @@
       "expect": "mac",
       "match": {
         "op": "lease_changed",
-        "reason": "taken",
+        "reason": "takeover",
         "lease_epoch": 2
       }
     },
