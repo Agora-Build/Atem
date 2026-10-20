@@ -1,0 +1,51 @@
+[package]
+name = "atem-client-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "Swift/Kotlin (UniFFI) and WASM (wasm-bindgen) bindings over atem-client, the atem-session r9 client core"
+publish = false
+
+[lib]
+name = "atem_client_ffi"
+# cdylib: Kotlin (JNA), the WASM module and Swift dev builds; staticlib: the
+# xcframework; lib: the Rust tests and the uniffi-bindgen binary.
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+# The UniFFI generator (library mode), built only with `--features bindgen`.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+default = ["uniffi"]
+# Swift and Kotlin through UniFFI.
+uniffi = ["dep:uniffi"]
+# The UniFFI CLI (`uniffi-bindgen generate --library …`).
+bindgen = ["uniffi", "uniffi/cli", "uniffi/cargo-metadata"]
+# The browser / Node build (`--no-default-features --features wasm`).
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde", "dep:serde-wasm-bindgen", "dep:serde_bytes", "dep:getrandom"]
+# An in-memory key store for bots (keys loaded from their own secret store)
+# and for the conformance tests. Never in the packaged app artifacts.
+software-keys = ["atem-client/software-keys"]
+# Deterministic HPKE re-seals and raw primitive verification, for the
+# known-answer vectors only. Never in the packaged app artifacts.
+test-vectors = ["atem-client/test-vectors", "software-keys"]
+
+[dependencies]
+atem-client = { path = "../atem-client" }
+serde_json = "1.0"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+uniffi = { version = "=0.32.2", optional = true, default-features = false }
+wasm-bindgen = { version = "=0.2.101", optional = true }
+js-sys = { version = "=0.3.78", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "=0.6.5", optional = true }
+serde_bytes = { version = "=0.11.19", optional = true }
+# `getrandom` (behind rand_core) reads crypto.getRandomValues on wasm32.
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
+[dev-dependencies]
+# The end-to-end test host (atem-client's test support) signs with software keys.
+atem-client = { path = "../atem-client", features = ["software-keys", "test-vectors"] }

@@ -1,0 +1,114 @@
+name: atem-client-bindings
+
+# atem-client's bindings (crates/atem-client-ffi): the shared r9 vectors
+# through Kotlin (UniFFI + JNA), WASM (Node) and Swift, the binding end-to-end
+# test (a Kotlin phone and a Node/WASM browser against a test host over
+# loopback TCP), and a dry run of the Apple package.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "designs/protocol/fixtures/**"
+      - "scripts/check-atem-client-bindings.sh"
+      - "scripts/package-atem-client-apple.sh"
+      - ".github/workflows/atem-client-bindings.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "designs/protocol/fixtures/**"
+      - "scripts/check-atem-client-bindings.sh"
+      - "scripts/package-atem-client-apple.sh"
+      - ".github/workflows/atem-client-bindings.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: atem-client-bindings-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Toolchains, pinned with their published checksums (the Kotlin release's
+  # .sha256 and GitHub asset digest; JNA's Maven Central SHA-1 and the
+  # maintainer's PGP signature, recorded here as SHA-256).
+  KOTLIN_VERSION: "2.4.21"
+  KOTLIN_SHA256: "7cc140e76daf416a0424a5557f99afd7ca89ebd463ea1101261e3e01c33e75cd"
+  JNA_VERSION: "5.19.1"
+  JNA_SHA256: "4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae"
+  # Must equal the wasm-bindgen version crates/atem-client-ffi pins.
+  WASM_BINDGEN_VERSION: "0.2.101"
+
+jobs:
+  linux:
+    name: Rust, Kotlin, WASM, end to end (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Rust tests (atem-client, atem-client-ffi)
+        run: cargo test -p atem-client -p atem-client-ffi
+
+      - name: The atem binary links no binding crate
+        run: |
+          if cargo tree -p atem -e normal --prefix none | grep -E '^(atem-client-ffi|uniffi|wasm-bindgen) '; then
+            echo "atem must not depend on the binding crates" >&2
+            exit 1
+          fi
+
+      - name: Fetch the Kotlin compiler and JNA (checksums verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kotlin-dl" "$RUNNER_TEMP/kotlin" "$RUNNER_TEMP/jna"
+          curl -fsSL -o "$RUNNER_TEMP/kotlin-dl/kotlin.zip" \
+            "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip"
+          echo "${KOTLIN_SHA256}  $RUNNER_TEMP/kotlin-dl/kotlin.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/kotlin-dl/kotlin.zip" -d "$RUNNER_TEMP/kotlin"
+          curl -fsSL -o "$RUNNER_TEMP/jna/jna.jar" \
+            "https://repo1.maven.org/maven2/net/java/dev/jna/jna/${JNA_VERSION}/jna-${JNA_VERSION}.jar"
+          echo "${JNA_SHA256}  $RUNNER_TEMP/jna/jna.jar" | sha256sum -c -
+
+      - name: wasm-bindgen CLI
+        run: cargo install --locked --root "$RUNNER_TEMP/wasm-bindgen" wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
+
+      - name: Kotlin and WASM conformance, binding end to end
+        run: |
+          KOTLINC="$RUNNER_TEMP/kotlin/kotlinc/bin/kotlinc" \
+          JNA_JAR="$RUNNER_TEMP/jna/jna.jar" \
+          JAVA="$JAVA_HOME/bin/java" \
+          WASM_BINDGEN="$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen" \
+          ./scripts/check-atem-client-bindings.sh kotlin wasm e2e
+
+  macos:
+    name: Swift conformance, Apple package (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Swift conformance (CryptoKit provider through the foreign trait)
+        run: ./scripts/check-atem-client-bindings.sh swift
+
+      - name: Package dry run (xcframework + SwiftPM, no test features)
+        run: |
+          ./scripts/package-atem-client-apple.sh dev target/atem-client-package
+          test -s target/atem-client-package/atem-client-dev-apple-swiftpm.zip
+          (cd target/atem-client-package && shasum -a 256 -c atem-client-dev-SHA256SUMS.txt)
+          # The shipped package builds without the test features.
+          (cd target/atem-client-package/AtemClient && swift build)
