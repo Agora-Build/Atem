@@ -2067,13 +2067,11 @@ fn push_hint() {
     );
     run.pass("seen: verified, the open's identity and window; rebuilt byte for byte");
     let other = run.get("seen_other_process_gen");
-    let other_object = SignedObject::from_strict(&strict(&serde_json::json!({
-        "body": other["body"].clone(), "sig": other["sig"].clone()
-    })))
-    .unwrap();
+    let other_details = run.get("seen_other_process_gen_details");
+    let other_object = SignedObject::from_strict(&strict(&other)).unwrap();
     assert_eq!(
         hex(other_object.signing_input().as_bytes()),
-        s(&other, "signing_input_hex")
+        s(&other_details, "signing_input_hex")
     );
     other_object.verify(&host_key).unwrap();
     run.pass("seen_other_process_gen: signing input, host signature");
