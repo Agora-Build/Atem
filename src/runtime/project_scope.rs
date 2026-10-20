@@ -51,15 +51,18 @@ impl ProjectHasher for AgentHasher {
     }
 }
 
-/// The kids the device list's services name in their `projects` scopes:
+/// The kids the device list's services name in their `projects` scopes,
+/// of the services that can be admitted now (in the list, not expired):
 /// their hashes are made before a service even connects, so its first
 /// `list` already sees its sessions (with the agent unlocked).
-pub fn project_kids_of(m: &atem_client::membership::Membership) -> BTreeSet<String> {
+pub fn project_kids_of(m: &atem_client::membership::Membership, now_wall: u64) -> BTreeSet<String> {
     use atem_client::membership::entry::MemberKind;
     m.members()
         .into_iter()
         .filter_map(|id| match &m.member(id)?.member.kind {
-            MemberKind::Service { scope, .. } => scope.projects.clone(),
+            MemberKind::Service { scope, expires_at } if *expires_at > now_wall => {
+                scope.projects.clone()
+            }
             _ => None,
         })
         .flatten()
@@ -80,8 +83,16 @@ pub fn hash_with(
             .iter()
             .map(|(key, kid)| CryptOp::keyed_hash_under(key.as_bytes(), kid))
             .collect();
-        for result in agent.crypt(astation_id, ops)? {
-            out.push(result.into_text()?);
+        for (result, (_, kid)) in agent.crypt(astation_id, ops)?.into_iter().zip(chunk) {
+            let hash = result.into_text()?;
+            // An agent that ignored the kid (an older build) hashed under
+            // its current key: never cached as this kid's answer.
+            if !hash.starts_with(&format!("h1.{kid}.")) {
+                anyhow::bail!(
+                    "the cred agent hashed under another key than {kid} (an older cred agent may be running: atem cred lock, then atem cred unlock)"
+                );
+            }
+            out.push(hash);
         }
     }
     Ok(out)
@@ -162,20 +173,23 @@ impl crate::memory::cred_agent::CredAgentApi for TableAgent {
 }
 
 type Pair = (String, String);
-type Done = Result<Vec<(Pair, String)>, String>;
+/// A job's kid and its outcome.
+type Done = (String, Result<Vec<(Pair, String)>, String>);
 
 /// The launch projects of the sessions and their known hashes.
 pub struct ProjectScopes {
     hasher: Arc<dyn ProjectHasher>,
     keys: BTreeMap<String, String>,
     hashes: HashMap<Pair, String>,
-    /// A job is out (one at a time).
-    pending: bool,
-    retry_at: Option<Instant>,
+    /// The kid of the job that is out (one at a time, one kid per job:
+    /// a kid the agent can't hash never holds another back).
+    pending: Option<String>,
+    /// Per kid, after a failure: not asked again before then.
+    retry_at: HashMap<String, Instant>,
     tx: mpsc::Sender<Done>,
     rx: mpsc::Receiver<Done>,
-    /// The last failure, logged once until it changes.
-    failure: Option<String>,
+    /// Per kid, the last failure, logged once until it changes.
+    failure: HashMap<String, String>,
 }
 
 fn kid_of(entry: &str) -> Option<&str> {
@@ -192,11 +206,11 @@ impl ProjectScopes {
             hasher,
             keys: BTreeMap::new(),
             hashes: HashMap::new(),
-            pending: false,
-            retry_at: None,
+            pending: None,
+            retry_at: HashMap::new(),
             tx,
             rx,
-            failure: None,
+            failure: HashMap::new(),
         }
     }
 
@@ -207,7 +221,7 @@ impl ProjectScopes {
             Some(key) => {
                 if self.keys.insert(sid.to_string(), key).is_none() {
                     // A new session is hashed at once.
-                    self.retry_at = None;
+                    self.retry_at.clear();
                 }
             }
             None => self.forget(sid),
@@ -224,13 +238,16 @@ impl ProjectScopes {
     /// then a job for what is still missing.
     pub fn pass(&mut self, kids: &BTreeSet<String>, now: Instant) -> Vec<String> {
         let mut fresh = BTreeSet::new();
-        while let Ok(done) = self.rx.try_recv() {
-            self.pending = false;
+        while let Ok((kid, done)) = self.rx.try_recv() {
+            self.pending = None;
             match done {
                 Ok(results) => {
-                    if self.failure.take().is_some() {
-                        eprintln!("atem runtime: project scopes: the cred agent answers again");
+                    if self.failure.remove(&kid).is_some() {
+                        eprintln!(
+                            "atem runtime: project scopes: the cred agent hashes under {kid} again"
+                        );
                     }
+                    self.retry_at.remove(&kid);
                     for ((sid, kid), hash) in results {
                         if self.keys.contains_key(&sid) {
                             fresh.insert(sid.clone());
@@ -239,36 +256,38 @@ impl ProjectScopes {
                     }
                 }
                 Err(why) => {
-                    if self.failure.as_deref() != Some(why.as_str()) {
+                    if self.failure.get(&kid) != Some(&why) {
                         eprintln!(
-                            "atem runtime: project scopes pending (sessions stay out of project-scoped services): {why}"
+                            "atem runtime: project scopes under {kid} pending (sessions stay out of the services that name it): {why}"
                         );
-                        self.failure = Some(why);
+                        self.failure.insert(kid.clone(), why);
                     }
-                    self.retry_at = Some(now + RETRY);
+                    self.retry_at.insert(kid, now + RETRY);
                 }
             }
         }
-        if !self.pending && self.retry_at.is_none_or(|at| now >= at) {
-            let missing: Vec<(Pair, String)> = self
-                .keys
-                .iter()
-                .flat_map(|(sid, key)| {
-                    kids.iter()
-                        .map(move |kid| ((sid.clone(), kid.clone()), key.clone()))
-                })
-                .filter(|(pair, _)| !self.hashes.contains_key(pair))
-                .collect();
-            if !missing.is_empty() {
-                self.pending = true;
-                self.retry_at = None;
-                self.spawn(missing);
+        if self.pending.is_none() {
+            let due = kids.iter().find_map(|kid| {
+                if self.retry_at.get(kid).is_some_and(|at| now < *at) {
+                    return None;
+                }
+                let missing: Vec<(Pair, String)> = self
+                    .keys
+                    .iter()
+                    .map(|(sid, key)| ((sid.clone(), kid.clone()), key.clone()))
+                    .filter(|(pair, _)| !self.hashes.contains_key(pair))
+                    .collect();
+                (!missing.is_empty()).then(|| (kid.clone(), missing))
+            });
+            if let Some((kid, missing)) = due {
+                self.pending = Some(kid.clone());
+                self.spawn(kid, missing);
             }
         }
         fresh.into_iter().collect()
     }
 
-    fn spawn(&self, missing: Vec<(Pair, String)>) {
+    fn spawn(&self, kid: String, missing: Vec<(Pair, String)>) {
         let hasher = self.hasher.clone();
         let tx = self.tx.clone();
         #[cfg(test)]
@@ -296,14 +315,14 @@ impl ProjectScopes {
                             .zip(hashes)
                             .collect())
                     });
-            let _ = tx.send(done);
+            let _ = tx.send((kid, done));
         });
     }
 
     /// No job out and nothing missing for `kids` (tests).
     #[cfg(test)]
     pub fn idle(&self, kids: &BTreeSet<String>) -> bool {
-        !self.pending
+        self.pending.is_none()
             && self.keys.keys().all(|sid| {
                 kids.iter()
                     .all(|kid| self.hashes.contains_key(&(sid.clone(), kid.clone())))
@@ -348,12 +367,66 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let fresh = p.pass(kids, now);
-            if !fresh.is_empty() || !p.pending {
+            if !fresh.is_empty() || p.pending.is_none() {
                 return fresh;
             }
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Review N1: a kid the agent doesn't hold (pruned after a rotation, a
+    /// typo) never holds another kid back: the held kid's sessions come
+    /// into scope, the unheld one stays out, with its own failure.
+    #[test]
+    fn an_unheld_kid_never_blocks_a_held_one() {
+        let agent = TableAgent::new(true);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert(("proj".into(), "k1".into()), "h1.k1.aa".into());
+        let mut p = ProjectScopes::new(Arc::new(CredAgentHasher {
+            agent: agent.clone(),
+            astation_id: "astation-1".into(),
+        }));
+        p.session("ses-a", Some("proj".into()));
+        let kids: BTreeSet<String> = ["k0-unheld".to_string(), "k1".to_string()].into();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while p.matches("ses-a", "h1.k1.aa").is_none() {
+            assert!(Instant::now() < deadline, "the held kid was never hashed");
+            p.pass(&kids, Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(p.matches("ses-a", "h1.k1.aa"), Some(true));
+        assert_eq!(p.matches("ses-a", "h1.k0-unheld.aa"), None);
+        assert!(
+            p.failure
+                .get("k0-unheld")
+                .is_some_and(|why| why.contains("no retained key")),
+            "{:?}",
+            p.failure
+        );
+    }
+
+    /// Review N2: an agent answering under another key than the one asked
+    /// (an older build ignoring `kid`) is a failure, never cached.
+    #[test]
+    fn a_hash_under_another_kid_is_refused() {
+        let agent = TableAgent::new(true);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert(("proj".into(), "k1".into()), "h1.k2.aa".into());
+        let error = hash_with(
+            agent.as_ref(),
+            "astation-1",
+            &[("proj".into(), "k1".into())],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("older cred agent"), "{error}");
     }
 
     /// Pending while locked (no answer, never a guess), retried every
@@ -370,17 +443,17 @@ mod tests {
         let kids: BTreeSet<String> = ["k1".to_string()].into();
         let t0 = Instant::now();
         p.pass(&kids, t0);
-        while p.pending {
+        while p.pending.is_some() {
             std::thread::sleep(Duration::from_millis(5));
             p.pass(&kids, t0);
         }
         assert_eq!(p.matches("ses-a", "h1.k1.21"), None, "locked: pending");
         // Not asked again before RETRY.
         p.pass(&kids, t0 + Duration::from_secs(1));
-        assert!(!p.pending);
+        assert!(p.pending.is_none());
         *table.unlocked.lock().unwrap() = true;
         p.pass(&kids, t0 + RETRY);
-        assert!(p.pending);
+        assert!(p.pending.is_some());
         let fresh = settle(&mut p, &kids, t0 + RETRY);
         assert_eq!(fresh, vec!["ses-a".to_string()]);
         assert_eq!(p.matches("ses-a", "h1.k1.21"), Some(true));

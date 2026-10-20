@@ -458,7 +458,7 @@ pub struct HostBridge {
     /// keyed hashes (§R9.6, `project_scope`).
     projects: ProjectScopes,
     /// Sessions whose worker record (and launch project) wasn't read yet.
-    project_unread: HashSet<String>,
+    project_unread: HashMap<String, Instant>,
 }
 
 /// What `atem status` shows of the link's session attachment.
@@ -586,7 +586,7 @@ impl HostBridge {
         };
         Ok(Self {
             projects: ProjectScopes::new(hasher),
-            project_unread: HashSet::new(),
+            project_unread: HashMap::new(),
             r9: R9Host::new(r9host::Limits::default(), Some(dir)),
             r9_link: None,
             r9_socket: 0,
@@ -906,23 +906,35 @@ impl HostBridge {
         if !self.project_unread.is_empty()
             && let Some(state) = self.dir.parent()
         {
-            let read: Vec<(String, Option<String>)> = self
+            // A record not there yet (or unreadable) is looked for again
+            // every `RETRY`, not every pass.
+            let now = Instant::now();
+            let due: Vec<String> = self
                 .project_unread
                 .iter()
-                .filter_map(|sid| {
-                    let path = super::worker::record_path(state, sid);
-                    let record = super::worker::read_record(&path).ok()?;
-                    Some((sid.clone(), record.project_key))
-                })
+                .filter(|(_, at)| now >= **at)
+                .map(|(sid, _)| sid.clone())
                 .collect();
-            for (sid, key) in read {
-                self.project_unread.remove(&sid);
-                self.projects.session(&sid, key);
+            for sid in due {
+                let path = super::worker::record_path(state, &sid);
+                match super::worker::read_record(&path) {
+                    Ok(record) => {
+                        self.project_unread.remove(&sid);
+                        self.projects.session(&sid, record.project_key);
+                    }
+                    Err(_) => {
+                        self.project_unread
+                            .insert(sid, now + super::project_scope::RETRY);
+                    }
+                }
             }
         }
         let mut kids = self.r9.scope_project_kids();
         if let Some(m) = &self.membership {
-            kids.extend(super::project_scope::project_kids_of(m.membership()));
+            kids.extend(super::project_scope::project_kids_of(
+                m.membership(),
+                host_now().wall_ms,
+            ));
         }
         for sid in self.projects.pass(&kids, Instant::now()) {
             self.host.registry_resend(&sid);
@@ -2051,7 +2063,7 @@ impl HostBridge {
         // Its launch project, as recorded at launch (§R9.6): the worker
         // keeps it in its record (read at the next passes until it is
         // there).
-        self.project_unread.insert(sid.clone());
+        self.project_unread.insert(sid.clone(), Instant::now());
         let session = &cx.sessions[id];
         let (rows, cols) = session.size();
         let spec = SessionSpec {

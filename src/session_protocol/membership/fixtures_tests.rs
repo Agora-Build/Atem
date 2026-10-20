@@ -75,6 +75,7 @@ fn settle_projects(host: &mut HostRt) {
     if let Some(m) = &host.m {
         kids.extend(crate::runtime::project_scope::project_kids_of(
             m.membership(),
+            host.now.wall_ms,
         ));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
