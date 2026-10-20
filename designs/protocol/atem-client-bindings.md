@@ -39,8 +39,12 @@ In the app:
   hands to the app in the clear: the Recovery Kit's `R` (typed or scanned)
   and the account keys `K` (sealed into or opened from K backups).
 - **Transport**: send the frames the binding returns, pass every frame
-  received. Frames are JSON text (`{"ch":"atem-ch1",…}`), identical over
-  the Astation link, the relay and direct :8080.
+  received. Frames are JSON text (`{"ch":"atem-ch1",…}`), the same over
+  the relay and Astation's :8080. Each `ClientConnection` is one virtual
+  channel: the app's transport adapter carries its frames on that channel
+  only, and the router wraps them in the channel envelope on Atem's link
+  (atem-session-v1.md §R9.7a). The binding never sees the envelope or the
+  routing handle.
 - **Clock**: a monotonic time in ms for every channel call; the verifier
   clock (`HostClock{wall_ms, mono_ms, boot_id}`) for the log; wall ms for
   push hints.
@@ -109,8 +113,8 @@ on_frame(frame, now)                    → [ClientEvent]
 
 Effects and timers:
 
-- **Any `Channel` error** (and `Malformed`): close the transport; the
-  object is `Closed`. Make a new connection to retry.
+- **Any `Channel` error** (and `Malformed`): close the transport (that
+  connection's virtual channel only); the object is `Closed`. Make a new connection to retry.
 - **`accept_deadline_ms()`**: give up waiting for `accept` then. The
   `finish` must follow `accept` within 10 s (a deferred signer must answer
   in time).
@@ -403,7 +407,9 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
   signer is refused `Publish{code: outstanding}` while one holds a prepared
   body (the claim ends when the relay answered, at `Done`/`Failed`, or when
   the object is freed). Across restarts, use the saved state.
-- One `ClientConnection` per transport; feed its frames in order.
+- One `ClientConnection` per virtual channel (§R9.7a); feed its frames
+  in order. Several connections may share one network connection to the
+  router; each has its own channel, keys and attachment.
 - WASM is single-threaded; nothing blocks inside the binding.
 
 ## 6. Data conventions
@@ -418,7 +424,10 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
   `null` inside an object and `undefined` as a plain return. JS takes
   records such as the clock as objects (`{wallMs, monoMs, bootId}`) and
   enum values as strings (`"p256"`, `"client"`, `"mobile"`).
-- `ClientConnection.disconnect()` closes the channel (Swift/Kotlin
+- `ClientConnection.disconnect()` closes the channel: its keys are wiped
+  and the app closes that virtual channel only (the router sends Atem the
+  envelope's `close` for its handle); the shared link and other clients'
+  channels stay, and Atem fences only that channel's attachment (Swift/Kotlin
   objects also have the generated `close()`/`destroy()` that free the
   Rust object).
 

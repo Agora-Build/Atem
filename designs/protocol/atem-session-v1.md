@@ -1717,7 +1717,8 @@ how it is authenticated, and how revocation reaches the host.
 **No compatibility.** An r9 host refuses r8 admission: the "paired
 Astation over its authenticated link" principal of §H is removed, and the
 Mac is the genesis member using the same channel as every other client
-(over its link, the relay or direct :8080). Its link stays for pairing,
+(over Atem's link to the relay or to Astation's :8080, inside the
+channel envelope of R9.7a). Its link stays for pairing,
 `cred unlock`, `credentialSync`, key grants and relay messages.
 
 ### R9.1 Encodings and signed objects
@@ -2632,7 +2633,8 @@ observe them; the shared core exposes signing as an effect):
 One suite, no negotiation, no rekeying, no resumption, no 0-RTT. Every
 connection is a full handshake and a new attachment (no lease is
 carried, §3). Transport messages are JSON text frames, identical over
-the Astation link, the relay and direct :8080:
+the relay and Astation's :8080, each carried in the channel envelope of
+R9.7a on Atem's one outbound link:
 
 | # | dir | message |
 |---|---|---|
@@ -2738,6 +2740,98 @@ Vectors: `r9-vectors-channel-handshake` (every intermediate value, the
 first records, and the negative cases: tampered head, tampered finish,
 replayed finish, replayed record, direction confusion, zero shared
 secret).
+
+### R9.7a Channel envelope (routing on Atem's link)
+
+Atem is outbound-only (user decision, 2026-10-20): it opens no listening
+port. Every r9 client (the Mac's own Astation included) reaches it over
+Atem's one existing outbound link: the relay room (`role=atem`) or
+Astation's local :8080. The router (the relay, or Astation on :8080)
+wraps each client's `atem-ch1` frames (R9.7) in an envelope that names a
+routing handle, so several clients share the link. Agreed with Astation
+(#81 6287955132, PR #80 6287954583); fixtures `r9-envelope-*`.
+
+| event | dir | message |
+|---|---|---|
+| `open` | router → Atem | `{"type":"channel","event":"open","channel":"<h>","transport":"relay"\|"direct"}` |
+| `frame` | both | `{"type":"channel","event":"frame","channel":"<h>","frame":{<one atem-ch1 frame, R9.7>}}` |
+| `close` | both | `{"type":"channel","event":"close","channel":"<h>","reason"?:"<code>"}` |
+
+**Fields.** Exactly these fields per event (I-JSON, `parse_strict`, no
+other field: `open` carries no client address, device identity, roles
+or other metadata; routing hints never grant membership, host identity
+or authorization). `channel` (the handle): 1–64 characters of
+`[A-Za-z0-9_-]`, assigned by the router. `transport` is the router's
+label (`relay` for the relay room, `direct` for :8080); Atem logs it and
+never trusts it. `reason`: 1–32 characters of `[a-z_]`. `frame` is the
+`atem-ch1` frame object itself (not a string). Non-compact JSON is
+accepted; every bound below applies to the bytes as received.
+
+**Scope of a handle.** A handle is valid only within one generation of
+Atem's link (one authenticated WebSocket connection): Atem keys channels
+by (link generation, handle). The router never reuses a handle while
+that link lives; a stale handle, or a delayed callback of an earlier
+link, never binds to a channel of a new link. The handle is a routing
+id only, distinct from the cryptographic `channel_id = hex(th4[0..16])`
+(R9.7); neither stands in for the other, and authentication is entirely
+`atem-ch1` (R9.7) and the principal checks (R9.6).
+
+**Lifecycle.**
+
+1. `open` comes before the channel's first `frame`; each direction is
+   delivered in order per channel (a gap or reorder fails the `atem-ch1`
+   counter and closes that channel only).
+2. A duplicate `open` of a live handle is ignored: it never replaces the
+   live handshake, keys or attachment.
+3. A `frame` for a handle Atem doesn't hold (never opened, closed, or of
+   an earlier link) is answered with one `close{reason:"unknown_channel"}`
+   for that handle per link generation (Atem remembers at most 1024 such
+   handles per link and sends at most 16 such closes a second; beyond
+   either it drops the frame and counts it in runtime.log). No reply ever
+   answers a `close`: a `close` from either side ends the channel at once,
+   a repeated or unknown `close` is ignored, so no close loops.
+4. Atem's `close` ends a client's channel (after its last record, e.g. a
+   refusal or a fence); the router's `close` reports that the client
+   went away. Either one fences that channel's attachment (§3: no lease
+   is carried) and releases only that channel: every other channel and
+   attachment on the link stays.
+5. Any failure of one channel (malformed envelope or frame, a failed
+   tag, replay or reorder, an exceeded bound, a handshake timeout)
+   closes that channel only.
+6. **Link loss closes every channel** on it and fences their
+   attachments. A reconnect is a new link generation: clients open new
+   channels, run full handshakes and catch up authoritatively (`sessions`
+   snapshot, history pages, `receipt_query`); no lease is restored and
+   no prompt is replayed.
+7. Dispatch order on Atem: an incoming message whose `type` is
+   `channel` is demultiplexed before any other handling of the link's
+   messages. Once a device list exists (R9.3), r8 admission is refused
+   (`hello` → `unsupported_version`, `revision: 9`): neither the link
+   itself nor routing possession bypasses r9 admission.
+
+**Bounds** (each exceeded bound closes the channel, or refuses a new
+one, with a `close` naming the reason; records are never silently
+dropped and queues never grow without bound):
+
+| bound | value | exceeded |
+|---|---|---|
+| record plaintext (R9.7) | 1 048 576 bytes | the sender refuses it locally; a peer past it fails the channel |
+| inner frame (compact) | the largest legal `rec` or `finish`: 1 398 159 bytes (`ct` of 1 398 123 base64url characters for 1 MiB + 16-byte tag) | `close{reason:"too_large"}` |
+| envelope as received | 2 097 152 bytes (2 MiB); the largest legal record with a 64-character handle is 1 398 279 bytes compact | `close{reason:"too_large"}` when the handle is readable, else dropped and logged |
+| open channels per link | 64 | the new channel: `close{reason:"busy"}` |
+| handshakes in progress per link (opened, not yet welcomed) | 16 | the new channel: `close{reason:"busy"}` |
+| bytes queued from Atem per channel (not yet taken by the link) | 4 MiB | that channel: `close{reason:"busy"}` |
+| `init`s per link (R9.7 "per transport") | 1 a second | clear `busy` error frame, then `close{reason:"busy"}` |
+
+Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
+fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
+`handshake_failed` (a clear handshake error frame was sent first),
+`expired` (the channel's lifetime ended, R9.7 "Limits").
+
+**Clients and bindings.** A client implementation holds one
+`ClientConnection` (the shared core's per-channel state) per virtual
+channel; closing it closes only its channel, never the shared link or
+another client's channel (`atem-client-bindings.md`).
 
 ### R9.8 r9 hello, welcome and new session ops
 
@@ -2976,7 +3070,9 @@ expiry, browser grant, push hints (sign and verify,
 `seen-after-resolution-reopens-nothing`,
 `seen-lost-delivery-is-retried-until-acked`), and the multi-device set
 (Mac and phone online, Mac off, takeover, approval while another holds
-the lease).
+the lease), and the channel envelope (R9.7a): `r9-envelope-vectors`,
+`r9-envelope-several-channels`, `r9-envelope-unknown-and-duplicate`,
+`r9-envelope-link-loss`, `r9-envelope-bounds`.
 
 ### R9.13 Open questions for Astation
 

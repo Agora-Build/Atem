@@ -220,6 +220,7 @@ and `negative`/`invalid` cases must be refused for the stated reason.
 | `r9-vectors-recovery` | `R` → signing seed, recovery key (= E1's) and its X25519 form; the `R7` entry; `atem-k-backup-v2` envelopes sealed to kit 1 (`k_backup`, version 3; `k_backup_rotated`, version 4) with `info`, `ikmE`, `backup_hash`; `kit_2` (the replacement kit) and the envelope re-sealed to it; each kit's genesis binding (`kit`, `kit_2.kit`: `account_id`, `genesis_hash`, `kit_tag`); `substitute_chain` (its envelope sealed to kit 1, opening with kit 1, refused `genesis_mismatch`) |
 | `r9-vectors-channel-handshake` | a full `atem-ch1` handshake (every input, `th2`, `sig_h`, `ss`, `hs`, `k_finish`, `th3`, `sig_c`, the `finish` ciphertext, `th4`, `channel_id`, both record keys, three records) and the negative cases |
 | `r9-vectors-browser-grant` | a signed QR grant, its hash, the browser's `th3`/`sig_c`, and two invalid grants |
+| `r9-envelope-vectors` | the channel envelope (R9.7a): the three event shapes, valid and invalid handles and reasons, envelopes Atem refuses, and every bound (the largest legal record and its exact serialized sizes) |
 | `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints |
 
 `kind: "scenario"` — `{name, requires, kind, side, log, note, setup,
@@ -283,6 +284,28 @@ stand for the client's current read / lease binding. New:
 | `{"relay_lost": true}`, `{"relay_ack": {op, acks}}` | host side: the last relay message Atem sent was lost; the relay acknowledges |
 | `{"restore": {kit, relay_log, relay_blob, host_heads}, "tamper"?: {…}, "result": "restored"\|"refused", "detail"?, "freshness"?, "kids"?, "published": false\|{…}}` | client side: a Recovery Kit restore against that relay log and envelope with those host-signed heads; `published` is the `recovery_add` it then signs (none when refused) |
 | `{"client_data": {"kid": k}, "result": r}` | client side: the restored device meets data sealed under `kid` |
+
+Channel envelope steps (R9.7a; `r9-envelope-*`, host side). Every
+`connect` that names a `channel` runs inside the envelope on Atem's
+link: the router's `open` with that handle and `transport`, then each
+`atem-ch1` frame wrapped in a `frame` event; every expectation on a
+client's records unwraps them. Without `link_up` no link exists.
+
+| step | meaning |
+|---|---|
+| `{"link_up": true}` / `{"link_down": true}` | Atem's link authenticates (a new link generation) / drops (every channel on it closes) |
+| `{"connect": c, "channel": h, "transport": "relay"\|"direct", …, "expect_init_refused"?: code}` | the router opens `h` for client c, then a full handshake inside it; `expect_init_refused`: Atem answers the `init` with that clear error frame |
+| `{"envelope_in": {…}}` / `{"envelope_in_bytes": {"channel": h, "bytes": n}}` | the router sends this envelope as is / a `frame` envelope for `h` whose serialized size is exactly `n` bytes (the harness pads the frame's `ct`) |
+| `{"close_channel": h, "reason"?: r}` | the router closes `h` (the client went away) |
+| `{"expect_envelope": {"match": {…}}}` / `{"expect_no_envelope": {"channel"?: h, "for_ms": n}}` | the next envelope Atem sends outside any client's records (a `close`) / none (for that handle) |
+| `{"expect_channel_open": c}` | c's channel is still open and its attachment live |
+| `{"send_record": c, "tamper": "tag"}` | c sends its next record with one bit of the tag flipped |
+| `{"send_frame": c, "frame_of_plaintext_bytes": n, "expect_envelope_bytes"?: m, "unchecked"?: true}` | c sends a record of `n` plaintext bytes (any valid session message padded to size); `expect_envelope_bytes`: its compact envelope is exactly `m` bytes; `unchecked`: sent past the sender's own bound |
+| `{"stall_link": true}` / `{"unstall_link": true}` | Atem's link stops taking messages / takes them again (queued output builds up) |
+| `{"fill_queue": c, "bytes": n}` | c's requests make Atem queue at least `n` bytes for c's channel while the link is stalled |
+
+New `assert` keys: `channels` (channels open on the link),
+`attachments` (as r8).
 
 In r9 scenarios `advance_ms` moves the host's (or relay's) monotonic
 and wall clocks together, and `set_wall_clock` the wall clock only.
