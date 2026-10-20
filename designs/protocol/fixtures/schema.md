@@ -193,15 +193,17 @@ Astation's API-level merge fixture (a delayed HTTP page against newer SSE
 versions) is Astation's; the host side of it is
 `r8-history-page-and-live-events-share-one-ordered-stream`.
 
-## r9 fixtures (draft; not run)
+## r9 fixtures
 
-`r9-*.json` files carry `"requires": "r9"` and exercise the drafted
-appendix "r9" of `../atem-session-v1.md`. r9 isn't implemented: both
+`r9-*.json` files carry `"requires": "r9"` and exercise appendix "r9" of
+`../atem-session-v1.md`, implemented by Atem. They run in
+`crates/atem-client`'s tests (vectors, client and relay sides) and in
+Atem's `tests/r9_runner` (host side, against the real runtime; results and
+the items no channel can express in `../atem-host-handoff.md`). The r8
 runners report every one as NOT RUN ("requires r9 …",
 `revision::R9_NOT_RUN`) and only check that it parses, is named after its
-file and has a known `kind`. They become runnable in `crates/atem-client`
-(vectors, client and relay sides) and the Atem host harness (host side)
-when r9 is built; the steps below are the contract for those harnesses.
+file and has a known `kind`. The steps below are the contract for the r9
+harnesses.
 
 `kind: "vectors"` — known-answer values computed with this crate's own
 dependencies (`p256`, `ed25519-dalek`, `x25519-dalek`, `hkdf`,

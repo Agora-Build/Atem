@@ -200,13 +200,16 @@ pub const R8_FIXTURE_NEEDS: &[(&str, &[&str])] = &[
 ];
 
 /// r9 (remote clients: the membership log, channel `atem-ch1`, member,
-/// service and browser principals) is drafted in the contract's appendix
-/// "r9" and not implemented: both runners report every `r9-*` fixture
-/// (`"requires": "r9"`) as not run with this reason.
+/// service and browser principals; the contract's appendix "r9") is
+/// implemented, but its fixtures have their own runners: atem-client's
+/// tests (vectors, client and relay sides) and atem's `tests/r9_runner`
+/// (host side, against the real runtime). The r8 runners (the core runner
+/// and its fake runtime) report every `r9-*` fixture (`"requires": "r9"`)
+/// as not run with this reason.
 pub const R9_NOT_RUN: &str =
-    "requires r9 (atem-session-v1.md appendix r9: drafted, not implemented)";
+    "requires r9: run by atem-client's r9 tests and atem's tests/r9_runner, not the r8 runner";
 
-/// Whether a fixture belongs to the r9 draft (its name starts with `r9-`).
+/// Whether a fixture belongs to r9 (its name starts with `r9-`).
 pub fn is_r9_fixture(name: &str) -> bool {
     name.starts_with("r9-")
 }
