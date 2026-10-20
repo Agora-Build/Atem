@@ -775,3 +775,37 @@ fn a_device_removed_mid_approval_gets_no_more_hints() {
         HintState::Resolved { .. }
     ));
 }
+
+/// A suspend: the host's wall clock moves 700 s while its monotonic clock
+/// doesn't (`ATEM_TEST_HOST_CLOCK`), as after a laptop's lid was closed.
+/// An approval opened then still gets its sealed hints, stamped with the
+/// wall clock: `created_at` is the card's and now (never the session
+/// host's own suspend-blind wall), `expires_at` 600 s later.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn after_a_suspend_an_approval_still_gets_its_hints() {
+    let rig = Rig::new(false, true);
+    let (sid, fake) = rig.agent();
+    let mut router = Router::new(&rig.astation);
+    let clock = rig.clock.as_ref().unwrap();
+    clock.jump(700_000);
+    let before = clock.wall();
+    let (_m, _p, _ap, first, request) = approval(&rig, &mut router, &sid, &fake);
+    let after = clock.wall();
+    let hs = rig.hints(&first);
+    assert_eq!(hs.len(), 2);
+    for h in &hs {
+        assert_eq!(json!(h.created_at()), request["created_at"]);
+        assert!(
+            before <= h.created_at() && h.created_at() <= after,
+            "{before} <= {} <= {after}",
+            h.created_at()
+        );
+        assert_eq!(h.expires_at() - h.created_at(), 600_000);
+    }
+    assert!(
+        !rig.runtime_log().contains("no hint"),
+        "{}",
+        rig.runtime_log()
+    );
+}
