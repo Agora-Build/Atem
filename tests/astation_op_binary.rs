@@ -73,7 +73,8 @@ fn fake_astation() -> (String, mpsc::Receiver<(String, Value)>) {
                         }
                         "verifyCommit" => Some(json!({"type": "verifyKeys", "data": {
                             "sign_pub": b64(&hex(SIGN_PUB)), "enc_pub": b64(&[5; 32]),
-                            "recovery_sign_pub": b64(&[6; 32]), "nonce": b64(&[7; 32])}})),
+                            "recovery_sign_pub": b64(&[6; 32]), "nonce": b64(&[7; 32]),
+                            "genesis_hash": "ab".repeat(32)}})),
                         _ => None,
                     };
                     let _ = seen_tx.send((kind, value["data"].clone()));
@@ -112,7 +113,9 @@ fn pair_verify_runs_through_the_auto_started_runtime() {
     let mut cli = sandbox.spawn(&["pair", "verify"], &sandbox.home, &[("ASTATION_WS", &url)]);
     // The runtime (started by the CLI) authenticates its link and verifies on it.
     saw(&seen, "verifyCommit");
-    saw(&seen, "verifyReveal");
+    // r9: the reveal carries this pairing's host channel key.
+    let reveal = saw(&seen, "verifyReveal");
+    assert_eq!(reveal["host_channel_pub"].as_str().map(str::len), Some(43));
     cli.shows("Safety code:");
     cli.shows("Does the code on your Mac match? Type y or n:");
     // The CLI answers from its terminal; a refusal reaches Astation.
