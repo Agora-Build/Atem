@@ -2988,6 +2988,18 @@ messages (about 340 bytes an identity). Atem drops a larger relay
 message unread (counted in its log); what it would have acknowledged is
 resent and acknowledged again.
 
+What Atem keeps for delivery is bounded, and a bound never cuts a
+lifecycle the relay may already hold: once an approval's open hints were
+handed to the link, Atem keeps them while the approval is pending, and
+its resolved hint until the relay acknowledges it (or `expires_at +
+300 000` passes), so every published approval gets its cancellation. To
+make room Atem only forgets an approval with nothing left to send, then
+one whose opens were never published. When every tracked approval holds
+a published lifecycle, a **new** approval gets no push hint at all (Atem
+logs it, without content); it is still an approval like any other:
+`approval_request` to attached clients with `control`, answerable over
+the channel. Atem's bound is at least 64 approvals.
+
 **Clients:** a notification extension that can't use the device's
 `enc_key` while the screen is locked shows a generic "Atem on <host>
 needs approval" and the app reconnects; there is no separate push key
