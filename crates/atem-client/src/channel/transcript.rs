@@ -22,7 +22,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::Principal;
 use super::wire::{Accept, Frame, Init, frame_of_value};
@@ -230,9 +230,10 @@ pub struct Schedule {
 impl Schedule {
     /// `hs = HKDF-Extract(salt = th2, ikm = ss)`.
     pub fn new(th2: Hash32, ss: &[u8; 32]) -> Self {
-        let (prk, _) = Hkdf::<Sha256>::extract(Some(th2.as_bytes()), ss);
+        let (mut prk, _) = Hkdf::<Sha256>::extract(Some(th2.as_bytes()), ss);
         let mut hs = Zeroizing::new([0u8; 32]);
         hs.copy_from_slice(&prk);
+        prk.as_mut_slice().zeroize();
         Schedule { hs, th2 }
     }
 

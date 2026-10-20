@@ -13,12 +13,17 @@ mod support;
 
 use std::collections::BTreeMap;
 
+use atem_client::KeyId;
 use atem_client::SignedObject;
 use atem_client::backup::{BackupKey, KBackupEnvelope};
 use atem_client::backup_writer::{BackupError, BackupJob, BackupWriter, Discarded, PutReply, Step};
 use atem_client::canonical::StrictValue;
 use atem_client::channel::HostAccept;
-use atem_client::encoding::{Hash32, b64u_decode};
+use atem_client::channel::responder::HostContext;
+use atem_client::channel::{
+    Channel, ChannelError, ClientProof, Initiator, Keyed, Principal, Responder,
+};
+use atem_client::encoding::{Hash32, b64u, b64u_decode};
 use atem_client::kit::RecoveryKit;
 use atem_client::membership::publish::{AppendReply, Published, Publisher};
 use atem_client::membership::{Admission, Conflict, Member, MemberKind, Membership, Role, Stop};
@@ -27,7 +32,6 @@ use serde_json::{Map, Value, json};
 use support::*;
 use zeroize::Zeroizing;
 
-const T3: &str = "Task 3 (atem-ch1 handshake and host-signed heads)";
 const T6: &str = "Task 6 (host durable membership state: carriage record, intent, fault record, held, restart replay)";
 const T7: &str = "Task 7 (host admission and effects: welcome fields, fences, attachments, leases, receipts, events)";
 
@@ -160,6 +164,8 @@ struct HostSide<'a> {
     hosts: BTreeMap<String, Host>,
     current: String,
     clients: BTreeMap<String, String>,
+    /// Each client's key (a `r9-vectors-keys` name).
+    client_keys: BTreeMap<String, String>,
     replies: BTreeMap<String, Reply>,
     carried: Vec<Hash32>,
     faulted: bool,
@@ -168,6 +174,100 @@ struct HostSide<'a> {
     // Relay-side state.
     relay: Option<FakeRelay>,
     devices: BTreeMap<String, (Membership, Publisher, Vec<Hash32>)>,
+}
+
+fn principal_of(principal: &str) -> Principal {
+    let (kind, id) = principal.split_once(':').unwrap();
+    match kind {
+        "member" => Principal::Native {
+            device_id: id.into(),
+        },
+        "service" => Principal::Service {
+            device_id: id.into(),
+        },
+        other => panic!("principal kind {other}"),
+    }
+}
+
+/// A full `atem-ch1` handshake of a client (its key from the book) with a
+/// host whose committed log is `host`, the client's `hello` carrying
+/// `carry`. The client's verified log is the host's (the fixtures carry
+/// the entries explicitly). Returns what the host decrypted, or its clear
+/// refusal.
+struct Shake {
+    keyed: Keyed,
+    client: Channel,
+    entries: Vec<StrictValue>,
+    bytes: usize,
+}
+
+fn channel_handshake(
+    book: &Book,
+    host: &Membership,
+    principal: &Principal,
+    key: &str,
+    carry: &[StrictValue],
+) -> Result<Shake, ChannelError> {
+    let host_key = KeyId::new("host-a/host_key");
+    let ctx = HostContext {
+        log: host,
+        host_id: "host-a",
+        host_trust_gen: 1,
+        provider: &book.provider,
+        key: &host_key,
+    };
+    let (initiator, init) = Initiator::start(host, "host-a", 0).unwrap();
+    let (await_finish, accept) = Responder::on_init(&ctx, &init, 0).map_err(|r| r.error)?;
+    let signed = initiator
+        .on_frame(&accept, host, 0)
+        .unwrap()
+        .sign(principal.clone(), &book.provider, &book.auth(key))
+        .unwrap();
+    let head = host.head();
+    let hello = json!({"type": "session", "data": {"v": 1, "op": "hello", "revision": 9,
+        "id": "aaaaaaaa-0000-4000-8000-0000000000aa",
+        "proof": {"principal": principal.to_json(), "sig": b64u(signed.sig_c())},
+        "membership": {"head": {"seq": head.seq, "hash": head.hash.to_hex()},
+                       "entries": carry.iter().map(|e| e.value().clone()).collect::<Vec<_>>()}}});
+    let (client, finish) = signed.finish(hello.to_string().as_bytes(), 0).unwrap();
+    let opened = await_finish.on_finish(&finish, 0).unwrap();
+    let received = StrictValue::parse(opened.hello(), usize::MAX).unwrap();
+    let data = received.get("data").unwrap();
+    let proof = data.get("proof").unwrap();
+    let entries = data.get("membership").unwrap().get("entries").unwrap();
+    let proof = ClientProof {
+        principal: Principal::from_json(proof.get("principal").unwrap().value(), None).unwrap(),
+        sig_c: b64u_decode(proof.get("sig").unwrap().value().as_str().unwrap()).unwrap(),
+    };
+    Ok(Shake {
+        keyed: opened.key(&proof),
+        client,
+        bytes: entries.value().to_string().len(),
+        entries: entries.items().unwrap(),
+    })
+}
+
+impl Shake {
+    /// After the carriage: a member is admitted with its `auth_key` (sig_c
+    /// must verify); anyone else gets the encrypted first-record refusal.
+    /// Either way the client opens the host's first record.
+    fn complete(self, admission: &Admission) {
+        let Shake {
+            keyed, mut client, ..
+        } = self;
+        let first = match admission {
+            Admission::Member { state, .. } => {
+                let mut host = keyed.admit(&state.member.auth_key).expect("sig_c verifies");
+                assert_eq!(host.channel_id(), client.channel_id());
+                host.seal(br#"{"type":"session","data":{"v":1,"op":"welcome"}}"#, 0)
+                    .unwrap()
+            }
+            _ => keyed
+                .refuse(br#"{"type":"session","data":{"v":1,"op":"error"}}"#, 0)
+                .unwrap(),
+        };
+        client.open(&first, 0).unwrap();
+    }
 }
 
 fn admission_fields(adm: &Admission, m: &Membership, clock: &Clock) -> Value {
@@ -222,6 +322,7 @@ impl<'a> HostSide<'a> {
             hosts: BTreeMap::new(),
             current: String::new(),
             clients: BTreeMap::new(),
+            client_keys: BTreeMap::new(),
             replies: BTreeMap::new(),
             carried: Vec::new(),
             faulted: false,
@@ -268,6 +369,10 @@ impl<'a> HostSide<'a> {
             self.clients.insert(
                 client["name"].as_str().unwrap().to_owned(),
                 client["principal"].as_str().unwrap().to_owned(),
+            );
+            self.client_keys.insert(
+                client["name"].as_str().unwrap().to_owned(),
+                client["key"].as_str().unwrap().to_owned(),
             );
         }
         for key in ["connected", "holds_lease"] {
@@ -438,13 +543,20 @@ impl<'a> HostSide<'a> {
                 let spec = &step["host_connect"];
                 let clock = self.hosts[""].clock.clone();
                 let mut m = self.pinned(&labels(&spec["host_pinned"]), &clock);
-                let (carry, bytes) = self.carry(&labels(&spec["carry"]));
-                let eval = m.evaluate(&carry, bytes, &clock.now);
+                let (carry, _) = self.carry(&labels(&spec["carry"]));
+                let client = spec["client"].as_str().unwrap();
+                let principal = principal_of(&self.clients[client]);
+                let shake =
+                    channel_handshake(self.book, &m, &principal, &self.client_keys[client], &carry)
+                        .unwrap();
+                let eval = m.evaluate(&shake.entries, shake.bytes, &clock.now);
+                let admission =
+                    eval.admission(&device_of(&self.clients[client]), false, &clock.now);
                 m = eval.next;
+                shake.complete(&admission);
                 self.hosts.insert("relay-host".into(), Host { m, clock });
                 self.current = "relay-host".into();
                 self.report.pass();
-                self.report.pending("host_connect: the handshake", T3);
             }
             other => self.report.pending(other.to_owned(), T7),
         }
@@ -464,16 +576,37 @@ impl<'a> HostSide<'a> {
                 self.report.pending(format!("connect {key}"), T7);
             }
         }
-        self.report.pending("connect: the atem-ch1 handshake", T3);
+        let key = self.client_keys[&client].clone();
+        let book = self.book;
         let host = self.host();
-        if host.m.frozen().is_some() {
-            self.replies.insert(client, Reply::ChannelFrozen);
-            return;
-        }
+        // The atem-ch1 handshake (host B of a two-host fixture answers with
+        // host-a's test key: "handshake keys come from the harness"); the
+        // host evaluates the entries that came out of the decrypted hello.
+        let shake = match channel_handshake(book, &host.m, &principal_of(&principal), &key, &carry)
+        {
+            Ok(shake) => shake,
+            Err(error) => {
+                assert_eq!(error, ChannelError::AccountFrozen);
+                assert!(host.m.frozen().is_some());
+                self.replies.insert(client, Reply::ChannelFrozen);
+                self.report.pass();
+                return;
+            }
+        };
+        assert_eq!(
+            shake.entries, carry,
+            "carried through the channel unchanged"
+        );
+        // What arrived: the entries array as received (its items plus the
+        // brackets and commas).
+        assert!(shake.bytes >= bytes);
         let now = host.clock.now.clone();
-        let eval = host.m.evaluate(&carry, bytes, &now);
+        let eval = host.m.evaluate(&shake.entries, shake.bytes, &now);
         let admission = eval.admission(&device, more, &now);
         host.m = eval.next;
+        shake.complete(&admission);
+        self.report.pass();
+        let host = self.host();
         let fields = admission_fields(&admission, &host.m, &host.clock);
         self.replies.insert(client, Reply::Hello(fields));
     }
