@@ -139,7 +139,10 @@ Effects and timers:
   `receipts` (a query's answer), `sessions`/`session_changed` (the registry,
   also through `sessions()`), approvals, `lease_changed`, errors with `re`.
 - **`ClientEvent::Error{code, re}`**: a refused request (`forbidden`,
-  `unknown_session`, `lease_held`, `stale_lease`, …).
+  `unknown_session`, `lease_held`, `stale_lease`, …). Its `json` is the
+  whole error: a `lease_held` names the holder in `controller`
+  (`{controller_session, lease_epoch}`), which a confirmed takeover sends
+  back as `expected_controller` (r8 §F).
 - **`approval_seen`**: only when the card was rendered in a focused
   foreground window and the user was active in the last 60 s; never from a
   background delivery or a notification.

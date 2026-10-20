@@ -240,6 +240,9 @@ pub struct SessionError {
     pub need_before: Option<u64>,
     pub entry_hash: Option<crate::Hash32>,
     pub effective_at: Option<u64>,
+    /// r8 §F: the lease holder a `lease_held` names (a confirmed takeover
+    /// sends it back as `expected_controller`).
+    pub controller: Option<crate::session::wire::Controller>,
 }
 
 impl SessionError {
@@ -286,6 +289,12 @@ impl SessionError {
         if let Some(at) = self.effective_at {
             data.insert("effective_at".into(), json!(at));
         }
+        if let Some(c) = &self.controller {
+            data.insert(
+                "controller".into(),
+                json!({"controller_session": c.controller_session, "lease_epoch": c.lease_epoch}),
+            );
+        }
         json!({"type": "session", "data": Value::Object(data)})
     }
 
@@ -329,6 +338,13 @@ impl SessionError {
                 Some(h) => Some(crate::Hash32::from_hex(h.as_str()?).ok()?),
             },
             effective_at: opt_u64("effective_at")?,
+            controller: match object.get("controller") {
+                None | Some(Value::Null) => None,
+                Some(c) => Some(crate::session::wire::Controller {
+                    controller_session: c.get("controller_session")?.as_str()?.to_owned(),
+                    lease_epoch: c.get("lease_epoch")?.as_u64()?,
+                }),
+            },
         })
     }
 }
@@ -615,5 +631,35 @@ impl Incoming {
             },
             _ => Incoming::Other,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r8 §F: a `lease_held` names the holder; the client keeps it (a
+    /// confirmed takeover sends it back as `expected_controller`), and the
+    /// wire form the bindings hand to apps carries it.
+    #[test]
+    fn a_lease_held_error_keeps_its_controller() {
+        let data = json!({"v": 1, "op": "error", "id": "aaaaaaaa-0000-4000-8000-000000000001",
+            "re": "aaaaaaaa-0000-4000-8000-000000000002", "code": "lease_held",
+            "controller": {"controller_session": "cccccccc-0000-4000-8000-000000000003",
+                           "lease_epoch": 4}});
+        let e = SessionError::from_data(&data).unwrap();
+        let c = e.controller.clone().unwrap();
+        assert_eq!(c.controller_session, "cccccccc-0000-4000-8000-000000000003");
+        assert_eq!(c.lease_epoch, 4);
+        assert_eq!(e.to_json()["data"]["controller"], data["controller"]);
+        // Absent or null: none; mistyped: not an error message we read.
+        let mut none = data.clone();
+        none["controller"] = Value::Null;
+        assert!(SessionError::from_data(&none).unwrap().controller.is_none());
+        none.as_object_mut().unwrap().remove("controller");
+        assert!(SessionError::from_data(&none).unwrap().controller.is_none());
+        let mut bad = data.clone();
+        bad["controller"]["lease_epoch"] = json!("4");
+        assert!(SessionError::from_data(&bad).is_none());
     }
 }
