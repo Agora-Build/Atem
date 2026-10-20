@@ -342,6 +342,12 @@ impl R9Host {
         }
     }
 
+    /// The r9 attachments (debug builds: the fixture state dump).
+    #[cfg(any(test, debug_assertions))]
+    pub fn attachment_ids(&self) -> Vec<String> {
+        self.by_attachment.keys().cloned().collect()
+    }
+
     /// Whether `att` is an r9 attachment (its messages go back here).
     pub fn owns(&self, att: &str) -> bool {
         self.by_attachment.contains_key(att)
@@ -567,8 +573,9 @@ impl R9Host {
 
     /// Tests: the fixture runners connect clients back to back; the
     /// per-link `init` rate is checked by the engine tests and the envelope
-    /// fixtures.
-    #[cfg(test)]
+    /// fixtures. Debug builds: the real runtime's fixture hook
+    /// (`ATEM_TEST_NO_INIT_LIMIT`).
+    #[cfg(any(test, debug_assertions))]
     pub fn reset_init_limiter(&mut self) {
         self.limiter = InitLimiter::new();
     }

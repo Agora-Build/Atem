@@ -38,6 +38,27 @@
 //! - `ATEM_TEST_BUILD=<id>`: this process reports `<id>` as its build
 //!   (`cred_agent::build_id`), so a binary test can run a runtime that looks
 //!   like another atem build.
+//!
+//! For the r9 fixtures against the real runtime (`tests/r9_runner/`):
+//! - `ATEM_TEST_PTY_FAULTS=<dir>`, read by the broker too: while
+//!   `<dir>/hold_dispatch` exists, accepted work stays queued (the
+//!   fixtures' `hold_dispatch`).
+//! - `ATEM_TEST_NO_INIT_LIMIT=1`: `init`s aren't limited to one a second
+//!   per link (the fixtures connect clients back to back on a host clock
+//!   that only they move; the envelope fixtures, which check the limit,
+//!   leave it on).
+//! - `ATEM_TEST_PROJECT_HASHES=<file>` (`{"<project key>": {"<kid>":
+//!   "h1.<kid>.<hash>"}}`): the service `projects` scopes' keyed hashes
+//!   come from this table instead of the cred agent (the fixtures name
+//!   project hashes, never a `K`); everything else of the scope check is
+//!   the runtime's own.
+//! - `ATEM_TEST_SESSION_ID=<ses-…>` in a `launch` request's environment:
+//!   the session gets that id (the fixtures' signed browser grants name
+//!   their session).
+//! - `ATEM_TEST_STATE_DUMP=<file>`: after each pass the broker writes the
+//!   state the fixtures assert (device list, leases, receipts, control
+//!   generations, channels) to `<file>` (JSON, replaced atomically, only
+//!   when it changed).
 
 #[cfg(debug_assertions)]
 mod imp {
@@ -128,6 +149,25 @@ mod imp {
         let mono = parts.next()?.parse().ok()?;
         let boot = parts.next()?.to_string();
         Some((wall, mono, boot))
+    }
+
+    pub fn hold_dispatch() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_dispatch").exists())
+    }
+
+    pub fn no_init_limit() -> bool {
+        static CELL: OnceLock<bool> = OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os("ATEM_TEST_NO_INIT_LIMIT").is_some())
+    }
+
+    pub fn project_hashes() -> Option<&'static PathBuf> {
+        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+        env_path("ATEM_TEST_PROJECT_HASHES", &CELL)
+    }
+
+    pub fn state_dump() -> Option<&'static PathBuf> {
+        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+        env_path("ATEM_TEST_STATE_DUMP", &CELL)
     }
 
     pub fn take_fault(name: &str) -> bool {
@@ -232,4 +272,42 @@ pub fn membership_hooks() -> bool {
     return std::env::var_os("ATEM_TEST_MEMBERSHIP_FAULTS").is_some();
     #[cfg(not(debug_assertions))]
     false
+}
+
+/// Accepted work stays queued (`<pty faults>/hold_dispatch`).
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub fn hold_dispatch() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::hold_dispatch();
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// `init`s aren't rate-limited per link (`ATEM_TEST_NO_INIT_LIMIT`).
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub fn no_init_limit() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::no_init_limit();
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// The project-hash table replacing the cred agent's keyed hashes
+/// (`ATEM_TEST_PROJECT_HASHES`).
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub fn project_hashes() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    return imp::project_hashes().cloned();
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+/// Where the broker writes the state the fixtures assert
+/// (`ATEM_TEST_STATE_DUMP`).
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub fn state_dump() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    return imp::state_dump().cloned();
+    #[cfg(not(debug_assertions))]
+    None
 }

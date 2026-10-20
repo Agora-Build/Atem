@@ -857,8 +857,26 @@ impl Server {
                         "launch",
                     );
                 }
+                // Debug builds: the r9 fixtures' sessions keep the ids their
+                // signed grants name (`ATEM_TEST_SESSION_ID` in the launch
+                // environment; refused when taken).
+                #[cfg(debug_assertions)]
+                let session_id = match env
+                    .0
+                    .iter()
+                    .find(|(k, _)| k == "ATEM_TEST_SESSION_ID")
+                    .and_then(|(_, v)| SessionId::parse(v))
+                {
+                    Some(sid) if self.sessions.contains_key(&sid) => {
+                        return self.error(id, "That session id is taken", "launch");
+                    }
+                    Some(sid) => sid,
+                    None => SessionId::new(),
+                };
+                #[cfg(not(debug_assertions))]
+                let session_id = SessionId::new();
                 let request = SpawnRequest {
-                    session_id: SessionId::new(),
+                    session_id,
                     process_gen: uuid::Uuid::new_v4().to_string(),
                     provider,
                     args,

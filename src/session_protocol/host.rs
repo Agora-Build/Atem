@@ -600,8 +600,9 @@ pub struct SessionHost<J: Journal> {
     /// `hello` is refused (`unsupported_version`, `revision: 9`) and no
     /// attachment is welcomed outside the channel.
     refuse_r8: bool,
-    /// Fixtures (`hold_dispatch`): accepted work stays queued.
-    #[cfg(test)]
+    /// Fixtures (`hold_dispatch`; debug builds only, the real runtime's
+    /// fixture hook): accepted work stays queued.
+    #[cfg(any(test, debug_assertions))]
     dispatch_held: bool,
 }
 
@@ -662,7 +663,7 @@ impl<J: Journal> SessionHost<J> {
             refused: Refused::default(),
             out: Vec::new(),
             refuse_r8: false,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             dispatch_held: false,
         };
         host.reload()?;
@@ -2077,6 +2078,18 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| self.render(&e.stored))
     }
 
+    /// Every receipt's request id, every registered session's id and
+    /// every principal with a control state (debug builds: the real
+    /// runtime's fixture state dump).
+    #[cfg(any(test, debug_assertions))]
+    pub fn debug_ids(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            self.receipts.keys().cloned().collect(),
+            self.sessions.keys().cloned().collect(),
+            self.principals.keys().cloned().collect(),
+        )
+    }
+
     /// Receipts `attachment` could read with `receipt_query` (view
     /// permission, current trust generation, a visible session).
     pub fn receipts_visible(&self, attachment: &str) -> usize {
@@ -3121,18 +3134,20 @@ impl<J: Journal> SessionHost<J> {
         })
     }
 
-    /// Fixtures (`hold_dispatch`): accepted work stays queued, not executing.
-    #[cfg(test)]
+    /// Fixtures (`hold_dispatch`): accepted work stays queued, not
+    /// executing. Debug builds only (also the real runtime's fixture hook,
+    /// `runtime::test_hooks::hold_dispatch`).
+    #[cfg(any(test, debug_assertions))]
     pub fn hold_dispatch(&mut self, hold: bool) {
         self.dispatch_held = hold;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn dispatch_held(&self) -> bool {
         self.dispatch_held
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, debug_assertions)))]
     fn dispatch_held(&self) -> bool {
         false
     }

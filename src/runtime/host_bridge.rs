@@ -585,6 +585,12 @@ impl HostBridge {
             .map(membership::list_stamp)
             .unwrap_or_default();
         let hasher: Arc<dyn ProjectHasher> = match profile {
+            #[cfg(debug_assertions)]
+            Some(_) if super::test_hooks::project_hashes().is_some() => {
+                Arc::new(super::project_scope::TableHasher {
+                    file: super::test_hooks::project_hashes().unwrap(),
+                })
+            }
             Some(src) => Arc::new(AgentHasher { src: src.clone() }),
             None => Arc::new(NoHasher),
         };
@@ -739,18 +745,12 @@ impl HostBridge {
         Some(result)
     }
 
-    /// The device list's 100 ms pass: recovery waits on the host clock, the
-    /// time waited persisted; and, in debug builds, a test carriage
+    /// Every pass, in debug builds: a test carriage
     /// (`ATEM_TEST_MEMBERSHIP_FAULTS/carry.json`, as the host's own relay
-    /// fetch).
-    fn membership_pass(&mut self, cx: &mut Cx) {
-        self.reopen_list_if_changed(cx);
+    /// fetch), whatever the clocks do (release builds: never one).
+    fn test_carriage(&mut self, cx: &mut Cx) {
         if self.membership.is_none() {
             return;
-        }
-        let pending = std::mem::take(&mut self.membership_effects);
-        if !pending.is_empty() {
-            self.exec(pending, cx);
         }
         if let Some(text) = super::test_hooks::membership_carry() {
             let entries = StrictValue::parse(text.as_bytes(), usize::MAX)
@@ -779,6 +779,19 @@ impl HostBridge {
                 None => "unreadable carry.json".into(),
             };
             super::test_hooks::membership_carried(&line);
+        }
+    }
+
+    /// The device list's 100 ms pass: recovery waits on the host clock, the
+    /// time waited persisted.
+    fn membership_pass(&mut self, cx: &mut Cx) {
+        self.reopen_list_if_changed(cx);
+        if self.membership.is_none() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.membership_effects);
+        if !pending.is_empty() {
+            self.exec(pending, cx);
         }
         if self
             .membership
@@ -1242,6 +1255,8 @@ impl HostBridge {
         // follow the host clock, which moves while the machine sleeps.
         self.host
             .set_wall_offset(host_now().wall_ms.saturating_sub(self.clock.now()));
+        #[cfg(debug_assertions)]
+        self.host.hold_dispatch(super::test_hooks::hold_dispatch());
         // Only a welcomed attachment's authorization ends the link: on an
         // r9 host (r8 refused) the link's attachment is never welcomed, and
         // dropping the link would close every r9 channel on it daily.
@@ -1300,6 +1315,10 @@ impl HostBridge {
             hosted.channel_bytes = 0;
             let overflow = std::mem::take(&mut hosted.channel_overflow);
             for (link_gen, text) in channels {
+                #[cfg(debug_assertions)]
+                if super::test_hooks::no_init_limit() {
+                    self.r9.reset_init_limiter();
+                }
                 if Some(link_gen) == self.r9_link {
                     let effects = self.r9_call(|r9, parts| r9.on_envelope(&text, parts));
                     self.r9_exec(effects, &mut cx);
@@ -1339,6 +1358,7 @@ impl HostBridge {
             let effects = self.r9_call(|r9, parts| r9.tick(parts));
             self.r9_exec(effects, &mut cx);
         }
+        self.test_carriage(&mut cx);
         self.project_pass(&mut cx);
         self.sync_all(&mut cx);
         self.drain_remote(&mut cx);
@@ -1372,6 +1392,96 @@ impl HostBridge {
         }
         if let Some(reason) = self.take_close() {
             app.drop_astation_link(reason.into());
+        }
+        #[cfg(debug_assertions)]
+        self.dump_state();
+    }
+
+    /// Debug builds (`ATEM_TEST_STATE_DUMP`): the state the r9 fixtures
+    /// assert, written after each pass when it changed (`tests/r9_runner`).
+    #[cfg(debug_assertions)]
+    fn dump_state(&mut self) {
+        use serde_json::json;
+        let Some(file) = super::test_hooks::state_dump() else {
+            return;
+        };
+        let head =
+            |h: atem_client::membership::Head| json!({"seq": h.seq, "hash": h.hash.to_hex()});
+        let (receipt_ids, session_ids, principals) = self.host.debug_ids();
+        let receipts: serde_json::Map<String, serde_json::Value> = receipt_ids
+            .iter()
+            .filter_map(|rid| {
+                let r = serde_json::to_value(self.host.receipt(rid)?).ok()?;
+                Some((
+                    rid.clone(),
+                    json!({"state": r["state"], "detail": r["detail"]}),
+                ))
+            })
+            .collect();
+        let leases: serde_json::Map<String, serde_json::Value> = session_ids
+            .iter()
+            .map(|sid| {
+                (
+                    sid.clone(),
+                    json!({"holder": self.host.lease_holder(sid),
+                           "epoch": self.host.lease_epoch(sid)}),
+                )
+            })
+            .collect();
+        let visible: serde_json::Map<String, serde_json::Value> = self
+            .r9
+            .attachment_ids()
+            .into_iter()
+            .map(|att| {
+                let n = self.host.receipts_visible(&att);
+                (att, json!(n))
+            })
+            .collect();
+        let status = self.r9.status();
+        let mut state = json!({
+            "journal_halted": self.host.journal_halted(),
+            "channels": status.channels,
+            "attachments": status.attachments,
+            "leases": leases,
+            "receipts": receipts,
+            "receipts_visible": visible,
+            "membership_error": self.membership_error,
+        });
+        if let Some(m) = self.membership.as_ref() {
+            let control_gen: serde_json::Map<String, serde_json::Value> = principals
+                .iter()
+                .map(|p| (p.clone(), json!(self.host.control_gen(p))))
+                .collect();
+            state["membership"] = json!({
+                "head": head(m.head()),
+                "applied": head(m.applied().head),
+                "frozen": m.is_frozen(),
+                "frozen_durable": m.frozen_durable(),
+                "faulted": m.faulted().is_some(),
+                "held": m.held().is_some(),
+                "unclean": m.unclean().map(head),
+                "carriage_record": m.carriage_record_present(),
+                "fault_record": m.fault_record_present(),
+                "control_gen": control_gen,
+                "members": m.membership().members(),
+                "records": m.membership().records().iter().map(|r| {
+                    (r.entry_hash.to_hex(), json!(r.state().as_str()))
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
+                "evidence": {
+                    "count": m.membership().evidence().count,
+                    "reason": m.membership().evidence().recent.last().map(|r| r.reason.as_str()),
+                },
+                "recovery_key": atem_client::encoding::b64u(m.membership().recovery_key().as_bytes()),
+                "k_backup": m.membership().k_backup().map(|k| json!({
+                    "blob_version": k.blob_version, "backup_hash": k.backup_hash.to_hex()})),
+            });
+        }
+        let text = state.to_string();
+        let tmp = file.with_extension("tmp");
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(text.as_str())
+            && std::fs::write(&tmp, &text).is_ok()
+        {
+            let _ = std::fs::rename(&tmp, &file);
         }
     }
 

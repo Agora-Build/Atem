@@ -98,6 +98,32 @@ pub fn hash_with(
     Ok(out)
 }
 
+/// Debug builds, the r9 fixtures against the real runtime
+/// (`ATEM_TEST_PROJECT_HASHES`): each (project key, kid)'s hash read from a
+/// table file (`{"<project key>": {"<kid>": "h1.<kid>.<hash>"}}`) instead
+/// of the cred agent; a pair the table lacks fails like an agent that
+/// doesn't hold the kid.
+#[cfg(debug_assertions)]
+pub struct TableHasher {
+    pub file: std::path::PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl ProjectHasher for TableHasher {
+    fn hash(&self, items: &[(String, String)]) -> Result<Vec<String>> {
+        let table: serde_json::Value = serde_json::from_slice(&std::fs::read(&self.file)?)?;
+        items
+            .iter()
+            .map(|(key, kid)| {
+                table[key][kid]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("no retained key {kid} (test table)"))
+            })
+            .collect()
+    }
+}
+
 /// A hasher over a given cred agent (tests: an injected or fake agent on
 /// the same `Crypt` requests as [`AgentHasher`]).
 #[cfg(test)]
