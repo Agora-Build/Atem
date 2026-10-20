@@ -101,6 +101,9 @@ const LEFTOVERS: [DlFile; 6] = [
     DlFile::HostChannelKey,
     DlFile::Applied,
 ];
+/// `membership_applied` while `atem unpair` removes a list that never had
+/// one (so a half-done removal still opens as failed, never as none).
+const UNPAIRING_MARKER: &[u8] = br#"{"unpairing":true}"#;
 /// `frozen_genesis` keeps at most this many hashes.
 const MAX_FROZEN_GENESIS: usize = 16;
 
@@ -544,14 +547,20 @@ impl MembershipHost {
             .ok_or_else(damaged)?;
         let value = parse_json(&bytes).ok_or_else(damaged)?;
         let (m, pin, previous_checkpoint) = parse_state(&value).ok_or_else(damaged)?;
-        let applied =
-            match store.read(DlFile::Applied) {
-                Ok(Some(bytes)) => Some(parse_applied(&bytes).ok_or_else(|| {
-                    format!("{} is damaged", store.path(DlFile::Applied).display())
-                })?),
-                Ok(None) => None,
-                Err(e) => return Err(format!("cannot read membership_applied: {e}")),
-            };
+        let applied = match store.read(DlFile::Applied) {
+            // An `atem unpair` that stopped before the list's removal began
+            // and couldn't take its marker back: as if no record (every
+            // fence is replayed, idempotently).
+            Ok(Some(bytes)) if bytes == UNPAIRING_MARKER => None,
+            Ok(Some(bytes)) => Some(parse_applied(&bytes).ok_or_else(|| {
+                format!(
+                    "{} is damaged; re-pair this host (atem unpair, then atem pair)",
+                    store.path(DlFile::Applied).display()
+                )
+            })?),
+            Ok(None) => None,
+            Err(e) => return Err(format!("cannot read membership_applied: {e}")),
+        };
         if let Some(a) = &applied {
             let ours = m.entry(a.head.seq).map(|e| e.hash());
             if a.head.seq > m.head().seq || ours != Some(a.head.hash) {
@@ -835,7 +844,7 @@ impl MembershipHost {
             Ok(())
         } else {
             Err(WriteError {
-                file: DlFile::Carriage,
+                file: DlFile::Fault,
                 step: store::Step::TempWrite,
                 message: "the hold's fault record can't be written; the carriage is refused".into(),
             })
@@ -1696,7 +1705,10 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
         || state.as_ref().is_some_and(|v| v.get("frozen").is_some());
     let mut store = Store::new(pairing, &journal_of(pairing));
     #[cfg(test)]
-    if let Some(injected) = FORGET_FAULT.with(|f| f.take()) {
+    if let Some(injected) = FORGET_FAULT.with(|f| f.get())
+        && injected.file != DlFile::Applied
+    {
+        FORGET_FAULT.with(|f| f.set(None));
         store.inject(injected);
     }
     let not_begun = |e: WriteError| ForgetError {
@@ -1724,17 +1736,28 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
     // `forget_leftovers`, after the unpair committed the next trust
     // generation, so a failure in between still opens as `Failed`. A list
     // without one (never applied) gets one now.
-    if store::present(&pairing.membership) && !store.present(DlFile::Applied) {
+    let marker = store::present(&pairing.membership) && !store.present(DlFile::Applied);
+    if marker {
         store
-            .replace(DlFile::Applied, br#"{"unpairing":true}"#)
+            .replace(DlFile::Applied, UNPAIRING_MARKER)
             .map_err(not_begun)?;
     }
-    store.remove(DlFile::State).map_err(|e| ForgetError {
+    if let Err(e) = store.remove(DlFile::State) {
         // A failed unlink changed nothing; a failed directory fsync after
         // it may have.
-        begun: e.step == store::Step::Remove || !store::present(&pairing.membership),
-        message: e.to_string(),
-    })?;
+        let begun = e.step == store::Step::Remove || !store::present(&pairing.membership);
+        if !begun && marker {
+            // Aborted: the host stays paired as it was, so the marker goes
+            // (`open` would ignore it anyway).
+            if let Err(e) = store.remove(DlFile::Applied) {
+                log(&format!("cannot remove the unpairing marker: {e}"));
+            }
+        }
+        return Err(ForgetError {
+            begun,
+            message: e.to_string(),
+        });
+    }
     for file in LEFTOVERS {
         if file == DlFile::Applied {
             continue;
@@ -1752,6 +1775,10 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
 /// one (`membership_applied`) included.
 pub fn forget_leftovers(pairing: &PairingPaths) -> Result<(), String> {
     let mut store = Store::new(pairing, &journal_of(pairing));
+    #[cfg(test)]
+    if let Some(injected) = FORGET_FAULT.with(|f| f.take()) {
+        store.inject(injected);
+    }
     for file in LEFTOVERS {
         store.remove(file).map_err(|e| e.to_string())?;
     }

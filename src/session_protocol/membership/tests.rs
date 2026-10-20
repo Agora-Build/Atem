@@ -1176,3 +1176,66 @@ fn an_old_host_never_clears_a_newer_pins_fault() {
     );
     assert!(rig.exists(DlFile::Fault), "the newer pin's fault stays");
 }
+
+// ── Task 6 carry-overs (Task 7a) ──
+
+/// `atem unpair` of a list that never had `membership_applied` writes the
+/// unpairing marker first; when the list's own unlink then fails, the
+/// unpair aborts with the host paired as it was and the marker taken back,
+/// so the next start opens the list normally.
+#[test]
+fn an_aborted_unpair_takes_its_marker_back() {
+    let rig = Rig::new();
+    let src = crate::profile::Sources::in_dir(rig.dir.path());
+    crate::pairing::tests::bound_profile(rig.dir.path(), "astation-a");
+    rig.pin(&["E1", "E2"]);
+    std::fs::remove_file(rig.journal.join("membership_applied")).unwrap();
+    FORGET_FAULT.with(|f| {
+        f.set(Some(Injected {
+            file: DlFile::State,
+            step: Step::Rename,
+        }))
+    });
+    let err = crate::pairing::unpair(&src).unwrap_err();
+    assert!(
+        err.to_string().contains("could not remove the device list"),
+        "{err}"
+    );
+    assert!(
+        crate::records::PairingRecord::load(&rig.pairing)
+            .unwrap()
+            .is_some(),
+        "still paired"
+    );
+    assert!(rig.pairing.membership.exists(), "the list is kept");
+    assert!(!rig.exists(DlFile::Applied), "the marker was taken back");
+    let (host, _) = rig
+        .open(2, &clock(WALL0, 2_000, "boot-1"), &mut RecFences::default())
+        .expect("opens as it was");
+    assert_eq!(host.head(), vectors().head("E2"));
+}
+
+/// A marker that couldn't be taken back is read as no record (every fence
+/// replayed); any other damaged record names the fix.
+#[test]
+fn an_unpairing_marker_beside_the_list_reads_as_no_record() {
+    let rig = Rig::new();
+    rig.pin(&["E1", "E2"]);
+    std::fs::write(
+        rig.journal.join("membership_applied"),
+        br#"{"unpairing":true}"#,
+    )
+    .unwrap();
+    let (host, _) = rig
+        .open(2, &clock(WALL0, 2_000, "boot-1"), &mut RecFences::default())
+        .expect("opens");
+    assert_eq!(host.applied().head, vectors().head("E2"), "rewritten");
+    std::fs::write(rig.journal.join("membership_applied"), b"{\"x\":1}").unwrap();
+    let err = rig
+        .open(3, &clock(WALL0, 3_000, "boot-1"), &mut RecFences::default())
+        .unwrap_err();
+    assert!(
+        err.contains("is damaged; re-pair this host (atem unpair, then atem pair)"),
+        "{err}"
+    );
+}

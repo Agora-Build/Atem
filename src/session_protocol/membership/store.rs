@@ -415,6 +415,10 @@ impl Store {
         if !present(&path) && !present(&temp_of(&path)) {
             return Ok(()); // nothing to remove, nothing to sync
         }
+        // The unlink itself (reported as `Rename`: nothing changed).
+        if self.fails(file, Step::Rename) {
+            return Err(Self::failure(file, Step::Rename, "injected unlink failure"));
+        }
         remove_entry(&temp_of(&path))
             .and_then(|()| remove_entry(&path))
             .map_err(|e| Self::failure(file, Step::Rename, e.to_string()))?;

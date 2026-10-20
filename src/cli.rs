@@ -1223,8 +1223,8 @@ fn revocation_recorded(src: &crate::profile::Sources) -> bool {
 /// `atem unpair` after the confirmation: first durably commits the next host
 /// trust generation (so work started under the old pairing can't apply
 /// anything, even if what follows is interrupted), then removes the pairing
-/// record (the user's own login, memory, vault data, trust pins and keys
-/// stay: `pairing::unpair`), and, when an
+/// record and the r9 device list (the user's own login, memory, vault data,
+/// trust pins and keys stay: `pairing::unpair_with_notices`), and, when an
 /// Astation revoked this device and `agent` (the running cred agent, if any)
 /// doesn't hold its keys unlocked, sets the revoked keys aside so the next
 /// `atem pair` verifies with new ones. Returns the notices to print: keys set

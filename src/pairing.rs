@@ -750,6 +750,8 @@ pub(crate) mod tests {
             (DlFile::Freeze, Step::Remove),
             (DlFile::Fault, Step::Remove),
             (DlFile::HostChannelKey, Step::Remove),
+            // `membership_applied` goes last, in `forget_leftovers`, after
+            // the generation is committed: its fault reaches it there.
             (DlFile::Applied, Step::Remove),
         ];
         for (file, step) in steps {
@@ -772,7 +774,22 @@ pub(crate) mod tests {
                 std::fs::write(store.path(f), b"x").unwrap();
             }
             FORGET_FAULT.with(|f| f.set(Some(Injected { file, step })));
-            let unpaired = unpair(&src).is_ok();
+            let result = unpair_with_notices(&src);
+            assert!(
+                FORGET_FAULT.with(|f| f.get()).is_none(),
+                "the fault was reached: {file:?}"
+            );
+            if file == DlFile::Applied {
+                // The last leftover's removal failed after the commit: the
+                // unpair completes and says so.
+                assert!(
+                    result
+                        .as_ref()
+                        .is_ok_and(|(_, notices)| !notices.is_empty()),
+                    "{result:?}"
+                );
+            }
+            let unpaired = result.is_ok();
             let paired = PairingRecord::load(paths).unwrap().is_some();
             assert_eq!(paired, !unpaired, "{file:?}");
             let opened = MembershipHost::open(
