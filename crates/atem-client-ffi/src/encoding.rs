@@ -153,6 +153,28 @@ pub fn verify_signed_object(json: String, key: PublicKeyData) -> Result<()> {
     Ok(signed(&json)?.verify(&key.to_key()?)?)
 }
 
+/// `verifyCommit.host_trust_gen` (§R9.2 "Pairing"), read as the contract
+/// requires: strict JSON, a JSON integer 1 ≤ n ≤ 2^53−1, present. Use this,
+/// never a platform decoder (Swift's `JSONDecoder` takes `3.0` and `3e0` as
+/// `Int`). Errors: `Invalid{code}` with `malformed`, `not_verify_commit`,
+/// `absent` or `out_of_range` (answer `verifyAbort`).
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn verify_commit_host_trust_gen(message_json: String) -> Result<u64> {
+    use atem_client::ceremony::{CommitRefusal, verify_commit_host_trust_gen as read};
+    read(message_json.as_bytes()).map_err(|why| {
+        let code = match why {
+            CommitRefusal::Malformed => "malformed",
+            CommitRefusal::NotVerifyCommit => "not_verify_commit",
+            CommitRefusal::Absent => "absent",
+            CommitRefusal::OutOfRange => "out_of_range",
+        };
+        AtemError::Invalid {
+            code: code.into(),
+            detail: "verifyCommit.host_trust_gen must be an integer 1..=2^53-1".into(),
+        }
+    })
+}
+
 /// `enc_kid` of an X25519 `enc_key` (§R9.9).
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn enc_kid(enc_key: PublicKeyData) -> Result<String> {

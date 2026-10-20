@@ -295,6 +295,16 @@ sig)`, `signed_object_info`, `verify_signed_object`, `enc_kid`,
 `ed25519_public_to_x25519` (the kit's HPKE key; CryptoKit lacks it),
 `check_public_key`.
 
+### Pairing ceremony
+
+`verify_commit_host_trust_gen(message_json)` (JS `verifyCommitHostTrustGen`)
+reads `verifyCommit.host_trust_gen` as §R9.2 requires: strict JSON, a JSON
+integer 1 ≤ n ≤ 2^53−1, present. It fails `Invalid{code}` with `malformed`,
+`not_verify_commit`, `absent` or `out_of_range`; answer `verifyAbort`.
+Astation must read the field with this function, never by decoding it
+itself: Swift's `JSONDecoder` accepts `3.0` and `3e0` as an `Int`, which
+the contract refuses (vectors `r9-vectors-pairing`).
+
 ## 3. The KeyProvider contract and signing purposes
 
 ```text

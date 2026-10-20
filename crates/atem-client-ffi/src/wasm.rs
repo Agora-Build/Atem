@@ -243,6 +243,13 @@ pub fn canonical_json(json: String) -> JsResult<String> {
     err(crate::encoding::canonical_json(json))
 }
 
+/// `verifyCommit.host_trust_gen` (§R9.2), as a JS number (always a safe
+/// integer).
+#[wasm_bindgen(js_name = verifyCommitHostTrustGen)]
+pub fn verify_commit_host_trust_gen(message_json: String) -> JsResult<f64> {
+    err(crate::encoding::verify_commit_host_trust_gen(message_json)).map(|n| n as f64)
+}
+
 #[wasm_bindgen(js_name = signingInput)]
 pub fn signing_input(label_name: &str, payload: Vec<u8>) -> JsResult<Vec<u8>> {
     Ok(crate::encoding::signing_input(label(label_name)?, payload))

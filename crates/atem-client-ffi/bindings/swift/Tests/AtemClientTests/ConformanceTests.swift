@@ -436,9 +436,25 @@ final class ConformanceTests: XCTestCase {
             try eq(pushNextDue(createdAt: created, expiresAt: expires, recipient: desktop, sent: [.desktopOs], now: created), nil)
         }
 
+        let pairing = o(try load("r9-vectors-pairing"))
+        check("verifyCommit host_trust_gen (r9-vectors-pairing)") {
+            // The binding's reader, never JSONDecoder (it takes 3.0 as Int).
+            let commits = o(pairing["verify_commit"])
+            for c in a(commits["valid"]).map(o) {
+                try eq(try verifyCommitHostTrustGen(messageJson: s(c["raw"])), u(c["host_trust_gen"]), s(c["case"]))
+            }
+            for c in a(commits["invalid"]).map(o) {
+                do {
+                    _ = try verifyCommitHostTrustGen(messageJson: s(c["raw"]))
+                    throw Failure(description: "\(s(c["case"])) was accepted")
+                } catch AtemError.Invalid {
+                }
+            }
+        }
+
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 34)
+        XCTAssertEqual(passed, 35)
     }
 }

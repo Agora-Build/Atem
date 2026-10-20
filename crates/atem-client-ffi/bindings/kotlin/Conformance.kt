@@ -386,6 +386,20 @@ fun main(args: Array<String>) {
         eq(pushNextDue(created, expires, desktop, listOf(PushStage.DESKTOP_OS), created), null)
     }
 
+    val pairing = load("r9-vectors-pairing")
+    check("verifyCommit host_trust_gen (r9-vectors-pairing)") {
+        for (c in pairing["verify_commit"]["valid"].arr()) {
+            eq(verifyCommitHostTrustGen(c["raw"].s()), c["host_trust_gen"].l().toULong(), c["case"].s())
+        }
+        for (c in pairing["verify_commit"]["invalid"].arr()) {
+            try {
+                verifyCommitHostTrustGen(c["raw"].s())
+                throw AssertionError("${c["case"].s()} was accepted")
+            } catch (e: AtemException.Invalid) {
+            }
+        }
+    }
+
     println("kotlin conformance: $passed passed, ${failures.size} failed")
     failures.forEach { println("FAIL $it") }
     kotlin.system.exitProcess(if (failures.isEmpty()) 0 else 1)

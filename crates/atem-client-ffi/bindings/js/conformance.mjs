@@ -338,6 +338,20 @@ check("schedule from the signed created_at, and the 15 s guard", () => {
   eq(m.pushNextDue(created, push.open[0].body.expires_at, desktop, ["desktop_os"], created), undefined);
 });
 
+const pairing = load("r9-vectors-pairing");
+check("verifyCommit host_trust_gen (r9-vectors-pairing)", () => {
+  for (const c of pairing.verify_commit.valid) eq(m.verifyCommitHostTrustGen(c.raw), c.host_trust_gen, c.case);
+  for (const c of pairing.verify_commit.invalid) {
+    let refused = false;
+    try {
+      m.verifyCommitHostTrustGen(c.raw);
+    } catch (e) {
+      refused = e.kind !== undefined || e.code !== undefined;
+    }
+    if (!refused) throw new Error(`${c.case} was accepted`);
+  }
+});
+
 console.log(`wasm conformance: ${passed} passed, ${failures.length} failed`);
 for (const f of failures) console.log(`FAIL ${f}`);
 process.exit(failures.length === 0 ? 0 : 1);
