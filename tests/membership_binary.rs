@@ -415,6 +415,11 @@ fn a_pending_recovery_waits_on_the_host_clock_across_a_reboot() {
     // A reboot: 30 h off, a new boot whose clock starts at 5 s.
     b.set_clock(WALL0 + 40 * hour, 5_000, "boot-2");
     b.start(true);
+    // The device list opens (and reads the host clock) after the socket
+    // listens: move the clock only once it has.
+    b.until("the device list to open", || {
+        b.log().matches("host_channel_key is missing").count() >= 2
+    });
     b.set_clock(WALL0 + 40 * hour + 13 * hour, 5_000 + 13 * hour, "boot-2");
     b.until("the time waited after the reboot", || {
         record(&b)["mono_waited_ms"].as_u64() == Some(23 * hour)
