@@ -2876,6 +2876,15 @@ new one; what the socket doesn't take then is dropped and counted (a
 handle is scoped to its generation, so a late close could end a new
 channel).
 
+**The router enforces the envelope bound.** The router (the relay, or
+Astation on :8080) never forwards to Atem an envelope over 2 MiB: a client
+frame that would make one is refused at the router and that client's
+channel closed there (`too_large`). Atem's link reader takes at most 4 MiB
+per WebSocket message (the 2 MiB bound plus a margin); a larger message
+ends Atem's **whole link**, every channel on it (each device reconnects),
+so a router that forwarded one would cut off every device, not just the
+sender. Between 2 and 4 MiB Atem applies the bound itself (the row above).
+
 Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
 fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
 `handshake_failed` (a clear handshake error frame was sent first),
