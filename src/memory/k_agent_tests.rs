@@ -686,3 +686,63 @@ fn every_caller_follows_the_newest_state_when_two_astations_name_one_account() {
         );
     }
 }
+
+/// §R9.6 end to end on the real cred agent (review N5): an unlocked agent
+/// holding `K` under a current kid (B) and a previous one (A); the runtime's
+/// `ProjectScopes` asks it through `Crypt` and a scope entry under each kid
+/// matches. The hash under the current kid equals memory sync's own keyed
+/// project hash (`CryptOp::keyed_hash`, as `wire_projects` makes it), and
+/// the one under A is HMAC-SHA256(K_A, project key).
+#[test]
+fn project_scopes_hash_under_each_retained_kid_on_the_real_agent() {
+    use crate::runtime::project_scope::{CredAgentHasher, ProjectScopes};
+    use crate::session_protocol::r9::ProjectScope;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::Enabling, A, [1; 32]);
+    device.set_key(EncryptionMode::Enabling, B, [2; 32]);
+    let key = "github.com/agora-build/atem";
+    let agent: std::sync::Arc<dyn CredAgentApi> = device.agent.clone();
+    let mut scopes = ProjectScopes::new(std::sync::Arc::new(CredAgentHasher {
+        agent: agent.clone(),
+        astation_id: ASTATION_ID.into(),
+    }));
+    scopes.session("ses-aaaaaaaaaaaa", Some(key.into()));
+    let kids: BTreeSet<String> = [A.to_string(), B.to_string()].into();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !scopes.idle(&kids) {
+        assert!(Instant::now() < deadline, "never hashed");
+        scopes.pass(&kids, Instant::now());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Under B (current): memory sync's own hash.
+    let memory_hash = agent
+        .crypt(ASTATION_ID, vec![CryptOp::keyed_hash(key.as_bytes())])
+        .unwrap()
+        .remove(0)
+        .into_text()
+        .unwrap();
+    assert!(
+        memory_hash.starts_with(&format!("h1.{B}.")),
+        "{memory_hash}"
+    );
+    assert_eq!(scopes.matches("ses-aaaaaaaaaaaa", &memory_hash), Some(true));
+    // Under A (previous): HMAC-SHA256(K_A, key).
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[1; 32]).unwrap();
+    mac.update(key.as_bytes());
+    let digest: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let under_a = format!("h1.{A}.{digest}");
+    assert_eq!(scopes.matches("ses-aaaaaaaaaaaa", &under_a), Some(true));
+    // Another project's hash under either kid doesn't match.
+    let other = format!("h1.{A}.{}", "0".repeat(64));
+    assert_eq!(scopes.matches("ses-aaaaaaaaaaaa", &other), Some(false));
+}

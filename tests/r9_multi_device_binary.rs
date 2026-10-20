@@ -777,6 +777,17 @@ fn the_macs_link_drops_and_the_phone_goes_on_over_the_relay() {
     let (_, stale) = p_old.a.list(client_ms()).unwrap();
     router.frame("phone", &stale);
     assert!(matches!(router.next("phone"), Out::Close(Some(r)) if r == "unknown_channel"));
+    // And the old attachment itself ended: naming its attachment_gen (on the
+    // phone's new channel) is stale_target.
+    let mut old_binding = p.read(&sid);
+    old_binding["attachment_gen"] = json!(p_old.a.welcome().attachment_gen);
+    p.send(
+        &mut router,
+        json!({"type": "session", "data": {"v": 1, "op": "acquire", "id": uuid(),
+            "binding": old_binding, "takeover": false}}),
+    );
+    let stale_att = p.wait(&mut router, |v| v["op"] == "error");
+    assert_eq!(stale_att["code"], "stale_target", "{stale_att}");
     // The Mac's lease isn't restored to anyone; it expires.
     let held = p.acquire(&mut router, &sid, None);
     assert_eq!(held["code"], "lease_held", "{held}");
@@ -859,7 +870,10 @@ fn a_project_scoped_bot_sees_nothing_while_the_cred_agent_is_locked() {
         "{later:?}"
     );
     let deadline = Instant::now() + WAIT;
-    while !rig.runtime_log().contains("project scopes pending") {
+    while !rig
+        .runtime_log()
+        .contains("project scopes under 0a0b0c0d pending")
+    {
         assert!(Instant::now() < deadline, "{}", rig.runtime_log());
         std::thread::sleep(Duration::from_millis(100));
     }
