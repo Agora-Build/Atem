@@ -2738,11 +2738,13 @@ channel without a reply and wipes its keys.
 **Limits** (a new channel is required before any is reached; the side
 that reaches one first sends nothing more and closes; the client
 reconnects, a new attachment): 2^32 records or 2^36 plaintext bytes per
-direction; lifetime 24 h for native principals (on the monotonic
-clock only: a key-rotation bound, not authorization, so a suspend doesn't
-end it; removal from the device list ends it at once), the expiry for
-service/browser (wall and monotonic, see "Time rules for authority"); `accept` within 10 s of `init`, `finish` within 10 s of
-`accept`, else closed. The host keeps no state for an `init` beyond its
+direction; lifetime 24 h for native principals, on the monotonic clock
+only (a key-rotation bound: native members never expire, so a suspend
+doesn't end it, removal from the device list does at once; it still
+counts in `welcome.authorization_ms_left`), the expiry for
+service/browser (wall and monotonic, "Time rules for authority");
+`accept` within 10 s of `init`, `finish` within 10 s of `accept`, else
+closed. The host keeps no state for an `init` beyond its
 ephemeral key and answers at most one `init` a second per transport.
 
 **Errors.** Before `finish` opens they are clear, then close:
