@@ -117,13 +117,13 @@ pub(crate) fn is_removed_op(text: &str) -> bool {
         .is_some_and(|kind| REMOVED_OPS.contains(&kind.as_str()))
 }
 
-/// The `data.id` of a `session` message, when it has one (no other check).
 /// The link's WebSocket limits: no message (or frame) larger than the
 /// §R9.7a envelope bound plus a margin is ever buffered; a larger one
 /// ends the link (tungstenite's default would be 64 MiB).
 pub(crate) const MAX_LINK_MESSAGE_BYTES: usize =
     crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES + (2 << 20);
 
+/// The link's WebSocket configuration (the limits above).
 pub(crate) fn link_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(MAX_LINK_MESSAGE_BYTES),
@@ -132,6 +132,7 @@ pub(crate) fn link_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebS
     }
 }
 
+/// The `data.id` of a `session` message, when it has one (no other check).
 fn session_message_id(text: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Data {
