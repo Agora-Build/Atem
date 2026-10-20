@@ -1832,9 +1832,23 @@ a new member (or a new `add_host`).
 Log limits: ≤ 1024 entries, ≤ 256 members, ≤ 64 hosts. A full log is
 `membership_invalid` "device list full; re-pair to start a new one".
 Vectors: `r9-vectors-membership-log` (E1–E6 and the alternatives used
-by the scenarios).
+by the scenarios); `r9-vectors-pairing` (`verifyCommit` and its
+`host_trust_gen` cases).
 
-**Pairing (ceremony changes).** `verifyKeys` gains `genesis_hash`
+**Pairing (ceremony changes).** `verifyCommit` gains `host_trust_gen`:
+the binding's host trust generation, public, a JSON integer with
+1 ≤ n ≤ 2^53−1 (R9.1), in the existing message's payload:
+`{"type":"verifyCommit","data":{"device_id":"<atem_device_id>",
+"commitment":"<base64>","host_trust_gen":3}}`. It is required (no
+compatibility): Astation refuses (`verifyAbort`) a `verifyCommit`
+without it, or with a value that isn't an integer in that range, and
+copies it unchanged into the signed `add_host`. Both sides capture it
+with the commitment for that verification attempt and never change it
+while the owner's confirmation is pending; the attempt is void after a
+reconnect of the link or a new pairing (`atem pair`, `atem unpair`) on
+either side. No secrecy or commitment binding is needed: Atem compares
+the `add_host` it receives with its own host id, key and generation and
+refuses any other. `verifyKeys` gains `genesis_hash`
 (lowercase hex); `verifyReveal` gains `host_channel_pub` (the 32-byte
 Ed25519 key, R9.6, in base64url without padding as R9.1 says; the
 ceremony's older fields stay standard base64), inside the commitment,
@@ -3040,7 +3054,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
-`r9-vectors-browser-grant`, `r9-vectors-push-hint`. Scenarios
+`r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`. Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,
