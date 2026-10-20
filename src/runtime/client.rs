@@ -681,6 +681,8 @@ pub async fn restart() -> Result<()> {
 
 /// What a passive look at the runtime found.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// One short-lived value per look: boxing the welcome buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Look {
     NotRunning,
     /// Something answers but couldn't be asked (or didn't answer in time).

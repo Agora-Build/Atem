@@ -98,9 +98,14 @@ impl TestLog {
         );
         let genesis = sign_entry(&keys, &auth(MAC), body).unwrap();
         let now = host_now();
-        let log = Membership::verify_chain(account, &genesis.hash(), &[genesis.clone()], &now)
-            .unwrap()
-            .membership;
+        let log = Membership::verify_chain(
+            account,
+            &genesis.hash(),
+            std::slice::from_ref(&genesis),
+            &now,
+        )
+        .unwrap()
+        .membership;
         TestLog {
             keys,
             account: account.into(),

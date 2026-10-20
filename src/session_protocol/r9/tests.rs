@@ -242,7 +242,7 @@ impl Rig {
         });
         for text in sent {
             match envelope::parse(&text).expect("Atem sends valid envelopes") {
-                Event::Frame { channel, frame } => self.to_client(&channel, &frame),
+                Event::Frame { channel, frame } => self.deliver_to_client(&channel, &frame),
                 Event::Close { channel, reason } => {
                     if let Some(Client::Attached(..)) = self.clients.get(&channel) {
                         self.clients.insert(
@@ -257,7 +257,7 @@ impl Rig {
         }
     }
 
-    fn to_client(&mut self, handle: &str, frame: &[u8]) {
+    fn deliver_to_client(&mut self, handle: &str, frame: &[u8]) {
         let Some(client) = self.clients.remove(handle) else {
             return;
         };

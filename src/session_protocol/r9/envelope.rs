@@ -162,7 +162,7 @@ pub fn parse(text: &str) -> Result<Event, Refused> {
         .get("channel")
         .and_then(Value::as_str)
         .filter(|h| is_handle(h))
-        .ok_or_else(|| Refused::Malformed {
+        .ok_or(Refused::Malformed {
             channel: None,
             why: "channel",
         })?
@@ -337,7 +337,7 @@ mod tests {
         );
         // Non-compact JSON within the bound is accepted.
         let spaced =
-            format!("{{ \"type\" : \"channel\", \"event\": \"close\", \"channel\": \"ch-1\" }}");
+            "{ \"type\" : \"channel\", \"event\": \"close\", \"channel\": \"ch-1\" }".to_string();
         assert!(parse(&spaced).is_ok());
     }
 

@@ -863,7 +863,7 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
                 crate::session_protocol::membership::r9log::MAC,
             ),
         );
-        let log = verifier.log.borrow();
+        let log = verifier.log.into_inner();
         let mut attached = peer
             .r9_connect("mac-1", &log, ATEM_ID, mac)
             .await
@@ -880,7 +880,7 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
                 .iter()
                 .any(|e| matches!(e, atem_client::connect::Event::Session(m)
                 if matches!(&m.op, crate::session_protocol::wire::Op::Sessions { sessions, .. }
-                    if sessions.iter().any(|d| d.session_id == session.id.to_string())))),
+                    if sessions.iter().any(|d| d.session_id == session.id.as_str())))),
             "{events:?}"
         );
         frontend
