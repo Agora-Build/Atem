@@ -7,6 +7,7 @@
 # in the shipped bindings, and each package used once: the Node build of
 # the WASM package and the JVM jar (through JNA) both read the r9 pairing
 # vectors' verifyCommit messages with the shared parser.
+#   EXPECT_COMMIT  the full SHA the packages must pin (with a clean tree)
 #   NODE  node (default: node on PATH)
 #   JAVA, JAVAC  java and javac (default: on PATH), and JNA_JAR: the jar check
 set -euo pipefail
@@ -20,10 +21,15 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" <<'EOF'
+python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'
 import json, re, sys
 pin = json.load(open(sys.argv[1]))
 assert re.fullmatch(r"[0-9a-f]{40}", pin["commit"]), pin
+expect = sys.argv[2]
+if expect:
+    # The build you asked for: that exact commit, from a clean tree.
+    assert pin["commit"] == expect, ("pin names", pin["commit"], "expected", expect)
+    assert pin["tree_dirty"] is False, pin
 for crate in ("atem-client", "atem-client-ffi", "uniffi", "wasm-bindgen"):
     assert pin["crates"].get(crate), (crate, pin)
 assert pin["toolchain"].get("rustc"), pin

@@ -485,8 +485,12 @@ pull requests touching the crates, fixtures or these scripts, and manual
 runs) uploads the production packages as workflow artifacts. They are
 built with the default features only (`wasm` alone for JS): no
 `software-keys`, `test-vectors` or `host` code is in them. Nothing is
-published to a registry. `<version>` is the crate version and the commit's
-first 12 hex digits (`0.1.0-9bb4a932183e`).
+published to a registry. Every package is built from the commit under
+review: a pull request's **head** commit (the workflow checks it out
+explicitly, never GitHub's synthetic merge of the PR into main), or the
+pushed commit on main. `<version>` is the crate version and that commit's
+first 12 hex digits (`0.1.0-5e14c29c8f6a`). CI fails unless every package's
+pin names exactly that commit with `tree_dirty: false`.
 
 | artifact | built on | files |
 |---|---|---|
@@ -504,24 +508,26 @@ and `tree_dirty`, `crates` (`atem-client`, `atem-client-ffi`, and
 `xcodebuild`, `swift`).
 
 To take one (`gh` with read access to the repository; artifacts expire
-after GitHub's retention, 90 days):
+after GitHub's retention, 90 days). `<sha>` is the full commit you were
+asked to integrate (the PR head named on #80/#81, e.g. `gh pr view 89 -R
+Agora-Build/Atem --json headRefOid -q .headRefOid`):
 
 ```sh
-gh run list -R Agora-Build/Atem -w atem-client-bindings -b <branch> -L 5   # pick the run of the commit you want
+gh run list -R Agora-Build/Atem -w atem-client-bindings -c <sha> -L 5   # runs of exactly that commit
 gh run download <run-id> -R Agora-Build/Atem -n atem-client-wasm-<version> -D atem-client-wasm
 cd atem-client-wasm
 shasum -a 256 -c atem-client-<version>-SHA256SUMS.txt        # every file: OK
-python3 -c 'import json; print(json.load(open("atem-client-<version>-SOURCE.json"))["commit"])'
+python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["commit"] == sys.argv[2] and p["tree_dirty"] is False, p; print("pin ok")' \
+  atem-client-<version>-SOURCE.json <sha>
 ```
 
-Then check that `commit` is the commit you meant (the PR's head, or the
-pinned commit on #80/#81) and that `tree_dirty` is `false`; only then
-unpack (`unzip` / `tar xzf`) and use it. A mismatching sum or commit means
-the download is not the build you asked for: don't use it.
-`scripts/check-atem-client-packages.sh <version> <dir>` is what CI runs on
-the Linux packages (sums, pin, no test-only or host-role export, and one
-call through the Node build and the JVM jar); it can be run on a download
-the same way.
+Only then unpack (`unzip` / `tar xzf`) and use it. A mismatching sum, a
+pin naming another commit (for instance a merge commit) or `tree_dirty:
+true` means the download is not the build you asked for: don't use it.
+`EXPECT_COMMIT=<sha> scripts/check-atem-client-packages.sh <version> <dir>`
+is what CI runs on the Linux packages (sums, the pin's commit and clean
+tree, no test-only or host-role export, and one call through the Node
+build and the JVM jar); it can be run on a download the same way.
 
 ## 8. Tests
 

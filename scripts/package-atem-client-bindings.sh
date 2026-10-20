@@ -42,6 +42,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FILES=()
 TOOLS=()
+FEATURES=()
 
 archive() { # archive <name.tar.gz> <dir> <entry>
   tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$2" -cf - "$3" \
@@ -63,6 +64,7 @@ if want wasm; then
   done
   archive "atem-client-${VERSION}-wasm.tar.gz" "$WORK" atem-client-wasm
   TOOLS+=("wasm-bindgen-cli=$GOT")
+  FEATURES+=("wasm: --no-default-features --features wasm")
 fi
 
 if want kotlin; then
@@ -97,12 +99,13 @@ if want kotlin; then
     TOOLS+=("kotlinc=$("$KOTLINC" -version 2>&1 | sed -n 's/.*kotlinc-jvm \([^ ]*\).*/\1/p')")
     TOOLS+=("jna=$(basename "$JNA_JAR" .jar | sed 's/^jna-//')")
   fi
+  FEATURES+=("kotlin: default (uniffi)")
   archive "atem-client-${VERSION}-kotlin-jvm-${PLATFORM}.tar.gz" "$WORK" atem-client-kotlin-jvm
 fi
 
 PIN="atem-client-${VERSION}-SOURCE.json"
 ./scripts/atem-client-source-pin.sh "$OUT/$PIN" "$(IFS=,; echo "${kinds[*]}")" \
-  "default (uniffi) for Kotlin; --no-default-features --features wasm for WASM" \
+  "$(printf '%s\n' "${FEATURES[@]}" | paste -sd ';' - | sed 's/;/; /g')" \
   ${TOOLS[@]+"${TOOLS[@]}"}
 FILES+=("$PIN")
 SUMS="atem-client-${VERSION}-SHA256SUMS.txt"

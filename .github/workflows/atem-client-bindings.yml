@@ -37,6 +37,11 @@ on:
       - ".github/workflows/atem-client-bindings.yml"
   workflow_dispatch:
 
+# Read-only token: nothing here writes to the repository. Actions are pinned
+# by tag, as in the repository's other workflows.
+permissions:
+  contents: read
+
 concurrency:
   group: atem-client-bindings-${{ github.ref }}
   cancel-in-progress: true
@@ -59,6 +64,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The packages are built from (and their pin names) the commit under
+          # review: a pull request's head, never GitHub's synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -108,7 +117,10 @@ jobs:
           set -euo pipefail
           CRATE=$(cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
-          echo "ATEM_CLIENT_VERSION=${CRATE}-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "ATEM_CLIENT_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
 
       - name: Production packages (WASM, Kotlin/JVM; no test features)
         run: |
@@ -123,6 +135,7 @@ jobs:
           set -euo pipefail
           export JNA_JAR="$RUNNER_TEMP/jna/jna.jar" JAVA="$JAVA_HOME/bin/java" JAVAC="$JAVA_HOME/bin/javac"
           export KOTLIN_STDLIB="$RUNNER_TEMP/kotlin/kotlinc/lib/kotlin-stdlib.jar"
+          export EXPECT_COMMIT="$ATEM_CLIENT_HEAD"
           ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-wasm"
           ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-kotlin"
 
@@ -145,6 +158,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The packages are built from (and their pin names) the commit under
+          # review: a pull request's head, never GitHub's synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
@@ -157,7 +174,10 @@ jobs:
           set -euo pipefail
           CRATE=$(cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
-          echo "ATEM_CLIENT_VERSION=${CRATE}-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "ATEM_CLIENT_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
 
       - name: Production package (xcframework + SwiftPM, no test features)
         run: |
@@ -166,8 +186,9 @@ jobs:
           ./scripts/package-atem-client-apple.sh "$ATEM_CLIENT_VERSION" "$OUT"
           test -s "$OUT/atem-client-$ATEM_CLIENT_VERSION-apple-swiftpm.zip"
           (cd "$OUT" && shasum -a 256 -c "atem-client-$ATEM_CLIENT_VERSION-SHA256SUMS.txt")
-          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert len(p["commit"]) == 40 and p["crates"]["uniffi"], p' \
-            "$OUT/atem-client-$ATEM_CLIENT_VERSION-SOURCE.json"
+          # The pin names the commit under review, built from a clean tree.
+          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["commit"] == sys.argv[2] and p["tree_dirty"] is False and p["crates"]["uniffi"], p' \
+            "$OUT/atem-client-$ATEM_CLIENT_VERSION-SOURCE.json" "$ATEM_CLIENT_HEAD"
           # The shipped package builds without the test features, and
           # carries no test-only or host-role export.
           (cd "$OUT/AtemClient" && swift build)
