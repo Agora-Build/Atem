@@ -33,10 +33,16 @@
 //!   publication with their `409` paths;
 //! - [`restore`]: the Recovery Kit restore over the fetched log, envelope
 //!   and host-signed heads.
+//!
+//! The channel (§R9.7):
+//!
+//! - [`channel`]: `atem-ch1` in both roles (initiator and responder state
+//!   machines, transcript and key schedule, records, limits and errors).
 
 pub mod backup;
 pub mod backup_writer;
 pub mod canonical;
+pub mod channel;
 pub mod domain;
 pub mod encoding;
 pub mod error;

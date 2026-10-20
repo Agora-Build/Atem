@@ -380,8 +380,8 @@ pub fn signed_accept(
     genesis_hash: Hash32,
     host_id: &str,
     head: Head,
-) -> atem_client::restore::HostAccept {
-    let mut pair = atem_client::restore::HostAccept {
+) -> atem_client::channel::HostAccept {
+    let mut pair = atem_client::channel::HostAccept {
         e_c: [1; 32],
         n_c: [2; 32],
         genesis_hash,

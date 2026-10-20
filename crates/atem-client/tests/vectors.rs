@@ -12,6 +12,16 @@ use std::path::PathBuf;
 use atem_client::backup::{BackupKey, KBackupEnvelope};
 use atem_client::canonical::StrictValue;
 use atem_client::canonical::{self, Numbers, jcs};
+use atem_client::channel::record::{record_aad, record_nonce};
+use atem_client::channel::responder::HostContext;
+use atem_client::channel::transcript::{
+    Schedule, channel_id, client_signing_input, th3 as th3_of, th4,
+};
+use atem_client::channel::wire::{self, clear_error};
+use atem_client::channel::{
+    ChannelError, ClearCode, ClientProof, Direction, Failure, HeadError, HeadRelation, HostAccept,
+    Initiator, Principal, Responder,
+};
 use atem_client::domain::{SignLabel, SigningInput};
 use atem_client::encoding::{Hash32, b64u, b64u_decode, enc, hex, u64_field};
 use atem_client::hpke;
@@ -22,7 +32,7 @@ use atem_client::membership::{
     RecoveryState, Role, Stop,
 };
 use atem_client::provider::sign;
-use atem_client::restore::{HeadError, HostAccept, restore};
+use atem_client::restore::restore;
 use atem_client::{Error, KeyId, KeyProvider, SignedObject, SoftwareKeys};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -33,7 +43,6 @@ fn strict(value: &Value) -> StrictValue {
     StrictValue::parse(value.to_string().as_bytes(), usize::MAX).unwrap()
 }
 
-const TASK3: &str = "Task 3 (atem-ch1 transcript, key schedule, framing)";
 const TASK4: &str = "Task 4 (principals, grants, push hint and seen rules)";
 
 fn fixtures_dir() -> PathBuf {
@@ -109,14 +118,6 @@ impl Run {
 
     fn pending(&mut self, what: impl Into<String>, reason: &'static str) {
         self.pending.push((what.into(), reason));
-    }
-
-    /// Marks top-level fields that are wholly pending.
-    fn pending_fields(&mut self, fields: &[&str], reason: &'static str) {
-        for field in fields {
-            self.get(field);
-            self.pending(field.to_string(), reason);
-        }
     }
 
     fn finish(self) {
@@ -1301,6 +1302,187 @@ fn channel_handshake() {
         .unwrap();
     run.pass("sig_c: input enc([atem-ch1-client-sig-v1, th3]), dev-phone verifies");
 
+    // th2 and sig_h from the init/accept messages, verified with host-a's
+    // key from log L (HostAccept, §R9.7 steps 2–3).
+    let ml = load("r9-vectors-membership-log");
+    let ctx = Context::new(&ml["log"], &ml["others"], genesis_hash());
+    let log_l = ctx.chain(&[]);
+    let pair = HostAccept::from_messages(&strict(&init), &strict(&accept)).unwrap();
+    assert_eq!(pair.th2().to_hex(), run.get("th2_hex").as_str().unwrap());
+    let th2_input = run.get("th2_input_hex");
+    assert_eq!(Hash32::of(&unhex(th2_input.as_str().unwrap())), pair.th2());
+    assert_eq!(
+        hex(pair.signing_input().as_bytes()),
+        run.get("sig_h_input_hex").as_str().unwrap()
+    );
+    let verified = pair.verify(&log_l).unwrap();
+    assert_eq!(verified.head(), log_l.head());
+    run.pass("th2 from its transcript input, and sig_h verified with host-a's key from log L");
+
+    // The whole handshake through both state machines with the vector's
+    // ephemerals and nonces: every message and value byte for byte.
+    let e_c_secret = unhex32(s(&inputs, "e_c_secret_hex"));
+    let e_h_secret = unhex32(s(&inputs, "e_h_secret_hex"));
+    let n_c = unhex32(s(&inputs, "n_c_hex"));
+    let n_h = unhex32(s(&inputs, "n_h_hex"));
+    let host_signer = book.signer("host-a");
+    let host_ctx = HostContext {
+        log: &log_l,
+        host_id: "host-a",
+        host_trust_gen: 1,
+        provider: &book.provider,
+        key: &host_signer,
+    };
+    let (client, init_frame) = Initiator::start_with(&log_l, "host-a", e_c_secret, n_c, 0).unwrap();
+    assert_eq!(
+        wire::parse_frame(&init_frame).unwrap(),
+        wire::parse_frame(init.to_string().as_bytes()).unwrap()
+    );
+    run.pass("init: the initiator's frame (host-a at trust gen 1 from log L)");
+    let (host, accept_frame) =
+        Responder::on_init_with(&host_ctx, &init_frame, e_h_secret, n_h, 0).unwrap();
+    assert_eq!(
+        wire::parse_frame(&accept_frame).unwrap(),
+        wire::parse_frame(accept.to_string().as_bytes()).unwrap()
+    );
+    run.pass("accept: the responder's frame (head E6, sig_h reproduced)");
+    let accepted = client.on_frame(&accept_frame, &log_l, 1).unwrap();
+    assert_eq!(accepted.th2(), pair.th2());
+    assert_eq!(accepted.relation(), HeadRelation::Same);
+    assert_eq!(accepted.host_head().head(), log_l.head());
+    run.pass("the initiator verifies the accept against its log: same head");
+
+    let schedule = Schedule::new(pair.th2(), &unhex32(ss.as_str().unwrap()));
+    assert_eq!(hex(schedule.hs()), run.get("hs_hex").as_str().unwrap());
+    assert_eq!(
+        hex(&*schedule.finish_key()),
+        run.get("k_finish_hex").as_str().unwrap()
+    );
+    assert_eq!(
+        hex(&schedule.finish_aad()),
+        run.get("finish_aad_hex").as_str().unwrap()
+    );
+    run.pass("hs = HKDF-Extract(th2, ss); k_fin; the finish AAD");
+
+    let principal = Principal::Native {
+        device_id: "dev-phone".into(),
+    };
+    assert_eq!(principal.jcs(), run.get("principal_jcs").as_str().unwrap());
+    assert_eq!(
+        hex(th3_of(&pair.th2(), &sig_h, &principal).as_bytes()),
+        s(&run.file, "th3_hex")
+    );
+    let signed = accepted
+        .sign(principal.clone(), &book.provider, &book.signer("dev-phone"))
+        .unwrap();
+    assert_eq!(hex(signed.th3().as_bytes()), s(&run.file, "th3_hex"));
+    assert_eq!(
+        hex(signed.sig_c()),
+        s(&run.file, "sig_c_hex"),
+        "RFC 6979, low S"
+    );
+    run.pass("principal_jcs; th3; sig_c reproduced by the initiator");
+
+    let hello = run.get("hello_jcs");
+    let hello = hello.as_str().unwrap().as_bytes();
+    let hello_value: Value = serde_json::from_slice(hello).unwrap();
+    assert_eq!(
+        hello_value["data"]["proof"]["sig"].as_str().unwrap(),
+        b64u(signed.sig_c())
+    );
+    assert_eq!(
+        hello_value["data"]["proof"]["principal"],
+        principal.to_json()
+    );
+    let (mut client_channel, finish_frame) = signed.finish(hello, 2).unwrap();
+    let finish = run.get("finish");
+    assert_eq!(
+        wire::parse_frame(&finish_frame).unwrap(),
+        wire::parse_frame(finish.to_string().as_bytes()).unwrap()
+    );
+    let wire::Frame::Finish { ct } = wire::parse_frame(&finish_frame).unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(hex(&ct), run.get("finish_ct_hex").as_str().unwrap());
+    run.pass("finish: the hello sealed under k_fin, byte for byte");
+
+    let th4_value = th4(&signed_th3(&run), &unhex(s(&run.file, "sig_c_hex")), hello);
+    assert_eq!(
+        hex(th4_value.as_bytes()),
+        run.get("th4_hex").as_str().unwrap()
+    );
+    assert_eq!(
+        channel_id(&th4_value),
+        run.get("channel_id").as_str().unwrap()
+    );
+    assert_eq!(client_channel.channel_id(), s(&run.file, "channel_id"));
+    let (k_c2h, k_h2c) = schedule.record_keys(&th4_value);
+    assert_eq!(hex(&*k_c2h), run.get("k_c2h_hex").as_str().unwrap());
+    assert_eq!(hex(&*k_h2c), run.get("k_h2c_hex").as_str().unwrap());
+    run.pass("th4, channel_id, k_c2h, k_h2c");
+
+    let opened = host.on_finish(&finish_frame, 3).unwrap();
+    assert_eq!(opened.hello(), hello);
+    let keyed = opened.key(&ClientProof {
+        principal: principal.clone(),
+        sig_c: unhex(s(&run.file, "sig_c_hex")),
+    });
+    assert_eq!(keyed.channel_id(), s(&run.file, "channel_id"));
+    let mut host_channel = keyed.admit(&client_key).unwrap();
+    run.pass("the responder opens the finish, derives th4 and admits sig_c with dev-phone's key");
+
+    let records = run.get("records");
+    let records = records.as_array().unwrap();
+    for (i, record) in records.iter().enumerate() {
+        let dir = match s(record, "dir") {
+            "c2h" => Direction::C2h,
+            "h2c" => Direction::H2c,
+            other => panic!("dir {other}"),
+        };
+        let counter = record["counter"].as_u64().unwrap();
+        assert_eq!(hex(&record_aad(dir)), s(record, "aad_hex"));
+        assert_eq!(hex(&record_nonce(counter)), s(record, "nonce_hex"));
+        let plain = s(record, "plain_jcs").as_bytes();
+        let (sender, receiver) = match dir {
+            Direction::C2h => (&mut client_channel, &mut host_channel),
+            Direction::H2c => (&mut host_channel, &mut client_channel),
+        };
+        assert_eq!(sender.counters().0, counter, "record {i}");
+        let frame = sender.seal(plain, 4).unwrap();
+        let wire::Frame::Rec { ct } = wire::parse_frame(&frame).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(hex(&ct), s(record, "ct_hex"), "record {i}");
+        assert_eq!(&**receiver.open(&frame, 4).unwrap(), plain);
+    }
+    run.pass("records: welcome h2c 0, list c2h 0 and 1, sealed and opened byte for byte");
+
+    let rec = |ct_hex: &str| wire::Frame::Rec { ct: unhex(ct_hex) }.to_bytes();
+    // A fresh host channel at the vector's keys (the same ephemerals): what
+    // a host that has seen n records does with each negative case.
+    let sig_c_vector = unhex(s(&run.file, "sig_c_hex"));
+    let fresh_pair = || {
+        let (client, init_frame) =
+            Initiator::start_with(&log_l, "host-a", e_c_secret, n_c, 0).unwrap();
+        let (host, accept_frame) =
+            Responder::on_init_with(&host_ctx, &init_frame, e_h_secret, n_h, 0).unwrap();
+        let signed = client
+            .on_frame(&accept_frame, &log_l, 0)
+            .unwrap()
+            .sign(principal.clone(), &book.provider, &book.signer("dev-phone"))
+            .unwrap();
+        let (client_channel, finish_frame) = signed.finish(hello, 0).unwrap();
+        let host_channel = host
+            .on_finish(&finish_frame, 0)
+            .unwrap()
+            .key(&ClientProof {
+                principal: principal.clone(),
+                sig_c: sig_c_vector.clone(),
+            })
+            .admit(&client_key)
+            .unwrap();
+        (client_channel, host_channel, finish_frame)
+    };
     for case in run.get("negative").as_array().unwrap() {
         let name = s(case, "case");
         match name {
@@ -1314,81 +1496,163 @@ fn channel_handshake() {
                         Err(Error::ZeroSharedSecret)
                     );
                 }
-                run.pass("negative zero_shared_secret: refused before any HKDF");
+                // The host, on an init with that ephemeral: clear
+                // handshake_failed, before any key exists.
+                let mut zero_init = init.clone();
+                zero_init["e"] = Value::String(b64u(&peer));
+                let refused = Responder::on_init_with(
+                    &host_ctx,
+                    zero_init.to_string().as_bytes(),
+                    e_h_secret,
+                    n_h,
+                    0,
+                )
+                .err()
+                .unwrap();
+                assert_eq!(
+                    refused.error,
+                    ChannelError::HandshakeFailed(Failure::ZeroSharedSecret)
+                );
+                assert_eq!(
+                    refused.reply.as_deref(),
+                    Some(&clear_error(ClearCode::HandshakeFailed)[..])
+                );
+                // The client, on a correctly signed accept with it: refused,
+                // nothing sent.
+                let (client, init_frame) =
+                    Initiator::start_with(&log_l, "host-a", e_c_secret, n_c, 0).unwrap();
+                let wire::Frame::Init(sent) = wire::parse_frame(&init_frame).unwrap() else {
+                    unreachable!()
+                };
+                let mut forged = wire::Accept {
+                    e: peer,
+                    n: n_h,
+                    head: log_l.head(),
+                    sig: Vec::new(),
+                };
+                forged.sig = sign(
+                    &book.provider,
+                    &host_signer,
+                    &HostAccept::new(&sent, &forged).signing_input(),
+                )
+                .unwrap();
+                assert_eq!(
+                    client
+                        .on_frame(&wire::Frame::Accept(forged).to_bytes(), &log_l, 0)
+                        .err(),
+                    Some(ChannelError::HandshakeFailed(Failure::ZeroSharedSecret))
+                );
+                run.pass(
+                    "negative zero_shared_secret: refused before any HKDF, by both state machines",
+                );
             }
             "tampered_head" => {
                 assert_eq!(case["sig_h_valid"], false);
                 let input = SigningInput::new(SignLabel::ChannelHost, &unhex(s(case, "th2_hex")));
                 assert_eq!(host_key.verify(&input, &sig_h), Err(Error::BadSignature));
-                run.pass("negative tampered_head: sig_h fails over the rewritten th2");
+                let mut rewritten = accept.clone();
+                rewritten["head"] = case["head"].clone();
+                let forged =
+                    HostAccept::from_messages(&strict(&init), &strict(&rewritten)).unwrap();
+                assert_eq!(forged.th2().to_hex(), s(case, "th2_hex"));
+                assert_eq!(forged.verify(&log_l), Err(HeadError::BadSignature));
+                let (client, _) =
+                    Initiator::start_with(&log_l, "host-a", e_c_secret, n_c, 0).unwrap();
+                assert_eq!(
+                    client
+                        .on_frame(rewritten.to_string().as_bytes(), &log_l, 0)
+                        .err(),
+                    Some(ChannelError::HandshakeFailed(Failure::BadHostSignature))
+                );
+                run.pass("negative tampered_head: th2 from the rewritten head; sig_h refused by the initiator");
             }
             "replayed_finish" => {
-                let input = SigningInput::new(SignLabel::ChannelHost, &unhex(s(case, "th2_hex")));
+                // The second channel's host values are public only: its th2,
+                // sig_h and k_finish from the client's side of that channel.
+                let e_h2 = unhex32(s(case, "e_h_hex"));
+                let mut second = pair.clone();
+                second.e_h = e_h2;
+                second.n_h = unhex32(s(case, "n_h_hex"));
+                assert_eq!(second.th2().to_hex(), s(case, "th2_hex"));
                 host_key
-                    .verify(&input, &unhex(s(case, "sig_h_hex")))
+                    .verify(&second.signing_input(), &unhex(s(case, "sig_h_hex")))
                     .unwrap();
-                run.pass("negative replayed_finish: the second channel's sig_h verifies");
-                run.pending(
-                    "negative replayed_finish: th2, k_finish and the failed tag",
-                    TASK3,
+                let ss2 = eph.x25519(&KeyId::new("e_c"), &e_h2).unwrap();
+                let schedule2 = Schedule::new(second.th2(), &ss2);
+                assert_eq!(hex(&*schedule2.finish_key()), s(case, "k_finish_hex"));
+                assert_eq!(case["opens"], false);
+                assert!(schedule2.open_finish(&ct).is_none());
+                // And through the responder: a new channel (fresh e_h, n_h)
+                // refuses the replayed finish in the clear.
+                let (host2, _) = Responder::on_init(&host_ctx, &init_frame, 0).unwrap();
+                let refused = host2.on_finish(&finish_frame, 0).err().unwrap();
+                assert_eq!(
+                    refused.error,
+                    ChannelError::HandshakeFailed(Failure::FinishTag)
+                );
+                assert_eq!(
+                    refused.reply.as_deref(),
+                    Some(&clear_error(ClearCode::HandshakeFailed)[..])
+                );
+                run.pass("negative replayed_finish: th2, sig_h and k_finish of the second channel; the tag fails");
+            }
+            "tampered_finish" => {
+                assert_eq!(case["opens"], false);
+                let (host, _) =
+                    Responder::on_init_with(&host_ctx, &init_frame, e_h_secret, n_h, 0).unwrap();
+                let tampered = wire::Frame::Finish {
+                    ct: unhex(s(case, "ct_hex")),
+                }
+                .to_bytes();
+                let refused = host.on_finish(&tampered, 0).err().unwrap();
+                assert_eq!(
+                    refused.error,
+                    ChannelError::HandshakeFailed(Failure::FinishTag)
+                );
+                assert_eq!(
+                    refused.reply.as_deref(),
+                    Some(&clear_error(ClearCode::HandshakeFailed)[..])
+                );
+                run.pass("negative tampered_finish: the responder refuses it in the clear");
+            }
+            "replayed_record" => {
+                assert_eq!(case["opens"], false);
+                assert_eq!(case["expected_counter"], 1);
+                let (mut client, mut host, _) = fresh_pair();
+                let first = client
+                    .seal(s(&records[1], "plain_jcs").as_bytes(), 0)
+                    .unwrap();
+                host.open(&first, 0).unwrap();
+                assert_eq!(
+                    host.open(&rec(s(case, "ct_hex")), 0).err(),
+                    Some(ChannelError::RecordRejected)
+                );
+                assert!(host.is_closed());
+                run.pass(
+                    "negative replayed_record: counter 0 again where 1 is due closes the channel",
                 );
             }
-            "tampered_finish" | "replayed_record" | "direction_confusion" => {
-                run.pending(format!("negative {name}"), TASK3)
+            "direction_confusion" => {
+                assert_eq!(case["opens"], false);
+                let (mut client, _, _) = fresh_pair();
+                assert_eq!(
+                    client.open(&rec(s(case, "ct_hex")), 0).err(),
+                    Some(ChannelError::RecordRejected)
+                );
+                assert!(client.is_closed());
+                run.pass(
+                    "negative direction_confusion: a c2h record at the h2c receiver closes it",
+                );
             }
             other => panic!("unknown negative case {other}"),
         }
     }
-    run.pending_fields(
-        &[
-            "hello_jcs",
-            "principal_jcs",
-            "hs_hex",
-            "k_finish_hex",
-            "finish",
-            "finish_aad_hex",
-            "finish_ct_hex",
-            "th4_hex",
-            "channel_id",
-            "k_c2h_hex",
-            "k_h2c_hex",
-            "records",
-        ],
-        TASK3,
-    );
-    // th2 and sig_h from the init/accept messages, verified with host-a's
-    // key from log L (restore's HostAccept, §R9.7 steps 2–3).
-    let ml = load("r9-vectors-membership-log");
-    let ctx = Context::new(&ml["log"], &ml["others"], genesis_hash());
-    let log_l = ctx.chain(&[]);
-    let init = run.get("init");
-    let accept = run.get("accept");
-    let pair = HostAccept::from_messages(&strict(&init), &strict(&accept)).unwrap();
-    assert_eq!(pair.th2().to_hex(), run.get("th2_hex").as_str().unwrap());
-    let th2_input = run.get("th2_input_hex");
-    assert_eq!(Hash32::of(&unhex(th2_input.as_str().unwrap())), pair.th2());
-    assert_eq!(
-        hex(pair.signing_input().as_bytes()),
-        run.get("sig_h_input_hex").as_str().unwrap()
-    );
-    let verified = pair.verify(&log_l).unwrap();
-    assert_eq!(verified.head(), log_l.head());
-    run.pass("th2 from its transcript input, and sig_h verified with host-a's key from log L");
-    // The tampered head: the client's th2 changes and sig_h fails.
-    let tampered = &run.file["negative"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["case"] == "tampered_head")
-        .unwrap()
-        .clone();
-    let mut rewritten = accept.clone();
-    rewritten["head"] = tampered["head"].clone();
-    let forged = HostAccept::from_messages(&strict(&init), &strict(&rewritten)).unwrap();
-    assert_eq!(forged.th2().to_hex(), s(tampered, "th2_hex"));
-    assert_eq!(forged.verify(&log_l), Err(HeadError::BadSignature));
-    run.pass("negative tampered_head: th2 from the rewritten head; sig_h refused");
     run.finish();
+}
+
+/// The vector's `th3` (what the host recomputes from the hello's proof).
+fn signed_th3(run: &Run) -> Hash32 {
+    Hash32::from_hex(s(&run.file, "th3_hex")).unwrap()
 }
 
 #[test]
@@ -1448,8 +1712,24 @@ fn browser_grant() {
         ));
         run.pending(format!("invalid {name}: {}", s(case, "reason")), TASK4);
     }
-    run.pending("th3 with grant_hash (and principal_jcs)", TASK3);
-    run.get("principal_jcs");
+    // th3 binds the principal and the grant hash (§R9.7 step 5).
+    let principal = Principal::browser(&object).unwrap();
+    assert_eq!(principal.jcs(), run.get("principal_jcs").as_str().unwrap());
+    let channel = load("r9-vectors-channel-handshake");
+    let th2 = Hash32::from_hex(s(&channel, "th2_hex")).unwrap();
+    let browser_th3 = th3_of(&th2, &unhex(s(&channel, "sig_h_hex")), &principal);
+    assert_eq!(hex(browser_th3.as_bytes()), s(&run.file, "th3_hex"));
+    assert_eq!(
+        hex(&sign(
+            &browser,
+            &KeyId::new("b"),
+            &client_signing_input(&browser_th3)
+        )
+        .unwrap()),
+        s(&run.file, "sig_c_hex"),
+        "RFC 6979, low S"
+    );
+    run.pass("th3 with principal_jcs and grant_hash; sig_c reproduced");
     run.finish();
 }
 

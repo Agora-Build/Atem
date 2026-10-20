@@ -6,6 +6,7 @@ mod support;
 
 use atem_client::backup::{BackupKey, KBackupEnvelope};
 use atem_client::backup_writer::{BackupError, BackupJob, BackupWriter, PutReply, Step};
+use atem_client::channel::{HeadError, HostAccept};
 use atem_client::encoding::Hash32;
 use atem_client::kit::RecoveryKit;
 use atem_client::membership::publish::{AppendReply, Published, Publisher};
@@ -14,7 +15,7 @@ use atem_client::membership::{
     KBackupRecord, KitMode, Member, MemberKind, Membership, RECOVERY_SIGNER, RECOVERY_WAIT_MS,
     Role, Stop, draft_on, sign_entry, sign_entry_cosigned,
 };
-use atem_client::restore::{HeadError, HostAccept, restore};
+use atem_client::restore::restore;
 use atem_client::{Alg, KeyId, SignedObject, SoftwareKeys};
 use support::{FakeRelay, signed_accept, strict};
 use zeroize::Zeroizing;
