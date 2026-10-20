@@ -24,10 +24,9 @@ use atem_client::channel::{
     Channel, ChannelError, ClientProof, Initiator, Keyed, Principal, Responder,
 };
 use atem_client::encoding::{Hash32, b64u, b64u_decode};
-use atem_client::kit::RecoveryKit;
 use atem_client::membership::publish::{AppendReply, Published, Publisher};
 use atem_client::membership::{Admission, Conflict, Member, MemberKind, Membership, Role, Stop};
-use atem_client::restore::{RestoreError, restore};
+use atem_client::restore::{Enrollment, Freshness, RestoreError, RestoreFlow, UserNotice};
 use serde_json::{Map, Value, json};
 use support::*;
 use zeroize::Zeroizing;
@@ -862,6 +861,8 @@ struct ClientSide<'a> {
     /// The last restore: the kids it stored, or why it stopped (`None`:
     /// the kit itself was refused).
     last_restore: Option<Result<Vec<String>, Option<RestoreError>>>,
+    /// The restore client machine of the last `restore` step.
+    last_flow: Option<RestoreFlow>,
 }
 
 impl<'a> ClientSide<'a> {
@@ -891,6 +892,7 @@ impl<'a> ClientSide<'a> {
             keys,
             clock: Clock::at(1_793_264_200_000),
             last_restore: None,
+            last_flow: None,
         }
     }
 
@@ -1200,7 +1202,6 @@ impl<'a> ClientSide<'a> {
     }
 
     fn assert_client(&mut self, spec: &Value) {
-        let mut later = Vec::new();
         if let Some(name) = spec.get("by").and_then(Value::as_str) {
             let w = &self.writers[name];
             let writer = w.writer.as_ref().unwrap();
@@ -1256,14 +1257,22 @@ impl<'a> ClientSide<'a> {
                         assert!(last.is_err(), "no log stored as current");
                     }
                     "may_rotate_k" | "may_seal_backup" => {
-                        assert!(!want.as_bool().unwrap());
-                        assert!(last.is_err(), "no K stored, so nothing to rotate or seal");
-                        later.push(key.clone());
+                        let flow = self.last_flow.as_ref().expect("a restore flow ran");
+                        let got = if key == "may_rotate_k" {
+                            flow.may_rotate_k("dev-newmac")
+                        } else {
+                            flow.may_seal_backup("dev-newmac")
+                        };
+                        assert_eq!(got, want.as_bool().unwrap(), "{key}");
+                        assert_eq!(flow.k_stored(), last.is_ok());
                     }
                     "user_notice" => {
                         assert_eq!(want, "waiting_for_host");
-                        assert!(matches!(last, Err(Some(e)) if e.is_withheld()));
-                        later.push(key.clone());
+                        let flow = self.last_flow.as_ref().expect("a restore flow ran");
+                        assert!(matches!(
+                            flow.user_notice(),
+                            Some(UserNotice::WaitingForHost { hosts }) if hosts == ["host-a"]
+                        ));
                     }
                     "refetch" => assert_eq!(
                         matches!(last, Err(Some(e)) if e.refetch()),
@@ -1274,12 +1283,6 @@ impl<'a> ClientSide<'a> {
             }
         }
         self.report.pass();
-        for key in later {
-            self.report.pending(
-                format!("assert_client {key}: the client machine's flag and notice"),
-                "Task 4 (client machines)",
-            );
-        }
     }
 
     fn restore(&mut self, step: &Value) {
@@ -1302,16 +1305,17 @@ impl<'a> ClientSide<'a> {
                 }
             }
         }
-        let outcome = match RecoveryKit::read(&r, &account, genesis, &tag) {
+        let outcome = match RestoreFlow::read(&r, &account, genesis, &tag) {
             Err(e) => {
                 assert_eq!(step["result"], "refused");
                 assert_eq!(e.code(), step["detail"].as_str().unwrap());
                 assert_eq!(step["published"], false);
                 self.last_restore = Some(Err(None));
+                self.last_flow = None;
                 self.report.pass();
                 return;
             }
-            Ok(kit) => {
+            Ok(mut flow) => {
                 let refs = labels(&spec["relay_log"]);
                 let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
                 let blob = resolve(&spec["relay_blob"], self.v, &self.named);
@@ -1353,17 +1357,18 @@ impl<'a> ClientSide<'a> {
                         )
                     })
                     .collect();
-                let result = restore(
-                    &kit,
-                    &self.v.entries(&refs),
-                    blob.as_bytes(),
-                    &heads,
-                    &self.clock.now,
-                );
-                (kit, result)
+                let result = flow
+                    .attempt(
+                        &self.v.entries(&refs),
+                        blob.as_bytes(),
+                        &heads,
+                        &self.clock.now,
+                    )
+                    .map(|r| r.keys.iter().map(|k| k.kid.clone()).collect::<Vec<_>>());
+                (flow, result)
             }
         };
-        let (kit, result) = outcome;
+        let (mut flow, result) = outcome;
         match result {
             Err(error) => {
                 let want = step["result"].as_str().unwrap();
@@ -1386,10 +1391,11 @@ impl<'a> ClientSide<'a> {
                 assert_eq!(step["published"], false);
                 self.last_restore = Some(Err(Some(error)));
             }
-            Ok(restored) => {
+            Ok(kids) => {
                 assert_eq!(step["result"], "restored", "{}", self.report.name);
                 assert_eq!(step["freshness"], "host_confirmed");
-                let kids: Vec<String> = restored.keys.iter().map(|k| k.kid.clone()).collect();
+                assert_eq!(flow.freshness(), Some(Freshness::HostConfirmed));
+                assert!(flow.k_stored());
                 assert_eq!(kids, labels(&step["kids"]));
                 // Publish: a recovery_add for the new device on the
                 // confirmed head, valid on the restored log.
@@ -1401,9 +1407,8 @@ impl<'a> ClientSide<'a> {
                         roles: [Role::Control, Role::Manage, Role::View].into(),
                     },
                 };
-                let entry = restored
-                    .recovery_add(&kit, member, self.clock.now.wall_ms)
-                    .unwrap();
+                let (entry, expected) = flow.enroll(member, self.clock.now.wall_ms).unwrap();
+                assert_eq!(expected, flow.restored().unwrap().head);
                 let published = resolve(&step["published"], self.v, &self.named);
                 assert_eq!(published["action"], "recovery_add");
                 assert_eq!(entry.seq, published["seq"].as_u64().unwrap());
@@ -1412,12 +1417,23 @@ impl<'a> ClientSide<'a> {
                     published["prev_hash"].as_str().unwrap()
                 );
                 assert_eq!(
-                    restored.log.check_next(&entry),
+                    flow.restored().unwrap().log.check_next(&entry),
                     atem_client::membership::Check::Valid
                 );
+                // The relay stores it: published, pending the 24 h wait; the
+                // device holds nothing yet, so it rotates and seals nothing.
+                assert!(matches!(
+                    flow.append_reply(
+                        atem_client::membership::publish::AppendReply::Stored,
+                        &self.clock.now
+                    ),
+                    Ok(Enrollment::Published { .. })
+                ));
+                assert!(!flow.may_rotate_k("dev-newmac"));
                 self.last_restore = Some(Ok(kids));
             }
         }
+        self.last_flow = Some(flow);
         self.report.pass();
     }
 }

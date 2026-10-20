@@ -13,6 +13,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
+use atem_client::SignedObject;
 use atem_client::channel::record::Direction;
 use atem_client::channel::responder::HostContext;
 use atem_client::channel::transcript::{Schedule, th3, th4};
@@ -24,11 +25,11 @@ use atem_client::channel::{
 use atem_client::encoding::{b64u, b64u_decode, hex};
 use atem_client::membership::{Admission, Entry, Membership};
 use atem_client::provider::sign;
+use atem_client::session::r9::{Hello, HelloRefusal};
 use atem_client::{KeyId, SoftwareKeys};
 use serde_json::{Value, json};
 use support::*;
 
-const T4: &str = "Task 4 (the r9 hello and welcome inside the channel: revision, proof, carriage)";
 const T7: &str = "Task 7 (host admission and effects: welcome content, attachments, dispatches, PTY writes, session replies)";
 
 const FILES: [&str; 5] = [
@@ -124,15 +125,16 @@ enum Outcome {
         reply: Option<Vec<u8>>,
     },
     /// The host's encrypted first-record refusal, opened with the keys the
-    /// hello as sent gives: the session error's code.
-    InChannel { code: String },
+    /// hello as sent gives: the session error.
+    InChannel { code: String, error: Value },
     /// The client refused; how many frames it sent after `accept`.
     ClientRefused {
         error: ChannelError,
         sent_after_accept: usize,
     },
-    /// The client sent its `finish`; the carriage its hello carried.
-    ClientSent { carriage: Carriage },
+    /// The client sent its `finish`; the carriage its hello carried, and
+    /// the hello the crate built (the bytes it sealed).
+    ClientSent { carriage: Carriage, hello: Vec<u8> },
 }
 
 struct Fixture<'a> {
@@ -339,7 +341,10 @@ impl<'a> Fixture<'a> {
                 // Opened with the keys of the hello as sent, the host's
                 // first record is the session error.
                 let code = self.open_as_sent(&reply, &proof, &sent, &hello);
-                self.outcome = Some(Outcome::InChannel { code });
+                self.outcome = Some(Outcome::InChannel {
+                    code,
+                    error: Value::Null,
+                });
             }
         }
     }
@@ -497,18 +502,21 @@ impl<'a> Fixture<'a> {
                         &self.book.auth("dev-phone"),
                     )
                     .unwrap();
-                let hello = json!({"type": "session", "data": {"v": 1, "op": "hello",
-                    "revision": 9, "id": "aaaaaaaa-0000-4000-8000-000000000001",
-                    "proof": {"principal": Self::principal().to_json(), "sig": b64u(signed.sig_c())},
-                    "membership": {"head": {"seq": carriage.head.seq,
-                                            "hash": carriage.head.hash.to_hex()},
-                                   "entries": carriage.entries.iter().map(|o| o.to_json()).collect::<Vec<_>>()}}});
-                let (_, finish) = signed.finish(hello.to_string().as_bytes(), 0).unwrap();
+                // The crate's own hello (what `finish_hello` seals).
+                let id = "aaaaaaaa-0000-4000-8000-000000000001";
+                let hello = atem_client::session::r9::hello_bytes(
+                    id,
+                    &Self::principal(),
+                    signed.sig_c(),
+                    &carriage,
+                    None,
+                );
+                let (_, finish) = signed.finish_hello(id, &carriage, None, 0).unwrap();
                 assert!(matches!(
                     wire::parse_frame(&finish),
                     Ok(Frame::Finish { .. })
                 ));
-                self.outcome = Some(Outcome::ClientSent { carriage });
+                self.outcome = Some(Outcome::ClientSent { carriage, hello });
             }
         }
     }
@@ -645,7 +653,7 @@ impl<'a> Fixture<'a> {
                             Some(wire::clear_error(ClearCode::parse(code).unwrap()))
                         );
                     }
-                    Some(Outcome::InChannel { code: got }) => {
+                    Some(Outcome::InChannel { code: got, .. }) => {
                         assert_eq!(at, "finish");
                         assert_eq!(got, code);
                     }
@@ -678,7 +686,7 @@ impl<'a> Fixture<'a> {
                 self.report.pass();
             }
             "expect_client_sent" => {
-                let Some(Outcome::ClientSent { carriage }) = self.outcome.take() else {
+                let Some(Outcome::ClientSent { carriage, hello }) = self.outcome.take() else {
                     panic!("{}: the client sent no finish", self.report.name)
                 };
                 assert_eq!(step["op"], "finish");
@@ -701,8 +709,20 @@ impl<'a> Fixture<'a> {
                     }
                 }
                 self.report.pass();
-                self.report
-                    .pending("expect_client_sent: the hello carrying that carriage", T4);
+                // The hello as the host reads it carries exactly that
+                // carriage, revision 9 and the proof.
+                let read = Hello::parse(&hello).expect("a readable hello");
+                let membership = read.check().expect("a valid r9 hello");
+                assert_eq!(membership.head, carriage.head);
+                let entries: Vec<SignedObject> = membership
+                    .entries
+                    .iter()
+                    .map(|e| SignedObject::from_strict(e).unwrap())
+                    .collect();
+                assert_eq!(entries, carriage.entries);
+                assert_eq!(membership.more, carriage.more);
+                assert_eq!(read.proof.principal, Self::principal());
+                self.report.pass();
             }
             "replay" => {
                 keys(&step, &["replay"]);
@@ -760,10 +780,13 @@ impl<'a> Fixture<'a> {
                 match self.outcome.take() {
                     // The channel carried the refusal (checked in `connect`);
                     // the refusal itself is the hello check.
-                    Some(Outcome::InChannel { .. }) => self.report.pending(
-                        format!("expect {want}: refusing the hello for its revision"),
-                        T4,
-                    ),
+                    // The host's hello check refused it in the channel.
+                    Some(Outcome::InChannel { error, .. }) => {
+                        for (k, v) in want.as_object().unwrap() {
+                            assert_eq!(&error["data"][k], v, "{k}");
+                        }
+                        self.report.pass();
+                    }
                     _ => self
                         .report
                         .pending(format!("expect {want}: a session reply in the channel"), T7),
@@ -815,19 +838,21 @@ impl<'a> Fixture<'a> {
         let hello = hello.to_string().into_bytes();
         let (mut client, finish) = signed.finish(&hello, 0).unwrap();
         let opened = host.on_finish(&finish, 0).unwrap();
-        let sent: Value = serde_json::from_slice(opened.hello()).unwrap();
-        let keyed = opened.key(&ClientProof {
-            principal: Self::principal(),
-            sig_c: b64u_decode(s(&sent["data"]["proof"], "sig")).unwrap(),
-        });
-        assert_eq!(sent["data"]["revision"], 8);
-        let error = json!({"type": "session", "data": {"v": 1, "op": "error",
-            "code": "unsupported_version", "revision": 9}});
-        let reply = keyed.refuse(error.to_string().as_bytes(), 0).unwrap();
+        // The host's order: read the proof, key the channel, then the hello
+        // check, whose refusal is the encrypted first record.
+        let read = Hello::parse(opened.hello()).expect("the proof is readable");
+        assert_eq!(read.revision, Some(8));
+        let refusal = read.check().expect_err("a revision-8 hello is refused");
+        assert_eq!(refusal, HelloRefusal::UnsupportedVersion);
+        let keyed = opened.key(&read.proof);
+        let reply = keyed
+            .refuse(&refusal.to_error(read.id.as_deref()).to_bytes(), 0)
+            .unwrap();
         let plain = client.open(&reply, 0).unwrap();
         let got: Value = serde_json::from_slice(&plain).unwrap();
         self.outcome = Some(Outcome::InChannel {
             code: got["data"]["code"].as_str().unwrap().to_owned(),
+            error: got,
         });
         self.report.pass();
     }

@@ -15,6 +15,8 @@ use atem_client::membership::{Entry, Head, HostNow};
 use atem_client::{KeyId, KeyProvider, PublicKey, SignedObject, SoftwareKeys};
 use serde_json::Value;
 
+pub mod host;
+
 pub const ACCOUNT: &str = "acct-test-1";
 
 pub fn fixtures_dir() -> PathBuf {
@@ -89,6 +91,19 @@ impl Book {
                     Some("p256") => provider.insert_p256(id, &secret).unwrap(),
                     Some("ed25519") => provider.insert_ed25519(id, &secret),
                     _ => provider.insert_x25519(id, &secret),
+                }
+            }
+            // A key named by its entry alone (the browser's WebCrypto key).
+            if let (Some(alg), Some(secret)) = (
+                entry.get("alg").and_then(Value::as_str),
+                entry.get("secret_hex").and_then(Value::as_str),
+            ) {
+                let id = KeyId::new(format!("{name}/auth"));
+                let secret = unhex32(secret);
+                match alg {
+                    "p256" => provider.insert_p256(id, &secret).unwrap(),
+                    "ed25519" => provider.insert_ed25519(id, &secret),
+                    _ => {}
                 }
             }
             if let Some(seed) = entry.get("sign_seed_hex") {

@@ -31,7 +31,12 @@ use atem_client::membership::{
     Check, Entry, Head, HostNow, Invalid, Member, MemberKind, Membership, RECOVERY_WAIT_MS,
     RecoveryState, Role, Stop,
 };
+use atem_client::principal::{Authority, BrowserGrant, Need, Op, Refusal as PrincipalRefusal};
 use atem_client::provider::sign;
+use atem_client::push::{
+    self, Accepted, Hint, HintBook, HintPlain, HintState, Refusal as PushRefusal, RelayLedger,
+    Seen, Stage, Verdict, Verifier,
+};
 use atem_client::restore::restore;
 use atem_client::{Error, KeyId, KeyProvider, SignedObject, SoftwareKeys};
 use serde_json::Value;
@@ -42,8 +47,6 @@ use zeroize::Zeroizing;
 fn strict(value: &Value) -> StrictValue {
     StrictValue::parse(value.to_string().as_bytes(), usize::MAX).unwrap()
 }
-
-const TASK4: &str = "Task 4 (principals, grants, push hint and seen rules)";
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../designs/protocol/fixtures")
@@ -206,6 +209,12 @@ impl Book {
     fn signer_public(&self, name: &str) -> PublicKey {
         self.provider.public_key(&self.signer(name)).unwrap()
     }
+}
+
+/// Log L (E1–E6) as a verifier holds it.
+fn log_l() -> Membership {
+    let file = load("r9-vectors-membership-log");
+    Context::new(&file["log"], &file["others"], genesis_hash()).chain(&[])
 }
 
 fn genesis_hash() -> Hash32 {
@@ -1722,6 +1731,38 @@ fn browser_grant() {
     );
     run.pass("th2 is the channel vector's");
 
+    // The grant through §R9.6's checks at host-a (log L, generation 1):
+    // a view-only browser on its target session, for the rest of its hour.
+    let log = log_l();
+    let grant = BrowserGrant::parse(object.clone()).unwrap();
+    let now = grant.issued_at + 1_000;
+    let authority = Authority::of_grant(&grant, &log, "host-a", 1, now, &|_| false).unwrap();
+    assert_eq!(
+        authority.name(),
+        "browser:7b2d8c5a-0e3f-4a41-9c9d-3e4f5a6b7c8d"
+    );
+    assert_eq!(authority.key, browser_key);
+    assert_eq!(authority.issuer.as_deref(), Some("dev-phone"));
+    assert!(authority.allows(Need::Op(Op::View)));
+    assert!(!authority.allows(Need::Lease));
+    assert!(!authority.allows(Need::Control));
+    assert!(authority.session_in_scope("host-a", "ses-aaaaaaaaaaaa", &|_| None));
+    assert!(!authority.session_in_scope("host-a", "ses-bbbbbbbbbbbb", &|_| None));
+    assert_eq!(authority.authorization_ms_left(now, 86_400_000), 3_599_000);
+    assert_eq!(
+        Authority::of_grant(&grant, &log, "host-a", 1, grant.expires_at, &|_| false),
+        Err(PrincipalRefusal::Unauthorized("expired"))
+    );
+    assert_eq!(
+        Authority::of_grant(&grant, &log, "host-a", 1, now, &|id| id == grant.grant_id),
+        Err(PrincipalRefusal::Unauthorized("grant revoked"))
+    );
+    assert_eq!(
+        Authority::of_grant(&grant, &log, "host-a", 2, now, &|_| false),
+        Err(PrincipalRefusal::Unauthorized("invalid grant"))
+    );
+    run.pass("grant: a view-only browser on its session at host-a; expired, revoked, other generation refused");
+
     for case in run.get("invalid").as_array().unwrap() {
         let name = s(case, "case");
         let object = SignedObject::from_strict(&strict(&case["grant"])).unwrap();
@@ -1730,7 +1771,16 @@ fn browser_grant() {
         run.pass(format!(
             "invalid {name}: well-formed and signed by {signer}"
         ));
-        run.pending(format!("invalid {name}: {}", s(case, "reason")), TASK4);
+        let invalid = BrowserGrant::parse(object).unwrap();
+        assert_eq!(
+            Authority::of_grant(&invalid, &log, "host-a", 1, now, &|_| false),
+            Err(PrincipalRefusal::Unauthorized("invalid grant")),
+            "{name}"
+        );
+        run.pass(format!(
+            "invalid {name}: refused, invalid grant ({})",
+            s(case, "reason")
+        ));
     }
     // th3 binds the principal and the grant hash (§R9.7 step 5).
     let principal = Principal::browser(&object).unwrap();
@@ -1827,7 +1877,67 @@ fn push_hint() {
         run.pass(format!(
             "{name}: opens for {device}; seal from ikmE reproduces enc and ct"
         ));
-        run.pending(format!("{name}: seal info from the hint's fields"), TASK4);
+
+        // The crate's own host side and recipient side.
+        let log = log_l();
+        let now = run.get("verifier_now").as_u64().unwrap();
+        let verified = Hint::verify(&object, &log, now, Verifier::Client).unwrap();
+        verified.check_sealed().unwrap();
+        let HintState::Open { .. } = &verified.state else {
+            panic!("{name} is open")
+        };
+        assert_eq!(
+            hex(&push::seal_info(
+                &verified.key,
+                verified.created_at,
+                verified.expires_at,
+                device,
+                &kid
+            )
+            .unwrap()),
+            s(details, "info_hex")
+        );
+        let opened = verified
+            .open(&book.provider, &KeyId::new(format!("{device}/enc")), device)
+            .unwrap();
+        assert_eq!(
+            serde_json::json!({"summary": opened.summary, "tool": opened.tool}).to_string(),
+            s(details, "plain_jcs")
+        );
+        let other = if device == "dev-phone" {
+            "dev-mac"
+        } else {
+            "dev-phone"
+        };
+        assert!(
+            verified
+                .open(&book.provider, &KeyId::new(format!("{other}/enc")), other)
+                .is_err(),
+            "another device can't open it"
+        );
+        let rebuilt = push::open_hint_with_ikm(
+            &book.provider,
+            &book.signer("host-a"),
+            &verified.key,
+            verified.created_at,
+            verified.expires_at,
+            device,
+            &recipient,
+            &HintPlain {
+                tool: opened.tool.clone(),
+                summary: opened.summary.clone(),
+            },
+            &unhex32(s(details, "ikmE_hex")),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, object, "the host's hint, byte for byte");
+        assert_eq!(
+            Hint::verify(&object, &log, now, Verifier::Relay).unwrap(),
+            verified
+        );
+        run.pass(format!(
+            "{name}: seal info from the hint's fields; verified by client and relay; opened by {device} only; rebuilt byte for byte"
+        ));
     };
 
     let open = run.get("open");
@@ -1845,13 +1955,92 @@ fn push_hint() {
         let hint = run.get(name);
         let details = run.get(&format!("{name}_details"));
         check_open(&mut run, name.to_owned(), &hint, &details);
-        run.pending(format!("{name}: {}", s(&details, "note")), TASK4);
+        // The mobile stage at created_at + 60 s against the guard.
+        let object = SignedObject::from_strict(&strict(&hint)).unwrap();
+        let h = Hint::verify(
+            &object,
+            &log_l(),
+            run.get("verifier_now").as_u64().unwrap(),
+            Verifier::Relay,
+        )
+        .unwrap();
+        let mobile = push::RecipientInfo {
+            class: push::DeviceClass::Mobile,
+            connected: false,
+            immediate_mobile: false,
+        };
+        let (stage, due) = push::stages(h.created_at, mobile)
+            .into_iter()
+            .find(|(st, _)| *st == Stage::Mobile)
+            .unwrap();
+        assert_eq!(due, h.created_at + 60_000);
+        let sent = push::send_now(stage, due, due, h.expires_at, false, false);
+        let later = push::send_now(
+            stage,
+            due,
+            h.expires_at - 15_001,
+            h.expires_at,
+            false,
+            false,
+        );
+        match name {
+            "open_g75" => {
+                assert_eq!(due, push::guard(h.expires_at));
+                assert!(!sent && !later, "on the guard: never sent");
+            }
+            _ => {
+                assert_eq!(due + 1, push::guard(h.expires_at));
+                assert!(sent, "1 ms before the guard: sent");
+            }
+        }
+        run.pass(format!("{name}: {}", s(&details, "note")));
     }
 
     let resolved = SignedObject::from_strict(&strict(&run.get("resolved"))).unwrap();
     resolved.verify(&host_key).unwrap();
     assert!(resolved.sealed().is_none());
     run.pass("resolved: host signature");
+    let log = log_l();
+    let now = run.get("verifier_now").as_u64().unwrap();
+    let open0 = SignedObject::from_strict(&strict(&run.get("open")[0])).unwrap();
+    let open0 = Hint::verify(&open0, &log, now, Verifier::Client).unwrap();
+    let res = Hint::verify(&resolved, &log, now, Verifier::Client).unwrap();
+    let HintState::Resolved {
+        reason,
+        resolved_at,
+    } = &res.state
+    else {
+        panic!("resolved")
+    };
+    assert_eq!(res.key, open0.key, "the same approval identity");
+    assert_eq!(
+        push::resolved_hint(
+            &book.provider,
+            &book.signer("host-a"),
+            &res.key,
+            res.created_at,
+            res.expires_at,
+            reason,
+            *resolved_at
+        )
+        .unwrap(),
+        resolved
+    );
+    // A resolved dominates its opens in either order.
+    let mut book_a = HintBook::new();
+    assert_eq!(book_a.offer(open0.clone()), Ok(Accepted::Accepted));
+    assert_eq!(book_a.offer(res.clone()), Ok(Accepted::Accepted));
+    assert_eq!(
+        book_a.offer(open0.clone()),
+        Ok(Accepted::IgnoredAfterResolved)
+    );
+    let mut book_b = HintBook::new();
+    assert_eq!(book_b.offer(res.clone()), Ok(Accepted::Accepted));
+    assert_eq!(
+        book_b.offer(open0.clone()),
+        Ok(Accepted::IgnoredAfterResolved)
+    );
+    run.pass("resolved: verified, rebuilt byte for byte, the open's identity; dominates the open in either order");
 
     let seen = SignedObject::from_strict(&strict(&run.get("seen"))).unwrap();
     assert_eq!(seen.label(), SignLabel::Seen);
@@ -1861,6 +2050,22 @@ fn push_hint() {
     );
     seen.verify(&host_key).unwrap();
     run.pass("seen: signing input, host signature");
+    let seen_v = Seen::verify(&seen, &log).unwrap();
+    assert_eq!(seen_v.key, open0.key);
+    assert!(seen_v.in_window(open0.created_at));
+    assert_eq!(
+        push::seen(
+            &book.provider,
+            &book.signer("host-a"),
+            &seen_v.key,
+            seen_v.created_at,
+            &seen_v.device_id,
+            seen_v.seen_at
+        )
+        .unwrap(),
+        seen
+    );
+    run.pass("seen: verified, the open's identity and window; rebuilt byte for byte");
     let other = run.get("seen_other_process_gen");
     let other_object = SignedObject::from_strict(&strict(&serde_json::json!({
         "body": other["body"].clone(), "sig": other["sig"].clone()
@@ -1872,21 +2077,50 @@ fn push_hint() {
     );
     other_object.verify(&host_key).unwrap();
     run.pass("seen_other_process_gen: signing input, host signature");
-    run.pending(
-        "seen_other_process_gen: identity never matches open[0]",
-        TASK4,
+    let other_v = Seen::verify(&other_object, &log).unwrap();
+    assert_ne!(other_v.key, open0.key);
+    assert_ne!(other_v.identity(), seen_v.identity());
+    let mut ledger = RelayLedger::new();
+    for o in run.get("open").as_array().unwrap() {
+        let o = SignedObject::from_strict(&strict(o)).unwrap();
+        assert_eq!(ledger.receive_hint(&o, &log, now).0, Verdict::Accepted);
+    }
+    assert_eq!(
+        ledger.receive_seen(&other_object, &log, now).0,
+        Verdict::Pending
     );
+    assert_eq!(ledger.receive_seen(&seen, &log, now).0, Verdict::Applied);
+    run.pass("seen_other_process_gen: identity never matches open[0] (pending); seen applies");
 
     for (i, case) in run.get("invalid").as_array().unwrap().iter().enumerate() {
         let object = SignedObject::from_strict(&strict(&case["hint"])).unwrap();
         object.verify(&host_key).unwrap();
         run.pass(format!("invalid[{i}]: well-formed and host-signed"));
-        run.pending(format!("invalid[{i}]: {}", s(case, "reason")), TASK4);
+        // Every rule runs on the verifier's clock (verifier_now = the good
+        // hint's created_at); the time rules and the duplicate check come
+        // before the sealed part (these hints carry none).
+        let client = Hint::verify(&object, &log, now, Verifier::Client);
+        let relay = Hint::verify(&object, &log, now, Verifier::Relay);
+        match i {
+            0 => {
+                assert_eq!(client, Err(PushRefusal::Skew));
+                assert_eq!(relay, Err(PushRefusal::Skew));
+            }
+            1 | 2 => {
+                assert_eq!(client, Err(PushRefusal::InvalidTimes));
+                assert_eq!(relay, Err(PushRefusal::InvalidTimes));
+            }
+            3 => {
+                let mut book = HintBook::new();
+                assert_eq!(book.offer(open0.clone()), Ok(Accepted::Accepted));
+                assert_eq!(book.offer(client.unwrap()), Err(PushRefusal::Duplicate));
+                assert_eq!(book.opens(&open0.key)[0], &open0, "the first stays");
+            }
+            _ => panic!("an unexpected invalid hint"),
+        }
+        run.pass(format!("invalid[{i}]: refused, {}", s(case, "reason")));
     }
     run.get("verifier_now");
-    run.pending(
-        "verifier_now: time checks against the verifier's clock",
-        TASK4,
-    );
+    run.pass("verifier_now: every time rule above ran against it");
     run.finish();
 }
