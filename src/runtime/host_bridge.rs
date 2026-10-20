@@ -954,7 +954,21 @@ impl HostBridge {
             }
             _ => false,
         };
-        if same && self.host_key_error.is_none() {
+        if same {
+            // The same pin (our own writes moved the stamp): never reopened
+            // (that would drop the run's in-memory state: a fault, a hold);
+            // only a host key that was missing is looked for again.
+            if self.host_key.is_none()
+                && let Some(m) = &self.membership
+            {
+                match membership::host_channel_seed(&pairing, m.membership(), &m.pin_of().host_id) {
+                    Ok(seed) => {
+                        self.host_key = Some(HostKey::new(&seed));
+                        self.host_key_error = None;
+                    }
+                    Err(error) => self.host_key_error = Some(error),
+                }
+            }
             return;
         }
         eprintln!("atem runtime: device list: changed on disk; opening it again");
