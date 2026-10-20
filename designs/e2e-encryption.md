@@ -1441,6 +1441,7 @@ Derived public keys:
 | `sign_pub` (x963, 65 bytes) | `0457e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34c5ab3770ba573bdff5414065640ffb5b346dfa84dec4db4d68e5f59cc471c2ec` |
 | `enc_pub` | `219e4d800da968d2a5fcb009c784f4746c7138edb9ee4844b739e830b05cf424` |
 | `recovery_sign_pub` | `c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7` |
+| `host_channel_pub` (r9) | `e734ea6c2b6257de72355e472aa05a4c487e6b463c029ed306df2f01b5636b58` |
 
 Outputs:
 

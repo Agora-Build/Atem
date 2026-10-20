@@ -207,7 +207,9 @@ Every request that targets a session carries one **binding** object:
   with `resume`, and any `resume_proof`, is refused `unauthorized`. A second
   `hello` (without `resume`) on an attachment that was already welcomed
   replaces it (r7.1): the host fences the old attachment as a transport drop
-  or re-authentication would — its leases end (none is carried over), its
+  or re-authentication would, except that its leases end at once (after a
+  drop or re-authentication a lease is left to expire, §5; either way none
+  is carried over) — its
   subscriptions, streams and chat conversations close, its pending replies
   are dropped — and answers `welcome` on a new attachment over the same
   authenticated transport: new `attachment_gen` and `controller_session`,
@@ -1832,9 +1834,13 @@ Log limits: ≤ 1024 entries, ≤ 256 members, ≤ 64 hosts. A full log is
 Vectors: `r9-vectors-membership-log` (E1–E6 and the alternatives used
 by the scenarios).
 
-**Pairing (ceremony changes).** `verifyKeys` gains `genesis_hash`;
-`verifyReveal` gains `host_channel_pub` (Ed25519, R9.6), inside the
-commitment; the safety code becomes `base32(SHA-256(enc(["atem-safety-code-v2",
+**Pairing (ceremony changes).** `verifyKeys` gains `genesis_hash`
+(lowercase hex); `verifyReveal` gains `host_channel_pub` (the 32-byte
+Ed25519 key, R9.6, in base64url without padding as R9.1 says; the
+ceremony's older fields stay standard base64), inside the commitment,
+whose label is unchanged: `C = SHA-256(enc(["atem-verify-commit-v1",
+device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub,
+nonce_a]))`; the safety code becomes `base32(SHA-256(enc(["atem-safety-code-v2",
 device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub,
 astation_sign_pub, astation_enc_pub, recovery_sign_pub, genesis_hash,
 nonce_a, nonce_s])))[:12]`. After Touch ID the pairing manager appends
@@ -2799,7 +2805,10 @@ id only, distinct from the cryptographic `channel_id = hex(th4[0..16])`
    tag, replay or reorder, an exceeded bound, a handshake timeout)
    closes that channel only.
 6. **Link loss closes every channel** on it and fences their
-   attachments. A reconnect is a new link generation: clients open new
+   attachments. When Atem ends every channel while its socket stays up
+   (its device list was pinned again or removed, or the link is
+   re-authenticated, a new generation), it first sends `close{closed}`
+   for each live handle. A reconnect is a new link generation: clients open new
    channels, run full handshakes and catch up authoritatively (`sessions`
    snapshot, history pages, `receipt_query`); no lease is restored and
    no prompt is replayed.
@@ -2816,11 +2825,12 @@ dropped and queues never grow without bound):
 | bound | value | exceeded |
 |---|---|---|
 | record plaintext (R9.7) | 1 048 576 bytes | the sender refuses it locally; a peer past it fails the channel |
-| inner frame (compact) | the largest legal `rec` or `finish`: 1 398 159 bytes (`ct` of 1 398 123 base64url characters for 1 MiB + 16-byte tag) | `close{reason:"too_large"}` |
+| inner frame (compact) | a `ct` of at most 1 398 123 base64url characters (1 MiB + the 16-byte tag): the largest legal `rec` is 1 398 159 bytes, the largest `finish` 1 398 162 | `close{reason:"too_large"}` |
 | envelope as received | 2 097 152 bytes (2 MiB); the largest legal record with a 64-character handle is 1 398 279 bytes compact | `close{reason:"too_large"}` when the handle is readable, else dropped and logged |
 | open channels per link | 64 | the new channel: `close{reason:"busy"}` |
 | handshakes in progress per link (opened, not yet welcomed) | 16 | the new channel: `close{reason:"busy"}` |
 | bytes queued from Atem per channel (not yet taken by the link) | 4 MiB | that channel: `close{reason:"busy"}` |
+| `close`s Atem queues outside any channel (refused `open`s, `unknown_channel`) | 1024 queued, 16 a second | dropped and counted in runtime.log |
 | `init`s per link (R9.7 "per transport") | 1 a second | clear `busy` error frame, then `close{reason:"busy"}` |
 
 Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
@@ -3019,7 +3029,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
+| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9` |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 
