@@ -29,6 +29,9 @@
 pub mod envelope;
 #[cfg(test)]
 mod fixtures_tests;
+pub mod push;
+#[cfg(test)]
+mod push_tests;
 #[cfg(test)]
 mod tests;
 
@@ -247,6 +250,8 @@ pub struct R9Host {
     dead: Vec<String>,
     /// The channel the link last refused (the next round starts after it).
     flush_cursor: Option<String>,
+    /// Sealed push hints and seen for the relay (§R9.9).
+    push: push::HostPush,
 }
 
 fn log(line: &str) {
@@ -323,6 +328,7 @@ impl R9Host {
             fence_errors: HashMap::new(),
             dead: Vec::new(),
             flush_cursor: None,
+            push: push::HostPush::default(),
         };
         host.load_revoked();
         host
@@ -367,6 +373,9 @@ impl R9Host {
             self.limiter = InitLimiter::new();
             self.unknown.clear();
             self.unknown_order.clear();
+            // §R9.9: everything unacknowledged goes again at a reconnect.
+            self.push
+                .link_up(push_suppressed(parts), parts.now.host.wall_ms);
         }
         effects
     }
@@ -397,6 +406,7 @@ impl R9Host {
         self.unknown.clear();
         self.unknown_order.clear();
         self.link = None;
+        self.push.link_down();
         effects
     }
 
@@ -1422,12 +1432,14 @@ impl R9Host {
         effects
     }
 
-    /// `approval_seen{binding, approval_id}` → `seen{re}` (§R9.9, the host's
-    /// side without push): the attachment has `control` (and `approval` for
-    /// a scoped principal, checked by the authority), the approval is
-    /// pending for exactly that session and process. Only the first seen
-    /// of a device counts; later ones are answered `seen` too. The signed
-    /// `push_seen` to the relay is Task 8's.
+    /// `approval_seen{binding, approval_id}` → `seen{re}` (§R9.9): the
+    /// attachment has `control` (and `approval` for a scoped principal,
+    /// checked by the authority), the approval is pending for exactly that
+    /// session and process. Only the first seen of a device counts; later
+    /// ones are answered `seen` too. A native device's first one is signed
+    /// and sent to the relay (`push_seen`) until acknowledged; services and
+    /// browsers are never hint recipients, so their seen suppresses
+    /// nothing and nothing is signed.
     fn approval_seen<J: Journal>(
         &mut self,
         att: &str,
@@ -1474,10 +1486,97 @@ impl R9Host {
         if self.seen.insert((approval.to_string(), device)) {
             log(&format!("{} saw approval {approval}", authority.name()));
         }
+        if let Principal::Native { device_id } = &authority.principal {
+            self.push.suppress(push_suppressed(parts));
+            let wall = parts.now.host.wall_ms;
+            self.push.seen(
+                approval,
+                session,
+                process,
+                device_id,
+                signer_of(&parts.list),
+                wall,
+            );
+        }
         let reply = r9::seen(&new_id(), re.unwrap_or_default())
             .to_string()
             .into_bytes();
         self.seal_to(att, &reply, mono);
+    }
+
+    // ── Push (§R9.9) ──
+
+    /// An approval opened (`Effect::PushApproval`): its open hints, sealed
+    /// per recipient, `expires_at` = now on the host clock + `wait_ms` (the
+    /// hook's wait: Claude 600 s, Codex 300 s).
+    pub fn approval_opened<J: Journal>(
+        &mut self,
+        request: &r8::ApprovalRequest,
+        wait_ms: u64,
+        parts: &mut Parts<'_, J>,
+    ) {
+        self.push.suppress(push_suppressed(parts));
+        let wall = parts.now.host.wall_ms;
+        let Some(key) = approval_key(&parts.list, request) else {
+            return;
+        };
+        let plain = atem_client::push::HintPlain {
+            tool: request.tool.clone(),
+            summary: request.summary.clone(),
+        };
+        self.push.opened(
+            key,
+            wall.saturating_add(wait_ms),
+            &plain,
+            signer_of(&parts.list),
+            wall,
+        );
+    }
+
+    /// An approval stopped being pending (`Effect::PushResolved`): its
+    /// resolved hint.
+    pub fn approval_resolved<J: Journal>(
+        &mut self,
+        approval_id: &str,
+        reason: r8::ApprovalCloseReason,
+        parts: &mut Parts<'_, J>,
+    ) {
+        self.push.suppress(push_suppressed(parts));
+        let reason = serde_json::to_value(reason)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let wall = parts.now.host.wall_ms;
+        self.push
+            .resolved(approval_id, &reason, signer_of(&parts.list), wall);
+    }
+
+    /// A relay message on Atem's link (`{"type":"relay",…}`): a `push_ack`
+    /// ends the resends of what it names.
+    pub fn relay_message(&mut self, text: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        let matched = self.push.ack(&value);
+        if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
+            log("a push_ack acknowledged nothing pending");
+        }
+    }
+
+    /// Hands the relay messages due now to `send` (Atem's link).
+    pub fn flush_relay(&mut self, send: &mut dyn FnMut(String) -> bool) {
+        self.push.flush(send);
+    }
+
+    /// The relay delivery's health for `atem status`.
+    pub fn push_status(&self, now_wall: u64) -> push::PushStatus {
+        self.push.status(now_wall)
+    }
+
+    /// The device list changed (a re-pin or unpair): the old identity's
+    /// hints are dropped.
+    pub fn reset_push(&mut self) {
+        self.push.reset();
     }
 
     // ── Out ──
@@ -1749,6 +1848,7 @@ impl R9Host {
             effects.extend(parts.host.fence_principal(&principal, 0));
         }
         self.revoked.prune(wall);
+        self.push.tick(push_suppressed(parts), wall);
         effects
     }
 
@@ -1785,6 +1885,53 @@ impl R9Host {
 }
 
 /// §R9.7a: the compact inner frame, or its `ct`, over the bound.
+/// Why no push hint or seen may be signed or sent now (§R9.9 with §R9.3,
+/// §R9.4 and r8 §I): no device list, a held, frozen or faulted one, or a
+/// halted session journal.
+fn push_suppressed<J: Journal>(parts: &Parts<'_, J>) -> Option<&'static str> {
+    if parts.host.journal_halted() {
+        return Some("journal halted");
+    }
+    match &parts.list {
+        DeviceList::Open { m, .. } if m.is_frozen() => Some("device list frozen"),
+        DeviceList::Open { m, .. } if m.faulted().is_some() => Some("device list faulted"),
+        DeviceList::Open { m, .. } if m.held().is_some() => Some("device list held"),
+        DeviceList::Open { .. } => None,
+        DeviceList::Failed(_) => Some("device list failed"),
+        DeviceList::None => Some("no device list"),
+    }
+}
+
+/// The verified log and the host key that sign hints and seens.
+fn signer_of<'a>(list: &'a DeviceList<'_>) -> Option<push::Signer<'a>> {
+    match list {
+        DeviceList::Open { m, key } => Some(push::Signer {
+            log: m.membership(),
+            key,
+        }),
+        _ => None,
+    }
+}
+
+/// An approval's push identity on this host (§R9.9).
+fn approval_key(
+    list: &DeviceList<'_>,
+    request: &r8::ApprovalRequest,
+) -> Option<atem_client::push::ApprovalKey> {
+    let DeviceList::Open { m, .. } = list else {
+        return None;
+    };
+    let pin = m.pin_of();
+    Some(atem_client::push::ApprovalKey::new(
+        m.membership(),
+        &pin.host_id,
+        pin.host_trust_gen,
+        &request.session_id,
+        &request.process_gen,
+        &request.approval_id,
+    ))
+}
+
 fn inner_too_large(frame: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct Peek<'a> {

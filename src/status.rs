@@ -350,8 +350,9 @@ pub fn passive_device_list_line(
 }
 
 /// `Device list:` from the running runtime (r9, §R9.3, §R9.5): pinned,
-/// held, frozen, paused or failed, with what to do, and each pending
-/// recovery with when it takes effect.
+/// held, frozen, paused or failed, with what to do, each pending
+/// recovery with when it takes effect, and the push hints and seens the
+/// relay hasn't acknowledged yet (§R9.9).
 pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Line> {
     let Look::Running {
         status: Some(status),
@@ -368,6 +369,16 @@ pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Lin
             p.subject,
             p.action,
             hhmm(p.effective_at)
+        ));
+    }
+    if list.push_pending > 0 {
+        let oldest = list
+            .push_oldest_ms
+            .map(|ms| format!(", oldest {} s", ms / 1000))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "; push: {} waiting for the relay's acknowledgment{oldest}",
+            list.push_pending
         ));
     }
     Some(Line::new(text))
@@ -762,6 +773,18 @@ pub(crate) mod tests {
             notes: Vec::new(),
         };
         assert!(render(&report).contains("\nDevice list:    held ("));
+        let open = DeviceListStatus {
+            state: "open".into(),
+            text: "pinned at seq 4 (1 remote client)".into(),
+            push_pending: 3,
+            push_oldest_ms: Some(21_500),
+            ..Default::default()
+        };
+        let line = device_list_line(&look(Some(open)), |_| "?".into()).unwrap();
+        assert_eq!(
+            line.value,
+            "pinned at seq 4 (1 remote client); push: 3 waiting for the relay's acknowledgment, oldest 21 s"
+        );
         report.device_list = None;
         assert!(!render(&report).contains("Device list"));
         assert_eq!(device_list_line(&Look::NotRunning, |_| "?".into()), None);

@@ -90,6 +90,20 @@ pub(crate) fn session_family(text: &str) -> Option<&'static str> {
     }
 }
 
+/// A relay message for Atem (`{"type":"relay",…}`, atem-session-v1.md
+/// §R9.9: the relay's `push_ack`), from its `type`.
+pub(crate) fn is_relay_message(text: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Peek {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    serde_json::from_str::<Peek>(text)
+        .ok()
+        .and_then(|p| p.kind)
+        .is_some_and(|kind| kind == "relay")
+}
+
 /// Message types removed in atem-session r6 (§0): no compatibility, but
 /// still answered, so a sender learns they are gone.
 pub(crate) const REMOVED_OPS: &[&str] = &[
@@ -187,6 +201,11 @@ pub enum AstationMessage {
     /// parsed): its handle, closed `too_large`.
     #[serde(skip)]
     ChannelTooLarge(String),
+
+    /// A relay message for Atem (`{"type":"relay",…}`, §R9.9: `push_ack`)
+    /// as its raw JSON text, for the runtime's r9 push.
+    #[serde(skip)]
+    Relay(String),
 
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
@@ -1019,6 +1038,7 @@ impl AstationClient {
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
                             None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),
+                            None if is_relay_message(&text) => Some(AstationMessage::Relay(text)),
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };
                         if let Some(astation_msg) = astation_msg
@@ -2100,6 +2120,17 @@ fn relay_ws_url(relay_base: &str, identity_code: &str, atem_id: &str) -> String 
 mod tests {
     use super::*;
     use std::fs;
+
+    /// §R9.9: the relay's `push_ack` (any `{"type":"relay",…}`) is kept
+    /// raw for the runtime's r9 push; nothing else is taken for one.
+    #[test]
+    fn relay_messages_are_told_by_their_type() {
+        assert!(is_relay_message(r#"{"type":"relay","op":"push_ack","acks":[]}"#));
+        assert!(!is_relay_message(r#"{"type":"session","data":{"op":"relay"}}"#));
+        assert!(!is_relay_message(r#"{"op":"push_ack"}"#));
+        assert!(!is_relay_message("not json"));
+        assert_eq!(session_family(r#"{"type":"relay","op":"push_ack"}"#), None);
+    }
 
     /// A delayed success for a connection whose pairing was replaced (atem
     /// unpair, then atem pair) while the proof was out is not adopted: no

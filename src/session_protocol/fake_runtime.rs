@@ -169,7 +169,8 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     /// Every effect the host produced, in order.
     pub effects: Vec<Effect>,
     /// Sends and closes for attachments this runtime doesn't play (r9
-    /// channels, served by `session_protocol::r9`), in order.
+    /// channels, served by `session_protocol::r9`), and the push requests
+    /// (r9's sealed push), in order.
     pub foreign: Vec<Effect>,
     now: u64,
     /// r8: the chat of each session with `chat`, and its conversations.
@@ -700,18 +701,27 @@ impl<J: Journal> FakeRuntime<J> {
                     }
                 }
                 Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
-                Effect::PushApproval { request } => self
-                    .pty
-                    .pushes
-                    .push(json!({"op": "push_approval", "approval_id": request.approval_id})),
+                Effect::PushApproval { request } => {
+                    self.pty
+                        .pushes
+                        .push(json!({"op": "push_approval", "approval_id": request.approval_id}));
+                    // r9's sealed push is the r9 host's (`r9::push`).
+                    self.foreign.push(Effect::PushApproval { request });
+                }
                 Effect::PushResolved {
                     approval_id,
                     reason,
-                } => self.pty.pushes.push(json!({
-                    "op": "push_resolved",
-                    "approval_id": approval_id,
-                    "reason": reason,
-                })),
+                } => {
+                    self.pty.pushes.push(json!({
+                        "op": "push_resolved",
+                        "approval_id": approval_id,
+                        "reason": reason,
+                    }));
+                    self.foreign.push(Effect::PushResolved {
+                        approval_id,
+                        reason,
+                    });
+                }
                 Effect::Reconcile { request_id, .. } => {
                     let answer = self.reconcile_answer.clone();
                     work.extend(self.host.dispatch_report(&request_id, answer));

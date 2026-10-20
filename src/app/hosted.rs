@@ -17,6 +17,9 @@ use std::time::Instant;
 
 /// Messages kept for the session host per pass, at most.
 pub const INBOX_LIMIT: usize = 1024;
+/// A relay message larger than this is dropped (a `push_ack` names at most
+/// a handful of identities).
+pub const RELAY_MESSAGE_BYTES: usize = 256 * 1024;
 /// r9 channel envelopes kept for the broker per pass, at most (bytes; each
 /// is at most 2 MiB, §R9.7a). Beyond it the envelope's channel is closed
 /// (`busy`), never silently short of a frame.
@@ -55,6 +58,9 @@ pub struct Hosted {
     /// handle, close reason): `busy` when it didn't fit the inbox,
     /// `too_large` over the envelope bound.
     pub channel_overflow: Vec<(u64, String, &'static str)>,
+    /// Relay messages from the link (§R9.9: `push_ack`), with the link
+    /// generation they arrived on, in order (at most `INBOX_LIMIT`).
+    pub relay: VecDeque<(u64, String)>,
 }
 
 impl Hosted {
@@ -139,6 +145,22 @@ impl App {
                 handle,
                 crate::session_protocol::r9::envelope::reason::BUSY,
             ));
+        }
+    }
+
+    /// A relay message (`push_ack`) for the broker's r9 push, while the
+    /// link is authenticated; beyond the bound it is dropped (what it
+    /// acknowledged is resent and acknowledged again).
+    pub(super) fn relay_message(&mut self, text: String) {
+        if !self.astation_connected || self.astation_client.is_ws_closed() {
+            return;
+        }
+        let link = self.astation_link_gen;
+        if let Some(hosted) = self.hosted.as_mut()
+            && hosted.relay.len() < INBOX_LIMIT
+            && text.len() <= RELAY_MESSAGE_BYTES
+        {
+            hosted.relay.push_back((link, text));
         }
     }
 

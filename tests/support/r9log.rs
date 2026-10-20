@@ -68,6 +68,19 @@ pub fn auth(device: &str) -> KeyId {
     KeyId::new(format!("{device} auth"))
 }
 
+/// A native device's `enc_key` (X25519) in [`TestLog::keys`]: it opens the
+/// device's sealed push hints (§R9.9).
+pub fn enc(device: &str) -> KeyId {
+    KeyId::new(format!("{device} enc"))
+}
+
+/// Puts `device`'s X25519 `enc_key` into `keys`: its public key.
+fn enc_key(keys: &mut SoftwareKeys, device: &str) -> PublicKey {
+    use atem_client::KeyProvider;
+    keys.insert_x25519(enc(device), &secret(&format!("{device} enc")));
+    keys.public_key(&enc(device)).unwrap()
+}
+
 impl TestLog {
     /// A list whose genesis is the Mac, its manager key the P-256
     /// `mac_secret` (Astation's ceremony identity).
@@ -78,7 +91,7 @@ impl TestLog {
             device_id: MAC.into(),
             auth_key: PublicKey::new(Alg::P256, &p256_pub(mac_secret)).unwrap(),
             kind: MemberKind::Native {
-                enc_key: PublicKey::new(Alg::X25519, &secret("mac enc")).unwrap(),
+                enc_key: enc_key(&mut keys, MAC),
                 roles: BTreeSet::from([Role::Control, Role::Manage, Role::View]),
             },
         };
@@ -160,7 +173,7 @@ impl TestLog {
             device_id: device.into(),
             auth_key: PublicKey::new(Alg::P256, &p256_pub(&s)).unwrap(),
             kind: MemberKind::Native {
-                enc_key: PublicKey::new(Alg::X25519, &secret(&format!("{device} enc"))).unwrap(),
+                enc_key: enc_key(&mut self.keys, device),
                 roles: roles.iter().map(|r| Role::parse(r).unwrap()).collect(),
             },
         };
@@ -225,7 +238,7 @@ impl TestLog {
             device_id: device.into(),
             auth_key: PublicKey::new(Alg::P256, &p256_pub(&s)).unwrap(),
             kind: MemberKind::Native {
-                enc_key: PublicKey::new(Alg::X25519, &secret(&format!("{device} enc"))).unwrap(),
+                enc_key: enc_key(&mut self.keys, device),
                 roles: roles.iter().map(|r| Role::parse(r).unwrap()).collect(),
             },
         }

@@ -17,8 +17,8 @@ pub(super) const HOST: &str = "host-r9";
 pub(super) const ACCOUNT: &str = "acct-r9";
 pub(super) const SID: &str = "ses-aaaaaaaaaaaa";
 pub(super) const SID_B: &str = "ses-bbbbbbbbbbbb";
-const PGEN: &str = "22222222-2222-4222-8222-222222222222";
-const PGEN_B: &str = "33333333-3333-4333-8333-333333333333";
+pub(super) const PGEN: &str = "22222222-2222-4222-8222-222222222222";
+pub(super) const PGEN_B: &str = "33333333-3333-4333-8333-333333333333";
 pub(super) const WALL0: u64 = 1_793_264_000_000;
 
 /// A client's side of one channel.
@@ -54,7 +54,14 @@ pub(super) struct Rig {
     /// The runtime's project scopes (none: `NoProjects`, a rig that needs
     /// no cred agent).
     pub projects: Option<crate::runtime::project_scope::ProjectScopes>,
+    /// What Atem sent the relay (§R9.9), in order, not taken yet.
+    pub relay: std::collections::VecDeque<Value>,
+    /// The relay takes nothing (its messages are lost).
+    pub relay_down: bool,
 }
+
+/// The hook's wait the rig's approvals get (Claude's, 600 s).
+pub(super) const WAIT_MS: u64 = 600_000;
 
 pub(super) fn now_at(wall: u64, mono: u64) -> Now {
     Now {
@@ -149,6 +156,8 @@ impl Rig {
             link_gen: 0,
             host_id: host_id.to_string(),
             projects: None,
+            relay: Default::default(),
+            relay_down: false,
         }
     }
 
@@ -157,6 +166,18 @@ impl Rig {
     pub fn run<T>(
         &mut self,
         f: impl FnOnce(&mut R9Host, &mut Parts<'_, FileJournal>) -> (T, Vec<Effect>),
+    ) -> T {
+        let (out, effects) = self.with_parts(f);
+        self.rt.apply(effects);
+        self.route();
+        self.engine.end_pass();
+        out
+    }
+
+    /// Runs `f` on the engine with this rig's parts (nothing else).
+    pub fn with_parts<T>(
+        &mut self,
+        f: impl FnOnce(&mut R9Host, &mut Parts<'_, FileJournal>) -> T,
     ) -> T {
         let list = match (&mut self.m, &self.failed) {
             (_, Some(why)) => DeviceList::Failed(why),
@@ -172,15 +193,11 @@ impl Rig {
                 None => &NoProjects,
             },
         };
-        let (out, effects) = f(&mut self.engine, &mut parts);
-        self.rt.apply(effects);
-        self.route();
-        self.engine.end_pass();
-        out
+        f(&mut self.engine, &mut parts)
     }
 
     /// The session host's messages and closes for r9 attachments.
-    fn route(&mut self) {
+    pub fn route(&mut self) {
         loop {
             let foreign = std::mem::take(&mut self.rt.foreign);
             if foreign.is_empty() {
@@ -204,10 +221,32 @@ impl Rig {
                     Effect::Close { attachment } => self
                         .engine
                         .close_attachment(&attachment, self.now.host.mono_ms),
+                    // §R9.9, as the runtime's bridge does.
+                    Effect::PushApproval { request } => {
+                        self.with_parts(|e, p| e.approval_opened(&request, WAIT_MS, p))
+                    }
+                    Effect::PushResolved {
+                        approval_id,
+                        reason,
+                    } => self.with_parts(|e, p| e.approval_resolved(&approval_id, reason, p)),
                     _ => {}
                 }
             }
         }
+    }
+
+    /// What Atem sent the relay since the last call (the link takes it
+    /// unless `relay_down`).
+    pub fn relay_out(&mut self) -> Vec<Value> {
+        self.pump();
+        std::mem::take(&mut self.relay).into_iter().collect()
+    }
+
+    /// The relay acknowledges.
+    pub fn relay_in(&mut self, message: &Value) {
+        let text = message.to_string();
+        self.engine.relay_message(&text);
+        self.pump();
     }
 
     pub fn link_up(&mut self) {
@@ -242,6 +281,15 @@ impl Rig {
         // As the runtime's pass: channels closed on Atem's side (overflow)
         // leave the session host.
         self.run(|e, p| ((), e.reap(p)));
+        let mut relay = Vec::new();
+        let down = self.relay_down;
+        self.engine.flush_relay(&mut |text| {
+            if !down {
+                relay.push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            true
+        });
+        self.relay.extend(relay);
         if self.stalled {
             return;
         }

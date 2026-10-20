@@ -323,6 +323,12 @@ pub struct DeviceListStatus {
     /// r9 clients attached now.
     #[serde(default)]
     pub clients: usize,
+    /// Push hints and seens the relay hasn't acknowledged yet (§R9.9).
+    #[serde(default)]
+    pub push_pending: usize,
+    /// How long the oldest of them has waited (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_oldest_ms: Option<u64>,
 }
 
 /// A recovery waiting on this host's clock (§R9.5).

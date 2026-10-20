@@ -822,6 +822,9 @@ impl HostBridge {
     /// each live handle gets `close{closed}` on the link, the link
     /// generation goes on (envelopes of this pass are still served).
     fn restart_channels(&mut self, cx: &mut Cx) {
+        // The old pin's approvals and their hints go with it (§R9.9: a
+        // hint is bound to the account, genesis and host trust generation).
+        self.r9.reset_push();
         let before = self.r9_attachments();
         // The closes are queued in the engine with the ones already there
         // and sent on this socket by the pass's flush.
@@ -840,14 +843,19 @@ impl HostBridge {
     /// row: `None` without one. Failed is shown too (`host_error` doesn't
     /// report it: r8 sessions are unaffected without a list).
     pub fn device_list_status(&self) -> Option<crate::runtime::protocol::DeviceListStatus> {
-        device_list_status_of(
+        let now = host_now();
+        let mut status = device_list_status_of(
             self.membership.as_ref(),
             self.membership_error
                 .as_deref()
                 .or(self.host_key_error.as_deref()),
             self.r9.status().attachments,
-            &host_now(),
-        )
+            &now,
+        )?;
+        let push = self.r9.push_status(now.wall_ms);
+        status.push_pending = push.pending;
+        status.push_oldest_ms = push.oldest_ms;
+        Some(status)
     }
 
     /// Runs `f` on the r9 host with this bridge's session host, device
@@ -1288,6 +1296,12 @@ impl HostBridge {
                     self.stale_envelope(link_gen);
                 }
             }
+            for (link_gen, text) in std::mem::take(&mut hosted.relay) {
+                // §R9.9: the relay's `push_ack` on the link it was sent on.
+                if Some(link_gen) == self.r9_link {
+                    self.r9.relay_message(&text);
+                }
+            }
             for (link_gen, handle, why) in overflow {
                 if Some(link_gen) == self.r9_link {
                     let effects = self.r9_call(|r9, parts| r9.refuse_unread(&handle, why, parts));
@@ -1319,6 +1333,10 @@ impl HostBridge {
         self.r9_exec(effects, &mut cx);
         let client = cx.client;
         self.r9.flush(&mut |text| client.try_send_channel(text));
+        if self.r9_link.is_some() {
+            self.r9
+                .flush_relay(&mut |text| client.try_send_wire(text, false).is_ok());
+        }
         self.r9.end_pass();
         if let Some(hosted) = app.hosted.as_mut() {
             hosted.sessions = cx
@@ -2762,12 +2780,11 @@ impl HostBridge {
             );
         }
         if self.host.refuses_r8() {
-            // r9 (§R9.9): never the tool or summary in clear to the relay;
-            // sealed push hints are Task 8's. Until then nothing is pushed.
-            eprintln!(
-                "atem runtime: approval {}: no push (an r9 host sends sealed hints only)",
-                request.approval_id
-            );
+            // r9 (§R9.9): never the tool or summary in clear to the relay,
+            // only hints sealed per control device, signed with the host
+            // channel key (`r9::push`).
+            let wait_ms = timeout * 1000;
+            self.r9_call(|r9, parts| r9.approval_opened(&request, wait_ms, parts));
             return;
         }
         let data = json!({
@@ -2800,8 +2817,11 @@ impl HostBridge {
             self.card_state(approval_id, state, cx);
         }
         // An r9 host sends no clear push at all (not even a resolve of one
-        // pushed before its pin; that entry went at the pin).
-        if !self.host.refuses_r8() {
+        // pushed before its pin; that entry went at the pin): its resolved
+        // hint (§R9.9).
+        if self.host.refuses_r8() {
+            self.r9_call(|r9, parts| r9.approval_resolved(approval_id, reason, parts));
+        } else {
             self.pushes.resolve(approval_id, reason);
         }
         self.flush_pushes(cx);
@@ -3513,6 +3533,7 @@ pub(crate) fn device_list_status_of(
             head_seq: None,
             pending_recovery: Vec::new(),
             clients,
+            ..Default::default()
         });
     }
     let m = m?;
@@ -3570,6 +3591,7 @@ pub(crate) fn device_list_status_of(
         head_seq,
         pending_recovery: pending,
         clients,
+        ..Default::default()
     })
 }
 
