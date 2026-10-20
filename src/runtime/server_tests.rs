@@ -961,6 +961,7 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
             agent_pid: None,
             agent_start_time: None,
             exited: None,
+            project_key: None,
         };
         super::worker::write_record(&runtime.state(), &record).unwrap();
         let lock = super::worker::lock_path(&runtime.state(), &sid);
@@ -1091,6 +1092,7 @@ impl FakeWorker {
             agent_pid: None,
             agent_start_time: None,
             exited: None,
+            project_key: None,
         };
         super::worker::write_record(&root.join("state"), &record).unwrap();
         let hello = encode_worker(&WorkerMsg::Hello {

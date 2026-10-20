@@ -429,6 +429,7 @@ fn gone_record(state: &Path) -> WorkerRecord {
         agent_pid: None,
         agent_start_time: None,
         exited: None,
+        project_key: None,
     }
 }
 

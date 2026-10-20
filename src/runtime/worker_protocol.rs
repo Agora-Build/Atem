@@ -78,6 +78,10 @@ pub struct WorkerRecord {
     /// The agent's exit status, once it exited (kept until a broker heard it).
     #[serde(default)]
     pub exited: Option<String>,
+    /// The launch project key from the spec (§R9.6), kept here because the
+    /// spec is removed once the worker read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
 }
 
 /// Broker → worker.

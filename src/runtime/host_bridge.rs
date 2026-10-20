@@ -457,6 +457,8 @@ pub struct HostBridge {
     /// Service `projects` scopes: the sessions' launch projects and their
     /// keyed hashes (§R9.6, `project_scope`).
     projects: ProjectScopes,
+    /// Sessions whose worker record (and launch project) wasn't read yet.
+    project_unread: HashSet<String>,
 }
 
 /// What `atem status` shows of the link's session attachment.
@@ -584,6 +586,7 @@ impl HostBridge {
         };
         Ok(Self {
             projects: ProjectScopes::new(hasher),
+            project_unread: HashSet::new(),
             r9: R9Host::new(r9host::Limits::default(), Some(dir)),
             r9_link: None,
             r9_socket: 0,
@@ -900,6 +903,23 @@ impl HostBridge {
     /// goes out again, so attachments whose `projects` scope now holds it
     /// see it (§R9.6; out-of-scope ones still get nothing).
     fn project_pass(&mut self, cx: &mut Cx) {
+        if !self.project_unread.is_empty()
+            && let Some(state) = self.dir.parent()
+        {
+            let read: Vec<(String, Option<String>)> = self
+                .project_unread
+                .iter()
+                .filter_map(|sid| {
+                    let path = super::worker::record_path(state, sid);
+                    let record = super::worker::read_record(&path).ok()?;
+                    Some((sid.clone(), record.project_key))
+                })
+                .collect();
+            for (sid, key) in read {
+                self.project_unread.remove(&sid);
+                self.projects.session(&sid, key);
+            }
+        }
         let mut kids = self.r9.scope_project_kids();
         if let Some(m) = &self.membership {
             kids.extend(super::project_scope::project_kids_of(m.membership()));
@@ -2004,6 +2024,7 @@ impl HostBridge {
             .collect();
         for sid in gone {
             self.projects.forget(&sid);
+            self.project_unread.remove(&sid);
             self.approvals.retain(|_, a| a.sid != sid);
             let registered = self.per.remove(&sid).is_some_and(|p| p.registered);
             if registered {
@@ -2027,13 +2048,10 @@ impl HostBridge {
 
     fn register(&mut self, id: &SessionId, cx: &mut Cx) {
         let sid = id.to_string();
-        // Its launch project, as recorded at launch (§R9.6).
-        let project_key = self
-            .dir
-            .parent()
-            .and_then(|state| super::worker::read_spec(state, &sid).ok())
-            .and_then(|spec| spec.project_key);
-        self.projects.session(&sid, project_key);
+        // Its launch project, as recorded at launch (§R9.6): the worker
+        // keeps it in its record (read at the next passes until it is
+        // there).
+        self.project_unread.insert(sid.clone());
         let session = &cx.sessions[id];
         let (rows, cols) = session.size();
         let spec = SessionSpec {
