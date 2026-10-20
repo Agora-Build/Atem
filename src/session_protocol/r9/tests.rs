@@ -1306,3 +1306,43 @@ fn unknown_handles_get_one_close_each_and_the_1025th_none() {
     rig.envelope_in(&envelope::frame("ghost-1024", ghost));
     assert_eq!(unknown(&rig), 1024, "no second close, no eviction");
 }
+
+/// Fair service with output backed up: a channel with a long queue
+/// doesn't hold another's records back; each round gives every channel
+/// one message, starting after the one the link last refused.
+#[test]
+fn a_backed_up_link_serves_the_channels_in_turn() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("a-busy", phone());
+    rig.advance(1000);
+    rig.connect("b-quiet", phone());
+    rig.stalled = true;
+    for _ in 0..20 {
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig.attached("a-busy").list(mono).unwrap();
+        let text = envelope::frame("a-busy", &frame);
+        rig.run(|e, p| ((), e.on_envelope(&text, p)));
+    }
+    let mono = rig.now.host.mono_ms;
+    let (_, frame) = rig.attached("b-quiet").list(mono).unwrap();
+    let text = envelope::frame("b-quiet", &frame);
+    rig.run(|e, p| ((), e.on_envelope(&text, p)));
+    // The link takes three messages: the quiet channel's reply is among
+    // them, not behind the busy one's twenty.
+    let mut taken = Vec::new();
+    let mut budget = 3;
+    rig.engine.flush(&mut |t| {
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+        taken.push(t);
+        true
+    });
+    let channels: Vec<String> = taken
+        .iter()
+        .map(|t| envelope::parse(t).unwrap().channel().to_string())
+        .collect();
+    assert!(channels.contains(&"b-quiet".to_string()), "{channels:?}");
+}

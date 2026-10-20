@@ -240,6 +240,8 @@ pub struct R9Host {
     /// Attachments whose channel Atem closed (overflow), for the session
     /// host to forget.
     dead: Vec<String>,
+    /// The channel the link last refused (the next round starts after it).
+    flush_cursor: Option<String>,
 }
 
 fn log(line: &str) {
@@ -314,6 +316,7 @@ impl R9Host {
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
             dead: Vec::new(),
+            flush_cursor: None,
         };
         host.load_revoked();
         host
@@ -1536,27 +1539,41 @@ impl R9Host {
                 return;
             }
         }
-        let handles: Vec<String> = self.chans.keys().cloned().collect();
-        let mut done = Vec::new();
-        for handle in handles {
-            let chan = self.chans.get_mut(&handle).expect("listed");
-            while let Some(text) = chan.queue.pop_front() {
-                let len = text.len();
-                if !send(text.clone()) {
-                    chan.queue.push_front(text);
-                    return;
-                }
-                chan.queued = chan.queued.saturating_sub(len);
-            }
-            if let Some(why) = chan.close {
-                if !send(envelope::close(&handle, Some(why))) {
-                    return;
-                }
-                done.push(handle);
-            }
+        // Fair service: one message per channel per round, the rounds
+        // starting after the channel the link last refused, so a busy
+        // channel can't hold the others back (§R9.7a "Bounds").
+        let mut handles: Vec<String> = self.chans.keys().cloned().collect();
+        if let Some(cursor) = &self.flush_cursor {
+            let at = handles.partition_point(|h| h <= cursor);
+            handles.rotate_left(at);
         }
-        for handle in done {
-            self.chans.remove(&handle);
+        loop {
+            let mut progressed = false;
+            for handle in &handles {
+                let Some(chan) = self.chans.get_mut(handle) else {
+                    continue;
+                };
+                if let Some(text) = chan.queue.pop_front() {
+                    let len = text.len();
+                    if !send(text.clone()) {
+                        chan.queue.push_front(text);
+                        self.flush_cursor = Some(handle.clone());
+                        return;
+                    }
+                    chan.queued = chan.queued.saturating_sub(len);
+                    progressed = true;
+                } else if let Some(why) = chan.close {
+                    if !send(envelope::close(handle, Some(why))) {
+                        self.flush_cursor = Some(handle.clone());
+                        return;
+                    }
+                    self.chans.remove(handle);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                return;
+            }
         }
     }
 
