@@ -202,7 +202,20 @@ impl<'a> Router<'a> {
         host_id: &str,
         identity: &Identity,
     ) -> Result<Attached, (String, Option<String>)> {
-        self.open(handle, "relay");
+        self.connect_via(handle, "relay", log, host_id, identity)
+    }
+
+    /// [`Router::connect`] with the router's `transport` label (`relay` or
+    /// `direct`, Astation's :8080).
+    pub fn connect_via(
+        &mut self,
+        handle: &str,
+        transport: &str,
+        log: &TestLog,
+        host_id: &str,
+        identity: &Identity,
+    ) -> Result<Attached, (String, Option<String>)> {
+        self.open(handle, transport);
         let (connecting, init) = Connector::new(host_id)
             .start(&log.log, client_ms())
             .map_err(|e| (format!("{e:?}"), None))?;
