@@ -94,17 +94,28 @@ const VECTOR_BYTES: &str = "the vector's exact bytes (fixed ephemeral keys and n
 const STALL: &str = "Atem's link is a real WebSocket: a peer that stops reading leaves up to tcp_wmem + tcp_rmem (4 MiB + 6 MiB here) in kernel buffers before Atem's own queue holds anything, so 'queued output passes 4 MiB' can't be produced at a known step; the per-channel 4 MiB bound runs on the engine (r9::fixtures_tests::the_envelope_fixtures_pass_on_the_engine)";
 const OUTSIDE_LOG: &str = "host-b's add_host is outside the vectors (the fixture's note): the real runtime opens that device list but refuses every r9 channel to a host its list doesn't name (host_channel_key isn't the key the device list names for host-b), and an add_host signed for it with the vectors' dev-mac key would take seq 6, which E6 and S6_phone need; so its chain side runs on the real runtime B as its own relay fetch (ATEM_TEST_MEMBERSHIP_FAULTS/carry.json, §R9.3: no more trust than any carrier) and is checked on its state, while the welcome or fence a channel would carry can't be";
 
-/// Why a whole scenario can't run against the real runtime, if it can't.
+/// Why a whole file can't run against the real runtime, if it can't: it
+/// has no host side (and which runner covers it).
 pub fn not_expressible(scenario: &Value) -> Option<String> {
-    if scenario["side"] != "host" || scenario["kind"] != "scenario" {
-        return Some(match (scenario["kind"].as_str(), scenario["side"].as_str()) {
-            (Some("vectors"), _) => "known-answer vectors (exact bytes), no host process: atem-client's vector runners (crates/atem-client/tests/vectors.rs, channel_fixtures.rs) and src/session_protocol/r9/envelope.rs".into(),
-            (_, Some("client")) => "a client-side scenario (the client's machines, K backups, restores): atem-client's runners (crates/atem-client/tests/r9_fixtures.rs, scenarios.rs); no host acts in it".into(),
-            (_, Some("relay")) => "a relay-side scenario (CAS appends, push schedules, skew, seen handling at the relay): Astation's relay implements it; Atem runs its checks in atem-client (crates/atem-client/tests/r9_fixtures.rs)".into(),
-            (k, s) => format!("{k:?}/{s:?}: no host side"),
-        });
+    let name = scenario["name"].as_str().unwrap_or_default();
+    if scenario["side"] == "host" && scenario["kind"] == "scenario" {
+        return None;
     }
-    None
+    Some(match (scenario["kind"].as_str(), scenario["side"].as_str()) {
+        (Some("vectors"), _) if name == "r9-envelope-vectors" => {
+            "known-answer envelope vectors (exact bytes), no host process: src/session_protocol/r9/envelope.rs tests".into()
+        }
+        (Some("vectors"), _) => "known-answer vectors (exact bytes), no host process: crates/atem-client/tests/vectors.rs (and channel_fixtures.rs for the handshake)".into(),
+        (_, Some("client")) if name == "r9-handshake-wrong-head" => {
+            "the client refusing an accept with the wrong head: no host acts in it (crates/atem-client/tests/channel_fixtures.rs)".into()
+        }
+        (_, Some("client")) => "the client's K backup and restore machines (relay CAS, envelopes, the kit): no host acts in it (crates/atem-client/tests/scenarios.rs)".into(),
+        (_, Some("relay")) if name.starts_with("r9-chain-") => {
+            "the relay's CAS appends: Astation's relay; Atem's reference check is crates/atem-client/tests/scenarios.rs (and membership_e2e::honest_concurrent_appends_never_fork)".into()
+        }
+        (_, Some("relay")) => "the relay's push schedule, skew and seen handling: Astation's relay; Atem runs it against atem-client's reference relay (crates/atem-client/tests/r9_fixtures.rs)".into(),
+        (k, s) => format!("{k:?}/{s:?}: no host side"),
+    })
 }
 
 // ── Vectors and keys ─────────────────────────────────────────────────────

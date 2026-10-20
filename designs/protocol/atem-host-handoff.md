@@ -358,9 +358,10 @@ slack; a hook read after its npm-wrapper parent exited is dropped (harmless).
 
 Two runners execute `fixtures/` (format in `fixtures/schema.md`):
 
-Both runners report the 34 drafted `r9-*` fixtures (7 vector files, 27
-scenarios; appendix "r9" of `atem-session-v1.md`) as NOT RUN ("requires
-r9 …") and only check that they parse; the counts below are r8's.
+The core runner reports the `r9-*` fixtures as not run (they have their
+own runners); the real-runtime runner runs them in a test of their own (see
+"Shared fixtures (r9) against the real runtime"). The counts below are
+r8's.
 
 - **Core runner** (`src/session_protocol/fixtures.rs`, `cargo test --bin
   atem session_protocol::fixtures`): `SessionHost` through the fixtures' fake
@@ -486,6 +487,78 @@ Not honoured against real processes: `timers: false` (the broker's loop runs
 `set_permissions`, `drop`, `replace_process`, `change_trust_gen`,
 `approval_rules`, `chat_evict`, `worker_gap`, and more than one client per
 scenario.
+
+## Shared fixtures (r9) against the real runtime
+
+`cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture`
+(Linux, debug build; `ATEM_FIXTURE=<name>[,<name>…]` runs some;
+`ATEM_R9_PARALLEL` sets how many runtimes run at once, default 6) takes
+every one of the 75 `r9-*` files. Each host scenario runs against the
+`atem runtime` binary (runner: `tests/r9_runner/`):
+
+- a temp profile verified as the fixture's account and host, its device
+  list pinned to the vectors' log (`setup.pinned`) exactly as `atem pair`
+  writes it, with host-a's `host_channel_key` from `r9-vectors-keys`;
+- real `atem worker`s running the fake Claude Code (chat hooks, a
+  transcript, the real PermissionRequest hook), launched with the
+  fixture's session ids (signed browser grants name them);
+- the clients (phones, Macs, services, browsers) speak `atem-ch1` with the
+  vectors' keys in the §R9.7a envelope on the runtime's link to a fake
+  Astation, which also plays the relay (`push_hint`/`push_seen` in,
+  `push_ack` out): every `connect` is a full handshake and a `hello` with
+  exactly the fixture's entries;
+- clocks, faults and crashes through debug-only hooks
+  (`src/runtime/test_hooks.rs`): the host clock and the session clock are
+  files the harness moves; `fail_next_membership_write`,
+  `crash_after_membership_commit` (the runtime kills itself),
+  `hold_dispatch`, PTY write holds; `restart_runtime` is SIGTERM,
+  `crash_runtime` SIGKILL; a lost rename (`disk: rename_lost`) puts the
+  file's earlier bytes back while the runtime is down; `unpair` is the real
+  `atem unpair --yes`; `expect_local_status` reads the real `atem status`;
+- what the fixtures assert of the host comes from the runtime itself: its
+  state dump after each pass (device list, leases, receipts, control
+  generations, channels, attachments), cross-checked with the real files
+  (`membership_applied`, the fault, carriage and freeze records,
+  `frozen_genesis`, `membership.json`), the fake agent's input and hook
+  answers, and the `written` acks.
+
+**Result: 48 host scenarios run against the real runtime and all 48 pass
+(715 items checked); 21 items of them can't be expressed there (below);
+the 27 other files have no host side.** A changed expectation fails the
+run (`r9_changed_expectations_fail_against_the_real_runtime`: seven
+mutations, each fails).
+
+Items not expressible against real processes (each printed by the run):
+
+| scenario | items | why |
+|---|---|---|
+| `r9-handshake-success`, `-replay`, `-tampered-transcript` | the vector's exact record bytes, `channel_id` value, fixed `e_h`/`n_h`; the client's side | the vectors use fixed ephemeral keys and nonces: atem-client's `channel_fixtures` checks the bytes; here every step runs on a live handshake |
+| `r9-chain-conflict-by-a-current-manager-freezes` | `pair` refused `frozen genesis` | re-pairing needs Astation's signed `deviceVerified` (the §R9.2 ceremony, Touch ID); the refusal runs on the real store in the in-process host runner; the `frozen_genesis` file this runtime wrote is checked |
+| `r9-envelope-bounds` | `stall_link`, `fill_queue`, the `busy` close after it, `unstall_link`, the assert after | Atem's link is a real WebSocket: a peer that stops reading leaves up to `tcp_wmem` + `tcp_rmem` (4 + 6 MiB here) in kernel buffers before Atem queues anything, so "queued output passes 4 MiB" can't be produced at a known step; the bound runs on the engine (`r9::fixtures_tests`) |
+| `r9-chain-relay-cas-failure-freezes-both-hosts` | host B's welcome fields and the fence of the phone's admission there | host-b's `add_host` is outside the vectors (the fixture's note): the real runtime refuses every r9 channel to a host its list doesn't name, and an `add_host` signed with the vectors' dev-mac key would take seq 6 (E6's and S6_phone's). Host B is a second real runtime on its own profile: the carriages reach it as its own relay fetch (`carry.json`, §R9.3), and its head and freeze are checked on its state |
+
+| files | why they have no host side |
+|---|---|
+| 9 vector files: 8 `r9-vectors-*`, `r9-envelope-vectors` | known-answer bytes, no host process: `crates/atem-client/tests/vectors.rs` (and `channel_fixtures.rs`), the envelope tests in `src/session_protocol/r9/envelope.rs` |
+| 8 client scenarios: `r9-handshake-wrong-head`, `r9-recovery-k-backup-*` (4), `r9-recovery-restore-*` (2), `r9-recovery-stale-head-withholds-the-recovery` | the client's machines, no host acts: `channel_fixtures.rs`, `scenarios.rs` |
+| 10 relay scenarios: `r9-chain-honest-concurrent-appends-never-fork`, `r9-push-*` (6), `r9-seen-after-…`, `r9-seen-before-…`, `r9-seen-from-another-…` | the relay's side (Astation's relay); Atem runs them against atem-client's reference relay (`r9_fixtures.rs`, `scenarios.rs`) |
+
+Found by this run and fixed (not fixture changes):
+- the link's r8 attachment, never welcomed on an r9 host, dropped the whole
+  link at 24 h, closing every r9 channel daily: only a welcomed attachment's
+  authorization ends the link now;
+- the 100 ms pass (recovery waits, service expiry, push resends) also runs
+  when the host clock moved, not only the session clock.
+
+**Headless multi-device harness** (for Astation): `cargo test --test
+r9_harness -- --nocapture` runs one real host and N simulated clients
+(`ATEM_HARNESS_PHONES`, `ATEM_HARNESS_BOTS`, `ATEM_HARNESS_BROWSERS`;
+defaults 2, 1, 1) through admission, the registry, a lease, a prompt to its
+turn's end (a bot's `lease_held`), an approval with sealed push hints
+verified and opened per device, a `seen` (`push_seen` verified; a view-only
+browser's refused) and a lease-free answer with its resolved hint. It
+prints a transcript; `ATEM_HARNESS_OUT=<file>` writes it as JSON lines.
+Test target only, never in a release build.
 
 ## Approvals (r7 §6a, on `feat/approvals`)
 
