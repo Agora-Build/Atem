@@ -1129,7 +1129,10 @@ impl InProcess {
             rows: request.rows,
             cols: request.cols,
             socket: self.socket_dir.join(format!("{sid}.sock")),
+            project_key: Some(crate::memory::project::project_key_for(&request.cwd)),
         };
+        // As `adopt::spawn`: the spec (and its launch project) on disk.
+        worker::write_spec(&self.state, &spec)?;
         let listener = worker::listen(&spec.socket)?;
         let pid = std::process::id();
         let options = WorkerOptions {

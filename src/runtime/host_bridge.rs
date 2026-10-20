@@ -64,6 +64,7 @@
 //! trust (`confirm_approval_rules`; the worker drops the rest, and allows by
 //! none until then), and a rebind or trust change drops them all.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
+use super::project_scope::{AgentHasher, ProjectHasher, ProjectScopes};
 use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
 use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome, HeldRule, RuleGrant};
@@ -83,7 +84,7 @@ use crate::session_protocol::membership::{
     self, CarriageResult, DeviceList, Held, HostFences, MembershipHost, host_now,
 };
 use crate::session_protocol::r9::{
-    self as r9host, HostKey, NoProjects, Now as R9Now, Parts as R9Parts, R9Host,
+    self as r9host, HostKey, Now as R9Now, Parts as R9Parts, R9Host,
 };
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
@@ -453,6 +454,9 @@ pub struct HostBridge {
     stale_envelopes: u64,
     /// The device-list files as last opened (a change reopens them).
     list_stamp: Vec<Option<(u64, u64, i64, i64)>>,
+    /// Service `projects` scopes: the sessions' launch projects and their
+    /// keyed hashes (§R9.6, `project_scope`).
+    projects: ProjectScopes,
 }
 
 /// What `atem status` shows of the link's session attachment.
@@ -574,7 +578,12 @@ impl HostBridge {
             .as_ref()
             .map(membership::list_stamp)
             .unwrap_or_default();
+        let hasher: Arc<dyn ProjectHasher> = match profile {
+            Some(src) => Arc::new(AgentHasher { src: src.clone() }),
+            None => Arc::new(NoHasher),
+        };
         Ok(Self {
+            projects: ProjectScopes::new(hasher),
             r9: R9Host::new(r9host::Limits::default(), Some(dir)),
             r9_link: None,
             r9_socket: 0,
@@ -860,7 +869,7 @@ impl HostBridge {
                 mono: self.clock.now(),
                 host: host_now(),
             },
-            projects: &NoProjects,
+            projects: &self.projects,
         };
         f(&mut self.r9, &mut parts)
     }
@@ -884,6 +893,22 @@ impl HostBridge {
     fn shows_cards(&self, attachment: &str) -> bool {
         self.host.attachment_can(attachment, Permission::Control)
             && (!self.r9.owns(attachment) || self.r9.sees_approvals(attachment))
+    }
+
+    /// The keyed hashes of the sessions' launch projects (never waiting
+    /// for the cred agent): once a session's become known, its descriptor
+    /// goes out again, so attachments whose `projects` scope now holds it
+    /// see it (§R9.6; out-of-scope ones still get nothing).
+    fn project_pass(&mut self, cx: &mut Cx) {
+        let mut kids = self.r9.scope_project_kids();
+        if let Some(m) = &self.membership {
+            kids.extend(super::project_scope::project_kids_of(m.membership()));
+        }
+        for sid in self.projects.pass(&kids, Instant::now()) {
+            self.host.registry_resend(&sid);
+            let effects = self.host.take_effects();
+            self.r9_exec(effects, cx);
+        }
     }
 
     fn r9_attachments(&self) -> HashSet<String> {
@@ -1252,6 +1277,7 @@ impl HostBridge {
             let effects = self.r9_call(|r9, parts| r9.tick(parts));
             self.r9_exec(effects, &mut cx);
         }
+        self.project_pass(&mut cx);
         self.sync_all(&mut cx);
         self.drain_remote(&mut cx);
         self.frames(&mut cx);
@@ -1600,7 +1626,7 @@ impl HostBridge {
             self.r9.deliver(
                 attachment,
                 message,
-                &NoProjects,
+                &self.projects,
                 &host_id,
                 host_now().mono_ms,
             );
@@ -1649,7 +1675,7 @@ impl HostBridge {
                 attachment,
                 &sid,
                 &text,
-                &NoProjects,
+                &self.projects,
                 &host_id,
                 host_now().mono_ms,
             );
@@ -1977,6 +2003,7 @@ impl HostBridge {
             .cloned()
             .collect();
         for sid in gone {
+            self.projects.forget(&sid);
             self.approvals.retain(|_, a| a.sid != sid);
             let registered = self.per.remove(&sid).is_some_and(|p| p.registered);
             if registered {
@@ -2000,6 +2027,13 @@ impl HostBridge {
 
     fn register(&mut self, id: &SessionId, cx: &mut Cx) {
         let sid = id.to_string();
+        // Its launch project, as recorded at launch (§R9.6).
+        let project_key = self
+            .dir
+            .parent()
+            .and_then(|state| super::worker::read_spec(state, &sid).ok())
+            .and_then(|spec| spec.project_key);
+        self.projects.session(&sid, project_key);
         let session = &cx.sessions[id];
         let (rows, cols) = session.size();
         let spec = SessionSpec {
@@ -2239,7 +2273,7 @@ impl HostBridge {
                 attachment,
                 sid,
                 &text,
-                &NoProjects,
+                &self.projects,
                 &host_id,
                 host_now().mono_ms,
             );
@@ -2892,7 +2926,7 @@ impl HostBridge {
                         &key.0,
                         &key.1,
                         &text,
-                        &NoProjects,
+                        &self.projects,
                         &host_id,
                         host_now().mono_ms,
                     );
@@ -2964,7 +2998,7 @@ impl HostBridge {
                 attachment,
                 sid,
                 &text,
-                &NoProjects,
+                &self.projects,
                 &host_id,
                 host_now().mono_ms,
             );
@@ -3507,6 +3541,15 @@ pub(crate) fn device_list_status_of(
         pending_recovery: pending,
         clients,
     })
+}
+
+/// No profile (tests without one): no project hash is ever known.
+struct NoHasher;
+
+impl ProjectHasher for NoHasher {
+    fn hash(&self, _: &[(String, String)]) -> anyhow::Result<Vec<String>> {
+        anyhow::bail!("no profile")
+    }
 }
 
 fn app_link(app: &App) -> Option<u64> {

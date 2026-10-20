@@ -1615,6 +1615,7 @@ mod approval_settings_tests {
             rows: 24,
             cols: 80,
             socket: PathBuf::from("/nonexistent.sock"),
+            project_key: None,
         }
     }
 

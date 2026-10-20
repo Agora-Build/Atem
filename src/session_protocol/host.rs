@@ -2550,6 +2550,13 @@ impl<J: Journal> SessionHost<J> {
         Ok(())
     }
 
+    /// The session's descriptor again to every subscribed viewer, though
+    /// it didn't change: who may see it did (an r9 project scope became
+    /// known, §R9.6). Its effects are taken with [`SessionHost::take_effects`].
+    pub fn registry_resend(&mut self, sid: &str) {
+        self.registry_changed(sid);
+    }
+
     /// Sends the session's complete new descriptor to every subscribed viewer.
     fn registry_changed(&mut self, sid: &str) {
         let Some(descriptor) = self.sessions.get(sid).map(|s| self.descriptor(s)) else {

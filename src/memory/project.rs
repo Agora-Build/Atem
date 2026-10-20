@@ -97,7 +97,9 @@ pub fn detect_repo(cwd: &Path) -> Option<RepoInfo> {
     Some(RepoInfo { root, key, label })
 }
 
-#[cfg(test)]
+/// The project key of a working directory: its repository's (normalized
+/// remote), else `local:<folder>`. Also the launch project of an agent
+/// session (atem-session-v1.md §R9.6 service `projects` scopes).
 pub fn project_key_for(cwd: &Path) -> String {
     detect_repo(cwd).map(|r| r.key).unwrap_or_else(|| format!("local:{}", dir_name(cwd)))
 }

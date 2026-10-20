@@ -1547,6 +1547,24 @@ impl R9Host {
             .map_or(0, |c| c.queued)
     }
 
+    /// The kids the live attachments' service `projects` scopes name
+    /// (`h1.<kid>.<hash>`): the keyed hashes the runtime must know.
+    pub fn scope_project_kids(&self) -> std::collections::BTreeSet<String> {
+        self.chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a) => a.authority.scope.as_ref()?.projects.clone(),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|e| {
+                e.strip_prefix("h1.")
+                    .and_then(|r| r.split_once('.'))
+                    .map(|(kid, _)| kid.to_string())
+            })
+            .collect()
+    }
+
     /// Whether the r9 attachment `att` may see approvals (cards, rules):
     /// unscoped principals may; a scoped one only with the `approval` op.
     pub fn sees_approvals(&self, att: &str) -> bool {
