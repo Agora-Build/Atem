@@ -141,29 +141,146 @@ fn peek_handle(text: &str) -> Option<String> {
 /// Only this much of an oversize message is looked at, never parsed.
 const OVERSIZE_PEEK: usize = 4096;
 
-/// An oversize message (over [`MAX_ENVELOPE_BYTES`], never parsed): whether
-/// its first bytes say it is a channel envelope, and its handle when they
-/// name one (`"channel":"<h>"`, compact form), to address the
-/// `close{too_large}`.
-pub fn oversize_envelope(text: &str) -> Option<Option<String>> {
-    let head = &text.as_bytes()[..text.len().min(OVERSIZE_PEEK)];
-    let head = String::from_utf8_lossy(head);
-    if !head.contains(r#""type":"channel""#) {
+/// What the first bytes of an oversize message (over
+/// [`MAX_ENVELOPE_BYTES`], never parsed) say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Oversize {
+    /// Its top-level `type` isn't `channel` (or isn't in its first bytes):
+    /// not an envelope as far as can be told.
+    NotAnEnvelope,
+    /// A channel envelope whose top-level `channel` (before any `frame`)
+    /// names this handle: closed `too_large`.
+    Channel(String),
+    /// A channel envelope whose handle can't be told cheaply: dropped and
+    /// logged, no channel closed.
+    Unaddressed,
+}
+
+/// The top-level string members of a JSON object's first bytes, in order,
+/// up to its `frame` member (or the end of `head`): `None` when `head`
+/// isn't the start of an object. Nested values are skipped, never read.
+fn top_level_strings(head: &[u8]) -> Option<Vec<(String, String)>> {
+    let mut i = 0;
+    let ws = |i: &mut usize| {
+        while *i < head.len() && matches!(head[*i], b' ' | b'\t' | b'\n' | b'\r') {
+            *i += 1;
+        }
+    };
+    // A plain string (no escapes): its text; escaped strings are skipped.
+    let string = |i: &mut usize| -> Option<Option<String>> {
+        if head.get(*i) != Some(&b'"') {
+            return None;
+        }
+        *i += 1;
+        let start = *i;
+        let mut escaped = false;
+        while *i < head.len() {
+            match head[*i] {
+                b'\\' => {
+                    escaped = true;
+                    *i += 2;
+                }
+                b'"' => {
+                    let text = std::str::from_utf8(&head[start..*i]).ok()?.to_string();
+                    *i += 1;
+                    return Some((!escaped).then_some(text));
+                }
+                _ => *i += 1,
+            }
+        }
+        None
+    };
+    let mut out = Vec::new();
+    ws(&mut i);
+    if head.get(i) != Some(&b'{') {
         return None;
     }
-    let handle = head.find(r#""channel":""#).and_then(|at| {
-        let rest = &head[at + r#""channel":""#.len()..];
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string()).filter(|h| is_handle(h))
-    });
-    Some(handle)
+    i += 1;
+    loop {
+        ws(&mut i);
+        let Some(key) = string(&mut i) else {
+            return Some(out);
+        };
+        ws(&mut i);
+        if head.get(i) != Some(&b':') {
+            return Some(out);
+        }
+        i += 1;
+        ws(&mut i);
+        if key.as_deref() == Some("frame") {
+            return Some(out);
+        }
+        match head.get(i) {
+            Some(b'"') => {
+                let Some(value) = string(&mut i) else {
+                    return Some(out);
+                };
+                if let (Some(k), Some(v)) = (key, value) {
+                    out.push((k, v));
+                }
+            }
+            Some(b'{') | Some(b'[') => {
+                // Skip a nested value (strings inside included).
+                let mut depth = 0usize;
+                while i < head.len() {
+                    match head[i] {
+                        b'"' => {
+                            string(&mut i)?;
+                            continue;
+                        }
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                while i < head.len() && !matches!(head[i], b',' | b'}') {
+                    i += 1;
+                }
+            }
+        }
+        ws(&mut i);
+        match head.get(i) {
+            Some(b',') => i += 1,
+            _ => return Some(out),
+        }
+    }
+}
+
+/// An oversize message, from its first 4 KiB only (§R9.7a: never parsed):
+/// a channel envelope is told by its top-level `type`, its handle by the
+/// top-level `channel` before `frame`; nested keys never count.
+pub fn oversize_envelope(text: &str) -> Oversize {
+    let head = &text.as_bytes()[..text.len().min(OVERSIZE_PEEK)];
+    let Some(members) = top_level_strings(head) else {
+        return Oversize::NotAnEnvelope;
+    };
+    let value = |k: &str| members.iter().find(|(key, _)| key == k).map(|(_, v)| v);
+    if value("type").map(String::as_str) != Some("channel") {
+        return Oversize::NotAnEnvelope;
+    }
+    match value("channel").filter(|h| is_handle(h)) {
+        Some(handle) => Oversize::Channel(handle.clone()),
+        None => Oversize::Unaddressed,
+    }
 }
 
 /// Parses one envelope (§R9.7a "Fields").
 pub fn parse(text: &str) -> Result<Event, Refused> {
     if text.len() > MAX_ENVELOPE_BYTES {
         return Err(Refused::TooLarge {
-            channel: oversize_envelope(text).flatten(),
+            channel: match oversize_envelope(text) {
+                Oversize::Channel(handle) => Some(handle),
+                _ => None,
+            },
         });
     }
     let malformed = |why| Refused::Malformed {
@@ -360,6 +477,56 @@ mod tests {
         let spaced =
             "{ \"type\" : \"channel\", \"event\": \"close\", \"channel\": \"ch-1\" }".to_string();
         assert!(parse(&spaced).is_ok());
+    }
+
+    /// §R9.7a: an oversize message is never parsed; its handle comes only
+    /// from its top-level members before `frame`.
+    #[test]
+    fn the_oversize_peek_reads_top_level_members_only() {
+        let pad = "A".repeat(MAX_ENVELOPE_BYTES);
+        let big = |head: &str| format!("{head}{pad}\"}}}}");
+        assert_eq!(
+            oversize_envelope(&big(
+                r#"{"type":"channel","event":"frame","channel":"h1","frame":{"ch":"atem-ch1","op":"rec","ct":""#
+            )),
+            Oversize::Channel("h1".into())
+        );
+        // Non-compact.
+        assert_eq!(
+            oversize_envelope(&big(
+                r#"{ "type" : "channel", "channel" : "h2", "event": "frame", "frame": {"ct": ""#
+            )),
+            Oversize::Channel("h2".into())
+        );
+        // A nested `channel` before the top-level one never counts.
+        assert_eq!(
+            oversize_envelope(&big(
+                r#"{"type":"channel","event":"frame","frame":{"channel":"victim","ct":""#
+            )),
+            Oversize::Unaddressed
+        );
+        assert_eq!(
+            oversize_envelope(&big(
+                r#"{"type":"channel","x":{"channel":"victim"},"channel":"h3","frame":{"ct":""#
+            )),
+            Oversize::Channel("h3".into())
+        );
+        // An escaped value is never taken.
+        assert_eq!(
+            oversize_envelope(&big(
+                r#"{"type":"channel","channel":"h\u0034","frame":{"ct":""#
+            )),
+            Oversize::Unaddressed
+        );
+        // Not an envelope, or the type out of reach.
+        assert_eq!(
+            oversize_envelope(&big(r#"{"type":"session","data":{"x":""#)),
+            Oversize::NotAnEnvelope
+        );
+        assert_eq!(
+            oversize_envelope(&big(r#"{"frame":{"ct":""#)),
+            Oversize::NotAnEnvelope
+        );
     }
 
     #[test]

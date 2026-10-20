@@ -4039,3 +4039,70 @@ fn a_device_list_drop_reason_never_outlives_its_drop() {
     assert_eq!(bridge.take_close(), Some(super::REFUSAL_DROP));
     assert_eq!(bridge.take_close(), None);
 }
+
+/// r9 (§R9.9): once a device list is pinned while the runtime runs, the
+/// relay gets nothing in clear: not the resolve of an approval pushed
+/// before the pin, and no new push.
+#[test]
+fn a_pinned_host_sends_no_clear_push_even_for_an_earlier_approval() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "codex", &fake).await;
+        let sid = session.id.clone();
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        ask(
+            &fake,
+            1,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo build"}}),
+        );
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        peer.wait_from(0, |v| is_relay(v, "push_approval", &aid))
+            .await;
+        // A pairing pins a list for this host while the runtime runs.
+        let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+        log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.dir.path().join("profile")).pairing;
+        let journal = rt.dir.path().join("state").join("journal");
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: TRUST_GEN,
+        };
+        MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+        let peer = &mut rt.peer;
+        let id = peer.request("hello", json!({"revision": 8}));
+        let refused = peer.reply(&id).await;
+        assert_eq!(refused["revision"], 9, "the list is in force: {refused}");
+        // The approval ends (released by local input): no push_resolved.
+        attach_client(&mut client, &sid, 24, 80).await;
+        client.send(&ClientMsg::input(&sid, b"L")).await.unwrap();
+        agent_event(&fake, "answer 1 none ").await;
+        let peer = &mut rt.peer;
+        peer.drain(Duration::from_millis(500)).await;
+        assert!(
+            !peer.seen.iter().any(|v| is_relay(v, "push_resolved", &aid)),
+            "no clear resolve on an r9 host"
+        );
+        // Nor a new push.
+        ask(
+            &fake,
+            2,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo test"}}),
+        );
+        peer.drain(Duration::from_millis(800)).await;
+        assert_eq!(
+            peer.seen
+                .iter()
+                .filter(|v| v["type"] == "relay" && v["data"]["op"] == "push_approval")
+                .count(),
+            1
+        );
+        rt.shutdown().await;
+    });
+}

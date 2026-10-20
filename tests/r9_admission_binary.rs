@@ -431,11 +431,17 @@ fn a_pin_while_the_runtime_runs_is_picked_up() {
     assert_eq!(router.next_other()["data"]["op"], "welcome");
     write_pin(&rig.sandbox.config(), &rig.log, HOST, 1, &rig.host_seed);
     // The very first connect after the pin is served: the pin is seen
-    // before the envelopes of that pass, which are never dropped.
+    // before the envelopes of that pass, which are never dropped. (Spaced
+    // a second from the last init: one init a second per link.)
+    next_init();
     let started = Instant::now();
-    let mut ph = router
-        .connect("c2", &rig.log, HOST, &phone())
-        .unwrap_or_else(|e| panic!("refused: {e:?}\n{}", rig.runtime_log()));
+    let mut ph = match router.connect("c2", &rig.log, HOST, &phone()) {
+        Ok(ph) => ph,
+        Err((code, detail)) => panic!(
+            "the first connect after the pin was refused: {code} {detail:?}\n{}",
+            rig.runtime_log()
+        ),
+    };
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",

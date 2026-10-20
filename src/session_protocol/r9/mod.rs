@@ -409,7 +409,7 @@ impl R9Host {
             Event::Close { channel, .. } => self.router_closed(&channel, parts),
             Event::Frame { channel, frame } => {
                 if !self.chans.contains_key(&channel) {
-                    self.unknown_frame(&channel, parts.now.mono);
+                    self.unknown_frame(&channel, parts.now.host.mono_ms);
                     return Vec::new();
                 }
                 self.on_frame(&channel, &frame, parts)
@@ -431,7 +431,9 @@ impl R9Host {
             self.refuse_outside(&handle, reason::BUSY, parts.now.host.mono_ms);
             return;
         }
-        self.unknown.remove(&handle);
+        if self.unknown.remove(&handle) {
+            self.unknown_order.retain(|h| *h != handle);
+        }
         self.chans.insert(
             handle,
             Chan {
@@ -510,16 +512,21 @@ impl R9Host {
     }
 
     /// Ends every channel while the socket stays up (a re-pin, an unpair, a
-    /// re-authentication): as [`R9Host::link_down`], and returns a
-    /// `close{closed}` for each live handle, for the caller to send on the
-    /// still-open socket (§R9.7a 6).
-    pub fn restart<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> (Vec<Effect>, Vec<String>) {
-        let closes = self
-            .chans
-            .keys()
-            .map(|h| envelope::close(h, Some(reason::CLOSED)))
-            .collect();
-        (self.link_down(parts), closes)
+    /// re-authentication): as [`R9Host::link_down`], but the closes already
+    /// queued stay and a `close{closed}` is queued for each live handle
+    /// (at most 64, past the outside-channel bounds: they end channels the
+    /// router holds open), all sent on the same socket (§R9.7a 6). The
+    /// caller brings the link up again.
+    pub fn restart<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let mut queued = std::mem::take(&mut self.global);
+        queued.extend(
+            self.chans
+                .keys()
+                .map(|h| envelope::close(h, Some(reason::CLOSED))),
+        );
+        let effects = self.link_down(parts);
+        self.global = queued;
+        effects
     }
 
     /// Closes `handle` now with `reason` (no record first); its attachment,
@@ -1540,11 +1547,12 @@ impl R9Host {
             }
         }
         // Fair service: one message per channel per round, the rounds
-        // starting after the channel the link last refused, so a busy
+        // starting with the channel the link last refused, so a busy
         // channel can't hold the others back (§R9.7a "Bounds").
         let mut handles: Vec<String> = self.chans.keys().cloned().collect();
         if let Some(cursor) = &self.flush_cursor {
-            let at = handles.partition_point(|h| h <= cursor);
+            // Resume at the refused channel (it goes first next time).
+            let at = handles.partition_point(|h| h < cursor);
             handles.rotate_left(at);
         }
         loop {

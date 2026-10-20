@@ -448,6 +448,8 @@ pub struct HostBridge {
     host_key_error: Option<String>,
     /// The loaded key's public half (b64u), to tell a re-pin's new key.
     host_pub: Option<String>,
+    /// Envelopes of an ended link generation dropped so far.
+    stale_envelopes: u64,
     /// The device-list files as last opened (a change reopens them).
     list_stamp: Vec<Option<(u64, u64, i64, i64)>>,
 }
@@ -577,6 +579,7 @@ impl HostBridge {
             pairing,
             host_key,
             host_pub,
+            stale_envelopes: 0,
             host_key_error,
             list_stamp,
             host,
@@ -788,19 +791,29 @@ impl HostBridge {
 
     // ── r9 (§R9.7a) ──
 
+    /// An envelope of another link generation (it arrived while the link
+    /// was re-authenticated or replaced): its channel ended with that
+    /// generation; dropped, counted in runtime.log.
+    fn stale_envelope(&mut self, link_gen: u64) {
+        self.stale_envelopes += 1;
+        if self.stale_envelopes.is_power_of_two() {
+            eprintln!(
+                "atem runtime: r9: {} envelope(s) of an ended link generation dropped (the last of generation {link_gen})",
+                self.stale_envelopes
+            );
+        }
+    }
+
     /// Every channel ends while the socket stays up (a re-pin or unpair):
     /// each live handle gets `close{closed}` on the link, the link
     /// generation goes on (envelopes of this pass are still served).
     fn restart_channels(&mut self, cx: &mut Cx) {
         let before = self.r9_attachments();
-        let (effects, closes) = self.r9_call(|r9, parts| r9.restart(parts));
+        // The closes are queued in the engine with the ones already there
+        // and sent on this socket by the pass's flush.
+        let effects = self.r9_call(|r9, parts| r9.restart(parts));
         for gone in &before {
             self.forget_r9(gone);
-        }
-        if !cx.client.is_ws_closed() {
-            for close in closes {
-                let _ = cx.client.try_send_channel(close);
-            }
         }
         if let Some(link_gen) = self.r9_link {
             let up = self.r9_call(|r9, parts| r9.link_up(link_gen, parts));
@@ -953,16 +966,20 @@ impl HostBridge {
             return;
         }
         // A re-authentication (or a new generation) on a socket that is
-        // still up: the router learns each channel ended (§R9.7a 6).
+        // still up: the router learns each channel ended (§R9.7a 6), the
+        // closes queued in the engine and flushed on that socket. A socket
+        // that is gone takes everything with it.
         let before = self.r9_attachments();
-        let (mut effects, closes) = self.r9_call(|r9, parts| r9.restart(parts));
+        let live = !cx.client.is_ws_closed();
+        let mut effects = self.r9_call(|r9, parts| {
+            if live {
+                r9.restart(parts)
+            } else {
+                r9.link_down(parts)
+            }
+        });
         for gone in &before {
             self.forget_r9(gone);
-        }
-        if !cx.client.is_ws_closed() {
-            for close in closes {
-                let _ = cx.client.try_send_channel(close);
-            }
         }
         if let Some(link_gen) = want {
             effects.extend(self.r9_call(|r9, parts| r9.link_up(link_gen, parts)));
@@ -1011,6 +1028,7 @@ impl HostBridge {
                 match membership::host_channel_seed(&pairing, m.membership(), &m.pin_of().host_id) {
                     Ok(seed) => {
                         self.host_key = Some(HostKey::new(&seed));
+                        self.host_pub = membership::peek_host_pub(&pairing);
                         self.host_key_error = None;
                     }
                     Err(error) => self.host_key_error = Some(error),
@@ -1088,6 +1106,11 @@ impl HostBridge {
             return;
         }
         self.host.set_refuse_r8(refuse);
+        if refuse {
+            // r9 (§R9.9): nothing in clear to the relay from now on, not
+            // even what was queued before the pin.
+            self.pushes = Default::default();
+        }
         if refuse && let Some(link) = self.link.take() {
             eprintln!("atem runtime: {DEVICE_LIST_PINNED}");
             let want = self.considered;
@@ -1251,12 +1274,16 @@ impl HostBridge {
                 if Some(link_gen) == self.r9_link {
                     let effects = self.r9_call(|r9, parts| r9.on_envelope(&text, parts));
                     self.r9_exec(effects, &mut cx);
+                } else {
+                    self.stale_envelope(link_gen);
                 }
             }
             for (link_gen, handle, why) in overflow {
                 if Some(link_gen) == self.r9_link {
                     let effects = self.r9_call(|r9, parts| r9.refuse_unread(&handle, why, parts));
                     self.r9_exec(effects, &mut cx);
+                } else {
+                    self.stale_envelope(link_gen);
                 }
             }
         }
@@ -2755,7 +2782,11 @@ impl HostBridge {
         if let Some(state) = state {
             self.card_state(approval_id, state, cx);
         }
-        self.pushes.resolve(approval_id, reason);
+        // An r9 host sends no clear push at all (not even a resolve of one
+        // pushed before its pin; that entry went at the pin).
+        if !self.host.refuses_r8() {
+            self.pushes.resolve(approval_id, reason);
+        }
         self.flush_pushes(cx);
     }
 

@@ -963,13 +963,19 @@ impl AstationClient {
                         // one over its bound is never parsed (its handle only,
                         // from its first bytes, for the `too_large` close).
                         if text.len() > crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES {
-                            if let Some(handle) = crate::session_protocol::r9::envelope::oversize_envelope(&text) {
-                                if let Some(handle) = handle
-                                    && tx.send(AstationMessage::ChannelTooLarge(handle)).await.is_err()
-                                {
-                                    break;
+                            use crate::session_protocol::r9::envelope::{oversize_envelope, Oversize};
+                            match oversize_envelope(&text) {
+                                Oversize::Channel(handle) => {
+                                    if tx.send(AstationMessage::ChannelTooLarge(handle)).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
                                 }
-                                continue;
+                                Oversize::Unaddressed => {
+                                    eprintln!("atem: r9: an oversize channel envelope without a readable handle was dropped ({} bytes)", text.len());
+                                    continue;
+                                }
+                                Oversize::NotAnEnvelope => {}
                             }
                         } else if crate::session_protocol::r9::envelope::is_envelope(&text) {
                             if tx.send(AstationMessage::Channel(text)).await.is_err() {

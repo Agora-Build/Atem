@@ -1175,22 +1175,36 @@ fn a_restart_closes_every_live_handle() {
     rig.advance(1000);
     rig.connect("b", bot());
     rig.envelope_in(&envelope::open("c", Transport::Relay));
-    let closes = rig.run(|e, p| {
-        let (fx, closes) = e.restart(p);
-        (closes, fx)
+    // A close already queued outside a channel (an unknown handle) stays.
+    rig.stalled = true;
+    rig.envelope_in(&envelope::frame(
+        "ghost",
+        br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#,
+    ));
+    rig.closes.clear();
+    let link = rig.link_gen;
+    rig.run(|e, p| {
+        let mut fx = e.restart(p);
+        fx.extend(e.link_up(link, p));
+        ((), fx)
     });
-    let mut handles: Vec<String> = closes
+    rig.stalled = false;
+    rig.pump();
+    let mut handles: Vec<String> = rig
+        .closes
         .iter()
-        .map(|c| match envelope::parse(c).unwrap() {
-            Event::Close { channel, reason } => {
-                assert_eq!(reason.as_deref(), Some("closed"));
-                channel
-            }
-            other => panic!("{other:?}"),
+        .map(|(h, r)| {
+            let want = if h == "ghost" {
+                "unknown_channel"
+            } else {
+                "closed"
+            };
+            assert_eq!(r.as_deref(), Some(want), "{h}");
+            h.clone()
         })
         .collect();
     handles.sort();
-    assert_eq!(handles, ["a", "b", "c"]);
+    assert_eq!(handles, ["a", "b", "c", "ghost"]);
     assert_eq!(rig.rt.host.welcomed_attachments(), 0);
 }
 
@@ -1345,4 +1359,79 @@ fn a_backed_up_link_serves_the_channels_in_turn() {
         .map(|t| envelope::parse(t).unwrap().channel().to_string())
         .collect();
     assert!(channels.contains(&"b-quiet".to_string()), "{channels:?}");
+}
+
+/// N1: the outside-channel rate is one window on one clock, whatever the
+/// session clock says: refused opens and unknown frames alternating in
+/// one second queue at most 16.
+#[test]
+fn the_refusal_rate_uses_one_clock() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(
+        Limits {
+            open_channels: 1,
+            ..Limits::default()
+        },
+        None,
+    );
+    rig.link_up();
+    rig.envelope_in(&envelope::open("held", Transport::Relay));
+    rig.stalled = true;
+    // The session clock far from the host clock (different origins).
+    rig.now.mono = 7;
+    rig.now.host.mono_ms = 9_000_000_000;
+    let ghost = br#"{"ch":"atem-ch1","op":"rec","ct":"AAAAAAAAAAAAAAAAAAAAAA"}"#;
+    for i in 0..50 {
+        rig.envelope_in(&envelope::open(&format!("o-{i}"), Transport::Relay));
+        rig.envelope_in(&envelope::frame(&format!("u-{i}"), ghost));
+    }
+    assert_eq!(rig.engine.queued_closes(), 16);
+}
+
+/// N2: with more backed-up channels than the link takes per pass, every
+/// channel gets about an equal share (the round resumes at the channel the
+/// link refused).
+#[test]
+fn backed_up_channels_share_the_link_equally() {
+    for (channels, per_pass) in [(2usize, 1usize), (3, 2)] {
+        let mut rig = Rig::new();
+        rig.link_up();
+        let names: Vec<String> = (0..channels).map(|i| format!("ch-{i}")).collect();
+        for name in &names {
+            rig.connect(name, phone());
+            rig.advance(1000);
+        }
+        rig.stalled = true;
+        for name in &names {
+            for _ in 0..30 {
+                let mono = rig.now.host.mono_ms;
+                let (_, frame) = rig.attached(name).list(mono).unwrap();
+                let text = envelope::frame(name, &frame);
+                rig.run(|e, p| ((), e.on_envelope(&text, p)));
+            }
+        }
+        let mut served: BTreeMap<String, usize> = BTreeMap::new();
+        for _ in 0..(9 * channels / per_pass) {
+            let mut budget = per_pass;
+            rig.engine.flush(&mut |t| {
+                if budget == 0 {
+                    return false;
+                }
+                budget -= 1;
+                *served
+                    .entry(envelope::parse(&t).unwrap().channel().to_string())
+                    .or_default() += 1;
+                true
+            });
+        }
+        let counts: Vec<usize> = names
+            .iter()
+            .map(|n| served.get(n).copied().unwrap_or(0))
+            .collect();
+        let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+        assert!(
+            max - min <= 1,
+            "{channels} channels at {per_pass} a pass: {counts:?}"
+        );
+    }
 }
