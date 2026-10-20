@@ -508,6 +508,45 @@ fn a_phone_a_desktop_a_bot_and_a_browser_use_the_host() {
     let frame = b.send(&open, now()).unwrap();
     let ev = exchange(&mut b, &mut bw, &frame, now(), |e| !e.is_empty());
     assert_eq!(family_error(&ev).as_deref(), Some("unknown_session"));
+    // The same in the registry's lease ops and in receipts (§R9.6): an
+    // acquire, or a receipt_query for the Mac's receipt on that session,
+    // is unknown_session, never a lease or a receipt.
+    for data in [
+        json!({"v": 1, "op": "acquire", "id": "aaaaaaaa-0000-4000-8000-0000000000b1",
+               "binding": forged, "takeover": false}),
+        json!({"v": 1, "op": "receipt_query", "id": "aaaaaaaa-0000-4000-8000-0000000000b2",
+               "binding": forged, "request_ids": ["bbbbbbbb-0000-4000-8000-000000000002"]}),
+    ] {
+        let frame = b
+            .send(&json!({"type": "session", "data": data}), now())
+            .unwrap();
+        let ev = exchange(&mut b, &mut bw, &frame, now(), |e| !e.is_empty());
+        assert_eq!(
+            error_code(&ev).as_deref(),
+            Some("unknown_session"),
+            "{data}"
+        );
+    }
+    // A query on its own session doesn't leak another session's receipt.
+    let (_, frame) = b
+        .receipt_query(
+            SES_A,
+            &["bbbbbbbb-0000-4000-8000-000000000002".into()],
+            now(),
+        )
+        .unwrap();
+    let ev = exchange(&mut b, &mut bw, &frame, now(), |e| {
+        e.iter()
+            .any(|e| matches!(e, Event::Session(m) if matches!(m.op, Op::Receipts { .. })))
+    });
+    assert!(ev.iter().any(|e| matches!(e, Event::Session(m)
+        if matches!(&m.op, Op::Receipts { receipts } if receipts.is_empty()))));
+    // Without the approval op, a seen is forbidden (no cards for it).
+    let (_, frame) = b
+        .approval_seen(SES_A, "8c3e9d6b-1f40-4b52-8dae-4f5a6b7c8d9e", now())
+        .unwrap();
+    let ev = exchange(&mut b, &mut bw, &frame, now(), |e| !e.is_empty());
+    assert_eq!(error_code(&ev).as_deref(), Some("forbidden"));
 
     // The browser (WebCrypto P-256 grant from the phone), Unix socket.
     let browser = Device::browser(&world, grant_vector(), log.clone());
@@ -577,6 +616,19 @@ fn a_phone_a_desktop_a_bot_and_a_browser_use_the_host() {
     // The natives never expire.
     let mut pw2 = world.tcp();
     assert!(phone.connect(&mut pw2).is_ok());
+    // The host journals revoked grant ids until their expiry, at most 256.
+    {
+        let mut core = world.core.lock().unwrap();
+        for i in 0..300 {
+            core.revoke(&format!("7b2d8c5a-0e3f-4a41-9c9d-{i:012}"));
+        }
+        assert_eq!(core.revoked.len(), 256);
+    }
+    world.advance(3_900_001);
+    assert!(
+        world.core.lock().unwrap().revoked.is_empty(),
+        "expired ids are dropped"
+    );
 }
 
 /// A phone carries a suffix (E7: it removes the bot); the host applies it
@@ -635,7 +687,9 @@ fn a_contradicting_welcome_is_refused() {
     let log = world.log(&L);
     let phone = Device::native(&world, "dev-phone", log.clone());
     type Rewrite = fn(&mut atem_client::session::r9::Welcome);
-    let cases: [(Rewrite, &str); 6] = [
+    let cases: [(Rewrite, &str); 8] = [
+        (|w| w.host_trust_gen = 2, "host"),
+        (|w| w.atem_device_id = "host-b".into(), "host"),
         (|w| w.revision = 8, "revision"),
         (|w| w.channel_id = "00".repeat(16), "channel_id"),
         (|w| w.principal = "member:dev-mac".into(), "principal"),
@@ -1100,7 +1154,7 @@ fn push_hints_seen_and_the_schedule_end_to_end() {
         push::seen(
             &core.keys,
             &core.host_key,
-            &hint.key,
+            hint.key(),
             c,
             "dev-phone",
             c + 71_000,
@@ -1126,7 +1180,7 @@ fn push_hints_seen_and_the_schedule_end_to_end() {
         push::resolved_hint(
             &core.keys,
             &core.host_key,
-            &hint.key,
+            hint.key(),
             c,
             c + 600_000,
             "answered_terminal",

@@ -533,12 +533,34 @@ impl Refusal {
 
 /// A verified hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its fields are private: only [`Hint::verify`] makes one, so a hint can
+/// only be opened (its decryption `info` built from its fields) after its
+/// signature verified.
 pub struct Hint {
-    pub object: SignedObject,
-    pub key: ApprovalKey,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub state: HintState,
+    object: SignedObject,
+    key: ApprovalKey,
+    created_at: u64,
+    expires_at: u64,
+    state: HintState,
+}
+
+impl Hint {
+    pub fn object(&self) -> &SignedObject {
+        &self.object
+    }
+    pub fn key(&self) -> &ApprovalKey {
+        &self.key
+    }
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+    pub fn state(&self) -> &HintState {
+        &self.state
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,18 +603,46 @@ fn check_host(
     key: &ApprovalKey,
     log: &Membership,
 ) -> std::result::Result<(), Refusal> {
-    let host = log.host(&key.host_id).ok_or(Refusal::Binding)?;
+    check_host_signed(object, key, log).map_err(|(r, _)| r)
+}
+
+/// `check_host`, also telling whether the signature had verified when it
+/// refused (only a binding refusal after it can name an identity).
+fn check_host_signed(
+    object: &SignedObject,
+    key: &ApprovalKey,
+    log: &Membership,
+) -> std::result::Result<(), (Refusal, bool)> {
+    let host = log.host(&key.host_id).ok_or((Refusal::Binding, false))?;
     // The signature first: a tampered field fails here whatever it says.
     object
         .verify(&host.host_key)
-        .map_err(|_| Refusal::BadSignature)?;
+        .map_err(|_| (Refusal::BadSignature, false))?;
     if key.account_id != log.account_id()
         || key.genesis_hash != log.genesis_hash().to_hex()
         || key.host_trust_gen != host.host_trust_gen
     {
-        return Err(Refusal::Binding);
+        return Err((Refusal::Binding, true));
     }
     Ok(())
+}
+
+/// A refusal, and the identity when the signature had verified (boxed:
+/// an identity is a handful of strings).
+pub type Reported = (Refusal, Option<Box<Identity>>);
+
+fn exact_or(o: &Map<String, Value>, extra: &[&str]) -> std::result::Result<(), Reported> {
+    exact(o, extra).map_err(|r| (r, None))
+}
+
+fn identity_of(key: &ApprovalKey, state: &HintState) -> Identity {
+    match state {
+        HintState::Open { device_id, .. } => Identity::Open {
+            key: key.clone(),
+            device_id: device_id.clone(),
+        },
+        HintState::Resolved { .. } => Identity::Resolved { key: key.clone() },
+    }
 }
 
 fn u64_of(o: &Map<String, Value>, k: &'static str) -> std::result::Result<u64, Refusal> {
@@ -615,16 +665,30 @@ impl Hint {
         now_ms: u64,
         verifier: Verifier,
     ) -> std::result::Result<Hint, Refusal> {
+        Self::verify_reporting(object, log, now_ms, verifier).map_err(|(r, _)| r)
+    }
+
+    /// [`Hint::verify`], also naming the hint's identity in a refusal once
+    /// its signature verified (times, skew, staleness, binding): the relay
+    /// acknowledges every hint it can identify, refused ones included
+    /// (§R9.9), so the host stops resending them.
+    pub fn verify_reporting(
+        object: &SignedObject,
+        log: &Membership,
+        now_ms: u64,
+        verifier: Verifier,
+    ) -> std::result::Result<Hint, Reported> {
+        let unidentified = |r: Refusal| (r, None);
         if object.body_type() != "atem-push-hint" {
-            return Err(Refusal::Malformed("type"));
+            return Err(unidentified(Refusal::Malformed("type")));
         }
         let o = object
             .body()
             .as_object()
-            .ok_or(Refusal::Malformed("body"))?;
+            .ok_or(unidentified(Refusal::Malformed("body")))?;
         let state = o.get("state").and_then(Value::as_str);
         match state {
-            Some("open") => exact(
+            Some("open") => exact_or(
                 o,
                 &[
                     "state",
@@ -634,32 +698,32 @@ impl Hint {
                     "sealed_hash",
                 ],
             )?,
-            Some("resolved") => exact(
+            Some("resolved") => exact_or(
                 o,
                 &["state", "created_at", "expires_at", "reason", "resolved_at"],
             )?,
-            _ => return Err(Refusal::Malformed("state")),
+            _ => return Err(unidentified(Refusal::Malformed("state"))),
         }
-        let key = ApprovalKey::read(o).map_err(|_| Refusal::Malformed("identity"))?;
-        let created_at = u64_of(o, "created_at")?;
-        let expires_at = u64_of(o, "expires_at")?;
+        let key = ApprovalKey::read(o).map_err(|_| unidentified(Refusal::Malformed("identity")))?;
+        let created_at = u64_of(o, "created_at").map_err(unidentified)?;
+        let expires_at = u64_of(o, "expires_at").map_err(unidentified)?;
         let state = if state == Some("open") {
             let r = o
                 .get("recipient")
                 .and_then(Value::as_object)
                 .filter(|r| r.len() == 2)
-                .ok_or(Refusal::Malformed("recipient"))?;
+                .ok_or(unidentified(Refusal::Malformed("recipient")))?;
             let device_id = r
                 .get("device_id")
                 .and_then(Value::as_str)
-                .ok_or(Refusal::Malformed("recipient.device_id"))?;
+                .ok_or(unidentified(Refusal::Malformed("recipient.device_id")))?;
             let enc_kid = r
                 .get("enc_kid")
                 .and_then(Value::as_str)
                 .filter(|k| {
                     k.len() == 16 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
                 })
-                .ok_or(Refusal::Malformed("recipient.enc_kid"))?;
+                .ok_or(unidentified(Refusal::Malformed("recipient.enc_kid")))?;
             HintState::Open {
                 device_id: device_id.to_owned(),
                 enc_kid: enc_kid.to_owned(),
@@ -667,34 +731,36 @@ impl Hint {
                     .get("sealed_hash")
                     .and_then(Value::as_str)
                     .and_then(|h| Hash32::from_hex(h).ok())
-                    .ok_or(Refusal::Malformed("sealed_hash"))?,
+                    .ok_or(unidentified(Refusal::Malformed("sealed_hash")))?,
             }
         } else {
             HintState::Resolved {
                 reason: o
                     .get("reason")
                     .and_then(Value::as_str)
-                    .ok_or(Refusal::Malformed("reason"))?
+                    .ok_or(unidentified(Refusal::Malformed("reason")))?
                     .to_owned(),
-                resolved_at: u64_of(o, "resolved_at")?,
+                resolved_at: u64_of(o, "resolved_at").map_err(unidentified)?,
             }
         };
-        check_host(object, &key, log)?;
+        check_host_signed(object, &key, log)
+            .map_err(|(r, signed)| (r, signed.then(|| Box::new(identity_of(&key, &state)))))?;
+        let identified = |r: Refusal| (r, Some(Box::new(identity_of(&key, &state))));
         if expires_at <= created_at || expires_at - created_at > MAX_HINT_LIFETIME_MS {
-            return Err(Refusal::InvalidTimes);
+            return Err(identified(Refusal::InvalidTimes));
         }
         let open = matches!(state, HintState::Open { .. });
         match verifier {
             Verifier::Client if created_at > now_ms.saturating_add(CLIENT_SKEW_MS) => {
-                return Err(Refusal::Skew);
+                return Err(identified(Refusal::Skew));
             }
             Verifier::Relay if open && created_at.abs_diff(now_ms) > RELAY_SKEW_MS => {
-                return Err(Refusal::Skew);
+                return Err(identified(Refusal::Skew));
             }
             _ => {}
         }
         if expires_at.saturating_add(CLIENT_SKEW_MS) <= now_ms {
-            return Err(Refusal::Stale);
+            return Err(identified(Refusal::Stale));
         }
         Ok(Hint {
             object: object.clone(),
@@ -766,12 +832,32 @@ impl Hint {
 
 /// A verified seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Only [`Seen::verify`] makes one (private fields).
 pub struct Seen {
-    pub object: SignedObject,
-    pub key: ApprovalKey,
-    pub created_at: u64,
-    pub device_id: String,
-    pub seen_at: u64,
+    object: SignedObject,
+    key: ApprovalKey,
+    created_at: u64,
+    device_id: String,
+    seen_at: u64,
+}
+
+impl Seen {
+    pub fn object(&self) -> &SignedObject {
+        &self.object
+    }
+    pub fn key(&self) -> &ApprovalKey {
+        &self.key
+    }
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+    pub fn seen_at(&self) -> u64 {
+        self.seen_at
+    }
 }
 
 impl Seen {
@@ -867,6 +953,11 @@ impl HintBook {
         }
         self.hints.insert(identity, hint);
         Ok(Accepted::Accepted)
+    }
+
+    /// The accepted hint with exactly these bytes, if any.
+    pub fn stored(&self, object: &SignedObject) -> Option<&Hint> {
+        self.hints.values().find(|h| h.object == *object)
     }
 
     pub fn is_resolved(&self, key: &ApprovalKey) -> bool {
@@ -1089,9 +1180,22 @@ impl RelayLedger {
         log: &Membership,
         now: u64,
     ) -> (Verdict, Option<Identity>) {
-        let hint = match Hint::verify(object, log, now, Verifier::Relay) {
+        // A resend of bytes already accepted (a lost ack, a reconnect) is
+        // idempotent whenever it arrives: the skew bound applies at first
+        // receipt only. The bytes are the verified ones.
+        if let Some(stored) = self.book.stored(object) {
+            let identity = stored.identity();
+            let verdict = match stored.state {
+                HintState::Open { .. } if self.book.is_resolved(&stored.key) => {
+                    Verdict::IgnoredAfterResolved
+                }
+                _ => Verdict::Idempotent,
+            };
+            return (verdict, Some(identity));
+        }
+        let hint = match Hint::verify_reporting(object, log, now, Verifier::Relay) {
             Ok(h) => h,
-            Err(r) => return (Verdict::Refused(r), None),
+            Err((r, identity)) => return (Verdict::Refused(r), identity.map(|i| *i)),
         };
         let identity = hint.identity();
         let key = hint.key.clone();

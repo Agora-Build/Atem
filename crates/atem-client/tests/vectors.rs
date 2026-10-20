@@ -1883,14 +1883,14 @@ fn push_hint() {
         let now = run.get("verifier_now").as_u64().unwrap();
         let verified = Hint::verify(&object, &log, now, Verifier::Client).unwrap();
         verified.check_sealed().unwrap();
-        let HintState::Open { .. } = &verified.state else {
+        let HintState::Open { .. } = &verified.state() else {
             panic!("{name} is open")
         };
         assert_eq!(
             hex(&push::seal_info(
-                &verified.key,
-                verified.created_at,
-                verified.expires_at,
+                verified.key(),
+                verified.created_at(),
+                verified.expires_at(),
                 device,
                 &kid
             )
@@ -1918,9 +1918,9 @@ fn push_hint() {
         let rebuilt = push::open_hint_with_ikm(
             &book.provider,
             &book.signer("host-a"),
-            &verified.key,
-            verified.created_at,
-            verified.expires_at,
+            verified.key(),
+            verified.created_at(),
+            verified.expires_at(),
             device,
             &recipient,
             &HintPlain {
@@ -1969,27 +1969,27 @@ fn push_hint() {
             connected: false,
             immediate_mobile: false,
         };
-        let (stage, due) = push::stages(h.created_at, mobile)
+        let (stage, due) = push::stages(h.created_at(), mobile)
             .into_iter()
             .find(|(st, _)| *st == Stage::Mobile)
             .unwrap();
-        assert_eq!(due, h.created_at + 60_000);
-        let sent = push::send_now(stage, due, due, h.expires_at, false, false);
+        assert_eq!(due, h.created_at() + 60_000);
+        let sent = push::send_now(stage, due, due, h.expires_at(), false, false);
         let later = push::send_now(
             stage,
             due,
-            h.expires_at - 15_001,
-            h.expires_at,
+            h.expires_at() - 15_001,
+            h.expires_at(),
             false,
             false,
         );
         match name {
             "open_g75" => {
-                assert_eq!(due, push::guard(h.expires_at));
+                assert_eq!(due, push::guard(h.expires_at()));
                 assert!(!sent && !later, "on the guard: never sent");
             }
             _ => {
-                assert_eq!(due + 1, push::guard(h.expires_at));
+                assert_eq!(due + 1, push::guard(h.expires_at()));
                 assert!(sent, "1 ms before the guard: sent");
             }
         }
@@ -2008,18 +2008,18 @@ fn push_hint() {
     let HintState::Resolved {
         reason,
         resolved_at,
-    } = &res.state
+    } = &res.state()
     else {
         panic!("resolved")
     };
-    assert_eq!(res.key, open0.key, "the same approval identity");
+    assert_eq!(res.key(), open0.key(), "the same approval identity");
     assert_eq!(
         push::resolved_hint(
             &book.provider,
             &book.signer("host-a"),
-            &res.key,
-            res.created_at,
-            res.expires_at,
+            res.key(),
+            res.created_at(),
+            res.expires_at(),
             reason,
             *resolved_at
         )
@@ -2051,16 +2051,16 @@ fn push_hint() {
     seen.verify(&host_key).unwrap();
     run.pass("seen: signing input, host signature");
     let seen_v = Seen::verify(&seen, &log).unwrap();
-    assert_eq!(seen_v.key, open0.key);
-    assert!(seen_v.in_window(open0.created_at));
+    assert_eq!(seen_v.key(), open0.key());
+    assert!(seen_v.in_window(open0.created_at()));
     assert_eq!(
         push::seen(
             &book.provider,
             &book.signer("host-a"),
-            &seen_v.key,
-            seen_v.created_at,
-            &seen_v.device_id,
-            seen_v.seen_at
+            seen_v.key(),
+            seen_v.created_at(),
+            seen_v.device_id(),
+            seen_v.seen_at()
         )
         .unwrap(),
         seen
@@ -2078,7 +2078,7 @@ fn push_hint() {
     other_object.verify(&host_key).unwrap();
     run.pass("seen_other_process_gen: signing input, host signature");
     let other_v = Seen::verify(&other_object, &log).unwrap();
-    assert_ne!(other_v.key, open0.key);
+    assert_ne!(other_v.key(), open0.key());
     assert_ne!(other_v.identity(), seen_v.identity());
     let mut ledger = RelayLedger::new();
     for o in run.get("open").as_array().unwrap() {
@@ -2114,7 +2114,7 @@ fn push_hint() {
                 let mut book = HintBook::new();
                 assert_eq!(book.offer(open0.clone()), Ok(Accepted::Accepted));
                 assert_eq!(book.offer(client.unwrap()), Err(PushRefusal::Duplicate));
-                assert_eq!(book.opens(&open0.key)[0], &open0, "the first stays");
+                assert_eq!(book.opens(open0.key())[0], &open0, "the first stays");
             }
             _ => panic!("an unexpected invalid hint"),
         }

@@ -12,21 +12,24 @@
 //! real sockets.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use atem_client::channel::responder::{AwaitFinish, HostContext, InitLimiter, Responder};
 use atem_client::channel::wire::{self as chwire, Frame, Parsed};
 use atem_client::channel::{Channel, Principal};
 use atem_client::membership::{Effect, HostNow, Membership};
-use atem_client::principal::{Authority, Need, Op, Refusal, admission_error};
+use atem_client::principal::{
+    Authority, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS, MAX_REVOKED_GRANTS, Need,
+    Refusal, SessionRef, admission_error,
+};
 use atem_client::push::{self, HintPlain, HostApproval, Outbox, SeenOutcome};
 use atem_client::session::r9::{
     self, Hello, PendingRecovery, R9_FEATURES, REVISION, SessionError, Welcome, code,
 };
 use atem_client::session::revision::KNOWN_FEATURES;
 use atem_client::session::wire::{
-    self, Activity, Binding, Descriptor, Envelope, ErrorCode, Op as WireOp, Receipt, ReceiptKind,
-    ReceiptLease, ReceiptState, SessionMessage, SessionState, Target,
+    self, Activity, Binding, Descriptor, Envelope, ErrorCode, Op as WireOp, Receipt, ReceiptLease,
+    ReceiptState, SessionMessage, SessionState, Target,
 };
 use atem_client::{KeyId, SoftwareKeys};
 use serde_json::{Value, json};
@@ -70,7 +73,9 @@ pub struct HostCore {
     pub keys: SoftwareKeys,
     pub host_key: KeyId,
     pub sessions: Vec<HostSession>,
-    pub revoked: BTreeSet<String>,
+    /// Revoked grant ids until their grant's expiry (wall ms), at most
+    /// `MAX_REVOKED_GRANTS` (§R9.6).
+    pub revoked: BTreeMap<String, u64>,
     pub runtime_gen: String,
     attachments: BTreeMap<u64, Attachment>,
     leases: BTreeMap<String, Lease>,
@@ -109,7 +114,7 @@ impl HostCore {
             keys,
             host_key,
             sessions,
-            revoked: BTreeSet::new(),
+            revoked: BTreeMap::new(),
             runtime_gen: "11111111-1111-4111-8111-111111111111".into(),
             attachments: BTreeMap::new(),
             leases: BTreeMap::new(),
@@ -131,6 +136,7 @@ impl HostCore {
     /// The host's wall clock jumps / time passes: expiry timers fence, and
     /// the outbox resends.
     pub fn tick(&mut self) {
+        self.prune_revoked();
         let now = self.now.wall_ms;
         let expired: Vec<u64> = self
             .attachments
@@ -143,6 +149,35 @@ impl HostCore {
         }
         let resends = self.outbox.tick(self.now.mono_ms);
         self.relay_sent.extend(resends);
+    }
+
+    /// Journals a revoked grant id until its grant's expiry: the expiry of
+    /// an attached browser holding it, else the longest a grant can still
+    /// live (1 h). At most 256 ids: the one expiring first goes.
+    pub fn revoke(&mut self, grant_id: &str) {
+        let now = self.now.wall_ms;
+        let until = self
+            .attachments
+            .values()
+            .filter(|a| a.authority.name() == format!("browser:{grant_id}"))
+            .find_map(|a| a.authority.expires_at)
+            .unwrap_or(now + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
+        self.revoked.insert(grant_id.into(), until);
+        self.prune_revoked();
+        while self.revoked.len() > MAX_REVOKED_GRANTS {
+            let first = self
+                .revoked
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(id, _)| id.clone())
+                .unwrap();
+            self.revoked.remove(&first);
+        }
+    }
+
+    fn prune_revoked(&mut self) {
+        let now = self.now.wall_ms;
+        self.revoked.retain(|_, until| now < *until);
     }
 
     fn fence(&mut self, conn: u64, detail: &str) {
@@ -434,7 +469,7 @@ impl HostConn {
                     &core.host_id,
                     core.trust_gen,
                     &now,
-                    &|id| revoked.contains(id),
+                    &|id| revoked.contains_key(id),
                 )
             }
         };
@@ -527,15 +562,42 @@ impl HostConn {
             .to_bytes()
         };
         let authority = core.attachments[&self.id].authority.clone();
+        // The one authority check for every request (§R9.6), before any
+        // field decoding: the named session first (out of scope or unknown:
+        // `unknown_session`), then the op (`forbidden`).
+        let family = value["type"].as_str().unwrap_or_default().to_owned();
+        if let Some(need) = Need::of_request(&family, data) {
+            let named = Need::session_of(data)
+                .map(|sid| core.sessions.iter().find(|s| s.session_id == sid).cloned());
+            let host_id = core.host_id.clone();
+            let check = |s: &HostSession| -> Result<(), Denied> {
+                let project = s.project.clone();
+                let matches = move |entry: &str| Some(entry == project);
+                let r = SessionRef {
+                    host_id: &host_id,
+                    session_id: &s.session_id,
+                    project_matches: &matches,
+                };
+                authority.authorize(need, Some(Some(&r)))
+            };
+            let verdict = match &named {
+                None => authority.authorize(need, None),
+                Some(None) => Err(Denied::UnknownSession),
+                Some(Some(s)) => check(s),
+            };
+            if let Err(denied) = verdict {
+                return vec![match family.as_str() {
+                    "session" => error(denied.code(), None),
+                    _ => family_error(&family, data, denied.code()),
+                }];
+            }
+        }
         // r9's own ops.
         if value["type"] == "session" {
             match data["op"].as_str() {
                 Some("revoke_grant") => {
-                    if !authority.allows(Need::RevokeGrant) {
-                        return vec![error(code::FORBIDDEN, None)];
-                    }
                     let grant_id = data["grant_id"].as_str().unwrap_or_default().to_owned();
-                    core.revoked.insert(grant_id.clone());
+                    core.revoke(&grant_id);
                     core.fence_principal(&format!("browser:{grant_id}"), "grant revoked");
                     return vec![
                         r9::grant_revoked(&uuid(0x9000), &id)
@@ -595,7 +657,7 @@ impl HostConn {
                             &core.keys,
                             &core.host_key,
                             &device,
-                            authority.allows(Need::Control),
+                            authority.allows(Need::Seen),
                             target["session_id"].as_str().unwrap_or_default(),
                             target["process_gen"].as_str().unwrap_or_default(),
                             core.now.wall_ms,
@@ -617,27 +679,6 @@ impl HostConn {
                     };
                 }
                 _ => {}
-            }
-        }
-        // The authority check by op name comes before the strict field
-        // decode, so a principal outside its ops learns `forbidden` and
-        // nothing from field validation (an Atem ordering; the r9 fixtures
-        // send `acquire` without r8's `takeover`).
-        if value["type"] == "session" {
-            let need = match data["op"].as_str() {
-                Some("acquire" | "renew" | "release") => Some(Need::Lease),
-                Some("submit") => match data["kind"].as_str() {
-                    Some("prompt") => Some(Need::Op(Op::Prompt)),
-                    Some("interrupt") => Some(Need::Op(Op::Interrupt)),
-                    Some("stop") => Some(Need::Op(Op::Stop)),
-                    Some("approval") => Some(Need::Op(Op::Approval)),
-                    Some("approval_rule_revoke") => Some(Need::Op(Op::RuleRevoke)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if need.is_some_and(|n| !authority.allows(n)) {
-                return vec![error(code::FORBIDDEN, None)];
             }
         }
         let env = match wire::decode(plain) {
@@ -679,22 +720,17 @@ impl HostConn {
                         sessions,
                     })]
                 }
-                WireOp::Acquire { binding, .. } => {
-                    if !authority.allows(Need::Lease) {
-                        return vec![wire_error(ErrorCode::Forbidden, None)];
+                WireOp::Acquire { binding, .. } => match self.grant(core, &binding) {
+                    Ok((epoch, _)) => {
+                        let mut b = binding.clone();
+                        b.lease_epoch = Some(epoch);
+                        vec![reply(WireOp::Lease {
+                            binding: b,
+                            ms_left: LEASE_MS,
+                        })]
                     }
-                    match self.grant(core, &binding) {
-                        Ok((epoch, _)) => {
-                            let mut b = binding.clone();
-                            b.lease_epoch = Some(epoch);
-                            vec![reply(WireOp::Lease {
-                                binding: b,
-                                ms_left: LEASE_MS,
-                            })]
-                        }
-                        Err(e) => vec![wire_error(e, None)],
-                    }
-                }
+                    Err(e) => vec![wire_error(e, None)],
+                },
                 WireOp::Submit {
                     binding,
                     request_id,
@@ -702,19 +738,6 @@ impl HostConn {
                     acquire,
                     ..
                 } => {
-                    let need = match kind {
-                        ReceiptKind::Prompt => Op::Prompt,
-                        ReceiptKind::Interrupt => Op::Interrupt,
-                        ReceiptKind::Stop => Op::Stop,
-                        ReceiptKind::Approval => Op::Approval,
-                        ReceiptKind::ApprovalRuleRevoke => Op::RuleRevoke,
-                    };
-                    if !authority.allows(Need::Op(need)) {
-                        return vec![wire_error(ErrorCode::Forbidden, None)];
-                    }
-                    if !self.session_visible(core, &authority, &binding) {
-                        return vec![wire_error(ErrorCode::UnknownSession, None)];
-                    }
                     let mut lease = None;
                     if acquire == Some(true) {
                         match self.grant(core, &binding) {
@@ -779,62 +802,24 @@ impl HostConn {
                         _ => vec![wire_error(ErrorCode::StaleLease, None)],
                     }
                 }
-                WireOp::ReceiptQuery { request_ids, .. } => {
+                WireOp::ReceiptQuery {
+                    binding,
+                    request_ids,
+                } => {
+                    // Only that (in-scope, checked above) session's receipts.
                     let receipts = request_ids
                         .iter()
                         .filter_map(|r| core.receipts.get(r).cloned())
+                        .filter(|r| r.target.session_id == binding.target.session_id)
                         .collect();
                     vec![reply(WireOp::Receipts { receipts })]
                 }
                 _ => vec![wire_error(ErrorCode::InvalidRequest, None)],
             },
-            Envelope::Family(f) => {
-                let op = f
-                    .data
-                    .as_ref()
-                    .and_then(|d| d["op"].as_str())
-                    .unwrap_or_default();
-                let need = match (f.family.as_str(), op) {
-                    ("terminal", "input" | "resize") => Need::Op(Op::Terminal),
-                    ("terminal", "stop") => Need::Op(Op::Stop),
-                    _ => Need::Op(Op::View),
-                };
-                let forbidden = !authority.allows(need);
-                let unknown = f
-                    .binding
-                    .as_ref()
-                    .is_some_and(|b| !self.session_visible(core, &authority, b));
-                let code = if forbidden {
-                    "forbidden"
-                } else if unknown {
-                    "unknown_session"
-                } else {
-                    return Vec::new();
-                };
-                // The r8 host's shapes: terminal `error{terminal_id, code,
-                // message}`, chat `error{conversationId, agentId, code, text}`.
-                let d = f.data.clone().unwrap_or_default();
-                let data = if f.family == "agentChat" {
-                    json!({"v": 1, "op": "error", "conversationId": d["conversationId"],
-                           "agentId": d["agentId"], "code": code, "text": code})
-                } else {
-                    json!({"v": 1, "op": "error", "terminal_id": d["terminal_id"],
-                           "code": code, "message": code})
-                };
-                vec![
-                    json!({"type": f.family, "data": data})
-                        .to_string()
-                        .into_bytes(),
-                ]
-            }
+            // Allowed terminal-v1/chat-v1 requests: the model has no
+            // terminal or chat behind them.
+            Envelope::Family(_) => Vec::new(),
         }
-    }
-
-    fn session_visible(&self, core: &HostCore, authority: &Authority, binding: &Binding) -> bool {
-        core.sessions
-            .iter()
-            .find(|s| s.session_id == binding.target.session_id)
-            .is_some_and(|s| core.in_scope(authority, s))
     }
 
     /// A lease for this connection: free, expired or its own.
@@ -864,6 +849,21 @@ impl HostConn {
         core.leases.insert(session, lease);
         Ok(out)
     }
+}
+
+/// A family's error in the r8 host's shapes: terminal `error{terminal_id,
+/// code, message}`, chat `error{conversationId, agentId, code, text}`.
+fn family_error(family: &str, d: &Value, code: &str) -> Vec<u8> {
+    let data = if family == "agentChat" {
+        json!({"v": 1, "op": "error", "conversationId": d["conversationId"],
+               "agentId": d["agentId"], "code": code, "text": code})
+    } else {
+        json!({"v": 1, "op": "error", "terminal_id": d["terminal_id"],
+               "code": code, "message": code})
+    };
+    json!({"type": family, "data": data})
+        .to_string()
+        .into_bytes()
 }
 
 /// Distinct message ids within a process.

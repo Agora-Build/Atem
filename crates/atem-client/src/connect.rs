@@ -228,6 +228,7 @@ impl Connecting {
         identity: &Identity,
         now_ms: u64,
     ) -> Result<(AwaitWelcome, Vec<u8>), ConnectError> {
+        let host_trust_gen = self.state.init().host_trust_gen;
         let accepted = self.state.on_frame(frame, log, now_ms)?;
         let host_head = accepted.host_head().clone();
         let relation = accepted.relation();
@@ -243,6 +244,7 @@ impl Connecting {
                 hello_id: id,
                 principal: identity.principal.clone(),
                 host_head,
+                host_trust_gen,
                 relation,
                 carriage,
             },
@@ -257,6 +259,8 @@ pub struct AwaitWelcome {
     hello_id: String,
     principal: Principal,
     host_head: HostHead,
+    /// The trust generation the `init` named and `sig_h` covered.
+    host_trust_gen: u64,
     relation: HeadRelation,
     carriage: Carriage,
 }
@@ -337,6 +341,13 @@ impl AwaitWelcome {
         }
         if welcome.account_id != log.account_id() {
             return Err("account_id");
+        }
+        // The host's identity the transcript bound (th2): every `Target`
+        // is built from these.
+        if welcome.atem_device_id != self.host_head.host_id()
+            || welcome.host_trust_gen != self.host_trust_gen
+        {
+            return Err("host");
         }
         // The head after the carriage never goes behind the signed accept,
         // and on the chain the client shares with the host it is the

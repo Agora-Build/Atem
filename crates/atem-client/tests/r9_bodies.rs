@@ -156,19 +156,19 @@ fn hints_and_seens_have_exactly_their_fields() {
             .is_err()
     );
     // Staleness and the client's skew, at their exact bounds.
-    assert!(Hint::verify(&ok, &log, h.expires_at + 299_999, Verifier::Client).is_ok());
+    assert!(Hint::verify(&ok, &log, h.expires_at() + 299_999, Verifier::Client).is_ok());
     assert_eq!(
-        Hint::verify(&ok, &log, h.expires_at + 300_000, Verifier::Client),
+        Hint::verify(&ok, &log, h.expires_at() + 300_000, Verifier::Client),
         Err(PushRefusal::Stale)
     );
-    assert!(Hint::verify(&ok, &log, h.created_at - 300_000, Verifier::Client).is_ok());
+    assert!(Hint::verify(&ok, &log, h.created_at() - 300_000, Verifier::Client).is_ok());
     assert_eq!(
-        Hint::verify(&ok, &log, h.created_at - 300_001, Verifier::Client),
+        Hint::verify(&ok, &log, h.created_at() - 300_001, Verifier::Client),
         Err(PushRefusal::Skew)
     );
-    assert!(Hint::verify(&ok, &log, h.created_at - 120_000, Verifier::Relay).is_ok());
+    assert!(Hint::verify(&ok, &log, h.created_at() - 120_000, Verifier::Relay).is_ok());
     assert_eq!(
-        Hint::verify(&ok, &log, h.created_at - 120_001, Verifier::Relay),
+        Hint::verify(&ok, &log, h.created_at() - 120_001, Verifier::Relay),
         Err(PushRefusal::Skew)
     );
 
@@ -291,7 +291,7 @@ fn the_outbox_resends_until_acknowledged() {
     let mut outbox = push::Outbox::new();
     let first = outbox.send_hints(&hints, 0);
     assert_eq!(first["hints"].as_array().unwrap().len(), 2);
-    outbox.send_seen(&seen, hints[0].expires_at, 0);
+    outbox.send_seen(&seen, hints[0].expires_at(), 0);
     assert!(outbox.tick(9_999).is_empty());
     let resent = outbox.tick(10_000);
     assert_eq!(resent.len(), 2, "one push_hint (both hints), one push_seen");
@@ -318,5 +318,142 @@ fn the_outbox_resends_until_acknowledged() {
     outbox.send_seen(&seen, 1_000, 0);
     assert!(outbox.tick(301_000).is_empty());
     assert!(outbox.is_empty());
+    let _ = book;
+}
+
+/// The reference relay: the skew bound applies at first receipt only (an
+/// accepted hint resent late is idempotent), and every refusal it can
+/// identify (the signature verified) names the identity, so the host can
+/// be acknowledged and stop resending.
+#[test]
+fn the_relay_acks_late_resends_and_identified_refusals() {
+    let v = Vectors::load();
+    let log = log_l(&v);
+    let file = load("r9-vectors-push-hint");
+    let now = file["verifier_now"].as_u64().unwrap();
+    let object = |v: &Value| SignedObject::parse(v.to_string().as_bytes()).unwrap();
+    let open = object(&file["open"][0]);
+    let mut ledger = push::RelayLedger::new();
+    assert_eq!(
+        ledger.receive_hint(&open, &log, now).0,
+        push::Verdict::Accepted
+    );
+    // 200 s later (beyond ±120 s), the same bytes: idempotent, acked.
+    let (verdict, id) = ledger.receive_hint(&open, &log, now + 200_000);
+    assert_eq!(verdict, push::Verdict::Idempotent);
+    assert!(id.is_some());
+    // A first receipt outside the bound: skew, still identified.
+    let other = object(&file["open"][1]);
+    let (verdict, id) = ledger.receive_hint(&other, &log, now + 200_000);
+    assert_eq!(verdict, push::Verdict::Refused(PushRefusal::Skew));
+    assert_eq!(
+        id,
+        Some(
+            Hint::verify(&other, &log, now, Verifier::Relay)
+                .unwrap()
+                .identity()
+        )
+    );
+    // invalid_times is identified too; a bad signature is not.
+    let (verdict, id) = ledger.receive_hint(&object(&file["invalid"][1]["hint"]), &log, now);
+    assert_eq!(verdict, push::Verdict::Refused(PushRefusal::InvalidTimes));
+    assert!(id.is_some());
+    let mut tampered = file["open"][1].clone();
+    tampered["body"]["created_at"] = json!(now - 1);
+    let (verdict, id) = ledger.receive_hint(&object(&tampered), &log, now);
+    assert_eq!(verdict, push::Verdict::Refused(PushRefusal::BadSignature));
+    assert!(id.is_none());
+}
+
+/// What each request needs, and the one per-request check (§R9.6): the
+/// session first (`unknown_session`), then the op (`forbidden`); any member
+/// with control may revoke a grant, services included.
+#[test]
+fn one_authority_check_per_request() {
+    use atem_client::principal::{Denied, SessionRef};
+    let v = Vectors::load();
+    let book = Book::load();
+    let log = log_l(&v);
+    let now = atem_client::membership::HostNow {
+        wall_ms: 1_793_264_001_000,
+        mono_ms: 0,
+        boot_id: "b".into(),
+    };
+    let bot = Authority::resolve(
+        &log,
+        &atem_client::channel::Principal::Service {
+            device_id: "svc-discord".into(),
+        },
+        None,
+        "host-a",
+        1,
+        &now,
+        &|_| false,
+    )
+    .unwrap();
+    let need = |family: &str, data: Value| Need::of_request(family, &data).unwrap();
+    assert_eq!(need("session", json!({"op": "acquire"})), Need::Lease);
+    assert_eq!(
+        need("session", json!({"op": "receipt_query"})),
+        Need::Op(Op::View)
+    );
+    assert_eq!(
+        need("session", json!({"op": "submit", "kind": "approval"})),
+        Need::Op(Op::Approval)
+    );
+    assert_eq!(need("session", json!({"op": "approval_seen"})), Need::Seen);
+    assert_eq!(
+        need("terminal", json!({"op": "input"})),
+        Need::Op(Op::Terminal)
+    );
+    assert_eq!(
+        need("agentChat", json!({"op": "submit", "text": "x"})),
+        Need::Op(Op::Prompt)
+    );
+    assert_eq!(
+        Need::session_of(&json!({"binding": {"target": {"session_id": "ses-aaaaaaaaaaaa"}}})),
+        Some("ses-aaaaaaaaaaaa")
+    );
+    let abab = |e: &str| {
+        Some(e.ends_with("abababababababababababababababababababababababababababababababab"))
+    };
+    let other = |_: &str| Some(false);
+    let mine = SessionRef {
+        host_id: "host-a",
+        session_id: "ses-aaaaaaaaaaaa",
+        project_matches: &abab,
+    };
+    let theirs = SessionRef {
+        host_id: "host-a",
+        session_id: "ses-bbbbbbbbbbbb",
+        project_matches: &other,
+    };
+    assert_eq!(bot.authorize(Need::Lease, Some(Some(&mine))), Ok(()));
+    assert_eq!(
+        bot.authorize(Need::Lease, Some(Some(&theirs))),
+        Err(Denied::UnknownSession)
+    );
+    assert_eq!(
+        bot.authorize(Need::Op(Op::Terminal), Some(Some(&theirs))),
+        Err(Denied::UnknownSession)
+    );
+    assert_eq!(
+        bot.authorize(Need::Op(Op::Terminal), Some(Some(&mine))),
+        Err(Denied::Forbidden)
+    );
+    assert_eq!(
+        bot.authorize(Need::Op(Op::View), Some(None)),
+        Err(Denied::UnknownSession)
+    );
+    assert_eq!(
+        bot.authorize(Need::Seen, Some(Some(&mine))),
+        Err(Denied::Forbidden),
+        "no approval op"
+    );
+    assert_eq!(
+        bot.authorize(Need::RevokeGrant, None),
+        Ok(()),
+        "a member with control"
+    );
     let _ = book;
 }

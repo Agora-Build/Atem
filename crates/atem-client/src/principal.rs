@@ -104,12 +104,92 @@ pub enum Need {
     /// `acquire`/`renew`/`release`: one of `prompt`, `interrupt`, `stop`,
     /// `terminal`.
     Lease,
-    /// `approval_seen` (R9.9): an attachment with `control`.
+    /// An attachment with `control`.
     Control,
-    /// `revoke_grant`: the grant's issuer or any native member with
-    /// `control` (an Atem reading of "a member with control": services never
-    /// issue grants, so they don't revoke them either).
+    /// `approval_seen` (R9.9): an attachment with `control`, and for a
+    /// scoped principal the `approval` op (§R9.6: "approvals only with
+    /// `approval` in `ops`").
+    Seen,
+    /// `revoke_grant`: the grant's issuer or any member with `control`
+    /// (§R9.6, services included; a browser never revokes: it holds a
+    /// grant, it isn't a member).
     RevokeGrant,
+}
+
+impl Need {
+    /// What one request needs, from its family and `data` as received
+    /// (before the strict field decode, so a principal outside its ops gets
+    /// `forbidden` and learns nothing from field validation). `None` for a
+    /// message a client may always send (`hello`) or one that isn't a
+    /// request (the host's own messages); the caller refuses those as before.
+    pub fn of_request(family: &str, data: &Value) -> Option<Need> {
+        let op = data.get("op").and_then(Value::as_str)?;
+        Some(match (family, op) {
+            ("session", "list" | "receipt_query") => Need::Op(Op::View),
+            ("session", "acquire" | "renew" | "release") => Need::Lease,
+            ("session", "submit") => Need::Op(match data.get("kind").and_then(Value::as_str)? {
+                "prompt" => Op::Prompt,
+                "interrupt" => Op::Interrupt,
+                "stop" => Op::Stop,
+                "approval" => Op::Approval,
+                "approval_rule_revoke" => Op::RuleRevoke,
+                _ => return None,
+            }),
+            ("session", "approval_seen") => Need::Seen,
+            ("session", "revoke_grant") => Need::RevokeGrant,
+            ("session", "membership") => Need::Op(Op::View),
+            ("terminal", "input" | "resize") => Need::Op(Op::Terminal),
+            ("terminal", "stop") => Need::Op(Op::Stop),
+            ("terminal", _) => Need::Op(Op::View),
+            ("agentChat", "submit") => {
+                if data.get("approval").is_some() {
+                    Need::Op(Op::Approval)
+                } else if data.get("approval_rule_revoke").is_some() {
+                    Need::Op(Op::RuleRevoke)
+                } else {
+                    Need::Op(Op::Prompt)
+                }
+            }
+            ("agentChat", _) => Need::Op(Op::View),
+            _ => return None,
+        })
+    }
+
+    /// The session a request names (`binding.target.session_id`), if any.
+    pub fn session_of(data: &Value) -> Option<&str> {
+        data.get("binding")?
+            .get("target")?
+            .get("session_id")?
+            .as_str()
+    }
+}
+
+/// Why [`Authority::authorize`] refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Denied {
+    /// The op is outside the principal's ops or permissions.
+    Forbidden,
+    /// The session is outside its scope (or doesn't exist): the same answer
+    /// in registry, chat, terminal and receipts alike (§R9.6).
+    UnknownSession,
+}
+
+impl Denied {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Denied::Forbidden => "forbidden",
+            Denied::UnknownSession => "unknown_session",
+        }
+    }
+}
+
+/// The session a request names, as the host knows it: `None` when the
+/// host has no such session; else its host id and how its recorded launch
+/// project matches a scope entry (see [`Authority::session_in_scope`]).
+pub struct SessionRef<'a> {
+    pub host_id: &'a str,
+    pub session_id: &'a str,
+    pub project_matches: &'a dyn Fn(&str) -> Option<bool>,
 }
 
 /// `view` and `control`, as `welcome.permissions` lists them.
@@ -641,13 +721,42 @@ impl Authority {
         let control = self.permissions.contains(&Permission::Control);
         match (&self.scope, need) {
             (_, Need::Control) => control,
-            (_, Need::RevokeGrant) => self.client_kind == ClientKind::Native && control,
+            (_, Need::RevokeGrant) => self.client_kind != ClientKind::Browser && control,
+            (None, Need::Seen) => control,
+            (Some(scope), Need::Seen) => control && scope.ops.contains(&Op::Approval),
             (None, Need::Op(Op::View)) => true,
             (None, Need::Op(_) | Need::Lease) => control,
             (Some(scope), Need::Op(op)) => scope.ops.contains(&op),
             (Some(scope), Need::Lease) => [Op::Prompt, Op::Interrupt, Op::Stop, Op::Terminal]
                 .iter()
                 .any(|op| scope.ops.contains(op)),
+        }
+    }
+
+    /// The one check a host runs per request (§R9.6): the session first —
+    /// a request naming a session outside the scope, or one the host
+    /// doesn't have (`session: Some(None)`), is `unknown_session`, so a
+    /// principal learns nothing of sessions it can't see — then the op.
+    /// `session: None` for a request that names no session (`list`,
+    /// `revoke_grant`, `membership`). Results a request returns (the
+    /// receipts of `receipt_query`, the registry of `list`) must be
+    /// filtered with [`Authority::session_in_scope`] as well.
+    pub fn authorize(
+        &self,
+        need: Need,
+        session: Option<Option<&SessionRef<'_>>>,
+    ) -> std::result::Result<(), Denied> {
+        match session {
+            Some(None) => return Err(Denied::UnknownSession),
+            Some(Some(s)) if !self.session_in_scope(s.host_id, s.session_id, s.project_matches) => {
+                return Err(Denied::UnknownSession);
+            }
+            _ => {}
+        }
+        if self.allows(need) {
+            Ok(())
+        } else {
+            Err(Denied::Forbidden)
         }
     }
 
