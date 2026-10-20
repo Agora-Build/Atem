@@ -239,6 +239,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-encoding.json",
             "r9-vectors-keys.json",
             "r9-vectors-membership-log.json",
+            "r9-vectors-pairing.json",
             "r9-vectors-push-hint.json",
             "r9-vectors-recovery.json",
         ],
@@ -2125,4 +2126,33 @@ fn push_hint() {
     run.get("verifier_now");
     run.pass("verifier_now: every time rule above ran against it");
     run.finish();
+}
+
+/// `r9-vectors-pairing`: every valid `verifyCommit` gives its
+/// `host_trust_gen`, every invalid one is refused.
+#[test]
+fn pairing() {
+    use atem_client::ceremony::verify_commit_host_trust_gen;
+    let file = load("r9-vectors-pairing");
+    let mut checked = 0;
+    for case in file["verify_commit"]["valid"].as_array().unwrap() {
+        let raw = case["raw"].as_str().unwrap();
+        assert_eq!(
+            verify_commit_host_trust_gen(raw.as_bytes()),
+            Ok(case["host_trust_gen"].as_u64().unwrap()),
+            "{}",
+            case["case"]
+        );
+        checked += 1;
+    }
+    for case in file["verify_commit"]["invalid"].as_array().unwrap() {
+        let raw = case["raw"].as_str().unwrap();
+        assert!(
+            verify_commit_host_trust_gen(raw.as_bytes()).is_err(),
+            "{} was accepted",
+            case["case"]
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 12);
 }

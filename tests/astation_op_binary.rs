@@ -112,7 +112,9 @@ fn pair_verify_runs_through_the_auto_started_runtime() {
     let (url, seen) = fake_astation();
     let mut cli = sandbox.spawn(&["pair", "verify"], &sandbox.home, &[("ASTATION_WS", &url)]);
     // The runtime (started by the CLI) authenticates its link and verifies on it.
-    saw(&seen, "verifyCommit");
+    let commit = saw(&seen, "verifyCommit");
+    // r9: the binding's generation, public (§R9.2).
+    assert_eq!(commit["host_trust_gen"], 1, "{commit}");
     // r9: the reveal carries this pairing's host channel key.
     let reveal = saw(&seen, "verifyReveal");
     assert_eq!(reveal["host_channel_pub"].as_str().map(str::len), Some(43));

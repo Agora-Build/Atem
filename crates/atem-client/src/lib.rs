@@ -57,6 +57,7 @@
 pub mod backup;
 pub mod backup_writer;
 pub mod canonical;
+pub mod ceremony;
 pub mod channel;
 pub mod connect;
 pub mod domain;

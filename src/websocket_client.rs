@@ -322,7 +322,10 @@ pub enum AstationMessage {
     /// Atem → Astation: start device verification with a commitment to keys
     /// atem hasn't revealed yet. All values base64.
     #[serde(rename = "verifyCommit")]
-    VerifyCommit { device_id: String, commitment: String },
+    /// r9 (§R9.2 "Pairing"): `host_trust_gen` is the binding's host trust
+    /// generation (1 ≤ n ≤ 2^53−1), public; Astation copies it into the
+    /// signed `add_host`.
+    VerifyCommit { device_id: String, commitment: String, host_trust_gen: u64 },
 
     /// Astation → Atem: Astation's public keys and nonce, sent only after it
     /// stored the commitment. `sign_pub` is a 65-byte SEC1 P-256 point.
@@ -3512,9 +3515,11 @@ mod tests {
 
     #[test]
     fn verify_messages_round_trip() {
-        let message = AstationMessage::VerifyCommit { device_id: "d".into(), commitment: "c".into() };
+        let message = AstationMessage::VerifyCommit { device_id: "d".into(), commitment: "c".into(), host_trust_gen: 3 };
         let json = serde_json::to_string(&message).unwrap();
-        assert_eq!(json, r#"{"type":"verifyCommit","data":{"device_id":"d","commitment":"c"}}"#);
+        assert_eq!(json, r#"{"type":"verifyCommit","data":{"device_id":"d","commitment":"c","host_trust_gen":3}}"#);
+        // As Astation must read it (§R9.2).
+        assert_eq!(atem_client::ceremony::verify_commit_host_trust_gen(json.as_bytes()), Ok(3));
     }
 
     #[test]

@@ -383,6 +383,8 @@ struct Verifier {
     account: String,
     /// r9: the account's device list (the Mac genesis, signed by `fake`).
     log: std::cell::RefCell<crate::session_protocol::membership::r9log::TestLog>,
+    /// `verifyCommit.host_trust_gen` (§R9.2).
+    advertised: u64,
 }
 
 /// The host trust generation of the profile at `dir`.
@@ -403,6 +405,10 @@ impl Verifier {
             .unwrap()
             .try_into()
             .unwrap();
+        // r9: the advertised generation, as Astation must read it.
+        let advertised =
+            atem_client::ceremony::verify_commit_host_trust_gen(commit.to_string().as_bytes())
+                .expect("verifyCommit carries host_trust_gen");
         let fake = FakeAstation::new();
         let nonce_s = [7u8; 32];
         let log = crate::session_protocol::membership::r9log::TestLog::genesis(
@@ -423,6 +429,7 @@ impl Verifier {
             nonce_s,
             account: account.to_string(),
             log: std::cell::RefCell::new(log),
+            advertised,
         }
     }
 
@@ -471,9 +478,11 @@ impl Verifier {
         .unwrap()
         .try_into()
         .unwrap();
+        // Astation copies the advertised generation into the add_host.
+        assert_eq!(self.advertised, host_trust_gen, "the binding's generation");
         self.log
             .borrow_mut()
-            .add_host_pub(&self.device_id, host_trust_gen, &host_pub);
+            .add_host_pub(&self.device_id, self.advertised, &host_pub);
         let key = |name: &str| -> [u8; 32] {
             STANDARD
                 .decode(reveal["data"][name].as_str().unwrap())
@@ -1655,6 +1664,52 @@ fn a_device_list_for_another_host_key_fails_the_verification() {
         assert_eq!(op.done().await.unwrap_err(), "device verification failed");
         let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
+        rt.shutdown().await;
+    });
+}
+
+/// r9 (§R9.2, `r9-vectors-pairing` "another generation"): an `add_host`
+/// naming another generation than `verifyCommit` advertised (tampered or
+/// mismatched) is refused; nothing is pinned or trusted.
+#[test]
+fn an_add_host_for_another_generation_fails_the_verification() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let verifier = Verifier::keys(&mut peer, "acct-op").await;
+        assert_eq!(verifier.advertised, trust_gen(&rt.profile));
+        let reveal = peer.next("verifyReveal").await;
+        let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
+            reveal["data"]["host_channel_pub"].as_str().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        verifier.log.borrow_mut().add_host_pub(
+            &verifier.device_id,
+            verifier.advertised + 1,
+            &host_pub,
+        );
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        peer.send(&verifier.certificate_for(&reveal));
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            abort["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("host key or trust generation"),
+            "{abort}"
+        );
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists());
         assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
         rt.shutdown().await;
     });

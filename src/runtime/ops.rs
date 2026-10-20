@@ -504,10 +504,19 @@ pub(crate) async fn verify_device<U: OpUi>(
         blocking(move || device_keys_for_verification(&paths, agent.as_ref())).await?
     };
     let handshake = Handshake::start(keys);
+    // r9 (§R9.2): the binding's generation, captured with the commitment
+    // for this attempt (the capture never changes; a new pairing voids it).
+    let host_trust_gen = capture.bound_to(astation_id)?.host_trust_gen;
+    if !(1..=atem_client::canonical::MAX_SAFE_INTEGER).contains(&host_trust_gen) {
+        bail!(
+            "the host trust generation {host_trust_gen} can't be sent; run atem unpair, then atem pair"
+        );
+    }
     client
         .send_message(AstationMessage::VerifyCommit {
             device_id: device_id.clone(),
             commitment: STANDARD.encode(handshake.commitment()),
+            host_trust_gen,
         })
         .await?;
 
