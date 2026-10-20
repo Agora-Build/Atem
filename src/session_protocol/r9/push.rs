@@ -51,6 +51,8 @@ pub const MAX_RELAY_OUT_BYTES: usize = 16 << 20;
 /// One `push_hint` message at most (well under the link's 2 MiB bound;
 /// one open hint is about 1.5 KiB).
 pub const MAX_MESSAGE_BYTES: usize = 256 << 10;
+/// The suppression reason of a host without a device list.
+pub const NO_LIST: &str = "no device list";
 /// How long after `expires_at` the outbox still resends (§R9.9).
 const RESEND_AFTER_EXPIRY_MS: u64 = push::CLIENT_SKEW_MS;
 
@@ -127,7 +129,7 @@ impl HostPush {
             log(&format!(
                 "approval {}: no hint ({})",
                 key.approval_id,
-                self.suppressed.unwrap_or("no device list")
+                self.suppressed.unwrap_or(NO_LIST)
             ));
             return;
         };
@@ -471,16 +473,21 @@ impl HostPush {
         match (self.suppressed, suppressed) {
             (None, Some(why)) => {
                 let n = self.outbox.len();
-                log(&format!(
-                    "suppressed ({why}); {n} unacknowledged hint(s)/seen(s) dropped"
-                ));
+                // A host without a device list (r8) has nothing to say.
+                if n > 0 || why != NO_LIST {
+                    log(&format!(
+                        "suppressed ({why}); {n} unacknowledged hint(s)/seen(s) dropped"
+                    ));
+                }
                 let link = self.link;
                 *self = HostPush::default();
                 self.link = link;
                 self.suppressed = Some(why);
             }
-            (Some(_), None) => {
-                log("no longer suppressed");
+            (Some(was), None) => {
+                if was != NO_LIST {
+                    log("no longer suppressed");
+                }
                 self.suppressed = None;
             }
             (Some(_), Some(why)) => self.suppressed = Some(why),

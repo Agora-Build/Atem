@@ -1917,7 +1917,7 @@ fn push_suppressed<J: Journal>(parts: &Parts<'_, J>) -> Option<&'static str> {
         DeviceList::Open { m, .. } if m.held().is_some() => Some("device list held"),
         DeviceList::Open { .. } => None,
         DeviceList::Failed(_) => Some("device list failed"),
-        DeviceList::None => Some("no device list"),
+        DeviceList::None => Some(push::NO_LIST),
     }
 }
 
