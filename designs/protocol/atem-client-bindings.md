@@ -1,0 +1,419 @@
+# atem-client bindings: the binding and effect contract
+
+Status: built (Task 5 of `designs/plans/2026-10-20-r9.md`), for Astation's
+integration. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
+`atem-session-v1.md` (§R9.5–§R9.9). Integration view:
+`remote-agent-api-atem.md` §6.
+
+`atem-client` is the shared r9 client core: canonical encoding and
+signatures, the membership verifier, `atem-ch1`, the r9 hello/welcome, r8's
+session-v1 client machines, push hints and seen, the Recovery Kit, K
+backups and the restore. `atem-client-ffi` puts a small, safe surface over
+it for:
+
+| consumer | binding | artifact |
+|---|---|---|
+| Astation macOS / iOS | UniFFI 0.32.2 → Swift | SwiftPM package `AtemClient` + `atem_client_ffiFFI.xcframework` (static libs: macOS arm64+x86_64, iOS arm64, iOS simulator arm64+x86_64) |
+| Astation Android | UniFFI 0.32.2 → Kotlin (JNA) | `atem_client_ffi.kt` + `libatem_client_ffi.so` per ABI |
+| browser, Node bots, the relay | wasm-bindgen 0.2.101 (feature `wasm`) | `atem_client_ffi.js` + `atem_client_ffi_bg.wasm` (+ `.d.ts`) |
+| Rust bots | the `atem-client` crate itself | — |
+
+Everything is sans-I/O: the app owns sockets, storage, timers, UI,
+notifications and key storage. The binding takes bytes, times and key
+results in and gives bytes, decisions and effects out.
+
+## 1. What stays in Rust, what the app does
+
+In Rust (one implementation, the same as the Atem host): canonical JSON,
+`enc`, every signature check (P-256 low S, Ed25519 strict, alg pins), the
+membership chain, signer authority, carriage, the conflict rule and freeze,
+recovery waits, the channel handshake and records, the welcome checks,
+lease/registry/chat ordering, push-hint verification, dedup and the
+schedule, K-backup format and version allocation, the restore's anchor and
+freshness rules.
+
+In the app:
+
+- **Keys** behind `AppKeyProvider` (§3). Native members' private keys never
+  enter Rust. The exceptions are values the user or the account already
+  hands to the app in the clear: the Recovery Kit's `R` (typed or scanned)
+  and the account keys `K` (sealed into or opened from K backups).
+- **Transport**: send the frames the binding returns, pass every frame
+  received. Frames are JSON text (`{"ch":"atem-ch1",…}`), identical over
+  the Astation link, the relay and direct :8080.
+- **Clock**: a monotonic time in ms for every channel call; the verifier
+  clock (`HostClock{wall_ms, mono_ms, boot_id}`) for the log; wall ms for
+  push hints.
+- **Storage**: the log's entries (`MembershipLog.entries()`), a
+  publisher's `prepared_json()`, the restore's `prepared_json()`, `K` in the
+  platform key store. Nothing else is required: the host's head is
+  authoritative.
+- **UI**: what the effects below say to show.
+
+## 2. Objects and the order of calls
+
+Names below are Rust's; Swift and Kotlin use lowerCamelCase methods and
+UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`,
+`membershipLog.extend(entries, now)`), JS uses camelCase (§6).
+
+### MembershipLog (§R9.2–§R9.5)
+
+| call | effect for the app |
+|---|---|
+| `MembershipLog::verify(account_id, genesis_hash, entries, now)` | at start, from the stored entries; `genesis_hash` is the anchor the app holds (pairing, or the kit's) |
+| `entries()` | store these (canonical JSON, in order) after every change |
+| `extend(entries, now)` | after fetching `…/entries?after=` from the relay: keeps the valid prefix; check `stop` (`invalid` → report, `need_before` → fetch an earlier window, `deferred` → wait, `conflict:freeze` / `frozen` → show the frozen state, stop signing entries) |
+| `evaluate(entries, now)` | the same without keeping it |
+| `head()`, `relation(head)` | how a head another party signed relates (`same`, `host_behind`, `host_ahead` → fetch and extend, `diverged`) |
+| `members()`, `member(id)`, `host(id)`, `recovery_key()`, `k_backup()`, `frozen()` | display, and the keys the app needs (a member's `enc_key`, the current kit) |
+| `pending_recovery(now)` | show "Recovery of <subject> pending, takes effect <effective_at>: approve or cancel" |
+| `advance(now)` | ends waits that are over on this clock |
+| `draft_entry(signer, signed_at, action_json)` | the next entry's body, checked with the verifier's own schema; show it, then publish (below) |
+| `check_member(member_json)` | a member object for `add` / `recovery_add`, checked |
+| `admit_carrier(device_id, entries, more, now)` | host role (Atem's own host uses the crate directly) |
+
+The log object is shared by reference: `extend`, `advance`, a publisher's
+or writer's reply change it in place. `snapshot()` copies.
+
+### ClientConnection (§R9.7, §R9.8; r8 session-v1 inside)
+
+```text
+ClientConnection::new(host_id, identity, need_before)
+start(log, now)                         → init frame            send
+on_accept(frame, log, provider, now)    → finish frame          send   (sig_c: purpose Channel)
+  or on_accept_deferred(frame, log, now) → SignRequest           sign it (async)
+     finish_with_signature(pub, sig, now) → finish frame        send
+on_welcome(frame, log, now)             → WelcomeInfo, or AtemError::Refused{next}
+list / acquire / renew / release / submit_prompt / submit_interrupt /
+submit_stop / submit_approval / submit_rule_revoke / receipt_query /
+approval_seen / revoke_grant / send_membership / terminal_subscribe /
+chat_open                               → Outgoing{id, frame}   send; replies carry re = id
+send_json(message_json, now)            → frame                 send (other terminal-v1/chat-v1 messages)
+on_frame(frame, now)                    → [ClientEvent]
+```
+
+Effects and timers:
+
+- **Any `Channel` error** (and `Malformed`): close the transport; the
+  object is `Closed`. Make a new connection to retry.
+- **`accept_deadline_ms()`**: give up waiting for `accept` then. The
+  `finish` must follow `accept` within 10 s (a deferred signer must answer
+  in time).
+- **`AtemError::Refused{code, detail, error_json, next}`**: `Reconnect
+  {need_before}` → a new `ClientConnection` with that `need_before`;
+  `WaitForRecovery{entry_hash, effective_at}` → show it, retry after;
+  `RetryLater` (busy); `Stop` → show the error, don't loop.
+- **`AtemError::BadWelcome{check}`**: the host contradicted what the
+  client verified; the channel is dropped. Report, don't retry blindly.
+- **`WelcomeInfo`**: `authorization_ms_left` bounds the channel (the
+  binding enforces it); show `pending_recovery`; `fetch_to(log)` → fetch
+  up to that head and `extend` the log (never adopt it unverified).
+- **`ClientEvent::Outgoing{frame}`**: send it now (a chat resync `open`).
+- **`ClientEvent::MembershipHead{head, pending_recovery}`**: as `fetch_to`.
+- **`ClientEvent::Fenced{code, detail}`**: the attachment is over
+  (`unauthorized` with `removed`, `expired`, `grant revoked`, …, or
+  `account_frozen`); the channel is closed. Reconnect to learn more.
+- **`ClientEvent::Lease{session_id, outcome}`**, `lease(session, now)`:
+  while `controls`, call `renew` every 5 s; stop at `deadline_ms`.
+- **`ClientEvent::Session{op, id, re, json}`**: receipts (`receipt`, its
+  `state` `accepted`/`completed`/`rejected`/`outcome_unknown`),
+  `receipts` (a query's answer), `sessions`/`session_changed` (the registry,
+  also through `sessions()`), approvals, `lease_changed`, errors with `re`.
+- **`ClientEvent::Error{code, re}`**: a refused request (`forbidden`,
+  `unknown_session`, `lease_held`, `stale_lease`, …).
+- **`approval_seen`**: only when the card was rendered in a focused
+  foreground window and the user was active in the last 60 s; never from a
+  background delivery or a notification.
+- **`submit_prompt`** acquires the lease with the prompt (r8 §F) when none
+  is held; keep `request_id` (a UUID v4) to `receipt_query` it after a
+  reconnect.
+- **`binding_json(session, mutation, now)`**: the binding for messages the
+  app builds: `mutation` false for reads (subscribe, open, history, ack),
+  true for terminal input/resize (none without the lease).
+
+### EntryPublisher (§R9.4 client rules 1–5)
+
+1. `prepare(log, body_json)`; **persist `prepared_json()`** (the body is
+   stored before the key signs it).
+2. `sign(provider, key_id, cosign_kit)`: one fresh owner confirmation of
+   that body (`cosign_kit`: the current kit for `set_recovery_key` with
+   `kit: "current"`); persist `prepared_json()` again.
+3. Send `POST …/entries {"entry": <entry_json>, "expected": <expected>}`.
+   On an uncertain outcome resend exactly `outstanding()`.
+4. `reply_stored(log, now)` (200) or `reply_conflict(log, head, entries,
+   more, now)` (409); persist `prepared_json()` (now none).
+
+| outcome | the app |
+|---|---|
+| `Committed{head}` | done; the log holds it |
+| `StoredPending{head, on}` | stored at the relay; joins the log when `on` takes effect here |
+| `LostRace{head}` | our body is discarded; re-check the intent on the new head; a new body needs a new confirmation |
+| `FetchMore{after}` | fetch after `after`, `extend`, decide again |
+| `Diverged` | stop signing entries; carry the window to hosts |
+| `Waiting{on}` | wait for `on` |
+| `RelayInconsistent{head}` / `RelayInvalid{index, code}` | refetch later; never rebuild on the unchanged head |
+
+After a restart: `EntryPublisher::resume(saved)`, then resend
+`outstanding()`, or `sign` again (a lost signature is re-made over the same
+body, the same `entry_hash`).
+
+### KBackupWriter (§R9.5 "Writing a backup")
+
+`KBackupWriter::start(log, kids, kit_recovery_key, signer)`, then perform
+each `BackupStep` and feed the answer back:
+
+| step | the app |
+|---|---|
+| `Seal{blob_version}` | `seal_k_backup(account, genesis, blob_version, kit_recovery_key, keys)` (the app holds `K`), then `sealed(log, envelope_json, signed_at)` |
+| `Sign{body_json}` | `sign(provider, manager_key)` (purpose `KeyBackup`, fresh confirmation of `body_json`) |
+| `Put{blob_version, bytes}` | upload put-if-absent, then `put_reply(log, None)` (200) or `put_reply(log, Some(max_occupied))` (409) |
+| `Append{request}` | append with the CAS, then `append_stored` / `append_conflict` |
+| `Fetch{after}` | fetch, then `fetched(log, entries, more, now, signed_at)` |
+| `Done{committed}` | the newest committed backup covers the job |
+| `Failed{code}` | stop (`relay_misbehaviour`, `diverged`, `waiting`, …) |
+
+`restart()` after an uncertain outcome resends the upload, then the entry.
+
+Durability (decision): the writer lives in memory; the crate's writer has
+no serialized form yet. After an app restart, fetch and `extend` the log,
+then `start` again: a committed backup ends at `Done`; an upload this
+writer made but never committed is occupied at the relay, so the next
+allocation moves above it after one `409`.
+
+### RecoveryKitHandle, K backups
+
+- `RecoveryKitHandle::generate(account_id, genesis_hash)` at account setup:
+  print `secret_r()` and `kit_tag()` for the user, put `recovery_key()` in
+  the genesis or a `set_recovery_key`; store nothing.
+- `RecoveryKitHandle::read(r, account, genesis, tag)`: `kit_tag_mismatch`
+  ("this Recovery Kit is damaged or mistyped") before anything is fetched.
+- `parse_k_backup`, `open_k_backup(envelope, kit)`, `seal_k_backup(…)`.
+
+### RestoreSession (§R9.5 "Restore"; no recovery on a stale head)
+
+1. `RestoreSession::read(r, account, genesis, tag)`.
+2. Fetch the relay's log and newest envelope; reach at least one host and
+   keep its `init`/`accept` pair; `attempt(entries, envelope, [HostAcceptPair],
+   now)`.
+   - `no_host_reachable`: show `waiting_for_hosts()` ("Recovery needs to
+     reach one of your Atem hosts (<names>) …") and retry; never fall back.
+   - `log_behind_host` (`refetch()`): fetch again or by another route.
+   - other codes: show, stop. Nothing is stored on any refusal.
+3. Success (`RestoredInfo{head, keys}`): store `keys` in the key store,
+   then `enroll(member_json, signed_at)` (the kit signs the `recovery_add`),
+   **persist `prepared_json()`**, send the `AppendRequest`, then
+   `append_stored(now)` → `Published{head}` (takes effect after 24 h unless
+   approved or vetoed) or `append_conflict(…)` → `Rebuild` (run `attempt`
+   again) / `Stopped`.
+4. `may_rotate_k(device)` / `may_seal_backup(device)` stay false until the
+   recovery took effect.
+
+`verify_host_accept(init, accept, log)` checks one host-signed head on its
+own; `host_accept_th2` gives its `th2`.
+
+### Push hints and seen (§R9.9)
+
+A phone receiving a hint (APNs/FCM payload):
+
+1. `verify_push_hint(hint_json, log, wall_now, Client)` (exact fields, the
+   host's newest key, binding, times, skew, staleness);
+2. `book.offer(hint)` on its `PushHintBook` (`accepted` → show,
+   `idempotent` → already shown, `ignored_after_resolved`, or refused
+   `duplicate`/`bad_sealed`); a resolved hint replaces the notification;
+3. `hint.open(provider, enc_key_id, device_id)` → `HintContent{tool,
+   summary}` (HPKE open by the provider; refused for another device or
+   `enc_key` before anything is opened). A locked device shows a generic
+   hint instead.
+
+The relay: `verify_push_hint(…, Relay)`, its book, `push_stages(created_at,
+recipient)`, `push_send_now(…)`, `push_next_due(…)`, `push_guard(expires_at)`
+(all from the signed `created_at`; never the relay's receipt time),
+`verify_seen`, `seen_in_window`, acks (`hint.ack_json()`, `seen_ack_json`,
+`push_ack_message`, `parse_push_ack`). `sign_seen` is the host's.
+
+### Browser grants (§R9.6)
+
+The phone issues one for a browser's public key (a QR):
+`issue_browser_grant(log, provider, issuer_key_id, issuer, browser_key,
+host_id, host_trust_gen, session_id, ops, issued_at, expires_at)` (purpose
+`BrowserGrant`, fresh confirmation; ≤ 1 h; `ops` contain `view`; a
+control op gives the browser control within them). The browser connects
+with `ClientIdentity{kind: Browser, key_id, grant_json}`; any member with
+control revokes it with `revoke_grant`. `parse_browser_grant` reads one.
+
+### Encoding helpers
+
+`canonical_json`, `encode_fields`, `hash_fields` (SHA-256 of `enc`),
+`signing_input(label, payload)`, `verify_signature(key, label, payload,
+sig)`, `signed_object_info`, `verify_signed_object`, `enc_kid`,
+`ed25519_public_to_x25519` (the kit's HPKE key; CryptoKit lacks it),
+`check_public_key`.
+
+## 3. The KeyProvider contract and signing purposes
+
+```text
+trait AppKeyProvider (Swift protocol / Kotlin interface):
+  public_key(key_id) -> PublicKeyData{alg, raw}
+  sign(SignRequest{key_id, purpose, fresh_confirmation, label, input, body_json}) -> bytes
+  x25519(key_id, peer) -> 32 bytes
+  hpke_open(key_id, enc, ct, info, aad) -> plaintext
+errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
+```
+
+- **Formats.** P-256: public key SEC1 uncompressed (65 bytes); signature
+  ECDSA over SHA-256 of `input`, 64-byte `r‖s`, either S (the core
+  normalizes to low S and verifies it before use). Ed25519: 32-byte public
+  key, signature over `input`. X25519: 32-byte keys; `x25519` returns the
+  raw shared secret (the core refuses all-zero). HPKE: RFC 9180 base mode,
+  DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 (CryptoKit
+  `HPKE.Ciphersuite.Curve25519_SHA256_ChachaPoly`, macOS 14 / iOS 17; Tink
+  on Android).
+- **Purposes** (`SignRequest.purpose`, derived by the binding from the
+  signing label and, for entries, the body's `action`):
+
+  | purpose | what is signed | confirmation (R9.6) |
+  |---|---|---|
+  | `Channel` | `sig_c` over the transcript (`body_json` none) | may reuse one owner confirmation ≤ 5 min; cleared on lock and background |
+  | `Genesis` | the account's first entry | fresh, bound to `body_json` |
+  | `Enroll` | `add` | fresh |
+  | `Remove` | `remove` | fresh |
+  | `Roles` | `set_roles` | fresh |
+  | `Host` | `add_host`, `remove_host` | fresh |
+  | `Recovery` | `recovery_add`, `recovery_approve`, `recovery_veto` | fresh |
+  | `Kit` | `set_recovery_key`, the current kit's co-signature | fresh |
+  | `KeyBackup` | `k_backup` | fresh (decision: a manager entry like the others) |
+  | `BrowserGrant` | a browser grant | fresh |
+  | `HostSigning` | `sig_h`, push hints, seens | never asked of a client |
+
+  `fresh_confirmation` is true for every purpose but `Channel` and
+  `HostSigning`. A fresh confirmation covers exactly `body_json` (show the
+  account, head and seq, applicant keys, roles, scope, expiry); a changed
+  body needs a new one; never in the background or a notification
+  extension. Managers' keys always need owner authentication (biometrics
+  with the passcode fallback).
+- **Cancel.** Return `ProviderError.Cancelled`: nothing is sent; the call
+  fails with `Channel{code: signing_failed}` (handshake) or `Publish{code:
+  sign}` / `Invalid{code: provider_error}`.
+- **Asynchronous signers** (WebCrypto, or an app whose owner-auth prompt
+  must not block a thread): `on_accept_deferred` returns the
+  `SignRequest`; sign `input` and call `finish_with_signature(public_key,
+  signature, now)` within the 10 s step. The signature is normalized and
+  verified with `public_key` before anything is sent. Browsers do this
+  with a non-extractable WebCrypto P-256 key:
+
+  ```js
+  const keyPair = await crypto.subtle.generateKey({name: "ECDSA", namedCurve: "P-256"}, false, ["sign"]);
+  const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey));
+  const req = conn.onAcceptDeferred(acceptFrame, log, now());
+  const sig = new Uint8Array(await crypto.subtle.sign({name: "ECDSA", hash: "SHA-256"}, keyPair.privateKey, req.input));
+  socket.send(conn.finishWithSignature("p256", publicRaw, sig, now()));
+  ```
+- **Bots** (`service` principals; R9.6 rule 5) hold a software key from
+  their own secret store: feature `software-keys` exports
+  `SoftwareKeyStore` (`insert_p256`, `insert_ed25519`, `insert_x25519`,
+  `generate`; `provider()` in Swift/Kotlin, passed directly in JS). Never
+  for a native member's keys; not in the shipped app artifacts.
+
+## 4. Errors
+
+`AtemError` (Swift `AtemError`, Kotlin `AtemException`, JS a thrown
+`Error` with `kind`, `code`, `detail` and the variant's fields):
+
+| variant | `code` (stable) |
+|---|---|
+| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error` |
+| `Membership{code, detail, index}` | `membership_invalid`; `detail` the verifier's (`bad_signature`, `gap`, `signer_not_manager`, `blob_version_not_increasing`, `kit_sig_missing`, …); `index` into what was passed |
+| `Channel{code, detail}` | `handshake_failed`, `stale_target`, `account_frozen`, `busy` (also as the host's clear, advisory error before the channel opens), `unknown_host`, `record_rejected`, `limit`, `too_large`, `closed`, `signing_failed`, `invalid_hello`, `cannot_carry` (a divergence deeper than any carriage) |
+| `Refused{code, detail, error_json, next}` | the host's session error code (`unauthorized`, `membership_invalid`, `membership_incomplete`, `recovery_pending`, `account_frozen`, `unsupported_version`, `busy`, …) |
+| `BadWelcome{check}` | `bad_welcome` (`check`: `revision`, `re`, `channel_id`, `principal`, `account_id`, `host`, `head`) |
+| `Request{detail}` | `request` (`unknown session`, `no lease`, `too many requests in flight`, `not attached`, …) |
+| `Restore{code, detail}` | `kit_tag_mismatch`, `genesis_mismatch`, `membership_invalid`, `no_host_reachable`, `log_behind_host`, `kit_not_current`, `no_backup`, `backup_hash_mismatch`, `backup_invalid` |
+| `Publish{code, detail}` | `outstanding`, `not_on_head`, `nothing_prepared`, `sign` |
+| `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
+| `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …) |
+
+`detail` is for logs and may change; branch on the variant and `code`.
+
+## 5. Threading
+
+- Every object is thread-safe (an internal lock) and can be shared;
+  records are values.
+- Provider callbacks run synchronously on the thread that called the
+  binding. Call the binding off the main thread (a provider may block on a
+  biometric prompt), or use the deferred handshake.
+- Never call back into the same binding object from inside a provider
+  callback: it holds that object's lock.
+- One `ClientConnection` per transport; feed its frames in order.
+- WASM is single-threaded; nothing blocks inside the binding.
+
+## 6. Data conventions
+
+- Hashes and genesis hashes: lowercase hex. Keys: raw bytes with their
+  `alg`. Signed objects, entries, grants, hints, envelopes: JSON text
+  (strict on input; canonical on output). Times: ms.
+- Swift: `Data`, `UInt64`. Kotlin: `ByteArray`, `ULong`
+  (`1793264001000uL`). JS: `Uint8Array`, numbers (all r9 times are below
+  2^53), records as plain objects with camelCase fields, enums with data as
+  `{type: "<snake_case>", …}`, unit enums as strings; an absent value is
+  `null` inside an object and `undefined` as a plain return. JS takes
+  records such as the clock as objects (`{wallMs, monoMs, bootId}`) and
+  enum values as strings (`"p256"`, `"client"`, `"mobile"`).
+- `ClientConnection.disconnect()` closes the channel (Swift/Kotlin
+  objects also have the generated `close()`/`destroy()` that free the
+  Rust object).
+
+## 7. Building and consuming
+
+Feature flags of `atem-client-ffi`:
+
+| feature | |
+|---|---|
+| `uniffi` (default) | the Swift/Kotlin scaffolding |
+| `bindgen` | the `uniffi-bindgen` binary (library mode) |
+| `wasm` | the wasm-bindgen surface (`--no-default-features --features wasm`) |
+| `software-keys` | `SoftwareKeyStore` (bots, tests) |
+| `test-vectors` | raw primitive verification for the vectors (implies `software-keys`) |
+
+Shipped artifacts use the defaults only (`wasm` alone for JS).
+
+- **Apple:** `scripts/package-atem-client-apple.sh <version> <out>` →
+  `<out>/AtemClient` (SwiftPM: `Package.swift`, `Sources/AtemClient/atem_client_ffi.swift`,
+  `atem_client_ffiFFI.xcframework`), `atem-client-<version>-apple-swiftpm.zip`,
+  the C header and `SHA256SUMS`. Add the package (local path, or the
+  unzipped release asset) and `import AtemClient`. Platforms: macOS 14,
+  iOS 17 (CryptoKit HPKE).
+- **Android/JVM:** build `libatem_client_ffi.so` per ABI (`cargo ndk -t
+  arm64-v8a -t armeabi-v7a -t x86_64 build -p atem-client-ffi --release`,
+  or `cargo build --target <android triple>` with the NDK linker), generate
+  Kotlin with `cargo run -p atem-client-ffi --features bindgen --bin
+  uniffi-bindgen -- generate --library <host lib> --language kotlin
+  --out-dir <dir>`, add `net.java.dev.jna:jna:5.19.1@aar` (Android) or the
+  JNA jar (JVM), put the `.so` files under `jniLibs/<abi>/`.
+- **WASM:** `rustup target add wasm32-unknown-unknown`; `cargo build -p
+  atem-client-ffi --target wasm32-unknown-unknown --release
+  --no-default-features --features wasm`; `wasm-bindgen --target web` (or
+  `nodejs`, `bundler`) with wasm-bindgen-cli 0.2.101 exactly.
+
+## 8. Tests
+
+`scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e]`
+(toolchains passed in: `KOTLINC`, `JNA_JAR`, `JAVA`, `NODE`,
+`WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
+Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
+
+- **Conformance** (the same 34 checks in each language, over
+  `designs/protocol/fixtures/r9-vectors-*.json`): `bindings/kotlin/Conformance.kt`
+  (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
+  open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
+  (with a CryptoKit `AppKeyProvider`).
+- **Flows** (`bindings/js/flows.mjs`): the K-backup writer and its 409s,
+  the restore's enrollment, the publisher's 409, host-role admission, the
+  recovery wait, kits, push books, acks and seens, object state errors.
+- **End to end** (`tests/e2e_bindings.rs`): a Kotlin phone and a
+  Node/WASM browser (WebCrypto key, deferred handshake) use a test host
+  over loopback TCP: hello and welcome, list, lease, prompt and receipts,
+  the other session requests, a browser grant, push hints (verified,
+  opened, seen), a membership entry carried on the channel, the grant's
+  revocation and the browser's fence. The host is built from atem-client's
+  responder role (`atem-client/tests/support/host.rs`); the real runtime
+  host is Task 7.
