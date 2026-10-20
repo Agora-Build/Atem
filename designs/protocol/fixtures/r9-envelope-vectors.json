@@ -2,7 +2,7 @@
   "name": "r9-envelope-vectors",
   "requires": "r9",
   "kind": "vectors",
-  "note": "R9.7a: the channel envelope's shapes, handle rules and bounds. Sizes are of compact JSON; a harness builds the largest legal record (1 MiB of plaintext under the channel's keys) and checks each serialized size exactly. `invalid_envelopes` are refused by the envelope parser (`close` names the reason Atem sends when the handle is readable); `refused_by_the_channel` are valid envelopes whose frame the channel refuses.",
+  "note": "R9.7a: the channel envelope's shapes, handle rules and bounds. Sizes are of compact JSON; a harness builds the largest legal record (1 MiB of plaintext under the channel's keys) and checks each serialized size exactly. `invalid_envelopes` are refused by the envelope parser (`close` is the reason Atem sends when the handle names a live channel; for any other handle nothing is sent); `refused_by_the_channel` are valid envelopes whose frame the channel refuses.",
   "events": {
     "open": {
       "type": "channel",
