@@ -496,6 +496,21 @@ impl R9Host {
         }
     }
 
+    /// The link couldn't keep an envelope of `handle` (the broker's inbox
+    /// was full): that channel closes `busy`, never short of a frame.
+    pub fn refuse_busy<J: Journal>(
+        &mut self,
+        handle: &str,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        if self.chans.contains_key(handle) {
+            return self.fail(handle, reason::BUSY, parts);
+        }
+        self.global
+            .push_back(envelope::close(handle, Some(reason::BUSY)));
+        Vec::new()
+    }
+
     /// Sends `frame` (an `atem-ch1` frame's bytes) on `handle`, then closes
     /// it with `why`.
     fn reply_and_close(&mut self, handle: &str, frame: Option<Vec<u8>>, why: &'static str) {
@@ -976,9 +991,25 @@ impl R9Host {
         let message = r9::membership_head(&new_id(), None, m.head(), &pending)
             .to_string()
             .into_bytes();
-        let atts: Vec<String> = self.by_attachment.keys().cloned().collect();
+        self.announce_to_all(&message, None, parts.now.host.mono_ms);
+    }
+
+    fn announce_to_all(&mut self, message: &[u8], except: Option<&str>, now_mono: u64) {
+        let atts: Vec<String> = self
+            .chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a)
+                    if Some(a.attachment.as_str()) != except
+                        && !self.fence_errors.contains_key(&a.authority.name()) =>
+                {
+                    Some(a.attachment.clone())
+                }
+                _ => None,
+            })
+            .collect();
         for att in atts {
-            self.seal_to(&att, &message, parts.now.host.mono_ms);
+            self.seal_to(&att, message, now_mono);
         }
     }
 
@@ -1142,11 +1173,20 @@ impl R9Host {
         let message = r9::membership_head(&new_id(), None, m.head(), &pending)
             .to_string()
             .into_bytes();
+        // Not to principals being fenced in this pass: their fence error
+        // is their last record.
         let atts: Vec<String> = self
-            .by_attachment
-            .keys()
-            .filter(|a| a.as_str() != except)
-            .cloned()
+            .chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a)
+                    if a.attachment != except
+                        && !self.fence_errors.contains_key(&a.authority.name()) =>
+                {
+                    Some(a.attachment.clone())
+                }
+                _ => None,
+            })
             .collect();
         for att in atts {
             self.seal_to(&att, &message, parts.now.host.mono_ms);

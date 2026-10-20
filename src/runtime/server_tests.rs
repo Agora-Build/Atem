@@ -1732,6 +1732,7 @@ fn a_runtime_of_another_worker_protocol_is_kept() {
                         astation: false,
                         host_error: None,
                         worker_protocol: Some(9),
+                        device_list: None,
                     },
                     ClientMsg::List => RuntimeMsg::Sessions {
                         sessions: vec![SessionSummary {
@@ -1814,6 +1815,7 @@ fn a_replacement_already_done_by_another_client_is_joined() {
                                     astation: false,
                                     host_error: None,
                                     worker_protocol: Some(1),
+                                    device_list: None,
                                 }
                             }
                             ClientMsg::Restart => {

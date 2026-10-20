@@ -29,6 +29,8 @@ pub struct Welcome {
     /// The worker protocol its workers speak (`None`: from before the
     /// field, i.e. worker protocol 1).
     pub worker_protocol: Option<u32>,
+    /// Its r9 device list, when it has one.
+    pub device_list: Option<super::protocol::DeviceListStatus>,
 }
 
 /// Where a runtime listens and logs.
@@ -254,6 +256,7 @@ impl RuntimeClient {
                 astation: false,
                 host_error: None,
                 worker_protocol: None,
+                device_list: None,
             },
         };
         let hello = ClientMsg::Hello {
@@ -275,6 +278,7 @@ impl RuntimeClient {
                 astation,
                 host_error,
                 worker_protocol,
+                device_list,
             })) => {
                 client.welcome = Welcome {
                     protocol,
@@ -283,6 +287,7 @@ impl RuntimeClient {
                     astation,
                     host_error,
                     worker_protocol,
+                    device_list,
                 };
                 Ok(client)
             }
@@ -777,6 +782,7 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             astation,
             host_error,
             worker_protocol,
+            device_list,
         })) => Welcome {
             protocol,
             build,
@@ -784,6 +790,7 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             astation,
             host_error,
             worker_protocol,
+            device_list,
         },
         Ok(Some(RuntimeMsg::Error { text, .. })) => return Look::Unreachable(text),
         Ok(Some(other)) => {

@@ -160,6 +160,8 @@ struct Server {
     host_error: Option<String>,
     /// The Astation link state the clients last heard.
     astation: bool,
+    /// The device list state the clients last heard.
+    device_list: Option<super::protocol::DeviceListStatus>,
     /// The running Astation operation (pairing, unlock), one at a time.
     op: Option<ActiveOp>,
     op_calls: mpsc::UnboundedSender<OpCall>,
@@ -256,6 +258,7 @@ pub async fn serve(
         bridge,
         host_error,
         astation: false,
+        device_list: None,
         op: None,
         op_calls,
         op_waiting: None,
@@ -273,6 +276,7 @@ pub async fn serve(
                 server.host_pass().await;
                 server.forward_status();
                 server.forward_astation();
+                server.forward_device_list();
                 server.op_tick();
             }
             Some(call) = op_called.recv() => server.op_call(call),
@@ -508,6 +512,29 @@ impl Server {
     }
 
     /// Every greeted client hears when the Astation link goes up or down.
+    /// The r9 device list's state, to every greeted client when it changes
+    /// (the status row shows it).
+    fn forward_device_list(&mut self) {
+        let status = self
+            .bridge
+            .as_ref()
+            .and_then(HostBridge::device_list_status);
+        // Clients see the state, not the client count.
+        let shown = |s: &Option<super::protocol::DeviceListStatus>| {
+            s.as_ref()
+                .map(|s| (s.state.clone(), s.label.clone(), s.text.clone()))
+        };
+        if shown(&status) == shown(&self.device_list) {
+            self.device_list = status;
+            return;
+        }
+        self.device_list = status.clone();
+        let message = RuntimeMsg::DeviceList { status };
+        for client in self.clients.values().filter(|c| c.greeted) {
+            client.send(&message);
+        }
+    }
+
     fn forward_astation(&mut self) {
         let connected = self.app.astation_connected;
         if connected == self.astation {
@@ -786,6 +813,7 @@ impl Server {
                             astation: self.astation,
                             host_error,
                             worker_protocol: Some(super::worker_protocol::WORKER_PROTOCOL),
+                            device_list: self.device_list.clone(),
                         });
                     }
                 }
@@ -1077,6 +1105,10 @@ impl Server {
             host_error,
             adopting: self.adopting,
             sessions: self.order.iter().map(|sid| self.summary(sid)).collect(),
+            device_list: self
+                .bridge
+                .as_ref()
+                .and_then(HostBridge::device_list_status),
         }
     }
 

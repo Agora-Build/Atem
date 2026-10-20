@@ -640,6 +640,9 @@ impl App {
             AstationMessage::SessionWire(text) => {
                 self.session_wire(text);
             }
+            AstationMessage::Channel(text) => {
+                self.channel_envelope(text);
+            }
             AstationMessage::SessionOversize { id, family } => {
                 self.session_oversize(id, &family);
             }

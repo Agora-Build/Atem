@@ -17,6 +17,10 @@ use std::time::Instant;
 
 /// Messages kept for the session host per pass, at most.
 pub const INBOX_LIMIT: usize = 1024;
+/// r9 channel envelopes kept for the broker per pass, at most (bytes; each
+/// is at most 2 MiB, §R9.7a). Beyond it the envelope's channel is closed
+/// (`busy`), never silently short of a frame.
+pub const CHANNEL_INBOX_BYTES: usize = 32 << 20;
 
 /// One broker session as mark tasks see it.
 #[derive(Debug, Clone)]
@@ -42,6 +46,14 @@ pub struct Hosted {
     /// Refusals answered here (oversize, a full inbox): (link generation,
     /// runtime.log line), written by the broker under its rate limit.
     pub refused: Vec<(u64, String)>,
+    /// r9 channel envelopes from the link (§R9.7a), with the link
+    /// generation they arrived on, in order.
+    pub channels: VecDeque<(u64, String)>,
+    /// Their bytes.
+    pub channel_bytes: usize,
+    /// Channels whose envelope didn't fit the inbox: (link generation,
+    /// handle), closed `busy` by the broker.
+    pub channel_overflow: Vec<(u64, String)>,
 }
 
 impl Hosted {
@@ -94,6 +106,35 @@ impl App {
         };
         // The host's inbox is full: `busy` (the client may retry).
         self.session_refusal(re, ErrorCode::Busy, None);
+    }
+
+    /// An r9 channel envelope for the broker's r9 host (§R9.7a), while the
+    /// link is authenticated.
+    pub(super) fn channel_envelope(&mut self, text: String) {
+        if !self.astation_connected || self.astation_client.is_ws_closed() {
+            return;
+        }
+        let link = self.astation_link_gen;
+        let Some(hosted) = self.hosted.as_mut() else {
+            return;
+        };
+        if hosted.channel_bytes + text.len() <= CHANNEL_INBOX_BYTES {
+            hosted.channel_bytes += text.len();
+            hosted.channels.push_back((link, text));
+            return;
+        }
+        #[derive(serde::Deserialize)]
+        struct Peek {
+            channel: Option<String>,
+        }
+        if let Some(handle) = serde_json::from_str::<Peek>(&text)
+            .ok()
+            .and_then(|p| p.channel)
+            .filter(|h| crate::session_protocol::r9::envelope::is_handle(h))
+            && hosted.channel_overflow.len() < INBOX_LIMIT
+        {
+            hosted.channel_overflow.push((link, handle));
+        }
     }
 
     /// A session-family message over the size bound: dropped unread and

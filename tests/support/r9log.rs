@@ -202,8 +202,7 @@ impl TestLog {
             device_id: device.into(),
             auth_key: PublicKey::new(Alg::P256, &p256_pub(&s)).unwrap(),
             kind: MemberKind::Native {
-                enc_key: PublicKey::new(Alg::X25519, &secret(&format!("{device} enc")))
-                    .unwrap(),
+                enc_key: PublicKey::new(Alg::X25519, &secret(&format!("{device} enc"))).unwrap(),
                 roles: roles.iter().map(|r| Role::parse(r).unwrap()).collect(),
             },
         }

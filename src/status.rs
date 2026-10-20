@@ -76,6 +76,8 @@ pub struct StatusReport {
     pub authorization: Line,
     pub relay: Line,
     pub local_agents: Line,
+    /// The runtime's r9 device list, when it has one (`Device list:`).
+    pub device_list: Option<Line>,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
 }
@@ -312,6 +314,7 @@ pub fn gather_full(
         if welcome.build != crate::memory::cred_agent::build_id());
     let (credentials, notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
     let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
+    let device_list = device_list_line(runtime, local_datetime);
     StatusReport {
         account: account_line(src, crate::credentials::now_secs()),
         pairing: pairing_line,
@@ -320,8 +323,33 @@ pub fn gather_full(
         authorization,
         relay,
         local_agents,
+        device_list,
         notes,
     }
+}
+
+/// `Device list:` from the running runtime (r9, §R9.3, §R9.5): pinned,
+/// held, frozen, paused or failed, with what to do, and each pending
+/// recovery with when it takes effect.
+pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Line> {
+    let Look::Running {
+        status: Some(status),
+        ..
+    } = look
+    else {
+        return None;
+    };
+    let list = status.device_list.as_ref()?;
+    let mut text = list.text.clone();
+    for p in &list.pending_recovery {
+        text.push_str(&format!(
+            "; recovery pending: {} ({}) takes effect at {} unless a managing device vetoes it",
+            p.subject,
+            p.action,
+            hhmm(p.effective_at)
+        ));
+    }
+    Some(Line::new(text))
 }
 
 /// The status from `src`, asking an already running cred agent when
@@ -351,6 +379,23 @@ fn local_hhmm(at: u64) -> String {
         return "?".into();
     }
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// A Unix ms time as local `YYYY-MM-DD HH:MM`.
+fn local_datetime(at: u64) -> String {
+    let t = (at / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return "?".into();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
 }
 
 /// What is left of an authorization: `23 h left`, `5 min left`.
@@ -489,6 +534,9 @@ pub fn render(report: &StatusReport) -> String {
     let mut out = String::new();
     for (label, line) in rows {
         out.push_str(&format!("{label:<16}{}\n", line.value));
+    }
+    if let Some(line) = &report.device_list {
+        out.push_str(&format!("{:<16}{}\n", "Device list:", line.value));
     }
     for note in &report.notes {
         out.push_str(note);
@@ -645,6 +693,59 @@ pub(crate) mod tests {
         gather_with(&Sources::in_dir(dir), None)
     }
 
+    /// r9: the runtime's device list is its own line, pending recoveries
+    /// with when they take effect; none without a list.
+    #[test]
+    fn the_device_list_line_says_what_to_do() {
+        use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus, RuntimeStatus};
+        let look = |list: Option<DeviceListStatus>| Look::Running {
+            status: Some(RuntimeStatus {
+                device_list: list,
+                ..Default::default()
+            }),
+            welcome: crate::runtime::client::Welcome {
+                protocol: 1,
+                build: "b".into(),
+                pid: 1,
+                astation: false,
+                host_error: None,
+                worker_protocol: None,
+                device_list: None,
+            },
+        };
+        assert_eq!(device_list_line(&look(None), |_| "?".into()), None);
+        let held = DeviceListStatus {
+            state: "held".into(),
+            text: "held (a device-list write fault was recorded); remote access waits".into(),
+            pending_recovery: vec![PendingRecoveryStatus {
+                subject: "dev-new".into(),
+                action: "recovery_add".into(),
+                effective_at: 7,
+            }],
+            ..Default::default()
+        };
+        let line = device_list_line(&look(Some(held)), |ms| format!("@{ms}")).unwrap();
+        assert_eq!(
+            line.value,
+            "held (a device-list write fault was recorded); remote access waits; recovery pending: dev-new (recovery_add) takes effect at @7 unless a managing device vetoes it"
+        );
+        let mut report = StatusReport {
+            account: Line::new("a"),
+            pairing: Line::new("p"),
+            verification: Line::new("v"),
+            credentials: Line::new("c"),
+            authorization: Line::new("au"),
+            relay: Line::new("r"),
+            local_agents: Line::new("l"),
+            device_list: Some(line),
+            notes: Vec::new(),
+        };
+        assert!(render(&report).contains("\nDevice list:    held ("));
+        report.device_list = None;
+        assert!(!render(&report).contains("Device list"));
+        assert_eq!(device_list_line(&Look::NotRunning, |_| "?".into()), None);
+    }
+
     #[test]
     fn render_aligns_every_label() {
         let report = StatusReport {
@@ -655,6 +756,7 @@ pub(crate) mod tests {
             authorization: Line::new("authorized (r8, since 18:25, 23 h left)"),
             relay: Line::new("connected locally"),
             local_agents: Line::new("2 running (claude ready, codex ready)"),
+            device_list: None,
             notes: Vec::new(),
         };
         assert_eq!(
@@ -1010,6 +1112,7 @@ pub(crate) mod tests {
             astation: true,
             host_error: None,
             worker_protocol: Some(1),
+            device_list: None,
         }
     }
 
@@ -1198,6 +1301,7 @@ pub(crate) mod tests {
                             astation: true,
                             host_error: None,
                             worker_protocol: Some(1),
+                            device_list: None,
                         }
                     }
                     Ok(ClientMsg::Status) => match status.clone() {

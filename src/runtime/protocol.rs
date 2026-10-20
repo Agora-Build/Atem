@@ -304,6 +304,37 @@ pub struct Refusal {
     pub at_ms: u64,
 }
 
+/// The r9 device list of the runtime (atem-session-v1.md §R9.3, §R9.5), as
+/// `atem status`, `atem agent list` and the terminal's status row show it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceListStatus {
+    /// `open`, `held`, `frozen`, `paused` (a write fault in this run) or
+    /// `failed` (it couldn't be opened).
+    pub state: String,
+    /// What it means and what to do, one line.
+    pub text: String,
+    /// The status row's short form (`None`: nothing to show).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_seq: Option<u64>,
+    #[serde(default)]
+    pub pending_recovery: Vec<PendingRecoveryStatus>,
+    /// r9 clients attached now.
+    #[serde(default)]
+    pub clients: usize,
+}
+
+/// A recovery waiting on this host's clock (§R9.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRecoveryStatus {
+    /// The device it adds (or `recovery key` for a kit replacement).
+    pub subject: String,
+    pub action: String,
+    /// Wall ms when it takes effect unless a manager vetoes it.
+    pub effective_at: u64,
+}
+
 /// What `status` reports: never a secret (no session id, token or relay
 /// code).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +370,9 @@ pub struct RuntimeStatus {
     pub adopting: bool,
     #[serde(default)]
     pub sessions: Vec<SessionSummary>,
+    /// The r9 device list, when the runtime has one (open or not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_list: Option<DeviceListStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +394,15 @@ pub enum RuntimeMsg {
         /// before the field, which speaks worker protocol 1).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_protocol: Option<u32>,
+        /// Its r9 device list (`device_list` follows on every change).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_list: Option<DeviceListStatus>,
+    },
+    /// The r9 device list changed (held, frozen, paused, failed, a pending
+    /// recovery, or back to normal).
+    DeviceList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<DeviceListStatus>,
     },
     Launched {
         session: SessionSummary,
@@ -698,6 +741,7 @@ mod tests {
                 astation: true,
                 host_error: Some("remote sessions disabled: x".into()),
                 worker_protocol: Some(1),
+                device_list: None,
             },
             RuntimeMsg::Launched { session: summary() },
             RuntimeMsg::Attached {

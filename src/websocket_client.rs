@@ -161,6 +161,13 @@ pub enum AstationMessage {
     #[serde(skip)]
     RemovedOp,
 
+    /// An r9 channel envelope (`{"type":"channel",…}`, atem-session-v1.md
+    /// §R9.7a) as its raw JSON text: demultiplexed before every other
+    /// message on the link, parsed strictly by the runtime's r9 host.
+    /// Outbound, the text is written as is.
+    #[serde(skip)]
+    Channel(String),
+
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
 
@@ -427,8 +434,15 @@ pub struct SystemStatus {
     pub projects: i32,
 }
 
+/// Channel envelopes handed to the link and not yet written, at most (bytes):
+/// beyond it `try_send_channel` refuses and the r9 host's per-channel
+/// queues hold the rest (§R9.7a "Bounds").
+const CHANNEL_INFLIGHT_BYTES: usize = 8 << 20;
+
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<OutboundMessage>>,
+    /// Bytes of channel envelopes queued on `sender` and not yet written.
+    channel_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     terminal_sender: Option<mpsc::Sender<OutboundMessage>>,
     receiver: Option<mpsc::Receiver<AstationMessage>>,
     transport_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -542,6 +556,7 @@ impl AstationClient {
     pub fn new() -> Self {
         Self {
             sender: None,
+            channel_inflight: Default::default(),
             receiver: None,
             terminal_sender: None,
             transport_tasks: Vec::new(),
@@ -617,6 +632,7 @@ impl AstationClient {
         let (tx, rx) = mpsc::channel(64);
         let mut view = Self::new();
         view.sender = self.sender.clone();
+        view.channel_inflight = self.channel_inflight.clone();
         view.terminal_sender = self.terminal_sender.clone();
         view.receiver = Some(rx);
         view.atem_id_override = self.atem_id_override.clone();
@@ -901,6 +917,9 @@ impl AstationClient {
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
         let (terminal_tx, mut terminal_rx) = mpsc::channel::<OutboundMessage>(32);
+        // A new socket: nothing of the old one is in flight.
+        self.channel_inflight = Default::default();
+        let inflight = self.channel_inflight.clone();
 
         // Spawn task to handle outgoing messages
         let writer_task = tokio::spawn(async move {
@@ -910,8 +929,11 @@ impl AstationClient {
                     outbound = terminal_rx.recv() => outbound,
                 };
                 let Some(outbound) = outbound else { break; };
+                if let AstationMessage::Channel(text) = &outbound.message {
+                    inflight.fetch_sub(text.len(), std::sync::atomic::Ordering::Relaxed);
+                }
                 let encoded = match &outbound.message {
-                    AstationMessage::SessionWire(text) => Ok(text.clone()),
+                    AstationMessage::SessionWire(text) | AstationMessage::Channel(text) => Ok(text.clone()),
                     message => serde_json::to_string(message),
                 };
                 let result = match encoded {
@@ -929,6 +951,13 @@ impl AstationClient {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
+                        // §R9.7a 7: channel traffic is demultiplexed first.
+                        if crate::session_protocol::r9::envelope::is_envelope(&text) {
+                            if tx.send(AstationMessage::Channel(text)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         let astation_msg = match session_family(&text) {
                             Some(family) if text.len() > if family == "terminal" { 32 * 1024 } else { crate::session_protocol::wire::MAX_MESSAGE_BYTES } => {
                                 Some(AstationMessage::SessionOversize { id: session_message_id(&text), family: family.to_string() })
@@ -1363,6 +1392,27 @@ impl AstationClient {
         self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?
             .send(outbound)
             .map_err(|e| anyhow!("Failed to send message: {}", e))
+    }
+
+    /// An r9 channel envelope for the link (§R9.7a). `false` when the link
+    /// is gone or already holds `CHANNEL_INFLIGHT_BYTES` of unwritten
+    /// envelopes: the caller keeps it queued and tries again.
+    pub fn try_send_channel(&self, text: String) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(sender) = self.sender.as_ref() else { return false };
+        let len = text.len();
+        if self.channel_inflight.load(Ordering::Relaxed) + len > CHANNEL_INFLIGHT_BYTES
+            && self.channel_inflight.load(Ordering::Relaxed) > 0
+        {
+            return false;
+        }
+        self.channel_inflight.fetch_add(len, Ordering::Relaxed);
+        let outbound = OutboundMessage { message: AstationMessage::Channel(text), delivered: None };
+        if sender.send(outbound).is_err() {
+            self.channel_inflight.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     pub async fn send_message(&self, message: AstationMessage) -> Result<()> {

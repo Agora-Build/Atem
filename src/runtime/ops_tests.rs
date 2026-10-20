@@ -97,6 +97,14 @@ struct Peer {
     /// The viewer's screen: frames applied up to `view_at`.
     view: vt100::Parser,
     view_at: usize,
+    /// r9: per channel handle, the index in `seen` read up to.
+    channel_at: std::collections::HashMap<String, usize>,
+}
+
+/// A client's monotonic ms (its own clock).
+fn client_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
 impl Peer {
@@ -140,8 +148,89 @@ impl Peer {
             welcome: Value::Null,
             view: vt100::Parser::new(24, 80, 0),
             view_at: 0,
+            channel_at: Default::default(),
         };
         (format!("ws://{address}/ws"), peer)
+    }
+
+    /// r9 (§R9.7a): the next `frame` Atem sends on `handle` (its inner
+    /// frame's bytes), or `Err(reason)` for its `close`.
+    async fn channel_next(&mut self, handle: &str) -> Result<Vec<u8>, Option<String>> {
+        let from = self.channel_at.get(handle).copied().unwrap_or(0);
+        let h = handle.to_string();
+        let at = self
+            .wait_from(from, |v| {
+                v["type"] == "channel" && v["channel"] == h.as_str()
+            })
+            .await;
+        self.channel_at.insert(handle.to_string(), at + 1);
+        let v = self.seen[at].clone();
+        match v["event"].as_str() {
+            Some("frame") => Ok(serde_json::to_vec(&v["frame"]).unwrap()),
+            _ => Err(v["reason"].as_str().map(str::to_string)),
+        }
+    }
+
+    /// The router side: one client frame on `handle`.
+    fn channel_send(&self, handle: &str, frame: &[u8]) {
+        self.to_atem
+            .send(crate::session_protocol::r9::envelope::frame(handle, frame))
+            .unwrap();
+    }
+
+    /// Opens `handle` and runs a full `atem-ch1` handshake for `identity`
+    /// with `log`'s keys; the attachment, or the refusal's code and detail.
+    async fn r9_connect(
+        &mut self,
+        handle: &str,
+        log: &crate::session_protocol::membership::r9log::TestLog,
+        host_id: &str,
+        identity: atem_client::connect::Identity,
+    ) -> Result<atem_client::connect::Attached, (String, Option<String>)> {
+        use crate::session_protocol::r9::envelope;
+        self.to_atem
+            .send(envelope::open(handle, envelope::Transport::Direct))
+            .unwrap();
+        let (connecting, init) = atem_client::connect::Connector::new(host_id)
+            .start(&log.log, client_ms())
+            .map_err(|e| (format!("{e:?}"), None))?;
+        self.channel_send(handle, &init);
+        let accept = self
+            .channel_next(handle)
+            .await
+            .map_err(|r| ("closed".into(), r))?;
+        if let Ok(atem_client::channel::wire::Frame::Error { code }) =
+            atem_client::channel::wire::parse_frame(&accept)
+        {
+            return Err((code, None));
+        }
+        let (welcoming, finish) = connecting
+            .on_accept(&accept, &log.log, &log.keys, &identity, client_ms())
+            .map_err(|e| (format!("{e:?}"), None))?;
+        self.channel_send(handle, &finish);
+        let first = self
+            .channel_next(handle)
+            .await
+            .map_err(|r| ("closed".into(), r))?;
+        match welcoming.on_frame(&first, &log.log, client_ms()) {
+            Ok(attached) => Ok(attached),
+            Err(atem_client::connect::ConnectError::Refused { error, .. }) => {
+                Err((error.code.clone(), error.detail.clone()))
+            }
+            Err(e) => Err((format!("{e:?}"), None)),
+        }
+    }
+
+    /// Sends `frame` on `handle` and returns the events of Atem's next record.
+    async fn r9_round(
+        &mut self,
+        handle: &str,
+        attached: &mut atem_client::connect::Attached,
+        frame: &[u8],
+    ) -> Vec<atem_client::connect::Event> {
+        self.channel_send(handle, frame);
+        let reply = self.channel_next(handle).await.expect("a record");
+        attached.on_frame(&reply, client_ms()).unwrap()
     }
 
     fn send(&self, message: &AstationMessage) {
@@ -698,7 +787,7 @@ async fn verify_until_the_question(
     rt: &Runtime,
     peer: &mut Peer,
     account: &str,
-) -> (Op, u64, AstationMessage) {
+) -> (Op, u64, AstationMessage, Verifier) {
     let op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
     let verifier = Verifier::keys(peer, account).await;
     let certificate = verifier.certificate(peer, trust_gen(&rt.profile)).await;
@@ -713,7 +802,7 @@ async fn verify_until_the_question(
         "{:?}",
         op.printed
     );
-    (op, question, certificate)
+    (op, question, certificate, verifier)
 }
 
 #[test]
@@ -729,7 +818,7 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
         // An unverified link gets no session attachment.
         assert_eq!(peer.hello().await["op"], "error");
 
-        let (mut op, question, certificate) =
+        let (mut op, question, certificate, verifier) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -756,23 +845,49 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
             "with the host channel key"
         );
 
-        // The same link (never reconnected) is now a verified pairing: it
-        // attaches, and sees the session the local frontend kept attached.
+        // The same link (never reconnected) carries r9 now: the device
+        // list pinned while the runtime ran is picked up, an r8 hello is
+        // refused (no compatibility) and the Mac, the list's genesis member,
+        // is admitted through the channel envelope on that link.
         assert!(
             !peer.drain(Duration::from_millis(200)).await,
             "the link closed"
         );
-        let welcome = peer.hello().await;
-        assert_eq!(welcome["op"], "welcome", "{welcome}");
-        assert_eq!(welcome["account_id"], "acct-op");
-        assert_eq!(welcome["atem_device_id"], ATEM_ID);
+        let refused = peer.hello().await;
+        assert_eq!(refused["op"], "error", "{refused}");
+        assert_eq!(refused["code"], "unsupported_version");
+        assert_eq!(refused["revision"], 9);
+        let mac = atem_client::connect::Identity::native(
+            crate::session_protocol::membership::r9log::MAC,
+            crate::session_protocol::membership::r9log::auth(
+                crate::session_protocol::membership::r9log::MAC,
+            ),
+        );
+        let log = verifier.log.borrow();
+        let mut attached = peer
+            .r9_connect("mac-1", &log, ATEM_ID, mac)
+            .await
+            .unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let w = attached.welcome().clone();
+        assert_eq!(w.account_id, "acct-op");
+        assert_eq!(w.atem_device_id, ATEM_ID);
+        assert_eq!(w.principal, "member:dev-mac");
+        assert_eq!(w.head, log.log.head());
+        let (_, frame) = attached.list(client_ms()).unwrap();
+        let events = peer.r9_round("mac-1", &mut attached, &frame).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, atem_client::connect::Event::Session(m)
+                if matches!(&m.op, crate::session_protocol::wire::Op::Sessions { sessions, .. }
+                    if sessions.iter().any(|d| d.session_id == session.id.to_string())))),
+            "{events:?}"
+        );
         frontend
             .send(&ClientMsg::input(&session.id, b"AFTER\r"))
             .await
             .unwrap();
         shows(&mut frontend, "AFTER").await;
-        peer.subscribe_until(&session.id, &session.generation, "AFTER")
-            .await;
         rt.shutdown().await;
     });
 }
@@ -785,7 +900,7 @@ fn a_cli_gone_mid_verification_aborts_it_and_a_late_certificate_is_dropped() {
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
-        let (mut op, question, certificate) =
+        let (mut op, question, certificate, _) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -815,7 +930,7 @@ fn a_lost_link_fails_the_verification_without_replay() {
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut frontend = rt.client().await;
         let session = rt.attached_session(&mut frontend).await;
-        let (mut op, question, _certificate) =
+        let (mut op, question, _certificate, _) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -852,7 +967,7 @@ fn a_second_operation_is_refused_while_one_runs() {
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
-        let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let (mut op, question, _, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
         for kind in [OpKind::CredUnlock, OpKind::Pair, OpKind::PairVerify] {
             let mut second = Op::start(rt.client().await, kind, OpOptions::default()).await;
             assert_eq!(second.done().await.unwrap_err(), BUSY);
@@ -1067,10 +1182,11 @@ fn first_pairing(leftover: Option<&str>) {
             "the pairing saved the granted session"
         );
         assert!(verified_as(&rt.keys(), "acct-new"));
-        // The pairing connection is the runtime's link: it attaches.
-        let welcome = peer.hello().await;
-        assert_eq!(welcome["op"], "welcome", "{welcome}");
-        assert_eq!(welcome["account_id"], "acct-new");
+        // The pairing pinned a device list: the link's r8 hello is refused
+        // (no compatibility; r9 clients come through the channel).
+        let refused = peer.hello().await;
+        assert_eq!(refused["op"], "error", "{refused}");
+        assert_eq!(refused["revision"], 9);
         rt.shutdown().await;
     });
 }
@@ -1420,7 +1536,7 @@ fn the_runtime_is_not_replaced_while_an_operation_runs() {
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir.clone(), Some(&url), Arc::new(test_agent(&keys))).await;
-        let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let (mut op, question, _, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
         let mut other = rt.client().await;
         other.send(&ClientMsg::Restart).await.unwrap();
         let refused = expect(&mut other, |m| match m {

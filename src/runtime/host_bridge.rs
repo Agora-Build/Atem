@@ -80,7 +80,10 @@ use crate::session_protocol::host::{
     HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
 };
 use crate::session_protocol::membership::{
-    CarriageResult, DeviceList, HostFences, MembershipHost, host_now,
+    self, CarriageResult, DeviceList, Held, HostFences, MembershipHost, host_now,
+};
+use crate::session_protocol::r9::{
+    self as r9host, HostKey, NoProjects, Now as R9Now, Parts as R9Parts, R9Host,
 };
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
@@ -137,6 +140,11 @@ const DEVICE_LIST_DROP: &str =
 const REFUSAL_DROP: &str = "The session journal couldn't record a refusal; the link was dropped";
 /// Session messages remembered for duplicate detection, at most.
 const MAX_SEEN: usize = 4096;
+/// An r9 channel's terminal frames wait while this much is queued for it.
+const R9_FRAME_BACKLOG: usize = 512 * 1024;
+/// Why the link was dropped: a device list was pinned while it ran.
+const DEVICE_LIST_PINNED: &str =
+    "A device list was pinned; remote clients connect with atem-session r9";
 
 /// The broker's monotonic clock in milliseconds, and wall time (tests move
 /// either forward).
@@ -429,6 +437,17 @@ pub struct HostBridge {
     /// The last `hello` refused for its revision (`atem status`): the
     /// revision it named and when (wall ms). A welcome clears it.
     last_refusal: Option<(Option<u64>, u64)>,
+    /// r9 admission over the link's channel envelopes (§R9.7a).
+    r9: R9Host,
+    /// The link generation the r9 host runs on.
+    r9_link: Option<u64>,
+    /// The profile's pairing files (the device list is reopened from them).
+    pairing: Option<crate::paths::PairingPaths>,
+    /// The pinned host's `host_channel_key`; r9 can't serve without it.
+    host_key: Option<HostKey>,
+    host_key_error: Option<String>,
+    /// The device-list files as last opened (a change reopens them).
+    list_stamp: Vec<Option<(u64, u64, i64, i64)>>,
 }
 
 /// What `atem status` shows of the link's session attachment.
@@ -462,11 +481,22 @@ impl HostBridge {
         // the next one (which supersedes the record in any case).
         let previous = current_runtime_epoch(dir)?;
         let epoch = next_runtime_epoch(dir)?;
-        let identity = profile.map(start_identity).unwrap_or(Identity {
+        let mut identity = profile.map(start_identity).unwrap_or(Identity {
             account_id: UNPAIRED.into(),
             atem_device_id: UNPAIRED.into(),
             host_trust_gen: 0,
         });
+        // r9: with a device list the host is the one it pins (§R9.2).
+        if let Some((account, pin)) = profile.and_then(|p| membership::peek_pin(&p.paths.pairing))
+            && wire::is_opaque_id(&account)
+            && wire::is_opaque_id(&pin.host_id)
+        {
+            identity = Identity {
+                account_id: account,
+                atem_device_id: pin.host_id,
+                host_trust_gen: pin.host_trust_gen.max(identity.host_trust_gen),
+            };
+        }
         let mut host = Self::build(journal, &identity, epoch, previous, &clock)?;
         // r9 §R9.3: the device list is opened before any remote admission
         // and before recovered work is resolved; its start fences go
@@ -504,7 +534,44 @@ impl HostBridge {
             }
             None => (None, None, Vec::new()),
         };
+        let pairing = profile.map(|p| p.paths.pairing.clone());
+        let (host_key, host_key_error) = match (&membership, &pairing) {
+            (Some(m), Some(pairing)) => {
+                match membership::host_channel_seed(pairing, m.membership(), &m.pin_of().host_id) {
+                    Ok(seed) => (Some(HostKey::new(&seed)), None),
+                    Err(error) => {
+                        eprintln!(
+                            "atem runtime: device list: {error}; r9 remote access is refused"
+                        );
+                        (None, Some(error))
+                    }
+                }
+            }
+            _ => (None, None),
+        };
+        // r9 "No compatibility": a device list (even one that failed to
+        // open) refuses r8 admission.
+        host.set_refuse_r8(membership.is_some() || membership_error.is_some());
+        // §R9.5: the previous run's clean checkpoint names its epoch.
+        let checkpoint_clean = membership
+            .as_ref()
+            .map(|m| m.previous_checkpoint() == Some(previous));
+        if checkpoint_clean == Some(false) {
+            eprintln!(
+                "atem runtime: device list: the previous run (epoch {previous}) left no clean checkpoint; recovery waits resume from the last persisted time"
+            );
+        }
+        let list_stamp = pairing
+            .as_ref()
+            .map(membership::list_stamp)
+            .unwrap_or_default();
         Ok(Self {
+            r9: R9Host::new(r9host::Limits::default(), Some(dir)),
+            r9_link: None,
+            pairing,
+            host_key,
+            host_key_error,
+            list_stamp,
             host,
             dir: dir.to_path_buf(),
             clock,
@@ -648,6 +715,7 @@ impl HostBridge {
     /// (`ATEM_TEST_MEMBERSHIP_FAULTS/carry.json`, as the host's own relay
     /// fetch).
     fn membership_pass(&mut self, cx: &mut Cx) {
+        self.reopen_list_if_changed(cx);
         if self.membership.is_none() {
             return;
         }
@@ -662,12 +730,21 @@ impl HostBridge {
                 .and_then(|e| e.items());
             let line = match entries {
                 Some(entries) => match self.carry(&entries, cx) {
-                    Some(result) => format!(
-                        "{:?} head={} fences={}",
-                        result.carried,
-                        self.membership.as_ref().map_or(0, |m| m.head().seq),
-                        result.fences.len()
-                    ),
+                    Some(result) => {
+                        self.r9.note_fences(&result.fences);
+                        let issued =
+                            self.r9_call(|r9, parts| r9.fence_issued(&result.fences, parts));
+                        self.r9_exec(issued, cx);
+                        if result.announce {
+                            self.r9_call(|r9, parts| r9.announce(parts));
+                        }
+                        format!(
+                            "{:?} head={} fences={}",
+                            result.carried,
+                            self.membership.as_ref().map_or(0, |m| m.head().seq),
+                            result.fences.len()
+                        )
+                    }
                     None => "no device list".into(),
                 },
                 None => "unreadable carry.json".into(),
@@ -681,16 +758,277 @@ impl HostBridge {
         {
             // `atem unpair` removed the device list: this host has none now.
             self.membership = None;
+            self.host_key = None;
+            self.sync_refuse_r8(cx);
         }
         let Some(membership) = self.membership.as_mut() else {
             return;
         };
         let mut fences = HostFences::new(&mut self.host);
-        let _changes = membership.advance(&host_now(), &mut fences);
+        let changes = membership.advance(&host_now(), &mut fences);
         let effects = fences.effects;
         if !effects.is_empty() {
             self.exec(effects, cx);
             self.sync_all(cx);
+        }
+        if !changes.is_empty() {
+            self.r9_call(|r9, parts| r9.announce(parts));
+        }
+    }
+
+    // ── r9 (§R9.7a) ──
+
+    /// The device list for `atem status`, `atem agent list` and the status
+    /// row: `None` without one. Failed is shown too (`host_error` doesn't
+    /// report it: r8 sessions are unaffected without a list).
+    pub fn device_list_status(&self) -> Option<crate::runtime::protocol::DeviceListStatus> {
+        use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus};
+        const REPAIR: &str =
+            "re-pair this host from a device you trust: atem unpair, then atem pair";
+        let clients = self.r9.status().attachments;
+        if let Some(error) = self
+            .membership_error
+            .as_ref()
+            .or(self.host_key_error.as_ref())
+        {
+            return Some(DeviceListStatus {
+                state: "failed".into(),
+                text: format!("failed ({error}); remote access is off"),
+                label: Some("Remote off".into()),
+                head_seq: None,
+                pending_recovery: Vec::new(),
+                clients,
+            });
+        }
+        let m = self.membership.as_ref()?;
+        let head_seq = Some(m.head().seq);
+        let now = host_now();
+        let pending: Vec<PendingRecoveryStatus> = m
+            .membership()
+            .pending_recovery(&now)
+            .iter()
+            .map(|p| {
+                let p = atem_client::session::r9::PendingRecovery::of(p);
+                PendingRecoveryStatus {
+                    subject: p.subject,
+                    action: p.action,
+                    effective_at: p.effective_at,
+                }
+            })
+            .collect();
+        let (state, text, label) = if m.is_frozen() {
+            (
+                "frozen",
+                format!("frozen (conflicting signed history); remote access is paused; {REPAIR}"),
+                Some("Remote frozen"),
+            )
+        } else if let Some(why) = m.faulted() {
+            (
+                "paused",
+                format!(
+                    "paused (a device-list write failed: {why}); remote access stops until atem runtime restart"
+                ),
+                Some("Remote paused"),
+            )
+        } else if let Some(held) = m.held() {
+            let text = match held {
+                Held::IntentMismatch(_) => format!(
+                    "held (the recorded device-list write doesn't match the list); remote access is off; {REPAIR}"
+                ),
+                _ => "held (a device-list write fault was recorded); remote access waits until a managing device (Astation on your Mac or phone) connects to reconcile".to_string(),
+            };
+            ("held", text, Some("Remote held"))
+        } else {
+            let n = match clients {
+                1 => "1 remote client".to_string(),
+                n => format!("{n} remote clients"),
+            };
+            (
+                "open",
+                format!("pinned at seq {} ({n})", m.head().seq),
+                (!pending.is_empty()).then_some("Recovery pending"),
+            )
+        };
+        Some(DeviceListStatus {
+            state: state.into(),
+            text,
+            label: label.map(str::to_string),
+            head_seq,
+            pending_recovery: pending,
+            clients,
+        })
+    }
+
+    /// Runs `f` on the r9 host with this bridge's session host, device
+    /// list and clocks.
+    fn r9_call<T>(&mut self, f: impl FnOnce(&mut R9Host, &mut R9Parts<'_, FileJournal>) -> T) -> T {
+        let list = match (
+            &mut self.membership,
+            &self.membership_error,
+            &self.host_key,
+            &self.host_key_error,
+        ) {
+            (_, Some(error), _, _) => r9host::DeviceList::Failed(error),
+            (Some(m), None, Some(key), _) => r9host::DeviceList::Open { m, key },
+            (Some(_), None, None, Some(error)) => r9host::DeviceList::Failed(error),
+            (Some(_), None, None, None) => r9host::DeviceList::Failed("no host channel key"),
+            (None, None, _, _) => r9host::DeviceList::None,
+        };
+        let mut parts = R9Parts {
+            host: &mut self.host,
+            list,
+            now: R9Now {
+                mono: self.clock.now(),
+                host: host_now(),
+            },
+            projects: &NoProjects,
+        };
+        f(&mut self.r9, &mut parts)
+    }
+
+    /// The session host's effects of an r9 call; attachments the r9 host
+    /// let go are forgotten here too.
+    fn r9_exec(&mut self, effects: Vec<Effect>, cx: &mut Cx) {
+        let before: HashSet<String> = self.r9_attachments();
+        self.exec(effects, cx);
+        let after = self.r9_attachments();
+        for gone in before.difference(&after) {
+            self.forget_r9(gone);
+        }
+        self.sync_all(cx);
+    }
+
+    fn r9_attachments(&self) -> HashSet<String> {
+        self.r9.attachments().into_iter().map(|(a, _)| a).collect()
+    }
+
+    /// The broker's side of a closed r9 attachment: its streams,
+    /// conversations and remote writes go (the link's terminal queue isn't
+    /// its).
+    fn forget_r9(&mut self, attachment: &str) {
+        self.streams.retain(|(att, _), _| att != attachment);
+        for chats in self.chats.values_mut() {
+            chats.map.retain(|_, c| c.attachment != attachment);
+        }
+        for per in self.per.values_mut() {
+            per.remote.retain(|w| w.attachment != attachment);
+        }
+    }
+
+    /// Channels run on the authenticated link: a new link generation
+    /// starts a new set (the old one's channels all closed, §R9.7a 6).
+    fn sync_r9_link(&mut self, want: Option<u64>, cx: &mut Cx) {
+        if want == self.r9_link {
+            return;
+        }
+        let mut effects = self.r9_call(|r9, parts| r9.link_down(parts));
+        if let Some(link_gen) = want {
+            effects.extend(self.r9_call(|r9, parts| r9.link_up(link_gen, parts)));
+        }
+        self.r9_link = want;
+        self.r9_exec(effects, cx);
+    }
+
+    /// The device list changed on disk while the runtime runs (a pairing
+    /// pinned one, `atem unpair` removed it, a re-pin replaced it): it is
+    /// opened again, the session host takes the pin's identity, r8 is
+    /// refused from then on, and every channel and the link's r8
+    /// attachment start over.
+    fn reopen_list_if_changed(&mut self, cx: &mut Cx) {
+        let Some(pairing) = self.pairing.clone() else {
+            return;
+        };
+        let stamp = membership::list_stamp(&pairing);
+        if stamp == self.list_stamp {
+            return;
+        }
+        self.list_stamp = stamp;
+        // Our own writes move the stamp too: only another pin matters.
+        let pinned = membership::peek_pin(&pairing);
+        let same = match (&self.membership, &pinned) {
+            (Some(m), Some((account, pin))) => {
+                !m.unpaired() && m.membership().account_id() == account && m.pin_of() == pin
+            }
+            (None, None) => {
+                self.membership_error.is_none() && !membership::has_device_list_files(&pairing)
+            }
+            _ => false,
+        };
+        if same && self.host_key_error.is_none() {
+            return;
+        }
+        eprintln!("atem runtime: device list: changed on disk; opening it again");
+        let effects = self.r9_call(|r9, parts| r9.link_down(parts));
+        self.r9_exec(effects, cx);
+        self.r9_link = None;
+        self.membership = None;
+        self.membership_error = None;
+        self.host_key = None;
+        self.host_key_error = None;
+        if let Some((account, pin)) = &pinned
+            && wire::is_opaque_id(account)
+            && wire::is_opaque_id(&pin.host_id)
+        {
+            let identity = Identity {
+                account_id: account.clone(),
+                atem_device_id: pin.host_id.clone(),
+                host_trust_gen: pin.host_trust_gen,
+            };
+            if !self.adopt_identity(&identity, cx) {
+                self.membership_error =
+                    Some("the device list names an older host trust generation".into());
+            }
+        }
+        if self.membership_error.is_none() {
+            let epoch = self.host.context().runtime_epoch;
+            let mut fences = HostFences::new(&mut self.host);
+            let opened = MembershipHost::open(&pairing, &self.dir, epoch, &host_now(), &mut fences);
+            let effects = fences.effects;
+            match opened {
+                Ok(Some((m, _))) => {
+                    match membership::host_channel_seed(
+                        &pairing,
+                        m.membership(),
+                        &m.pin_of().host_id,
+                    ) {
+                        Ok(seed) => self.host_key = Some(HostKey::new(&seed)),
+                        Err(error) => {
+                            eprintln!("atem runtime: device list: {error}");
+                            self.host_key_error = Some(error);
+                        }
+                    }
+                    eprintln!(
+                        "atem runtime: device list: opened at seq {} for {}",
+                        m.head().seq,
+                        m.pin_of().host_id
+                    );
+                    self.membership = Some(m);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("atem runtime: device list: {error}; r9 remote access is refused");
+                    self.membership_error = Some(error);
+                }
+            }
+            self.exec(effects, cx);
+        }
+        self.sync_refuse_r8(cx);
+        self.list_stamp = membership::list_stamp(&pairing);
+    }
+
+    /// r9 "No compatibility": r8 admission is refused while a device list
+    /// exists (open or failed). When one appears, the link's r8 attachment
+    /// (possibly welcomed) goes; the link gets a new, unwelcomed one.
+    fn sync_refuse_r8(&mut self, cx: &mut Cx) {
+        let refuse = self.membership.is_some() || self.membership_error.is_some();
+        if refuse == self.host.refuses_r8() {
+            return;
+        }
+        self.host.set_refuse_r8(refuse);
+        if refuse && let Some(link) = self.link.take() {
+            eprintln!("atem runtime: {DEVICE_LIST_PINNED}");
+            self.drop_attachment(&link.attachment, cx);
+            self.considered = None;
         }
     }
 
@@ -823,10 +1161,26 @@ impl HostBridge {
                 eprintln!("atem runtime: {error}");
             }
         }
+        self.sync_r9_link(app_link(app), &mut cx);
         if !adopting && let Some(hosted) = app.hosted.as_mut() {
             let inbox: Vec<(u64, String)> = hosted.inbox.drain(..).collect();
             for (link_gen, text) in inbox {
                 self.receive(link_gen, &text, &mut cx);
+            }
+            let channels: Vec<(u64, String)> = hosted.channels.drain(..).collect();
+            hosted.channel_bytes = 0;
+            let overflow = std::mem::take(&mut hosted.channel_overflow);
+            for (link_gen, text) in channels {
+                if Some(link_gen) == self.r9_link {
+                    let effects = self.r9_call(|r9, parts| r9.on_envelope(&text, parts));
+                    self.r9_exec(effects, &mut cx);
+                }
+            }
+            for (link_gen, handle) in overflow {
+                if Some(link_gen) == self.r9_link {
+                    let effects = self.r9_call(|r9, parts| r9.refuse_busy(&handle, parts));
+                    self.r9_exec(effects, &mut cx);
+                }
             }
         }
         self.worker_reports(&mut cx);
@@ -838,12 +1192,19 @@ impl HostBridge {
             self.exec(effects, &mut cx);
             self.finished_hand_offs(&mut cx);
             self.membership_pass(&mut cx);
+            let effects = self.r9_call(|r9, parts| r9.tick(parts));
+            self.r9_exec(effects, &mut cx);
         }
         self.sync_all(&mut cx);
         self.drain_remote(&mut cx);
         self.frames(&mut cx);
         self.heartbeats(&mut cx);
         self.flush_pushes(&mut cx);
+        let effects = self.r9_call(|r9, parts| r9.reap(parts));
+        self.r9_exec(effects, &mut cx);
+        let client = cx.client;
+        self.r9.flush(&mut |text| client.try_send_channel(text));
+        self.r9.end_pass();
         if let Some(hosted) = app.hosted.as_mut() {
             hosted.sessions = cx
                 .sessions
@@ -1042,6 +1403,12 @@ impl HostBridge {
             .is_some_and(|l| l.attachment == attachment)
     }
 
+    /// The attachment is the link's own or an r9 channel's: its messages
+    /// have somewhere to go.
+    fn reachable(&self, attachment: &str) -> bool {
+        self.current(attachment) || self.r9.owns(attachment)
+    }
+
     // ── Messages ──
 
     fn receive(&mut self, link_gen: u64, text: &str, cx: &mut Cx) {
@@ -1171,6 +1538,17 @@ impl HostBridge {
     }
 
     fn send(&mut self, attachment: &str, message: &Envelope, cx: &mut Cx) {
+        if self.r9.owns(attachment) {
+            let host_id = self.host.context().atem_device_id.clone();
+            self.r9.deliver(
+                attachment,
+                message,
+                &NoProjects,
+                &host_id,
+                host_now().mono_ms,
+            );
+            return;
+        }
         if !self.current(attachment) {
             return;
         }
@@ -1199,14 +1577,30 @@ impl HostBridge {
         }
     }
 
-    fn send_chat(&mut self, env: ChatEnvelope, cx: &mut Cx) {
+    fn send_chat(&mut self, attachment: &str, env: ChatEnvelope, cx: &mut Cx) {
         if env.op == "error"
             && let Some(code) = env.body.get("code").and_then(Value::as_str)
         {
             self.refused(code);
         }
+        let sid = env.agent_id.clone();
         let text = serde_json::to_string(&AstationMessage::AgentChat(env))
             .expect("chat envelopes serialize");
+        if self.r9.owns(attachment) {
+            let host_id = self.host.context().atem_device_id.clone();
+            self.r9.deliver_family(
+                attachment,
+                &sid,
+                &text,
+                &NoProjects,
+                &host_id,
+                host_now().mono_ms,
+            );
+            return;
+        }
+        if !self.current(attachment) {
+            return;
+        }
         let _ = cx.client.try_send_wire(text, false);
     }
 
@@ -1239,7 +1633,17 @@ impl HostBridge {
                 // delivery as uncertain. Other attachments it closes are
                 // already gone from the link.
                 Effect::Close { attachment } => {
-                    if self.current(&attachment) {
+                    if self.r9.owns(&attachment) {
+                        self.r9.close_attachment(&attachment, host_now().mono_ms);
+                        self.forget_r9(&attachment);
+                    } else if self.current(&attachment) && self.host.refuses_r8() {
+                        // With a device list the link is the r9 clients'
+                        // transport: an r8 fence (a freeze fences every
+                        // remote principal) never drops it. Its unwelcomed
+                        // attachment goes; the next pass makes a new one.
+                        self.link = None;
+                        self.considered = None;
+                    } else if self.current(&attachment) {
                         self.close_link = true;
                     }
                 }
@@ -1748,7 +2152,7 @@ impl HostBridge {
         error: Option<String>,
         cx: &mut Cx,
     ) {
-        if !self.current(attachment) {
+        if !self.reachable(attachment) {
             return;
         }
         let message = TerminalMessage::Written {
@@ -1758,12 +2162,30 @@ impl HostBridge {
             sequence,
             error,
         };
-        self.queue_terminal(message, cx);
+        self.queue_terminal(attachment, sid, message, cx);
     }
 
-    fn queue_terminal(&mut self, message: TerminalMessage, cx: &mut Cx) {
+    fn queue_terminal(
+        &mut self,
+        attachment: &str,
+        sid: &str,
+        message: TerminalMessage,
+        cx: &mut Cx,
+    ) {
         let text = serde_json::to_string(&AstationMessage::Terminal(message.into()))
             .expect("terminal messages serialize");
+        if self.r9.owns(attachment) {
+            let host_id = self.host.context().atem_device_id.clone();
+            self.r9.deliver_family(
+                attachment,
+                sid,
+                &text,
+                &NoProjects,
+                &host_id,
+                host_now().mono_ms,
+            );
+            return;
+        }
         self.terminal_out.push_back(Queued::Other(text));
         self.flush_terminal(cx);
     }
@@ -2041,21 +2463,22 @@ impl HostBridge {
             }
         }
         let rules = self.host.approval_rules(sid);
-        let ids: Vec<String> = self
+        let ids: Vec<(String, String)> = self
             .chats
             .get(sid)
             .map(|c| {
                 c.map
                     .iter()
-                    .filter(|(_, c)| self.current(&c.attachment))
+                    .filter(|(_, c)| self.reachable(&c.attachment))
                     .filter(|(_, c)| self.host.attachment_can(&c.attachment, Permission::Control))
-                    .map(|(id, _)| id.clone())
+                    .map(|(id, c)| (id.clone(), c.attachment.clone()))
                     .collect()
             })
             .unwrap_or_default();
-        for id in ids {
+        for (id, att) in ids {
             if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
                 self.send_chat(
+                    &att,
                     chat_wire::rules(&id, sid, &generation, sequence, &rules),
                     cx,
                 );
@@ -2323,6 +2746,10 @@ impl HostBridge {
         let keys: Vec<(String, String)> = self.streams.keys().cloned().collect();
         let mut failed = Vec::new();
         for key in keys {
+            if self.r9.owns(&key.0) {
+                self.r9_frames(&key, cx);
+                continue;
+            }
             if !self.current(&key.0) {
                 continue;
             }
@@ -2353,7 +2780,7 @@ impl HostBridge {
         }
         for (key, error) in failed {
             if let Some(stream) = self.streams.remove(&key) {
-                self.terminal_error(&key.1, Some(&stream.stream_id), "busy", &error, cx);
+                self.terminal_error(&key.0, &key.1, Some(&stream.stream_id), "busy", &error, cx);
             }
         }
         self.flush_terminal(cx);
@@ -2362,14 +2789,76 @@ impl HostBridge {
         }
     }
 
+    /// An r9 channel's stream: frames go into its channel (sealed, bounded
+    /// by the channel's queue), held back while the channel has a backlog.
+    fn r9_frames(&mut self, key: &(String, String), cx: &mut Cx) {
+        if self.r9.backlog(&key.0) > R9_FRAME_BACKLOG {
+            return;
+        }
+        let Some(session) = session_of(cx, &key.1) else {
+            return;
+        };
+        if !session.synced() {
+            return;
+        }
+        let exit = (session.state != BrokerState::Running).then(|| {
+            session
+                .exit_status
+                .clone()
+                .unwrap_or_else(|| "exited".into())
+        });
+        let Some(stream) = self.streams.get_mut(key) else {
+            return;
+        };
+        match stream.frames(session.screen(), exit.as_deref()) {
+            Ok(messages) => {
+                let host_id = self.host.context().atem_device_id.clone();
+                for message in messages {
+                    let text = serde_json::to_string(&AstationMessage::Terminal(message.into()))
+                        .expect("terminal messages serialize");
+                    self.r9.deliver_family(
+                        &key.0,
+                        &key.1,
+                        &text,
+                        &NoProjects,
+                        &host_id,
+                        host_now().mono_ms,
+                    );
+                }
+            }
+            Err(error) => {
+                if let Some(stream) = self.streams.remove(key) {
+                    self.terminal_error(
+                        &key.0,
+                        &key.1,
+                        Some(&stream.stream_id),
+                        "busy",
+                        &error,
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+
     /// The terminal transport fell behind: the frames waiting go and every
     /// stream ends (viewers subscribe again); `written` acks and errors stay
-    /// queued, in order.
+    /// queued, in order. r9 channels' streams aren't on that transport.
     fn congested(&mut self, cx: &mut Cx) {
         drop_frames(&mut self.terminal_out);
-        let streams: Vec<((String, String), FrameStream)> = self.streams.drain().collect();
-        for ((_, sid), stream) in streams {
+        let link_streams: Vec<(String, String)> = self
+            .streams
+            .keys()
+            .filter(|(att, _)| !self.r9.owns(att))
+            .cloned()
+            .collect();
+        let streams: Vec<((String, String), FrameStream)> = link_streams
+            .into_iter()
+            .filter_map(|k| self.streams.remove(&k).map(|s| (k, s)))
+            .collect();
+        for ((att, sid), stream) in streams {
             self.terminal_error(
+                &att,
                 &sid,
                 Some(&stream.stream_id),
                 "busy",
@@ -2382,6 +2871,7 @@ impl HostBridge {
     /// A terminal-v1 `error`, on the terminal stream (after what is queued).
     fn terminal_error(
         &mut self,
+        attachment: &str,
         sid: &str,
         stream_id: Option<&str>,
         code: &str,
@@ -2396,6 +2886,18 @@ impl HostBridge {
             data["stream_id"] = Value::String(stream_id.into());
         }
         let text = json!({"type": "terminal", "data": data}).to_string();
+        if self.r9.owns(attachment) {
+            let host_id = self.host.context().atem_device_id.clone();
+            self.r9.deliver_family(
+                attachment,
+                sid,
+                &text,
+                &NoProjects,
+                &host_id,
+                host_now().mono_ms,
+            );
+            return;
+        }
         self.terminal_out.push_back(Queued::Other(text));
         self.flush_terminal(cx);
     }
@@ -2416,6 +2918,7 @@ impl HostBridge {
                     let stream_id = stream.stream_id.clone();
                     self.streams.remove(&key);
                     self.terminal_error(
+                        attachment,
                         sid,
                         Some(&stream_id),
                         "stale_target",
@@ -2454,7 +2957,7 @@ impl HostBridge {
                             "unsupported_version",
                             &text,
                         );
-                        self.send_chat(env, cx);
+                        self.send_chat(attachment, env, cx);
                     }
                 }
             }
@@ -2481,7 +2984,7 @@ impl HostBridge {
                 None => NOT_AVAILABLE.to_string(),
             };
             let env = chat_error(conversation, sid, None, None, "busy", &text);
-            self.send_chat(env, cx);
+            self.send_chat(attachment, env, cx);
             return;
         }
         let opening = Opening {
@@ -2499,7 +3002,7 @@ impl HostBridge {
             &opening,
         );
         for env in envelopes {
-            self.send_chat(env, cx);
+            self.send_chat(attachment, env, cx);
         }
     }
 
@@ -2526,7 +3029,7 @@ impl HostBridge {
             &call,
         );
         for env in envelopes {
-            self.send_chat(env, cx);
+            self.send_chat(attachment, env, cx);
         }
     }
 
@@ -2546,7 +3049,7 @@ impl HostBridge {
         reply: ChatReply,
         cx: &mut Cx,
     ) {
-        if !self.current(attachment) {
+        if !self.reachable(attachment) {
             return;
         }
         // A refused removed form (r8 §A) takes no sequence.
@@ -2608,7 +3111,7 @@ impl HostBridge {
                 env
             }
         };
-        self.send_chat(env, cx);
+        self.send_chat(attachment, env, cx);
     }
 
     /// The chat session's output: to every open conversation, except what
@@ -2701,22 +3204,22 @@ impl HostBridge {
         control: bool,
         cx: &mut Cx,
     ) {
-        let ids: Vec<(String, bool)> = self
+        let ids: Vec<(String, bool, String)> = self
             .chats
             .get(sid)
             .map(|c| {
                 c.map
                     .iter()
-                    .filter(|(id, c)| Some(id.as_str()) != except && self.current(&c.attachment))
+                    .filter(|(id, c)| Some(id.as_str()) != except && self.reachable(&c.attachment))
                     .map(|(id, c)| {
                         let can = self.host.attachment_can(&c.attachment, Permission::Control);
-                        (id.clone(), can)
+                        (id.clone(), can, c.attachment.clone())
                     })
-                    .filter(|(_, can)| !control || *can)
+                    .filter(|(_, can, _)| !control || *can)
                     .collect()
             })
             .unwrap_or_default();
-        for (id, can) in ids {
+        for (id, can, att) in ids {
             // A view-only conversation's coverage names no card (r8 §C).
             let own = match out {
                 Out::Coverage(_) => {
@@ -2727,7 +3230,7 @@ impl HostBridge {
             if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
                 let env =
                     chat_wire::event(&id, sid, &generation, sequence, own.as_ref().unwrap_or(out));
-                self.send_chat(env, cx);
+                self.send_chat(&att, env, cx);
             }
         }
     }
@@ -2746,19 +3249,21 @@ impl HostBridge {
             request_id: None,
         };
         for id in ids {
-            let current = self
+            let att = self
                 .chats
                 .get(sid)
                 .and_then(|c| c.map.get(&id))
-                .is_some_and(|c| self.current(&c.attachment));
-            if current {
+                .map(|c| c.attachment.clone())
+                .filter(|a| self.reachable(a));
+            if let Some(att) = att {
                 if let Some((generation, sequence)) = self.next_head(sid, &id, cx) {
                     self.send_chat(
+                        &att,
                         chat_wire::event(&id, sid, &generation, sequence, &error),
                         cx,
                     );
                 }
-                self.send_chat(chat_wire::close(&id, sid, reason), cx);
+                self.send_chat(&att, chat_wire::close(&id, sid, reason), cx);
             }
         }
         self.chats.remove(sid);
@@ -2766,7 +3271,7 @@ impl HostBridge {
 
     /// Re-sends the status to each conversation that has not had it for 15 s.
     fn heartbeats(&mut self, cx: &mut Cx) {
-        let due: Vec<(String, String)> = self
+        let due: Vec<(String, String, String)> = self
             .chats
             .iter()
             .flat_map(|(sid, chats)| {
@@ -2774,11 +3279,11 @@ impl HostBridge {
                     .map
                     .iter()
                     .filter(|(_, c)| c.last_heartbeat.elapsed() >= HEARTBEAT)
-                    .map(|(id, _)| (sid.clone(), id.clone()))
+                    .map(|(id, c)| (sid.clone(), id.clone(), c.attachment.clone()))
                     .collect::<Vec<_>>()
             })
             .collect();
-        for (sid, id) in due {
+        for (sid, id, att) in due {
             let Some(status) = session_of(cx, &sid).map(|s| s.chat.heartbeat()) else {
                 continue;
             };
@@ -2787,6 +3292,7 @@ impl HostBridge {
             }
             if let Some((generation, sequence)) = self.next_head(&sid, &id, cx) {
                 self.send_chat(
+                    &att,
                     chat_wire::event(&id, &sid, &generation, sequence, &status),
                     cx,
                 );

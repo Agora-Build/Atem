@@ -1882,6 +1882,46 @@ pub fn forget_leftovers(pairing: &PairingPaths) -> Result<(), String> {
     Ok(())
 }
 
+/// The account and host `membership.json` pins, read without verifying
+/// the log (the runtime's session host takes this identity; `open`
+/// verifies everything). `None` without a readable list.
+pub fn peek_pin(pairing: &PairingPaths) -> Option<(String, HostPin)> {
+    #[derive(serde::Deserialize)]
+    struct Pin {
+        account_id: String,
+        host: HostField,
+    }
+    #[derive(serde::Deserialize)]
+    struct HostField {
+        host_id: String,
+        host_trust_gen: u64,
+    }
+    let bytes = store::read_private(&pairing.membership).ok()??;
+    let pin: Pin = serde_json::from_slice(&bytes).ok()?;
+    Some((
+        pin.account_id,
+        HostPin {
+            host_id: pin.host.host_id,
+            host_trust_gen: pin.host.host_trust_gen,
+        },
+    ))
+}
+
+/// What identifies the device-list files on disk now (inode, size, mtime
+/// of `membership.json` and `host_channel_key`): a change means a pin, an
+/// unpair or a write happened since.
+pub fn list_stamp(pairing: &PairingPaths) -> Vec<Option<(u64, u64, i64, i64)>> {
+    use std::os::unix::fs::MetadataExt;
+    [&pairing.membership, &pairing.host_channel_key]
+        .into_iter()
+        .map(|p| {
+            std::fs::symlink_metadata(p)
+                .ok()
+                .map(|m| (m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
+        })
+        .collect()
+}
+
 /// Whether the profile holds a device list or any r9 leftover.
 pub fn has_device_list_files(pairing: &PairingPaths) -> bool {
     let store = Store::new(pairing, &journal_of(pairing));
