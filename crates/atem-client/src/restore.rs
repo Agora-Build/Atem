@@ -34,6 +34,7 @@
 use crate::backup::{BackupKey, KBackupEnvelope};
 use crate::channel::{HostAccept, HostHead};
 use crate::kit::RecoveryKit;
+use crate::membership::publish::{AppendReply, Prepared, PublishError, Published, Publisher};
 use crate::membership::{
     Action, Entry, Head, HostNow, Invalid, Member, Membership, RECOVERY_SIGNER, sign_entry,
 };
@@ -41,6 +42,9 @@ use crate::membership::{
 /// Why a restore stopped. `code()` is the fixture `detail`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreError {
+    /// The kit's tag doesn't match what was typed ("this Recovery Kit is
+    /// damaged or mistyped"); nothing was fetched.
+    KitTagMismatch,
     GenesisMismatch,
     /// The relay's chain doesn't verify.
     ChainInvalid {
@@ -68,6 +72,7 @@ pub enum RestoreError {
 impl RestoreError {
     pub fn code(&self) -> &'static str {
         match self {
+            RestoreError::KitTagMismatch => "kit_tag_mismatch",
             RestoreError::GenesisMismatch => "genesis_mismatch",
             RestoreError::ChainInvalid { .. } => "membership_invalid",
             RestoreError::Withheld { .. } => "no_host_reachable",
@@ -180,9 +185,14 @@ pub fn restore(
             candidates.retain(|h| *h != highest);
         }
     }
+    // A deferral still remaining means the relay's log goes on beyond what
+    // this device can verify or any host confirmed: the newest k_backup
+    // may lie past it, so restoring from the verified prefix could open an
+    // older backup. Wait for a host head that reads through it instead.
+    let remaining = verified.deferred.is_some();
     let log = verified.membership;
     let confirmed: Vec<&HostHead> = confirmed.iter().collect();
-    if confirmed.is_empty() {
+    if confirmed.is_empty() || remaining {
         let hosts: Vec<String> = log
             .entries()
             .iter()
@@ -234,4 +244,210 @@ pub fn restore(
         .map_err(|_| RestoreError::BackupInvalid)?;
     let head = log.head();
     Ok(Restored { log, head, keys })
+}
+
+// ------------------------------------------------------------ the flow
+
+/// What the restoring device tells the user while it waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserNotice {
+    /// "Recovery needs to reach one of your Atem hosts (<names>) to confirm
+    /// the device list is current. Turn one on or join its network;
+    /// recovery then continues by itself."
+    WaitingForHost { hosts: Vec<String> },
+}
+
+/// How fresh the restored log is: in r9 a host-signed head is the only
+/// proof of freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    HostConfirmed,
+}
+
+/// What an enrollment append came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Enrollment {
+    /// The relay stored the `recovery_add`: it takes effect after the 24 h
+    /// wait unless another device approves it (or vetoes it). `head` is the
+    /// entry's.
+    Published { head: Head },
+    /// `409`: the returned entries verified and extend the confirmed head;
+    /// steps 4–5 must run again on the new head ([`RestoreFlow::attempt`]
+    /// with the relay's log and newest envelope), then a new entry is built
+    /// there.
+    Rebuild,
+    /// The relay misbehaved or showed conflicting history: stop (retry
+    /// later or by another route); nothing was published.
+    Stopped(Box<Published>),
+}
+
+/// The Recovery Kit restore as a client machine (§R9.5 "Restore"): read the
+/// kit, then attempt with what the relay and the hosts returned (a host
+/// that doesn't answer leaves the restore withheld, never on an
+/// unconfirmed head), store `K` only once restored, and publish the
+/// `recovery_add` on the confirmed head through the CAS rules.
+pub struct RestoreFlow {
+    kit: RecoveryKit,
+    last: Option<RestoreError>,
+    restored: Option<Restored>,
+    publisher: Publisher,
+}
+
+impl RestoreFlow {
+    /// Step 1: the kit as typed or scanned (`R`, account, genesis, tag).
+    pub fn read(
+        r: &[u8; 32],
+        account_id: &str,
+        genesis_hash: crate::Hash32,
+        tag: &[u8; 16],
+    ) -> Result<Self, RestoreError> {
+        let kit = RecoveryKit::read(r, account_id, genesis_hash, tag)
+            .map_err(|_| RestoreError::KitTagMismatch)?;
+        Ok(Self::new(kit))
+    }
+
+    pub fn new(kit: RecoveryKit) -> Self {
+        RestoreFlow {
+            kit,
+            last: None,
+            restored: None,
+            publisher: Publisher::new(),
+        }
+    }
+
+    pub fn kit(&self) -> &RecoveryKit {
+        &self.kit
+    }
+
+    /// Steps 2–5 over what was fetched. A withheld or refused attempt
+    /// stores nothing; retry with a new fetch and new host heads.
+    pub fn attempt(
+        &mut self,
+        relay_log: &[Entry],
+        relay_blob: &[u8],
+        host_accepts: &[HostAccept],
+        now: &HostNow,
+    ) -> Result<&Restored, RestoreError> {
+        match restore(&self.kit, relay_log, relay_blob, host_accepts, now) {
+            Ok(restored) => {
+                self.last = None;
+                self.restored = Some(restored);
+                Ok(self.restored.as_ref().expect("just stored"))
+            }
+            Err(e) => {
+                self.last = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// A `K` set is stored as current (only after a confirmed restore).
+    pub fn k_stored(&self) -> bool {
+        self.restored.is_some()
+    }
+
+    pub fn restored(&self) -> Option<&Restored> {
+        self.restored.as_ref()
+    }
+
+    /// Whether the device may rotate `K` or seal a new backup as
+    /// `device_id`: never while withheld or refused, and not after a
+    /// restore either until its recovery took effect (`device_id` active in
+    /// the restored log; a pending subject holds nothing).
+    pub fn may_rotate_k(&self, device_id: &str) -> bool {
+        self.restored.as_ref().is_some_and(|r| {
+            r.log
+                .member(device_id)
+                .is_some_and(|m| m.status == crate::membership::MemberStatus::Active)
+        })
+    }
+
+    /// Same rule as [`RestoreFlow::may_rotate_k`].
+    pub fn may_seal_backup(&self, device_id: &str) -> bool {
+        self.may_rotate_k(device_id)
+    }
+
+    /// What to tell the user now.
+    pub fn user_notice(&self) -> Option<UserNotice> {
+        match &self.last {
+            Some(RestoreError::Withheld { hosts }) => Some(UserNotice::WaitingForHost {
+                hosts: hosts.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The last attempt asks for a new fetch (or another route).
+    pub fn refetch(&self) -> bool {
+        self.last.as_ref().is_some_and(RestoreError::refetch)
+    }
+
+    pub fn last_error(&self) -> Option<&RestoreError> {
+        self.last.as_ref()
+    }
+
+    pub fn freshness(&self) -> Option<Freshness> {
+        self.restored.as_ref().map(|_| Freshness::HostConfirmed)
+    }
+
+    /// Step 6: prepares (durably: store [`RestoreFlow::prepared`]) and signs
+    /// the `recovery_add` for `member` on the confirmed head. Returns the
+    /// entry and the head to send as `expected`.
+    pub fn enroll(
+        &mut self,
+        member: Member,
+        signed_at: u64,
+    ) -> Result<(Entry, Head), PublishError> {
+        let restored = self
+            .restored
+            .as_ref()
+            .ok_or(PublishError::NothingPrepared)?;
+        let body = restored
+            .log
+            .draft(RECOVERY_SIGNER, signed_at, &Action::RecoveryAdd { member });
+        self.publisher.prepare(&restored.log, body)?;
+        self.publisher
+            .sign(&self.kit, &RecoveryKit::sign_id(), None)?;
+        let (entry, head) = self.publisher.outstanding().expect("just signed");
+        Ok((entry.clone(), head))
+    }
+
+    /// What to store for a resumed enrollment (§R9.4 rule 1).
+    pub fn prepared(&self) -> Option<&Prepared> {
+        self.publisher.prepared()
+    }
+
+    /// The relay's answer to the append.
+    pub fn append_reply(
+        &mut self,
+        reply: AppendReply,
+        now: &HostNow,
+    ) -> Result<Enrollment, PublishError> {
+        let restored = self
+            .restored
+            .as_mut()
+            .ok_or(PublishError::NothingPrepared)?;
+        let published = self.publisher.reply(reply, &mut restored.log, now)?;
+        Ok(match published {
+            Published::Committed(head) | Published::StoredPending { head, .. } => {
+                Enrollment::Published { head }
+            }
+            Published::LostRace { .. } | Published::FetchMore { .. } => {
+                // Steps 4–5 again on the new head: the kit may have been
+                // replaced or a newer backup named meanwhile.
+                self.restored = None;
+                Enrollment::Rebuild
+            }
+            other => Enrollment::Stopped(Box::new(other)),
+        })
+    }
+}
+
+impl std::fmt::Debug for RestoreFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestoreFlow")
+            .field("k_stored", &self.k_stored())
+            .field("last", &self.last)
+            .finish_non_exhaustive()
+    }
 }

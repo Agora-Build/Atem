@@ -38,11 +38,27 @@
 //!
 //! - [`channel`]: `atem-ch1` in both roles (initiator and responder state
 //!   machines, transcript and key schedule, records, limits and errors).
+//!
+//! The client machines and formats of §R9.6, §R9.8 and §R9.9 (Task 4):
+//!
+//! - [`session`]: r8's session-v1 wire and client machines (moved here from
+//!   the atem binary, which re-exports them) and r9's `hello` (built by the
+//!   crate around `sig_c`), `welcome`, errors and new ops;
+//! - [`connect`]: a client's connection: handshake, carriage, the checked
+//!   welcome, then r8's lease/registry/chat machines inside the channel;
+//! - [`principal`]: native, service and browser principals, scope, ops,
+//!   expiry, browser grants (the checks a host runs at admission);
+//! - [`push`]: sealed push hints, seen, acks, the relay's schedule from the
+//!   signed `created_at` (a pure function), a reference relay ledger, and
+//!   the host's per-approval seen state and resend outbox;
+//! - [`restore::RestoreFlow`]: the Recovery Kit restore as a client
+//!   machine (withheld until a host-signed head confirms the log).
 
 pub mod backup;
 pub mod backup_writer;
 pub mod canonical;
 pub mod channel;
+pub mod connect;
 pub mod domain;
 pub mod encoding;
 pub mod error;
@@ -50,7 +66,9 @@ pub mod hpke;
 pub mod keys;
 pub mod kit;
 pub mod membership;
+pub mod principal;
 pub mod provider;
+pub mod push;
 pub mod restore;
 pub mod session;
 pub mod signed;

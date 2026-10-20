@@ -499,7 +499,10 @@ fn a_restore_reads_through_a_past_recovery() {
     .unwrap();
     assert_eq!(restored.head, log.head());
     assert_eq!(*restored.keys[0].k, [7; 32]);
-    // A head before the subject's entry confirms nothing beyond it.
+    // A head before the subject's entry confirms nothing beyond it, and
+    // the restore doesn't go on with the verified prefix (its newest
+    // k_backup may be older than the log's): it waits (Task 2 review
+    // carried requirement, applied in Task 4).
     let early = signed_accept(
         &host_keys,
         &h,
@@ -515,7 +518,7 @@ fn a_restore_reads_through_a_past_recovery() {
             .err()
             .unwrap()
             .code(),
-        "no_backup"
+        "no_host_reachable"
     );
 
     // M-1: restore is fail-closed on host heads. A head whose sig_h doesn't
