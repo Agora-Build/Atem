@@ -1694,12 +1694,7 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
         .and_then(|b| parse_json(&b));
     let frozen = store::present(&pairing.freeze)
         || state.as_ref().is_some_and(|v| v.get("frozen").is_some());
-    let journal = pairing
-        .dir()
-        .parent()
-        .map(|config| crate::runtime::state_dir(config).join("journal"))
-        .unwrap_or_else(|| pairing.dir().to_path_buf());
-    let mut store = Store::new(pairing, &journal);
+    let mut store = Store::new(pairing, &journal_of(pairing));
     #[cfg(test)]
     if let Some(injected) = FORGET_FAULT.with(|f| f.take()) {
         store.inject(injected);
@@ -1725,6 +1720,15 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
             .replace(DlFile::FrozenGenesis, file.to_string().as_bytes())
             .map_err(not_begun)?;
     }
+    // `membership_applied` is the last leftover: it stays until
+    // `forget_leftovers`, after the unpair committed the next trust
+    // generation, so a failure in between still opens as `Failed`. A list
+    // without one (never applied) gets one now.
+    if store::present(&pairing.membership) && !store.present(DlFile::Applied) {
+        store
+            .replace(DlFile::Applied, br#"{"unpairing":true}"#)
+            .map_err(not_begun)?;
+    }
     store.remove(DlFile::State).map_err(|e| ForgetError {
         // A failed unlink changed nothing; a failed directory fsync after
         // it may have.
@@ -1732,10 +1736,40 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
         message: e.to_string(),
     })?;
     for file in LEFTOVERS {
+        if file == DlFile::Applied {
+            continue;
+        }
         store.remove(file).map_err(|e| ForgetError {
             message: e.to_string(),
             begun: true,
         })?;
     }
     Ok(())
+}
+
+/// After `atem unpair` committed the next trust generation (or on an
+/// unpaired profile with leftovers): removes every r9 leftover, the last
+/// one (`membership_applied`) included.
+pub fn forget_leftovers(pairing: &PairingPaths) -> Result<(), String> {
+    let mut store = Store::new(pairing, &journal_of(pairing));
+    for file in LEFTOVERS {
+        store.remove(file).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Whether the profile holds a device list or any r9 leftover.
+pub fn has_device_list_files(pairing: &PairingPaths) -> bool {
+    let store = Store::new(pairing, &journal_of(pairing));
+    store::present(&pairing.membership) || LEFTOVERS.into_iter().any(|f| store.present(f))
+}
+
+/// The journal directory of the runtime this profile's `atem runtime`
+/// uses (`<config>/runtime/journal`).
+fn journal_of(pairing: &PairingPaths) -> std::path::PathBuf {
+    pairing
+        .dir()
+        .parent()
+        .map(|config| crate::runtime::state_dir(config).join("journal"))
+        .unwrap_or_else(|| pairing.dir().to_path_buf())
 }

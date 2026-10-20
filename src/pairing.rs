@@ -291,30 +291,63 @@ pub fn capture(src: &Sources) -> Result<TrustState> {
 }
 
 /// `atem unpair`: removes the r9 device list, durably commits the next
-/// generation (so every capture of the old binding goes stale), then
-/// removes the pairing record. Returns the new generation. All under
-/// `trust_gen.lock`. The device list goes first: a failure before its
-/// removal began leaves the host paired as it was; once it began, the
-/// unpair completes (never a paired host without its list).
+/// generation (so every capture of the old binding goes stale), removes
+/// the pairing record, then the device list's last leftover. Returns the
+/// new generation. All under `trust_gen.lock`. The device list goes first:
+/// a failure before its removal began leaves the host paired as it was;
+/// once it began, the unpair completes. Its last leftover
+/// (`membership_applied`) stays until the generation is committed, so a
+/// paired host is never left without its list (it opens as failed).
+#[cfg(test)]
 pub fn unpair(src: &Sources) -> Result<u64> {
+    unpair_with_notices(src).map(|(next, _)| next)
+}
+
+/// `unpair`, with what the user should know (files that couldn't be
+/// removed).
+pub fn unpair_with_notices(src: &Sources) -> Result<(u64, Vec<String>)> {
+    use crate::session_protocol::membership;
     let _lock = lock(src)?;
     let next = read_trust_gen(&src.paths.pairing)? + 1;
+    let mut notices = Vec::new();
     // r9 §R9.3: a frozen list's genesis is kept on `frozen_genesis`, so it
-    // can't be re-paired to. A failure before the list's removal began
-    // changes nothing; one after it finishes the unpair (the files left
-    // make the next runtime start fail closed, and `atem pair` removes
-    // them): a paired host is never left without its list.
-    if let Err(e) = crate::session_protocol::membership::forget_on_unpair(&src.paths.pairing) {
+    // can't be re-paired to.
+    if let Err(e) = membership::forget_on_unpair(&src.paths.pairing) {
         if !e.begun {
             anyhow::bail!("could not remove the device list: {e}");
         }
-        eprintln!(
-            "atem: some device-list files couldn't be removed ({e}); remote access stays off until the next atem pair"
-        );
+        notices.push(left_over(&e.to_string()));
     }
     write_trust_gen(&src.paths.pairing, next)?;
     remove_record(&src.paths.pairing)?;
-    Ok(next)
+    if notices.is_empty()
+        && let Err(e) = membership::forget_leftovers(&src.paths.pairing)
+    {
+        notices.push(left_over(&e));
+    }
+    Ok((next, notices))
+}
+
+fn left_over(error: &str) -> String {
+    format!(
+        "Some device-list files couldn't be removed ({error}); remote access stays off. Run `atem unpair` again."
+    )
+}
+
+/// `atem unpair` on a profile that isn't paired but still holds r9
+/// device-list files (an unpair that stopped midway): removes them, under
+/// `trust_gen.lock`. True when there was something to remove.
+pub fn remove_device_list_leftovers(src: &Sources) -> Result<bool> {
+    use crate::session_protocol::membership;
+    let _lock = lock(src)?;
+    if !membership::has_device_list_files(&src.paths.pairing) {
+        return Ok(false);
+    }
+    membership::forget_on_unpair(&src.paths.pairing)
+        .map_err(|e| anyhow::anyhow!("could not remove the device-list files: {e}"))?;
+    membership::forget_leftovers(&src.paths.pairing)
+        .map_err(|e| anyhow::anyhow!("could not remove the device-list files: {e}"))?;
+    Ok(true)
 }
 
 /// `atem pair`: a new binding with `astation_id` in the next generation,
@@ -797,6 +830,94 @@ pub(crate) mod tests {
             &mut NoFences,
         );
         assert!(opened.is_err(), "Failed, never None");
+    }
+
+    fn opens_as_none(src: &Sources, dir: &std::path::Path) -> bool {
+        let journal = crate::runtime::state_dir(dir).join("journal");
+        matches!(
+            crate::session_protocol::membership::MembershipHost::open(
+                &src.paths.pairing,
+                &journal,
+                9,
+                &atem_client::membership::HostNow {
+                    wall_ms: 1,
+                    mono_ms: 1,
+                    boot_id: "b".into(),
+                },
+                &mut NoFences,
+            ),
+            Ok(None)
+        )
+    }
+
+    /// A paired r9 profile: a (stub) device list and its applied head.
+    fn r9_profile(dir: &std::path::Path) -> Sources {
+        let src = Sources::in_dir(dir);
+        bound_profile(dir, "astation-a");
+        std::fs::write(&src.paths.pairing.membership, b"{}").unwrap();
+        let journal = crate::runtime::state_dir(dir).join("journal");
+        crate::session_protocol::membership::store::private_dir(&journal).unwrap();
+        std::fs::write(journal.join("membership_applied"), b"{}").unwrap();
+        src
+    }
+
+    /// Re-review 2, Important 1: the device list is removed, then the
+    /// trust generation can't be written. The unpair fails, the pairing
+    /// stays bound, and its device list's last leftover keeps it failed
+    /// (never "no device list").
+    #[test]
+    fn a_failed_generation_write_after_the_list_went_never_opens_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = r9_profile(dir.path());
+        let gen_before = read_trust_gen(&src.paths.pairing).unwrap();
+        let unpair_err = {
+            let _failing = crate::memory::crypto::fail_writes_to(&src.paths.pairing.trust_gen);
+            unpair(&src).is_err()
+        };
+        let still_bound = load(&src).unwrap().binding.is_some();
+        assert!(unpair_err && still_bound);
+        assert_eq!(read_trust_gen(&src.paths.pairing).unwrap(), gen_before);
+        assert!(!src.paths.pairing.membership.exists());
+        assert!(!opens_as_none(&src, dir.path()), "Failed, never None");
+        // `atem unpair` again finishes it.
+        let (_, notices) = unpair_with_notices(&src).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(load(&src).unwrap().binding.is_none());
+        assert!(opens_as_none(&src, dir.path()));
+        assert!(!crate::session_protocol::membership::has_device_list_files(
+            &src.paths.pairing
+        ));
+    }
+
+    /// Re-review 2, Minor 1: on a profile that isn't paired, `atem unpair`
+    /// still removes r9 leftovers (the message "run atem unpair, then atem
+    /// pair" works); with none it removes nothing.
+    #[test]
+    fn unpair_on_an_unpaired_profile_removes_device_list_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = r9_profile(dir.path());
+        let failing = crate::session_protocol::membership::store::Store::new(
+            &src.paths.pairing,
+            &crate::runtime::state_dir(dir.path()).join("journal"),
+        )
+        .path(crate::session_protocol::membership::store::DlFile::HostChannelKey);
+        // An unpair that stopped midway: a directory in the way of a leftover.
+        std::fs::create_dir(&failing).unwrap();
+        std::fs::write(failing.join("x"), b"x").unwrap();
+        let (_, notices) = unpair_with_notices(&src).unwrap();
+        assert_eq!(notices.len(), 1, "the partial removal is a notice");
+        assert!(notices[0].contains("atem unpair"), "{notices:?}");
+        assert!(load(&src).unwrap().binding.is_none(), "unpaired");
+        assert!(!opens_as_none(&src, dir.path()), "leftovers fail closed");
+        std::fs::remove_dir_all(&failing).unwrap();
+        assert!(remove_device_list_leftovers(&src).unwrap());
+        assert!(opens_as_none(&src, dir.path()));
+        assert!(!remove_device_list_leftovers(&src).unwrap(), "nothing left");
+        // A plain r8 profile: nothing to remove, nothing created.
+        let r8 = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(r8.path());
+        assert!(!remove_device_list_leftovers(&src).unwrap());
+        assert!(!crate::runtime::state_dir(r8.path()).exists());
     }
 
     struct NoFences;

@@ -942,7 +942,13 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Unpair { yes } => {
             let src = crate::profile::Sources::current()?;
             if !crate::status::profile_paired(&src) && !revocation_recorded(&src) {
-                println!("No pairing to remove.");
+                // r9: an unpair that stopped midway left device-list files.
+                if crate::pairing::remove_device_list_leftovers(&src)? {
+                    println!("Removed the leftover device-list files.");
+                    reload_runtime().await;
+                } else {
+                    println!("No pairing to remove.");
+                }
                 return Ok(());
             }
             let what = match crate::status::pairing(&src) {
@@ -1228,9 +1234,8 @@ fn unpair_profile(
     src: &crate::profile::Sources,
     agent: Option<&dyn crate::memory::cred_agent::CredAgentApi>,
 ) -> Result<Vec<String>> {
-    crate::pairing::unpair(src)?;
+    let (_, mut notices) = crate::pairing::unpair_with_notices(src)?;
     // Unpaired from here on: what happens to revoked keys is only reported.
-    let mut notices = Vec::new();
     match crate::memory::verification::set_aside_revoked_keys(&src.paths.cred, agent) {
         Ok(Some(notice)) => notices.push(notice),
         Ok(None) => {}

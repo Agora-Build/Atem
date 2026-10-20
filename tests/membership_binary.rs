@@ -295,12 +295,10 @@ fn a_runtime_killed_between_commit_and_fences_replays_them_at_start() {
     assert!(b.principal(SVC).is_none());
 
     b.start(false);
-    b.until("the fences replayed", || {
-        std::fs::read(b.journal().join("membership_applied"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|v| v["seq"] == 7)
-    });
+    // The start's whole replay is done once the runtime logs it (the
+    // applied head is written before the leftover intent is removed).
+    b.until("the fences replayed", || b.log().contains("replayed"));
+    assert_eq!(b.applied_seq(), 7);
     let fence = b.principal(SVC).unwrap();
     assert_eq!(fence["control"], false);
     assert_eq!(fence["control_gen"], 2);
