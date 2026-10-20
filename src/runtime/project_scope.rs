@@ -319,6 +319,12 @@ impl ProjectScopes {
         });
     }
 
+    /// The last failure of `kid`, if its hashes are pending (tests).
+    #[cfg(test)]
+    pub fn failure_of(&self, kid: &str) -> Option<&str> {
+        self.failure.get(kid).map(String::as_str)
+    }
+
     /// No job out and nothing missing for `kids` (tests).
     #[cfg(test)]
     pub fn idle(&self, kids: &BTreeSet<String>) -> bool {

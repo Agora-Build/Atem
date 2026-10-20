@@ -746,3 +746,98 @@ fn project_scopes_hash_under_each_retained_kid_on_the_real_agent() {
     let other = format!("h1.{A}.{}", "0".repeat(64));
     assert_eq!(scopes.matches("ses-aaaaaaaaaaaa", &other), Some(false));
 }
+
+/// §R9.6 on the real cred agent (Astation's case, PR #80 comment
+/// 6296544817): three kids, the current one (B), a retained previous one
+/// (A) and one the agent doesn't hold (C). A's and B's hashes are learned
+/// and match; C stays pending (out of scope) without holding them back.
+/// Once C is installed, the next try after `RETRY` learns it too. A later
+/// lock revokes none of the learned matches ("until the first unlock").
+#[test]
+fn project_scopes_learn_a_kid_installed_later_and_keep_matches_after_a_lock() {
+    use crate::runtime::project_scope::{CredAgentHasher, ProjectScopes, RETRY};
+    use crate::session_protocol::r9::ProjectScope;
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+    const C: &str = "fedcba98";
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::Enabling, A, [1; 32]);
+    device.set_key(EncryptionMode::Enabling, B, [2; 32]);
+    let key = "github.com/agora-build/atem";
+    let agent: std::sync::Arc<dyn CredAgentApi> = device.agent.clone();
+    let hash_under = |kid: &str| -> String {
+        // What the agent makes under `kid` right now (the scope entry a
+        // manager would sign).
+        agent
+            .crypt(
+                ASTATION_ID,
+                vec![CryptOp::keyed_hash_under(key.as_bytes(), kid)],
+            )
+            .unwrap()
+            .remove(0)
+            .into_text()
+            .unwrap()
+    };
+    let (under_a, under_b) = (hash_under(A), hash_under(B));
+    let mut scopes = ProjectScopes::new(std::sync::Arc::new(CredAgentHasher {
+        agent: agent.clone(),
+        astation_id: ASTATION_ID.into(),
+    }));
+    let sid = "ses-aaaaaaaaaaaa";
+    scopes.session(sid, Some(key.into()));
+    let kids: BTreeSet<String> = [A, B, C].iter().map(|k| k.to_string()).collect();
+    let mut now = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while scopes.matches(sid, &under_a).is_none()
+        || scopes.matches(sid, &under_b).is_none()
+        || scopes.failure_of(C).is_none()
+    {
+        assert!(Instant::now() < deadline, "A, B or C's failure never came");
+        scopes.pass(&kids, now);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(scopes.matches(sid, &under_a), Some(true));
+    assert_eq!(scopes.matches(sid, &under_b), Some(true));
+    let c_entry = format!("h1.{C}.{}", "0".repeat(64));
+    assert_eq!(
+        scopes.matches(sid, &c_entry),
+        None,
+        "C: pending, out of scope"
+    );
+    assert!(
+        scopes.failure_of(C).unwrap().contains("no retained key"),
+        "{:?}",
+        scopes.failure_of(C)
+    );
+
+    // C is installed (a new grant: C current, A and B retained).
+    device.set_key(EncryptionMode::Enabling, C, [3; 32]);
+    let under_c = hash_under(C);
+    // Not asked again before RETRY; then learned.
+    scopes.pass(&kids, now);
+    assert_eq!(scopes.matches(sid, &under_c), None);
+    now += RETRY;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while scopes.matches(sid, &under_c).is_none() {
+        assert!(Instant::now() < deadline, "C was never learned");
+        scopes.pass(&kids, now);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(scopes.matches(sid, &under_c), Some(true));
+    assert!(scopes.failure_of(C).is_none());
+
+    // A later lock revokes none of them.
+    device.agent.lock_keys().unwrap();
+    assert!(
+        agent
+            .crypt(ASTATION_ID, vec![CryptOp::keyed_hash(key.as_bytes())])
+            .is_err(),
+        "the agent is locked"
+    );
+    now += RETRY * 2;
+    scopes.pass(&kids, now);
+    for entry in [&under_a, &under_b, &under_c] {
+        assert_eq!(scopes.matches(sid, entry), Some(true), "{entry}");
+    }
+}
