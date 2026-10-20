@@ -96,7 +96,7 @@ mod support;
 /// r8 revision and features, and which `r8-*` fixtures can run: the same
 /// list the core runner gates on.
 #[allow(dead_code)]
-#[path = "../src/session_protocol/revision.rs"]
+#[path = "../crates/atem-client/src/session/revision.rs"]
 mod revision;
 
 use base64::{Engine, engine::general_purpose::STANDARD};

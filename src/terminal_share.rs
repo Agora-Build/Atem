@@ -2,107 +2,15 @@
 //! Viewers receive rendered state, never the CLI's terminal queries or hidden buffers.
 use crate::pty_session::PtyInput;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 const FRAME_BYTES: usize = 16 * 1024;
 const WINDOW_BYTES: u64 = 128 * 1024;
 const RESTORE_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Envelope {
-    pub v: u8,
-    #[serde(flatten)]
-    pub message: Message,
-}
-
-impl From<Message> for Envelope {
-    fn from(message: Message) -> Self {
-        Self { v: 1, message }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum Message {
-    Subscribe {
-        terminal_id: String,
-        generation: String,
-    },
-    Unsubscribe {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-    },
-    Ack {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-        offset: u64,
-    },
-    Input {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-        sequence: u64,
-        bytes: String,
-    },
-    Resize {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-        rows: u16,
-        cols: u16,
-    },
-    Stop {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-    },
-    Attached {
-        session: SessionInfo,
-        stream_id: String,
-    },
-    Frame {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-        offset: u64,
-        bytes: String,
-        reset: bool,
-        complete: bool,
-        rows: u16,
-        cols: u16,
-    },
-    Written {
-        terminal_id: String,
-        generation: String,
-        stream_id: String,
-        sequence: u64,
-        error: Option<String>,
-    },
-    Exited {
-        terminal_id: String,
-        generation: String,
-        status: String,
-    },
-    Error {
-        terminal_id: Option<String>,
-        message: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionInfo {
-    pub terminal_id: String,
-    pub generation: String,
-    pub provider: String,
-    pub rows: u16,
-    pub cols: u16,
-    pub exit_status: Option<String>,
-    pub rendering: String,
-    pub width_profile: String,
-}
+// The terminal-v1 wire types live in the shared client crate (apps decode
+// the host's frames with the same types).
+pub use atem_client::session::terminal::{Envelope, Message, SessionInfo};
 
 /// One remote viewer's stream of canonical-screen frames (terminal-v1
 /// `frame`/`exited`), opened by the session host's `subscribe`. Only one

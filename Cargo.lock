@@ -213,6 +213,7 @@ dependencies = [
  "hpke",
  "p256",
  "rand_core",
+ "serde",
  "serde_json",
  "sha2",
  "subtle",
