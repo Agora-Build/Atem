@@ -1093,8 +1093,10 @@ impl HostBridge {
             }
             self.exec(effects, cx);
         }
+        // The stamp stays the one read before opening: a pin still being
+        // written (its key and applied head first, the list last) changes
+        // it again, and the next pass opens the finished list.
         self.sync_refuse_r8(cx);
-        self.list_stamp = membership::list_stamp(&pairing);
     }
 
     /// r9 "No compatibility": r8 admission is refused while a device list
