@@ -16,9 +16,12 @@
 //! finish and record, the host's own record sent back) is made on a live
 //! handshake and the host's effects are checked.
 //!
-//! Items that are another task's (sealed push to the relay: Task 8) or
-//! another runner's (keys, client side) are listed pending with their
-//! owner; an unknown step or assert key fails the run.
+//! Sealed push (§R9.9) runs on the engine's own push: every relay message
+//! Atem sends (`push_hint`, `push_seen`) is checked by `expect_relay`, and
+//! the fixture's `push_ack`s are fed back to it.
+//!
+//! Items that are another runner's (keys, client side) are listed pending
+//! with their owner; an unknown step or assert key fails the run.
 use super::store::{DlFile, Injected, Step};
 use super::tests::{Rig, Vectors, clock, fixtures_dir, pinned, vectors};
 use super::*;
@@ -41,7 +44,6 @@ use base64::Engine as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-const T8: &str = "Task 8 (sealed push: push_hint/push_seen to the relay, the relay's acks)";
 const CRATE: &str = "atem-client runners (keys, the client side, exact vector bytes)";
 const CHAIN_ONLY: &str = "the fixture's note: this host is outside the vectors (chain handling only; no atem-ch1 client can reach a host missing from its log)";
 const AUTH_MS: u64 = 24 * 60 * 60 * 1000;
@@ -133,7 +135,12 @@ struct HostRt {
     /// Clients admitted on the device list only (a host outside the
     /// vectors: no channel can reach it).
     chain_only: BTreeSet<String>,
+    /// What Atem sent the relay (§R9.9) and no `expect_relay` took yet.
+    relay: VecDeque<Value>,
 }
+
+/// The hook's wait of the fixtures' approvals (a Claude session, 600 s).
+const WAIT_MS: u64 = 600_000;
 
 impl HostRt {
     /// Runs `f` on the engine with this host's parts, then performs its
@@ -141,6 +148,18 @@ impl HostRt {
     fn call<T>(
         &mut self,
         f: impl FnOnce(&mut R9Host, &mut R9Parts<'_, FileJournal>) -> (T, Vec<Effect>),
+    ) -> T {
+        let (out, effects) = self.with_parts(f);
+        self.rt.apply(effects);
+        self.route();
+        self.engine.end_pass();
+        out
+    }
+
+    /// Runs `f` on the engine with this host's parts (nothing else).
+    fn with_parts<T>(
+        &mut self,
+        f: impl FnOnce(&mut R9Host, &mut R9Parts<'_, FileJournal>) -> T,
     ) -> T {
         let mono = self.rt.now();
         let list = match &mut self.m {
@@ -156,11 +175,7 @@ impl HostRt {
             },
             projects: &self.projects,
         };
-        let (out, effects) = f(&mut self.engine, &mut parts);
-        self.rt.apply(effects);
-        self.route();
-        self.engine.end_pass();
-        out
+        f(&mut self.engine, &mut parts)
     }
 
     /// The session host's messages and closes for r9 attachments.
@@ -185,6 +200,14 @@ impl HostRt {
                     Effect::Close { attachment } => {
                         self.engine.close_attachment(&attachment, self.now.mono_ms)
                     }
+                    // §R9.9, as the runtime's bridge does.
+                    Effect::PushApproval { request } => {
+                        self.with_parts(|e, p| e.approval_opened(&request, WAIT_MS, p))
+                    }
+                    Effect::PushResolved {
+                        approval_id,
+                        reason,
+                    } => self.with_parts(|e, p| e.approval_resolved(&approval_id, reason, p)),
                     _ => {}
                 }
             }
@@ -211,6 +234,11 @@ impl HostRt {
         let mut sent = Vec::new();
         self.engine.flush(&mut |text| {
             sent.push(text);
+            true
+        });
+        let relay = &mut self.relay;
+        self.engine.flush_relay(&mut |text| {
+            relay.push_back(serde_json::from_str(&text).expect("Atem sends JSON"));
             true
         });
         let mono = self.now.mono_ms;
@@ -264,6 +292,22 @@ impl HostRt {
             .find(|(_, c)| c.attachment.as_deref() == Some(att))
             .map(|(n, _)| n.clone())
     }
+}
+
+/// `path` in a relay message: dotted, array indices as numbers, a final
+/// `#` the array's length.
+fn relay_path(v: &Value, path: &str) -> Value {
+    let mut at = v;
+    for part in path.split('.') {
+        if part == "#" {
+            return json!(at.as_array().map_or(0, Vec::len));
+        }
+        at = match part.parse::<usize>() {
+            Ok(i) => &at[i],
+            Err(_) => &at[part],
+        };
+    }
+    at.clone()
 }
 
 /// The fence error a principal admitted on the device list only hears
@@ -540,6 +584,7 @@ impl Runner {
                 handles: 0,
                 link_attached: false,
                 chain_only: BTreeSet::new(),
+                relay: VecDeque::new(),
             };
             host.call(|e, p| ((), e.link_up(1, p)));
             settle_projects(&mut host);
@@ -1578,8 +1623,42 @@ impl Runner {
                 };
                 self.host_event(event);
             }
-            "expect_relay" | "expect_relay_none" | "relay_ack" | "relay_lost" => {
-                self.later(format!("{kind}: {}", step[kind]), T8)
+            "expect_relay" => self.expect_relay(step),
+            "expect_relay_none" => {
+                self.drain();
+                let left = std::mem::take(&mut self.host().relay);
+                assert!(
+                    left.is_empty(),
+                    "{}: Atem sent the relay {left:?}",
+                    self.name
+                );
+                self.pass();
+            }
+            "relay_ack" => {
+                let ack = self.resolve(&step["relay_ack"]);
+                let identities = atem_client::push::parse_push_ack(&json!({
+                    "type": "relay", "op": ack["op"], "acks": ack["acks"]}));
+                assert_eq!(
+                    identities.len(),
+                    ack["acks"].as_array().unwrap().len(),
+                    "{}: every ack entry names an identity",
+                    self.name
+                );
+                let host = self.host();
+                let before = host.engine.push_status(host.now.wall_ms).pending;
+                let text =
+                    json!({"type": "relay", "op": ack["op"], "acks": ack["acks"]}).to_string();
+                host.engine.relay_message(&text);
+                let after = host.engine.push_status(host.now.wall_ms).pending;
+                assert!(after < before, "{}: the ack matched nothing", self.name);
+                self.drain();
+                self.pass();
+            }
+            "relay_lost" => {
+                // The host can't tell: what it sent stays unacknowledged.
+                let host = self.host();
+                assert!(host.engine.push_status(host.now.wall_ms).pending > 0);
+                self.pass();
             }
             "unpair" => {
                 let host = self.host();
@@ -1609,6 +1688,31 @@ impl Runner {
             }
             other => panic!("{}: unhandled step {other}", self.name),
         }
+    }
+
+    /// `expect_relay`: the next relay message Atem sent matches each
+    /// `path: value` (`a.b.0.c`; `x.#` an array's length; `${…}`
+    /// resolved); `capture` takes values by path.
+    fn expect_relay(&mut self, step: &Value) {
+        self.drain();
+        let name = self.name.clone();
+        let got = self
+            .host()
+            .relay
+            .pop_front()
+            .unwrap_or_else(|| panic!("{name}: Atem sent the relay nothing ({step})"));
+        let want = self.resolve(&step["expect_relay"]);
+        for (path, value) in want.as_object().unwrap() {
+            assert_eq!(&relay_path(&got, path), value, "{name}: {path} of {got}");
+        }
+        if let Some(capture) = step.get("capture").and_then(Value::as_object) {
+            for (label, path) in capture {
+                let v = relay_path(&got, path.as_str().unwrap());
+                assert!(!v.is_null(), "{name}: nothing at {path} of {got}");
+                self.captures.insert(label.clone(), v);
+            }
+        }
+        self.pass();
     }
 
     /// The welcome on the wire: r9 revision, kind, permissions and the
@@ -1824,11 +1928,11 @@ fn r9_host_scenarios_on_the_real_engine_and_store() {
     }
 }
 
-/// Nothing a host scenario asserts is left to Task 7: what stays pending
-/// is sealed push (Task 8) or the client side and exact vector bytes (the
+/// Nothing a host scenario asserts is left to Task 7 or Task 8 (sealed
+/// push): what stays pending is the client side and exact vector bytes (the
 /// crate's runners).
 #[test]
-fn no_host_scenario_item_is_left_to_task_7() {
+fn no_host_scenario_item_is_left_to_task_7_or_8() {
     for name in scenario_names() {
         let Some((passed, pending)) = run(&name) else {
             continue;
@@ -1837,7 +1941,7 @@ fn no_host_scenario_item_is_left_to_task_7() {
         assert!(
             pending
                 .iter()
-                .all(|(_, owner)| *owner == T8 || *owner == CRATE || *owner == CHAIN_ONLY),
+                .all(|(_, owner)| *owner == CRATE || *owner == CHAIN_ONLY),
             "{name}: {pending:?}"
         );
     }

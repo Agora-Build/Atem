@@ -32,8 +32,6 @@ use support::host::{HostConn, HostCore, HostSession};
 use support::*;
 
 const T7: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
-const PUSH: &str = "Task 8 (sealed push: the host's push_hint/push_seen to the relay)";
-const T8: &str = "host runner (src/session_protocol/membership/fixtures_tests.rs: the real r9 admission engine, device-list store and session host)";
 
 fn resolve(value: &Value, v: &Vectors, captured: &BTreeMap<String, Value>) -> Value {
     match value {
@@ -592,14 +590,9 @@ impl HostRun<'_> {
             && kind != "connect"
             && !(kind == "expect" && step["match"]["op"] == "welcome")
         {
-            // What Atem sends the relay is sealed push (Task 8); the rest
-            // runs on the real host.
-            let owner = if kind.starts_with("expect_relay") || kind.starts_with("relay_") {
-                PUSH
-            } else {
-                T7
-            };
-            self.report.pending(format!("{kind}: {}", raw), owner);
+            // The rest, what Atem sends the relay included (its sealed
+            // push, §R9.9), runs on the real host.
+            self.report.pending(format!("{kind}: {}", raw), T7);
             return;
         }
         match kind.as_str() {
@@ -611,8 +604,8 @@ impl HostRun<'_> {
                 let host_only = matches!(op.as_str(), "lease_changed" | "approval_closed")
                     || (op == "receipt" && step["match"]["state"] != "accepted");
                 if op == "approval_request" {
-                    // The card is the runtime's (Task 8); the approval id is
-                    // the one the test host opened.
+                    // The card is the runtime's (the host runner); the
+                    // approval id is the one the test host opened.
                     if let Some(cap) = step.get("capture") {
                         for k in cap.as_object().unwrap().keys() {
                             let ap = self.core.approvals.keys().last().unwrap().clone();
@@ -620,7 +613,7 @@ impl HostRun<'_> {
                         }
                     }
                     self.report
-                        .pending(format!("expect {}: the approval card", step["expect"]), T8);
+                        .pending(format!("expect {}: the approval card", step["expect"]), T7);
                 } else if host_only {
                     self.report
                         .pending(format!("expect {}: {op}", step["expect"]), T7);
@@ -749,8 +742,7 @@ impl HostRun<'_> {
             }
             "assert" => {
                 for key in step["assert"].as_object().unwrap().keys() {
-                    let owner = if key == "approvals_pending" { T8 } else { T7 };
-                    self.report.pending(format!("assert {key}"), owner);
+                    self.report.pending(format!("assert {key}"), T7);
                 }
             }
             "approval_applied" | "turn_complete" => self.report.pending(kind.clone(), T7),
