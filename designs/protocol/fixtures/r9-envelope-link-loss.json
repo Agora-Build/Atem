@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.7a: losing Atem's link closes every channel and fences their attachments (the lease ends by its expiry, never carried); the reconnect is a new link generation where an old handle is unknown, and a fresh handshake gets a new attachment with no lease.",
+  "note": "R9.7a: losing Atem's link closes every channel and fences their attachments; their lease is never carried (it ends by its 15 s expiry, r8 §3); the reconnect is a new link generation where an old handle is unknown, and a fresh handshake gets a new attachment that holds no lease.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -118,7 +118,7 @@
       }
     },
     {
-      "advance_ms": 1000
+      "advance_ms": 15000
     },
     {
       "connect": "phone",
