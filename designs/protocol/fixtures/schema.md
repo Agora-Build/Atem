@@ -220,6 +220,7 @@ and `negative`/`invalid` cases must be refused for the stated reason.
 | `r9-vectors-recovery` | `R` → signing seed, recovery key (= E1's) and its X25519 form; the `R7` entry; `atem-k-backup-v2` envelopes sealed to kit 1 (`k_backup`, version 3; `k_backup_rotated`, version 4) with `info`, `ikmE`, `backup_hash`; `kit_2` (the replacement kit) and the envelope re-sealed to it; each kit's genesis binding (`kit`, `kit_2.kit`: `account_id`, `genesis_hash`, `kit_tag`); `substitute_chain` (its envelope sealed to kit 1, opening with kit 1, refused `genesis_mismatch`) |
 | `r9-vectors-channel-handshake` | a full `atem-ch1` handshake (every input, `th2`, `sig_h`, `ss`, `hs`, `k_finish`, `th3`, `sig_c`, the `finish` ciphertext, `th4`, `channel_id`, both record keys, three records) and the negative cases |
 | `r9-vectors-browser-grant` | a signed QR grant, its hash, the browser's `th3`/`sig_c`, and two invalid grants |
+| `r9-vectors-pairing` | `verifyCommit` with `host_trust_gen` (§R9.2): valid and invalid messages as exact bytes, the `add_host` generation checks, and when a verification attempt is void |
 | `r9-envelope-vectors` | the channel envelope (R9.7a): the three event shapes, valid and invalid handles and reasons, envelopes Atem refuses, and every bound (the largest legal record and its exact serialized sizes) |
 | `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints |
 
