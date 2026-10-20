@@ -12,11 +12,14 @@ rule (§I, which removes §6's double-I/O exception). Atem's host speaks only
 r8: a `hello` without `revision: 8` is refused, so Astation must send it.
 The shared fixtures and where they run are in `atem-host-handoff.md`; the
 consolidated Astation note is `r8-astation-handoff.md`.
-**r9 (draft, 2026-10-19; not implemented):** the appendix "r9" at the end
-specifies remote clients that reach Atem without the Mac (native members,
-scoped services, browser grants) over the end-to-end channel `atem-ch1`,
-authorized by a signed membership log pinned at pairing; its fixtures
-(`fixtures/r9-*.json`, `requires: "r9"`) are reported NOT RUN. r8 stays
+**r9 (signed off 2026-10-19; implemented by Atem 2026-10-20, PR #89, not
+yet merged):** the appendix "r9" at the end specifies remote clients that
+reach Atem without the Mac (native members, scoped services, browser
+grants) over the end-to-end channel `atem-ch1`, authorized by a signed
+membership log pinned at pairing. Atem implements it in `atem-client`
+(with its Swift, Kotlin and WASM bindings) and the runtime host; its
+fixtures (`fixtures/r9-*.json`, `requires: "r9"`) run in atem-client's
+tests and against the real runtime (`atem-host-handoff.md`). r8 stays
 authoritative until r9 ships on both sides.
 r9 note (2026-10-20), a clarification of signed-off r8 text, not a
 change: §3's replaced-attachment sentence read "its leases end (none is
@@ -1700,10 +1703,12 @@ crash before the grant: no lease, and after the restart `rejected`
 | `lease_held` | now carries `controller{controller_session, lease_epoch}` (also for §5 `acquire`); also: an acquiring Send while another holds the lease, or a takeover whose `expected_controller` is no longer the holder (§F) |
 | `forbidden` | also: a Send or approval answer from an attachment without `control`, checked before any lease state (§F, §G) |
 
-## Appendix: r9 (draft, 2026-10-19; not implemented, r8 stays authoritative)
+## Appendix: r9 (signed off 2026-10-19; implemented by Atem 2026-10-20)
 
-Status: **draft for joint review.** Nothing here is emitted or accepted by
-Atem until r9 ships on both sides; until then r8 (above) is the contract.
+Status: **implemented by Atem** (2026-10-20: `crates/atem-client`, its
+bindings and the runtime host; PR #89, merged only once Astation ships its
+side). Released Atem speaks r8 until r9 ships on both sides; until then r8
+(above) is the contract.
 r9 adds remote clients that reach Atem independently of the Mac: native
 members (Mac, iPhone, iPad, Android), scoped bots (`service`) and short
 browser grants, all over one end-to-end channel (`atem-ch1`) whose
@@ -1714,7 +1719,8 @@ reviews of r2, of the first r9 pin `ffe840d` (its r3 review) and of
 `016abe7` (its r4 review, both 2026-10-19; "Astation r4 review N" in
 this appendix means the latter) are answered point by point in `remote-agent-api-atem.md`
 §10. Fixtures: `fixtures/r9-*.json`
-(`requires: "r9"`; every runner reports them NOT RUN until r9 is built),
+(`requires: "r9"`; run by atem-client's tests and, host side, against the
+real runtime; the r8 runners report them NOT RUN),
 format in `fixtures/schema.md` "r9 fixtures".
 
 **What r9 keeps.** Every r8 operation, error and journal rule (§A–§I)

@@ -1,5 +1,8 @@
 # Atem host handoff: atem-session r8 on `feat/r8` (r6 runtime, r7 approvals)
 
+r9 (on `feat/r9`, PR #89): "Shared fixtures (r9) against the real runtime"
+and "r9 binding and effect contract (for Astation)" below.
+
 ## atem-session r8 on `feat/r8` (2026-10-18)
 
 Atem's host now speaks **r8 only** ([atem-session-v1.md](atem-session-v1.md),
@@ -562,6 +565,52 @@ prints a transcript; `ATEM_HARNESS_OUT=<file>` writes it as JSON lines.
 Test target only, never in a release build. Limits: Linux only, the fake
 Claude only (no fake Codex), a fixed flow with no entry point for
 Astation's own router or relay.
+
+## r9 binding and effect contract (for Astation)
+
+What Astation's apps and router do with `atem-client`. The full call
+order and every effect are in `atem-client-bindings.md` (cited as B§n);
+the normative rules are the r9 appendix of `atem-session-v1.md`. This
+section only says where each obligation lives.
+
+| effect / output | the native app or router must | where |
+|---|---|---|
+| `SignRequest` (purposes `Channel`, `Entry`, `KeyBackup`, `BrowserGrant`, …) | sign through its `AppKeyProvider` (Secure Enclave / Keystore), one fresh owner confirmation per entry or grant body; refuse `HostSigning` | B§3; §R9.1, §R9.4 rule 2 |
+| `prepared_json()` of `EntryPublisher`, `KBackupWriter`, `RestoreSession` | persist it before performing the returned step, resume from it after a restart, never start a second write for the device while one is saved | B§1 "Storage", B§2; §R9.4 rules 1 and 4, §R9.5 step 2 |
+| `MembershipLog::entries()` | persist after every change; the host's head stays authoritative | B§2 MembershipLog; §R9.3 |
+| frames from `start`/`on_accept`/`finish_with_signature`/`Outgoing`, `ClientEvent::Outgoing` | send at once on that connection's virtual channel only; pass every received frame to `on_frame` | B§1 "Transport", B§2 ClientConnection; §R9.7 |
+| `AtemError::Refused{next}`, `BadWelcome`, `Fenced`, channel errors | reconnect / wait for recovery / retry later / stop as `next` says; a fence or channel error closes that channel only | B§2 ClientConnection, B§4; §R9.8, §R9.11 |
+| `WelcomeInfo.fetch_to`, `ClientEvent::MembershipHead` | fetch to that head and `extend` the log; never adopt a head unverified | B§2; §R9.3 |
+| `pending_recovery`, frozen log | render it (approve / cancel; frozen state), stop signing entries while frozen | B§2 MembershipLog; §R9.4, §R9.5 |
+| approval events (r8 §G inside the channel) | render the card; answer with `submit_approval` | B§2; r8 §G, §R9.8 |
+| `approval_seen` | send only when the card was rendered in a focused foreground window and the user was active in the last 60 s; never from a background delivery or a notification | B§2 "Push hints and seen"; §R9.9 |
+| push hint (APNs/FCM payload) | `verify_push_hint`, `book.offer`, `hint.open` by the device's own key; a locked device shows a generic hint | B§2 "Push hints and seen"; §R9.9 |
+
+Router obligations (the relay and Astation's :8080):
+
+- **Outbound-only channel envelope.** Atem opens no port; every client,
+  the Mac's own Astation included, reaches it over Atem's one outbound
+  link. The router wraps each client's `atem-ch1` frames in the
+  `channel` envelope (`open` / `frame` / `close`, exact fields) and
+  never shows the binding the handle. §R9.7a; fixtures `r9-envelope-*`.
+- **2 MiB envelope.** The router never forwards an envelope over
+  2 097 152 bytes as received; Atem closes an over-limit one
+  `too_large` (or drops one it can't address). §R9.7a "Limits".
+- **256 KiB relay messages.** Every relay message on Atem's link
+  (`push_hint`, `push_seen`, `push_ack`), either direction, is at most
+  262 144 bytes as sent; the relay splits its acknowledgments, Atem drops
+  a larger one unread. §R9.9.
+- **Native channel lifetime.** A native principal's channel lasts 24 h
+  on the monotonic clock only (a key-rotation bound: a suspend doesn't
+  end it, removal from the device list does at once); it counts in
+  `welcome.authorization_ms_left`, which the binding enforces. Reconnect
+  with a new channel when it ends. Services and browsers end at their
+  expiry (wall and monotonic). An r9 host keeps its Astation link past the
+  r8 attachment's 24 h (that attachment is never welcomed). §R9.6,
+  §R9.7 "Limits".
+
+Artifacts: `atem-client-bindings.md` §7 (SwiftPM, WASM, Kotlin/JVM,
+Android; SHA256SUMS and the source pin).
 
 ## Approvals (r7 §6a, on `feat/approvals`)
 
