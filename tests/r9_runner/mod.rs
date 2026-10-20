@@ -1392,6 +1392,9 @@ impl Runner {
         // No reply is made up: the `expect` that follows checks what B's
         // state can show (its head) and lists the rest not expressible.
         let host_name = self.current.clone();
+        // `carried` is appended during a pass and the dump written at its
+        // end: read a dump from a later pass.
+        self.pass_barrier(&host_name);
         if self.host().state()["membership"]["frozen"] != true {
             self.outside.insert(client.to_owned(), host_name.clone());
         }
@@ -1404,6 +1407,7 @@ impl Runner {
     /// other field, and a refusal, is not expressible (no channel carries
     /// it; a freeze is checked by the scenario's own `frozen` assert).
     fn expect_outside(&mut self, client: &str, host: &str, want: &Value) {
+        self.pass_barrier(host);
         let state = self.hosts[host].state();
         let head = &state["membership"]["head"];
         let mut checked = false;
@@ -1687,19 +1691,8 @@ impl Runner {
             self.current = name.as_str().unwrap().to_owned();
         }
         let assert = self.resolve(assert);
-        // A barrier: the dump read must come from a pass after this step
-        // began (one from before it could show a state about to change).
-        let pass_of = |rt: &Rt| rt.state()["pass"].as_u64().unwrap_or(0);
-        let start = pass_of(self.host());
-        let deadline = Instant::now() + WAIT;
-        while pass_of(self.host()) < start + 2 {
-            assert!(
-                Instant::now() < deadline,
-                "{}: the runtime's state dump stopped",
-                self.name
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let current = self.current.clone();
+        self.pass_barrier(&current);
         let deadline = Instant::now() + SETTLE_STATE;
         loop {
             self.drain();
@@ -1714,6 +1707,29 @@ impl Runner {
                 Err(e) if Instant::now() > deadline => panic!("{}: {e}", self.name),
                 Err(_) => self.host().pump(Duration::from_millis(100)),
             }
+        }
+    }
+
+    /// A barrier: the next dump read of `host` comes from a pass that began
+    /// after this call (one from before could show a state about to
+    /// change). It orders against the runtime's passes, not against the
+    /// delivery of the step's last frame: a frame the fake Astation wrote
+    /// just before may still be in the runtime's WebSocket reader when that
+    /// pass runs. The window is that reader hop (microseconds against the
+    /// 16 ms pass); an assert that expects a change re-reads until it holds
+    /// (`SETTLE_STATE`), so only an "unchanged" assert could pass early.
+    fn pass_barrier(&self, host: &str) {
+        let rt = &self.hosts[host];
+        let pass_of = |rt: &Rt| rt.state()["pass"].as_u64().unwrap_or(0);
+        let start = pass_of(rt);
+        let deadline = Instant::now() + WAIT;
+        while pass_of(rt) < start + 2 {
+            assert!(
+                Instant::now() < deadline,
+                "{}: the runtime's state dump stopped",
+                self.name
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
