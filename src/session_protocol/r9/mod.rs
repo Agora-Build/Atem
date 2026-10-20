@@ -553,6 +553,14 @@ impl R9Host {
         }
     }
 
+    /// Tests: the fixture runners connect clients back to back; the
+    /// per-link `init` rate is checked by the engine tests and the envelope
+    /// fixtures.
+    #[cfg(test)]
+    pub fn reset_init_limiter(&mut self) {
+        self.limiter = InitLimiter::new();
+    }
+
     /// `close`s queued outside any channel (tests: the bound holds).
     pub fn queued_closes(&self) -> usize {
         self.global.len()
@@ -864,6 +872,20 @@ impl R9Host {
         };
         if let Some(result) = &carriage {
             self.note_fences(&result.fences);
+            if result.announce {
+                // Every live attachment learns the new head now, whatever
+                // the carrier's own admission (its welcome names it).
+                let pending: Vec<PendingRecovery> = m
+                    .membership()
+                    .pending_recovery(&parts.now.host)
+                    .iter()
+                    .map(PendingRecovery::of)
+                    .collect();
+                let message = r9::membership_head(&new_id(), None, m.head(), &pending)
+                    .to_string()
+                    .into_bytes();
+                self.announce_to_all(&message, None, parts.now.host.mono_ms);
+            }
             let refused = match result.carried {
                 Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
                     Some(error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECORDED)))
@@ -1060,10 +1082,6 @@ impl R9Host {
             authority,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
-        let announce = carriage.as_ref().is_some_and(|c| c.announce);
-        if announce {
-            self.announce(parts);
-        }
         effects
     }
 
@@ -1527,6 +1545,16 @@ impl R9Host {
             .get(att)
             .and_then(|h| self.chans.get(h))
             .map_or(0, |c| c.queued)
+    }
+
+    /// Whether the r9 attachment `att` may see approvals (cards, rules):
+    /// unscoped principals may; a scoped one only with the `approval` op.
+    pub fn sees_approvals(&self, att: &str) -> bool {
+        self.authority_of(att).is_some_and(|a| {
+            a.scope
+                .as_ref()
+                .is_none_or(|scope| scope.ops.contains(&Op::Approval))
+        })
     }
 
     fn authority_of(&self, att: &str) -> Option<&Authority> {

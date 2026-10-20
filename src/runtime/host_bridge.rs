@@ -826,81 +826,14 @@ impl HostBridge {
     /// row: `None` without one. Failed is shown too (`host_error` doesn't
     /// report it: r8 sessions are unaffected without a list).
     pub fn device_list_status(&self) -> Option<crate::runtime::protocol::DeviceListStatus> {
-        use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus};
-        const REPAIR: &str =
-            "re-pair this host from a device you trust: atem unpair, then atem pair";
-        let clients = self.r9.status().attachments;
-        if let Some(error) = self
-            .membership_error
-            .as_ref()
-            .or(self.host_key_error.as_ref())
-        {
-            return Some(DeviceListStatus {
-                state: "failed".into(),
-                text: format!("failed ({error}); remote access is off"),
-                label: Some("Remote off".into()),
-                head_seq: None,
-                pending_recovery: Vec::new(),
-                clients,
-            });
-        }
-        let m = self.membership.as_ref()?;
-        let head_seq = Some(m.head().seq);
-        let now = host_now();
-        let pending: Vec<PendingRecoveryStatus> = m
-            .membership()
-            .pending_recovery(&now)
-            .iter()
-            .map(|p| {
-                let p = atem_client::session::r9::PendingRecovery::of(p);
-                PendingRecoveryStatus {
-                    subject: p.subject,
-                    action: p.action,
-                    effective_at: p.effective_at,
-                }
-            })
-            .collect();
-        let (state, text, label) = if m.is_frozen() {
-            (
-                "frozen",
-                format!("frozen (conflicting signed history); remote access is paused; {REPAIR}"),
-                Some("Remote frozen"),
-            )
-        } else if let Some(why) = m.faulted() {
-            (
-                "paused",
-                format!(
-                    "paused (a device-list write failed: {why}); remote access stops until atem runtime restart"
-                ),
-                Some("Remote paused"),
-            )
-        } else if let Some(held) = m.held() {
-            let text = match held {
-                Held::IntentMismatch(_) => format!(
-                    "held (the recorded device-list write doesn't match the list); remote access is off; {REPAIR}"
-                ),
-                _ => "held (a device-list write fault was recorded); remote access waits until a managing device (Astation on your Mac or phone) connects to reconcile".to_string(),
-            };
-            ("held", text, Some("Remote held"))
-        } else {
-            let n = match clients {
-                1 => "1 remote client".to_string(),
-                n => format!("{n} remote clients"),
-            };
-            (
-                "open",
-                format!("pinned at seq {} ({n})", m.head().seq),
-                (!pending.is_empty()).then_some("Recovery pending"),
-            )
-        };
-        Some(DeviceListStatus {
-            state: state.into(),
-            text,
-            label: label.map(str::to_string),
-            head_seq,
-            pending_recovery: pending,
-            clients,
-        })
+        device_list_status_of(
+            self.membership.as_ref(),
+            self.membership_error
+                .as_deref()
+                .or(self.host_key_error.as_deref()),
+            self.r9.status().attachments,
+            &host_now(),
+        )
     }
 
     /// Runs `f` on the r9 host with this bridge's session host, device
@@ -940,6 +873,15 @@ impl HostBridge {
             self.forget_r9(gone);
         }
         self.sync_all(cx);
+    }
+
+    /// Approval cards and session rules are shown to (and answerable by)
+    /// an attachment with `control`; an r9 principal also needs the
+    /// `approval` op when it is scoped (§R9.6: a service without it gets
+    /// no cards).
+    fn shows_cards(&self, attachment: &str) -> bool {
+        self.host.attachment_can(attachment, Permission::Control)
+            && (!self.r9.owns(attachment) || self.r9.sees_approvals(attachment))
     }
 
     fn r9_attachments(&self) -> HashSet<String> {
@@ -2582,7 +2524,7 @@ impl HostBridge {
                 c.map
                     .iter()
                     .filter(|(_, c)| self.reachable(&c.attachment))
-                    .filter(|(_, c)| self.host.attachment_can(&c.attachment, Permission::Control))
+                    .filter(|(_, c)| self.shows_cards(&c.attachment))
                     .map(|(id, c)| (id.clone(), c.attachment.clone()))
                     .collect()
             })
@@ -3093,7 +3035,7 @@ impl HostBridge {
     fn open_conversation(&mut self, attachment: &str, sid: &str, conversation: &str, cx: &mut Cx) {
         // Approval cards and session rules only for an attachment that may
         // answer them.
-        let control = self.host.attachment_can(attachment, Permission::Control);
+        let control = self.shows_cards(attachment);
         let rules = if control {
             self.host.approval_rules(sid)
         } else {
@@ -3134,7 +3076,7 @@ impl HostBridge {
     /// A chat-v1 `history` (r8 §B): a page of the retained history in the
     /// conversation's stream, or an error there.
     fn history(&mut self, attachment: &str, sid: &str, env: &ChatEnvelope, cx: &mut Cx) {
-        let control = self.host.attachment_can(attachment, Permission::Control);
+        let control = self.shows_cards(attachment);
         let now_ms = self.clock.now();
         let Some(session) = session_of(cx, sid) else {
             return;
@@ -3337,7 +3279,7 @@ impl HostBridge {
                     .iter()
                     .filter(|(id, c)| Some(id.as_str()) != except && self.reachable(&c.attachment))
                     .map(|(id, c)| {
-                        let can = self.host.attachment_can(&c.attachment, Permission::Control);
+                        let can = self.shows_cards(&c.attachment);
                         (id.clone(), can, c.attachment.clone())
                     })
                     .filter(|(_, can, _)| !control || *can)
@@ -3481,6 +3423,85 @@ fn after_reopen(pairing: &crate::paths::PairingPaths) {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// The device list for `atem status`, `atem agent list` and the status
+/// row (see [`HostBridge::device_list_status`]): `m` open, or `error` why
+/// it failed; `clients` the r9 attachments.
+pub(crate) fn device_list_status_of(
+    m: Option<&MembershipHost>,
+    error: Option<&str>,
+    clients: usize,
+    now: &atem_client::membership::HostNow,
+) -> Option<crate::runtime::protocol::DeviceListStatus> {
+    use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus};
+    const REPAIR: &str = "re-pair this host from a device you trust: atem unpair, then atem pair";
+    if let Some(error) = error {
+        return Some(DeviceListStatus {
+            state: "failed".into(),
+            text: format!("failed ({error}); remote access is off"),
+            label: Some("Remote off".into()),
+            head_seq: None,
+            pending_recovery: Vec::new(),
+            clients,
+        });
+    }
+    let m = m?;
+    let head_seq = Some(m.head().seq);
+    let pending: Vec<PendingRecoveryStatus> = m
+        .membership()
+        .pending_recovery(now)
+        .iter()
+        .map(|p| {
+            let p = atem_client::session::r9::PendingRecovery::of(p);
+            PendingRecoveryStatus {
+                subject: p.subject,
+                action: p.action,
+                effective_at: p.effective_at,
+            }
+        })
+        .collect();
+    let (state, text, label) = if m.is_frozen() {
+        (
+            "frozen",
+            format!("frozen (conflicting signed history); remote access is paused; {REPAIR}"),
+            Some("Remote frozen"),
+        )
+    } else if let Some(why) = m.faulted() {
+        (
+            "paused",
+            format!(
+                "paused (a device-list write failed: {why}); remote access stops until atem runtime restart"
+            ),
+            Some("Remote paused"),
+        )
+    } else if let Some(held) = m.held() {
+        let text = match held {
+            Held::IntentMismatch(_) => format!(
+                "held (the recorded device-list write doesn't match the list); remote access is off; {REPAIR}"
+            ),
+            _ => "held (a device-list write fault was recorded); remote access waits until a managing device (Astation on your Mac or phone) connects to reconcile".to_string(),
+        };
+        ("held", text, Some("Remote held"))
+    } else {
+        let n = match clients {
+            1 => "1 remote client".to_string(),
+            n => format!("{n} remote clients"),
+        };
+        (
+            "open",
+            format!("pinned at seq {} ({n})", m.head().seq),
+            (!pending.is_empty()).then_some("Recovery pending"),
+        )
+    };
+    Some(DeviceListStatus {
+        state: state.into(),
+        text,
+        label: label.map(str::to_string),
+        head_seq,
+        pending_recovery: pending,
+        clients,
+    })
 }
 
 fn app_link(app: &App) -> Option<u64> {

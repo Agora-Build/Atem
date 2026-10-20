@@ -1584,3 +1584,82 @@ fn backed_up_channels_share_the_link_equally() {
         );
     }
 }
+
+/// R9.10 with the PTY-write fence: a native phone holds the lease, its
+/// terminal input waits at the writer, and the Mac carries the phone's
+/// removal: the phone's attachment is fenced at once ("removed", then
+/// Atem's close), the Mac hears the lease revoked, and the queued bytes are
+/// dropped at the write boundary, never written.
+#[test]
+fn a_removed_phones_queued_terminal_input_is_dropped_at_the_write_boundary() {
+    use crate::session_protocol::fixtures::{HostEvent, HostUnderTest};
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("ch-phone", phone());
+    rig.advance(1000);
+    rig.connect(
+        "ch-mac",
+        Identity::native(r9log::MAC, r9log::auth(r9log::MAC)),
+    );
+    rig.list("ch-mac");
+    let read = rig.binding("ch-phone", SID);
+    rig.send(
+        "ch-phone",
+        &json!({"type": "session", "data": {"v": 1, "op": "acquire",
+            "id": "aaaaaaaa-0000-4000-8000-0000000000c1", "binding": read, "takeover": false}}),
+    );
+    assert_eq!(rig.rt.host.lease_epoch(SID), Some(1));
+    rig.send(
+        "ch-phone",
+        &json!({"type": "terminal", "data": {"v": 1, "op": "subscribe", "terminal_id": SID,
+            "generation": PGEN, "binding": read}}),
+    );
+    let stream = rig
+        .events("ch-phone")
+        .into_iter()
+        .find_map(|e| match e {
+            CEvent::Family(f) => f
+                .data
+                .filter(|d| d["op"] == "attached")
+                .map(|d| d["stream_id"].clone()),
+            _ => None,
+        })
+        .expect("subscribed");
+    let now = rig.rt.now();
+    rig.rt.event(&HostEvent::HoldPtyWrites, now).unwrap();
+    let mut lease = read.clone();
+    lease["lease_epoch"] = json!(1);
+    rig.send(
+        "ch-phone",
+        &json!({"type": "terminal", "data": {"v": 1, "op": "input", "terminal_id": SID,
+            "generation": PGEN, "stream_id": stream, "sequence": 0, "bytes": "eA==",
+            "binding": lease}}),
+    );
+    rig.events("ch-mac");
+    // The Mac carries the phone's removal.
+    let removal = rig.log.remove("dev-phone");
+    let mono = rig.now.host.mono_ms;
+    let entry = atem_client::SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+    let (_, frame) = rig
+        .attached("ch-mac")
+        .send_membership(&[entry], mono)
+        .unwrap();
+    rig.send_frame("ch-mac", &frame);
+    assert_eq!(
+        rig.refused("ch-phone"),
+        ("closed".into(), Some("closed".into()))
+    );
+    let events = rig.events("ch-mac");
+    assert!(
+        events.iter().any(|e| matches!(e, CEvent::Session(m)
+            if matches!(&m.op, R8Op::LeaseChanged { reason, .. }
+                if format!("{reason:?}").to_lowercase().contains("revoked")))),
+        "{events:?}"
+    );
+    let now = rig.rt.now();
+    rig.rt.event(&HostEvent::FlushPtyWrites, now).unwrap();
+    assert_eq!(rig.rt.counter("pty_writes_dropped").unwrap(), json!(1));
+    assert_eq!(rig.rt.counter("pty_writes_remote").unwrap(), json!(0));
+    assert_eq!(rig.rt.host.lease_holder(SID), None);
+    assert_eq!(rig.rt.host.control_gen("member:dev-phone"), 2);
+}
