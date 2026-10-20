@@ -8,7 +8,12 @@
 //! checks each step and prints a transcript. Never part of a release build
 //! (a test target).
 //!
-//! Run (Linux; a debug build):
+//! Limits: Linux only (the sandbox cleans up through `/proc`; on macOS
+//! the target compiles to nothing); the agent is the fake Claude Code only
+//! (no fake Codex yet); the flow is fixed, with no entry point for
+//! Astation's own router or relay (the fake Astation plays both).
+//!
+//! Run (Linux; debug or release build):
 //!
 //! ```text
 //! cargo test --test r9_harness -- --nocapture

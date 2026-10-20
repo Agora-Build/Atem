@@ -91,7 +91,7 @@ const NO_CEREMONY: &str = "re-pairing needs Astation's signed deviceVerified (th
 const CLIENT_SIDE: &str =
     "the client's side of the handshake (atem-client's channel_fixtures, on the vectors)";
 const VECTOR_BYTES: &str = "the vector's exact bytes (fixed ephemeral keys and nonces: atem-client's channel_fixtures); here the same step runs on a live handshake";
-const STALL: &str = "Atem's link is a real WebSocket: a peer that stops reading leaves up to tcp_wmem + tcp_rmem (4 MiB + 6 MiB here) in kernel buffers before Atem's own queue holds anything, so 'queued output passes 4 MiB' can't be produced at a known step; the per-channel 4 MiB bound runs on the engine (r9::fixtures_tests::the_envelope_fixtures_pass_on_the_engine)";
+const STALL: &str = "not expressed without a hook that stalls Atem's link writer: the link is a real WebSocket, and a peer that stops reading leaves up to tcp_wmem + tcp_rmem (4 MiB + 6 MiB here) in kernel buffers before Atem's own queue holds anything, so 'queued output passes 4 MiB' can't be produced from outside at a known step; the per-channel 4 MiB bound runs on the engine (r9::fixtures_tests::the_envelope_fixtures_pass_on_the_engine)";
 const OUTSIDE_LOG: &str = "host-b's add_host is outside the vectors (the fixture's note): the real runtime opens that device list but refuses every r9 channel to a host its list doesn't name (host_channel_key isn't the key the device list names for host-b), and an add_host signed for it with the vectors' dev-mac key would take seq 6, which E6 and S6_phone need; so its chain side runs on the real runtime B as its own relay fetch (ATEM_TEST_MEMBERSHIP_FAULTS/carry.json, §R9.3: no more trust than any carrier) and is checked on its state, while the welcome or fence a channel would carry can't be";
 
 /// Why a whole file can't run against the real runtime, if it can't: it
@@ -775,6 +775,8 @@ struct Runner {
     stall: Stall,
     /// Clients admitted on a host outside the vectors' log, by host.
     outside: BTreeMap<String, String>,
+    /// A client's next `expect` is about its admission on that host.
+    outside_expect: BTreeMap<String, String>,
 }
 
 /// `stall_link` (not expressible, `STALL`): the steps up to the first
@@ -1387,20 +1389,39 @@ impl Runner {
             format!("{client}'s channel to host {}", self.current),
             OUTSIDE_LOG,
         );
+        // No reply is made up: the `expect` that follows checks what B's
+        // state can show (its head) and lists the rest not expressible.
         let host_name = self.current.clone();
-        // What the welcome's head would say, or the refusal: noted for the
-        // `expect` that follows (checked against the runtime's own state).
-        let state = self.host().state();
-        let m = &state["membership"];
-        let reply = if m["frozen"] == true {
-            json!({"op": "error", "code": "account_frozen", "__outside_log": true})
-        } else {
-            self.outside.insert(client.to_owned(), host_name);
-            json!({"op": "welcome", "principal": self.clients[client].principal,
-                   "head": m["head"], "__outside_log": true})
-        };
-        self.deliver(client, reply);
+        if self.host().state()["membership"]["frozen"] != true {
+            self.outside.insert(client.to_owned(), host_name.clone());
+        }
+        self.outside_expect.insert(client.to_owned(), host_name);
         self.pass();
+    }
+
+    /// The `expect` right after an admission on a host outside the log:
+    /// a welcome's `head` is checked against that host's real state; every
+    /// other field, and a refusal, is not expressible (no channel carries
+    /// it; a freeze is checked by the scenario's own `frozen` assert).
+    fn expect_outside(&mut self, client: &str, host: &str, want: &Value) {
+        let state = self.hosts[host].state();
+        let head = &state["membership"]["head"];
+        let mut checked = false;
+        for (key, value) in want.as_object().unwrap() {
+            let real = match key.as_str() {
+                "head.seq" if want["op"] == "welcome" => &head["seq"],
+                "head.hash" if want["op"] == "welcome" => &head["hash"],
+                _ => {
+                    self.later(format!("{client}: {key} on host {host}"), OUTSIDE_LOG);
+                    continue;
+                }
+            };
+            assert_eq!(real, value, "{}: host {host}'s {key}", self.name);
+            checked = true;
+        }
+        if checked {
+            self.pass();
+        }
     }
 
     /// A crash armed by `crash_after_membership_commit` happened in the
@@ -1467,9 +1488,12 @@ impl Runner {
 
     fn expect(&mut self, client: &str, want: &Value, kind: Option<&str>, capture: Option<&Value>) {
         let want = self.resolve(want);
+        if let Some(host) = self.outside_expect.remove(client) {
+            return self.expect_outside(client, &host, &want);
+        }
         let op = want.get("op").and_then(Value::as_str);
         let picks = |m: &Value| {
-            kind.is_none_or(|t| m["__type"] == t || m.get("__outside_log").is_some())
+            kind.is_none_or(|t| m["__type"] == t)
                 && op.is_none_or(|op| m.get("op").and_then(Value::as_str) == Some(op))
                 && ["code", "detail", "reason", "state", "re"].iter().all(|k| {
                     want.get(*k)
@@ -1513,11 +1537,9 @@ impl Runner {
             self.host().pump(Duration::from_millis(50));
         };
         let got = self.inbox.get_mut(client).unwrap().remove(i);
-        let outside = got.get("__outside_log").is_some();
         for (key, value) in want.as_object().unwrap() {
             match get_path(&got, key) {
                 Some(g) => assert_eq!(&g, value, "{}: {client} {key} in {got}", self.name),
-                None if outside => self.later(format!("{client}: welcome {key}"), OUTSIDE_LOG),
                 None => panic!("{}: {client}: {key} not produced in {got}", self.name),
             }
         }
@@ -1665,6 +1687,19 @@ impl Runner {
             self.current = name.as_str().unwrap().to_owned();
         }
         let assert = self.resolve(assert);
+        // A barrier: the dump read must come from a pass after this step
+        // began (one from before it could show a state about to change).
+        let pass_of = |rt: &Rt| rt.state()["pass"].as_u64().unwrap_or(0);
+        let start = pass_of(self.host());
+        let deadline = Instant::now() + WAIT;
+        while pass_of(self.host()) < start + 2 {
+            assert!(
+                Instant::now() < deadline,
+                "{}: the runtime's state dump stopped",
+                self.name
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let deadline = Instant::now() + SETTLE_STATE;
         loop {
             self.drain();
@@ -1755,6 +1790,9 @@ impl Runner {
                 }
                 "control_gen" => {
                     for (p, n) in want.as_object().unwrap() {
+                        // The dump names every principal the session host
+                        // has a control state for; one it never saw has
+                        // `control_gen` 1 (`SessionHost::control_gen`).
                         let got = m["control_gen"].get(p).cloned().unwrap_or(json!(1));
                         if got != *n {
                             errors.push(format!("control_gen {p}: {got} != {n}"));
@@ -2830,6 +2868,7 @@ pub fn run(scenario: &Value) -> Result<Outcome, String> {
             harness_ids: BTreeSet::new(),
             stall: Stall::None,
             outside: BTreeMap::new(),
+            outside_expect: BTreeMap::new(),
         };
         let steps = scenario["steps"].as_array().unwrap().clone();
         let message = |e: Box<dyn std::any::Any + Send>| {

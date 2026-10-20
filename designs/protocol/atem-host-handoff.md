@@ -523,10 +523,11 @@ every one of the 75 `r9-*` files. Each host scenario runs against the
   answers, and the `written` acks.
 
 **Result: 48 host scenarios run against the real runtime and all 48 pass
-(715 items checked); 21 items of them can't be expressed there (below);
+(714 items checked); 25 items of them can't be expressed there (below);
 the 27 other files have no host side.** A changed expectation fails the
-run (`r9_changed_expectations_fail_against_the_real_runtime`: seven
-mutations, each fails).
+run at the changed step (`r9_changed_expectations_fail_against_the_real_runtime`:
+seven mutations). Each assert reads a state dump from a pass after the
+step began.
 
 Items not expressible against real processes (each printed by the run):
 
@@ -534,8 +535,8 @@ Items not expressible against real processes (each printed by the run):
 |---|---|---|
 | `r9-handshake-success`, `-replay`, `-tampered-transcript` | the vector's exact record bytes, `channel_id` value, fixed `e_h`/`n_h`; the client's side | the vectors use fixed ephemeral keys and nonces: atem-client's `channel_fixtures` checks the bytes; here every step runs on a live handshake |
 | `r9-chain-conflict-by-a-current-manager-freezes` | `pair` refused `frozen genesis` | re-pairing needs Astation's signed `deviceVerified` (the §R9.2 ceremony, Touch ID); the refusal runs on the real store in the in-process host runner; the `frozen_genesis` file this runtime wrote is checked |
-| `r9-envelope-bounds` | `stall_link`, `fill_queue`, the `busy` close after it, `unstall_link`, the assert after | Atem's link is a real WebSocket: a peer that stops reading leaves up to `tcp_wmem` + `tcp_rmem` (4 + 6 MiB here) in kernel buffers before Atem queues anything, so "queued output passes 4 MiB" can't be produced at a known step; the bound runs on the engine (`r9::fixtures_tests`) |
-| `r9-chain-relay-cas-failure-freezes-both-hosts` | host B's welcome fields and the fence of the phone's admission there | host-b's `add_host` is outside the vectors (the fixture's note): the real runtime refuses every r9 channel to a host its list doesn't name, and an `add_host` signed with the vectors' dev-mac key would take seq 6 (E6's and S6_phone's). Host B is a second real runtime on its own profile: the carriages reach it as its own relay fetch (`carry.json`, §R9.3), and its head and freeze are checked on its state |
+| `r9-envelope-bounds` | `stall_link`, `fill_queue`, the `busy` close after it, `unstall_link`, the assert after | not expressed without a hook that stalls Atem's link writer: the link is a real WebSocket, and a peer that stops reading leaves up to `tcp_wmem` + `tcp_rmem` (4 + 6 MiB here) in kernel buffers before Atem queues anything, so "queued output passes 4 MiB" can't be produced from outside at a known step; the bound runs on the engine (`r9::fixtures_tests`) |
+| `r9-chain-relay-cas-failure-freezes-both-hosts` | the two channels to host B; the phone's welcome there (`op`, `principal`, `revision`, `client_kind`, `permissions`); the mac's `account_frozen` there (`op`, `code`); the fence of the phone's admission there | host-b's `add_host` is outside the vectors (the fixture's note): the real runtime refuses every r9 channel to a host its list doesn't name, and an `add_host` signed with the vectors' dev-mac key would take seq 6 (E6's and S6_phone's). Host B is a second real runtime on its own profile: the carriages reach it as its own relay fetch (`carry.json`, §R9.3); what is checked there is its real state only: the welcome's `head` against B's head after S6_phone, and B's freeze by the scenario's `frozen` assert. No reply is made up for a channel that can't exist |
 
 | files | why they have no host side |
 |---|---|
@@ -545,8 +546,8 @@ Items not expressible against real processes (each printed by the run):
 
 Found by this run and fixed (not fixture changes):
 - the link's r8 attachment, never welcomed on an r9 host, dropped the whole
-  link at 24 h, closing every r9 channel daily: only a welcomed attachment's
-  authorization ends the link now;
+  link at 24 h, closing every r9 channel daily: a host that refuses r8
+  keeps its link now (an r8 host's link ends at 24 h as before);
 - the 100 ms pass (recovery waits, service expiry, push resends) also runs
   when the host clock moved, not only the session clock.
 
@@ -558,7 +559,9 @@ turn's end (a bot's `lease_held`), an approval with sealed push hints
 verified and opened per device, a `seen` (`push_seen` verified; a view-only
 browser's refused) and a lease-free answer with its resolved hint. It
 prints a transcript; `ATEM_HARNESS_OUT=<file>` writes it as JSON lines.
-Test target only, never in a release build.
+Test target only, never in a release build. Limits: Linux only, the fake
+Claude only (no fake Codex), a fixed flow with no entry point for
+Astation's own router or relay.
 
 ## Approvals (r7 §6a, on `feat/approvals`)
 

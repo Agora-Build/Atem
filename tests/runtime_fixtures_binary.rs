@@ -2345,12 +2345,14 @@ fn r9_changed_expectations_fail_against_the_real_runtime() {
     let files = r9_files();
     let named = |name: &str| files.iter().find(|s| s["name"] == name).unwrap().clone();
     let step_with = |s: &mut Value, pick: &dyn Fn(&Value) -> bool| -> usize {
-        s["steps"]
+        let i = s["steps"]
             .as_array()
             .unwrap()
             .iter()
             .position(pick)
-            .unwrap()
+            .unwrap();
+        s["mutated_step"] = json!(i);
+        i
     };
     let mut cases = Vec::new();
     let mut s = named("r9-multi-device-mac-and-phone-online");
@@ -2396,7 +2398,9 @@ fn r9_changed_expectations_fail_against_the_real_runtime() {
         for (name, h) in handles {
             let result = h.join().unwrap_or_else(|_| Err("panicked".into()));
             let error = result.expect_err(name);
-            assert!(error.contains("step "), "{name}: {error}");
+            let i = cases.iter().find(|c| c["name"] == name).unwrap()["mutated_step"].clone();
+            // The mutated step itself fails (not a flaky or unrelated one).
+            assert!(error.starts_with(&format!("step {i} ")), "{name}: {error}");
         }
     });
 }

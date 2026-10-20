@@ -1401,7 +1401,8 @@ impl HostBridge {
     }
 
     /// Debug builds (`ATEM_TEST_STATE_DUMP`): the state the r9 fixtures
-    /// assert, written after each pass when it changed (`tests/r9_runner`).
+    /// assert, written after each pass with the pass number
+    /// (`tests/r9_runner`).
     #[cfg(debug_assertions)]
     fn dump_state(&mut self) {
         use serde_json::json;
@@ -1479,11 +1480,13 @@ impl HostBridge {
                     "blob_version": k.blob_version, "backup_hash": k.backup_hash.to_hex()})),
             });
         }
+        // The pass number: a reader can wait for a pass after its own
+        // action (a dump from before it can't satisfy an assert).
+        static PASS: AtomicU64 = AtomicU64::new(0);
+        state["pass"] = json!(PASS.fetch_add(1, Ordering::SeqCst) + 1);
         let text = state.to_string();
         let tmp = file.with_extension("tmp");
-        if std::fs::read_to_string(&file).ok().as_deref() != Some(text.as_str())
-            && std::fs::write(&tmp, &text).is_ok()
-        {
+        if std::fs::write(&tmp, &text).is_ok() {
             let _ = std::fs::rename(&tmp, &file);
         }
     }

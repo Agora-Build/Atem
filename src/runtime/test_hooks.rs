@@ -57,8 +57,8 @@
 //!   their session).
 //! - `ATEM_TEST_STATE_DUMP=<file>`: after each pass the broker writes the
 //!   state the fixtures assert (device list, leases, receipts, control
-//!   generations, channels) to `<file>` (JSON, replaced atomically, only
-//!   when it changed).
+//!   generations, channels, and the pass number) to `<file>` (JSON,
+//!   replaced atomically).
 
 #[cfg(debug_assertions)]
 mod imp {
