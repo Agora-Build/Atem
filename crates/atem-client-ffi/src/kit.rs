@@ -12,10 +12,10 @@ use atem_client::restore::{Enrollment, RestoreFlow};
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
-use crate::encoding::hash_of;
+use crate::encoding::{hash_of, safe_int};
 use crate::error::{AtemError, Result};
 use crate::log::{MembershipLog, entries_of};
-use crate::publish::{append_request, conflict_reply, prepared_json};
+use crate::publish::{append_request, conflict_reply, prepared_from_json, prepared_json};
 use crate::types::{
     AccountKey, AppendRequest, EnrollmentOutcome, HostAcceptPair, HostClock, KBackupInfo, LogHead,
     PublicKeyData, RestoredInfo,
@@ -44,6 +44,13 @@ pub struct RecoveryKitHandle {
 impl RecoveryKitHandle {
     pub(crate) fn kit(&self) -> MutexGuard<'_, RecoveryKit> {
         self.kit.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A copy of the kit for one signing, so no lock of this handle is held
+    /// while it is used.
+    pub(crate) fn fresh(&self) -> RecoveryKit {
+        let kit = self.kit();
+        RecoveryKit::make(&self.r, kit.account_id(), kit.genesis_hash())
     }
 
     fn wrap(r: Zeroizing<[u8; 32]>, kit: RecoveryKit) -> Arc<Self> {
@@ -181,7 +188,7 @@ pub fn seal_k_backup(
     let envelope = KBackupEnvelope::seal(
         &account_id,
         hash_of(&genesis_hash)?,
-        blob_version,
+        safe_int(blob_version, "blob_version")?,
         &recovery_key.to_key()?,
         &keys,
     )?;
@@ -275,6 +282,36 @@ impl RestoreSession {
         }))
     }
 
+    /// After a restart with an enrollment in flight: the kit read again and
+    /// the persisted `prepared_json()` (trusted local storage; read
+    /// strictly and checked again). Run `attempt` again with a new fetch,
+    /// then resend `outstanding()` and feed the relay's answer to
+    /// `append_stored` / `append_conflict`; `enroll` refuses a new body while
+    /// this one is outstanding.
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn resume(
+        r: Vec<u8>,
+        account_id: String,
+        genesis_hash: String,
+        kit_tag: Vec<u8>,
+        prepared_json: String,
+    ) -> Result<Arc<Self>> {
+        let r = r32(&Zeroizing::new(r))?;
+        let kit = RecoveryKit::read(&r, &account_id, hash_of(&genesis_hash)?, &tag16(&kit_tag)?)?;
+        let prepared = prepared_from_json(&prepared_json)?;
+        Ok(Arc::new(RestoreSession {
+            inner: Mutex::new(RestoreFlow::resume(kit, prepared)),
+        }))
+    }
+
+    /// The signed `recovery_add` to send (and resend after an uncertain
+    /// outcome).
+    pub fn outstanding(&self) -> Option<AppendRequest> {
+        self.lock()
+            .outstanding()
+            .map(|(entry, head)| append_request(entry, head))
+    }
+
     /// Steps 2–5 over what was fetched. Secret output (`keys`).
     pub fn attempt(
         &self,
@@ -343,6 +380,7 @@ impl RestoreSession {
     pub fn enroll(&self, member_json: String, signed_at: u64) -> Result<AppendRequest> {
         let log = self.log().ok_or_else(|| AtemError::state("not restored"))?;
         let member = log.parse_member(&member_json)?;
+        let signed_at = safe_int(signed_at, "signed_at")?;
         let (entry, head) = self.lock().enroll(member, signed_at)?;
         Ok(append_request(&entry, head))
     }

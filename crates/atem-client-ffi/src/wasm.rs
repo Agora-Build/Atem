@@ -388,6 +388,7 @@ impl MembershipLog {
     }
     /// Host role: the membership side of admitting `deviceId` after its
     /// carriage (commits the evaluation).
+    #[cfg(feature = "host")]
     #[wasm_bindgen(js_name = admitCarrier)]
     pub fn admit_carrier(
         &self,
@@ -536,6 +537,26 @@ impl RestoreSession {
         ok(self
             .0
             .attempt(relay_entries, envelope_json, pairs, clock(now)?))
+    }
+    /// After a restart with an enrollment in flight (its `preparedJson()`).
+    pub fn resume(
+        r: Vec<u8>,
+        account_id: String,
+        genesis_hash: String,
+        kit_tag: Vec<u8>,
+        prepared_json: String,
+    ) -> JsResult<RestoreSession> {
+        Ok(RestoreSession(err(crate::kit::RestoreSession::resume(
+            r,
+            account_id,
+            genesis_hash,
+            kit_tag,
+            prepared_json,
+        ))?))
+    }
+    /// The signed `recovery_add` to (re)send.
+    pub fn outstanding(&self) -> JsResult<JsValue> {
+        to_js(&self.0.outstanding())
     }
     pub fn log(&self) -> Option<MembershipLog> {
         self.0.log().map(MembershipLog)
@@ -810,16 +831,10 @@ impl ClientConnection {
         ok(self.0.on_accept_deferred(frame, log.0.clone(), ms(now_ms)?))
     }
     #[wasm_bindgen(js_name = finishWithSignature)]
-    pub fn finish_with_signature(
-        &self,
-        alg_name: &str,
-        public_raw: Vec<u8>,
-        signature: Vec<u8>,
-        now_ms: f64,
-    ) -> JsResult<Vec<u8>> {
-        err(self
-            .0
-            .finish_with_signature(key(alg_name, public_raw)?, signature, ms(now_ms)?))
+    /// The WebCrypto signature (`r‖s`) over the request's `input`; it must
+    /// verify with the identity's own key (the grant's `browser_key`).
+    pub fn finish_with_signature(&self, signature: Vec<u8>, now_ms: f64) -> JsResult<Vec<u8>> {
+        err(self.0.finish_with_signature(signature, ms(now_ms)?))
     }
     #[cfg(feature = "software-keys")]
     #[wasm_bindgen(js_name = onAccept)]
@@ -1163,6 +1178,17 @@ impl KBackupWriter {
             signer,
         ))?))
     }
+    /// A writer resumed from its persisted `preparedJson()`.
+    pub fn resume(saved_json: String) -> JsResult<KBackupWriter> {
+        Ok(KBackupWriter(err(crate::publish::KBackupWriter::resume(
+            saved_json,
+        ))?))
+    }
+    /// The durable state: persist it after every call, before the step.
+    #[wasm_bindgen(js_name = preparedJson)]
+    pub fn prepared_json(&self) -> Option<String> {
+        self.0.prepared_json()
+    }
     pub fn step(&self) -> JsResult<JsValue> {
         to_js(&self.0.step())
     }
@@ -1176,12 +1202,12 @@ impl KBackupWriter {
     }
     #[cfg(feature = "software-keys")]
     pub fn sign(&self, store: &SoftwareKeyStore, key_id: String) -> JsResult<JsValue> {
-        to_js(&self.0.sign_with(&*store.0, &key_id))
+        ok(self.0.sign_with(&*store.0, &key_id))
     }
     #[wasm_bindgen(js_name = putReply)]
     pub fn put_reply(&self, log: &MembershipLog, max_occupied: Option<f64>) -> JsResult<JsValue> {
         let max = max_occupied.map(ms).transpose()?;
-        to_js(&self.0.put_reply(log.0.clone(), max))
+        ok(self.0.put_reply(log.0.clone(), max))
     }
     #[wasm_bindgen(js_name = appendStored)]
     pub fn append_stored(
@@ -1190,11 +1216,9 @@ impl KBackupWriter {
         now: JsValue,
         signed_at: f64,
     ) -> JsResult<JsValue> {
-        to_js(
-            &self
-                .0
-                .append_stored(log.0.clone(), clock(now)?, ms(signed_at)?),
-        )
+        ok(self
+            .0
+            .append_stored(log.0.clone(), clock(now)?, ms(signed_at)?))
     }
     #[wasm_bindgen(js_name = appendConflict)]
     pub fn append_conflict(
@@ -1228,7 +1252,7 @@ impl KBackupWriter {
             .fetched(log.0.clone(), entries, more, clock(now)?, ms(signed_at)?))
     }
     pub fn restart(&self) -> JsResult<JsValue> {
-        to_js(&self.0.restart())
+        ok(self.0.restart())
     }
 }
 
@@ -1266,7 +1290,7 @@ pub fn issue_browser_grant(
 }
 
 /// Host role: a seen signed with `host_channel_key` from a software store.
-#[cfg(feature = "software-keys")]
+#[cfg(all(feature = "software-keys", feature = "host"))]
 #[wasm_bindgen(js_name = signSeen)]
 pub fn sign_seen(
     store: &SoftwareKeyStore,

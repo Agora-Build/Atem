@@ -174,11 +174,15 @@ check("draft + publish reproduces E7 byte for byte (RFC 6979)", () => {
   eq(req.entryHash, byLabel.E7.entry_hash);
   eq(req.expected, head(mlog.head));
   eq(m.canonicalJson(req.entryJson), m.canonicalJson(entry("E7")));
-  const resumed = m.EntryPublisher.resume(p.preparedJson());
+  // A restart: the saved state resumes (one append per device, so the old
+  // object goes first).
+  const saved = p.preparedJson();
+  p.free();
+  const resumed = m.EntryPublisher.resume(saved);
   eq(resumed.outstanding().entryHash, byLabel.E7.entry_hash);
-  eq(p.replyStored(log, NOW), { type: "committed", head: { seq: 7, hash: byLabel.E7.entry_hash } });
+  eq(resumed.replyStored(log, NOW), { type: "committed", head: { seq: 7, hash: byLabel.E7.entry_hash } });
   eq(log.head().seq, 7);
-  eq(p.preparedJson(), undefined);
+  eq(resumed.preparedJson(), undefined);
 });
 check("a draft the verifier would refuse is refused before signing", () => {
   throwsCode(() => logL().draftEntry("dev-phone", 1, str({ action: "remove" })), "membership_invalid");

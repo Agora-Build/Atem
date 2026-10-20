@@ -33,7 +33,7 @@ TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
 OUT=$TARGET/atem-client-bindings
 FIXTURES=$ROOT/designs/protocol/fixtures
 BINDINGS=$ROOT/crates/atem-client-ffi/bindings
-FEATURES=software-keys,test-vectors
+FEATURES=software-keys,test-vectors,host
 JAVA=${JAVA:-java}
 NODE=${NODE:-node}
 case "$(uname)" in

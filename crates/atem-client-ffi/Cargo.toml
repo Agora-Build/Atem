@@ -28,6 +28,9 @@ wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde", "dep:serde-wasm-bindgen",
 # An in-memory key store for bots (keys loaded from their own secret store)
 # and for the conformance tests. Never in the packaged app artifacts.
 software-keys = ["atem-client/software-keys"]
+# Host-role functions (sign_seen, admit_carrier): for the conformance and
+# host-side tests; never in an app build.
+host = []
 # Deterministic HPKE re-seals and raw primitive verification, for the
 # known-answer vectors only. Never in the packaged app artifacts.
 test-vectors = ["atem-client/test-vectors", "software-keys"]

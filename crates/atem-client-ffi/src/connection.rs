@@ -21,23 +21,31 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use atem_client::SignedObject;
+use atem_client::channel::Principal;
 use atem_client::connect::{
     Attached, AwaitWelcome, Connecting, Connector, Event, Identity, NextStep as CoreNextStep,
     PendingSignature,
 };
+use atem_client::domain::SigningInput;
+use atem_client::keys::PublicKey;
+use atem_client::membership::Membership;
+use atem_client::principal::BrowserGrant;
 use atem_client::provider::{KeyId, KeyProvider};
 use atem_client::session::r9::{PendingRecovery, SessionError, Welcome};
 use atem_client::session::wire::{self, Envelope, ReceiptKind};
 use serde_json::{Value, json};
 
-use crate::encoding::{canonical, not_attached, signed, strict};
+use crate::encoding::{canonical_lossy, not_attached, signed, strict};
+
+fn moved() -> AtemError {
+    AtemError::state("the connection changed while the provider was signing")
+}
 use crate::error::{AtemError, Result};
 use crate::log::{MembershipLog, objects_of};
 use crate::provider::sign_request;
 use crate::types::{
     ApprovalChoice, ClientEvent, ClientIdentity, ConnectionState, LeaseInfo, LogHead, NextStep,
-    Outgoing, PendingRecoveryInfo, PrincipalKind, PublicKeyData, SessionInfo, SignRequest,
-    WelcomeInfo,
+    Outgoing, PendingRecoveryInfo, PrincipalKind, SessionInfo, SignRequest, WelcomeInfo,
 };
 
 impl From<&CoreNextStep> for NextStep {
@@ -87,8 +95,8 @@ fn welcome_info(w: &Welcome) -> WelcomeInfo {
         head: w.head.into(),
         pending_recovery: w.pending_recovery.iter().map(pending_info).collect(),
         channel_id: w.channel_id.clone(),
-        scope_json: w.scope.as_ref().map(|s| canonical(&s.to_json())),
-        json: canonical(&w.to_json()),
+        scope_json: w.scope.as_ref().map(|s| canonical_lossy(&s.to_json())),
+        json: canonical_lossy(&w.to_json()),
     }
 }
 
@@ -110,7 +118,7 @@ fn snake(debug: &str) -> String {
 }
 
 fn error_event(e: &SessionError, fenced: bool) -> ClientEvent {
-    let json = canonical(&e.to_json());
+    let json = canonical_lossy(&e.to_json());
     if fenced {
         ClientEvent::Fenced {
             code: e.code.clone(),
@@ -135,7 +143,7 @@ fn event_info(event: Event) -> ClientEvent {
                 op: value["data"]["op"].as_str().unwrap_or_default().into(),
                 id: msg.id,
                 re: msg.re,
-                json: canonical(&value),
+                json: canonical_lossy(&value),
             }
         }
         Event::Registry(outcome) => ClientEvent::Registry {
@@ -158,7 +166,7 @@ fn event_info(event: Event) -> ClientEvent {
             ClientEvent::Family {
                 family: name,
                 op,
-                json: canonical(&wire::to_value(&Envelope::Family(family))),
+                json: canonical_lossy(&wire::to_value(&Envelope::Family(family))),
             }
         }
         Event::Outgoing(frame) => ClientEvent::Outgoing { frame },
@@ -178,10 +186,20 @@ fn event_info(event: Event) -> ClientEvent {
     }
 }
 
+/// `sig_c` asked for: the pending handshake, the key that must have signed
+/// (from the verified log, or the browser grant), and a token so a
+/// signature made without the lock lands only on the handshake it was made
+/// for.
+struct Signing {
+    pending: PendingSignature,
+    expected: PublicKey,
+    token: u64,
+}
+
 enum Phase {
     New,
     AwaitAccept(Box<Connecting>),
-    AwaitSignature(Box<PendingSignature>),
+    AwaitSignature(Box<Signing>),
     AwaitWelcome(Box<AwaitWelcome>),
     Attached(Box<Attached>),
     Closed,
@@ -192,6 +210,25 @@ struct Inner {
     host_id: String,
     identity: Identity,
     need_before: Option<u64>,
+    next_token: u64,
+}
+
+/// The key `sig_c` must verify with: a browser grant's `browser_key`, or the
+/// member's `auth_key` in the client's own verified log.
+fn expected_key(identity: &Identity, log: &Membership) -> Result<PublicKey> {
+    match &identity.principal {
+        Principal::Browser { .. } => {
+            let grant = identity
+                .grant
+                .clone()
+                .ok_or_else(|| AtemError::malformed("a browser identity carries its grant"))?;
+            Ok(BrowserGrant::parse(grant)?.browser_key)
+        }
+        Principal::Native { device_id } | Principal::Service { device_id } => log
+            .member(device_id)
+            .map(|m| m.member.auth_key.clone())
+            .ok_or_else(|| AtemError::request("this device is not in the verified log")),
+    }
 }
 
 impl Inner {
@@ -263,6 +300,65 @@ impl ClientConnection {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Verifies `accept` and plans the carriage under the locks, then leaves
+    /// the handshake waiting for `sig_c`: returns what to sign, by which
+    /// key, and the token of this wait. No lock is held on return.
+    fn accept_unsigned(
+        &self,
+        frame: &[u8],
+        log: &MembershipLog,
+        now_ms: u64,
+    ) -> Result<(SigningInput, KeyId, u64)> {
+        let mut inner = self.lock();
+        if !matches!(inner.phase, Phase::AwaitAccept(_)) {
+            return Err(AtemError::state("not waiting for accept"));
+        }
+        let identity = inner.identity.clone();
+        let log = log.lock();
+        let expected = expected_key(&identity, &log)?;
+        let Phase::AwaitAccept(connecting) = inner.take() else {
+            unreachable!("checked above");
+        };
+        let r = connecting.on_accept_unsigned(frame, &log, &identity, now_ms);
+        drop(log);
+        let pending = inner.on_err(r)?;
+        inner.next_token += 1;
+        let token = inner.next_token;
+        let input = pending.signing_input().clone();
+        let key = pending.key().clone();
+        inner.phase = Phase::AwaitSignature(Box::new(Signing {
+            pending,
+            expected,
+            token,
+        }));
+        Ok((input, key, token))
+    }
+
+    /// Builds the `finish` around `sig`: verified with the expected key.
+    /// `token`: the wait the signature was made for (the provider path);
+    /// `None` for the app's deferred signature.
+    fn finish_signed(&self, sig: &[u8], token: Option<u64>, now_ms: u64) -> Result<Vec<u8>> {
+        let mut inner = self.lock();
+        match (&inner.phase, token) {
+            (Phase::AwaitSignature(s), Some(t)) if s.token != t => return Err(moved()),
+            (Phase::AwaitSignature(_), _) => {}
+            (_, Some(_)) => return Err(moved()),
+            (_, None) => return Err(AtemError::state("no signature pending")),
+        }
+        let Phase::AwaitSignature(signing) = inner.take() else {
+            unreachable!("checked above");
+        };
+        let Signing {
+            pending, expected, ..
+        } = *signing;
+        let r = pending.finish(&expected, sig, now_ms);
+        let (await_welcome, finish) = inner.on_err(r)?;
+        inner.phase = Phase::AwaitWelcome(Box::new(await_welcome));
+        Ok(finish)
+    }
+
+    /// `on_accept` with the provider: no binding lock (this connection's or
+    /// the log's) is held while the provider signs.
     pub(crate) fn on_accept_with(
         &self,
         frame: &[u8],
@@ -270,18 +366,19 @@ impl ClientConnection {
         provider: &dyn KeyProvider,
         now_ms: u64,
     ) -> Result<Vec<u8>> {
-        let mut inner = self.lock();
-        if !matches!(inner.phase, Phase::AwaitAccept(_)) {
-            return Err(AtemError::state("not waiting for accept"));
-        }
-        let Phase::AwaitAccept(connecting) = inner.take() else {
-            unreachable!("checked above");
+        let (input, key, token) = self.accept_unsigned(frame, log, now_ms)?;
+        let sig = match atem_client::provider::sign(provider, &key, &input) {
+            Ok(sig) => sig,
+            Err(e) => {
+                // A cancelled confirmation ends this handshake: nothing sent.
+                let mut inner = self.lock();
+                if matches!(&inner.phase, Phase::AwaitSignature(s) if s.token == token) {
+                    inner.phase = Phase::Closed;
+                }
+                return Err(atem_client::channel::ChannelError::Signing(e).into());
+            }
         };
-        let identity = inner.identity.clone();
-        let r = connecting.on_accept(frame, &log.lock(), provider, &identity, now_ms);
-        let (await_welcome, finish) = inner.on_err(r)?;
-        inner.phase = Phase::AwaitWelcome(Box::new(await_welcome));
-        Ok(finish)
+        self.finish_signed(&sig, Some(token), now_ms)
     }
 
     fn request(
@@ -352,6 +449,7 @@ impl ClientConnection {
                 host_id,
                 identity: identity_of(&identity)?,
                 need_before,
+                next_token: 0,
             }),
         }))
     }
@@ -404,41 +502,16 @@ impl ClientConnection {
         log: Arc<MembershipLog>,
         now_ms: u64,
     ) -> Result<SignRequest> {
-        let mut inner = self.lock();
-        if !matches!(inner.phase, Phase::AwaitAccept(_)) {
-            return Err(AtemError::state("not waiting for accept"));
-        }
-        let Phase::AwaitAccept(connecting) = inner.take() else {
-            unreachable!("checked above");
-        };
-        let identity = inner.identity.clone();
-        let r = connecting.on_accept_unsigned(&frame, &log.lock(), &identity, now_ms);
-        let pending = inner.on_err(r)?;
-        let request = sign_request(pending.key(), pending.signing_input());
-        inner.phase = Phase::AwaitSignature(Box::new(pending));
-        Ok(request)
+        let (input, key, _) = self.accept_unsigned(&frame, &log, now_ms)?;
+        Ok(sign_request(&key, &input))
     }
 
-    /// The signature for `on_accept_deferred`'s request, by the identity's
-    /// key (`public_key`): verified before use. Returns the `finish` frame.
-    pub fn finish_with_signature(
-        &self,
-        public_key: PublicKeyData,
-        signature: Vec<u8>,
-        now_ms: u64,
-    ) -> Result<Vec<u8>> {
-        let mut inner = self.lock();
-        if !matches!(inner.phase, Phase::AwaitSignature(_)) {
-            return Err(AtemError::state("no signature pending"));
-        }
-        let public = public_key.to_key()?;
-        let Phase::AwaitSignature(pending) = inner.take() else {
-            unreachable!("checked above");
-        };
-        let r = pending.finish(&public, &signature, now_ms);
-        let (await_welcome, finish) = inner.on_err(r)?;
-        inner.phase = Phase::AwaitWelcome(Box::new(await_welcome));
-        Ok(finish)
+    /// The signature for `on_accept_deferred`'s request. It must verify with
+    /// the identity's own key (the member's `auth_key` in the verified log,
+    /// or the grant's `browser_key`); P-256 may be either S. Returns the
+    /// `finish` frame.
+    pub fn finish_with_signature(&self, signature: Vec<u8>, now_ms: u64) -> Result<Vec<u8>> {
+        self.finish_signed(&signature, None, now_ms)
     }
 
     /// The host's first record: the welcome (checked against what this
@@ -541,7 +614,7 @@ impl ClientConnection {
                     controller_session: d.controller.as_ref().map(|c| c.controller_session.clone()),
                     lease_epoch: d.controller.as_ref().map(|c| c.lease_epoch),
                     capabilities: d.capabilities.clone(),
-                    json: canonical(&value),
+                    json: canonical_lossy(&value),
                 }
             })
             .collect()
@@ -573,7 +646,7 @@ impl ClientConnection {
         };
         Self::binding_value(a, &session_id, mutation, now_ms)
             .ok()
-            .map(|b| canonical(&b))
+            .map(|b| canonical_lossy(&b))
     }
 
     /// `list`: the registry snapshot (and subscribes to changes).

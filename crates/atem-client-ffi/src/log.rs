@@ -11,15 +11,15 @@ use atem_client::SignedObject;
 use atem_client::channel::HeadRelation;
 use atem_client::encoding::b64u;
 use atem_client::membership::{
-    Action, Admission, Conflict, Effect, Entry, Evaluation, Head, HostNow, Invalid, Member,
-    MemberKind, MemberStatus, Membership, Stop,
+    Action, Conflict, Effect, Entry, Evaluation, Head, HostNow, Invalid, Member, MemberKind,
+    MemberStatus, Membership, Stop,
 };
 
-use crate::encoding::{canonical, hash_of, signed, strict};
+use crate::encoding::{canonical, canonical_lossy, hash_of, safe_int, signed, strict};
 use crate::error::{AtemError, Result};
 use crate::types::{
-    AdmissionInfo, CarriageResult, CarriageStop, FreezeInfo, HeadRelationKind, HostClock, HostInfo,
-    KBackupInfo, LogHead, MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo,
+    CarriageResult, CarriageStop, FreezeInfo, HeadRelationKind, HostClock, HostInfo, KBackupInfo,
+    LogHead, MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo,
 };
 
 impl From<&HostClock> for HostNow {
@@ -75,7 +75,7 @@ pub(crate) fn objects_of(json: &[String]) -> Result<Vec<SignedObject>> {
 }
 
 pub(crate) fn object_json(object: &SignedObject) -> String {
-    canonical(&object.to_json())
+    canonical_lossy(&object.to_json())
 }
 
 fn member_info(member: &Member, status: MemberStatus) -> MemberInfo {
@@ -91,7 +91,7 @@ fn member_info(member: &Member, status: MemberStatus) -> MemberInfo {
             "service",
             vec!["service".to_owned()],
             None,
-            Some(canonical(&scope.to_json())),
+            Some(canonical_lossy(&scope.to_json())),
             Some(*expires_at),
         ),
     };
@@ -113,7 +113,7 @@ fn member_info(member: &Member, status: MemberStatus) -> MemberInfo {
         enc_key,
         scope_json,
         expires_at,
-        member_json: canonical(&member.to_json()),
+        member_json: canonical_lossy(&member.to_json()),
     }
 }
 
@@ -203,7 +203,11 @@ pub(crate) fn structural_entry(body: &serde_json::Value) -> std::result::Result<
     if body["action"] == "set_recovery_key" && body["kit"] == "current" {
         object["kit_sig"] = serde_json::json!(zero);
     }
-    let object = SignedObject::parse(canonical(&object).as_bytes())?;
+    let object = SignedObject::parse(
+        canonical(&object)
+            .map_err(|_| Invalid::Malformed("outside the canonical domain"))?
+            .as_bytes(),
+    )?;
     Entry::parse(object)
 }
 
@@ -436,9 +440,50 @@ impl MembershipLog {
         Ok(result)
     }
 
-    /// Host role: the membership side of admitting `device_id` after its
-    /// carriage (`more`: the hello said more entries follow); commits the
-    /// evaluation like `extend`.
+    /// Ends waits that are over on this clock (pending recoveries).
+    pub fn advance(&self, now: HostClock) -> Vec<MembershipEffect> {
+        self.lock()
+            .advance(&(&now).into())
+            .iter()
+            .map(effect_info)
+            .collect()
+    }
+
+    /// The body of the next entry after this head, signed by `signer`:
+    /// `action_json` is the action and its own fields, e.g.
+    /// `{"action":"remove","device_id":"dev-ipad"}` or `{"action":"add",
+    /// "member":{…}}`. Checked by the verifier's schema before it is
+    /// returned, so the owner only confirms a body the verifier accepts.
+    /// Returns canonical JSON: show it, then prepare it with an
+    /// `EntryPublisher`.
+    pub fn draft_entry(
+        &self,
+        signer: String,
+        signed_at: u64,
+        action_json: String,
+    ) -> Result<String> {
+        let action = strict(&action_json)?;
+        let body = self.draft_value(&signer, safe_int(signed_at, "signed_at")?, &action)?;
+        structural_entry(&body)?;
+        canonical(&body)
+    }
+
+    /// Checks a member object (`add`/`recovery_add`'s `member`) with the
+    /// verifier's schema; returns it in canonical JSON.
+    pub fn check_member(&self, member_json: String) -> Result<String> {
+        canonical(&self.parse_member(&member_json)?.to_json())
+    }
+}
+
+#[cfg(feature = "host")]
+use crate::types::AdmissionInfo;
+
+#[cfg(feature = "host")]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl MembershipLog {
+    /// Host role (feature `host`, never in an app build): the membership
+    /// side of admitting `device_id` after its carriage (`more`: the hello
+    /// said more entries follow); commits the evaluation like `extend`.
     pub fn admit_carrier(
         &self,
         device_id: String,
@@ -446,6 +491,7 @@ impl MembershipLog {
         more: bool,
         now: HostClock,
     ) -> Result<AdmissionInfo> {
+        use atem_client::membership::Admission;
         let objects = objects_of(&entries)?;
         let now: HostNow = (&now).into();
         let mut log = self.lock();
@@ -481,39 +527,5 @@ impl MembershipLog {
                 device_id: state.member.device_id,
             },
         })
-    }
-
-    /// Ends waits that are over on this clock (pending recoveries).
-    pub fn advance(&self, now: HostClock) -> Vec<MembershipEffect> {
-        self.lock()
-            .advance(&(&now).into())
-            .iter()
-            .map(effect_info)
-            .collect()
-    }
-
-    /// The body of the next entry after this head, signed by `signer`:
-    /// `action_json` is the action and its own fields, e.g.
-    /// `{"action":"remove","device_id":"dev-ipad"}` or `{"action":"add",
-    /// "member":{…}}`. Checked by the verifier's schema before it is
-    /// returned, so the owner only confirms a body the verifier accepts.
-    /// Returns canonical JSON: show it, then prepare it with an
-    /// `EntryPublisher`.
-    pub fn draft_entry(
-        &self,
-        signer: String,
-        signed_at: u64,
-        action_json: String,
-    ) -> Result<String> {
-        let action = strict(&action_json)?;
-        let body = self.draft_value(&signer, signed_at, &action)?;
-        structural_entry(&body)?;
-        Ok(canonical(&body))
-    }
-
-    /// Checks a member object (`add`/`recovery_add`'s `member`) with the
-    /// verifier's schema; returns it in canonical JSON.
-    pub fn check_member(&self, member_json: String) -> Result<String> {
-        Ok(canonical(&self.parse_member(&member_json)?.to_json()))
     }
 }

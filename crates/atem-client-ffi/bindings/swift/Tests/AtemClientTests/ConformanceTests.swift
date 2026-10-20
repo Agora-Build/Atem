@@ -225,10 +225,10 @@ final class ConformanceTests: XCTestCase {
             try store.insertP256(keyId: "dev-phone/auth", secret: unhex(s(phoneAuth["secret_hex"])))
             let provider = store.provider()
             #endif
-            let p = EntryPublisher()
-            try p.prepare(log: log, bodyJson: body)
-            try eq(p.preparedJson() != nil, true)
-            let req = try p.sign(provider: provider, keyId: "dev-phone/auth", cosignKit: nil)
+            var p: EntryPublisher? = EntryPublisher()
+            try p!.prepare(log: log, bodyJson: body)
+            try eq(p!.preparedJson() != nil, true)
+            let req = try p!.sign(provider: provider, keyId: "dev-phone/auth", cosignKit: nil)
             try eq(req.entryHash, hash("E7"))
             try eq(req.expected, mlogHead)
             #if canImport(CryptoKit)
@@ -238,10 +238,15 @@ final class ConformanceTests: XCTestCase {
             try eq(phone.requests[0].bodyJson, body)
             #endif
             try verifySignedObject(json: req.entryJson, key: PublicKeyData(alg: .p256, raw: unhex(s(phoneAuth["pub_hex"]))))
-            try eq(try EntryPublisher.resume(preparedJson: p.preparedJson()!).outstanding()!.entryHash, req.entryHash)
-            try eq(try p.replyStored(log: log, now: now), .committed(head: LogHead(seq: 7, hash: hash("E7"))))
+            // A restart: the saved state resumes (one append per device, so
+            // the old object goes first).
+            let saved = p!.preparedJson()!
+            p = nil
+            let resumed = try EntryPublisher.resume(preparedJson: saved)
+            try eq(resumed.outstanding()!.entryHash, req.entryHash)
+            try eq(try resumed.replyStored(log: log, now: now), .committed(head: LogHead(seq: 7, hash: hash("E7"))))
             try eq(log.head().seq, 7)
-            try eq(p.preparedJson(), nil)
+            try eq(resumed.preparedJson(), nil)
         }
         check("a draft the verifier would refuse is refused before signing") {
             try throwsCode("membership_invalid") { _ = try logL().draftEntry(signer: "dev-phone", signedAt: 1, actionJson: "{\"action\":\"remove\"}") }

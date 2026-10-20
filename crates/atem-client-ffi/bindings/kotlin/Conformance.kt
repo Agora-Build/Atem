@@ -207,16 +207,22 @@ fun main(args: Array<String>) {
         eq(phone.requests.single().freshConfirmation, true)
         eq(phone.requests.single().bodyJson, body)
         verifySignedObject(req.entryJson, PublicKeyData(KeyAlg.P256, unhex(keys["dev-phone"]["auth"]["pub_hex"].s())))
-        eq(EntryPublisher.resume(p.preparedJson()!!).outstanding()!!.entryHash, req.entryHash)
-        eq(p.replyStored(log, now), PublishOutcome.Committed(LogHead(7uL, byLabel.getValue("E7")["entry_hash"].s())))
+        // A restart: the saved state resumes (one append per device, so the
+        // old object goes first).
+        val saved = p.preparedJson()!!
+        p.destroy()
+        val resumed = EntryPublisher.resume(saved)
+        eq(resumed.outstanding()!!.entryHash, req.entryHash)
+        eq(resumed.replyStored(log, now), PublishOutcome.Committed(LogHead(7uL, byLabel.getValue("E7")["entry_hash"].s())))
         eq(log.head().seq, 7uL)
-        eq(p.preparedJson(), null)
+        eq(resumed.preparedJson(), null)
         // The software store (bots) reproduces E7's RFC 6979 signature exactly.
         val store = SoftwareKeyStore()
         store.insertP256("dev-phone/auth", unhex(keys["dev-phone"]["auth"]["secret_hex"].s()))
         val p2 = EntryPublisher()
         p2.prepare(logL(), body)
         eq(canonicalJson(p2.sign(store.provider(), "dev-phone/auth", null).entryJson), canonicalJson(entry("E7")))
+        p2.destroy()
     }
     check("a draft the verifier would refuse is refused before signing") {
         throwsCode("membership_invalid") { logL().draftEntry("dev-phone", 1uL, "{\"action\":\"remove\"}") }

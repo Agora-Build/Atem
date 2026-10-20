@@ -20,8 +20,34 @@ pub(crate) fn strict(text: &str) -> Result<serde_json::Value> {
     )
 }
 
-pub(crate) fn canonical(value: &serde_json::Value) -> String {
-    jcs(value).expect("strict JSON values are in the jcs domain")
+/// `jcs` of a value built from caller input: outside the domain (an
+/// integer ≥ 2^53, a float) is a typed error, never a panic.
+pub(crate) fn canonical(value: &serde_json::Value) -> Result<String> {
+    jcs(value).map_err(|e| AtemError::Invalid {
+        code: "not_canonical".into(),
+        detail: format!("outside the canonical JSON domain: {e:?}"),
+    })
+}
+
+/// `jcs` of a value for display or storage that came from verified or
+/// strictly parsed state; falls back to plain JSON text rather than
+/// panicking if a peer's message held a value outside the domain.
+pub(crate) fn canonical_lossy(value: &serde_json::Value) -> String {
+    jcs(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// The largest integer every JSON consumer reads exactly (2^53 − 1).
+pub(crate) const MAX_SAFE: u64 = 9_007_199_254_740_991;
+
+/// A caller's integer that goes into a signed body: ≤ 2^53 − 1.
+pub(crate) fn safe_int(value: u64, what: &str) -> Result<u64> {
+    if value > MAX_SAFE {
+        return Err(AtemError::Invalid {
+            code: "not_canonical".into(),
+            detail: format!("{what} is above 2^53 - 1"),
+        });
+    }
+    Ok(value)
 }
 
 pub(crate) fn hash_of(hex: &str) -> Result<Hash32> {
@@ -62,7 +88,7 @@ pub fn encode_fields(fields: Vec<Vec<u8>>) -> Vec<u8> {
 /// unsafe integers, lone surrogates … are refused).
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn canonical_json(json: String) -> Result<String> {
-    Ok(canonical(&strict(&json)?))
+    canonical(&strict(&json)?)
 }
 
 /// `enc([label, payload])`: the bytes a key signs.
@@ -117,7 +143,7 @@ pub fn signed_object_info(json: String) -> Result<SignedObjectInfo> {
         signing_input: object.signing_input().as_bytes().to_vec(),
         entry_hash: object.entry_hash().map(|h| h.to_hex()),
         grant_hash: object.grant_hash().map(|h| h.to_hex()),
-        json: canonical(&object.to_json()),
+        json: canonical_lossy(&object.to_json()),
     })
 }
 

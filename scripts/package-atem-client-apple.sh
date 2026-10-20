@@ -23,9 +23,9 @@ TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 FEATURES=()
-[ $CONFORMANCE = 1 ] && FEATURES=(--features software-keys,test-vectors)
+[ $CONFORMANCE = 1 ] && FEATURES=(--features software-keys,test-vectors,host)
 BINDGEN_FEATURES=bindgen
-[ $CONFORMANCE = 1 ] && BINDGEN_FEATURES=bindgen,software-keys,test-vectors
+[ $CONFORMANCE = 1 ] && BINDGEN_FEATURES=bindgen,software-keys,test-vectors,host
 
 # The Swift side, generated from a host build with the same exports.
 cargo build -p atem-client-ffi --features "$BINDGEN_FEATURES"

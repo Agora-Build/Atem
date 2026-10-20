@@ -79,7 +79,7 @@ async function main() {
   expect(request.label === "atem-ch1-client-sig-v1" && request.keyId === "browser-webcrypto", "request label and key");
   expect(JSON.stringify(conn.state()) === '"await_signature"', "waiting for the signature");
   const signature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keyPair.privateKey, request.input));
-  wire.send(conn.finishWithSignature("p256", publicRaw, signature, mono()));
+  wire.send(conn.finishWithSignature(signature, mono()));
   const welcome = conn.onWelcome(await wire.recv(), log, mono());
   console.log(`WELCOME ${welcome.principal} ${welcome.clientKind} ${[...welcome.permissions].sort().join(",")} ${welcome.revision} ${welcome.head.seq}`);
   expect(welcome.authorizationMsLeft <= 3_000_000, "authorization bounded by the grant");
@@ -162,7 +162,7 @@ async function main() {
   again.send(conn2.start(log, mono()));
   const request2 = conn2.onAcceptDeferred(await again.recv(), log, mono());
   const signature2 = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keyPair.privateKey, request2.input));
-  again.send(conn2.finishWithSignature("p256", publicRaw, signature2, mono()));
+  again.send(conn2.finishWithSignature(signature2, mono()));
   try {
     conn2.onWelcome(await again.recv(), log, mono());
     fail("a revoked grant must be refused");

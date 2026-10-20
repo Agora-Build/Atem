@@ -213,6 +213,33 @@ check("restore: enroll publishes a pending recovery_add; a 409 rebuilds", () => 
   eq(s3.lastErrorCode(), "no_host_reachable");
 });
 
+check("restarts: the writer and the enrollment resume where they were", () => {
+  const log = logOf(["E1", "E2", "E3", "E4", "E5", "E6"]);
+  const kit = kit1().recoveryKey();
+  const w = m.KBackupWriter.start(log, K.map((k) => k.kid), kit.alg, kit.raw, "dev-mac");
+  const step = w.sealed(log, m.sealKBackup(ACCOUNT, GENESIS, 1, kit.alg, kit.raw, K), 5);
+  const saved = w.preparedJson();
+  // Another write for the device is refused while this one is prepared.
+  throwsCode(() => m.KBackupWriter.resume(saved), "outstanding");
+  w.free();
+  const resumed = m.KBackupWriter.resume(saved);
+  eq(resumed.step(), step, "the same body to sign");
+  eq(resumed.sign(store(), "dev-mac/auth").type, "put");
+  eq(resumed.putReply(log, undefined).type, "append");
+  eq(resumed.appendStored(log, NOW, 5), { type: "done", committed: 1 });
+  eq(resumed.preparedJson(), undefined);
+  // The restore's enrollment.
+  const accept = [{ initJson: str(hs.init), acceptJson: str(hs.accept) }];
+  const read = () => m.RestoreSession.read(unhex(rec.R_hex), ACCOUNT, GENESIS, unhex(rec.kit.kit_tag_hex));
+  const s = read();
+  s.attempt([...L, entry("KB7")], str(rec.k_backup.wire), accept, NOW);
+  const req = s.enroll(str(byLabel.R7.entry.body.member), 1792400020000);
+  const r = m.RestoreSession.resume(unhex(rec.R_hex), ACCOUNT, GENESIS, unhex(rec.kit.kit_tag_hex), s.preparedJson());
+  eq(r.outstanding(), req);
+  r.attempt([...L, entry("KB7")], str(rec.k_backup.wire), accept, NOW);
+  eq(r.appendStored(NOW).type, "published");
+});
+
 check("kits: generate, print R, read back", () => {
   const kit = m.RecoveryKit.generate(ACCOUNT, GENESIS);
   const r = kit.secretR();
@@ -256,7 +283,7 @@ check("connection objects refuse out-of-order calls", () => {
   conn.start(log, 1);
   eq(conn.state(), "await_accept");
   throwsCode(() => conn.start(log, 1), "already started");
-  throwsCode(() => conn.finishWithSignature("p256", unhex(keys["dev-phone"].auth.pub_hex), new Uint8Array(64), 1), "no signature pending");
+  throwsCode(() => conn.finishWithSignature(new Uint8Array(64), 1), "no signature pending");
   // A garbage accept closes the handshake.
   throwsCode(() => conn.onAcceptDeferred(new Uint8Array(Buffer.from("{}")), log, 2), "handshake_failed");
   eq(conn.state(), "closed");

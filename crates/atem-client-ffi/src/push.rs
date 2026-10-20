@@ -16,7 +16,7 @@ use atem_client::push::{
     Seen, Stage, Verifier,
 };
 
-use crate::encoding::{canonical, hash_of, signed, strict};
+use crate::encoding::{canonical, canonical_lossy, hash_of, safe_int, signed, strict};
 use crate::error::{AtemError, Result};
 use crate::log::{MembershipLog, object_json};
 use crate::types::{
@@ -82,7 +82,7 @@ fn stage_info(s: Stage) -> PushStage {
 }
 
 fn ack_json(identity: &Identity) -> String {
-    canonical(&identity.to_ack())
+    canonical_lossy(&identity.to_ack())
 }
 
 /// A verified push hint (only `verify_push_hint` makes one).
@@ -326,7 +326,7 @@ pub fn push_ack_message(acks: Vec<String>) -> Result<String> {
         .iter()
         .map(|a| Ok(Identity::from_ack(&strict(a)?)?))
         .collect::<Result<Vec<_>>>()?;
-    Ok(canonical(&push::push_ack(&identities)))
+    canonical(&push::push_ack(&identities))
 }
 
 /// The ack entries a `push_ack` names (entries that don't parse ack
@@ -339,6 +339,7 @@ pub fn parse_push_ack(message_json: String) -> Result<Vec<String>> {
         .collect())
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn sign_seen_with(
     provider: &dyn KeyProvider,
     host_key_id: &str,
@@ -351,15 +352,16 @@ pub(crate) fn sign_seen_with(
         provider,
         &KeyId::new(host_key_id),
         &approval.to_key()?,
-        created_at,
+        safe_int(created_at, "created_at")?,
         device_id,
-        seen_at,
+        safe_int(seen_at, "seen_at")?,
     )?;
     Ok(object_json(&object))
 }
 
-/// Host role: signs a seen for `device_id` with `host_channel_key`.
-#[cfg(feature = "uniffi")]
+/// Host role (feature `host`, never in an app build): signs a seen for
+/// `device_id` with `host_channel_key`.
+#[cfg(all(feature = "uniffi", feature = "host"))]
 #[uniffi::export]
 pub fn sign_seen(
     provider: Arc<dyn crate::provider::AppKeyProvider>,
@@ -426,18 +428,20 @@ pub(crate) fn issue_browser_grant_with(
         .iter()
         .map(|o| Op::parse(o).ok_or_else(|| AtemError::malformed("unknown op")))
         .collect::<Result<_>>()?;
-    let log = log.lock();
+    // A copy of the log: no binding lock is held while the provider asks
+    // the owner to confirm the grant.
+    let log = log.lock().clone();
     let body = BrowserGrant::body(
         &log,
         &atem_client::session::new_id(),
         issuer,
         &browser_key.to_key()?,
         host_id,
-        host_trust_gen,
+        safe_int(host_trust_gen, "host_trust_gen")?,
         session_id,
         &ops,
-        issued_at,
-        expires_at,
+        safe_int(issued_at, "issued_at")?,
+        safe_int(expires_at, "expires_at")?,
     );
     let grant = BrowserGrant::issue(&log, provider, &KeyId::new(issuer_key_id), body)?;
     Ok(object_json(&grant.object))

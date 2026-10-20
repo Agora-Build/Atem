@@ -44,10 +44,25 @@ In the app:
 - **Clock**: a monotonic time in ms for every channel call; the verifier
   clock (`HostClock{wall_ms, mono_ms, boot_id}`) for the log; wall ms for
   push hints.
-- **Storage**: the log's entries (`MembershipLog.entries()`), a
-  publisher's `prepared_json()`, the restore's `prepared_json()`, `K` in the
-  platform key store. Nothing else is required: the host's head is
-  authoritative.
+- **Storage** (trusted local storage: the app's own container, not shared
+  or synced storage):
+  - the log's entries (`MembershipLog.entries()`), after every change;
+  - **every write in flight, before acting on it**: an `EntryPublisher`'s,
+    a `KBackupWriter`'s and a `RestoreSession`'s `prepared_json()` (§R9.4
+    rule 1, §R9.5 "Writing a backup" step 2). After a restart the app
+    resumes from them (`EntryPublisher::resume`, `KBackupWriter::resume`,
+    `RestoreSession::resume`), never starting a new write for the same
+    device while one is saved (rule 4: nothing else is signed until the
+    relay answered). `resume` reads the saved state strictly and checks the
+    prepared body again with the verifier's schema, but the state is not
+    integrity-protected: keep it where only the app can write;
+  - `K` and the kit's `R` only in the platform key store.
+
+  The host's head is authoritative for everything else.
+- **Secrets returned to the app**: `RecoveryKitHandle::secret_r()`,
+  `open_k_backup`'s keys and `RestoredInfo.keys` are copies the binding
+  can't wipe once returned (UniFFI buffers, JS arrays). Store them in the
+  key store at once and wipe the app-side buffers.
 - **UI**: what the effects below say to show.
 
 ## 2. Objects and the order of calls
@@ -70,7 +85,7 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 | `advance(now)` | ends waits that are over on this clock |
 | `draft_entry(signer, signed_at, action_json)` | the next entry's body, checked with the verifier's own schema; show it, then publish (below) |
 | `check_member(member_json)` | a member object for `add` / `recovery_add`, checked |
-| `admit_carrier(device_id, entries, more, now)` | host role (Atem's own host uses the crate directly) |
+| `admit_carrier(device_id, entries, more, now)` | host role, feature `host` only (never in an app build) |
 
 The log object is shared by reference: `extend`, `advance`, a publisher's
 or writer's reply change it in place. `snapshot()` copies.
@@ -82,7 +97,7 @@ ClientConnection::new(host_id, identity, need_before)
 start(log, now)                         → init frame            send
 on_accept(frame, log, provider, now)    → finish frame          send   (sig_c: purpose Channel)
   or on_accept_deferred(frame, log, now) → SignRequest           sign it (async)
-     finish_with_signature(pub, sig, now) → finish frame        send
+     finish_with_signature(sig, now)    → finish frame          send
 on_welcome(frame, log, now)             → WelcomeInfo, or AtemError::Refused{next}
 list / acquire / renew / release / submit_prompt / submit_interrupt /
 submit_stop / submit_approval / submit_rule_revoke / receipt_query /
@@ -174,11 +189,15 @@ each `BackupStep` and feed the answer back:
 
 `restart()` after an uncertain outcome resends the upload, then the entry.
 
-Durability (decision): the writer lives in memory; the crate's writer has
-no serialized form yet. After an app restart, fetch and `extend` the log,
-then `start` again: a committed backup ends at `Done`; an upload this
-writer made but never committed is occupied at the relay, so the next
-allocation moves above it after one `409`.
+Durability (§R9.5 step 2, §R9.4 rules 1 and 4): **persist
+`prepared_json()` after every call, before performing the returned step**.
+It holds the job, the phase, the envelope bytes and their version, the
+versions uploaded and not committed, the last `max_occupied`, the prepared
+`k_backup` body (and its signature once signed) and what was discarded;
+`None` once nothing is in flight (`Done`, `Failed`). After a restart,
+`KBackupWriter::resume(saved)` stands at the same step: it signs the same
+body again (same `entry_hash`, never a sibling), resends the same envelope
+and entry. Don't `start` a new backup while a saved one exists.
 
 ### RecoveryKitHandle, K backups
 
@@ -205,6 +224,10 @@ allocation moves above it after one `409`.
    `append_stored(now)` → `Published{head}` (takes effect after 24 h unless
    approved or vetoed) or `append_conflict(…)` → `Rebuild` (run `attempt`
    again) / `Stopped`.
+   After a restart in between: `RestoreSession::resume(r, account, genesis,
+   tag, saved)`, `attempt(…)` with a new fetch, resend `outstanding()`, then
+   `append_stored` / `append_conflict`; `enroll` is refused (`outstanding`)
+   while that `recovery_add` is in flight.
 4. `may_rotate_k(device)` / `may_seal_backup(device)` stay false until the
    recovery took effect.
 
@@ -229,7 +252,9 @@ The relay: `verify_push_hint(…, Relay)`, its book, `push_stages(created_at,
 recipient)`, `push_send_now(…)`, `push_next_due(…)`, `push_guard(expires_at)`
 (all from the signed `created_at`; never the relay's receipt time),
 `verify_seen`, `seen_in_window`, acks (`hint.ack_json()`, `seen_ack_json`,
-`push_ack_message`, `parse_push_ack`). `sign_seen` is the host's.
+`push_ack_message`, `parse_push_ack`). `sign_seen` is the host's (feature
+`host`, never in an app build; an app provider should refuse a
+`HostSigning` request anyway).
 
 ### Browser grants (§R9.6)
 
@@ -296,17 +321,20 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
   sign}` / `Invalid{code: provider_error}`.
 - **Asynchronous signers** (WebCrypto, or an app whose owner-auth prompt
   must not block a thread): `on_accept_deferred` returns the
-  `SignRequest`; sign `input` and call `finish_with_signature(public_key,
-  signature, now)` within the 10 s step. The signature is normalized and
-  verified with `public_key` before anything is sent. Browsers do this
-  with a non-extractable WebCrypto P-256 key:
+  `SignRequest`; sign `input` and call `finish_with_signature(signature,
+  now)` within the 10 s step. The signature is normalized and verified
+  with the identity's own key before anything is sent: the member's
+  `auth_key` in the client's verified log, or the grant's `browser_key`
+  (a device missing from its own log is refused `Request{this device is
+  not in the verified log}` at `on_accept`). Browsers do this with a
+  non-extractable WebCrypto P-256 key:
 
   ```js
   const keyPair = await crypto.subtle.generateKey({name: "ECDSA", namedCurve: "P-256"}, false, ["sign"]);
   const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey));
   const req = conn.onAcceptDeferred(acceptFrame, log, now());
   const sig = new Uint8Array(await crypto.subtle.sign({name: "ECDSA", hash: "SHA-256"}, keyPair.privateKey, req.input));
-  socket.send(conn.finishWithSignature("p256", publicRaw, sig, now()));
+  socket.send(conn.finishWithSignature(sig, now()));
   ```
 - **Bots** (`service` principals; R9.6 rule 5) hold a software key from
   their own secret store: feature `software-keys` exports
@@ -321,28 +349,43 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 
 | variant | `code` (stable) |
 |---|---|
-| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error` |
+| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body |
 | `Membership{code, detail, index}` | `membership_invalid`; `detail` the verifier's (`bad_signature`, `gap`, `signer_not_manager`, `blob_version_not_increasing`, `kit_sig_missing`, …); `index` into what was passed |
 | `Channel{code, detail}` | `handshake_failed`, `stale_target`, `account_frozen`, `busy` (also as the host's clear, advisory error before the channel opens), `unknown_host`, `record_rejected`, `limit`, `too_large`, `closed`, `signing_failed`, `invalid_hello`, `cannot_carry` (a divergence deeper than any carriage) |
 | `Refused{code, detail, error_json, next}` | the host's session error code (`unauthorized`, `membership_invalid`, `membership_incomplete`, `recovery_pending`, `account_frozen`, `unsupported_version`, `busy`, …) |
 | `BadWelcome{check}` | `bad_welcome` (`check`: `revision`, `re`, `channel_id`, `principal`, `account_id`, `host`, `head`) |
 | `Request{detail}` | `request` (`unknown session`, `no lease`, `too many requests in flight`, `not attached`, …) |
 | `Restore{code, detail}` | `kit_tag_mismatch`, `genesis_mismatch`, `membership_invalid`, `no_host_reachable`, `log_behind_host`, `kit_not_current`, `no_backup`, `backup_hash_mismatch`, `backup_invalid` |
-| `Publish{code, detail}` | `outstanding`, `not_on_head`, `nothing_prepared`, `sign` |
+| `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
-| `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …) |
+| `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
 
 ## 5. Threading
 
-- Every object is thread-safe (an internal lock) and can be shared;
-  records are values.
+- Every object is thread-safe (an internal lock held only for the call)
+  and can be used from several threads at once: `MembershipLog`,
+  `ClientConnection`, `EntryPublisher`, `KBackupWriter`, `RestoreSession`,
+  `PushHint`, `PushHintBook`, `RecoveryKitHandle`. Records are values.
+- **No binding lock is held while the app's provider runs.** The calls
+  that sign (`ClientConnection::on_accept`, `EntryPublisher::sign`,
+  `KBackupWriter::sign`, `issue_browser_grant`, `PushHint::open`) do their
+  work under the lock, release it, call the provider, then take the lock
+  again to apply the result. So a provider waiting on an owner-auth prompt
+  doesn't block a UI thread reading the log, the registry or a writer's
+  step, and a provider may call any binding object. If the object moved
+  meanwhile (another thread answered the same step), the call fails with
+  `AtemError::State` ("… changed while the provider was signing") and
+  nothing is applied.
 - Provider callbacks run synchronously on the thread that called the
   binding. Call the binding off the main thread (a provider may block on a
   biometric prompt), or use the deferred handshake.
-- Never call back into the same binding object from inside a provider
-  callback: it holds that object's lock.
+- One outstanding append per device (§R9.4 rule 5): within the process, a
+  second `EntryPublisher` or `KBackupWriter` for the same account and
+  signer is refused `Publish{code: outstanding}` while one holds a prepared
+  body (the claim ends when the relay answered, at `Done`/`Failed`, or when
+  the object is freed). Across restarts, use the saved state.
 - One `ClientConnection` per transport; feed its frames in order.
 - WASM is single-threaded; nothing blocks inside the binding.
 
@@ -373,8 +416,10 @@ Feature flags of `atem-client-ffi`:
 | `wasm` | the wasm-bindgen surface (`--no-default-features --features wasm`) |
 | `software-keys` | `SoftwareKeyStore` (bots, tests) |
 | `test-vectors` | raw primitive verification for the vectors (implies `software-keys`) |
+| `host` | host-role functions (`sign_seen`, `admit_carrier`), for the conformance and host-side tests |
 
-Shipped artifacts use the defaults only (`wasm` alone for JS).
+Shipped artifacts use the defaults only (`wasm` alone for JS); the
+conformance builds add `software-keys,test-vectors,host`.
 
 - **Apple:** `scripts/package-atem-client-apple.sh <version> <out>` →
   `<out>/AtemClient` (SwiftPM: `Package.swift`, `Sources/AtemClient/atem_client_ffi.swift`,
