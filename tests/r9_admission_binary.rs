@@ -431,13 +431,19 @@ fn a_pin_while_the_runtime_runs_is_picked_up() {
     assert_eq!(router.next_other()["data"]["op"], "welcome");
     write_pin(&rig.sandbox.config(), &rig.log, HOST, 1, &rig.host_seed);
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut attempt = 0;
     let ph = loop {
         next_init();
-        match router.connect("c2", &rig.log, HOST, &phone()) {
+        // A router never reuses a handle while the link lives (§R9.7a).
+        attempt += 1;
+        match router.connect(&format!("c2-{attempt}"), &rig.log, HOST, &phone()) {
             Ok(ph) => break ph,
-            Err(e) => assert!(Instant::now() < deadline, "never admitted: {e:?}"),
+            Err(e) => assert!(
+                Instant::now() < deadline,
+                "never admitted: {e:?}\n{}",
+                rig.runtime_log()
+            ),
         }
-        router.close("c2");
     };
     assert_eq!(ph.welcome().principal, "member:dev-phone");
     router.send_raw(
