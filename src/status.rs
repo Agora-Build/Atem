@@ -827,6 +827,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_binding_below_the_legacy_generation_is_an_unfinished_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        // Upgraded across the move to `pairing/`: the legacy file says 6, the
+        // new files restarted and were paired again at 3.
+        std::fs::write(
+            &src.paths.legacy_pairing,
+            br#"{"version":1,"host_trust_gen":6,"binding_id":"b","astation_id":"astation-1","created_at":1}"#,
+        )
+        .unwrap();
+        crate::pairing::tests::write_bound(dir.path(), ASTATION, 3, "binding-3", ("s", "t"));
+        let before = snapshot(dir.path());
+        assert_eq!(
+            report(dir.path()).pairing.value,
+            "not paired (unfinished pairing with astation-1; run `atem pair`)"
+        );
+        assert_eq!(snapshot(dir.path()), before, "status writes nothing");
+        assert_eq!(already_paired(&src), None, "`atem pair` proceeds");
+        let before = crate::pairing::capture(&src).unwrap();
+        crate::pairing::bind_new(&src, &before, ASTATION).unwrap();
+        assert_eq!(
+            report(dir.path()).pairing.value,
+            "paired (astation-1, trust gen 7)"
+        );
+    }
+
+    #[test]
     fn already_paired_prints_the_status_and_the_next_steps() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(already_paired(&Sources::in_dir(dir.path())), None);

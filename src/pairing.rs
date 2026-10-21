@@ -1,5 +1,5 @@
 //! The one pairing (`pairing/pairing.enc`) and the host trust generation
-//! (`pairing/trust_gen`).
+//! (`pairing/trust_gen`, floor copy `cred/trust_gen_floor`).
 //!
 //! A profile is paired with at most one Astation. Its record holds the
 //! Astation id, the pairing binding once `atem pair` created it, the session
@@ -11,7 +11,15 @@
 //! generation. `atem unpair` commits the next generation *before* it removes
 //! the record, so an interrupted unpair still invalidates the old binding
 //! (a binding of an older generation than `trust_gen` is no binding). The
-//! generation never decreases or repeats; it survives unpairing.
+//! generation never decreases or repeats; it survives unpairing. A floor
+//! copy lives in `cred/trust_gen_floor`, beside the device id Astation keys
+//! its own floor by. The generation is the highest of the two files, the
+//! record's binding and the legacy `pairing.json` (where it lived until
+//! v0.7.1; moving here restarted it at 1, below generations Astation had
+//! already accepted), so losing `pairing/` or either file never lowers it.
+//! An unreadable one fails closed. A new generation goes to the floor copy
+//! first; a file found below the generation is raised to it under the lock
+//! (`capture`); `pairing.json` is only read, never written or removed.
 //!
 //! Asynchronous Astation work (authentication, re-authentication,
 //! verification, unlock, rotation, escrow, credential reports, credentials
@@ -240,42 +248,146 @@ impl TrustState {
     }
 }
 
-/// `trust_gen` (0 without the file); an error when it can't be read.
-fn read_trust_gen(paths: &PairingPaths) -> Result<u64> {
-    match std::fs::read_to_string(&paths.trust_gen) {
-        Ok(text) => text
-            .trim()
-            .parse()
-            .with_context(|| format!("{} is unreadable", paths.trust_gen.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(error) => {
-            Err(anyhow!(error).context(format!("could not read {}", paths.trust_gen.display())))
-        }
+/// The file at `path` (`None` without it), never through a symlink; an
+/// error when it can't be read.
+fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    match read_no_follow(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow!(error).context(format!("could not read {}", path.display()))),
     }
 }
 
-fn write_trust_gen(paths: &PairingPaths, generation: u64) -> Result<()> {
-    crate::memory::crypto::write_private(&paths.trust_gen, format!("{generation}\n").as_bytes())
+/// A generation file (0 without it); an error when it can't be read.
+fn read_gen_file(path: &std::path::Path) -> Result<u64> {
+    let Some(raw) = read_optional(path)? else {
+        return Ok(0);
+    };
+    std::str::from_utf8(&raw)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| anyhow!("{} is unreadable", path.display()))
 }
 
-/// The current state, read-only: the generation and the record's binding
-/// when it is of that generation.
-pub fn load(src: &Sources) -> Result<TrustState> {
-    let paths = &src.paths.pairing;
-    let host_trust_gen = read_trust_gen(paths)?;
-    let binding = PairingRecord::load(paths)?.and_then(|record| {
-        let binding = record.binding?;
-        (binding.host_trust_gen == host_trust_gen).then_some(Binding {
-            binding_id: binding.binding_id,
-            astation_id: record.astation_id,
-            host_trust_gen,
-            created_at: binding.created_at,
+fn write_gen_file(path: &std::path::Path, generation: u64) -> Result<()> {
+    crate::memory::crypto::write_private(path, format!("{generation}\n").as_bytes())
+}
+
+/// The legacy `pairing.json` (until v0.7.1), exactly as that version wrote
+/// it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Parsed to check the shape; only the generation is used.
+struct LegacyPairing {
+    version: u8,
+    host_trust_gen: u64,
+    #[serde(default)]
+    binding_id: Option<String>,
+    #[serde(default)]
+    astation_id: Option<String>,
+    #[serde(default)]
+    created_at: Option<u64>,
+}
+
+/// The legacy `pairing.json`'s generation (0 without the file); an error
+/// when it can't be read or isn't that file's version 1.
+fn read_legacy_gen(path: &std::path::Path) -> Result<u64> {
+    let Some(raw) = read_optional(path)? else {
+        return Ok(0);
+    };
+    let legacy: LegacyPairing = serde_json::from_slice(&raw)
+        .with_context(|| format!("{} is unreadable", path.display()))?;
+    if legacy.version != 1 {
+        bail!(
+            "{} is unreadable (version {})",
+            path.display(),
+            legacy.version
+        );
+    }
+    Ok(legacy.host_trust_gen)
+}
+
+/// What the profile holds of the generation: `pairing/trust_gen`, the floor
+/// copy `cred/trust_gen_floor`, the legacy `pairing.json` and the record.
+struct Generations {
+    file: u64,
+    floor: u64,
+    legacy: u64,
+    record: Option<PairingRecord>,
+}
+
+impl Generations {
+    /// An unreadable file fails closed.
+    fn read(src: &Sources) -> Result<Self> {
+        Ok(Self {
+            record: PairingRecord::load(&src.paths.pairing)?,
+            ..Self::files(src)?
         })
-    });
-    Ok(TrustState {
-        host_trust_gen,
-        binding,
-    })
+    }
+
+    /// The files only, without the record.
+    fn files(src: &Sources) -> Result<Self> {
+        Ok(Self {
+            file: read_gen_file(&src.paths.pairing.trust_gen)?,
+            floor: read_gen_file(&src.paths.cred.trust_gen_floor)?,
+            legacy: read_legacy_gen(&src.paths.legacy_pairing)?,
+            record: None,
+        })
+    }
+
+    /// The generation: the highest of the two files and the record's
+    /// binding, so losing either file (or `pairing/`) never lowers it.
+    fn effective(&self) -> u64 {
+        let bound = self
+            .record
+            .as_ref()
+            .and_then(|record| record.binding.as_ref())
+            .map_or(0, |binding| binding.host_trust_gen);
+        self.file.max(self.floor).max(self.legacy).max(bound)
+    }
+
+    fn state(self) -> TrustState {
+        let host_trust_gen = self.effective();
+        let binding = self.record.and_then(|record| {
+            let binding = record.binding?;
+            (binding.host_trust_gen == host_trust_gen).then_some(Binding {
+                binding_id: binding.binding_id,
+                astation_id: record.astation_id,
+                host_trust_gen,
+                created_at: binding.created_at,
+            })
+        });
+        TrustState {
+            host_trust_gen,
+            binding,
+        }
+    }
+
+    /// Raises a file below the generation to it (the floor copy first).
+    /// Under the lock.
+    fn heal(&self, src: &Sources) -> Result<()> {
+        let generation = self.effective();
+        if self.floor < generation {
+            write_gen_file(&src.paths.cred.trust_gen_floor, generation)?;
+        }
+        if self.file < generation {
+            write_gen_file(&src.paths.pairing.trust_gen, generation)?;
+        }
+        Ok(())
+    }
+}
+
+/// Commits a new `generation` (above `load`'s) to both files: the floor copy
+/// first, then `pairing/trust_gen`. Under the lock.
+fn commit_generation(src: &Sources, generation: u64) -> Result<()> {
+    write_gen_file(&src.paths.cred.trust_gen_floor, generation)?;
+    write_gen_file(&src.paths.pairing.trust_gen, generation)
+}
+
+/// The current state, read-only: the generation (`Generations::effective`)
+/// and the record's binding when it is of that generation.
+pub fn load(src: &Sources) -> Result<TrustState> {
+    Ok(Generations::read(src)?.state())
 }
 
 /// The lock every pairing change and every bound apply holds
@@ -284,19 +396,33 @@ fn lock(src: &Sources) -> Result<TrustLock> {
     TrustStore::lock(&src.paths.pairing.trust_gen)
 }
 
-/// The state at the start of asynchronous work (under the lock).
+/// The state at the start of asynchronous work (under the lock). A file
+/// below the generation is raised to it first (best effort: the state is
+/// the same either way, and `unpair`/`bind_new` write both files).
 pub fn capture(src: &Sources) -> Result<TrustState> {
     let _lock = lock(src)?;
-    load(src)
+    let generations = Generations::read(src)?;
+    if let Err(error) = generations.heal(src) {
+        crate::diagnostics::warn(format!(
+            "Couldn't raise the stored host trust generation to {}: {error:#}",
+            generations.effective()
+        ));
+    }
+    Ok(generations.state())
 }
 
 /// `atem unpair`: durably commits the next generation (so every capture of
 /// the old binding goes stale), then removes the pairing record. Returns
-/// the new generation.
+/// the new generation. An unreadable record still goes (its binding counts
+/// for nothing: it is never read again).
 pub fn unpair(src: &Sources) -> Result<u64> {
     let _lock = lock(src)?;
-    let next = read_trust_gen(&src.paths.pairing)? + 1;
-    write_trust_gen(&src.paths.pairing, next)?;
+    let generations = Generations {
+        record: PairingRecord::load(&src.paths.pairing).unwrap_or(None),
+        ..Generations::files(src)?
+    };
+    let next = generations.effective() + 1;
+    commit_generation(src, next)?;
     remove_record(&src.paths.pairing)?;
     Ok(next)
 }
@@ -308,10 +434,11 @@ pub fn unpair(src: &Sources) -> Result<u64> {
 pub fn bind_new(src: &Sources, expected: &TrustState, astation_id: &str) -> Result<TrustState> {
     let _lock = lock(src)?;
     let paths = &src.paths.pairing;
-    if !load(src)?.same(expected) {
+    let generations = Generations::read(src)?;
+    let host_trust_gen = generations.effective() + 1;
+    if !generations.state().same(expected) {
         bail!(CHANGED);
     }
-    let host_trust_gen = read_trust_gen(paths)? + 1;
     let binding = BindingRecord {
         binding_id: uuid::Uuid::new_v4().to_string(),
         host_trust_gen,
@@ -321,7 +448,7 @@ pub fn bind_new(src: &Sources, expected: &TrustState, astation_id: &str) -> Resu
         .filter(|record| record.astation_id == astation_id)
         .unwrap_or_else(|| PairingRecord::new(astation_id));
     record.binding = Some(binding.clone());
-    write_trust_gen(paths, host_trust_gen)?;
+    commit_generation(src, host_trust_gen)?;
     record.save(paths)?;
     Ok(TrustState {
         host_trust_gen,
@@ -477,7 +604,7 @@ pub(crate) mod tests {
         (session_id, token): (&str, &str),
     ) {
         let paths = crate::paths::ProfilePaths::in_dir(dir).pairing;
-        write_trust_gen(&paths, trust_gen).unwrap();
+        write_gen_file(&paths.trust_gen, trust_gen).unwrap();
         PairingRecord {
             binding: Some(BindingRecord {
                 binding_id: binding_id.into(),
@@ -520,7 +647,11 @@ pub(crate) mod tests {
     /// moved on, the record is still there.
     pub(crate) fn interrupted_unpair(dir: &std::path::Path) {
         let paths = crate::paths::ProfilePaths::in_dir(dir).pairing;
-        write_trust_gen(&paths, read_trust_gen(&paths).unwrap() + 1).unwrap();
+        write_gen_file(
+            &paths.trust_gen,
+            read_gen_file(&paths.trust_gen).unwrap() + 1,
+        )
+        .unwrap();
     }
 
     /// Edits the record of the profile at `dir` (under the lock).
@@ -789,5 +920,209 @@ pub(crate) mod tests {
         // And an unbound capture can't make one.
         let unbound = Captured::now(captured.sources()).unwrap();
         assert!(BoundAgent::new(unbound, Arc::new(NeverCalled)).is_err());
+    }
+
+    fn floor(src: &Sources) -> u64 {
+        read_gen_file(&src.paths.cred.trust_gen_floor).unwrap()
+    }
+
+    fn file(src: &Sources) -> u64 {
+        read_gen_file(&src.paths.pairing.trust_gen).unwrap()
+    }
+
+    /// Paired, then unpaired four times and paired again: generation 5 is
+    /// bound, and both files say so.
+    fn bound_at_five(dir: &std::path::Path) -> Sources {
+        let src = Sources::in_dir(dir);
+        bound_profile(dir, "astation-1");
+        for _ in 0..3 {
+            unpair(&src).unwrap();
+        }
+        bound_profile(dir, "astation-1");
+        assert_eq!(load(&src).unwrap().host_trust_gen, 5);
+        assert_eq!((floor(&src), file(&src)), (5, 5));
+        src
+    }
+
+    #[test]
+    fn a_lost_or_reset_trust_gen_file_never_lowers_the_generation() {
+        for reset in [None, Some(1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = bound_at_five(dir.path());
+            // The record goes too, as after an unpair.
+            remove_record(&src.paths.pairing).unwrap();
+            match reset {
+                None => std::fs::remove_file(&src.paths.pairing.trust_gen).unwrap(),
+                Some(generation) => {
+                    write_gen_file(&src.paths.pairing.trust_gen, generation).unwrap()
+                }
+            }
+            assert_eq!(load(&src).unwrap().host_trust_gen, 5);
+            let captured = capture(&src).unwrap();
+            assert_eq!(captured.host_trust_gen, 5);
+            assert_eq!(file(&src), 5, "raised under the lock");
+            assert_eq!(unpair(&src).unwrap(), 6);
+            let before = capture(&src).unwrap();
+            paired_record("astation-1")
+                .save(&src.paths.pairing)
+                .unwrap();
+            let after = bind_new(&src, &before, "astation-1").unwrap();
+            assert_eq!(after.host_trust_gen, 7);
+            assert_eq!((floor(&src), file(&src)), (7, 7));
+        }
+    }
+
+    #[test]
+    fn pairing_again_after_losing_the_pairing_dir_goes_above_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = bound_at_five(dir.path());
+        std::fs::remove_dir_all(dir.path().join("pairing")).unwrap();
+        let before = capture(&src).unwrap();
+        assert_eq!(before.host_trust_gen, 5);
+        assert!(before.binding.is_none());
+        paired_record("astation-1")
+            .save(&src.paths.pairing)
+            .unwrap();
+        let after = bind_new(&src, &before, "astation-1").unwrap();
+        assert_eq!(after.host_trust_gen, 6);
+        assert_eq!(load(&src).unwrap(), after);
+    }
+
+    #[test]
+    fn a_binding_above_the_files_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = bound_at_five(dir.path());
+        let binding = load(&src).unwrap().binding.unwrap();
+        // Both files lost: the record's binding still says 5.
+        std::fs::remove_file(&src.paths.pairing.trust_gen).unwrap();
+        std::fs::remove_file(&src.paths.cred.trust_gen_floor).unwrap();
+        let state = load(&src).unwrap();
+        assert_eq!(state.host_trust_gen, 5);
+        assert_eq!(
+            state.binding.as_ref(),
+            Some(&binding),
+            "still the current binding"
+        );
+        assert_eq!(capture(&src).unwrap(), state);
+        assert_eq!((floor(&src), file(&src)), (5, 5), "both raised");
+        assert_eq!(unpair(&src).unwrap(), 6);
+    }
+
+    #[test]
+    fn a_profile_without_a_floor_copy_gets_one_at_the_first_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        // An existing profile: written before the floor copy existed.
+        write_bound(dir.path(), "astation-1", 4, "binding-4", ("s", "t"));
+        let src = Sources::in_dir(dir.path());
+        assert!(!src.paths.cred.trust_gen_floor.exists());
+        let state = load(&src).unwrap();
+        assert_eq!(state.host_trust_gen, 4);
+        assert!(
+            !src.paths.cred.trust_gen_floor.exists(),
+            "load is read-only"
+        );
+        assert_eq!(capture(&src).unwrap(), state);
+        assert_eq!((floor(&src), file(&src)), (4, 4));
+        // A floor above the file is never lowered by a capture.
+        write_gen_file(&src.paths.cred.trust_gen_floor, 9).unwrap();
+        assert_eq!(capture(&src).unwrap().host_trust_gen, 9);
+        assert_eq!((floor(&src), file(&src)), (9, 9));
+        // The old binding (4) is no longer current.
+        assert!(load(&src).unwrap().binding.is_none());
+    }
+
+    const LEGACY_6: &[u8] = br#"{
+  "version": 1,
+  "host_trust_gen": 6,
+  "binding_id": "legacy-binding",
+  "astation_id": "astation-1",
+  "created_at": 1
+}"#;
+
+    /// Astation's #91: a profile upgraded across the move to `pairing/`.
+    #[test]
+    fn the_legacy_pairing_json_is_a_floor_the_generation_never_goes_below() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        std::fs::write(&src.paths.legacy_pairing, LEGACY_6).unwrap();
+        write_bound(dir.path(), "astation-1", 3, "binding-3", ("s", "t"));
+        let state = load(&src).unwrap();
+        assert_eq!(state.host_trust_gen, 6);
+        assert!(state.binding.is_none(), "the binding at 3 is not current");
+        let before = capture(&src).unwrap();
+        assert_eq!(before, state);
+        assert_eq!((floor(&src), file(&src)), (6, 6), "raised at the capture");
+        assert_eq!(
+            std::fs::read(&src.paths.legacy_pairing).unwrap(),
+            LEGACY_6,
+            "kept as is"
+        );
+        // `atem pair` replaces the stale binding above everything seen.
+        let after = bind_new(&src, &before, "astation-1").unwrap();
+        assert_eq!(after.host_trust_gen, 7);
+        assert_eq!(load(&src).unwrap(), after);
+        let mut issued = vec![after.host_trust_gen];
+        for _ in 0..2 {
+            issued.push(unpair(&src).unwrap());
+            let before = capture(&src).unwrap();
+            paired_record("astation-1")
+                .save(&src.paths.pairing)
+                .unwrap();
+            issued.push(
+                bind_new(&src, &before, "astation-1")
+                    .unwrap()
+                    .host_trust_gen,
+            );
+        }
+        assert_eq!(issued, [7, 8, 9, 10, 11]);
+        // Without `pairing/`, the floor copy holds.
+        std::fs::remove_dir_all(dir.path().join("pairing")).unwrap();
+        assert_eq!(capture(&src).unwrap().host_trust_gen, 11);
+        assert_eq!(unpair(&src).unwrap(), 12);
+    }
+
+    #[test]
+    fn an_unreadable_legacy_pairing_json_fails_closed() {
+        for contents in [
+            &b"not json"[..],
+            br#"{"version":2,"host_trust_gen":6}"#,
+            br#"{"version":1,"host_trust_gen":6,"extra":1}"#,
+            br#"{"version":1}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = Sources::in_dir(dir.path());
+            std::fs::write(&src.paths.legacy_pairing, contents).unwrap();
+            assert!(load(&src).is_err());
+            assert!(capture(&src).is_err());
+            assert!(unpair(&src).is_err());
+            assert!(
+                bind_new(
+                    &src,
+                    &load(&src).unwrap_or(TrustState {
+                        host_trust_gen: 0,
+                        binding: None,
+                    }),
+                    "astation-1"
+                )
+                .is_err()
+            );
+        }
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let src = Sources::in_dir(dir.path());
+            let target = dir.path().join("elsewhere.json");
+            std::fs::write(&target, LEGACY_6).unwrap();
+            std::os::unix::fs::symlink(&target, &src.paths.legacy_pairing).unwrap();
+            assert!(load(&src).is_err(), "never through a symlink");
+        }
+    }
+
+    #[test]
+    fn a_fresh_profile_writes_no_floor_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(capture(&src).unwrap().host_trust_gen, 0);
+        assert!(!src.paths.cred.dir.exists());
     }
 }
