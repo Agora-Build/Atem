@@ -672,33 +672,59 @@ mod tests {
         drop(listener);
     }
 
-    #[test]
-    fn spawn_detached_logs_privately_in_its_own_session() {
-        let dir = short_dir();
-        let log = dir.path().join("logs").join("d.log");
+    /// A detached test child, killed with its whole process group when the
+    /// test ends, passes or panics. `spawn_detached` makes it a session and
+    /// group leader in a new session, so nothing else ever stops it: a child
+    /// a test leaves behind is reparented to init and lives on.
+    struct Detached(libc::pid_t);
+
+    impl Drop for Detached {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-self.0, libc::SIGKILL) };
+        }
+    }
+
+    /// Whether `pid` is gone (reaped by `spawn`'s waiter thread), within 5 s.
+    fn gone(pid: libc::pid_t) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// `sh script` printing its directory, `$MARK` and its pid, then waiting
+    /// without polling (one `sleep`, bounded even if the guard never runs).
+    fn spawn_waiting_script(dir: &Path, log: &Path) -> Detached {
         // `sh <subcommand>` runs the named script file: write one.
-        let script = dir.path().join("script.sh");
-        // It stays alive (its log written) until the test has read its
-        // session: `getsid` of a reaped pid would fail. (`ps -o sid` is
-        // Linux-only: macOS `ps` has no such keyword.)
-        let gate = dir.path().join("gate");
-        std::fs::write(
-            &script,
-            format!(
-                "pwd; echo \"$MARK\"; echo $$; while [ ! -e '{}' ]; do sleep 0.05; done\n",
-                gate.display()
-            ),
-        )
-        .unwrap();
+        let script = dir.join("script.sh");
+        std::fs::write(&script, "pwd; echo \"$MARK\"; echo $$; exec sleep 30\n").unwrap();
         let pid = spawn_detached(
             Path::new("/bin/sh"),
             script.to_str().unwrap(),
             Path::new("/"),
-            &log,
+            log,
             &[(OsString::from("MARK"), OsString::from("hello"))],
         )
         .unwrap();
         assert!(pid > 0);
+        Detached(pid as libc::pid_t)
+    }
+
+    #[test]
+    fn spawn_detached_logs_privately_in_its_own_session() {
+        let dir = short_dir();
+        let log = dir.path().join("logs").join("d.log");
+        // It stays alive until the test has read its session (`getsid` of a
+        // reaped pid would fail; `ps -o sid` is Linux-only), then the guard
+        // kills it: it must never outlive the test.
+        let child = spawn_waiting_script(dir.path(), &log);
+        let pid = child.0;
         let mut text = String::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while text.lines().count() < 3 && std::time::Instant::now() < deadline {
@@ -707,14 +733,36 @@ mod tests {
         }
         // A new session: its id is its own pid, not ours (and it leads its
         // own process group).
-        let sid = unsafe { libc::getsid(pid as libc::pid_t) };
-        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
-        std::fs::write(&gate, "").unwrap();
+        let sid = unsafe { libc::getsid(pid) };
+        let pgid = unsafe { libc::getpgid(pid) };
+        drop(child);
+        assert!(gone(pid), "the detached child {pid} outlived the test");
         let lines: Vec<_> = text.lines().map(str::trim).collect();
         assert_eq!(lines, ["/", "hello", &pid.to_string()], "{text:?}");
-        assert_eq!(sid, pid as libc::pid_t);
-        assert_eq!(pgid, pid as libc::pid_t);
+        assert_eq!(sid, pid);
+        assert_eq!(pgid, pid);
         assert_ne!(sid, unsafe { libc::getsid(0) });
         assert_eq!(std::fs::metadata(&log).unwrap().mode() & 0o777, 0o600);
+    }
+
+    /// Regression: a test that fails after `spawn_detached` must not leave
+    /// its child running (hundreds of orphaned `sh script.sh` polling loops
+    /// piled up on a dev machine when a gate file vanished with the temp dir).
+    #[test]
+    fn a_failing_test_leaves_no_detached_child_behind() {
+        let dir = short_dir();
+        let log = dir.path().join("d.log");
+        let mut pid = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let child = spawn_waiting_script(dir.path(), &log);
+            pid = child.0;
+            panic!("the test fails while its child runs");
+        }));
+        assert!(result.is_err());
+        assert!(pid > 0);
+        assert!(
+            gone(pid),
+            "the detached child {pid} outlived the failed test"
+        );
     }
 }
