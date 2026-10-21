@@ -902,6 +902,49 @@ fn held_and_frozen_lists_refuse_r9() {
     assert_eq!(rig.refused("c3").0, "account_frozen");
 }
 
+/// A held host and a `finish` naming a manager at the host's head whose
+/// `sig_c` is forged (another key): `handshake_failed`, and the host stays
+/// held with `membership.fault` on disk (reconciliation only after the
+/// proof is verified, §R9.3 "Held", §R9.7 step 6). The real manager then
+/// reconciles.
+#[test]
+fn a_forged_finish_never_lifts_a_hold() {
+    let mut rig = Rig::new();
+    std::fs::write(
+        &rig.pairing.fault,
+        br#"{"v":1,"runtime_epoch":1,"file":"membership.json","at":1}"#,
+    )
+    .unwrap();
+    let mut fences = HostFences::new(&mut rig.rt.host);
+    let (m, _) = MembershipHost::open(&rig.pairing, &rig.journal, 2, &rig.now.host, &mut fences)
+        .unwrap()
+        .unwrap();
+    rig.m = Some(m);
+    rig.link_up();
+    // The Mac's device id (public in the log), a proof under another key.
+    rig.connect(
+        "forged",
+        Identity::native(r9log::MAC, r9log::auth("svc-bot")),
+    );
+    assert_eq!(rig.refused("forged").0, "handshake_failed");
+    assert!(rig.m.as_ref().unwrap().held().is_some());
+    assert!(rig.pairing.fault.exists());
+    // Still held for everyone else.
+    rig.advance(1000);
+    rig.connect("c1", phone());
+    assert_eq!(
+        rig.refused("c1"),
+        ("busy".into(), Some("device list not reconciled".into()))
+    );
+    assert!(rig.pairing.fault.exists());
+    // The manager's own proof reconciles.
+    rig.advance(1000);
+    rig.connect("mac", Identity::native(r9log::MAC, r9log::auth(r9log::MAC)));
+    rig.attached("mac");
+    assert!(rig.m.as_ref().unwrap().held().is_none());
+    assert!(!rig.pairing.fault.exists());
+}
+
 /// A pending recovery shows in every welcome (and its subject is refused
 /// `recovery_pending` until the wait ends).
 #[test]

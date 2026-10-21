@@ -324,6 +324,9 @@ impl CarriageResult {
 pub enum Hello {
     /// The membership side of admission (Task 7 adds scope, expiry, keys).
     Admit(Admission),
+    /// Admitted once the sender's proof is verified, which then lifts the
+    /// hold ([`MembershipHost::reconcile`]); never before.
+    Reconcile(Admission),
     /// `busy` "device list not reconciled".
     NotReconciled,
     /// `busy` "device list not recorded" (a fault in this run).
@@ -1438,9 +1441,15 @@ impl MembershipHost {
     /// `more` the carriage's flag. While held, only a reconciling `hello`
     /// is admitted: a `native` member holding `manage` at the committed
     /// head, with a clean carriage and no `more`, whose head is the host's,
-    /// with no intent unsatisfied; it removes the fault record.
-    pub fn hello(
-        &mut self,
+    /// with no intent unsatisfied.
+    ///
+    /// A pure decision: it changes nothing. [`Hello::Reconcile`] says the
+    /// `hello` would reconcile; the caller verifies the sender's proof
+    /// (`sig_c`) first and only then calls [`MembershipHost::reconcile`],
+    /// which removes the fault record. An unauthenticated `finish` never
+    /// lifts a hold.
+    pub fn decide_hello(
+        &self,
         device_id: &str,
         client_head: Option<Head>,
         carriage: Option<&CarriageResult>,
@@ -1470,11 +1479,27 @@ impl MembershipHost {
         if !(manager && clean && satisfied && client_head == Some(self.m.head())) {
             return Hello::NotReconciled;
         }
+        Hello::Reconcile(admission)
+    }
+
+    /// Lifts the hold after [`MembershipHost::decide_hello`] answered
+    /// [`Hello::Reconcile`] for `device_id` and the caller verified that
+    /// device's proof: removes the fault record (and an unreadable carriage
+    /// record left behind) under `trust_gen.lock`. False when it couldn't:
+    /// the host stays held and the `hello` is `busy` "device list not
+    /// reconciled".
+    pub fn reconcile(&mut self, device_id: &str) -> bool {
+        let Some(held) = self.held.clone() else {
+            return true;
+        };
+        if self.faulted.is_some() || self.is_frozen() {
+            return false;
+        }
         // Under `trust_gen.lock`, and only while the list is still this
         // host's pin (an old host never clears a newer pin's fault).
         let _lock = match self.lock_for_write(DlFile::Fault) {
             Ok(Some(lock)) => lock,
-            Ok(None) | Err(_) => return Hello::NotReconciled,
+            Ok(None) | Err(_) => return false,
         };
         // An unreadable carriage record left because its fault record
         // couldn't be written goes too (the manager confirmed the head).
@@ -1484,18 +1509,38 @@ impl MembershipHost {
             log(&format!(
                 "cannot remove the carriage record: {e}; still held"
             ));
-            return Hello::NotReconciled;
+            return false;
         }
         if let Err(e) = self.store.remove(DlFile::Fault) {
             log(&format!("cannot remove the fault record: {e}; still held"));
-            return Hello::NotReconciled;
+            return false;
         }
         log(&format!(
             "reconciled by {device_id} at seq {}; remote admission resumes",
             self.m.head().seq
         ));
         self.held = None;
-        Hello::Admit(admission)
+        true
+    }
+
+    /// Tests: [`MembershipHost::decide_hello`], then, for a reconciling
+    /// `hello` (its proof taken as verified), [`MembershipHost::reconcile`].
+    #[cfg(test)]
+    pub fn hello(
+        &mut self,
+        device_id: &str,
+        client_head: Option<Head>,
+        carriage: Option<&CarriageResult>,
+        more: bool,
+        now: &HostNow,
+    ) -> Hello {
+        match self.decide_hello(device_id, client_head, carriage, more, now) {
+            Hello::Reconcile(admission) => match self.reconcile(device_id) {
+                true => Hello::Admit(admission),
+                false => Hello::NotReconciled,
+            },
+            other => other,
+        }
     }
 
     // ── Time ──

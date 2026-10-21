@@ -924,15 +924,26 @@ impl R9Host {
         let pin = m.pin_of().clone();
         let now = parts.now.host.clone();
         let wall = now.wall_ms;
+        // A `hello` that would lift a hold (a manager's reconciliation)
+        // does so only after its `sig_c` is verified below: nothing of the
+        // hold changes for an unauthenticated `finish`.
+        let mut reconciles: Option<String> = None;
         let resolved: Result<Authority, SessionError> = match &hello.proof.principal {
             Principal::Native { device_id } | Principal::Service { device_id } => {
-                match m.hello(
+                let decided = match m.decide_hello(
                     device_id,
                     Some(membership.head),
                     carriage.as_ref(),
                     membership.more,
                     &now,
                 ) {
+                    MHello::Reconcile(admission) => {
+                        reconciles = Some(device_id.clone());
+                        MHello::Admit(admission)
+                    }
+                    other => other,
+                };
+                match decided {
                     MHello::Frozen => Err(error(code::ACCOUNT_FROZEN, re.as_deref(), None)),
                     MHello::NotRecorded => {
                         Err(error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECORDED)))
@@ -951,6 +962,7 @@ impl R9Host {
                     .map_err(|r| r.to_error(re.as_deref())),
                     MHello::Admit(other) => Err(admission_error(&other, re.as_deref())
                         .unwrap_or_else(|| error(code::UNAUTHORIZED, re.as_deref(), None))),
+                    MHello::Reconcile(_) => unreachable!("mapped above"),
                 }
             }
             Principal::Browser { .. } => {
@@ -1000,6 +1012,18 @@ impl R9Host {
                 return effects;
             }
         };
+        // The proof is verified: a manager's reconciliation lifts the hold
+        // now (§R9.3 "Held"), or the hello is refused and the host stays held.
+        if let Some(device_id) = reconciles
+            && !m.reconcile(&device_id)
+        {
+            log("refused a hello: busy (device list not reconciled)");
+            let e = error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECONCILED));
+            let frame = channel.seal(&e.to_bytes(), mono).ok();
+            channel.close();
+            self.reply_and_close(handle, frame, reason::CLOSED);
+            return effects;
+        }
         // The session host's attachment: one per channel (its own client),
         // speaking for the principal (r8 §H).
         let attachment = new_id();

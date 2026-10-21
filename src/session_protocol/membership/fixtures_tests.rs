@@ -951,6 +951,7 @@ impl Runner {
             Hello::NotRecorded => {
                 json!({"op": "error", "code": "busy", "detail": DETAIL_NOT_RECORDED})
             }
+            Hello::Reconcile(_) => unreachable!("`hello` reconciles or refuses"),
         };
         self.deliver(client, reply);
         self.pass();

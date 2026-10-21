@@ -343,6 +343,38 @@ fn held_frozen_and_failed_lists_refuse_r9_and_say_so() {
     );
     let status = rig.status();
     assert!(status.contains("Device list:    held ("), "{status}");
+    // A forged finish naming the Mac (public in the log) with a proof
+    // under another key: handshake_failed, and the hold and its fault
+    // record stay (reconciliation only after sig_c is verified).
+    next_init();
+    assert_eq!(
+        router
+            .connect(
+                "forged",
+                &rig.log,
+                HOST,
+                &Identity::native(MAC, auth("svc-bot"))
+            )
+            .unwrap_err()
+            .0,
+        "handshake_failed"
+    );
+    let fault = rig
+        .sandbox
+        .config()
+        .join("pairing")
+        .join("membership.fault");
+    assert!(fault.exists());
+    let status = rig.status();
+    assert!(status.contains("Device list:    held ("), "{status}");
+    next_init();
+    assert_eq!(
+        router.connect("c1b", &rig.log, HOST, &phone()).unwrap_err(),
+        (
+            "busy".to_string(),
+            Some("device list not reconciled".to_string())
+        )
+    );
     next_init();
     let mut mac = router
         .connect("mac", &rig.log, HOST, &Identity::native(MAC, auth(MAC)))
@@ -352,6 +384,7 @@ fn held_frozen_and_failed_lists_refuse_r9_and_say_so() {
         status.contains("Device list:    pinned at seq 4"),
         "{status}"
     );
+    assert!(!fault.exists());
 
     // Frozen: a conflicting entry by a current manager.
     let conflict = rig.log.conflicting_add("dev-x");
