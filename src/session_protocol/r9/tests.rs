@@ -1879,3 +1879,103 @@ fn a_project_scoped_bot_sees_its_projects_sessions_only_after_an_unlock() {
     assert_eq!(changed, vec![SID.to_string()], "only its project's session");
     assert_eq!(rig.list("ch-proj"), vec![SID.to_string()]);
 }
+
+/// §R9.6 "fenced when the issuer is removed or loses `control`", with the
+/// change carried in a new client's `hello` (§R9.3: the main route a
+/// removal reaches a host): the browser the phone issued holds the lease
+/// with terminal input queued at the writer; the Mac connects carrying
+/// `change`; the browser is fenced at once (its channel closes, its lease
+/// is revoked, its queued bytes are dropped at the write boundary, its
+/// control generation rises), and it can't come back.
+fn a_carried_issuer_change_fences_its_browser(change: impl FnOnce(&mut TestLog)) {
+    use crate::session_protocol::fixtures::{HostEvent, HostUnderTest};
+    let mut rig = Rig::new();
+    rig.link_up();
+    let wall = rig.now.host.wall_ms;
+    let grant_id = "aaaaaaaa-1111-4111-8111-0000000000c2";
+    let (grant, key) = rig.log.grant(
+        "dev-phone",
+        grant_id,
+        HOST,
+        1,
+        Some(SID),
+        &["view", "terminal", "prompt"],
+        wall,
+        wall + 600_000,
+    );
+    rig.connect(
+        "browser",
+        Identity::browser(grant.clone(), key.clone()).unwrap(),
+    );
+    let read = rig.binding("browser", SID);
+    rig.send(
+        "browser",
+        &json!({"type": "session", "data": {"v": 1, "op": "acquire",
+            "id": "aaaaaaaa-0000-4000-8000-0000000000c3", "binding": read, "takeover": false}}),
+    );
+    assert_eq!(rig.rt.host.lease_epoch(SID), Some(1));
+    rig.send(
+        "browser",
+        &json!({"type": "terminal", "data": {"v": 1, "op": "subscribe", "terminal_id": SID,
+            "generation": PGEN, "binding": read}}),
+    );
+    let stream = rig
+        .events("browser")
+        .into_iter()
+        .find_map(|e| match e {
+            CEvent::Family(f) => f
+                .data
+                .filter(|d| d["op"] == "attached")
+                .map(|d| d["stream_id"].clone()),
+            _ => None,
+        })
+        .expect("subscribed");
+    let now = rig.rt.now();
+    rig.rt.event(&HostEvent::HoldPtyWrites, now).unwrap();
+    let mut lease = read.clone();
+    lease["lease_epoch"] = json!(1);
+    rig.send(
+        "browser",
+        &json!({"type": "terminal", "data": {"v": 1, "op": "input", "terminal_id": SID,
+            "generation": PGEN, "stream_id": stream, "sequence": 0, "bytes": "eA==",
+            "binding": lease}}),
+    );
+    let principal = format!("browser:{grant_id}");
+    let gen_before = rig.rt.host.control_gen(&principal);
+    // The Mac connects with the change in its hello.
+    change(&mut rig.log);
+    let client_log = rig.log.log.clone();
+    rig.advance(1000);
+    rig.connect_with(
+        "mac",
+        Identity::native(r9log::MAC, r9log::auth(r9log::MAC)),
+        Some(&client_log),
+    );
+    rig.attached("mac");
+    assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert_eq!(rig.refused("browser").0, "closed");
+    assert_eq!(rig.rt.host.lease_holder(SID), None);
+    assert!(rig.rt.host.control_gen(&principal) > gen_before);
+    let now = rig.rt.now();
+    rig.rt.event(&HostEvent::FlushPtyWrites, now).unwrap();
+    assert_eq!(rig.rt.counter("pty_writes_dropped").unwrap(), json!(1));
+    assert_eq!(rig.rt.counter("pty_writes_remote").unwrap(), json!(0));
+    // The grant can't come back.
+    rig.advance(1000);
+    rig.connect("browser-2", Identity::browser(grant, key).unwrap());
+    assert_eq!(rig.refused("browser-2").0, "unauthorized");
+}
+
+#[test]
+fn an_issuers_removal_carried_in_a_hello_fences_its_browser() {
+    a_carried_issuer_change_fences_its_browser(|log| {
+        log.remove("dev-phone");
+    });
+}
+
+#[test]
+fn an_issuers_demotion_carried_in_a_hello_fences_its_browser() {
+    a_carried_issuer_change_fences_its_browser(|log| {
+        log.set_native_roles("dev-phone", &["view"]);
+    });
+}

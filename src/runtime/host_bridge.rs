@@ -760,13 +760,8 @@ impl HostBridge {
             let line = match entries {
                 Some(entries) => match self.carry(&entries, cx) {
                     Some(result) => {
-                        self.r9.note_fences(&result.fences);
-                        let issued =
-                            self.r9_call(|r9, parts| r9.fence_issued(&result.fences, parts));
-                        self.r9_exec(issued, cx);
-                        if result.announce {
-                            self.r9_call(|r9, parts| r9.announce(parts));
-                        }
+                        let carried = self.r9_call(|r9, parts| r9.carried(&result, None, parts));
+                        self.r9_exec(carried, cx);
                         format!(
                             "{:?} head={} fences={}",
                             result.carried,

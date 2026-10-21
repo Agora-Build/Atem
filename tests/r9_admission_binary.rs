@@ -294,6 +294,89 @@ fn clients_share_the_link_and_are_fenced_one_by_one() {
     );
 }
 
+/// §R9.6 "issuer fenced" on the real runtime, the change carried in a
+/// `hello` (§R9.3): a browser the phone issued is attached; the Mac
+/// connects with the phone's demotion, then (another browser) with its
+/// removal, in its hello; each browser gets `unauthorized` "issuer fenced"
+/// and Atem's close at once, and its grant can't come back.
+#[test]
+fn an_issuer_change_carried_in_a_hello_fences_its_browsers() {
+    let mut rig = Rig::new(true, |_| {});
+    rig.start();
+    let mut router = Router::new(&rig.astation);
+    let grant_of = |log: &mut TestLog, n: u32| {
+        let wall = r9log::host_now().wall_ms;
+        log.grant(
+            "dev-phone",
+            &format!("aaaaaaaa-1111-4111-8111-0000000000{n:02}"),
+            HOST,
+            1,
+            None,
+            &["view", "prompt"],
+            wall,
+            wall + 600_000,
+        )
+    };
+    for (n, change) in [(1u32, "demotion"), (2, "removal")] {
+        let (grant, key) = grant_of(&mut rig.log, n);
+        let handle = format!("br-{n}");
+        next_init();
+        let mut br = router
+            .connect(
+                &handle,
+                &rig.log,
+                HOST,
+                &Identity::browser(grant.clone(), key.clone()).unwrap(),
+            )
+            .expect("the browser");
+        match change {
+            "demotion" => rig.log.set_native_roles("dev-phone", &["view"]),
+            _ => rig.log.remove("dev-phone"),
+        };
+        next_init();
+        let mac = format!("mac-{n}");
+        router
+            .connect(&mac, &rig.log, HOST, &Identity::native(MAC, auth(MAC)))
+            .expect("the Mac carries the change");
+        let fenced = router.events(&handle, &mut br).unwrap();
+        assert!(
+            fenced
+                .iter()
+                .any(|e| matches!(e, CEvent::Fenced(e) | CEvent::Error(e)
+                if e.code == "unauthorized" && e.detail.as_deref() == Some("issuer fenced"))),
+            "{change}: {fenced:?}"
+        );
+        assert!(matches!(router.next(&handle), Out::Close(_)), "{change}");
+        next_init();
+        assert_eq!(
+            router
+                .connect(
+                    &format!("{handle}-again"),
+                    &rig.log,
+                    HOST,
+                    &Identity::browser(grant, key).unwrap()
+                )
+                .unwrap_err()
+                .0,
+            "unauthorized",
+            "{change}"
+        );
+        if change == "demotion" {
+            // The phone holds control again for the next round.
+            rig.log.set_native_roles("dev-phone", &["control", "view"]);
+            next_init();
+            router
+                .connect(
+                    &format!("mac-{n}b"),
+                    &rig.log,
+                    HOST,
+                    &Identity::native(MAC, auth(MAC)),
+                )
+                .expect("the Mac carries the re-promotion");
+        }
+    }
+}
+
 /// Held, frozen and failed device lists refuse r9 with the right error,
 /// and `atem status` / `atem agent list` say why.
 #[test]

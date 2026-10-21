@@ -38,8 +38,8 @@ mod tests;
 use super::host::{Attach, Effect, SessionHost};
 use super::journal::Journal;
 use super::membership::{
-    self, Carried, DETAIL_NOT_RECONCILED, DETAIL_NOT_RECORDED, Fence, FenceReason, Hello as MHello,
-    HostFences, Init as MInit, MembershipHost,
+    self, CarriageResult, Carried, DETAIL_NOT_RECONCILED, DETAIL_NOT_RECORDED, Fence, FenceReason,
+    Hello as MHello, HostFences, Init as MInit, MembershipHost,
 };
 use super::wire::{self as r8, Envelope as R8Envelope, Op as R8Op};
 use atem_client::canonical::StrictValue;
@@ -872,42 +872,28 @@ impl R9Host {
                 return effects;
             }
         };
-        let DeviceList::Open { m, .. } = &mut parts.list else {
+        if !matches!(parts.list, DeviceList::Open { .. }) {
             refuse(
                 self,
                 keyed,
                 error(code::BUSY, re.as_deref(), Some(DETAIL_UNPAIRED)),
             );
             return effects;
-        };
+        }
         // §R9.7 step 6: the carriage before judging the sender (§R9.3).
-        let carriage = if membership.entries.is_empty() {
-            None
-        } else {
-            let mut fences = HostFences::new(parts.host);
-            let result = m.apply_carriage(&membership.entries, &parts.now.host, &mut fences);
-            effects.extend(fences.effects);
-            Some(result)
+        let carriage = match (&mut parts.list, membership.entries.is_empty()) {
+            (DeviceList::Open { m, .. }, false) => {
+                let mut fences = HostFences::new(parts.host);
+                let result = m.apply_carriage(&membership.entries, &parts.now.host, &mut fences);
+                effects.extend(fences.effects);
+                Some(result)
+            }
+            _ => None,
         };
         if let Some(result) = &carriage {
-            self.note_fences(&result.fences);
-            // §R9.9: a removed or demoted device's hints stop at once.
-            self.push
-                .sync_recipients(m.membership(), parts.now.host.wall_ms);
-            if result.announce {
-                // Every live attachment learns the new head now, whatever
-                // the carrier's own admission (its welcome names it).
-                let pending: Vec<PendingRecovery> = m
-                    .membership()
-                    .pending_recovery(&parts.now.host)
-                    .iter()
-                    .map(PendingRecovery::of)
-                    .collect();
-                let message = r9::membership_head(&new_id(), None, m.head(), &pending)
-                    .to_string()
-                    .into_bytes();
-                self.announce_to_all(&message, None, parts.now.host.mono_ms);
-            }
+            // Every live attachment learns the new head now, whatever the
+            // carrier's own admission (its welcome names it).
+            effects.extend(self.carried(result, None, parts));
             let refused = match result.carried {
                 Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
                     Some(error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECORDED)))
@@ -921,6 +907,9 @@ impl R9Host {
                 return effects;
             }
         }
+        let DeviceList::Open { m, .. } = &mut parts.list else {
+            unreachable!("checked above");
+        };
         let pin = m.pin_of().clone();
         let now = parts.now.host.clone();
         let wall = now.wall_ms;
@@ -1131,10 +1120,37 @@ impl R9Host {
         effects
     }
 
+    /// Everything a carriage requires beyond the device list itself, the
+    /// same on every route that advances the head while channels are live
+    /// (a `hello`'s carriage, the `membership` op, the host's own fetch),
+    /// so the routes can't drift: the fenced principals' errors noted, the
+    /// browsers whose issuer was removed or lost its roles fenced with them
+    /// (§R9.6 "issuer fenced"), push recipients re-derived (§R9.9: a
+    /// removed or demoted device's hints stop at once), and, when the head
+    /// moved, `membership_head` to every live attachment but `except` (the
+    /// carrier that gets its own reply) and those being fenced. Restart
+    /// replay has no live channel: its fences reach the session host
+    /// through `MembershipHost::open`, and a browser of a fenced issuer is
+    /// refused at admission ("issuer fenced").
+    pub fn carried<J: Journal>(
+        &mut self,
+        result: &CarriageResult,
+        except: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        self.note_fences(&result.fences);
+        self.push_recipients(parts);
+        let effects = self.fence_issued(&result.fences, parts);
+        if result.announce {
+            self.announce_except(except, parts);
+        }
+        effects
+    }
+
     /// The fences a carriage made: each fenced principal's attachments get
     /// its error before their close; browsers whose issuer was removed or
     /// lost its roles are fenced with them (§R9.6 "issuer fenced").
-    pub fn note_fences(&mut self, fences: &[Fence]) {
+    fn note_fences(&mut self, fences: &[Fence]) {
         for f in fences {
             self.fence_errors
                 .entry(f.principal.clone())
@@ -1144,7 +1160,7 @@ impl R9Host {
 
     /// The browsers whose issuer `fences` fenced (removed or roles
     /// changed): fenced too, through §H.
-    pub fn fence_issued<J: Journal>(
+    fn fence_issued<J: Journal>(
         &mut self,
         fences: &[Fence],
         parts: &mut Parts<'_, J>,
@@ -1188,38 +1204,7 @@ impl R9Host {
     /// Every r9 attachment gets `membership_head` (the head moved, or a
     /// pending entry changed state).
     pub fn announce<J: Journal>(&mut self, parts: &mut Parts<'_, J>) {
-        let DeviceList::Open { m, .. } = &parts.list else {
-            return;
-        };
-        let pending: Vec<PendingRecovery> = m
-            .membership()
-            .pending_recovery(&parts.now.host)
-            .iter()
-            .map(PendingRecovery::of)
-            .collect();
-        let message = r9::membership_head(&new_id(), None, m.head(), &pending)
-            .to_string()
-            .into_bytes();
-        self.announce_to_all(&message, None, parts.now.host.mono_ms);
-    }
-
-    fn announce_to_all(&mut self, message: &[u8], except: Option<&str>, now_mono: u64) {
-        let atts: Vec<String> = self
-            .chans
-            .values()
-            .filter_map(|c| match &c.phase {
-                Phase::Open(a)
-                    if Some(a.attachment.as_str()) != except
-                        && !self.fence_errors.contains_key(&a.authority.name()) =>
-                {
-                    Some(a.attachment.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        for att in atts {
-            self.seal_to(&att, message, now_mono);
-        }
+        self.announce_except(None, parts);
     }
 
     // ── Records ──
@@ -1336,10 +1321,6 @@ impl R9Host {
         let mut fences = HostFences::new(parts.host);
         let result = m.apply_carriage(&entries, &parts.now.host, &mut fences);
         let mut effects = fences.effects;
-        self.note_fences(&result.fences);
-        // §R9.9: a removed or demoted device's hints stop at once.
-        self.push
-            .sync_recipients(m.membership(), parts.now.host.wall_ms);
         let reply = match result.carried {
             Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
                 error(code::BUSY, re, Some(DETAIL_NOT_RECORDED)).to_bytes()
@@ -1364,15 +1345,12 @@ impl R9Host {
             }
         };
         self.seal_to(att, &reply, mono);
-        effects.extend(self.fence_issued(&result.fences, parts));
-        if result.announce {
-            // The carrier got its reply; everyone else the event.
-            self.announce_except(att, parts);
-        }
+        // The carrier got its reply; everyone else the event.
+        effects.extend(self.carried(&result, Some(att), parts));
         effects
     }
 
-    fn announce_except<J: Journal>(&mut self, except: &str, parts: &mut Parts<'_, J>) {
+    fn announce_except<J: Journal>(&mut self, except: Option<&str>, parts: &mut Parts<'_, J>) {
         let DeviceList::Open { m, .. } = &parts.list else {
             return;
         };
@@ -1392,7 +1370,7 @@ impl R9Host {
             .values()
             .filter_map(|c| match &c.phase {
                 Phase::Open(a)
-                    if a.attachment != except
+                    if Some(a.attachment.as_str()) != except
                         && !self.fence_errors.contains_key(&a.authority.name()) =>
                 {
                     Some(a.attachment.clone())
