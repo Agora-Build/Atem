@@ -970,7 +970,9 @@ impl MembershipHost {
         if self.faulted.is_some() {
             return CarriageResult::plain(Carried::Refused);
         }
-        if !self.holds_anything_new(carried) {
+        // §R9.3 step 0: only a carriage within the bounds is recorded; one
+        // past them is refused (`carriage_too_large`) before any write.
+        if !self.holds_anything_new(carried) || past_carriage_bounds(carried) {
             let eval = self.m.evaluate(carried, now);
             let mut result = CarriageResult::plain(Carried::Unchanged);
             result.announce = !advanced.is_empty();
@@ -1687,6 +1689,21 @@ fn parse_state(value: &Value) -> Option<(Membership, HostPin, Option<u64>)> {
         .and_then(|c| c.get("runtime_epoch"))
         .and_then(Value::as_u64);
     Some((m, pin, checkpoint))
+}
+
+/// More than `MAX_CARRIAGE_ENTRIES` entries, or more than
+/// `MAX_CARRIAGE_BYTES` by `carried_bytes` (the compact `entries` array),
+/// the measure `Membership::evaluate` refuses (`carriage_too_large`).
+fn past_carriage_bounds(carried: &[StrictValue]) -> bool {
+    use atem_client::membership::{MAX_CARRIAGE_BYTES, MAX_CARRIAGE_ENTRIES};
+    if carried.len() > MAX_CARRIAGE_ENTRIES {
+        return true;
+    }
+    let mut total = 1;
+    carried.iter().any(|v| {
+        total += v.value().to_string().len() + 1;
+        total > MAX_CARRIAGE_BYTES
+    })
 }
 
 fn carriage_bytes(runtime_epoch: u64, base: &Head, carried: &[StrictValue]) -> Vec<u8> {

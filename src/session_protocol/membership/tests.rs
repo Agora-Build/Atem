@@ -356,6 +356,36 @@ fn a_carriage_record_that_cant_be_written_is_refused_unread() {
     }
 }
 
+/// §R9.3 step 0: the record holds a carriage within the carriage bounds.
+/// One past them (65 entries) is refused `carriage_too_large` before
+/// anything is written: no carriage record, no fault (here a write would
+/// fail and fault the host).
+#[test]
+fn a_carriage_past_its_bounds_is_refused_before_the_record() {
+    let v = vectors();
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (mut host, mut f) = opened(&rig, 1);
+    host.store_mut().inject(Injected {
+        file: DlFile::Carriage,
+        step: Step::TempWrite,
+    });
+    let carried: Vec<StrictValue> = (0..65).map(|_| v.strict("C6_mac")).collect();
+    let result = host.apply_carriage(&carried, &t0(), &mut f);
+    assert_eq!(result.carried, Carried::Unchanged);
+    assert!(matches!(
+        result.evaluation.as_ref().and_then(|e| e.stop.clone()),
+        Some(atem_client::membership::Stop::Invalid {
+            index: 64,
+            reason: atem_client::membership::Invalid::CarriageTooLarge
+        })
+    ));
+    assert!(host.faulted().is_none());
+    assert!(f.faults.is_empty());
+    assert!(!rig.exists(DlFile::Carriage));
+    assert_eq!(host.head(), v.head("E6"));
+}
+
 #[test]
 fn a_freeze_is_durable_first_and_survives_restarts() {
     let rig = Rig::new();
