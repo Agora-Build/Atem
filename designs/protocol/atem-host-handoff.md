@@ -706,24 +706,52 @@ keeps the record, so a revocation during it or a restart can't end it
 early; it ends once the wall clock passed the recorded end and the running
 process saw 65 min on its monotonic clock. The conservative bound also
 lives in its own sidecar, `runtime/journal/revoked_quarantine`
-(`{"v":1,"until","high_water"}`: the latest quarantine end, which only
-rises, and the highest host wall time seen at a write), written durably
-before every write of `revoked_grants`. A quarantine found after any
-damage ends no earlier than the previous end, now + 65 min and the
-high-water mark + 65 min, so damage found again after the wall clock went
-back can't shorten an earlier quarantine (Astation's 12:00 / 10:00 /
-12:10 trace, comment 6307612632). While the host's wall clock is below
-the high-water mark, browser grants are refused `busy` "host clock went
-back" until it catches up (an entry pruned or lost at a later wall time
-could name a grant that is valid again). An unreadable sidecar, or a
-missing one with evidence of earlier damage (a `*.damaged-<ms>` file or
-a quarantine record), fails closed: `busy` "revoked grants unreadable",
-the bound rebuilt from the newest modification time in the journal
-directory (each write left its wall time there) + 65 min, and 65 min on
-the monotonic clock, as for any damage; the damaged sidecar is kept aside
-(`revoked_quarantine.damaged-<ms>`). Members, native revocations and the
-fencing of live browsers are unaffected throughout. No revocation is
-lost.
+(`{"v":1,"until","high_water"}`), written durably before every write of
+`revoked_grants`: `until` is the latest quarantine end, `high_water` the
+high-water mark; both only rise. At every write the high-water mark is
+raised to at least the host's wall time and every retained entry's
+`until − 65 min`. The host's trusted time is `max(wall, high_water)`:
+a revocation of a grant that isn't live is kept until trusted time + 65
+min, and a quarantine ends no earlier than the previous end, the
+high-water mark + 65 min and trusted time + 65 min, so no retained
+entry outlives it, whatever wall time it was written at, and damage
+found again after the wall clock went back can't shorten an earlier
+quarantine (Astation's 12:00 / 10:00 / 12:10 trace, comment
+6307612632). While the host's wall clock is below `max(until,
+high_water)`, browser grants are refused `busy` "host clock went back"
+until it catches up. The two files vouch for each other (comment
+6308222846): `revoked_grants` missing or unreadable while the sidecar or
+a `*.damaged-<ms>` file exists, or the sidecar missing or unreadable
+while `revoked_grants` or a `*.damaged-<ms>` file exists, is lost and
+fails closed the same way: `busy` "revoked grants unreadable", until
+the bound above and 65 min on the monotonic clock. A lost sidecar's
+bound is rebuilt from what is left (the entries and the quarantine
+record in `revoked_grants`) with the newest modification time in the
+journal directory as an extra floor; the damaged sidecar is kept aside
+(`revoked_quarantine.damaged-<ms>`). Only a journal with neither file and
+no `*.damaged-<ms>` copy is fresh. Members, native revocations and the
+fencing of live browsers are unaffected throughout.
+
+`busy` details a browser `hello` or a `revoke_grant` can get from this:
+"revoked grants unreadable" (the quarantine), "host clock went back"
+(the wall clock below the bound), "revocation not recorded" (a
+`revoke_grant` whose sidecar or `revoked_grants` write failed: the
+revocation is in effect in memory and a live browser is fenced, but it
+may not survive a restart; send it again) and "revoked grants journal
+full".
+
+Limits: a revocation can still be forgotten when both files are lost
+together with every copy aside (indistinguishable from a new profile),
+when the journal directory is restored from an older backup, or when
+both are damaged with no copy aside yet after a write made while the
+wall clock was behind (the rebuilt floor then rests on modification
+times written at that rolled-back time). A host whose high-water mark is
+far in the future (one write while the wall clock was wrong) refuses
+browsers "host clock went back" until the clock reaches it; there is no
+override, and the only path is to wait for the clock. Removing the
+journal directory is not a reset: it forgets every revocation (a
+revoked grant still within its lifetime would be admitted again) and the
+session journal with it.
 
 Artifacts: `atem-client-bindings.md` §7 (SwiftPM, WASM, Kotlin/JVM,
 Android; SHA256SUMS and the source pin).
