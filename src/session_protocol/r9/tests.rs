@@ -2059,3 +2059,28 @@ fn a_full_revoked_grants_journal_still_fences_the_live_browser() {
     );
     assert_eq!(rig.refused("browser").0, "closed");
 }
+
+/// runtime.log lines the router's input drives (refused envelopes,
+/// duplicate opens, unmatched acknowledgments) are rate-limited like
+/// refusal lines: a flood writes at most 20 a window plus one summary.
+#[test]
+fn router_driven_log_lines_are_rate_limited() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("ph", phone());
+    let before = rig.engine.input_lines_written();
+    for _ in 0..500 {
+        rig.envelope_in("{\"not\":\"an envelope\"}");
+        rig.envelope_in(&envelope::open("ph", Transport::Relay));
+        rig.relay_in(&json!({"type": "relay", "op": "push_ack", "acks": []}));
+    }
+    assert!(
+        rig.engine.input_lines_written() - before <= 20,
+        "{}",
+        rig.engine.input_lines_written() - before
+    );
+    rig.advance(10_000);
+    rig.envelope_in("{\"not\":\"an envelope\"}");
+    // The next window: the summary and the line.
+    assert!(rig.engine.input_lines_written() - before <= 22);
+}

@@ -258,10 +258,55 @@ pub struct R9Host {
     flush_cursor: Option<String>,
     /// Sealed push hints and seen for the relay (§R9.9).
     push: push::HostPush,
+    /// Lines driven by the router's or the relay's input, rate-limited.
+    input_log: LineLimit,
+    /// The latest monotonic time seen (for lines without a clock at hand).
+    last_mono: u64,
 }
 
 fn log(line: &str) {
     eprintln!("atem runtime: r9: {line}");
+}
+
+/// At most this many input-driven lines per window (as `refusal_log`).
+const INPUT_LOG_LINES: u32 = 20;
+const INPUT_LOG_WINDOW_MS: u64 = 10_000;
+
+/// A runtime.log rate limit for lines whose number the router or the relay
+/// decides (refused envelopes, duplicate opens, closed channels, unmatched
+/// acknowledgments): at most `INPUT_LOG_LINES` per `INPUT_LOG_WINDOW_MS`,
+/// then one "… N more … suppressed" line when the next window starts.
+#[derive(Debug, Default)]
+struct LineLimit {
+    window: u64,
+    lines: u32,
+    suppressed: u64,
+    /// Lines written (tests: the bound holds).
+    written: u64,
+}
+
+impl LineLimit {
+    fn log(&mut self, now_ms: u64, line: impl FnOnce() -> String) {
+        if now_ms >= self.window.saturating_add(INPUT_LOG_WINDOW_MS) || now_ms < self.window {
+            if self.suppressed > 0 {
+                log(&format!(
+                    "… {} more input-driven line(s) suppressed",
+                    self.suppressed
+                ));
+                self.written += 1;
+            }
+            self.window = now_ms;
+            self.lines = 0;
+            self.suppressed = 0;
+        }
+        if self.lines < INPUT_LOG_LINES {
+            self.lines += 1;
+            self.written += 1;
+            log(&line());
+        } else {
+            self.suppressed += 1;
+        }
+    }
 }
 
 fn new_id() -> String {
@@ -336,9 +381,18 @@ impl R9Host {
             dead: Vec::new(),
             flush_cursor: None,
             push: push::HostPush::default(),
+            input_log: LineLimit::default(),
+            last_mono: 0,
         };
         host.load_revoked();
         host
+    }
+
+    /// Input-driven runtime.log lines written so far (tests: the rate
+    /// limit holds).
+    #[cfg(test)]
+    pub fn input_lines_written(&self) -> u64 {
+        self.input_log.written
     }
 
     pub fn status(&self) -> R9Status {
@@ -458,10 +512,14 @@ impl R9Host {
         if self.link.is_none() {
             return Vec::new();
         }
+        let mono = parts.now.host.mono_ms;
+        self.last_mono = mono;
         let event = match envelope::parse(text) {
             Ok(event) => event,
             Err(refused) => {
-                log(&format!("refused an envelope ({})", refused.reason()));
+                self.input_log.log(mono, || {
+                    format!("refused an envelope ({})", refused.reason())
+                });
                 if let Some(handle) = refused.channel().map(str::to_owned) {
                     return self.fail(&handle, refused.reason(), parts);
                 }
@@ -487,10 +545,12 @@ impl R9Host {
     fn open<J: Journal>(&mut self, handle: String, transport: Transport, parts: &Parts<'_, J>) {
         if self.chans.contains_key(&handle) {
             // Never replaces a live handshake, keys or attachment.
-            log(&format!(
-                "ignored a duplicate open of a live channel ({})",
-                transport.as_str()
-            ));
+            self.input_log.log(parts.now.host.mono_ms, || {
+                format!(
+                    "ignored a duplicate open of a live channel ({})",
+                    transport.as_str()
+                )
+            });
             return;
         }
         let handshakes = self.chans.values().filter(|c| c.handshaking()).count();
@@ -707,7 +767,9 @@ impl R9Host {
         parts: &mut Parts<'_, J>,
     ) -> Vec<Effect> {
         if inner_too_large(frame) {
-            log("a channel's frame is over the inner-frame bound; closed (too_large)");
+            self.input_log.log(parts.now.host.mono_ms, || {
+                "a channel's frame is over the inner-frame bound; closed (too_large)".into()
+            });
             return self.fail(handle, reason::TOO_LARGE, parts);
         }
         let chan = self.chans.get_mut(handle).expect("checked");
@@ -729,7 +791,9 @@ impl R9Host {
                     Err(e) => {
                         // A gap, replay, failed tag or wrong direction: that
                         // channel closes without a reply (§R9.7 "Records").
-                        log(&format!("a channel closed: {}", e.code()));
+                        let mono = parts.now.host.mono_ms;
+                        self.input_log
+                            .log(mono, || format!("a channel closed: {}", e.code()));
                         let chan = self.chans.get_mut(handle).expect("checked");
                         chan.phase = Phase::Open(a);
                         return self.fail(handle, reason::CLOSED, parts);
@@ -1607,7 +1671,9 @@ impl R9Host {
         };
         let matched = self.push.ack(&value);
         if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
-            log("a push_ack acknowledged nothing pending");
+            self.input_log.log(self.last_mono, || {
+                "a push_ack acknowledged nothing pending".into()
+            });
         }
     }
 
@@ -1874,6 +1940,7 @@ impl R9Host {
     pub fn tick<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
         let mono = parts.now.host.mono_ms;
         let wall = parts.now.host.wall_ms;
+        self.last_mono = mono;
         self.browsers_refused(wall);
         let mut effects = self.reap(parts);
         let mut timeouts = Vec::new();
