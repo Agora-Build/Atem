@@ -1740,7 +1740,10 @@ fn an_unreadable_frozen_genesis_aborts_before_touch_id() {
         let reason = abort["data"]["reason"].as_str().unwrap();
         assert_eq!(reason, crate::runtime::ops::FROZEN_GENESIS_UNREADABLE);
         assert!(reason.chars().count() <= 200 && !reason.contains('/'), "{reason}");
-        op.printed("remove pairing/frozen_genesis and runtime/journal/frozen_genesis")
+        op.printed(
+            "remove pairing/frozen_genesis and runtime/journal/frozen_genesis in Atem's config \
+             directory (~/.config/atem by default)",
+        )
             .await;
         assert_eq!(op.done().await.unwrap_err(), "device verification failed");
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());

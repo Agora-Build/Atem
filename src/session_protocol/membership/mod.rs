@@ -1828,7 +1828,8 @@ fn frozen_genesis_damaged(name: &str, why: &str) -> String {
     format!(
         "{name} can't be read ({why}): this host can't tell which device lists it was frozen \
          on, so pairing is refused; restore it, or remove pairing/frozen_genesis and \
-         runtime/journal/frozen_genesis to forget every frozen device list"
+         runtime/journal/frozen_genesis in Atem's config directory (~/.config/atem by \
+         default) to forget every frozen device list"
     )
 }
 
