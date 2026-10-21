@@ -734,7 +734,10 @@ ever raised, written durably before the sidecar at every write that
 raises it and at the pin; `atem unpair` keeps it): it floors the bound
 everywhere, and a sidecar below it (the journal restored or rolled back)
 or an unreadable copy on a pinned host fails closed the same way. A pin
-seeds the copy and both journal files, so a host with a pinned device
+seeds the copy and both journal files (a re-pin over an existing journal
+raises its sidecar to the copy, so it isn't read as a rollback; a
+running engine reads the copy before each write, so neither file is ever
+lowered), so a host with a pinned device
 list always has them: with a pinned list and neither journal file nor a
 copy aside (`runtime/journal/` or `runtime/` removed, or only the two
 files, one event, clock behind or not), they were lost and browsers are
