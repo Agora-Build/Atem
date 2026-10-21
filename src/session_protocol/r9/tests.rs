@@ -1978,3 +1978,43 @@ fn an_issuers_demotion_carried_in_a_hello_fences_its_browser() {
         log.set_native_roles("dev-phone", &["view"]);
     });
 }
+
+/// A damaged `revoked_grants` file fails closed: a revocation it held
+/// can't be told from none, so every browser grant is refused (`busy`)
+/// until any grant it could name has expired (grant lifetime + issue
+/// slack after the start); members are unaffected; after that window
+/// browsers are admitted again.
+#[test]
+fn a_damaged_revoked_grants_file_refuses_browsers_until_any_grant_expired() {
+    let mut rig = Rig::new();
+    std::fs::write(rig.journal.join(REVOKED_GRANTS_FILE), b"{not json").unwrap();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    let grant = |rig: &mut Rig, n: u32| {
+        let wall = rig.now.host.wall_ms;
+        rig.log.grant(
+            "dev-phone",
+            &format!("aaaaaaaa-1111-4111-8111-0000000000{n:02}"),
+            HOST,
+            1,
+            None,
+            &["view"],
+            wall,
+            wall + 600_000,
+        )
+    };
+    let (g, k) = grant(&mut rig, 1);
+    rig.connect("b1", Identity::browser(g, k).unwrap());
+    assert_eq!(rig.refused("b1").0, "busy");
+    rig.advance(1000);
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    rig.advance(GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS - 60_000);
+    let (g, k) = grant(&mut rig, 2);
+    rig.connect("b2", Identity::browser(g, k).unwrap());
+    assert_eq!(rig.refused("b2").0, "busy");
+    rig.advance(61_000);
+    let (g, k) = grant(&mut rig, 3);
+    rig.connect("b3", Identity::browser(g, k).unwrap());
+    rig.attached("b3");
+}

@@ -105,6 +105,8 @@ const DETAIL_JOURNAL_HALTED: &str = "journal halted; restart Atem";
 const DETAIL_IDENTITY: &str = "host identity differs from the device list";
 /// The revoked grants journal (§R9.6), in the session journal's directory.
 pub const REVOKED_GRANTS_FILE: &str = "revoked_grants";
+/// `busy` for a browser while the revoked grants couldn't be read.
+const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
 
 /// The host's `host_channel_key` behind a provider (plain, §R9.3).
 pub struct HostKey {
@@ -241,6 +243,10 @@ pub struct R9Host {
     revoked: RevokedGrants,
     revoked_until: BTreeMap<String, u64>,
     revoked_path: Option<PathBuf>,
+    /// The revoked-grants file couldn't be read at start: browser grants
+    /// are refused until this wall time (set at the first wall time seen:
+    /// by then any grant the file could name has expired). Fail closed.
+    revoked_unreadable: Option<Option<u64>>,
     /// (approval id, device) pairs whose first `approval_seen` was taken.
     seen: HashSet<(String, String)>,
     /// The error a fenced principal's attachments get before their close.
@@ -324,6 +330,7 @@ impl R9Host {
             revoked: RevokedGrants::new(),
             revoked_until: BTreeMap::new(),
             revoked_path,
+            revoked_unreadable: None,
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
             dead: Vec::new(),
@@ -955,7 +962,13 @@ impl R9Host {
                 }
             }
             Principal::Browser { .. } => {
-                if m.is_frozen() {
+                if self.browsers_refused(wall) {
+                    Err(error(
+                        code::BUSY,
+                        re.as_deref(),
+                        Some(DETAIL_REVOKED_UNREADABLE),
+                    ))
+                } else if m.is_frozen() {
                     Err(error(code::ACCOUNT_FROZEN, re.as_deref(), None))
                 } else if m.faulted().is_some() {
                     Err(error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECORDED)))
@@ -1853,6 +1866,7 @@ impl R9Host {
     pub fn tick<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
         let mono = parts.now.host.mono_ms;
         let wall = parts.now.host.wall_ms;
+        self.browsers_refused(wall);
         let mut effects = self.reap(parts);
         let mut timeouts = Vec::new();
         let mut ended = Vec::new();
@@ -1895,19 +1909,45 @@ impl R9Host {
         let Some(path) = &self.revoked_path else {
             return;
         };
-        let Ok(Some(bytes)) = membership::store::read_private(path) else {
+        let map = match membership::store::read_private(path) {
+            Ok(None) => return,
+            Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("revoked").and_then(Value::as_object).cloned())
+                .and_then(|map| {
+                    map.into_iter()
+                        .map(|(id, until)| until.as_u64().map(|u| (id, u)))
+                        .collect::<Option<Vec<_>>>()
+                }),
+            Err(_) => None,
+        };
+        let Some(map) = map else {
+            // A revocation it held can't be told from none (§R9.6): every
+            // browser grant is refused until any grant it could name has
+            // expired. The next revocation rewrites the file.
+            log("revoked_grants is unreadable; browser grants are refused for 65 min");
+            self.revoked_unreadable = Some(None);
             return;
         };
-        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-            log("revoked_grants is damaged; ignored (grants still expire within an hour)");
-            return;
-        };
-        if let Some(map) = value.get("revoked").and_then(Value::as_object) {
-            for (id, until) in map {
-                if let Some(until) = until.as_u64() {
-                    self.revoked_until.insert(id.clone(), until);
-                    let _ = self.revoked.revoke(id, until, 0);
+        for (id, until) in map {
+            self.revoked_until.insert(id.clone(), until);
+            let _ = self.revoked.revoke(&id, until, 0);
+        }
+    }
+
+    /// Whether browser grants are refused at `wall` because the revoked
+    /// grants couldn't be read at start (see `revoked_unreadable`).
+    fn browsers_refused(&mut self, wall: u64) -> bool {
+        match &mut self.revoked_unreadable {
+            None => false,
+            Some(until) => {
+                let until =
+                    *until.get_or_insert(wall + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
+                if wall < until {
+                    return true;
                 }
+                self.revoked_unreadable = None;
+                false
             }
         }
     }
