@@ -821,8 +821,11 @@ fn a_fault_record_that_cant_be_written_still_halts() {
         file: DlFile::State,
         step: Step::TempWrite,
     });
-    // The fault record's rename fails too: a directory is in its way.
+    // The fault record's rename fails too, and its mirror's: a directory
+    // is in their way.
+    let mirror = Store::new(&rig.pairing, &rig.journal).path(DlFile::FaultMirror);
     std::fs::create_dir(&rig.pairing.fault).unwrap();
+    std::fs::create_dir(&mirror).unwrap();
     let result = host.apply_carriage(&v.carry(&["E7"]), &t0(), &mut f);
     assert_eq!(result.carried, Carried::NotRecorded);
     assert!(host.faulted().is_some(), "halted all the same");
@@ -830,6 +833,7 @@ fn a_fault_record_that_cant_be_written_still_halts() {
     drop(host);
     // The restart relies on the carriage record alone.
     std::fs::remove_dir(&rig.pairing.fault).unwrap();
+    std::fs::remove_dir(&mirror).unwrap();
     let mut f2 = remote();
     let (host, _) = rig.open(2, &t0(), &mut f2).unwrap();
     assert_eq!(host.head(), v.head("E7"));
@@ -1067,8 +1071,14 @@ fn a_carriage_never_clears_a_hold_held_by_its_record_alone() {
         let rig = Rig::new();
         rig.pin(&LOG6);
         std::fs::write(&rig.pairing.carriage, b"\x00garbage").unwrap();
-        let dir = rig.pairing.dir().to_path_buf();
-        let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+        // Neither the fault record nor its mirror (in the journal's
+        // directory) can be written.
+        let dirs = [rig.pairing.dir().to_path_buf(), rig.journal.clone()];
+        let mode = |m| {
+            for dir in &dirs {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m)).unwrap();
+            }
+        };
         mode(0o500);
         let (mut host, _) = rig.open(1, &t0(), &mut remote()).unwrap();
         assert_eq!(host.held(), Some(&Held::CarriageUnreadable));
@@ -1110,8 +1120,14 @@ fn a_carriage_never_clears_a_hold_held_by_its_intent_alone() {
         rig.pin(&LOG6);
         let intent = Store::new(&rig.pairing, &rig.journal).path(DlFile::Intent);
         std::fs::write(&intent, far.to_json().to_string()).unwrap();
-        let dir = rig.pairing.dir().to_path_buf();
-        let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+        // Neither the fault record nor its mirror (in the journal's
+        // directory) can be written.
+        let dirs = [rig.pairing.dir().to_path_buf(), rig.journal.clone()];
+        let mode = |m| {
+            for dir in &dirs {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m)).unwrap();
+            }
+        };
         mode(0o500);
         let (mut host, _) = rig.open(1, &t0(), &mut remote()).unwrap();
         assert_eq!(host.held(), Some(&Held::Unclean(far)));
@@ -1307,4 +1323,46 @@ fn an_unpair_never_replaces_an_unreadable_frozen_genesis() {
         b"{not json"
     );
     assert!(frozen_genesis(&rig.pairing).is_err());
+}
+
+/// Re-review N3: an observed write fault holds the host; losing either
+/// `membership.fault` or its mirror never lifts the hold (the other one
+/// holds it at the restart). Only a managing device's reconciliation
+/// removes both.
+#[test]
+fn losing_one_fault_record_never_lifts_the_hold() {
+    let v = vectors();
+    for lost in [DlFile::Fault, DlFile::FaultMirror] {
+        let rig = Rig::new();
+        rig.pin(&LOG6);
+        let (mut host, mut f) = opened(&rig, 1);
+        host.store_mut().inject(Injected {
+            file: DlFile::State,
+            step: Step::TempFsync,
+        });
+        host.apply_carriage(&v.carry(&["E7"]), &t0(), &mut f);
+        drop(host);
+        assert!(rig.exists(DlFile::Fault) && rig.exists(DlFile::FaultMirror));
+        // The restart (which replays the carriage) is held.
+        let (host, _) = rig.open(2, &t0(), &mut remote()).unwrap();
+        assert_eq!(host.held(), Some(&Held::Fault), "{lost:?}");
+        drop(host);
+        let path = Store::new(&rig.pairing, &rig.journal).path(lost);
+        std::fs::remove_file(&path).unwrap();
+        let (mut host, _) = rig.open(3, &t0(), &mut remote()).unwrap();
+        assert_eq!(host.held(), Some(&Held::Fault), "{lost:?} lost: still held");
+        assert_eq!(
+            host.hello("svc-discord", Some(v.head("E7")), None, false, &t0()),
+            Hello::NotReconciled
+        );
+        // The manager at the head reconciles: both go.
+        assert!(matches!(
+            host.hello("dev-phone", Some(v.head("E7")), None, false, &t0()),
+            Hello::Admit(Admission::Member { .. })
+        ));
+        assert!(!rig.exists(DlFile::Fault) && !rig.exists(DlFile::FaultMirror));
+        drop(host);
+        let (host, _) = rig.open(4, &t0(), &mut remote()).unwrap();
+        assert!(host.held().is_none(), "{lost:?}: reconciled for good");
+    }
 }

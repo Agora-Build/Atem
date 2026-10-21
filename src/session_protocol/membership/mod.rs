@@ -100,14 +100,21 @@ const EVIDENCE_PERSIST_MS: u64 = 60_000;
 const CHECKPOINT_MS: u64 = 60_000;
 /// r9 files that exist only with a device list (§R9.3): one of them
 /// without `membership.json` is a damaged or half-removed list.
-const LEFTOVERS: [DlFile; 6] = [
+const LEFTOVERS: [DlFile; 7] = [
     DlFile::Carriage,
     DlFile::Intent,
     DlFile::Freeze,
     DlFile::Fault,
+    DlFile::FaultMirror,
     DlFile::HostChannelKey,
     DlFile::Applied,
 ];
+/// A device-list write fault is recorded: `membership.fault` or its mirror
+/// in the journal's directory, in any state.
+fn fault_recorded(store: &Store) -> bool {
+    store.present(DlFile::Fault) || store.present(DlFile::FaultMirror)
+}
+
 /// `membership_applied` while `atem unpair` removes a list that never had
 /// one (so a half-done removal still opens as failed, never as none).
 const UNPAIRING_MARKER: &[u8] = br#"{"unpairing":true}"#;
@@ -600,13 +607,20 @@ impl MembershipHost {
                 ));
             }
         }
-        let fault_present = store.present(DlFile::Fault);
-        let fault_intent = store
-            .read(DlFile::Fault)
-            .ok()
-            .flatten()
-            .and_then(|b| parse_json(&b))
-            .and_then(|v| v.get("intent").and_then(Head::from_json));
+        // The fault record and its mirror vouch for each other: either
+        // one, in any state, holds the host (losing one file never lifts
+        // a hold an observed fault put on it).
+        let fault_present = fault_recorded(&store);
+        let fault_intent = [DlFile::Fault, DlFile::FaultMirror]
+            .into_iter()
+            .find_map(|file| {
+                store
+                    .read(file)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| parse_json(&b))
+                    .and_then(|v| v.get("intent").and_then(Head::from_json))
+            });
         let mut host = MembershipHost {
             store,
             m,
@@ -674,7 +688,7 @@ impl MembershipHost {
                     host.record_fault(DlFile::Carriage, None, now);
                     // Removed only once the fault record holds the host;
                     // else the record itself holds it at the next start.
-                    if host.store.present(DlFile::Fault) {
+                    if fault_recorded(&host.store) {
                         let _ = host.store.remove(DlFile::Carriage);
                     }
                 }
@@ -711,14 +725,14 @@ impl MembershipHost {
                     });
                     log("an intent is left beyond the head; held until a manager reconciles");
                     host.record_fault(DlFile::Intent, Some(intent), now);
-                    if host.store.present(DlFile::Fault) {
+                    if fault_recorded(&host.store) {
                         let _ = host.store.remove(DlFile::Intent);
                     }
                     host.held = Some(host.intent_hold(intent));
                 }
             }
         }
-        if host.held.is_none() && (fault_present || host.store.present(DlFile::Fault)) {
+        if host.held.is_none() && (fault_present || fault_recorded(&host.store)) {
             host.held = Some(match fault_intent {
                 Some(intent) => host.intent_hold(intent),
                 None => Held::Fault,
@@ -809,7 +823,7 @@ impl MembershipHost {
 
     #[cfg(any(test, debug_assertions))]
     pub fn fault_record_present(&self) -> bool {
-        self.store.present(DlFile::Fault)
+        fault_recorded(&self.store)
     }
 
     /// The previous run's clean checkpoint named this `runtime_epoch`.
@@ -866,7 +880,7 @@ impl MembershipHost {
         let Some(held) = self.held.clone() else {
             return Ok(());
         };
-        if self.store.present(DlFile::Fault) {
+        if fault_recorded(&self.store) {
             return Ok(());
         }
         let (file, intent) = match held {
@@ -875,7 +889,7 @@ impl MembershipHost {
             Held::Fault => (DlFile::Fault, None),
         };
         self.record_fault(file, intent, now);
-        if self.store.present(DlFile::Fault) {
+        if fault_recorded(&self.store) {
             Ok(())
         } else {
             Err(WriteError {
@@ -1431,11 +1445,12 @@ impl MembershipHost {
         if let Some(intent) = intent {
             record["intent"] = intent.to_json();
         }
-        if let Err(e) = self
-            .store
-            .replace(DlFile::Fault, record.to_string().as_bytes())
-        {
-            log(&format!("cannot record the fault either: {e}"));
+        // Both places: the mirror (in the journal's directory) keeps the
+        // hold if `membership.fault` is lost, and the other way round.
+        for file in [DlFile::Fault, DlFile::FaultMirror] {
+            if let Err(e) = self.store.replace(file, record.to_string().as_bytes()) {
+                log(&format!("cannot record the fault either: {e}"));
+            }
         }
     }
 
@@ -1516,9 +1531,11 @@ impl MembershipHost {
             ));
             return false;
         }
-        if let Err(e) = self.store.remove(DlFile::Fault) {
-            log(&format!("cannot remove the fault record: {e}; still held"));
-            return false;
+        for file in [DlFile::Fault, DlFile::FaultMirror] {
+            if let Err(e) = self.store.remove(file) {
+                log(&format!("cannot remove the fault record: {e}; still held"));
+                return false;
+            }
         }
         log(&format!(
             "reconciled by {device_id} at seq {}; remote admission resumes",
@@ -2084,7 +2101,7 @@ pub fn passive_status(
     // Only a recorded fault needs a managing device; an unfinished write
     // left by a plain crash is replayed at the next start, which decides
     // (§R9.3: replay and resume, unless it can't be reconciled).
-    if store::present(&pairing.fault) {
+    if fault_recorded(&Store::new(pairing, &journal_of(pairing))) {
         return Some((
             "held",
             "held (a device-list write fault is recorded); remote access waits until a managing device connects to reconcile".into(),

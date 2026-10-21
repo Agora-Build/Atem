@@ -13,6 +13,7 @@
 //! <profile>/pairing/frozen_genesis       genesis hashes this host froze on (≤ 16)
 //! <profile>/pairing/frozen_genesis.mirror the same list, written first
 //! <config>/runtime/journal/membership_applied  the head whose fences are durable
+//! <config>/runtime/journal/membership_fault    the fault record's mirror
 //! ```
 //!
 //! Every step can fail on purpose (tests, and the debug-only hook
@@ -44,6 +45,9 @@ pub enum DlFile {
     Freeze,
     /// `membership.fault`.
     Fault,
+    /// `<journal>/membership_fault`: the fault record's mirror, in another
+    /// directory; either one holds the host.
+    FaultMirror,
     /// `<journal>/membership_applied`.
     Applied,
     /// `frozen_genesis`.
@@ -62,6 +66,7 @@ impl DlFile {
             DlFile::State => "membership.json",
             DlFile::Freeze => "membership.freeze",
             DlFile::Fault => "membership.fault",
+            DlFile::FaultMirror => "membership_fault",
             DlFile::Applied => "membership_applied",
             DlFile::FrozenGenesis => "frozen_genesis",
             DlFile::FrozenGenesisMirror => "frozen_genesis.mirror",
@@ -293,6 +298,7 @@ impl Store {
             DlFile::State => self.pairing.membership.clone(),
             DlFile::Freeze => self.pairing.freeze.clone(),
             DlFile::Fault => self.pairing.fault.clone(),
+            DlFile::FaultMirror => self.journal_dir.join("membership_fault"),
             DlFile::Applied => self.journal_dir.join("membership_applied"),
             DlFile::FrozenGenesis => self.pairing.frozen_genesis.clone(),
             DlFile::FrozenGenesisMirror => self.pairing.frozen_genesis_mirror.clone(),
@@ -302,7 +308,7 @@ impl Store {
 
     fn dir_of(&self, file: DlFile) -> PathBuf {
         match file {
-            DlFile::Applied => self.journal_dir.clone(),
+            DlFile::Applied | DlFile::FaultMirror => self.journal_dir.clone(),
             _ => self.pairing.dir().to_path_buf(),
         }
     }

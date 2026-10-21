@@ -434,3 +434,35 @@ fn a_pending_recovery_waits_on_the_host_clock_across_a_reboot() {
     assert_eq!(record(&b)["reason"], "wait_ended");
     b.stop();
 }
+
+/// Re-review N3: the hold an observed write fault put on the host isn't
+/// lifted by losing one of its two records: with `membership.fault` (or
+/// its mirror, `runtime/journal/membership_fault`) removed, `atem status`
+/// still says held and the next runtime starts held.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn losing_one_fault_record_keeps_the_runtime_held() {
+    for lost in ["pairing", "journal"] {
+        let mut b = Box_::new();
+        b.mark("fail_next", "state:temp_write");
+        b.carry(&["E7"]);
+        b.start(false);
+        b.until("the carriage", || !b.carried().is_empty());
+        assert!(b.exists("membership.fault"), "{lost}");
+        assert!(b.journal().join("membership_fault").exists(), "{lost}");
+        b.stop();
+        let path = match lost {
+            "pairing" => b.pairing().join("membership.fault"),
+            _ => b.journal().join("membership_fault"),
+        };
+        std::fs::remove_file(&path).unwrap();
+        let (out, err, _) = b.sandbox.atem(&["status"]);
+        assert!(
+            out.contains("held (a device-list write fault"),
+            "{lost}: {out}{err}"
+        );
+        b.start(false);
+        b.until("the restart", || b.log().contains("held ("));
+        b.stop();
+    }
+}
