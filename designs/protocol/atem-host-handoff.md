@@ -698,9 +698,13 @@ Host state behind two of these answers (no action for Astation): a
 revoked browser grant is kept in `runtime/journal/revoked_grants` until
 its grant's expiry (at most 256; a full journal answers `revoke_grant`
 `busy` "revoked grants journal full" but still fences a live browser at
-once); if that file can't be read at start, every browser grant is
-refused `busy` "revoked grants unreadable" for 65 min (grant lifetime +
-issue slack), so no revocation is lost.
+once); if that file can't be read at start, it is kept aside
+(`revoked_grants.damaged-<ms>`) and every browser grant is refused `busy`
+"revoked grants unreadable" for at least 65 min (grant lifetime + issue
+slack). The rewritten file records that quarantine and every later write
+keeps the record, so a revocation during it or a restart can't end it
+early; it ends once the wall clock passed the recorded end and the running
+process saw 65 min on its monotonic clock. No revocation is lost.
 
 Artifacts: `atem-client-bindings.md` §7 (SwiftPM, WASM, Kotlin/JVM,
 Android; SHA256SUMS and the source pin).
