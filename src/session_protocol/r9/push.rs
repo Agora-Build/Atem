@@ -581,8 +581,9 @@ impl HostPush {
 
     /// Forgets one tracked approval to make room, never a published
     /// lifecycle: first one with nothing left to send (its resolution
-    /// acknowledged, or none ever owed), then one pending whose opens were
-    /// never published. False when there is none.
+    /// acknowledged, or none ever owed), then one whose opens were never
+    /// published, pending or closed (the relay holds nothing of it, so its
+    /// resolution is owed to nobody). False when there is none.
     fn make_room(&mut self) -> bool {
         let pick = |want: &dyn Fn(&Tracked) -> bool| {
             self.order
@@ -592,7 +593,7 @@ impl HostPush {
         };
         let victim =
             pick(&|t: &Tracked| t.unacked.is_empty() && (t.approval.is_closed() || !t.published))
-                .or_else(|| pick(&|t: &Tracked| !t.approval.is_closed() && !t.published));
+                .or_else(|| pick(&|t: &Tracked| !t.published));
         let Some(victim) = victim else {
             return false;
         };

@@ -871,3 +871,135 @@ fn unpublished_opens_make_room_first() {
     assert!(!sent.contains(&ids[0]));
     assert!(sent.contains(&ids[64]));
 }
+
+/// The make-room order on a bare `HostPush` with the rig's signer.
+fn approval_key(rig: &Rig, n: usize) -> ApprovalKey {
+    ApprovalKey::new(
+        rig.m.as_ref().unwrap().membership(),
+        super::tests::HOST,
+        1,
+        SID,
+        PGEN,
+        &format!("8c3e9d6b-1f40-4b52-8dae-{n:012x}"),
+    )
+}
+
+fn signer_of(rig: &Rig) -> Signer<'_> {
+    Signer {
+        log: rig.m.as_ref().unwrap().membership(),
+        key: &rig.key,
+    }
+}
+
+fn plain() -> HintPlain {
+    HintPlain {
+        tool: "Bash".into(),
+        summary: "ls".into(),
+    }
+}
+
+/// Task 8 re-review 3 F1: an approval closed before its opens were ever
+/// published holds no lifecycle the relay may have; it makes room like an
+/// unpublished pending one, whether its resolution was acknowledged or
+/// not.
+#[test]
+fn a_closed_never_published_approval_makes_room() {
+    let rig = Rig::new();
+    let (key, signer) = (|n| approval_key(&rig, n), || signer_of(&rig));
+    let wall = rig.now.host.wall_ms;
+    let push = &mut HostPush::default();
+    {
+        push.link_up(None, wall);
+        for n in 0..MAX_APPROVALS - 1 {
+            push.opened(key(n), wall, wall + WAIT_MS, &plain(), Some(signer()), wall);
+        }
+        push.link_down();
+        let closed = key(100);
+        push.opened(
+            closed.clone(),
+            wall,
+            wall + WAIT_MS,
+            &plain(),
+            Some(signer()),
+            wall,
+        );
+        push.resolved(&closed.approval_id, "interrupted", Some(signer()), wall);
+        let next = key(101);
+        push.opened(
+            next.clone(),
+            wall,
+            wall + WAIT_MS,
+            &plain(),
+            Some(signer()),
+            wall,
+        );
+        assert!(!push.tracks(&closed.approval_id), "made room");
+        assert!(push.tracks(&next.approval_id));
+        assert_eq!(push.unhinted(), 0);
+        for n in 0..MAX_APPROVALS - 1 {
+            assert!(push.tracks(&key(n).approval_id), "published {n} kept");
+        }
+    }
+}
+
+/// Task 8 re-review 3 F3: a mixed population (published old, unpublished
+/// newer). Room is made from one with nothing left to send first, even a
+/// newer one, then from the oldest unpublished; never from a published
+/// lifecycle, however old; once all are published, a new one is unhinted.
+#[test]
+fn make_room_takes_finished_then_unpublished_never_published() {
+    let rig = Rig::new();
+    let (key, signer) = (|n| approval_key(&rig, n), || signer_of(&rig));
+    let wall = rig.now.host.wall_ms;
+    let push = &mut HostPush::default();
+    {
+        push.link_up(None, wall);
+        for n in 0..MAX_APPROVALS - 2 {
+            push.opened(key(n), wall, wall + WAIT_MS, &plain(), Some(signer()), wall);
+        }
+        push.link_down();
+        // Unpublished, pending (tier 2), older than…
+        let pending = key(200);
+        push.opened(
+            pending.clone(),
+            wall,
+            wall + WAIT_MS,
+            &plain(),
+            Some(signer()),
+            wall,
+        );
+        // …one unpublished whose opens the guard ended: nothing left to
+        // send (tier 1).
+        let finished = key(201);
+        push.opened(
+            finished.clone(),
+            wall,
+            wall + 20_000,
+            &plain(),
+            Some(signer()),
+            wall,
+        );
+        push.tick(None, wall + 6_000);
+        let at = wall + 6_000;
+        let a = key(202);
+        push.opened(a.clone(), at, at + WAIT_MS, &plain(), Some(signer()), at);
+        assert!(!push.tracks(&finished.approval_id), "tier 1 first");
+        assert!(push.tracks(&pending.approval_id));
+        let b = key(203);
+        push.opened(b.clone(), at, at + WAIT_MS, &plain(), Some(signer()), at);
+        assert!(
+            !push.tracks(&pending.approval_id),
+            "then the oldest unpublished"
+        );
+        assert!(push.tracks(&a.approval_id) && push.tracks(&b.approval_id));
+        for n in 0..MAX_APPROVALS - 2 {
+            assert!(push.tracks(&key(n).approval_id), "published {n} kept");
+        }
+        // The reconnect publishes the rest: no room for another.
+        push.link_up(None, at);
+        let c = key(204);
+        push.opened(c.clone(), at, at + WAIT_MS, &plain(), Some(signer()), at);
+        assert!(!push.tracks(&c.approval_id));
+        assert_eq!(push.unhinted(), 1);
+    }
+}
