@@ -2865,11 +2865,89 @@ fn vouched_engine(rig: &Rig) -> R9Host {
     )
 }
 
+/// `atem unpair`, then `atem pair` again (the same list): the journal is
+/// kept, the pin seeds over it.
+fn repin(rig: &Rig) {
+    crate::session_protocol::membership::forget_on_unpair(&rig.pairing).unwrap();
+    let pin = HostPin {
+        host_id: HOST.into(),
+        host_trust_gen: 1,
+    };
+    crate::session_protocol::membership::MembershipHost::pin(
+        &rig.pairing,
+        &rig.journal,
+        &pin,
+        &rig.log.log,
+        &secret("host seed"),
+    )
+    .unwrap();
+}
+
 fn bound_in(path: &std::path::Path) -> revoked::Bound {
     match revoked::load_sidecar(path) {
         revoked::SidecarLoaded::Read(b) => b,
         other => panic!("{}: {other:?}", path.display()),
     }
+}
+
+/// Re-review N1: a re-pin over an existing journal (unpair, then pair,
+/// then a restart) raises the journal's sidecar with the pairing's copy,
+/// so the restart is neither quarantined nor read as a journal rolled
+/// back; a revoked grant stays refused, a fresh one is admitted. A real
+/// rollback of the journal afterwards still fails closed.
+#[test]
+fn a_repin_over_the_journal_is_no_rollback() {
+    let mut rig = Rig::new();
+    rig.engine = vouched_engine(&rig);
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let a = browser_of(&mut rig, 1);
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    // The pin comes later on the host's clock than every write so far.
+    let written = bound_in(&rig.journal.join(revoked::SIDECAR_FILE)).high_water;
+    while r9log::host_now().wall_ms <= written + 10 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    rig.link_down();
+    repin(&rig);
+    let copy = bound_in(&rig.pairing.revoked_floor);
+    let side = bound_in(&rig.journal.join(revoked::SIDECAR_FILE));
+    assert!(copy.high_water > written, "the pin raised the copy");
+    // The restart.
+    rig.engine = vouched_engine(&rig);
+    rig.link_up();
+    rig.now.host.wall_ms = rig.now.host.wall_ms.max(copy.high_water) + 1000;
+    rig.advance(1000);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    rig.advance(1000);
+    let b = browser_of(&mut rig, 2);
+    rig.connect("b1", b);
+    rig.attached("b1");
+    assert_eq!(side, copy, "the pin raised the sidecar with the copy");
+    rig.advance(1000);
+    rig.connect("a1", a);
+    assert_eq!(rig.refused("a1").0, "unauthorized");
+
+    // A real rollback: the journal restored from before a revocation.
+    let files = [REVOKED_GRANTS_FILE, revoked::SIDECAR_FILE];
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(rig.journal.join(f)).unwrap())
+        .collect();
+    rig.advance(60_000);
+    let c = browser_of(&mut rig, 3);
+    let _ = revoke_from(&mut rig, "ph2", &revoked_grant_id(3));
+    for (f, bytes) in files.iter().zip(before) {
+        std::fs::write(rig.journal.join(f), bytes).unwrap();
+    }
+    rig.link_down();
+    rig.engine = vouched_engine(&rig);
+    rig.link_up();
+    rig.connect("ph3", phone());
+    rig.attached("ph3");
+    assert_quarantined(&mut rig, "c1", c);
 }
 
 /// Re-review N2: a pin while the engine runs raises the pairing's copy on

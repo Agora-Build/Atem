@@ -125,11 +125,13 @@ pub struct PairingVouch {
 }
 
 /// Seeds the revoked-grants files when a device list is pinned (§R9.6):
-/// the pairing's copy of the bound (`copy`, raised to `wall` at least),
-/// then in `journal_dir` the sidecar, then an empty `revoked_grants`, each
-/// durable. A pinned host then always has them, so their loss is never
-/// read as a fresh host. Journal files already there (a host paired
-/// before) are kept as they are.
+/// the pairing's copy of the bound (`copy`), raised to the max of itself,
+/// the journal's sidecar and `wall`, then the sidecar raised to the same
+/// floor (or seeded with it), then an empty `revoked_grants` if the journal
+/// has none, each durable. A pinned host then always has them, so their
+/// loss is never read as a fresh host, and a re-pin over an existing
+/// journal leaves the sidecar level with the copy. Damaged or lost journal
+/// files (a host paired before) are kept as they are.
 pub fn seed_revoked_journal(journal_dir: &Path, copy: &Path, wall: u64) -> std::io::Result<()> {
     let main = journal_dir.join(REVOKED_GRANTS_FILE);
     let sidecar = journal_dir.join(revoked::SIDECAR_FILE);
@@ -145,17 +147,23 @@ pub fn seed_revoked_journal(journal_dir: &Path, copy: &Path, wall: u64) -> std::
     if revoked::load_sidecar(copy) != revoked::SidecarLoaded::Read(floor) {
         revoked::write_atomic(copy, &revoked::encode_sidecar(floor), None)?;
     }
-    if main.symlink_metadata().is_ok()
-        || sidecar.symlink_metadata().is_ok()
-        || revoked::damaged_asides(journal_dir)
-    {
+    // Then the journal's sidecar, to the same floor (never below the copy,
+    // so a re-pin isn't read as a journal rolled back). A damaged or lost
+    // one is left as it is (it fails closed at the next start).
+    match revoked::load_sidecar(&sidecar) {
+        revoked::SidecarLoaded::Read(b) => {
+            if b != floor {
+                revoked::write_atomic(&sidecar, &revoked::encode_sidecar(floor), None)?;
+            }
+            return Ok(());
+        }
+        revoked::SidecarLoaded::Unreadable => return Ok(()),
+        revoked::SidecarLoaded::Missing => {}
+    }
+    if main.symlink_metadata().is_ok() || revoked::damaged_asides(journal_dir) {
         return Ok(());
     }
-    let bound = revoked::Bound {
-        until: 0,
-        high_water: wall,
-    };
-    revoked::write_atomic(&sidecar, &revoked::encode_sidecar(bound), None)?;
+    revoked::write_atomic(&sidecar, &revoked::encode_sidecar(floor), None)?;
     revoked::write_atomic(&main, &revoked::encode(&BTreeMap::new(), None), None)
 }
 
