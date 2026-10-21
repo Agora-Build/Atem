@@ -591,3 +591,266 @@ fn a_second_damage_after_the_clock_went_back_keeps_the_earlier_end() {
     }
     assert_eq!(rig.kept_aside().len(), 2, "{:?}", rig.kept_aside());
 }
+
+/// A live browser on `handle` is fenced by the phone's revocation of
+/// `grant_id` ("grant revoked"), and refused after that (with
+/// `again_code` when given).
+#[allow(clippy::too_many_arguments)]
+fn revoke_live(
+    router: &mut Router<'_>,
+    rig: &Rig,
+    ph_handle: &str,
+    ph: &mut Attached,
+    handle: &str,
+    live: &mut Attached,
+    grant_id: &str,
+    identity: &Identity,
+    again_code: Option<&str>,
+) {
+    revoke(router, ph_handle, ph, grant_id);
+    let mut fenced = false;
+    while let Ok(events) = router.events(handle, live) {
+        fenced |= events.iter().any(|e| {
+            matches!(e, CEvent::Fenced(e) | CEvent::Error(e)
+                if e.code == "unauthorized"
+                    && e.detail.as_deref() == Some("grant revoked"))
+        });
+    }
+    assert!(fenced, "the live browser is fenced by the revocation");
+    next_init();
+    let again = router
+        .connect(&format!("{handle}-again"), &rig.log, HOST, identity)
+        .err()
+        .expect("refused after its revocation");
+    if let Some(code) = again_code {
+        assert_eq!(again.0, code);
+    }
+}
+
+/// Astation's comment 6308222846: A issued at 12:00 for an hour and
+/// revoked at 12:01; the runtime stopped and only `revoked_grants` lost
+/// (the sidecar and the rest of the journal kept); at 12:03 A must be
+/// refused (quarantined), and native revocations and live fencing keep
+/// working. The same loss during an active quarantine, after the wall
+/// clock went back, keeps the earlier end.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn a_lost_revoked_grants_next_to_its_sidecar_refuses_the_revoked_grant() {
+    let mut rig = Rig::new();
+    rig.start();
+    let a = grant(&mut rig.log, &rig.clock, GA, 60 * MIN);
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-1", &rig.log, HOST, &phone())
+            .expect("the phone");
+        rig.clock.set_wall(MIN as i64);
+        revoke(&mut router, "ph-1", &mut ph, GA);
+    }
+    assert!(rig.journal().join("revoked_quarantine").exists());
+    rig.stop(true);
+    std::fs::remove_file(rig.revoked_file()).unwrap();
+
+    // 12:03.
+    rig.clock.set_wall(3 * MIN as i64);
+    rig.start();
+    let first_end;
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-2", &rig.log, HOST, &phone())
+            .expect("the phone (members are unaffected)");
+        quarantined(&mut router, &rig, "a-1", &a);
+        revoke(&mut router, "ph-2", &mut ph, GB);
+        let record: serde_json::Value = serde_json::from_str(&rig.revoked_text()).unwrap();
+        first_end = record["quarantine"]["until"].as_u64().expect("the record");
+        assert!(rig.revoked_text().contains(GB), "{}", rig.revoked_text());
+    }
+    rig.stop(true);
+
+    // During that quarantine: the wall clock an hour back, the main file
+    // lost again. The earlier end holds past the window on both clocks.
+    rig.clock.set_wall(-57 * MIN as i64);
+    std::fs::remove_file(rig.revoked_file()).unwrap();
+    rig.start();
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-3", &rig.log, HOST, &phone())
+            .expect("the phone");
+        quarantined(&mut router, &rig, "a-2", &a);
+        within("the second quarantine recorded", || {
+            rig.revoked_text().contains("\"quarantine\"")
+        });
+        let record: serde_json::Value = serde_json::from_str(&rig.revoked_text()).unwrap();
+        assert!(
+            record["quarantine"]["until"].as_u64().unwrap() >= first_end,
+            "{record}"
+        );
+        rig.clock.set_wall(10 * MIN as i64);
+        rig.clock.add_mono(66 * MIN);
+        quarantined(&mut router, &rig, "a-3", &a);
+
+        // Past the first end: a fresh grant is admitted and fenced live
+        // by a native revocation.
+        rig.clock
+            .set_wall((first_end - r9log::host_now().wall_ms + MIN) as i64);
+        let d_id = "aaaaaaaa-1111-4111-8111-0000000000d9";
+        let d = grant(&mut rig.log, &rig.clock, d_id, 50 * MIN);
+        next_init();
+        let mut live = router
+            .connect("d-1", &rig.log, HOST, &d)
+            .expect("a grant never revoked, after the first end");
+        revoke_live(
+            &mut router,
+            &rig,
+            "ph-3",
+            &mut ph,
+            "d-1",
+            &mut live,
+            d_id,
+            &d,
+            Some("unauthorized"),
+        );
+    }
+    let log = rig.runtime_log();
+    assert!(
+        log.contains("revoked_grants is unreadable or missing"),
+        "{log}"
+    );
+}
+
+/// The sidecar lost while `revoked_grants` is kept: fail closed, browser
+/// grants are quarantined (the bound rebuilt from what is left).
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn a_lost_sidecar_next_to_revoked_grants_is_quarantined() {
+    let mut rig = Rig::new();
+    rig.start();
+    let a = grant(&mut rig.log, &rig.clock, GA, 50 * MIN);
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-1", &rig.log, HOST, &phone())
+            .expect("the phone");
+        revoke(&mut router, "ph-1", &mut ph, GA);
+    }
+    rig.stop(true);
+    std::fs::remove_file(rig.journal().join("revoked_quarantine")).unwrap();
+    rig.start();
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-2", &rig.log, HOST, &phone())
+            .expect("the phone");
+        quarantined(&mut router, &rig, "a-1", &a);
+        let c = grant(
+            &mut rig.log,
+            &rig.clock,
+            "aaaaaaaa-1111-4111-8111-0000000000c1",
+            50 * MIN,
+        );
+        quarantined(&mut router, &rig, "c-1", &c);
+        revoke(&mut router, "ph-2", &mut ph, GB);
+    }
+    assert!(rig.journal().join("revoked_quarantine").exists());
+    let log = rig.runtime_log();
+    assert!(
+        log.contains("revoked_quarantine is unreadable or missing"),
+        "{log}"
+    );
+}
+
+/// Re-review N1a: a grant revoked while it isn't live and the wall clock
+/// is two hours behind the high-water mark is kept for the window after
+/// the trusted time; when the clock returns (across a restart), it is
+/// still refused.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn a_revocation_while_the_clock_is_behind_outlives_the_rollback() {
+    let mut rig = Rig::new();
+    rig.start();
+    let a = grant(&mut rig.log, &rig.clock, GA, 50 * MIN);
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-1", &rig.log, HOST, &phone())
+            .expect("the phone");
+        // W: another revocation sets the high-water mark.
+        revoke(&mut router, "ph-1", &mut ph, GB);
+        rig.clock.set_wall(-120 * MIN as i64);
+        revoke(&mut router, "ph-1", &mut ph, GA);
+    }
+    rig.stop(false);
+    rig.clock.set_wall(10 * MIN as i64);
+    rig.start();
+    {
+        let mut router = Router::new(&rig.astation);
+        router
+            .connect("ph-2", &rig.log, HOST, &phone())
+            .expect("the phone");
+        next_init();
+        assert_eq!(
+            router.connect("a-1", &rig.log, HOST, &a).unwrap_err().0,
+            "unauthorized"
+        );
+    }
+}
+
+/// Re-review N1b: A admitted live at W; the wall clock two hours back;
+/// A revoked (kept until its expiry, W + 50); one damage and a restart.
+/// After the window on both clocks, and when the wall clock is back at
+/// W + 10, A is still refused: the quarantine lasts until its true end.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn a_live_revocation_during_a_rollback_outlives_one_damage() {
+    let mut rig = Rig::new();
+    rig.start();
+    let a = grant(&mut rig.log, &rig.clock, GA, 50 * MIN);
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-1", &rig.log, HOST, &phone())
+            .expect("the phone");
+        next_init();
+        let mut live = router
+            .connect("a-1", &rig.log, HOST, &a)
+            .expect("A before its revocation");
+        rig.clock.set_wall(-120 * MIN as i64);
+        // Refused "host clock went back" meanwhile.
+        revoke_live(
+            &mut router,
+            &rig,
+            "ph-1",
+            &mut ph,
+            "a-1",
+            &mut live,
+            GA,
+            &a,
+            None,
+        );
+    }
+    rig.stop(true);
+    std::fs::write(rig.revoked_file(), b"\x00damaged").unwrap();
+    rig.start();
+    {
+        let mut router = Router::new(&rig.astation);
+        router
+            .connect("ph-2", &rig.log, HOST, &phone())
+            .expect("the phone");
+        quarantined(&mut router, &rig, "a-2", &a);
+        rig.clock.add_mono(WINDOW + MIN);
+        // W - 54 (A isn't valid yet on this clock): a fresh grant is
+        // refused; the quarantine alone (W - 55) would have ended.
+        rig.clock.set_wall(-54 * MIN as i64);
+        let c = grant(
+            &mut rig.log,
+            &rig.clock,
+            "aaaaaaaa-1111-4111-8111-0000000000c2",
+            50 * MIN,
+        );
+        quarantined(&mut router, &rig, "c-1", &c);
+        rig.clock.set_wall(10 * MIN as i64);
+        quarantined(&mut router, &rig, "a-3", &a);
+    }
+}

@@ -20,17 +20,23 @@
 //! The conservative bound lives in its own small file, independent of any
 //! one damaged `revoked_grants`: `revoked_quarantine`,
 //! `{"v":1,"until":ms,"high_water":ms}` ([`Bound`]): the latest quarantine
-//! end (only ever rises) and the highest host wall time seen at a write
-//! (every write of `revoked_grants` writes it first, durably). A new
-//! quarantine ends no earlier than `max(until, now + 65 min, high_water +
-//! 65 min)`, so damage found after the wall clock went back can't shorten
-//! an earlier one; and while the wall clock is below `high_water` browser
-//! grants are refused (the clock went back: an entry pruned or lost at a
-//! later wall time could name a grant valid again). An unreadable
-//! `revoked_quarantine`, or a missing one with evidence of earlier damage
-//! (a file kept aside, or a quarantine record), fails closed: the bound is
-//! rebuilt from the newest modification time in the journal directory
-//! (see [`newest_mtime`]).
+//! end (only ever rises) and the high-water mark (only ever rises): at
+//! every write at least the host's wall time and every retained entry's
+//! `until − 65 min` ([`Bound::cover`]), written first, durably. The host's
+//! trusted time is `max(wall, high_water)`; revocations and quarantines are
+//! bounded from it, never from a wall clock that went back. A new
+//! quarantine ends no earlier than `max(until, high_water + 65 min, trusted
+//! now + 65 min)`, so it outlives every entry a lost file could have held;
+//! and while the wall clock is below `max(until, high_water)` browser
+//! grants are refused (the clock went back).
+//!
+//! The files vouch for each other: a `revoked_grants` missing or unreadable
+//! while the sidecar or a copy aside exists, or a sidecar missing or
+//! unreadable while `revoked_grants` or a copy aside exists, is lost and
+//! quarantined (a lost sidecar's bound is rebuilt from the entries and the
+//! record left, with the newest modification time in the journal directory
+//! as an extra floor, see [`newest_mtime`]). Only a journal with none of
+//! them is fresh.
 
 use atem_client::principal::{GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS};
 use serde_json::Value;
@@ -47,10 +53,12 @@ use std::path::{Path, PathBuf};
 ///   3 600 000` (`GRANT_MAX_LIFETIME_MS`), so `expires_at ≤ w + 65 min`;
 /// - any other revocation is kept until `wall + 65 min` (`revoke_grant`).
 ///
-/// Those entries were written before the damage was found, so 65 min after
-/// that none of them is in effect any more; a wall clock that went back
-/// before it was found is covered by the sidecar's high-water mark
-/// ([`Bound::floor`]).
+/// A wall clock that went back breaks "after the wall time it was
+/// written" (a live browser admitted at a later wall time; a revocation
+/// written while the clock was behind): revocations are bounded from the
+/// trusted time `max(wall, high_water)` instead, and every write raises the
+/// high-water mark to cover each retained entry ([`Bound::cover`]), so
+/// `high_water + SAFE_WINDOW_MS` ([`Bound::floor`]) outlives them all.
 pub const SAFE_WINDOW_MS: u64 = GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS;
 
 /// Browser grants refused because the revoked grants couldn't be read.
@@ -187,6 +195,16 @@ impl Bound {
     pub fn floor(&self) -> u64 {
         self.until
             .max(self.high_water.saturating_add(SAFE_WINDOW_MS))
+    }
+
+    /// Raises the high-water mark so that every entry kept `until` ends
+    /// within the window after it (`high_water ≥ until − window`): a later
+    /// quarantine, `high_water + window` or more, outlives every retained
+    /// revocation, whatever wall time it was written at.
+    pub fn cover(&mut self, untils: impl IntoIterator<Item = u64>) {
+        for until in untils {
+            self.high_water = self.high_water.max(until.saturating_sub(SAFE_WINDOW_MS));
+        }
     }
 
     /// Wall times below this mean the clock went back.

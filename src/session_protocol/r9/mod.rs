@@ -108,9 +108,8 @@ const DETAIL_IDENTITY: &str = "host identity differs from the device list";
 pub const REVOKED_GRANTS_FILE: &str = "revoked_grants";
 /// `busy` for a browser while the revoked grants couldn't be read.
 const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
-/// `busy` for a browser while the host's wall clock is below the
-/// high-water mark the revoked grants were written at (the clock went
-/// back).
+/// `busy` for a browser while the host's wall clock is below the revoked
+/// grants' bound, `max(until, high_water)` (the clock went back).
 const DETAIL_CLOCK_BACK: &str = "host clock went back";
 
 /// The host's `host_channel_key` behind a provider (plain, §R9.3).
@@ -1535,7 +1534,10 @@ impl R9Host {
                 Phase::Open(a) if a.authority.name() == principal => a.authority.expires_at,
                 _ => None,
             })
-            .unwrap_or(wall + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
+            // Not live: the latest a grant of that id could still live,
+            // after the host's trusted time (a wall clock that went back
+            // can't shorten it).
+            .unwrap_or(self.trusted_now(wall) + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
         if self.revoked.revoke(&grant_id, until, wall).is_err() {
             // Not recorded (a later hello with that grant isn't refused),
             // but a live browser is fenced at once anyway (fail closed).
@@ -1555,8 +1557,9 @@ impl R9Host {
         self.revoked_until.retain(|_, t| wall < *t);
         let t = self.revoked_until.entry(grant_id.clone()).or_insert(until);
         *t = (*t).max(until);
+        let trusted = self.trusted_now(wall);
         if let Some(q) = &mut self.quarantine {
-            q.anchor(wall, mono);
+            q.anchor(trusted, mono);
         }
         // During a quarantine the write carries its record (§R9.6).
         let recorded = self.save_revoked(wall);
@@ -2037,10 +2040,25 @@ impl R9Host {
         };
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let sidecar = path.with_file_name(revoked::SIDECAR_FILE);
+        let main = revoked::load(&path);
+        let side = revoked::load_sidecar(&sidecar);
+        let asides = revoked::damaged_asides(&dir);
+        // The files vouch for each other (§R9.6): every write leaves both
+        // (the sidecar first), and damage leaves a copy aside. Only a
+        // journal with none of them is fresh.
+        if matches!(main, revoked::Loaded::Missing)
+            && side == revoked::SidecarLoaded::Missing
+            && !asides
+        {
+            return;
+        }
         let mut record = None;
-        let main_damaged = match revoked::load(&path) {
-            revoked::Loaded::Missing => false,
-            revoked::Loaded::Unreadable => true,
+        let main_lost = match main {
+            revoked::Loaded::Missing => true,
+            revoked::Loaded::Unreadable => {
+                self.revoked_damaged = revoked::Damaged::found();
+                true
+            }
             revoked::Loaded::Read {
                 revoked: map,
                 quarantine,
@@ -2053,50 +2071,45 @@ impl R9Host {
                 false
             }
         };
-        let side = revoked::load_sidecar(&sidecar);
-        // Evidence of earlier damage: a sidecar missing then is lost.
-        let evidence = record.is_some() || revoked::damaged_asides(&dir);
-        let bound = match side {
-            revoked::SidecarLoaded::Read(b) => Some(b),
-            revoked::SidecarLoaded::Missing if !evidence => Some(revoked::Bound::default()),
-            _ => None,
-        };
-        if main_damaged {
-            self.revoked_damaged = revoked::Damaged::found();
-        }
-        let Some(bound) = bound else {
-            // The bound is lost (§R9.6, fail closed): rebuilt as the newest
-            // write time left in the journal directory (each write left
-            // its wall time there), a new quarantine ending no earlier
-            // than that + the window and now + the window, on both clocks.
-            let high_water = revoked::newest_mtime(&dir);
-            let until = record.map_or(0, |(_, u)| u);
-            self.bound = revoked::Bound { until, high_water };
-            if side == revoked::SidecarLoaded::Unreadable {
-                self.sidecar_damaged = revoked::Damaged::found();
+        let (mut bound, side_lost) = match side {
+            revoked::SidecarLoaded::Read(b) => (b, false),
+            other => {
+                if other == revoked::SidecarLoaded::Unreadable {
+                    self.sidecar_damaged = revoked::Damaged::found();
+                }
+                // The bound is lost: rebuilt from what is there (below),
+                // and, as an extra floor, the newest write time left in the
+                // journal directory (each write left its wall time there).
+                (
+                    revoked::Bound {
+                        until: 0,
+                        high_water: revoked::newest_mtime(&dir),
+                    },
+                    true,
+                )
             }
-            log(&format!(
-                "revoked_quarantine is {}; browser grants are refused for at least 65 min \
-                 and until the wall clock passes {}",
-                if side == revoked::SidecarLoaded::Unreadable {
-                    "unreadable"
-                } else {
-                    "missing after earlier damage"
-                },
-                self.bound.floor()
-            ));
-            self.quarantine = Some(revoked::Quarantine::starting(self.bound.floor()));
-            return;
         };
+        bound.until = bound.until.max(record.map_or(0, |(_, u)| u));
+        bound.cover(self.revoked_until.values().copied());
         self.bound = bound;
-        if main_damaged {
-            // A revocation it held can't be told from none (§R9.6):
-            // every browser grant is refused until any grant it could
-            // name has expired, and no earlier than the previous end or
-            // the high-water mark + the window (a wall clock set back
-            // can't shorten it). The damaged file is kept aside at the
-            // first pass, and every write carries the quarantine.
-            log("revoked_grants is unreadable; browser grants are refused for at least 65 min");
+        if main_lost || side_lost {
+            // A revocation a lost file held can't be told from none
+            // (§R9.6, fail closed): every browser grant is refused until
+            // any grant it could name has expired, no earlier than the
+            // previous end or the high-water mark + the window (a wall
+            // clock set back can't shorten it), and for the window on this
+            // process's monotonic clock. A damaged file is kept aside at
+            // the first pass, and every write carries the quarantine.
+            let what = match (main_lost, side_lost) {
+                (true, true) => "revoked_grants and revoked_quarantine are",
+                (true, false) => "revoked_grants is",
+                _ => "revoked_quarantine is",
+            };
+            log(&format!(
+                "{what} unreadable or missing; browser grants are refused for at least 65 min \
+                 and until the wall clock passes {}",
+                bound.floor()
+            ));
             self.quarantine = Some(revoked::Quarantine::starting(bound.floor()));
         } else if let Some((started_at, until)) = record {
             let until = until.max(bound.until);
@@ -2109,14 +2122,22 @@ impl R9Host {
         }
     }
 
+    /// The host's trusted time: its wall clock, never below the high-water
+    /// mark (a wall clock that went back). Every revocation, quarantine and
+    /// retention bound is computed from it.
+    fn trusted_now(&self, wall: u64) -> u64 {
+        wall.max(self.bound.high_water)
+    }
+
     /// Why browser grants are refused now, if they are: the revoked grants
     /// couldn't be read (see `quarantine`), or the wall clock is below the
     /// high-water mark (it went back). Anchors a quarantine found at this
     /// start, records it durably (retried once a second), and ends it
     /// (dropping the record from the file).
     fn browsers_refused(&mut self, wall: u64, mono: u64) -> Option<&'static str> {
+        let trusted = self.trusted_now(wall);
         if let Some(q) = &mut self.quarantine {
-            q.anchor(wall, mono);
+            q.anchor(trusted, mono);
             if !q.ended(wall, mono) {
                 if !self.quarantine_recorded && mono >= self.quarantine_retry_at {
                     match self.save_revoked(wall) {
@@ -2147,7 +2168,8 @@ impl R9Host {
                 self.clock_back_logged = true;
                 log(&format!(
                     "the host wall clock is behind the revoked grants' high-water mark ({}); \
-                     browser grants are refused until it catches up",
+                     browser grants are refused until it catches up (there is no override: \
+                     wait for the clock; removing the journal forgets every revocation)",
                     self.bound.behind()
                 ));
             }
@@ -2172,6 +2194,9 @@ impl R9Host {
         };
         let mut bound = self.bound;
         bound.high_water = bound.high_water.max(wall);
+        // Every retained entry ends within the window after the high-water
+        // mark, so a later quarantine (high-water + window) outlives it.
+        bound.cover(self.revoked_until.values().copied());
         if let Some((_, until)) = record {
             bound.until = bound.until.max(until);
         }

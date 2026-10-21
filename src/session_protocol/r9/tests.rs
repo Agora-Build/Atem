@@ -2514,3 +2514,220 @@ fn a_browser_whose_issuer_is_in_a_later_window_is_membership_incomplete() {
     rig.attached("b2");
     assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
 }
+
+/// Re-review N1a: a grant revoked while it isn't live and the wall clock
+/// is behind the high-water mark is kept for the window after the host's
+/// trusted time (`max(wall, high_water)`), not after the rolled-back wall
+/// time: when the clock returns, the grant is still refused.
+#[test]
+fn a_revocation_while_the_clock_is_behind_outlives_the_rollback() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    // W: A issued, 50 min; another revocation sets the high-water mark.
+    let a = browser_of(&mut rig, 1);
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(9));
+    // Two hours back; A (not live) revoked.
+    rig.now.host.wall_ms -= 120 * 60_000;
+    rig.advance(1000);
+    let events = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. })),
+        "{events:?}"
+    );
+    // 70 min later on both clocks, then the wall clock is back (W + 11).
+    rig.advance(70 * 60_000);
+    rig.now.host.wall_ms += 60 * 60_000;
+    rig.advance(1000);
+    rig.connect("a1", a);
+    assert_eq!(rig.refused("a1").0, "unauthorized");
+}
+
+/// Re-review N1b: a live browser admitted at a later wall time than its
+/// revocation (the clock went back in between) is kept until its expiry;
+/// the high-water mark covers that entry, so a quarantine after one damage
+/// lasts until the grant's true end.
+#[test]
+fn a_live_revocation_during_a_rollback_outlives_one_damage() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let a = browser_of(&mut rig, 1); // until W + 50
+    rig.connect("a1", a.clone());
+    rig.attached("a1");
+    rig.now.host.wall_ms -= 120 * 60_000;
+    rig.advance(1000);
+    let events = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. })),
+        "{events:?}"
+    );
+    let file = rig.journal.join(REVOKED_GRANTS_FILE);
+    std::fs::write(&file, b"{not json").unwrap();
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    assert_quarantined(&mut rig, "a2", a.clone());
+    rig.advance(revoked::SAFE_WINDOW_MS + 2000);
+    rig.now.host.wall_ms += 60 * 60_000; // about W + 10
+    rig.advance(1000);
+    assert_quarantined(&mut rig, "a3", a);
+}
+
+/// Re-review N2a (Astation's comment 6308222846): `revoked_grants` missing
+/// next to its sidecar is lost, not fresh: browsers are quarantined, the
+/// phone and native revocations keep working.
+#[test]
+fn a_missing_revoked_grants_next_to_its_sidecar_is_quarantined() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let a = browser_of(&mut rig, 1);
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    assert!(rig.journal.join(revoked::SIDECAR_FILE).exists());
+    std::fs::remove_file(rig.journal.join(REVOKED_GRANTS_FILE)).unwrap();
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    assert_quarantined(&mut rig, "a1", a);
+    let events = revoke_from(&mut rig, "ph2", &revoked_grant_id(2));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. })),
+        "{events:?}"
+    );
+    let text = std::fs::read_to_string(rig.journal.join(REVOKED_GRANTS_FILE)).unwrap();
+    assert!(
+        text.contains("quarantine") && text.contains(&revoked_grant_id(2)),
+        "{text}"
+    );
+}
+
+/// Re-review N2a during an active quarantine: the main file lost keeps the
+/// earlier end and covers a revocation made during it (kept past that
+/// end).
+#[test]
+fn a_missing_revoked_grants_during_a_quarantine_keeps_its_end() {
+    let mut rig = Rig::new();
+    std::fs::write(rig.journal.join(REVOKED_GRANTS_FILE), b"{not json").unwrap();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    rig.advance(30 * 60_000); // the quarantine ends at about T + 65
+    let c = browser_of(&mut rig, 1); // issued T + 30, valid until T + 80
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1)); // kept until T + 95
+    std::fs::remove_file(rig.journal.join(REVOKED_GRANTS_FILE)).unwrap();
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    assert_quarantined(&mut rig, "c1", c.clone());
+    rig.advance(37 * 60_000); // T + 67: past the old end, C still valid
+    assert_quarantined(&mut rig, "c2", c);
+}
+
+/// Re-review N2b: `revoked_grants` damaged while the sidecar is missing
+/// and nothing is kept aside yet (after the wall clock went back) is not a
+/// fresh profile: the bound is rebuilt (here from the journal's write
+/// times) and A stays refused when the clock returns.
+#[test]
+fn a_damaged_file_with_a_missing_sidecar_after_a_rollback_is_quarantined() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let a = browser_of(&mut rig, 1);
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1)); // until W + 65
+    let written = rig.now.host.wall_ms;
+    rig.now.host.wall_ms -= 120 * 60_000;
+    std::fs::write(rig.journal.join(REVOKED_GRANTS_FILE), b"{not json").unwrap();
+    std::fs::remove_file(rig.journal.join(revoked::SIDECAR_FILE)).unwrap();
+    set_journal_mtimes(&rig.journal, written);
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    assert_quarantined(&mut rig, "a2", a.clone());
+    rig.advance(revoked::SAFE_WINDOW_MS + 2000);
+    rig.now.host.wall_ms += 60 * 60_000;
+    rig.advance(1000);
+    assert_quarantined(&mut rig, "a3", a);
+}
+
+/// Re-review L4: the modification-time floor decides. The journal was
+/// last written 40 min after the last revocation (the session journal),
+/// then the wall clock went back; the revoked grants and the sidecar are
+/// lost. The quarantine lasts until that write time + the window, past
+/// every other floor (now + window, the entries' window).
+#[test]
+fn the_journal_write_time_floor_decides_a_lost_bound() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1)); // until W + 65
+    let w = rig.now.host.wall_ms;
+    std::fs::write(rig.journal.join(REVOKED_GRANTS_FILE), b"{not json").unwrap();
+    std::fs::remove_file(rig.journal.join(revoked::SIDECAR_FILE)).unwrap();
+    set_journal_mtimes(&rig.journal, w + 40 * 60_000);
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    let b = browser_of(&mut rig, 2);
+    assert_quarantined(&mut rig, "b1", b);
+    // W + 67, on both clocks: every other floor has passed.
+    rig.advance(revoked::SAFE_WINDOW_MS + 2000);
+    let b = browser_of(&mut rig, 3);
+    assert_quarantined(&mut rig, "b2", b);
+    // Past W + 105: admitted.
+    rig.advance(40 * 60_000);
+    let b = browser_of(&mut rig, 4);
+    rig.advance(1000);
+    rig.connect("b3", b);
+    rig.attached("b3");
+}
+
+/// Sets the modification time of the journal directory, its entries and
+/// those one level down to `wall_ms` (never through a symlink).
+fn set_journal_mtimes(dir: &std::path::Path, wall_ms: u64) {
+    use std::os::unix::ffi::OsStrExt;
+    fn set(path: &std::path::Path, wall_ms: u64) {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let t = libc::timespec {
+            tv_sec: (wall_ms / 1000) as libc::time_t,
+            tv_nsec: ((wall_ms % 1000) * 1_000_000) as libc::c_long,
+        };
+        let times = [t, t];
+        // SAFETY: a valid C path and two timespecs for the call.
+        let r = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(r, 0, "{}", path.display());
+    }
+    for e in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+        if e.file_type().unwrap().is_dir() {
+            for f in std::fs::read_dir(e.path()).unwrap().filter_map(Result::ok) {
+                set(&f.path(), wall_ms);
+            }
+        }
+        set(&e.path(), wall_ms);
+    }
+    set(dir, wall_ms);
+}
