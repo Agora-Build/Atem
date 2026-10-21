@@ -400,7 +400,7 @@ impl MembershipLog {
     }
     #[wasm_bindgen(js_name = pendingRecovery)]
     pub fn pending_recovery(&self, now: JsValue) -> JsResult<JsValue> {
-        to_js(&self.0.pending_recovery(clock(now)?))
+        ok(self.0.pending_recovery(clock(now)?))
     }
     pub fn relation(&self, h: JsValue) -> JsResult<JsValue> {
         ok(self.0.relation(head(h)?))
@@ -412,7 +412,7 @@ impl MembershipLog {
         ok(self.0.extend(entries, clock(now)?))
     }
     pub fn advance(&self, now: JsValue) -> JsResult<JsValue> {
-        to_js(&self.0.advance(clock(now)?))
+        ok(self.0.advance(clock(now)?))
     }
     /// Host role: the membership side of admitting `deviceId` after its
     /// carriage (commits the evaluation).

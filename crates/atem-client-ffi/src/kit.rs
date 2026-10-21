@@ -336,7 +336,7 @@ impl RestoreSession {
     ) -> Result<RestoredInfo> {
         let entries = entries_of(&relay_entries)?;
         let accepts = host_accepts(&host_accepts_)?;
-        let now: HostNow = (&now).into();
+        let now: HostNow = now.host_now()?;
         let mut flow = self.lock();
         let restored = flow.attempt(&entries, envelope_json.as_bytes(), &accepts, &now)?;
         Ok(RestoredInfo {
@@ -406,7 +406,7 @@ impl RestoreSession {
     pub fn append_stored(&self, now: HostClock) -> Result<EnrollmentOutcome> {
         let outcome = self
             .lock()
-            .append_reply(AppendReply::Stored, &(&now).into())?;
+            .append_reply(AppendReply::Stored, &now.host_now()?)?;
         Ok(enrollment(outcome))
     }
 
@@ -418,7 +418,7 @@ impl RestoreSession {
         now: HostClock,
     ) -> Result<EnrollmentOutcome> {
         let reply = conflict_reply(head, &entries, more)?;
-        let outcome = self.lock().append_reply(reply, &(&now).into())?;
+        let outcome = self.lock().append_reply(reply, &now.host_now()?)?;
         Ok(enrollment(outcome))
     }
 }

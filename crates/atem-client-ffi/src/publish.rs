@@ -256,7 +256,7 @@ impl EntryPublisher {
 
     /// The relay answered `200`.
     pub fn reply_stored(&self, log: Arc<MembershipLog>, now: HostClock) -> Result<PublishOutcome> {
-        let now: HostNow = (&now).into();
+        let now: HostNow = now.host_now()?;
         let mut state = self.lock();
         let published = state
             .publisher
@@ -275,7 +275,7 @@ impl EntryPublisher {
         now: HostClock,
     ) -> Result<PublishOutcome> {
         let reply = conflict_reply(head, &entries, more)?;
-        let now: HostNow = (&now).into();
+        let now: HostNow = now.host_now()?;
         let mut state = self.lock();
         let published = state.publisher.reply(reply, &mut log.lock(), &now)?;
         let _ = sync_claim(&mut state.claim, None);
@@ -546,7 +546,7 @@ impl KBackupWriter {
         signed_at: u64,
     ) -> Result<BackupStep> {
         let signed_at = safe_int(signed_at, "signed_at")?;
-        let now: HostNow = (&now).into();
+        let now: HostNow = now.host_now()?;
         let mut state = self.lock();
         let mut work = state.writer.clone();
         let step = work.append_reply(&mut log.lock(), AppendReply::Stored, &now, signed_at);
@@ -565,7 +565,7 @@ impl KBackupWriter {
     ) -> Result<BackupStep> {
         let signed_at = safe_int(signed_at, "signed_at")?;
         let reply = conflict_reply(head, &entries, more)?;
-        let now: HostNow = (&now).into();
+        let now: HostNow = now.host_now()?;
         let mut state = self.lock();
         let mut work = state.writer.clone();
         let step = work.append_reply(&mut log.lock(), reply, &now, signed_at);
@@ -583,7 +583,7 @@ impl KBackupWriter {
     ) -> Result<BackupStep> {
         let signed_at = safe_int(signed_at, "signed_at")?;
         let objects = objects_of(&entries)?;
-        let now: HostNow = (&now).into();
+        let now: HostNow = now.host_now()?;
         let mut state = self.lock();
         let mut work = state.writer.clone();
         let step = work.fetched(&mut log.lock(), &objects, more, &now, signed_at);

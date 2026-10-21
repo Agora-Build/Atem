@@ -19,7 +19,7 @@ use atem_client::membership::{
     MemberStatus, Membership, Stop,
 };
 
-use crate::encoding::{canonical, canonical_lossy, hash_of, safe_int, signed, strict};
+use crate::encoding::{MAX_SAFE, canonical, canonical_lossy, hash_of, safe_int, signed, strict};
 use crate::error::{AtemError, Result};
 use crate::types::{
     CarriageResult, CarriageStop, FreezeInfo, HeadRelationKind, HostClock, HostInfo, KBackupInfo,
@@ -32,13 +32,27 @@ use crate::types::{
 /// recovery records and evidence). Checked before parsing.
 pub const MAX_STORED_JSON: usize = 16 << 20;
 
-impl From<&HostClock> for HostNow {
-    fn from(c: &HostClock) -> Self {
-        HostNow {
-            wall_ms: c.wall_ms,
-            mono_ms: c.mono_ms,
-            boot_id: c.boot_id.clone(),
+/// The snapshot format `stored_json` writes (`"v"`). A later binding reads
+/// every earlier version (migrating it) and refuses only versions newer
+/// than its own (`Stored{unsupported_version}`).
+pub const STORED_VERSION: u64 = 1;
+
+impl HostClock {
+    /// The reading as the core takes it. Both times are milliseconds and at
+    /// most 2^53 − 1 (the JSON integer domain the durable snapshot is
+    /// written in): anything above, e.g. nanoseconds passed by mistake, is
+    /// refused here rather than making the log unexportable later.
+    pub(crate) fn host_now(&self) -> Result<HostNow> {
+        if self.wall_ms > MAX_SAFE || self.mono_ms > MAX_SAFE {
+            return Err(AtemError::malformed(
+                "a HostClock time is milliseconds, at most 2^53 - 1",
+            ));
         }
+        Ok(HostNow {
+            wall_ms: self.wall_ms,
+            mono_ms: self.mono_ms,
+            boot_id: self.boot_id.clone(),
+        })
     }
 }
 
@@ -313,7 +327,7 @@ impl MembershipLog {
             &account_id,
             &hash_of(&genesis_hash)?,
             &entries,
-            &(&now).into(),
+            &now.host_now()?,
         )
         .map_err(|e| AtemError::membership(&e.reason, Some(e.index)))?;
         Ok(Self::wrap(verified.membership))
@@ -324,20 +338,22 @@ impl MembershipLog {
     /// from the pairing or the kit), never against the snapshot's own: the
     /// shared verifier replays the chain with the recorded decisions at
     /// their positions, checks one recovery record per pending-type entry,
-    /// the head, recovery keys and a freeze (`Membership::from_stored`, as
-    /// the host reads `membership.json` at start). The snapshot must be
-    /// exactly what `stored_json()` writes: any other field, a missing
-    /// record or a changed value is refused. Errors: `Stored{code}`
-    /// (`too_large`, `malformed`, `account_mismatch`, `genesis_mismatch`,
-    /// `stored_invalid`); a malformed anchor is `Invalid`.
+    /// the head, recovery keys and a freeze (`Membership::from_stored_client`:
+    /// the host's checks on `membership.json`, plus the restore-only
+    /// `host_confirmed` decision a kit restore records). The snapshot must
+    /// be exactly what `stored_json()` writes for its version `v`: any other
+    /// field, a missing record or a changed value is refused. Errors:
+    /// `Stored{code}` (`too_large`, `malformed`, `unsupported_version`,
+    /// `account_mismatch`, `genesis_mismatch`, `stored_invalid`); a
+    /// malformed anchor or clock is `Invalid`.
     ///
     /// `now` is this run's first reading of the verifier clock, taken as the
     /// host takes one at start: on the same boot every wait goes on from
-    /// first sight, on another boot from the time already waited (time
-    /// while the machine was off, or before this reading, never counts).
-    /// Nothing in the snapshot, `signed_at` or any relay time counts as
-    /// time waited. Restoring grants nothing: it is a verified log, like
-    /// `verify`'s.
+    /// first sight, on another boot from the time last persisted (time
+    /// while the machine was off, or not persisted, never counts). Nothing
+    /// in the snapshot, `signed_at` or any relay time counts as time
+    /// waited. Export once right after loading. Restoring grants nothing:
+    /// it is a verified log, like `verify`'s.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn from_stored(
         account_id: String,
@@ -346,21 +362,33 @@ impl MembershipLog {
         now: HostClock,
     ) -> Result<Arc<Self>> {
         let genesis = hash_of(&genesis_hash)?;
+        let now = now.host_now()?;
         if stored_json.len() > MAX_STORED_JSON {
             return Err(AtemError::stored(
                 "too_large",
                 format!("a snapshot is at most {MAX_STORED_JSON} bytes"),
             ));
         }
-        let value = parse_strict(
+        let mut value = parse_strict(
             stored_json.as_bytes(),
             MAX_STORED_JSON,
             Numbers::IntegersOnly,
         )
         .map_err(|e| AtemError::stored("malformed", format!("not strict JSON: {e:?}")))?;
         let object = value
-            .as_object()
+            .as_object_mut()
             .ok_or_else(|| AtemError::stored("malformed", "not an object"))?;
+        // The version first: a later format is never read as this one.
+        match object.remove("v").map(|v| v.as_u64()) {
+            None => return Err(AtemError::stored("malformed", "no snapshot version `v`")),
+            Some(Some(STORED_VERSION)) => {}
+            Some(_) => {
+                return Err(AtemError::stored(
+                    "unsupported_version",
+                    format!("this binding reads snapshot version {STORED_VERSION}"),
+                ));
+            }
+        }
         match object.get("account_id").and_then(|v| v.as_str()) {
             None => return Err(AtemError::stored("malformed", "account_id")),
             Some(a) if a != account_id => {
@@ -385,29 +413,38 @@ impl MembershipLog {
             }
             Some(_) => {}
         }
-        let mut log = Membership::from_stored(&account_id, &genesis, &value)
+        let mut log = Membership::from_stored_client(&account_id, &genesis, &value)
             .map_err(|e| AtemError::stored("stored_invalid", e.0))?;
         // Exactly the export: a field `to_stored` doesn't write (which
         // `from_stored` would ignore, as it ignores the host's own) or any
         // other spelling of the state is refused.
-        if canonical(&log.to_stored())? != canonical(&value)? {
+        let exact = match (canonical(&log.to_stored()), canonical(&value)) {
+            (Ok(ours), Ok(theirs)) => ours == theirs,
+            _ => false,
+        };
+        if !exact {
             return Err(AtemError::stored(
                 "stored_invalid",
                 "the snapshot holds more than the log's durable state",
             ));
         }
-        log.checkpoint(&(&now).into());
+        log.checkpoint(&now);
         Ok(Self::wrap(log))
     }
 
-    /// The durable snapshot (canonical JSON): the entries, the recovery
-    /// records with their wait clocks and decisions, evidence and a freeze.
-    /// Commit it durably after every `extend`, `advance` and publisher or
-    /// writer reply that changed the log, and at least once a minute while
-    /// a recovery waits, **before** acting on the returned effects or
-    /// showing what they permit; reload it with `from_stored`.
+    /// The durable snapshot (canonical JSON, `"v": 1`): the entries, the
+    /// recovery records with their wait clocks and decisions, evidence and
+    /// a freeze. Commit it durably after every change (`advance(now)`, then
+    /// export, then commit, then act on the effects), and once right after
+    /// `from_stored`; reload it with `from_stored`. Taking it records no
+    /// clock reading: only `advance`/`extend` do.
     pub fn stored_json(&self) -> Result<String> {
-        canonical(&self.lock().to_stored())
+        let mut value = self.lock().to_stored();
+        value
+            .as_object_mut()
+            .expect("the stored form is an object")
+            .insert("v".into(), serde_json::json!(STORED_VERSION));
+        canonical(&value)
     }
 
     /// A copy (later changes to either don't affect the other).
@@ -495,9 +532,11 @@ impl MembershipLog {
     }
 
     /// Pending recovery entries, with when they take effect on this clock.
-    pub fn pending_recovery(&self, now: HostClock) -> Vec<PendingRecoveryInfo> {
-        self.lock()
-            .pending_recovery(&(&now).into())
+    pub fn pending_recovery(&self, now: HostClock) -> Result<Vec<PendingRecoveryInfo>> {
+        let now = now.host_now()?;
+        Ok(self
+            .lock()
+            .pending_recovery(&now)
             .into_iter()
             .map(|p| PendingRecoveryInfo {
                 entry_hash: p.entry_hash.to_hex(),
@@ -506,7 +545,7 @@ impl MembershipLog {
                 subject: p.subject,
                 effective_at: p.effective_at,
             })
-            .collect()
+            .collect())
     }
 
     /// How a head another party signed relates to this log.
@@ -525,7 +564,7 @@ impl MembershipLog {
     /// rows.
     pub fn evaluate(&self, entries: Vec<String>, now: HostClock) -> Result<CarriageResult> {
         let objects = objects_of(&entries)?;
-        let eval = self.lock().evaluate_objects(&objects, &(&now).into());
+        let eval = self.lock().evaluate_objects(&objects, &now.host_now()?);
         Ok(carriage_result(&eval, false))
     }
 
@@ -535,19 +574,16 @@ impl MembershipLog {
     pub fn extend(&self, entries: Vec<String>, now: HostClock) -> Result<CarriageResult> {
         let objects = objects_of(&entries)?;
         let mut log = self.lock();
-        let eval = log.evaluate_objects(&objects, &(&now).into());
+        let eval = log.evaluate_objects(&objects, &now.host_now()?);
         let result = carriage_result(&eval, true);
         *log = eval.next;
         Ok(result)
     }
 
     /// Ends waits that are over on this clock (pending recoveries).
-    pub fn advance(&self, now: HostClock) -> Vec<MembershipEffect> {
-        self.lock()
-            .advance(&(&now).into())
-            .iter()
-            .map(effect_info)
-            .collect()
+    pub fn advance(&self, now: HostClock) -> Result<Vec<MembershipEffect>> {
+        let now = now.host_now()?;
+        Ok(self.lock().advance(&now).iter().map(effect_info).collect())
     }
 
     /// The body of the next entry after this head, signed by `signer`:
@@ -594,7 +630,7 @@ impl MembershipLog {
     ) -> Result<AdmissionInfo> {
         use atem_client::membership::Admission;
         let objects = objects_of(&entries)?;
-        let now: HostNow = (&now).into();
+        let now: HostNow = now.host_now()?;
         let mut log = self.lock();
         let eval = log.evaluate_objects(&objects, &now);
         let admission = eval.admission(&device_id, more, &now);
