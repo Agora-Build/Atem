@@ -661,8 +661,14 @@ impl HostBridge {
             None => (None, None, Vec::new()),
         };
         let pairing = profile.map(|p| p.paths.pairing.clone());
-        // §R9.6: a pinned list vouches for the revoked grants' files.
-        let pin_floor = pairing.as_ref().and_then(membership::pin_wall_floor);
+        // §R9.6: the pairing directory vouches for the revoked grants'
+        // files (its copy of their bound, and a pinned list's floor).
+        let vouch = pairing
+            .as_ref()
+            .map(|p| crate::session_protocol::r9::PairingVouch {
+                copy: p.revoked_floor.clone(),
+                pin_floor: membership::pin_wall_floor(p),
+            });
         let (host_key, host_key_error) = match (&membership, &pairing) {
             (Some(m), Some(pairing)) => {
                 match membership::host_channel_seed(pairing, m.membership(), &m.pin_of().host_id) {
@@ -710,7 +716,7 @@ impl HostBridge {
         Ok(Self {
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
-            r9: R9Host::with_pin(r9host::Limits::default(), Some(dir), pin_floor),
+            r9: R9Host::with_pairing(r9host::Limits::default(), Some(dir), vouch),
             r9_link: None,
             r9_socket: 0,
             pairing,

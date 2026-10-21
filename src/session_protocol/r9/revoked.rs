@@ -30,6 +30,11 @@
 //! and while the wall clock is below `max(until, high_water)` browser
 //! grants are refused (the clock went back).
 //!
+//! The bound has a copy outside the journal directory,
+//! `pairing/revoked_floor` (same format, only ever raised), written durably
+//! before the sidecar: it floors the bound, so losing `runtime/` (clock
+//! behind or not) never lowers it, and a sidecar below it fails closed.
+//!
 //! The files vouch for each other: a `revoked_grants` missing or unreadable
 //! while the sidecar or a copy aside exists, or a sidecar missing or
 //! unreadable while `revoked_grants` or a copy aside exists, is lost and
@@ -204,6 +209,14 @@ impl Bound {
     pub fn cover(&mut self, untils: impl IntoIterator<Item = u64>) {
         for until in untils {
             self.high_water = self.high_water.max(until.saturating_sub(SAFE_WINDOW_MS));
+        }
+    }
+
+    /// Each field the higher of the two.
+    pub fn max(self, other: Bound) -> Bound {
+        Bound {
+            until: self.until.max(other.until),
+            high_water: self.high_water.max(other.high_water),
         }
     }
 

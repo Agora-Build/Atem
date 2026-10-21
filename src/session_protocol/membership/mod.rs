@@ -532,8 +532,12 @@ impl MembershipHost {
             .map_err(|e| e.to_string())?;
         // §R9.6: a pinned host always has its revoked-grants files, so
         // their loss is never read as a fresh host.
-        crate::session_protocol::r9::seed_revoked_journal(journal_dir, host_now().wall_ms)
-            .map_err(|e| format!("cannot seed the revoked grants: {e}"))?;
+        crate::session_protocol::r9::seed_revoked_journal(
+            journal_dir,
+            &pairing.revoked_floor,
+            host_now().wall_ms,
+        )
+        .map_err(|e| format!("cannot seed the revoked grants: {e}"))?;
         // The list last: until it is there, whatever was written is a
         // leftover that fails closed.
         store

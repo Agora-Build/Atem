@@ -2745,7 +2745,14 @@ fn a_pinned_host_without_revoked_grants_files_is_quarantined() {
     let mut rig = Rig::new();
     lose(&rig);
     let floor = rig.now.host.wall_ms + 30 * 60_000;
-    rig.engine = R9Host::with_pin(Limits::default(), Some(&rig.journal), Some(floor));
+    rig.engine = R9Host::with_pairing(
+        Limits::default(),
+        Some(&rig.journal),
+        Some(PairingVouch {
+            copy: rig.pairing.revoked_floor.clone(),
+            pin_floor: Some(floor),
+        }),
+    );
     rig.link_up();
     rig.connect("ph", phone());
     rig.attached("ph");
@@ -2764,7 +2771,7 @@ fn a_pinned_host_without_revoked_grants_files_is_quarantined() {
     // No pinned list: fresh.
     let mut rig = Rig::new();
     lose(&rig);
-    rig.engine = R9Host::with_pin(Limits::default(), Some(&rig.journal), None);
+    rig.engine = R9Host::with_pairing(Limits::default(), Some(&rig.journal), None);
     rig.link_up();
     rig.advance(1000);
     let b = browser_of(&mut rig, 4);
@@ -2777,7 +2784,10 @@ fn a_pinned_host_without_revoked_grants_files_is_quarantined() {
 #[test]
 fn the_pin_seeds_the_revoked_grants_files() {
     let dir = tempfile::tempdir().unwrap();
-    super::seed_revoked_journal(dir.path(), 1234).unwrap();
+    let copy = dir.path().join("revoked_floor");
+    super::seed_revoked_journal(dir.path(), &copy, 1234).unwrap();
+    let floor: Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+    assert_eq!(floor, json!({"v": 1, "until": 0, "high_water": 1234}));
     let side: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join(revoked::SIDECAR_FILE)).unwrap())
             .unwrap();
@@ -2787,6 +2797,57 @@ fn the_pin_seeds_the_revoked_grants_files() {
         matches!(revoked::load(&main), revoked::Loaded::Read { ref revoked, quarantine: None } if revoked.is_empty())
     );
     std::fs::write(&main, b"{not json").unwrap();
-    super::seed_revoked_journal(dir.path(), 9999).unwrap();
+    super::seed_revoked_journal(dir.path(), &copy, 9999).unwrap();
     assert_eq!(std::fs::read(&main).unwrap(), b"{not json", "kept as it is");
+    // The copy only rises.
+    super::seed_revoked_journal(dir.path(), &copy, 5).unwrap();
+    let floor: Value = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+    assert_eq!(floor, json!({"v": 1, "until": 0, "high_water": 9999}));
+}
+
+/// Re-review R1: the revoked grants' bound has a copy in `pairing/`
+/// (`revoked_floor`), written before the journal's sidecar, only ever
+/// raised. A journal restored from before a revocation (its sidecar below
+/// the copy) can't be vouched for: quarantined, and A stays refused.
+#[test]
+fn a_journal_behind_the_pairing_copy_is_quarantined() {
+    let vouched = |rig: &Rig| {
+        R9Host::with_pairing(
+            Limits::default(),
+            Some(&rig.journal),
+            Some(PairingVouch {
+                copy: rig.pairing.revoked_floor.clone(),
+                pin_floor: Some(1),
+            }),
+        )
+    };
+    let mut rig = Rig::new();
+    rig.engine = vouched(&rig);
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let files = [REVOKED_GRANTS_FILE, revoked::SIDECAR_FILE];
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(rig.journal.join(f)).unwrap())
+        .collect();
+    rig.advance(60_000);
+    let a = browser_of(&mut rig, 1);
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    let copy: Value =
+        serde_json::from_slice(&std::fs::read(&rig.pairing.revoked_floor).unwrap()).unwrap();
+    assert!(
+        copy["high_water"].as_u64().unwrap() >= rig.now.host.wall_ms,
+        "{copy}"
+    );
+    // The journal's files restored from before the revocation.
+    for (f, bytes) in files.iter().zip(before) {
+        std::fs::write(rig.journal.join(f), bytes).unwrap();
+    }
+    rig.link_down();
+    rig.engine = vouched(&rig);
+    rig.link_up();
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    assert_quarantined(&mut rig, "a1", a);
 }

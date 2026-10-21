@@ -112,14 +112,39 @@ const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
 /// grants' bound, `max(until, high_water)` (the clock went back).
 const DETAIL_CLOCK_BACK: &str = "host clock went back";
 
-/// Seeds the revoked-grants files in `journal_dir` when a device list is
-/// pinned (§R9.6): the sidecar (high-water mark `wall`), then an empty
-/// `revoked_grants`, each durable. A pinned host then always has them, so
-/// their loss is never read as a fresh host. Files already there (a host
-/// paired before) are kept as they are.
-pub fn seed_revoked_journal(journal_dir: &Path, wall: u64) -> std::io::Result<()> {
+/// What the pairing directory vouches for, for the revoked grants (§R9.6).
+pub struct PairingVouch {
+    /// `pairing/revoked_floor`: a copy of the revoked grants' bound
+    /// (`{"v":1,"until","high_water"}`, only ever raised), written before
+    /// the journal's sidecar at every write that raises it.
+    pub copy: PathBuf,
+    /// With a pinned device list, the latest wall time the list vouches
+    /// for (its clean checkpoint, the newest write in `pairing/`); `None`
+    /// without one.
+    pub pin_floor: Option<u64>,
+}
+
+/// Seeds the revoked-grants files when a device list is pinned (§R9.6):
+/// the pairing's copy of the bound (`copy`, raised to `wall` at least),
+/// then in `journal_dir` the sidecar, then an empty `revoked_grants`, each
+/// durable. A pinned host then always has them, so their loss is never
+/// read as a fresh host. Journal files already there (a host paired
+/// before) are kept as they are.
+pub fn seed_revoked_journal(journal_dir: &Path, copy: &Path, wall: u64) -> std::io::Result<()> {
     let main = journal_dir.join(REVOKED_GRANTS_FILE);
     let sidecar = journal_dir.join(revoked::SIDECAR_FILE);
+    let mut floor = revoked::Bound {
+        until: 0,
+        high_water: wall,
+    };
+    for path in [copy, sidecar.as_path()] {
+        if let revoked::SidecarLoaded::Read(b) = revoked::load_sidecar(path) {
+            floor = floor.max(b);
+        }
+    }
+    if revoked::load_sidecar(copy) != revoked::SidecarLoaded::Read(floor) {
+        revoked::write_atomic(copy, &revoked::encode_sidecar(floor), None)?;
+    }
     if main.symlink_metadata().is_ok()
         || sidecar.symlink_metadata().is_ok()
         || revoked::damaged_asides(journal_dir)
@@ -271,6 +296,11 @@ pub struct R9Host {
     revoked: RevokedGrants,
     revoked_until: BTreeMap<String, u64>,
     revoked_path: Option<PathBuf>,
+    /// The bound's copy in `pairing/` (`revoked_floor`), outside the
+    /// journal directory: it survives the loss of `runtime/`.
+    pairing_copy: Option<PathBuf>,
+    /// What that copy durably holds (only ever raised).
+    copy_bound: revoked::Bound,
     /// The revoked-grants file couldn't be read (at this start, or at an
     /// earlier one whose record the file carries): browser grants are
     /// refused until it ends (`revoked::Quarantine::ended`). Fail closed.
@@ -401,16 +431,19 @@ impl R9Host {
     /// An engine with these bounds; revoked grants are journaled in
     /// `journal_dir/revoked_grants` (none: memory only, tests).
     pub fn new(limits: Limits, journal_dir: Option<&Path>) -> Self {
-        Self::with_pin(limits, journal_dir, None)
+        Self::with_pairing(limits, journal_dir, None)
     }
 
-    /// [`R9Host::new`] on a host whose device list is pinned: `pin_floor`
-    /// is the latest wall time the pinned list vouches for (its clean
-    /// checkpoint, the newest write in `pairing/`). A pinned host always has
-    /// its revoked-grants files (seeded at the pin), so finding none of them
+    /// [`R9Host::new`] on a host with a pairing directory: the revoked
+    /// grants' bound is also kept in `pairing.copy` (see [`PairingVouch`]),
+    /// and with a pinned list, finding none of the revoked-grants files
     /// means they were lost (the journal directory removed), never a fresh
-    /// host: browsers are quarantined from that floor.
-    pub fn with_pin(limits: Limits, journal_dir: Option<&Path>, pin_floor: Option<u64>) -> Self {
+    /// host: browsers are quarantined from the pairing's floor.
+    pub fn with_pairing(
+        limits: Limits,
+        journal_dir: Option<&Path>,
+        pairing: Option<PairingVouch>,
+    ) -> Self {
         let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
         let mut host = R9Host {
             limits,
@@ -434,6 +467,8 @@ impl R9Host {
             revoked_damaged: revoked::Damaged::default(),
             sidecar_damaged: revoked::Damaged::default(),
             bound: revoked::Bound::default(),
+            pairing_copy: pairing.as_ref().map(|p| p.copy.clone()),
+            copy_bound: revoked::Bound::default(),
             clock_back_logged: false,
             quarantine_retry_at: 0,
             seen: HashSet::new(),
@@ -446,7 +481,7 @@ impl R9Host {
             #[cfg(test)]
             revoked_crash: None,
         };
-        host.load_revoked(pin_floor);
+        host.load_revoked(pairing.and_then(|p| p.pin_floor));
         host
     }
 
@@ -2075,6 +2110,18 @@ impl R9Host {
         let main = revoked::load(&path);
         let side = revoked::load_sidecar(&sidecar);
         let asides = revoked::damaged_asides(&dir);
+        // The pairing's copy of the bound (§R9.6): a floor alongside
+        // everything else. Unreadable on a pinned host, or above the
+        // journal's sidecar (a journal restored or rolled back), the
+        // journal can't be vouched for.
+        let copy = self.pairing_copy.as_deref().map(revoked::load_sidecar);
+        let copy_bound = match &copy {
+            Some(revoked::SidecarLoaded::Read(b)) => *b,
+            _ => revoked::Bound::default(),
+        };
+        let copy_lost =
+            pin_floor.is_some() && matches!(copy, Some(revoked::SidecarLoaded::Unreadable));
+        self.copy_bound = copy_bound;
         // The files vouch for each other (§R9.6): every write leaves both
         // (the sidecar first), and damage leaves a copy aside. A pinned
         // device list vouches for them too (the pin seeds them). Only a
@@ -2084,12 +2131,19 @@ impl R9Host {
             && !asides
         {
             let Some(floor) = pin_floor else {
+                // Fresh; the pairing's copy (an earlier pairing's) still
+                // floors the bound.
+                self.bound = copy_bound;
+                self.write_pairing_copy();
                 return;
             };
-            self.bound = revoked::Bound {
+            // Lost: the floor is the pairing's copy of the bound (the
+            // trusted time, kept outside the journal directory), the
+            // pinned list's floor and the journal directory's newest write.
+            self.bound = copy_bound.max(revoked::Bound {
                 until: 0,
-                high_water: floor,
-            };
+                high_water: floor.max(revoked::newest_mtime(&dir)),
+            });
             log(&format!(
                 "the revoked grants are missing on a host with a pinned device list (the \
                  journal directory was removed?); browser grants are refused for at least \
@@ -2097,6 +2151,7 @@ impl R9Host {
                 self.bound.floor()
             ));
             self.quarantine = Some(revoked::Quarantine::starting(self.bound.floor()));
+            self.write_pairing_copy();
             return;
         }
         let mut record = None;
@@ -2118,8 +2173,12 @@ impl R9Host {
                 false
             }
         };
+        let mut copy_ahead = copy_lost;
         let (mut bound, side_lost) = match side {
-            revoked::SidecarLoaded::Read(b) => (b, false),
+            revoked::SidecarLoaded::Read(b) => {
+                copy_ahead |= copy_bound.high_water > b.high_water || copy_bound.until > b.until;
+                (b, false)
+            }
             other => {
                 if other == revoked::SidecarLoaded::Unreadable {
                     self.sidecar_damaged = revoked::Damaged::found();
@@ -2138,8 +2197,10 @@ impl R9Host {
         };
         bound.until = bound.until.max(record.map_or(0, |(_, u)| u));
         bound.cover(self.revoked_until.values().copied());
+        let bound = bound.max(copy_bound);
         self.bound = bound;
-        if main_lost || side_lost {
+        self.write_pairing_copy();
+        if main_lost || side_lost || copy_ahead {
             // A revocation a lost file held can't be told from none
             // (§R9.6, fail closed): every browser grant is refused until
             // any grant it could name has expired, no earlier than the
@@ -2148,13 +2209,17 @@ impl R9Host {
             // process's monotonic clock. A damaged file is kept aside at
             // the first pass, and every write carries the quarantine.
             let what = match (main_lost, side_lost) {
-                (true, true) => "revoked_grants and revoked_quarantine are",
-                (true, false) => "revoked_grants is",
-                _ => "revoked_quarantine is",
+                (true, true) => "revoked_grants and revoked_quarantine are unreadable or missing",
+                (true, false) => "revoked_grants is unreadable or missing",
+                (false, true) => "revoked_quarantine is unreadable or missing",
+                (false, false) => {
+                    "pairing/revoked_floor is unreadable or above the journal's bound (the \
+                     journal restored or rolled back?)"
+                }
             };
             log(&format!(
-                "{what} unreadable or missing; browser grants are refused for at least 65 min \
-                 and until the wall clock passes {}",
+                "{what}; browser grants are refused for at least 65 min and until the wall \
+                 clock passes {}",
                 bound.floor()
             ));
             self.quarantine = Some(revoked::Quarantine::starting(bound.floor()));
@@ -2167,6 +2232,32 @@ impl R9Host {
             self.quarantine = Some(revoked::Quarantine::restored(started_at, until));
             self.quarantine_recorded = true;
         }
+    }
+
+    /// Raises the pairing's copy of the bound to the bound in memory, best
+    /// effort (at load; every write does it before the sidecar). Without a
+    /// pairing directory there is nothing to write.
+    fn write_pairing_copy(&mut self) {
+        if let Err(e) = self.raise_pairing_copy(self.bound) {
+            log(&format!("cannot write pairing/revoked_floor: {e}"));
+        }
+    }
+
+    /// The pairing's copy raised to `bound` (never lowered), durably.
+    fn raise_pairing_copy(&mut self, bound: revoked::Bound) -> std::io::Result<()> {
+        let Some(copy) = self.pairing_copy.clone() else {
+            return Ok(());
+        };
+        if !copy.parent().is_some_and(Path::is_dir) {
+            return Ok(());
+        }
+        let want = self.copy_bound.max(bound);
+        if want == self.copy_bound && copy.exists() {
+            return Ok(());
+        }
+        revoked::write_atomic(&copy, &revoked::encode_sidecar(want), None)?;
+        self.copy_bound = want;
+        Ok(())
     }
 
     /// The host's trusted time: its wall clock, never below the high-water
@@ -2216,7 +2307,8 @@ impl R9Host {
                 log(&format!(
                     "the host wall clock is behind the revoked grants' high-water mark ({}); \
                      browser grants are refused until it catches up (there is no override: \
-                     wait for the clock; removing the journal forgets every revocation)",
+                     wait for the clock; removing runtime/ or the revoked grants' files doesn't \
+                     lift it, pairing/revoked_floor keeps the bound)",
                     self.bound.behind()
                 ));
             }
@@ -2265,6 +2357,8 @@ impl R9Host {
                 ));
             }
         }
+        // The pairing's copy first: it survives the journal directory.
+        self.raise_pairing_copy(bound)?;
         revoked::write_atomic(&sidecar, &revoked::encode_sidecar(bound), None)?;
         self.bound = bound;
         revoked::checkpoint(revoked::Step::SidecarWritten, crash)?;

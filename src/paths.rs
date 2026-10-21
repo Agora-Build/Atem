@@ -60,6 +60,10 @@ pub struct PairingPaths {
     /// `frozen_genesis`: genesis hashes this host was frozen on (kept by
     /// `atem unpair`; ≤ 16).
     pub frozen_genesis: PathBuf,
+    /// `revoked_floor`: a copy of the revoked browser grants' bound
+    /// (`runtime/journal/revoked_quarantine`), outside the journal directory
+    /// (kept by `atem unpair`; only ever raised).
+    pub revoked_floor: PathBuf,
     /// `host_channel_key`: the host's atem-ch1 key (deleted by `atem unpair`).
     pub host_channel_key: PathBuf,
 }
@@ -76,6 +80,7 @@ impl PairingPaths {
             freeze: dir.join("membership.freeze"),
             fault: dir.join("membership.fault"),
             frozen_genesis: dir.join("frozen_genesis"),
+            revoked_floor: dir.join("revoked_floor"),
             host_channel_key: dir.join("host_channel_key"),
         }
     }

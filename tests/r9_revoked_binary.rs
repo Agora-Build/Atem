@@ -905,3 +905,103 @@ fn removing_the_journal_of_a_pinned_host_keeps_revocations_refused() {
     let log = rig.runtime_log();
     assert!(log.contains("pinned device list"), "{log}");
 }
+
+fn set_mtime(path: &Path, at_ms: u64) {
+    let t = std::time::UNIX_EPOCH + Duration::from_millis(at_ms);
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(t).unwrap();
+}
+
+/// What is lost in [`lost_while_behind`].
+#[derive(Clone, Copy, Debug)]
+enum Loss {
+    /// `runtime/` removed after an orderly stop.
+    RuntimeAfterStop,
+    /// `runtime/` removed after a crash.
+    RuntimeAfterCrash,
+    /// Only the two revoked-grants files removed.
+    RevokedFiles,
+}
+
+/// Re-review R1 (the reviewer's proof of concept, turned around): the
+/// true time is T; A is revoked; the host clock goes back two hours; the
+/// runtime stops (or crashes) while behind, so the device list's
+/// checkpoint and every write in `pairing/` carry behind times; the
+/// journal (or its revoked-grants files) is lost; after 66 min on the
+/// monotonic clock, with the host wall at T + 1, A must still be refused:
+/// the pairing's copy of the bound (`pairing/revoked_floor`) keeps the
+/// trusted time.
+fn lost_while_behind(loss: Loss) {
+    let mut rig = Rig::new();
+    let pairing = rig.sandbox.config().join("pairing");
+    // The true time T is the system clock + 2 h; the host clock later goes
+    // back to the system clock, so what the runtime writes then carries
+    // the behind time (as a real clock would).
+    rig.clock.set_wall(120 * MIN as i64);
+    rig.start();
+    let t = rig.clock.wall();
+    let a = grant(&mut rig.log, &rig.clock, GA, 60 * MIN);
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-1", &rig.log, HOST, &phone())
+            .expect("the phone");
+        revoke(&mut router, "ph-1", &mut ph, GA);
+    }
+    rig.clock.set_wall(0);
+    rig.stop(matches!(loss, Loss::RuntimeAfterCrash));
+    let behind = rig.clock.wall();
+    // pairing/ as on a real host: pinned hours before A; what the stop
+    // wrote carries the behind time.
+    for e in std::fs::read_dir(&pairing).unwrap().filter_map(Result::ok) {
+        if e.file_type().unwrap().is_file() {
+            set_mtime(&e.path(), t - 5 * 60 * MIN);
+        }
+    }
+    set_mtime(&pairing.join("membership.json"), behind);
+    match loss {
+        Loss::RuntimeAfterStop | Loss::RuntimeAfterCrash => {
+            std::fs::remove_dir_all(rig.sandbox.config().join("runtime")).unwrap()
+        }
+        Loss::RevokedFiles => {
+            for f in ["revoked_grants", "revoked_quarantine"] {
+                std::fs::remove_file(rig.journal().join(f)).unwrap();
+            }
+            // The rest of the journal written at behind times too.
+            for e in std::fs::read_dir(rig.journal())
+                .unwrap()
+                .filter_map(Result::ok)
+            {
+                if e.file_type().unwrap().is_file() {
+                    set_mtime(&e.path(), behind);
+                }
+            }
+        }
+    }
+    rig.start();
+    let mut router = Router::new(&rig.astation);
+    let _ph = router
+        .connect("ph-2", &rig.log, HOST, &phone())
+        .expect("the phone");
+    rig.clock.add_mono(66 * MIN);
+    rig.clock.set_wall(121 * MIN as i64);
+    quarantined(&mut router, &rig, "a-1", &a);
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn removing_runtime_after_a_stop_while_behind_keeps_a_revocation() {
+    lost_while_behind(Loss::RuntimeAfterStop);
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn removing_runtime_after_a_crash_while_behind_keeps_a_revocation() {
+    lost_while_behind(Loss::RuntimeAfterCrash);
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn removing_the_revoked_files_while_behind_keeps_a_revocation() {
+    lost_while_behind(Loss::RevokedFiles);
+}
