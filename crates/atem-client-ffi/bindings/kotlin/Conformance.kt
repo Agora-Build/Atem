@@ -33,6 +33,7 @@ fun AtemException.codeOf(): String = when (this) {
     is AtemException.Restore -> code
     is AtemException.Publish -> code
     is AtemException.Push -> code
+    is AtemException.Stored -> code
     is AtemException.BadWelcome -> "bad_welcome"
     is AtemException.Request -> "request"
     is AtemException.State -> "state"
@@ -46,6 +47,7 @@ fun AtemException.detailOf(): String? = when (this) {
     is AtemException.Restore -> detail
     is AtemException.Publish -> detail
     is AtemException.Push -> detail
+    is AtemException.Stored -> detail
     is AtemException.BadWelcome -> check
     is AtemException.Request -> detail
     is AtemException.State -> detail
@@ -187,6 +189,21 @@ fun main(args: Array<String>) {
         eq(pending[0].subject, "dev-newmac")
         eq(pending[0].effectiveAt, now.wallMs + 86400000uL)
         eq(log.member("dev-newmac")!!.status, MemberStatusKind.PENDING)
+    }
+    check("the log's durable snapshot restores against the app's anchors") {
+        val log = logL()
+        log.extend(listOf(entry("R7")), now)
+        val saved = log.storedJson()
+        val later = HostClock(now.wallMs + 3600000uL, now.monoMs + 3600000uL, "boot-1")
+        val restored = MembershipLog.fromStored(account, genesis, saved, later)
+        eq(restored.head(), log.head())
+        eq(restored.pendingRecovery(later)[0].effectiveAt, now.wallMs + 86400000uL, "same boot: from first sight")
+        val reboot = HostClock(now.wallMs + 7200000uL, 500uL, "boot-2")
+        eq(MembershipLog.fromStored(account, genesis, saved, reboot).pendingRecovery(reboot)[0].effectiveAt, reboot.wallMs + 86400000uL, "another boot: nothing waited was persisted")
+        throwsCode("account_mismatch") { MembershipLog.fromStored("acct-other", genesis, saved, now) }
+        throwsCode("genesis_mismatch") { MembershipLog.fromStored(account, byLabel.getValue("SUB1")["entry_hash"].s(), saved, now) }
+        throwsCode("malformed") { MembershipLog.fromStored(account, genesis, saved.substring(0, saved.length / 2), now) }
+        throwsCode("stored_invalid") { MembershipLog.fromStored(account, genesis, saved.replaceFirst("{", "{\"extra\":1,"), now) }
     }
     check("draft + publish reproduces E7 (Kotlin signer through the foreign trait)") {
         val log = logL()

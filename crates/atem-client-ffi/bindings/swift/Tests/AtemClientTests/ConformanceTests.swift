@@ -54,6 +54,7 @@ func codeOf(_ e: AtemError) -> (String, String?) {
     case let .Restore(code, detail): return (code, detail)
     case let .Publish(code, detail): return (code, detail)
     case let .Push(code, detail): return (code, detail)
+    case let .Stored(code, detail): return (code, detail)
     case let .State(detail): return ("state", detail)
     }
 }
@@ -209,6 +210,22 @@ final class ConformanceTests: XCTestCase {
             try eq(pending[0].subject, "dev-newmac")
             try eq(pending[0].effectiveAt, now.wallMs + 86_400_000)
             try eq(log.member(deviceId: "dev-newmac")!.status, .pending)
+        }
+        check("the log's durable snapshot restores against the app's anchors") {
+            let log = try logL()
+            _ = try log.extend(entries: [entry("R7")], now: now)
+            let saved = try log.storedJson()
+            let later = HostClock(wallMs: now.wallMs + 3_600_000, monoMs: now.monoMs + 3_600_000, bootId: "boot-1")
+            let restored = try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: saved, now: later)
+            try eq(restored.head(), log.head())
+            try eq(restored.pendingRecovery(now: later)[0].effectiveAt, now.wallMs + 86_400_000, "same boot: from first sight")
+            let reboot = HostClock(wallMs: now.wallMs + 7_200_000, monoMs: 500, bootId: "boot-2")
+            try eq(try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: saved, now: reboot).pendingRecovery(now: reboot)[0].effectiveAt, reboot.wallMs + 86_400_000, "another boot: nothing waited was persisted")
+            try throwsCode("account_mismatch") { _ = try MembershipLog.fromStored(accountId: "acct-other", genesisHash: genesis, storedJson: saved, now: now) }
+            try throwsCode("genesis_mismatch") { _ = try MembershipLog.fromStored(accountId: account, genesisHash: hash("SUB1"), storedJson: saved, now: now) }
+            try throwsCode("malformed") { _ = try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: String(saved.prefix(saved.count / 2)), now: now) }
+            let extra = saved.replacingOccurrences(of: "{", with: "{\"extra\":1,", options: [], range: saved.range(of: "{"))
+            try throwsCode("stored_invalid") { _ = try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: extra, now: now) }
         }
         let phoneAuth = key("dev-phone", "auth")
         check("draft + publish reproduces E7 (a Swift signer through the foreign trait)") {
@@ -455,6 +472,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 35)
+        XCTAssertEqual(passed, 36)
     }
 }

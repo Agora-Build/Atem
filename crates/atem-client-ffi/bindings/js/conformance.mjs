@@ -38,7 +38,7 @@ function throwsCode(f, code) {
   try {
     f();
   } catch (e) {
-    if (e.code === code || e.detail === code) return;
+    if (e.code === code || e.detail === code) return e;
     throw new Error(`expected ${code}, got ${e.kind}/${e.code}/${e.detail}`);
   }
   throw new Error(`expected ${code}, nothing thrown`);
@@ -159,6 +159,22 @@ check("a recovery_add waits 24 h on the verifier's clock", () => {
   eq(pending[0].subject, "dev-newmac");
   eq(pending[0].effectiveAt, NOW.wallMs + 86400000);
   eq(log.member("dev-newmac").status, "pending");
+});
+check("the log's durable snapshot restores against the app's anchors", () => {
+  const log = logL();
+  log.extend([entry("R7")], NOW);
+  const saved = log.storedJson();
+  const later = { wallMs: NOW.wallMs + 3600000, monoMs: NOW.monoMs + 3600000, bootId: "boot-1" };
+  const restored = m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved, later);
+  eq(restored.head(), log.head());
+  eq(restored.pendingRecovery(later)[0].effectiveAt, NOW.wallMs + 86400000, "same boot: from first sight");
+  const reboot = { wallMs: NOW.wallMs + 7200000, monoMs: 500, bootId: "boot-2" };
+  eq(m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved, reboot).pendingRecovery(reboot)[0].effectiveAt, reboot.wallMs + 86400000, "another boot: nothing waited was persisted");
+  const e = throwsCode(() => m.MembershipLog.fromStored("acct-other", GENESIS, saved, NOW), "account_mismatch");
+  eq(e.kind, "stored");
+  throwsCode(() => m.MembershipLog.fromStored(ACCOUNT, byLabel.SUB1.entry_hash, saved, NOW), "genesis_mismatch");
+  throwsCode(() => m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved.slice(0, saved.length / 2), NOW), "malformed");
+  throwsCode(() => m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved.replace("{", '{"extra":1,'), NOW), "stored_invalid");
 });
 check("draft + publish reproduces E7 byte for byte (RFC 6979)", () => {
   const log = logL();
