@@ -205,6 +205,18 @@ fun main(args: Array<String>) {
         throwsCode("malformed") { MembershipLog.fromStored(account, genesis, saved.substring(0, saved.length / 2), now) }
         throwsCode("stored_invalid") { MembershipLog.fromStored(account, genesis, saved.replaceFirst("{", "{\"extra\":1,"), now) }
     }
+    check("a wait-ended decision survives the snapshot") {
+        val log = logL()
+        log.extend(listOf(entry("R7")), now)
+        val day = HostClock(now.wallMs + 86400000uL, now.monoMs + 86400000uL, "boot-1")
+        eq(log.advance(day).isNotEmpty(), true)
+        val saved = log.storedJson()
+        eq(saved.contains("\"reason\":\"wait_ended\""), true)
+        val restored = MembershipLog.fromStored(account, genesis, saved, day)
+        eq(restored.member("dev-newmac")!!.status, MemberStatusKind.ACTIVE)
+        eq(restored.extend(listOf(entry("N8")), day).appended, 1uL, "N8 relies on the decision")
+        throwsCode("unsupported_version") { MembershipLog.fromStored(account, genesis, saved.replace("\"v\":1", "\"v\":2"), day) }
+    }
     check("draft + publish reproduces E7 (Kotlin signer through the foreign trait)") {
         val log = logL()
         val e7 = byLabel.getValue("E7")["entry"]["body"]

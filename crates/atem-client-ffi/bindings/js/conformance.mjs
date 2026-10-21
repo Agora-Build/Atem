@@ -176,6 +176,18 @@ check("the log's durable snapshot restores against the app's anchors", () => {
   throwsCode(() => m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved.slice(0, saved.length / 2), NOW), "malformed");
   throwsCode(() => m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved.replace("{", '{"extra":1,'), NOW), "stored_invalid");
 });
+check("a wait-ended decision survives the snapshot", () => {
+  const log = logL();
+  log.extend([entry("R7")], NOW);
+  const day = { wallMs: NOW.wallMs + 86400000, monoMs: NOW.monoMs + 86400000, bootId: "boot-1" };
+  eq(log.advance(day).length > 0, true);
+  const saved = log.storedJson();
+  eq(saved.includes('"reason":"wait_ended"'), true);
+  const restored = m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved, day);
+  eq(restored.member("dev-newmac").status, "active");
+  eq(restored.extend([entry("N8")], day).appended, 1, "N8 relies on the decision");
+  throwsCode(() => m.MembershipLog.fromStored(ACCOUNT, GENESIS, saved.replaceAll('"v":1', '"v":2'), day), "unsupported_version");
+});
 check("draft + publish reproduces E7 byte for byte (RFC 6979)", () => {
   const log = logL();
   const e7 = byLabel.E7.entry.body;

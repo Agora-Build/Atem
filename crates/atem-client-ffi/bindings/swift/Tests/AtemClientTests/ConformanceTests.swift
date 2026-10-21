@@ -204,7 +204,7 @@ final class ConformanceTests: XCTestCase {
         check("a recovery_add waits 24 h on the verifier's clock") {
             let log = try logL()
             try eq(try log.extend(entries: [entry("R7")], now: now).appended, 1)
-            let pending = log.pendingRecovery(now: now)
+            let pending = try log.pendingRecovery(now: now)
             try eq(pending.count, 1)
             try eq(pending[0].entryHash, hash("R7"))
             try eq(pending[0].subject, "dev-newmac")
@@ -226,6 +226,19 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("malformed") { _ = try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: String(saved.prefix(saved.count / 2)), now: now) }
             let extra = saved.replacingOccurrences(of: "{", with: "{\"extra\":1,", options: [], range: saved.range(of: "{"))
             try throwsCode("stored_invalid") { _ = try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: extra, now: now) }
+        }
+        check("a wait-ended decision survives the snapshot") {
+            let log = try logL()
+            _ = try log.extend(entries: [entry("R7")], now: now)
+            let day = HostClock(wallMs: now.wallMs + 86_400_000, monoMs: now.monoMs + 86_400_000, bootId: "boot-1")
+            try eq(try log.advance(now: day).isEmpty, false)
+            let saved = try log.storedJson()
+            try eq(saved.contains("\"reason\":\"wait_ended\""), true)
+            let restored = try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: saved, now: day)
+            try eq(restored.member(deviceId: "dev-newmac")!.status, .active)
+            try eq(try restored.extend(entries: [entry("N8")], now: day).appended, 1, "N8 relies on the decision")
+            let newer = saved.replacingOccurrences(of: "\"v\":1", with: "\"v\":2")
+            try throwsCode("unsupported_version") { _ = try MembershipLog.fromStored(accountId: account, genesisHash: genesis, storedJson: newer, now: day) }
         }
         let phoneAuth = key("dev-phone", "auth")
         check("draft + publish reproduces E7 (a Swift signer through the foreign trait)") {
@@ -472,6 +485,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 36)
+        XCTAssertEqual(passed, 37)
     }
 }
