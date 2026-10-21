@@ -704,7 +704,26 @@ once); if that file can't be read at start, it is kept aside
 slack). The rewritten file records that quarantine and every later write
 keeps the record, so a revocation during it or a restart can't end it
 early; it ends once the wall clock passed the recorded end and the running
-process saw 65 min on its monotonic clock. No revocation is lost.
+process saw 65 min on its monotonic clock. The conservative bound also
+lives in its own sidecar, `runtime/journal/revoked_quarantine`
+(`{"v":1,"until","high_water"}`: the latest quarantine end, which only
+rises, and the highest host wall time seen at a write), written durably
+before every write of `revoked_grants`. A quarantine found after any
+damage ends no earlier than the previous end, now + 65 min and the
+high-water mark + 65 min, so damage found again after the wall clock went
+back can't shorten an earlier quarantine (Astation's 12:00 / 10:00 /
+12:10 trace, comment 6307612632). While the host's wall clock is below
+the high-water mark, browser grants are refused `busy` "host clock went
+back" until it catches up (an entry pruned or lost at a later wall time
+could name a grant that is valid again). An unreadable sidecar, or a
+missing one with evidence of earlier damage (a `*.damaged-<ms>` file or
+a quarantine record), fails closed: `busy` "revoked grants unreadable",
+the bound rebuilt from the newest modification time in the journal
+directory (each write left its wall time there) + 65 min, and 65 min on
+the monotonic clock, as for any damage; the damaged sidecar is kept aside
+(`revoked_quarantine.damaged-<ms>`). Members, native revocations and the
+fencing of live browsers are unaffected throughout. No revocation is
+lost.
 
 Artifacts: `atem-client-bindings.md` §7 (SwiftPM, WASM, Kotlin/JVM,
 Android; SHA256SUMS and the source pin).
