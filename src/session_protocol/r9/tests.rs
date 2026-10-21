@@ -2851,3 +2851,45 @@ fn a_journal_behind_the_pairing_copy_is_quarantined() {
     rig.attached("ph2");
     assert_quarantined(&mut rig, "a1", a);
 }
+
+/// The engine as `atem runtime` builds it: the pairing's copy of the
+/// bound, and the pinned list's floor.
+fn vouched_engine(rig: &Rig) -> R9Host {
+    R9Host::with_pairing(
+        Limits::default(),
+        Some(&rig.journal),
+        Some(PairingVouch {
+            copy: rig.pairing.revoked_floor.clone(),
+            pin_floor: crate::session_protocol::membership::pin_wall_floor(&rig.pairing),
+        }),
+    )
+}
+
+fn bound_in(path: &std::path::Path) -> revoked::Bound {
+    match revoked::load_sidecar(path) {
+        revoked::SidecarLoaded::Read(b) => b,
+        other => panic!("{}: {other:?}", path.display()),
+    }
+}
+
+/// Re-review N2: a pin while the engine runs raises the pairing's copy on
+/// disk; the engine's next write never lowers it (it reads the file each
+/// time) and raises the sidecar with it.
+#[test]
+fn the_pairing_copy_is_never_lowered_by_a_running_engine() {
+    let mut rig = Rig::new();
+    rig.engine = vouched_engine(&rig);
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let far = rig.now.host.wall_ms + 10 * 3_600_000;
+    super::seed_revoked_journal(&rig.journal, &rig.pairing.revoked_floor, far).unwrap();
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    let copy = bound_in(&rig.pairing.revoked_floor);
+    assert!(copy.high_water >= far, "never lowered: {copy:?}");
+    let side = bound_in(&rig.journal.join(revoked::SIDECAR_FILE));
+    assert!(
+        side.high_water >= copy.high_water,
+        "the sidecar is level: {side:?}"
+    );
+}

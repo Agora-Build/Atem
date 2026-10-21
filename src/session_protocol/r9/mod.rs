@@ -2238,26 +2238,34 @@ impl R9Host {
     /// effort (at load; every write does it before the sidecar). Without a
     /// pairing directory there is nothing to write.
     fn write_pairing_copy(&mut self) {
-        if let Err(e) = self.raise_pairing_copy(self.bound) {
-            log(&format!("cannot write pairing/revoked_floor: {e}"));
+        match self.raise_pairing_copy(self.bound) {
+            Ok(merged) => self.bound = merged,
+            Err(e) => log(&format!("cannot write pairing/revoked_floor: {e}")),
         }
     }
 
-    /// The pairing's copy raised to `bound` (never lowered), durably.
-    fn raise_pairing_copy(&mut self, bound: revoked::Bound) -> std::io::Result<()> {
+    /// The pairing's copy raised to `bound`, durably, and never lowered:
+    /// the file is read each time (a pin may have raised it while this
+    /// engine runs), and the result is the max of what it holds, what this
+    /// engine last wrote and `bound`. Returns that max, which the caller
+    /// writes to the sidecar too (so the sidecar is never below the copy).
+    fn raise_pairing_copy(&mut self, bound: revoked::Bound) -> std::io::Result<revoked::Bound> {
         let Some(copy) = self.pairing_copy.clone() else {
-            return Ok(());
+            return Ok(bound);
         };
         if !copy.parent().is_some_and(Path::is_dir) {
-            return Ok(());
+            return Ok(bound);
         }
-        let want = self.copy_bound.max(bound);
-        if want == self.copy_bound && copy.exists() {
-            return Ok(());
+        let on_disk = revoked::load_sidecar(&copy);
+        let mut want = self.copy_bound.max(bound);
+        if let revoked::SidecarLoaded::Read(b) = on_disk {
+            want = want.max(b);
         }
-        revoked::write_atomic(&copy, &revoked::encode_sidecar(want), None)?;
+        if on_disk != revoked::SidecarLoaded::Read(want) {
+            revoked::write_atomic(&copy, &revoked::encode_sidecar(want), None)?;
+        }
         self.copy_bound = want;
-        Ok(())
+        Ok(want)
     }
 
     /// The host's trusted time: its wall clock, never below the high-water
@@ -2357,8 +2365,9 @@ impl R9Host {
                 ));
             }
         }
-        // The pairing's copy first: it survives the journal directory.
-        self.raise_pairing_copy(bound)?;
+        // The pairing's copy first: it survives the journal directory. A
+        // copy a pin raised meanwhile raises this bound too.
+        let bound = self.raise_pairing_copy(bound)?;
         revoked::write_atomic(&sidecar, &revoked::encode_sidecar(bound), None)?;
         self.bound = bound;
         revoked::checkpoint(revoked::Step::SidecarWritten, crash)?;
