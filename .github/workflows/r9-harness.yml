@@ -13,6 +13,7 @@ on:
     paths:
       - "src/**"
       - "crates/atem-client/**"
+      - "crates/atem-core/**"
       - "build.rs"
       - "native/**"
       - "Cargo.toml"
@@ -27,6 +28,7 @@ on:
     paths:
       - "src/**"
       - "crates/atem-client/**"
+      - "crates/atem-core/**"
       - "build.rs"
       - "native/**"
       - "Cargo.toml"
