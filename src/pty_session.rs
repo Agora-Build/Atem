@@ -285,6 +285,15 @@ fn stop_child(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>) {
                 return;
             }
             if std::time::Instant::now() >= deadline {
+                // The whole group, before the agent is reaped (its pid, and so
+                // the group id, can't be recycled until then): a tool that
+                // ignored the hangup would otherwise outlive the session.
+                #[cfg(unix)]
+                if let Some(pid) = child.process_id() {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
                 let _ = child.kill();
                 return;
             }
@@ -769,8 +778,7 @@ mod tests {
     #[tokio::test]
     async fn stop_lets_the_agent_exit_on_its_own_hangup() {
         // Exits 7 on SIGHUP, as an agent saving its session would exit by itself.
-        let status =
-            status_after_stop("trap 'exit 7' HUP; echo up; while :; do sleep 0.05; done").await;
+        let status = status_after_stop("trap 'exit 7' HUP; echo up; sleep 30 & wait").await;
         assert!(!status.contains("Killed"), "{status}");
         assert!(status.contains('7'), "{status}");
     }
@@ -778,11 +786,75 @@ mod tests {
     #[tokio::test]
     async fn stop_kills_an_agent_that_ignores_its_hangup_after_the_grace() {
         let started = std::time::Instant::now();
-        let status = status_after_stop("trap '' HUP; echo up; while :; do sleep 0.05; done").await;
+        let status = status_after_stop("trap '' HUP; echo up; sleep 30 & wait").await;
         assert!(started.elapsed() >= STOP_GRACE, "{status}");
         assert!(
             status.contains("Killed") || status.contains('9'),
             "{status}"
         );
+    }
+
+    /// A tool the agent started that ignores the hangup too is killed with
+    /// the agent's process group, never left running after the session.
+    #[tokio::test]
+    async fn stop_kills_the_agents_tools_with_it() {
+        let mut session = spawn(
+            "sh",
+            &[
+                "-c".into(),
+                "trap '' HUP; sleep 300 & echo \"tool=$!\"; wait".into(),
+            ],
+        )
+        .unwrap();
+        let mut output = String::new();
+        let tool: libc::pid_t = loop {
+            if let PtyEvent::Output(bytes) = session.receiver.recv().await.unwrap() {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                if let Some(pid) = output
+                    .split("tool=")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|pid| pid.parse().ok())
+                {
+                    break pid;
+                }
+            }
+        };
+        // Never leave it behind, even when the test fails.
+        struct Kill(libc::pid_t);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+        let _guard = Kill(tool);
+        session.resize_handle.stop().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !matches!(session.receiver.recv().await.unwrap(), PtyEvent::Exit(_)) {}
+        })
+        .await
+        .unwrap();
+        // Killed (a zombie until init reaps it) or already gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let gone = loop {
+            // A zombie answers `kill(0)` too; on Linux tell it apart, elsewhere
+            // init reaps it within the deadline.
+            let zombie = cfg!(target_os = "linux")
+                && std::fs::read_to_string(format!("/proc/{tool}/stat"))
+                    .map(|stat| {
+                        stat.rsplit(')')
+                            .next()
+                            .unwrap_or("")
+                            .trim_start()
+                            .starts_with('Z')
+                    })
+                    .unwrap_or(false);
+            let alive = unsafe { libc::kill(tool, 0) } == 0 && !zombie;
+            if !alive || std::time::Instant::now() >= deadline {
+                break !alive;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(gone, "the agent's tool {tool} outlived the stopped session");
     }
 }
