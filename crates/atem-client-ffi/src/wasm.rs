@@ -44,6 +44,7 @@ fn js_error(e: AtemError) -> JsValue {
         AtemError::Restore { .. } => "restore",
         AtemError::Publish { .. } => "publish",
         AtemError::Push { .. } => "push",
+        AtemError::Stored { .. } => "stored",
         AtemError::State { .. } => "state",
     };
     set("kind", kind.into());
@@ -77,6 +78,7 @@ fn js_error(e: AtemError) -> JsValue {
         | AtemError::Restore { detail, .. }
         | AtemError::Publish { detail, .. }
         | AtemError::Push { detail, .. }
+        | AtemError::Stored { detail, .. }
         | AtemError::State { detail } => set("detail", detail.as_str().into()),
     }
     error.into()
@@ -335,6 +337,25 @@ impl MembershipLog {
             entries,
             clock(now)?,
         ))?))
+    }
+    /// The log from its durable snapshot, against the app's anchors.
+    #[wasm_bindgen(js_name = fromStored)]
+    pub fn from_stored(
+        account_id: String,
+        genesis_hash: String,
+        stored_json: String,
+        now: JsValue,
+    ) -> JsResult<MembershipLog> {
+        Ok(MembershipLog(err(crate::log::MembershipLog::from_stored(
+            account_id,
+            genesis_hash,
+            stored_json,
+            clock(now)?,
+        ))?))
+    }
+    #[wasm_bindgen(js_name = storedJson)]
+    pub fn stored_json(&self) -> JsResult<String> {
+        err(self.0.stored_json())
     }
     pub fn snapshot(&self) -> MembershipLog {
         MembershipLog(self.0.snapshot())

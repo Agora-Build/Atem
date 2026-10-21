@@ -10,7 +10,7 @@
 //!   (channel) or a fresh owner confirmation (entries, recovery, kit);
 //! - [`log`]: the membership log ([`log::MembershipLog`]): verify, extend
 //!   with fetched or carried entries, members, hosts, pending recovery,
-//!   drafts;
+//!   drafts, and its durable snapshot (`stored_json` / `from_stored`);
 //! - [`publish`]: the entry publisher (§R9.4 CAS rules) and the K-backup
 //!   writer;
 //! - [`kit`]: the Recovery Kit, K-backup envelopes and the restore flow;

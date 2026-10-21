@@ -1,15 +1,19 @@
-//! The membership log (§R9.2–§R9.5) as one object. The app stores the
-//! entries (`entries()`, canonical JSON, in order) and rebuilds the object
-//! with `verify` at start; nothing else needs storing for a client (the
-//! host's head is authoritative, §6 "storage policy").
+//! The membership log (§R9.2–§R9.5) as one object. The app stores its
+//! durable snapshot (`stored_json()`: the entries, the recovery records with
+//! their wait clocks and decisions, evidence and a freeze; the same form
+//! the host keeps in `membership.json`) after every change, and rebuilds the
+//! object with `from_stored` at start, against the anchors it holds. `verify`
+//! from the entries alone starts every pending wait again and loses where
+//! wait-ended decisions took effect.
 //!
 //! Mutating calls (`extend`, `advance`, a publisher's reply) change the
 //! object in place, so every holder sees the new state; `snapshot` copies.
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use atem_client::SignedObject;
+use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::channel::HeadRelation;
-use atem_client::encoding::b64u;
+use atem_client::encoding::{Hash32, b64u};
 use atem_client::membership::{
     Action, Conflict, Effect, Entry, Evaluation, Head, HostNow, Invalid, Member, MemberKind,
     MemberStatus, Membership, Stop,
@@ -21,6 +25,12 @@ use crate::types::{
     CarriageResult, CarriageStop, FreezeInfo, HeadRelationKind, HostClock, HostInfo, KBackupInfo,
     LogHead, MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo,
 };
+
+/// Largest durable snapshot `MembershipLog::from_stored` reads: the host's
+/// own bound on `membership.json` (`src/session_protocol/membership/store.rs`
+/// `MAX_FILE`, 16 MiB: a full log of 1024 entries with bodies ≤ 4 KiB, plus
+/// recovery records and evidence). Checked before parsing.
+pub const MAX_STORED_JSON: usize = 16 << 20;
 
 impl From<&HostClock> for HostNow {
     fn from(c: &HostClock) -> Self {
@@ -307,6 +317,97 @@ impl MembershipLog {
         )
         .map_err(|e| AtemError::membership(&e.reason, Some(e.index)))?;
         Ok(Self::wrap(verified.membership))
+    }
+
+    /// Rebuilds a log from its durable snapshot (`stored_json()`), checked
+    /// against the anchors the app holds (`account_id`, and `genesis_hash`
+    /// from the pairing or the kit), never against the snapshot's own: the
+    /// shared verifier replays the chain with the recorded decisions at
+    /// their positions, checks one recovery record per pending-type entry,
+    /// the head, recovery keys and a freeze (`Membership::from_stored`, as
+    /// the host reads `membership.json` at start). The snapshot must be
+    /// exactly what `stored_json()` writes: any other field, a missing
+    /// record or a changed value is refused. Errors: `Stored{code}`
+    /// (`too_large`, `malformed`, `account_mismatch`, `genesis_mismatch`,
+    /// `stored_invalid`); a malformed anchor is `Invalid`.
+    ///
+    /// `now` is this run's first reading of the verifier clock, taken as the
+    /// host takes one at start: on the same boot every wait goes on from
+    /// first sight, on another boot from the time already waited (time
+    /// while the machine was off, or before this reading, never counts).
+    /// Nothing in the snapshot, `signed_at` or any relay time counts as
+    /// time waited. Restoring grants nothing: it is a verified log, like
+    /// `verify`'s.
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn from_stored(
+        account_id: String,
+        genesis_hash: String,
+        stored_json: String,
+        now: HostClock,
+    ) -> Result<Arc<Self>> {
+        let genesis = hash_of(&genesis_hash)?;
+        if stored_json.len() > MAX_STORED_JSON {
+            return Err(AtemError::stored(
+                "too_large",
+                format!("a snapshot is at most {MAX_STORED_JSON} bytes"),
+            ));
+        }
+        let value = parse_strict(
+            stored_json.as_bytes(),
+            MAX_STORED_JSON,
+            Numbers::IntegersOnly,
+        )
+        .map_err(|e| AtemError::stored("malformed", format!("not strict JSON: {e:?}")))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| AtemError::stored("malformed", "not an object"))?;
+        match object.get("account_id").and_then(|v| v.as_str()) {
+            None => return Err(AtemError::stored("malformed", "account_id")),
+            Some(a) if a != account_id => {
+                return Err(AtemError::stored(
+                    "account_mismatch",
+                    "the snapshot is of another account",
+                ));
+            }
+            Some(_) => {}
+        }
+        match object
+            .get("genesis_hash")
+            .and_then(|v| v.as_str())
+            .and_then(|h| Hash32::from_hex(h).ok())
+        {
+            None => return Err(AtemError::stored("malformed", "genesis_hash")),
+            Some(h) if h != genesis => {
+                return Err(AtemError::stored(
+                    "genesis_mismatch",
+                    "the snapshot is of another genesis",
+                ));
+            }
+            Some(_) => {}
+        }
+        let mut log = Membership::from_stored(&account_id, &genesis, &value)
+            .map_err(|e| AtemError::stored("stored_invalid", e.0))?;
+        // Exactly the export: a field `to_stored` doesn't write (which
+        // `from_stored` would ignore, as it ignores the host's own) or any
+        // other spelling of the state is refused.
+        if canonical(&log.to_stored())? != canonical(&value)? {
+            return Err(AtemError::stored(
+                "stored_invalid",
+                "the snapshot holds more than the log's durable state",
+            ));
+        }
+        log.checkpoint(&(&now).into());
+        Ok(Self::wrap(log))
+    }
+
+    /// The durable snapshot (canonical JSON): the entries, the recovery
+    /// records with their wait clocks and decisions, evidence and a freeze.
+    /// Commit it durably after every `extend`, `advance` and publisher or
+    /// writer reply that changed the log, and at least once a minute while
+    /// a recovery waits, **before** acting on the returned effects or
+    /// showing what they permit; reload it with `from_stored`.
+    pub fn stored_json(&self) -> Result<String> {
+        canonical(&self.lock().to_stored())
     }
 
     /// A copy (later changes to either don't affect the other).

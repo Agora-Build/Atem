@@ -57,6 +57,11 @@ pub enum AtemError {
     /// `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`,
     /// `duplicate`).
     Push { code: String, detail: String },
+    /// A durable log snapshot (`MembershipLog::stored_json`) refused at
+    /// load (`too_large`, `malformed`, `account_mismatch`,
+    /// `genesis_mismatch`, `stored_invalid`). Nothing was restored: keep
+    /// the adapter halted, never fall back to an unverified state.
+    Stored { code: String, detail: String },
     /// The object was used out of order (a step already taken, a state it
     /// isn't in).
     State { detail: String },
@@ -72,7 +77,8 @@ impl AtemError {
             | AtemError::Refused { code, .. }
             | AtemError::Restore { code, .. }
             | AtemError::Publish { code, .. }
-            | AtemError::Push { code, .. } => code.clone(),
+            | AtemError::Push { code, .. }
+            | AtemError::Stored { code, .. } => code.clone(),
             AtemError::BadWelcome { .. } => "bad_welcome".into(),
             AtemError::Request { .. } => "request".into(),
             AtemError::State { .. } => "state".into(),
@@ -98,6 +104,13 @@ impl AtemError {
         }
     }
 
+    pub(crate) fn stored(code: &str, detail: impl Into<String>) -> Self {
+        AtemError::Stored {
+            code: code.into(),
+            detail: detail.into(),
+        }
+    }
+
     pub(crate) fn membership(reason: &Invalid, index: Option<usize>) -> Self {
         AtemError::Membership {
             code: "membership_invalid".into(),
@@ -114,7 +127,8 @@ impl std::fmt::Display for AtemError {
             | AtemError::Channel { code, detail }
             | AtemError::Restore { code, detail }
             | AtemError::Publish { code, detail }
-            | AtemError::Push { code, detail } => write!(f, "{code}: {detail}"),
+            | AtemError::Push { code, detail }
+            | AtemError::Stored { code, detail } => write!(f, "{code}: {detail}"),
             AtemError::Membership { detail, index, .. } => match index {
                 Some(i) => write!(f, "membership_invalid at {i}: {detail}"),
                 None => write!(f, "membership_invalid: {detail}"),
