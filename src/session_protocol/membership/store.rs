@@ -282,10 +282,6 @@ impl Store {
         }
     }
 
-    pub fn pairing(&self) -> &PairingPaths {
-        &self.pairing
-    }
-
     pub fn path(&self, file: DlFile) -> PathBuf {
         match file {
             DlFile::Carriage => self.pairing.carriage.clone(),
@@ -307,11 +303,13 @@ impl Store {
     }
 
     /// The next write of `injected.file` fails at `injected.step`.
+    #[cfg(test)]
     pub fn inject(&mut self, injected: Injected) {
         self.injected = Some(injected);
     }
 
     /// The last rename whose directory fsync failed, if any.
+    #[cfg(test)]
     pub fn unsynced_rename(&self) -> Option<&UnsyncedRename> {
         self.unsynced.as_ref()
     }

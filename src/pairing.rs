@@ -941,7 +941,6 @@ pub(crate) mod tests {
     impl crate::session_protocol::membership::Fences for NoFences {
         fn fence(&mut self, _: &str, _: u64) {}
         fn fault(&mut self, _: Option<&[String]>) {}
-        fn halt(&mut self) {}
         fn remote_principals(&self) -> Vec<String> {
             Vec::new()
         }

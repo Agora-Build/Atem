@@ -222,9 +222,6 @@ pub trait Fences {
     /// A device-list fault: `principals` (every remote one with `None`)
     /// fenced in memory, then the journal halts.
     fn fault(&mut self, principals: Option<&[String]>);
-    /// A journal write of the step failed (`membership_applied`): the journal
-    /// halts (r8 §I).
-    fn halt(&mut self);
     /// Every remote principal the host knows.
     fn remote_principals(&self) -> Vec<String>;
 }
@@ -252,11 +249,6 @@ impl<J: Journal> Fences for HostFences<'_, J> {
 
     fn fault(&mut self, principals: Option<&[String]>) {
         let fx = self.host.membership_fault(principals);
-        self.effects.extend(fx);
-    }
-
-    fn halt(&mut self) {
-        let fx = self.host.membership_fault(Some(&[]));
         self.effects.extend(fx);
     }
 
@@ -345,16 +337,18 @@ pub enum Init {
     Busy,
 }
 
-/// The runtime's device list as opened at start (§R9.3 "Crash recovery").
+/// The runtime's device list as opened at start (§R9.3 "Crash recovery";
+/// tests: the bridge's view of it).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
-pub enum DeviceList<'a> {
+pub enum DeviceList {
     /// No device list: this host isn't paired for r9.
     None,
-    Open(&'a MembershipHost),
+    Open,
     /// It exists but couldn't be opened (damaged, unsynced, an applied head
     /// it doesn't hold): r9 admission must be refused (Task 7); r8 is
     /// unaffected.
-    Failed(&'a str),
+    Failed,
 }
 
 /// `membership_applied`: the head whose fences are durable.
@@ -484,7 +478,9 @@ impl MembershipHost {
     /// `host_channel_key` and `membership_applied` at its head, under
     /// `trust_gen.lock`. Replaces any earlier device list: every r9 file
     /// left from an earlier one goes first (a stale carriage record, fault,
-    /// freeze, key or applied head never survives a new pin).
+    /// freeze, key or applied head never survives a new pin). Tests (the
+    /// runtime pins under its own lock, `pin_locked`).
+    #[cfg(test)]
     pub fn pin(
         pairing: &PairingPaths,
         journal_dir: &Path,
@@ -776,6 +772,7 @@ impl MembershipHost {
     }
 
     /// The freeze file is on disk (in any state).
+    #[cfg(any(test, debug_assertions))]
     pub fn frozen_durable(&self) -> bool {
         self.store.present(DlFile::Freeze)
     }
@@ -792,6 +789,7 @@ impl MembershipHost {
     }
 
     /// An intent beyond the head (`membership_unclean`).
+    #[cfg(any(test, debug_assertions))]
     pub fn unclean(&self) -> Option<Head> {
         match &self.held {
             Some(Held::Unclean(head) | Held::IntentMismatch(head)) => Some(*head),
@@ -799,14 +797,17 @@ impl MembershipHost {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub fn applied(&self) -> Applied {
         self.applied
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub fn carriage_record_present(&self) -> bool {
         self.store.present(DlFile::Carriage)
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub fn fault_record_present(&self) -> bool {
         self.store.present(DlFile::Fault)
     }
@@ -910,10 +911,12 @@ impl MembershipHost {
             && pin.host.host_trust_gen == self.pin.host_trust_gen
     }
 
+    #[cfg(test)]
     pub fn store(&self) -> &Store {
         &self.store
     }
 
+    #[cfg(test)]
     pub fn store_mut(&mut self) -> &mut Store {
         &mut self.store
     }

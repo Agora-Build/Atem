@@ -19,7 +19,6 @@ pub(super) const SID: &str = "ses-aaaaaaaaaaaa";
 pub(super) const SID_B: &str = "ses-bbbbbbbbbbbb";
 pub(super) const PGEN: &str = "22222222-2222-4222-8222-222222222222";
 pub(super) const PGEN_B: &str = "33333333-3333-4333-8333-333333333333";
-pub(super) const WALL0: u64 = 1_793_264_000_000;
 
 /// A client's side of one channel.
 pub(super) enum Client {
@@ -34,6 +33,8 @@ pub(super) enum Client {
 
 /// The runtime's r9 side, one link, and the clients on it.
 pub(super) struct Rig {
+    /// Keeps the temp profile alive.
+    #[allow(dead_code)]
     pub dir: tempfile::TempDir,
     pub pairing: crate::paths::PairingPaths,
     pub journal: std::path::PathBuf,

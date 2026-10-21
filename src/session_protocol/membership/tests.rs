@@ -68,13 +68,6 @@ impl Vectors {
             hash: self.hash(label),
         }
     }
-
-    pub fn label_of(&self, hash: &Hash32) -> Option<String> {
-        self.by_label
-            .iter()
-            .find(|(_, v)| v["entry_hash"].as_str() == Some(&hash.to_hex()))
-            .map(|(l, _)| l.clone())
-    }
 }
 
 pub(super) fn clock(wall_ms: u64, mono_ms: u64, boot: &str) -> HostNow {
@@ -168,7 +161,6 @@ pub(super) struct RecFences {
     pub remote: Vec<String>,
     pub fenced: Vec<(String, u64)>,
     pub faults: Vec<Vec<String>>,
-    pub halts: usize,
 }
 
 impl Fences for RecFences {
@@ -178,9 +170,6 @@ impl Fences for RecFences {
     fn fault(&mut self, principals: Option<&[String]>) {
         self.faults
             .push(principals.map_or_else(|| self.remote.clone(), |p| p.to_vec()));
-    }
-    fn halt(&mut self) {
-        self.halts += 1;
     }
     fn remote_principals(&self) -> Vec<String> {
         self.remote.clone()

@@ -159,9 +159,11 @@ pub trait ProjectScope {
 }
 
 /// No launch project is recorded: every `projects` scope leaves sessions
-/// out (pending), never in.
+/// out (pending), never in. Tests (the runtime has its `ProjectScopes`).
+#[cfg(test)]
 pub struct NoProjects;
 
+#[cfg(test)]
 impl ProjectScope for NoProjects {
     fn matches(&self, _: &str, _: &str) -> Option<bool> {
         None
@@ -648,17 +650,20 @@ impl R9Host {
     }
 
     /// `close`s queued outside any channel (tests: the bound holds).
+    #[cfg(test)]
     pub fn queued_closes(&self) -> usize {
         self.global.len()
     }
 
     /// Bytes of the `close`s queued outside any channel (tests: the bound
     /// holds).
+    #[cfg(test)]
     pub fn queued_close_bytes(&self) -> usize {
         self.global.iter().map(|(t, _)| t.len()).sum()
     }
 
     /// Restart closes not yet taken by the link (tests).
+    #[cfg(test)]
     pub fn pending_lifecycle_closes(&self) -> usize {
         self.lifecycle
     }

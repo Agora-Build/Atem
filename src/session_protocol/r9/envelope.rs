@@ -64,6 +64,7 @@ pub enum Event {
 }
 
 impl Event {
+    #[cfg(test)]
     pub fn channel(&self) -> &str {
         match self {
             Event::Open { channel, .. }
@@ -395,6 +396,7 @@ pub fn close(channel: &str, reason: Option<&str>) -> String {
 }
 
 /// An `open` envelope (the router's; tests and fake routers).
+#[cfg(test)]
 pub fn open(channel: &str, transport: Transport) -> String {
     json!({"type": "channel", "event": "open", "channel": channel, "transport": transport.as_str()})
         .to_string()

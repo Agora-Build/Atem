@@ -81,7 +81,7 @@ use crate::session_protocol::host::{
     HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
 };
 use crate::session_protocol::membership::{
-    self, CarriageResult, DeviceList, Held, HostFences, MembershipHost, host_now,
+    self, CarriageResult, Held, HostFences, MembershipHost, host_now,
 };
 use crate::session_protocol::r9::{
     self as r9host, HostKey, Now as R9Now, Parts as R9Parts, R9Host,
@@ -719,11 +719,12 @@ impl HostBridge {
     /// The r9 device list: none (not paired for r9), open (Task 7 admits
     /// through it), or failed to open (Task 7 refuses r9 admission; r8 is
     /// unaffected, so `host_error` doesn't report it).
-    #[allow(dead_code)]
-    pub fn device_list(&self) -> DeviceList<'_> {
+    #[cfg(test)]
+    pub fn device_list(&self) -> membership::DeviceList {
+        use membership::DeviceList;
         match (&self.membership, &self.membership_error) {
-            (Some(m), _) => DeviceList::Open(m),
-            (None, Some(error)) => DeviceList::Failed(error),
+            (Some(_), _) => DeviceList::Open,
+            (None, Some(_)) => DeviceList::Failed,
             (None, None) => DeviceList::None,
         }
     }

@@ -4062,7 +4062,7 @@ fn a_device_list_that_cant_be_opened_is_reported_apart_from_none() {
     crate::session_protocol::membership::store::private_dir(pairing.dir()).unwrap();
     std::fs::write(&pairing.membership, b"{damaged").unwrap();
     let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
-    assert!(matches!(bridge.device_list(), DeviceList::Failed(_)));
+    assert!(matches!(bridge.device_list(), DeviceList::Failed));
     assert!(bridge.host_error().is_none(), "r8 is unaffected");
 }
 
