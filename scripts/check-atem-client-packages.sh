@@ -126,16 +126,22 @@ if [ -f "$ANDROID" ]; then
     read -r ABI CLASS MACHINE <<<"$spec"
     SO="$PKG/jniLibs/$ABI/libatem_client_ffi.so"
     test -s "$SO" || { echo "android: no $ABI library" >&2; exit 1; }
+    # readelf's output is captured whole before any grep: a `grep -q` in a
+    # pipe exits at its first match, readelf then dies of SIGPIPE and, under
+    # pipefail, the match would read as a failure (and the check fail open).
     HDR=$("$READELF" -hW "$SO")
-    echo "$HDR" | grep -Eq "^ *Class: +$CLASS\$" || { echo "android $ABI: not $CLASS" >&2; exit 1; }
-    echo "$HDR" | grep -Eq "^ *Machine: +$MACHINE\$" || { echo "android $ABI: not $MACHINE" >&2; exit 1; }
-    ALIGNS=$("$READELF" -lW "$SO" | awk '$1 == "LOAD" {print $NF}' | sort -u)
+    grep -Eq "^ *Class: +$CLASS\$" <<<"$HDR" || { echo "android $ABI: not $CLASS" >&2; exit 1; }
+    grep -Eq "^ *Machine: +$MACHINE\$" <<<"$HDR" || { echo "android $ABI: not $MACHINE" >&2; exit 1; }
+    PHDRS=$("$READELF" -lW "$SO")
+    ALIGNS=$(awk '$1 == "LOAD" {print $NF}' <<<"$PHDRS" | sort -u)
     [ "$ALIGNS" = 0x4000 ] || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000" >&2; exit 1; }
-    if "$READELF" --dyn-syms -W "$SO" | grep -qiE 'sign_seen|admit_carrier|software_?key'; then
+    SYMS=$("$READELF" --dyn-syms -W "$SO")
+    [ -n "$SYMS" ] || { echo "android $ABI: no dynamic symbols read" >&2; exit 1; }
+    if grep -qiE 'sign_seen|admit_carrier|software_?key' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi
-    "$READELF" --dyn-syms -W "$SO" | grep -q 'uniffi_atem_client_ffi_fn_func_verify_commit_host_trust_gen' \
+    grep -q 'uniffi_atem_client_ffi_fn_func_verify_commit_host_trust_gen' <<<"$SYMS" \
       || { echo "android $ABI: the UniFFI exports are missing" >&2; exit 1; }
     echo "android $ABI: $CLASS $MACHINE, LOAD aligned 16 KB"
   done

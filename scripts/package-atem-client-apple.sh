@@ -77,7 +77,7 @@ cp "$WORK/gen/atem_client_ffiFFI.h" "$OUT/atem-client-${VERSION}-atem_client_ffi
 PIN="atem-client-${VERSION}-SOURCE.json"
 ./scripts/atem-client-source-pin.sh "$OUT/$PIN" apple-swiftpm "default (uniffi)" \
   "xcodebuild=$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')" \
-  "swift=$(swift --version 2>&1 | head -1)"
+  "swift=$(swift --version 2>&1 | sed -n 1p)"
 (cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" > "atem-client-${VERSION}-SHA256SUMS.txt")
 echo "Packaged into $OUT:"
 ls -l "$OUT"

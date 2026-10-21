@@ -112,7 +112,7 @@ main() {
   # Verify
   if command -v atem >/dev/null 2>&1; then
     local installed_version
-    installed_version="$(atem --version 2>/dev/null | head -1)"
+    installed_version="$(atem --version 2>/dev/null | sed -n 1p)" || true
     echo ""
     echo "Installed: ${installed_version}"
   else

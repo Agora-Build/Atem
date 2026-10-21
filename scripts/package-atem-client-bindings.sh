@@ -146,12 +146,19 @@ if want android; then
     cargo rustc -p atem-client-ffi --lib --release --target "$TRIPLE" --crate-type cdylib \
       -- -C link-arg=-Wl,-z,max-page-size=16384
     SO="$TARGET/$TRIPLE/release/libatem_client_ffi.so"
+    # Outputs captured whole before grep (no `| grep -q` under pipefail).
     HDR=$("$READELF" -hW "$SO")
-    echo "$HDR" | grep -Eq "^ *Class: +$CLASS\$" \
+    grep -Eq "^ *Class: +$CLASS\$" <<<"$HDR" \
       || { echo "android $ABI: not $CLASS" >&2; echo "$HDR" >&2; exit 1; }
-    echo "$HDR" | grep -Eq "^ *Machine: +$MACHINE\$" \
+    grep -Eq "^ *Machine: +$MACHINE\$" <<<"$HDR" \
       || { echo "android $ABI: not $MACHINE" >&2; echo "$HDR" >&2; exit 1; }
-    ALIGNS=$("$READELF" -lW "$SO" | awk '$1 == "LOAD" {print $NF}' | sort -u)
+    SYMS=$("$READELF" --dyn-syms -W "$SO")
+    if grep -qiE 'sign_seen|admit_carrier|software_?key' <<<"$SYMS"; then
+      echo "android $ABI: a test-only or host-role symbol is exported" >&2
+      exit 1
+    fi
+    PHDRS=$("$READELF" -lW "$SO")
+    ALIGNS=$(awk '$1 == "LOAD" {print $NF}' <<<"$PHDRS" | sort -u)
     [ "$ALIGNS" = 0x4000 ] \
       || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000 (16 KB)" >&2; exit 1; }
     mkdir -p "$PKG/jniLibs/$ABI"

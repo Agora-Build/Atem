@@ -25,6 +25,7 @@ on:
       - "scripts/package-atem-client-apple.sh"
       - "scripts/package-atem-client-bindings.sh"
       - "scripts/check-atem-client-packages.sh"
+      - "scripts/test-check-atem-client-packages.sh"
       - "scripts/atem-client-source-pin.sh"
       - "scripts/package-atem-r9-harness.sh"
       - "src/**"
@@ -44,6 +45,7 @@ on:
       - "scripts/package-atem-client-apple.sh"
       - "scripts/package-atem-client-bindings.sh"
       - "scripts/check-atem-client-packages.sh"
+      - "scripts/test-check-atem-client-packages.sh"
       - "scripts/atem-client-source-pin.sh"
       - "scripts/package-atem-r9-harness.sh"
       - "src/**"
@@ -225,6 +227,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/android-x"
           unzip -q "$RUNNER_TEMP/pkg-android/atem-client-$ATEM_CLIENT_VERSION-android.zip" -d "$RUNNER_TEMP/android-x"
           file "$RUNNER_TEMP"/android-x/atem-client-android/jniLibs/*/libatem_client_ffi.so
+
+      - name: The check refuses a host-role symbol, a missing export, 4 KB alignment
+        run: READELF=readelf ./scripts/test-check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-android"
 
       - name: Upload the Android package
         uses: actions/upload-artifact@v4
