@@ -284,17 +284,16 @@ enum PreviousEpoch {
     Lost,
 }
 
-/// Files the session journal holds only after a run used it: next to one,
-/// a missing `runtime_epoch` was lost (not a fresh journal).
-const JOURNAL_STATE: [&str; 8] = [
+/// Files only a runtime writes, after it took its epoch: next to one, a
+/// missing `runtime_epoch` was lost (not a fresh journal). The device
+/// list's `membership_applied` is left out: a pairing pins it.
+const JOURNAL_STATE: [&str; 6] = [
     "principals",
     "floors",
     "refused",
     "clean_close",
     "revoked_grants",
     "revoked_quarantine",
-    "membership_applied",
-    "membership_fault",
 ];
 
 fn journal_has_state(dir: &Path) -> bool {
