@@ -2636,7 +2636,12 @@ expires_at`), with a grant's `issued_at` ≤ `now + 300 000`; while
 attached, a timer fences the principal at expiry (wall and monotonic,
 whichever first, as §3's authorization deadline). `welcome.
 authorization_ms_left` = min(expiry − now, the channel's remaining
-lifetime).
+lifetime). A browser principal with no attachment, lease or unfinished
+request may be dropped from the journal (§H's `control_gen` is kept for
+native and service principals only); one that attaches again with a
+still-valid grant starts at `control_gen` 1, since nothing refers to the
+old value and revocation, issuer fencing and expiry are checked at
+admission.
 
 **Keys and owner confirmation — requirements on clients** (Atem can't
 observe them; the shared core exposes signing as an effect):
