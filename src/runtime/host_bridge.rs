@@ -273,20 +273,74 @@ fn link_principal(identity: &Identity, astation_id: &str) -> Option<String> {
     Some(format!("astation:{hex}"))
 }
 
-/// The runtime epoch the counter in `dir` holds (0 when there is none):
-/// the previous run's, before this run takes the next one.
-fn current_runtime_epoch(dir: &Path) -> anyhow::Result<u64> {
+/// The previous run's runtime epoch, before this run takes the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousEpoch {
+    /// The counter's value (0: a fresh journal, no run before).
+    Known(u64),
+    /// No counter next to the journal's state: it was lost. Which epochs
+    /// earlier runs used is unknown, so the previous run's clean close and
+    /// clean checkpoint can't be vouched for.
+    Lost,
+}
+
+/// Files the session journal holds only after a run used it: next to one,
+/// a missing `runtime_epoch` was lost (not a fresh journal).
+const JOURNAL_STATE: [&str; 8] = [
+    "principals",
+    "floors",
+    "refused",
+    "clean_close",
+    "revoked_grants",
+    "revoked_quarantine",
+    "membership_applied",
+    "membership_fault",
+];
+
+fn journal_has_state(dir: &Path) -> bool {
+    JOURNAL_STATE
+        .iter()
+        .any(|f| dir.join(f).symlink_metadata().is_ok())
+        || std::fs::read_dir(dir.join("receipts")).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// The runtime epoch the counter in `dir` holds: the previous run's, before
+/// this run takes the next one.
+fn current_runtime_epoch(dir: &Path) -> anyhow::Result<PreviousEpoch> {
     let path = dir.join(RUNTIME_EPOCH_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(text) => text.trim().parse::<u64>().map_err(|_| {
-            anyhow::anyhow!(
-                "{} is damaged; move it aside to reset the runtime epoch",
-                path.display()
-            )
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Ok(text) => text
+            .trim()
+            .parse::<u64>()
+            .map(PreviousEpoch::Known)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} is damaged; move it aside to reset the runtime epoch",
+                    path.display()
+                )
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && journal_has_state(dir) => {
+            Ok(PreviousEpoch::Lost)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PreviousEpoch::Known(0)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The epoch a run takes after the counter was lost: above every epoch an
+/// earlier run could have used, so none is reused (a reused one could
+/// match an old clean close or clean checkpoint): the wall clock in ms
+/// (earlier counters count starts from 1), and above the clean close's.
+fn epoch_after_lost(dir: &Path) -> u64 {
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let closed = std::fs::read(dir.join("clean_close"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("runtime_epoch")?.as_u64())
+        .map_or(0, |e| e.saturating_add(1));
+    wall.max(closed).max(1)
 }
 
 /// The next runtime epoch, durably (a counter in `dir`, incremented each start).
@@ -294,11 +348,12 @@ fn next_runtime_epoch(dir: &Path) -> anyhow::Result<u64> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let path = dir.join(RUNTIME_EPOCH_FILE);
-    let previous = current_runtime_epoch(dir)?;
-    let next = previous
-        .checked_add(1)
-        .filter(|n| *n <= crate::session_protocol::canonical::MAX_SAFE_INTEGER)
-        .ok_or_else(|| anyhow::anyhow!("the runtime epoch is exhausted"))?;
+    let next = match current_runtime_epoch(dir)? {
+        PreviousEpoch::Known(previous) => previous.checked_add(1),
+        PreviousEpoch::Lost => Some(epoch_after_lost(dir)),
+    }
+    .filter(|n| *n <= crate::session_protocol::canonical::MAX_SAFE_INTEGER)
+    .ok_or_else(|| anyhow::anyhow!("the runtime epoch is exhausted"))?;
     let temp = dir.join(format!("{RUNTIME_EPOCH_FILE}.tmp"));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -494,7 +549,21 @@ impl HostBridge {
         // r8 §H: the previous run ended cleanly only if the journal's
         // clean-close record names its epoch, read before this run takes
         // the next one (which supersedes the record in any case).
-        let previous = current_runtime_epoch(dir)?;
+        let previous = match current_runtime_epoch(dir)? {
+            PreviousEpoch::Known(previous) => previous,
+            PreviousEpoch::Lost => {
+                // No epoch matches: no clean close, no clean checkpoint
+                // (queued work is rejected, recovery waits resume from the
+                // last persisted time).
+                eprintln!(
+                    "atem runtime: {} is missing next to the session journal's state; \
+                     the previous run is treated as not closed cleanly and this run takes \
+                     an epoch above every earlier one",
+                    dir.join(RUNTIME_EPOCH_FILE).display()
+                );
+                0
+            }
+        };
         let epoch = next_runtime_epoch(dir)?;
         let mut identity = profile.map(start_identity).unwrap_or(Identity {
             account_id: UNPAIRED.into(),

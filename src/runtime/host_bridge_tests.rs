@@ -4234,3 +4234,35 @@ fn a_pin_finished_right_after_a_reopen_is_opened_on_the_next_pass() {
         rt.shutdown().await;
     });
 }
+
+/// Re-review N3: a missing `runtime_epoch` next to the journal's state was
+/// lost, not fresh: the counter never restarts at 1 (a reused epoch could
+/// match an old clean close or clean checkpoint). The previous run isn't
+/// vouched for, even by a clean close naming the old epoch, and the new
+/// epoch is above every earlier one.
+#[test]
+fn a_lost_runtime_epoch_never_restarts_the_counter() {
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    let first = bridge.host().context().runtime_epoch;
+    assert_eq!(first, 1);
+    bridge.close_cleanly();
+    drop(bridge);
+    assert!(journal.join("clean_close").exists());
+    std::fs::remove_file(journal.join("runtime_epoch")).unwrap();
+    let bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(
+        !bridge.host().previous_run_clean(),
+        "a lost counter vouches for no clean close"
+    );
+    let epoch = bridge.host().context().runtime_epoch;
+    assert!(
+        epoch > 1_000_000_000_000,
+        "above every earlier epoch: {epoch}"
+    );
+    assert!(bridge.host_error().is_none());
+    drop(bridge);
+    let again = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert_eq!(again.host().context().runtime_epoch, epoch + 1);
+}
