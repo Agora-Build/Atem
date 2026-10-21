@@ -14,6 +14,9 @@
 //! `account_frozen` and closed, the queued prompt of a fenced principal is
 //! rejected (r8 §H, "control revoked") and never reaches the agent, the
 //! freeze is durable and a new channel is refused.
+//!
+//! Debug builds only (`hold_dispatch`, the state dump); CI runs it in the
+//! Test workflow's debug step.
 #![cfg(target_os = "linux")]
 
 mod support;
@@ -292,6 +295,7 @@ fn carry(router: &mut Router, handle: &str, attached: &mut Attached, entry: &Val
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
 fn both_enrolled_hosts_admit_then_freeze_on_conflicting_carriage() {
     // The list: the Mac (genesis, manager), host A and host B with their
     // own channel keys, a phone (control).

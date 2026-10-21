@@ -40,6 +40,6 @@ jobs:
       - name: Run tests (release build, as the release workflow does)
         run: cargo test --release --target ${{ matrix.target }} --no-fail-fast
 
-      - name: Run session fixtures (debug build)
+      - name: Run session fixtures and the two-host r9 test (debug build)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --test runtime_fixtures_binary
+        run: cargo test --test runtime_fixtures_binary --test r9_two_hosts_binary
