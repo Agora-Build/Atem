@@ -1714,3 +1714,37 @@ fn an_add_host_for_another_generation_fails_the_verification() {
         rt.shutdown().await;
     });
 }
+
+/// Re-review F4: an unreadable `frozen_genesis` is found before the codes
+/// are compared and Touch ID is asked: Atem aborts right after
+/// `verifyKeys` with a short reason (no local path), shows the remedy
+/// locally, and pins nothing.
+#[test]
+fn an_unreadable_frozen_genesis_aborts_before_touch_id() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&dir.path().join("profile")).pairing;
+        crate::paths::write_test_file(&pairing.frozen_genesis, b"{not json");
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let _verifier = Verifier::keys(&mut peer, "acct-op").await;
+        // The next message is the abort: no reveal, no question.
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            !peer.seen.iter().any(|m| m["type"] == "verifyReveal"),
+            "aborted before the reveal (no codes, no Touch ID)"
+        );
+        let reason = abort["data"]["reason"].as_str().unwrap();
+        assert_eq!(reason, crate::runtime::ops::FROZEN_GENESIS_UNREADABLE);
+        assert!(reason.chars().count() <= 200 && !reason.contains('/'), "{reason}");
+        op.printed("remove pairing/frozen_genesis and runtime/journal/frozen_genesis")
+            .await;
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!pending(&rt.keys()), "no pending pin");
+        rt.shutdown().await;
+    });
+}

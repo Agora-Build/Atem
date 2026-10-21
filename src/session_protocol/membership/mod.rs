@@ -1785,11 +1785,14 @@ fn parse_applied(bytes: &[u8]) -> Option<Applied> {
 pub fn frozen_genesis(pairing: &PairingPaths) -> Result<Vec<Hash32>, String> {
     let mut list = Vec::new();
     let mirror = frozen_genesis_mirror(pairing);
-    for path in [&mirror, &pairing.frozen_genesis] {
+    for (path, name) in [
+        (&mirror, "runtime/journal/frozen_genesis"),
+        (&pairing.frozen_genesis, "pairing/frozen_genesis"),
+    ] {
         let bytes = match store::read_private(path) {
             Ok(None) => continue,
             Ok(Some(bytes)) => bytes,
-            Err(e) => return Err(frozen_genesis_damaged(path, &e.to_string())),
+            Err(e) => return Err(frozen_genesis_damaged(name, &e.to_string())),
         };
         let parsed = parse_json(&bytes).and_then(|v| {
             v.get("genesis")?
@@ -1799,7 +1802,7 @@ pub fn frozen_genesis(pairing: &PairingPaths) -> Result<Vec<Hash32>, String> {
                 .collect::<Option<Vec<_>>>()
         });
         let Some(parsed) = parsed else {
-            return Err(frozen_genesis_damaged(path, "not a genesis list"));
+            return Err(frozen_genesis_damaged(name, "not a genesis list"));
         };
         for genesis in parsed {
             if !list.contains(&genesis) {
@@ -1815,12 +1818,13 @@ pub fn frozen_genesis_mirror(pairing: &PairingPaths) -> std::path::PathBuf {
     Store::new(pairing, &journal_of(pairing)).path(DlFile::FrozenGenesisMirror)
 }
 
-fn frozen_genesis_damaged(path: &Path, why: &str) -> String {
+/// `name` is relative to the config directory: the message may reach
+/// Astation (a `verifyAbort` reason), never a local absolute path.
+fn frozen_genesis_damaged(name: &str, why: &str) -> String {
     format!(
-        "{} can't be read ({why}): this host can't tell which device lists it was frozen on, \
-         so pairing is refused; restore it, or remove pairing/frozen_genesis and \
-         runtime/journal/frozen_genesis to forget every frozen device list",
-        path.display()
+        "{name} can't be read ({why}): this host can't tell which device lists it was frozen \
+         on, so pairing is refused; restore it, or remove pairing/frozen_genesis and \
+         runtime/journal/frozen_genesis to forget every frozen device list"
     )
 }
 

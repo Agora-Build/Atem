@@ -450,6 +450,10 @@ async fn pair_verify<U: OpUi>(
     verified
 }
 
+/// `verifyAbort` reason when this host's record of frozen device lists
+/// can't be read (no local path; the remedy is shown locally).
+pub(crate) const FROZEN_GENESIS_UNREADABLE: &str = "this host's record of frozen device lists can't be read; pairing is refused until it is restored on the host";
+
 /// The CLI's answer to "does the code match?".
 fn code_answer(answer: Option<AnswerValue>) -> CodeAnswer {
     match answer {
@@ -592,6 +596,22 @@ pub(crate) async fn verify_device<U: OpUi>(
             _ => bail!("unexpected message during device verification"),
         },
     };
+
+    // r9 (§R9.4): this host's frozen device lists must be readable before
+    // the codes are compared and Touch ID is asked (the certificate's list
+    // is checked against them); an unreadable copy fails now, the remedy
+    // shown here, a short reason without a local path sent to Astation.
+    let pairing = capture.sources().paths.pairing.clone();
+    let frozen = blocking(move || {
+        Ok(crate::session_protocol::membership::frozen_genesis(
+            &pairing,
+        ))
+    })
+    .await?;
+    if let Err(error) = frozen {
+        let failure = VerifyFailure::local(FROZEN_GENESIS_UNREADABLE, anyhow!(error));
+        return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+    }
 
     let reveal = handshake.reveal();
     client
