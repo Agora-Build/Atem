@@ -694,6 +694,14 @@ Router obligations (the relay and Astation's :8080):
   r8 attachment's 24 h (that attachment is never welcomed). §R9.6,
   §R9.7 "Limits".
 
+Host state behind two of these answers (no action for Astation): a
+revoked browser grant is kept in `runtime/journal/revoked_grants` until
+its grant's expiry (at most 256; a full journal answers `revoke_grant`
+`busy` "revoked grants journal full" but still fences a live browser at
+once); if that file can't be read at start, every browser grant is
+refused `busy` "revoked grants unreadable" for 65 min (grant lifetime +
+issue slack), so no revocation is lost.
+
 Artifacts: `atem-client-bindings.md` §7 (SwiftPM, WASM, Kotlin/JVM,
 Android; SHA256SUMS and the source pin).
 
