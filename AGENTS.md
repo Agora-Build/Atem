@@ -33,7 +33,7 @@ cargo test -p atem-client -p atem-client-ffi # r9 client core + bindings: vector
 ./scripts/package-atem-client-bindings.sh <ver> <out> [wasm] [kotlin] [android] # binding packages + SHA256SUMS + SOURCE.json (android: ANDROID_NDK_HOME); check-atem-client-packages.sh checks them; Apple: package-atem-client-apple.sh
 cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture # r9 host scenarios against the real runtime (ATEM_FIXTURE=<name>[,…], ATEM_R9_PARALLEL)
 cargo test --test r9_harness -- --nocapture # headless multi-device harness: one real host, phones/bots/browsers through atem-client (ATEM_HARNESS_PHONES/BOTS/BROWSERS, ATEM_HARNESS_OUT)
-./scripts/package-atem-r9-harness.sh <ver> <out> # the harness prebuilt for Astation (NON-PRODUCTION: test binary + atem + fake agent + run script, sample transcript, SHA256SUMS, SOURCE.json); CI artifact
+./scripts/package-atem-r9-harness.sh <ver> <out> # the harness prebuilt for Astation (NON-PRODUCTION: test binary + atem + fake agent + run script, sample transcript, SHA256SUMS, SOURCE.json); CI artifact of `.github/workflows/r9-harness.yml`
 cargo check                              # Type-check without building
 rustfmt --edition 2024 <file>            # Format the files you touch; not project-wide: app.rs, main.rs, cli.rs, websocket_client.rs and memory/{mod,crypto,secrets}.rs aren't rustfmt-clean
 cargo clippy --all-targets --all-features  # Lint

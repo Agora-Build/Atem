@@ -74,8 +74,10 @@ cat >"$PKG/README.txt" <<README
 atem r9 harness ${VERSION} -- NON-PRODUCTION TEST TOOLING.
 
 Not a release of Atem: bin/atem is a build of the commit named in
-${PREFIX}-SOURCE.json for this harness only. Do not install it or use it
-with a real profile.
+${PREFIX}-SOURCE.json for this harness only. Its \`atem --version\` shows
+the same version number as the published release although it holds
+unreleased code: tell it apart by this directory and the source pin. Do
+not install it or use it with a real profile.
 
 What it does: one real \`atem runtime\` host on a temp profile (a verified
 pairing and a pinned device list signed with deterministic test keys, a

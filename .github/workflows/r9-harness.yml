@@ -1,0 +1,92 @@
+name: r9-harness
+
+# The NON-PRODUCTION r9 harness for Astation, who can't build Atem: the
+# headless multi-device harness (tests/r9_harness.rs) prebuilt with the atem
+# it drives, the fake Claude Code, a run script and a sample transcript from
+# a consumer-style run, with SHA-256 sums and a source pin
+# (scripts/package-atem-r9-harness.sh; designs/protocol/atem-host-handoff.md).
+# Uploaded as a workflow artifact only; no secret is used.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/atem-client/**"
+      - "build.rs"
+      - "native/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "tests/r9_harness.rs"
+      - "tests/support/**"
+      - "tests/fixtures/approvals/fake-agent.py"
+      - "scripts/package-atem-r9-harness.sh"
+      - "scripts/atem-client-source-pin.sh"
+      - ".github/workflows/r9-harness.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "crates/atem-client/**"
+      - "build.rs"
+      - "native/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "tests/r9_harness.rs"
+      - "tests/support/**"
+      - "tests/fixtures/approvals/fake-agent.py"
+      - "scripts/package-atem-r9-harness.sh"
+      - "scripts/atem-client-source-pin.sh"
+      - ".github/workflows/r9-harness.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r9-harness-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  r9-harness:
+    name: r9 harness, prebuilt (non-production, Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The package is built from (and its pin names) the commit under
+          # review: a pull request's head, never GitHub's synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Package version
+        run: |
+          set -euo pipefail
+          CRATE=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem"][0])')
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "ATEM_HARNESS_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "ATEM_HARNESS_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Package and run it as a consumer (the sample transcript)
+        run: ./scripts/package-atem-r9-harness.sh "$ATEM_HARNESS_VERSION" "$RUNNER_TEMP/pkg-harness"
+
+      - name: Check sums and pin
+        run: |
+          set -euo pipefail
+          P="atem-r9-harness-NONPRODUCTION-$ATEM_HARNESS_VERSION"
+          (cd "$RUNNER_TEMP/pkg-harness" && sha256sum -c "$P-SHA256SUMS.txt")
+          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["commit"] == sys.argv[2] and p["tree_dirty"] is False, p' \
+            "$RUNNER_TEMP/pkg-harness/$P-SOURCE.json" "$ATEM_HARNESS_HEAD"
+          file "$RUNNER_TEMP/pkg-harness/$P-linux-x86_64.tar.gz"
+
+      - name: Upload the harness (non-production)
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-r9-harness-NONPRODUCTION-${{ env.ATEM_HARNESS_VERSION }}-linux-x86_64
+          path: ${{ runner.temp }}/pkg-harness/
+          if-no-files-found: error
+

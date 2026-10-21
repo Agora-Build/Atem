@@ -13,7 +13,8 @@
 //! (no fake Codex yet); the flow is fixed, with no entry point for
 //! Astation's own router or relay (the fake Astation plays both).
 //!
-//! A prebuilt copy (no source build needed) is the CI artifact
+//! A prebuilt copy (no source build needed) is the `r9-harness.yml` CI
+//! artifact
 //! `atem-r9-harness-NONPRODUCTION-<version>-linux-x86_64`
 //! (`scripts/package-atem-r9-harness.sh`; its `run-harness.sh` sets
 //! `ATEM_HARNESS_ATEM_BIN` and `ATEM_HARNESS_FAKE_AGENT` to the packaged
@@ -204,6 +205,8 @@ fn hints(message: &Value, log: &TestLog) -> Vec<Hint> {
 
 #[test]
 fn harness() {
+    // A packaged harness runs the packaged atem (`ATEM_HARNESS_ATEM_BIN`).
+    support::allow_packaged_atem();
     let (phones, bots, browsers) = (
         count("ATEM_HARNESS_PHONES", 2).max(1),
         count("ATEM_HARNESS_BOTS", 1),

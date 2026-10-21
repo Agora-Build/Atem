@@ -15,12 +15,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+static PACKAGED_ATEM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lets [`atem_bin`] take `ATEM_HARNESS_ATEM_BIN`. Only the r9 harness
+/// calls it (a packaged harness runs outside the source tree,
+/// `scripts/package-atem-r9-harness.sh`): every other test always runs the
+/// `atem` cargo built, whatever the environment says.
+pub fn allow_packaged_atem() {
+    PACKAGED_ATEM.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The `atem` binary under test: the one cargo built, or
-/// `ATEM_HARNESS_ATEM_BIN` when a packaged harness runs outside the source
-/// tree (`scripts/package-atem-r9-harness.sh`; the file must be named
-/// `atem`).
+/// `ATEM_HARNESS_ATEM_BIN` once [`allow_packaged_atem`] was called (the
+/// file must be named `atem`).
 pub fn atem_bin() -> PathBuf {
     std::env::var_os("ATEM_HARNESS_ATEM_BIN")
+        .filter(|_| PACKAGED_ATEM.load(std::sync::atomic::Ordering::SeqCst))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_atem")))
 }

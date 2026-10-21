@@ -1708,7 +1708,8 @@ crash before the grant: no lease, and after the restart `rejected`
 Status: **implemented by Atem** (2026-10-20: `crates/atem-client`, its
 bindings and the runtime host; PR #89, merged only once Astation ships its
 side). Released Atem speaks r8 until r9 ships on both sides; until then r8
-(above) is the contract.
+(above) is the contract. A build of the PR (its packages and harness)
+already refuses r8 on a host once a device list is pinned.
 r9 adds remote clients that reach Atem independently of the Mac: native
 members (Mac, iPhone, iPad, Android), scoped bots (`service`) and short
 browser grants, all over one end-to-end channel (`atem-ch1`) whose

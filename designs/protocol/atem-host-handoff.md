@@ -589,7 +589,7 @@ Claude only (no fake Codex), a fixed flow with no entry point for
 Astation's own router or relay.
 
 **Prebuilt, without a source build** (NON-PRODUCTION test tooling):
-every run of `.github/workflows/atem-client-bindings.yml` uploads the
+every run of `.github/workflows/r9-harness.yml` uploads the
 artifact `atem-r9-harness-NONPRODUCTION-<version>-linux-x86_64`
 (`scripts/package-atem-r9-harness.sh`; `<version>` is atem's version and
 the commit's first 12 hex digits): `…-linux-x86_64.tar.gz` (`bin/r9_harness`,
@@ -675,8 +675,9 @@ Router obligations (the relay and Astation's :8080):
 - **Outbound-only channel envelope.** Atem opens no port; every client,
   the Mac's own Astation included, reaches it over Atem's one outbound
   link. The router wraps each client's `atem-ch1` frames in the
-  `channel` envelope (`open` / `frame` / `close`, exact fields) and
-  never shows the binding the handle. §R9.7a; fixtures `r9-envelope-*`.
+  `channel` envelope (`open` / `frame` / `close`, exact fields). The
+  handle is a routing id only, never authority (that is `atem-ch1`), and
+  the app's binding never sees it. §R9.7a; fixtures `r9-envelope-*`.
 - **2 MiB envelope.** The router never forwards an envelope over
   2 097 152 bytes as received; Atem closes an over-limit one
   `too_large` (or drops one it can't address). §R9.7a "Limits".

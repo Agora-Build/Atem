@@ -7,10 +7,8 @@ name: atem-client-bindings
 # features), uploaded as workflow artifacts, each with its SHA-256 sums and
 # source pin: the SwiftPM package with its xcframework, the WASM package, the
 # Kotlin/JVM bindings and the Android libraries (arm64-v8a, armeabi-v7a,
-# x86_64) with their Kotlin (designs/protocol/atem-client-bindings.md §7);
-# and the NON-PRODUCTION r9 harness (tests/r9_harness.rs, prebuilt with the
-# atem it drives, a run script and a sample transcript) for Astation, who
-# can't build Atem (designs/protocol/atem-host-handoff.md).
+# x86_64) with their Kotlin (designs/protocol/atem-client-bindings.md §7).
+# The prebuilt r9 harness is r9-harness.yml.
 # Nothing is published to a registry; no secret is used.
 
 on:
@@ -27,13 +25,6 @@ on:
       - "scripts/check-atem-client-packages.sh"
       - "scripts/test-check-atem-client-packages.sh"
       - "scripts/atem-client-source-pin.sh"
-      - "scripts/package-atem-r9-harness.sh"
-      - "src/**"
-      - "build.rs"
-      - "native/**"
-      - "tests/r9_harness.rs"
-      - "tests/support/**"
-      - "tests/fixtures/approvals/fake-agent.py"
       - ".github/workflows/atem-client-bindings.yml"
   pull_request:
     paths:
@@ -47,13 +38,6 @@ on:
       - "scripts/check-atem-client-packages.sh"
       - "scripts/test-check-atem-client-packages.sh"
       - "scripts/atem-client-source-pin.sh"
-      - "scripts/package-atem-r9-harness.sh"
-      - "src/**"
-      - "build.rs"
-      - "native/**"
-      - "tests/r9_harness.rs"
-      - "tests/support/**"
-      - "tests/fixtures/approvals/fake-agent.py"
       - ".github/workflows/atem-client-bindings.yml"
   workflow_dispatch:
 
@@ -236,46 +220,6 @@ jobs:
         with:
           name: atem-client-android-${{ env.ATEM_CLIENT_VERSION }}
           path: ${{ runner.temp }}/pkg-android/
-          if-no-files-found: error
-
-  r9-harness:
-    name: r9 harness, prebuilt (non-production, Linux x86_64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # The package is built from (and its pin names) the commit under
-          # review: a pull request's head, never GitHub's synthetic merge.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Package version
-        run: |
-          set -euo pipefail
-          CRATE=$(cargo metadata --format-version 1 --no-deps \
-            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem"][0])')
-          HEAD_SHA=$(git rev-parse HEAD)
-          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
-          echo "ATEM_HARNESS_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
-          echo "ATEM_HARNESS_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
-
-      - name: Package and run it as a consumer (the sample transcript)
-        run: ./scripts/package-atem-r9-harness.sh "$ATEM_HARNESS_VERSION" "$RUNNER_TEMP/pkg-harness"
-
-      - name: Check sums and pin
-        run: |
-          set -euo pipefail
-          P="atem-r9-harness-NONPRODUCTION-$ATEM_HARNESS_VERSION"
-          (cd "$RUNNER_TEMP/pkg-harness" && sha256sum -c "$P-SHA256SUMS.txt")
-          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["commit"] == sys.argv[2] and p["tree_dirty"] is False, p' \
-            "$RUNNER_TEMP/pkg-harness/$P-SOURCE.json" "$ATEM_HARNESS_HEAD"
-          file "$RUNNER_TEMP/pkg-harness/$P-linux-x86_64.tar.gz"
-
-      - name: Upload the harness (non-production)
-        uses: actions/upload-artifact@v4
-        with:
-          name: atem-r9-harness-NONPRODUCTION-${{ env.ATEM_HARNESS_VERSION }}-linux-x86_64
-          path: ${{ runner.temp }}/pkg-harness/
           if-no-files-found: error
 
   macos:
