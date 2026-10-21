@@ -2115,3 +2115,44 @@ fn a_membership_op_with_a_duplicate_key_is_refused() {
     );
     assert_eq!(rig.m.as_ref().unwrap().head(), head);
 }
+
+/// §R9.3 step 5 for a browser: its issuer is only in a later window of the
+/// client's carriage (`more`), so the hello is `membership_incomplete`
+/// (reconnect with the next window), not "invalid grant"; with the whole
+/// log carried, the browser is admitted.
+#[test]
+fn a_browser_whose_issuer_is_in_a_later_window_is_membership_incomplete() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    for n in 0..65 {
+        rig.log
+            .add_native(&format!("dev-n{n:02}"), &["control", "view"]);
+    }
+    let wall = rig.now.host.wall_ms;
+    let (grant, key) = rig.log.grant(
+        "dev-n64",
+        "aaaaaaaa-1111-4111-8111-0000000000e1",
+        HOST,
+        1,
+        None,
+        &["view"],
+        wall,
+        wall + 600_000,
+    );
+    let client_log = rig.log.log.clone();
+    rig.connect_with(
+        "b1",
+        Identity::browser(grant.clone(), key.clone()).unwrap(),
+        Some(&client_log),
+    );
+    assert_eq!(rig.refused("b1").0, "membership_incomplete");
+    // The first window was committed; the next hello carries the rest.
+    rig.advance(1000);
+    rig.connect_with(
+        "b2",
+        Identity::browser(grant, key).unwrap(),
+        Some(&client_log),
+    );
+    rig.attached("b2");
+    assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
+}

@@ -48,8 +48,8 @@ use atem_client::channel::wire::{self as chwire, Frame};
 use atem_client::channel::{Channel, ClearCode, Principal};
 use atem_client::membership::{Admission, HostNow};
 use atem_client::principal::{
-    Authority, ClientKind, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS, Need, Op,
-    Permission, Refusal, RevokedGrants, SessionRef, admission_error,
+    Authority, BrowserGrant, ClientKind, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS,
+    Need, Op, Permission, Refusal, RevokedGrants, SessionRef, admission_error,
 };
 use atem_client::session::r9::{
     self, Hello, PendingRecovery, R9_FEATURES, REVISION, SessionError, Welcome, code,
@@ -1042,6 +1042,18 @@ impl R9Host {
                         re.as_deref(),
                         Some(DETAIL_NOT_RECONCILED),
                     ))
+                } else if membership.more
+                    && hello
+                        .grant
+                        .as_ref()
+                        .and_then(|g| BrowserGrant::parse(g.clone()).ok())
+                        .is_some_and(|g| m.membership().member(&g.issuer).is_none())
+                {
+                    // §R9.3 step 5: the issuer may be in the next window.
+                    Err(
+                        admission_error(&Admission::Incomplete { head: m.head() }, re.as_deref())
+                            .unwrap_or_else(|| error(code::UNAUTHORIZED, re.as_deref(), None)),
+                    )
                 } else {
                     let revoked = &self.revoked;
                     Authority::resolve(
