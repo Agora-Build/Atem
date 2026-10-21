@@ -728,8 +728,14 @@ the bound above and 65 min on the monotonic clock. A lost sidecar's
 bound is rebuilt from what is left (the entries and the quarantine
 record in `revoked_grants`) with the newest modification time in the
 journal directory as an extra floor; the damaged sidecar is kept aside
-(`revoked_quarantine.damaged-<ms>`). Only a journal with neither file and
-no `*.damaged-<ms>` copy is fresh. Members, native revocations and the
+(`revoked_quarantine.damaged-<ms>`). A pin seeds both files (the
+sidecar, then an empty `revoked_grants`), so a host with a pinned device
+list always has them: with a pinned list and neither file nor a copy
+(`runtime/journal/` or `runtime/` removed, one event), they were lost and
+browsers are quarantined to `max(the list's clean checkpoint at_wall, the
+newest write in pairing/) + 65 min` and trusted time + 65 min, plus 65
+min on the monotonic clock. Only a host without a pinned list and with
+none of these files is fresh. Members, native revocations and the
 fencing of live browsers are unaffected throughout.
 
 `busy` details a browser `hello` or a `revoke_grant` can get from this:
@@ -740,25 +746,30 @@ revocation is in effect in memory and a live browser is fenced, but it
 may not survive a restart; send it again) and "revoked grants journal
 full".
 
-Limits: a revocation can still be forgotten when both files are lost
-together with every copy aside (indistinguishable from a new profile),
-when the journal directory is restored from an older backup, or when
-both are damaged with no copy aside yet after a write made while the
+Limits: a revocation can still be forgotten when the journal directory
+is restored from an older backup, when the device list is removed too
+(an unpaired host has nothing to vouch for its journal), or when both
+files are damaged with no copy aside yet after a write made while the
 wall clock was behind (the rebuilt floor then rests on modification
-times written at that rolled-back time). A host whose high-water mark is
-far in the future (one write while the wall clock was wrong) refuses
+times written at that rolled-back time). With the journal directory
+removed, a revocation made after the list's last write and while the
+clock was behind rests on the clock alone. A host whose high-water mark
+is far in the future (one write while the wall clock was wrong) refuses
 browsers "host clock went back" until the clock reaches it; there is no
-override, and the only path is to wait for the clock. Removing the
-journal directory is not a reset: it forgets every revocation (a
-revoked grant still within its lifetime would be admitted again) and the
-session journal with it.
+override, and the only path is to wait for the clock. Removing
+`runtime/journal/` or `runtime/` is no way out: the pinned list keeps
+the floor and quarantines again (and the session journal is lost with
+it).
 
 Other host files where "missing" used to mean "fresh" (re-review N3; no
-action for Astation): `pairing/frozen_genesis` now has a mirror
-(`frozen_genesis.mirror`, written first, read as their union): one
-missing is covered by the other, and either one unreadable refuses
-pairing (and the unpair of a frozen list) instead of reading as an
-empty list. The fault record that holds a host has a mirror in
+action for Astation): `pairing/frozen_genesis` now has a mirror in
+another directory (`runtime/journal/frozen_genesis`, written first, read
+as their union): one missing is covered by the other, and either one
+unreadable refuses pairing (and the unpair of a frozen list) instead of
+reading as an empty list. It is checked right after `verifyKeys`, before
+the codes and Touch ID: `verifyAbort` "this host's record of frozen
+device lists can't be read; pairing is refused until it is restored on
+the host" (no local path; the remedy is shown in the CLI). The fault record that holds a host has a mirror in
 `runtime/journal/membership_fault`: either one holds the host, so losing
 one file never lifts a hold (still only after an observed write fault).
 At start, a queued request whose principal `principals` doesn't name at
@@ -766,8 +777,14 @@ its `control_gen` (the file lost or older) rejects every queued request
 "authorization history unknown", as without a clean close; a lost
 `refused` list needs nothing (its failed admission write halted the
 journal, so that run never closed cleanly). A `runtime_epoch` missing
-next to the journal's state takes the wall clock in ms (above every
-earlier epoch) and vouches for no clean close. Not changed, for later:
+next to the session journal's state, or while a surviving file names an
+earlier epoch (the device list's clean checkpoint, a fault record), was
+lost: the run vouches for no clean close and takes an epoch above every
+epoch a surviving file names, and at least the wall clock in ms. An
+epoch no surviving file records can be reused after a second loss with
+the clock set back; no authority depends on it (the clean close needs
+the exact previous epoch and is consumed at each start; a checkpoint
+match decides only a log line). Not changed, for later:
 `floors` (a lost floor could reissue a lease epoch; workers keep their
 own input epoch and drop older writes, so this is availability, not
 authority) and `receipts/<sid>` (a lost log forgets request-id dedupe:
