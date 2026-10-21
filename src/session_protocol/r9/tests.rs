@@ -2018,3 +2018,44 @@ fn a_damaged_revoked_grants_file_refuses_browsers_until_any_grant_expired() {
     rig.connect("b3", Identity::browser(g, k).unwrap());
     rig.attached("b3");
 }
+
+/// The revoked grants journal full (256 junk ids): a real revocation is
+/// still in effect for the live browser (fenced at once, fail closed),
+/// though answered `busy` "revoked grants journal full".
+#[test]
+fn a_full_revoked_grants_journal_still_fences_the_live_browser() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("phone", phone());
+    rig.advance(1000);
+    let wall = rig.now.host.wall_ms;
+    let grant_id = "aaaaaaaa-1111-4111-8111-0000000000f1";
+    let (grant, key) = rig.log.grant(
+        "dev-phone",
+        grant_id,
+        HOST,
+        1,
+        None,
+        &["view"],
+        wall,
+        wall + 600_000,
+    );
+    rig.connect("browser", Identity::browser(grant, key).unwrap());
+    rig.attached("browser");
+    for n in 0..256u32 {
+        let junk = format!("eeeeeeee-0000-4000-8000-{n:012}");
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig.attached("phone").revoke_grant(&junk, mono).unwrap();
+        rig.send_frame("phone", &frame);
+    }
+    rig.events("phone");
+    let mono = rig.now.host.mono_ms;
+    let (_, frame) = rig.attached("phone").revoke_grant(grant_id, mono).unwrap();
+    rig.send_frame("phone", &frame);
+    let events = rig.events("phone");
+    assert_eq!(
+        Rig::last_error(&events),
+        Some(("busy".into(), Some("revoked grants journal full".into())))
+    );
+    assert_eq!(rig.refused("browser").0, "closed");
+}

@@ -1432,12 +1432,20 @@ impl R9Host {
             })
             .unwrap_or(wall + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
         if self.revoked.revoke(&grant_id, until, wall).is_err() {
+            // Not recorded (a later hello with that grant isn't refused),
+            // but a live browser is fenced at once anyway (fail closed).
+            log("revoked grants journal full; a live browser is fenced in memory only");
+            self.fence_errors.insert(
+                principal.clone(),
+                error(code::UNAUTHORIZED, None, Some("grant revoked")),
+            );
+            let effects = parts.host.fence_principal(&principal, 0);
             self.seal_to(
                 att,
                 &error(code::BUSY, re, Some("revoked grants journal full")).to_bytes(),
                 mono,
             );
-            return Vec::new();
+            return effects;
         }
         self.revoked_until.retain(|_, t| wall < *t);
         let t = self.revoked_until.entry(grant_id.clone()).or_insert(until);
