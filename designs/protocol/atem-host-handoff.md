@@ -728,14 +728,20 @@ the bound above and 65 min on the monotonic clock. A lost sidecar's
 bound is rebuilt from what is left (the entries and the quarantine
 record in `revoked_grants`) with the newest modification time in the
 journal directory as an extra floor; the damaged sidecar is kept aside
-(`revoked_quarantine.damaged-<ms>`). A pin seeds both files (the
-sidecar, then an empty `revoked_grants`), so a host with a pinned device
-list always has them: with a pinned list and neither file nor a copy
-(`runtime/journal/` or `runtime/` removed, one event), they were lost and
-browsers are quarantined to `max(the list's clean checkpoint at_wall, the
-newest write in pairing/) + 65 min` and trusted time + 65 min, plus 65
-min on the monotonic clock. Only a host without a pinned list and with
-none of these files is fresh. Members, native revocations and the
+(`revoked_quarantine.damaged-<ms>`). The bound also has a copy outside
+the journal directory, `pairing/revoked_floor` (the same format, only
+ever raised, written durably before the sidecar at every write that
+raises it and at the pin; `atem unpair` keeps it): it floors the bound
+everywhere, and a sidecar below it (the journal restored or rolled back)
+or an unreadable copy on a pinned host fails closed the same way. A pin
+seeds the copy and both journal files, so a host with a pinned device
+list always has them: with a pinned list and neither journal file nor a
+copy aside (`runtime/journal/` or `runtime/` removed, or only the two
+files, one event, clock behind or not), they were lost and browsers are
+quarantined to `max(the copy, the list's clean checkpoint at_wall, the
+newest write in pairing/ and in the journal) + 65 min` and trusted time
++ 65 min, plus 65 min on the monotonic clock. Only a host without a
+pinned list and with none of these files is fresh. Members, native revocations and the
 fencing of live browsers are unaffected throughout.
 
 `busy` details a browser `hello` or a `revoke_grant` can get from this:
@@ -746,20 +752,18 @@ revocation is in effect in memory and a live browser is fenced, but it
 may not survive a restart; send it again) and "revoked grants journal
 full".
 
-Limits: a revocation can still be forgotten when the journal directory
-is restored from an older backup, when the device list is removed too
-(an unpaired host has nothing to vouch for its journal), or when both
-files are damaged with no copy aside yet after a write made while the
-wall clock was behind (the rebuilt floor then rests on modification
-times written at that rolled-back time). With the journal directory
-removed, a revocation made after the list's last write and while the
-clock was behind rests on the clock alone. A host whose high-water mark
-is far in the future (one write while the wall clock was wrong) refuses
-browsers "host clock went back" until the clock reaches it; there is no
-override, and the only path is to wait for the clock. Removing
-`runtime/journal/` or `runtime/` is no way out: the pinned list keeps
-the floor and quarantines again (and the session journal is lost with
-it).
+Limits: losing `runtime/` or the revoked-grants files is covered, clock
+behind or not. A revocation can still be forgotten when both `pairing/`
+and `runtime/` are deliberately removed (that is an unpair, and pairing
+again needs Astation's ceremony), when both are restored from an older
+backup, or by same-user tampering (out of scope, as everywhere in
+Atem). A host whose high-water mark is far in the future (one write
+while the wall clock was wrong) refuses browsers "host clock went back"
+until the clock reaches it; there is no override, and the only path is
+to wait for the clock. Removing `runtime/`, `runtime/journal/` or the
+revoked-grants files is no way out: `pairing/revoked_floor` keeps the
+bound and the host quarantines again (and the session journal is lost
+with it).
 
 Other host files where "missing" used to mean "fresh" (re-review N3; no
 action for Astation): `pairing/frozen_genesis` now has a mirror in
@@ -769,7 +773,10 @@ unreadable refuses pairing (and the unpair of a frozen list) instead of
 reading as an empty list. It is checked right after `verifyKeys`, before
 the codes and Touch ID: `verifyAbort` "this host's record of frozen
 device lists can't be read; pairing is refused until it is restored on
-the host" (no local path; the remedy is shown in the CLI). The fault record that holds a host has a mirror in
+the host" (no local path; the remedy, naming Atem's config directory,
+is shown in the CLI). A `pairing/frozen_genesis.mirror` left by an
+earlier dev build is ignored (it always matched `frozen_genesis`) and
+can be deleted. The fault record that holds a host has a mirror in
 `runtime/journal/membership_fault`: either one holds the host, so losing
 one file never lifts a hold (still only after an observed write fault).
 At start, a queued request whose principal `principals` doesn't name at
