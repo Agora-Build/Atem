@@ -3003,7 +3003,16 @@ What Atem keeps for delivery is bounded, and a bound never cuts a
 lifecycle the relay may already hold: once an approval's open hints were
 handed to the link, Atem keeps them while the approval is pending, and
 its resolved hint until the relay acknowledges it (or `expires_at +
-300 000` passes), so every published approval gets its cancellation. To
+300 000` passes). So, within one runtime and while push isn't
+suppressed, every published approval gets its cancellation. The
+exceptions, where Atem drops every unacknowledged hint and seen,
+published lifecycles included, and sends no resolved hint for them:
+push is suppressed (the device list is held, frozen, faulted or failed
+to open, §R9.3, or the journal halted, §I); the device list is pinned
+again or removed (a re-pin or an unpair: the hints belong to the old
+identity); a broker restart (above). In each case the relay's own guard (below) bounds what
+it still sends: an open hint whose cancellation never comes can still
+escalate to a push until the guard (`expires_at − margin`). To
 make room Atem only forgets an approval with nothing left to send, then
 one whose opens were never published. When every tracked approval holds
 a published lifecycle, a **new** approval gets no push hint at all (Atem
