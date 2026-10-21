@@ -687,3 +687,83 @@ fn browser_principals_dont_accumulate_in_the_principals_file() {
     let (_, _, principals) = rt.host.debug_ids();
     assert!(principals.iter().any(|p| p == KEEP), "{principals:?}");
 }
+
+/// Re-review N3: a missing `principals` file next to queued work is lost
+/// control history, not a fresh one: after a clean close, queued work whose
+/// principal the file doesn't name is rejected "authorization history
+/// unknown", never dispatched when the principal connects again.
+#[test]
+fn a_lost_principals_file_rejects_queued_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let e = hold(&mut rt);
+    for n in [1, 2] {
+        let m = prompt(&rt, e, n);
+        rt.send("c1", &m);
+    }
+    assert_eq!(state_of(&rt, 2).unwrap().0, ReceiptState::Accepted);
+    std::fs::remove_file(dir.path().join("state/principals")).unwrap();
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(state_of(&rt, 2), rejected(DETAIL_HISTORY_UNKNOWN));
+    rt.event_reconnect_c1();
+    assert_eq!(state_of(&rt, 2), rejected(DETAIL_HISTORY_UNKNOWN));
+    assert_eq!(rt.pty.dispatch_attempts, 1, "only the first, before");
+}
+
+/// Re-review N3: an older `principals` file (a generation below the one
+/// queued work was accepted at) is lost history too: rejected, never run.
+#[test]
+fn an_older_principals_file_rejects_queued_work() {
+    const C1C: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let principals = dir.path().join("state/principals");
+    let old = std::fs::read(&principals).unwrap();
+    // c1 loses `control` (generation 2) and gets it back.
+    for (permissions, att) in [
+        (vec![Permission::View], C1B),
+        (vec![Permission::View, Permission::Control], C1C),
+    ] {
+        event(
+            &mut rt,
+            HostEvent::SetPermissions {
+                client: "c1".into(),
+                permissions,
+                attachment_gen: att.into(),
+            },
+        );
+    }
+    got(&mut rt);
+    let e = hold(&mut rt);
+    for n in [1, 2] {
+        let m = prompt(&rt, e, n);
+        rt.send("c1", &m);
+    }
+    assert_eq!(state_of(&rt, 2).unwrap().0, ReceiptState::Accepted);
+    std::fs::write(&principals, old).unwrap();
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(state_of(&rt, 2), rejected(DETAIL_HISTORY_UNKNOWN));
+    assert_eq!(rt.pty.dispatch_attempts, 1);
+}
+
+/// Re-review N3 (proof, no change needed): a lost refusal list can't let a
+/// request answered "acceptance not recorded" run. The failed admission
+/// write halted the journal, so that run never closed cleanly, and the
+/// next start rejects every recovered request ("authorization history
+/// unknown") even when its `accepted` record reached the disk.
+#[test]
+fn a_lost_refusal_list_never_runs_a_refused_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let e = hold(&mut rt);
+    // The admission's fsync fails and its rollback too: the record stays.
+    rt.host.journal_mut().fail_fsync_of(1, true);
+    let m = prompt(&rt, e, 1);
+    rt.send("c1", &m);
+    assert_eq!(got(&mut rt)[0]["detail"], DETAIL_ACCEPTANCE_NOT_RECORDED);
+    std::fs::remove_file(dir.path().join("state/refused")).unwrap();
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(state_of(&rt, 1), rejected(DETAIL_HISTORY_UNKNOWN));
+    rt.event_reconnect_c1();
+    assert_eq!(rt.pty.dispatch_attempts, 0);
+}

@@ -67,8 +67,9 @@
 //! that fails the link is closed without a reply. An orderly stop with a
 //! healthy journal writes the clean-close record (`close_cleanly`). At start
 //! (`recover`) recovered queued work is resolved in the appendix's order:
-//! refused (`acceptance not confirmed`), no clean close (`authorization
-//! history unknown`), trust changed, an older `control_gen` (`control
+//! refused (`acceptance not confirmed`), no clean close or lost control
+//! history (`authorization history unknown`: a queued request whose
+//! principal `principals` doesn't name at its `control_gen`), trust changed, an older `control_gen` (`control
 //! revoked`), else it waits for its principal to be welcomed with `control`
 //! and is `control not confirmed` 60 s after the start.
 //!
@@ -1986,13 +1987,24 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| (e.stored.order, e.stored.request_id.clone()))
             .collect();
         queued.sort();
+        // Every queued request's principal held `control` durably when it
+        // was accepted (`principals`), at a generation no lower than the
+        // request's: one the file doesn't name, or names lower, means the
+        // control history was lost (a missing or older `principals`), and a
+        // fence it held can't be told from none.
+        let history_lost = queued.iter().any(|(_, rid)| {
+            let s = &self.receipts[rid].stored;
+            self.principals
+                .get(&s.principal)
+                .is_none_or(|p| p.control_gen < s.control_gen)
+        });
         for (_, rid) in queued {
             debug_assert!(!on_list.contains(&rid));
             let (principal, control_gen, trust) = {
                 let s = &self.receipts[&rid].stored;
                 (s.principal.clone(), s.control_gen, s.target.host_trust_gen)
             };
-            let detail = if !self.previous_clean {
+            let detail = if !self.previous_clean || history_lost {
                 Some(DETAIL_HISTORY_UNKNOWN)
             } else if trust != self.ctx.host_trust_gen {
                 Some(DETAIL_TRUST_CHANGED)

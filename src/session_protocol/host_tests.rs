@@ -956,6 +956,16 @@ fn target_struct(trust: u64) -> Target {
     serde_json::from_value(target_with(S1, trust)).unwrap()
 }
 
+/// `c1` holds `control` durably (written before any work it submits).
+fn control_record() -> Record {
+    Record::Control {
+        principal: "c1".into(),
+        control: true,
+        control_gen: 1,
+        fence_seq: 0,
+    }
+}
+
 fn accepted_record(n: u64, trust: u64) -> Record {
     Record::Accepted {
         request_id: rid(n),
@@ -1014,6 +1024,7 @@ fn welcome_principal<J: Journal>(
 fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     // No clean close: accepted work is rejected whatever the journal holds.
     let mut j = journal();
+    j.append_ok(control_record());
     j.append_ok(accepted_record(1, 1));
     let mut host = start_host(j, 1, false);
     host.restore_session(spec(S1, P1)).unwrap();
@@ -1027,6 +1038,7 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     // After a clean close, accepted under an older trust generation:
     // rejected, never dispatched.
     let mut j = journal();
+    j.append_ok(control_record());
     j.append_ok(accepted_record(1, 1));
     let mut host = start_host(j, 2, true);
     host.restore_session(spec(S1, P1)).unwrap();
@@ -1040,6 +1052,7 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     // doesn't confirm it), is dispatched once, and a second restart only
     // reconciles it.
     let mut j = journal();
+    j.append_ok(control_record());
     j.append_ok(accepted_record(1, 1));
     let mut host = start_host(j, 1, true);
     host.restore_session(spec(S1, P1)).unwrap();
@@ -1070,6 +1083,7 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
     // Accepted for a process that is gone: rejected, session closed, once
     // its principal is confirmed.
     let mut j = journal();
+    j.append_ok(control_record());
     j.append_ok(accepted_record(1, 1));
     let mut host = start_host(j, 1, true);
     host.restore_session(spec(S1, "33333333-3333-4333-8333-000000000001"))
@@ -1083,6 +1097,7 @@ fn crash_rules<J: Journal>(mut journal: impl FnMut() -> J) {
 
     // A clean-close record naming another epoch is stale: no clean close.
     let mut j = journal();
+    j.append_ok(control_record());
     j.append_ok(accepted_record(1, 1));
     j.write_clean_close(5).unwrap();
     let mut host =
