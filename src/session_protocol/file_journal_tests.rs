@@ -635,3 +635,64 @@ fn a_turn_result_off_a_completed_prompt_is_not_trusted() {
     }
     assert!(replay(vec![accepted("a", S1, "x"), executing]).is_err());
 }
+
+/// A `principals` file past the 8 MiB record bound (grown before browser
+/// principals were pruned) is still read whole on open: remote sessions
+/// aren't disabled for its size, and no fence is forgotten. Its next
+/// control write keeps every state the host didn't forget.
+#[test]
+fn a_large_principals_file_is_read_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    drop(FileJournal::open(&state).unwrap());
+    let mut principals = BTreeMap::new();
+    for n in 0..150_000u64 {
+        principals.insert(
+            format!("browser:cccccccc-0000-4000-8000-{n:012}"),
+            DiskControl {
+                control: false,
+                control_gen: 2,
+                fence_seq: 0,
+            },
+        );
+    }
+    principals.insert(
+        "member:dev-phone".to_string(),
+        DiskControl {
+            control: false,
+            control_gen: 7,
+            fence_seq: 3,
+        },
+    );
+    let json = serde_json::to_vec(&PrincipalsFile { principals }).unwrap();
+    assert!(json.len() > MAX_RECORD_BYTES);
+    let path = state.join(PRINCIPALS);
+    std::fs::write(&path, frame(&json)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut j = FileJournal::open(&state).unwrap();
+    let replayed = journal::replay(j.load().unwrap()).unwrap();
+    assert_eq!(replayed.principals.len(), 150_001);
+    assert_eq!(replayed.principals["member:dev-phone"].control_gen, 7);
+    // The host forgets the browsers; the next control write shrinks it.
+    let gone: Vec<String> = replayed
+        .principals
+        .keys()
+        .filter(|p| p.starts_with("browser:"))
+        .cloned()
+        .collect();
+    j.forget_principals(&gone);
+    j.append(Record::Control {
+        principal: "member:dev-mac".into(),
+        control: true,
+        control_gen: 1,
+        fence_seq: 0,
+    })
+    .unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() < 1024);
+    drop(j);
+    let j = FileJournal::open(&state).unwrap();
+    let replayed = journal::replay(j.load().unwrap()).unwrap();
+    assert_eq!(replayed.principals.len(), 2);
+    assert_eq!(replayed.principals["member:dev-phone"].control_gen, 7);
+    assert_eq!(replayed.principals["member:dev-phone"].fence_seq, 3);
+}

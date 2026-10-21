@@ -100,6 +100,10 @@ use crate::chat::history::valid_page_id;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+/// The prefix of a browser grant's principal (r9 §R9.6): one per grant,
+/// pruned from the control states once it can no longer matter.
+pub const BROWSER_PRINCIPAL: &str = "browser:";
+
 /// A lease lasts this long from its grant or renewal (§5).
 pub const LEASE_MS: u64 = 15_000;
 /// Removed sessions answer `unknown_session` for this long (§4).
@@ -704,6 +708,9 @@ impl<J: Journal> SessionHost<J> {
         if self.journal_halted {
             return false;
         }
+        if let Record::Control { principal, .. } = &record {
+            self.prune_principals(principal);
+        }
         if self.journal.append(record).is_ok() {
             return true;
         }
@@ -723,6 +730,63 @@ impl<J: Journal> SessionHost<J> {
         for s in self.sessions.values_mut() {
             s.input_epoch += 1;
         }
+    }
+
+    /// r9 (§R9.6): each browser grant is its own principal
+    /// (`browser:<grant_id>`), so their control states would grow the
+    /// `principals` file without bound. Before each control write, the
+    /// browser principals that can no longer matter are forgotten (in
+    /// memory and in what the journal writes next, this write): no live
+    /// attachment, no lease, no request `accepted` or `executing`. A
+    /// `control_gen` exists to order such work against a fence (§H); with
+    /// none left, nothing is ever compared with it. A browser is never
+    /// admitted on the strength of a control state: a revoked grant is
+    /// refused from the revoked-grants journal, an issuer without
+    /// `control` at admission, an expired grant by its expiry. If the same
+    /// grant connects again it starts a new control state, which no earlier
+    /// work can use. Members and Astation principals are bounded by the
+    /// device list and the pairing and are kept.
+    fn prune_principals(&mut self, writing: &str) {
+        if !self
+            .principals
+            .keys()
+            .any(|p| p.starts_with(BROWSER_PRINCIPAL) && p != writing)
+        {
+            return;
+        }
+        let mut live: HashSet<&str> = self
+            .attachments
+            .values()
+            .map(|a| a.principal.as_str())
+            .collect();
+        live.extend(
+            self.sessions
+                .values()
+                .filter_map(|s| s.lease.as_ref().map(|l| l.principal.as_str())),
+        );
+        live.extend(
+            self.receipts
+                .values()
+                .filter(|e| !journal::is_final(e.stored.state))
+                .map(|e| e.stored.principal.as_str()),
+        );
+        let gone: Vec<String> = self
+            .principals
+            .keys()
+            .filter(|p| {
+                p.starts_with(BROWSER_PRINCIPAL)
+                    && p.as_str() != writing
+                    && !live.contains(p.as_str())
+            })
+            .cloned()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for p in &gone {
+            self.principals.remove(p);
+        }
+        self.journal.forget_principals(&gone);
     }
 
     /// The principal's control state (a principal the journal doesn't

@@ -615,3 +615,75 @@ fn recovered_work_is_resolved_before_a_connect_changes_control() {
     assert_eq!(r.state, ReceiptState::Rejected);
     assert_eq!(r.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
 }
+
+/// r9 (§R9.6): every browser grant is its own principal. Their control
+/// states don't accumulate in `principals`: a browser principal with no
+/// attachment, no lease and no unfinished work can never matter again
+/// (its grant's revocation and its issuer's fence are checked at
+/// admission), so it is pruned at the next control write. The file stays
+/// bounded over many grants; a browser with queued work keeps its raised
+/// generation, across a restart too.
+#[test]
+fn browser_principals_dont_accumulate_in_the_principals_file() {
+    const KEEP: &str = "browser:bbbbbbbb-0000-4000-8000-000000000001";
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let mut setup = setup_json();
+    setup["clients"][0]["name"] = json!(KEEP);
+    let journal = FileJournal::open(&state).unwrap();
+    let mut rt = FakeRuntime::from_json_with(setup, HostConfig::default(), journal);
+    // KEEP holds the lease and has a prompt queued behind a running one.
+    let b = json!({"target": target(), "attachment_gen": rt.attachment(KEEP)});
+    rt.send(
+        KEEP,
+        &session("acquire", json!({"binding": b, "takeover": false})),
+    );
+    let mut b = b.clone();
+    b["lease_epoch"] = json!(1);
+    for n in [1, 2] {
+        let m = session(
+            "submit",
+            json!({"binding": b, "request_id": rid(n), "kind": "prompt",
+                   "payload": {"text": "run the tests"}}),
+        );
+        rt.send(KEEP, &m);
+    }
+    assert_eq!(state_of(&rt, 2).map(|s| s.0), Some(ReceiptState::Accepted));
+    // Gone, and its lease ends; its queued work stays.
+    let fx = rt.host.disconnect(&rt.attachment(KEEP));
+    rt.apply(fx);
+    let later = rt.now() + 20_000;
+    rt.set_now(later);
+    assert_eq!(rt.host.lease_holder(S1), None);
+    assert_eq!(state_of(&rt, 2).map(|s| s.0), Some(ReceiptState::Accepted));
+    let size = || std::fs::metadata(state.join("principals")).unwrap().len();
+    let mut early = 0;
+    for n in 0..300u64 {
+        let principal = format!("browser:cccccccc-0000-4000-8000-{n:012}");
+        let att = format!("dddddddd-0000-4000-8000-{n:012}");
+        rt.connect_only(
+            &principal,
+            &att,
+            vec![Permission::View, Permission::Control],
+            600_000,
+        );
+        // Its expiry (or a revoke, or its issuer's fence).
+        let fx = rt.host.fence_principal(&principal, 0);
+        rt.apply(fx);
+        if n == 10 {
+            early = size();
+        }
+    }
+    assert!(size() <= early, "{} > {early}", size());
+    let (_, _, principals) = rt.host.debug_ids();
+    assert!(principals.len() <= 3, "{principals:?}");
+    assert!(principals.iter().any(|p| p == KEEP), "{principals:?}");
+    // A restart reads it back; KEEP's work is still waiting (control not
+    // confirmed yet), nothing is disabled.
+    restart(&mut rt, GEN2, 8);
+    assert!(rt.host.start_error().is_none());
+    assert!(!rt.host.journal_halted());
+    assert_eq!(state_of(&rt, 2).map(|s| s.0), Some(ReceiptState::Accepted));
+    let (_, _, principals) = rt.host.debug_ids();
+    assert!(principals.iter().any(|p| p == KEEP), "{principals:?}");
+}

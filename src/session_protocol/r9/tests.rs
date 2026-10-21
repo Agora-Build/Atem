@@ -1885,8 +1885,10 @@ fn a_project_scoped_bot_sees_its_projects_sessions_only_after_an_unlock() {
 /// removal reaches a host): the browser the phone issued holds the lease
 /// with terminal input queued at the writer; the Mac connects carrying
 /// `change`; the browser is fenced at once (its channel closes, its lease
-/// is revoked, its queued bytes are dropped at the write boundary, its
-/// control generation rises), and it can't come back.
+/// is revoked, its queued bytes are dropped at the write boundary), and it
+/// can't come back. (Its raised control state is then pruned at the Mac's
+/// own control write: nothing of it is left to order, see
+/// `SessionHost::prune_principals`.)
 fn a_carried_issuer_change_fences_its_browser(change: impl FnOnce(&mut TestLog)) {
     use crate::session_protocol::fixtures::{HostEvent, HostUnderTest};
     let mut rig = Rig::new();
@@ -1940,8 +1942,6 @@ fn a_carried_issuer_change_fences_its_browser(change: impl FnOnce(&mut TestLog))
             "generation": PGEN, "stream_id": stream, "sequence": 0, "bytes": "eA==",
             "binding": lease}}),
     );
-    let principal = format!("browser:{grant_id}");
-    let gen_before = rig.rt.host.control_gen(&principal);
     // The Mac connects with the change in its hello.
     change(&mut rig.log);
     let client_log = rig.log.log.clone();
@@ -1955,7 +1955,6 @@ fn a_carried_issuer_change_fences_its_browser(change: impl FnOnce(&mut TestLog))
     assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
     assert_eq!(rig.refused("browser").0, "closed");
     assert_eq!(rig.rt.host.lease_holder(SID), None);
-    assert!(rig.rt.host.control_gen(&principal) > gen_before);
     let now = rig.rt.now();
     rig.rt.event(&HostEvent::FlushPtyWrites, now).unwrap();
     assert_eq!(rig.rt.counter("pty_writes_dropped").unwrap(), json!(1));

@@ -75,6 +75,8 @@ use std::path::{Path, PathBuf};
 pub const COMPACT_BYTES: u64 = 1 << 20;
 /// Largest record accepted on load (a payload is far smaller).
 const MAX_RECORD_BYTES: usize = 8 << 20;
+/// Largest `principals` file read on load (see `load_principals`).
+const MAX_PRINCIPALS_BYTES: usize = 64 << 20;
 const LOG_SUFFIX: &str = ".log";
 const TMP_SUFFIX: &str = ".log.tmp";
 const FLOORS: &str = "floors";
@@ -369,13 +371,18 @@ fn decode_line(bytes: &[u8]) -> Option<(u64, Record, usize)> {
 
 /// The checked JSON of the frame at the start of `bytes`, and its length.
 fn unframe(bytes: &[u8]) -> Option<(&[u8], usize)> {
+    unframe_within(bytes, MAX_RECORD_BYTES)
+}
+
+/// [`unframe`] with a record of at most `max` bytes.
+fn unframe_within(bytes: &[u8], max: usize) -> Option<(&[u8], usize)> {
     let space = bytes.iter().take(21).position(|&b| b == b' ')?;
     let digits = &bytes[..space];
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
     let len: usize = std::str::from_utf8(digits).ok()?.parse().ok()?;
-    if len > MAX_RECORD_BYTES {
+    if len > max {
         return None;
     }
     let rest = &bytes[space + 1..];
@@ -864,6 +871,15 @@ impl FileJournal {
         &self,
         name: &str,
     ) -> Result<Option<T>, JournalError> {
+        self.read_framed_within(name, MAX_RECORD_BYTES)
+    }
+
+    /// [`FileJournal::read_framed`] with a record of at most `max` bytes.
+    fn read_framed_within<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        max: usize,
+    ) -> Result<Option<T>, JournalError> {
         let path = self.state.join(name);
         let tmp = self.state.join(format!("{name}.tmp"));
         remove_entry(&tmp).map_err(|e| io_err("cannot remove", &tmp, e))?;
@@ -871,7 +887,7 @@ impl FileJournal {
             return Ok(None);
         }
         let bytes = Self::read_private(&path)?;
-        unframe(&bytes)
+        unframe_within(&bytes, max)
             .filter(|(_, used)| *used == bytes.len())
             .and_then(|(json, _)| serde_json::from_slice::<T>(json).ok())
             .map(Some)
@@ -880,8 +896,13 @@ impl FileJournal {
 
     /// Reads the principals file. A damaged one is refused: forgetting a
     /// control generation could let revoked work run.
+    ///
+    /// Its own, larger bound: a file grown before browser principals were
+    /// pruned (`SessionHost::prune_principals`) is read whole and shrinks
+    /// at the next control write, never refused for its size.
     fn load_principals(&mut self) -> Result<(), JournalError> {
-        let file: Option<PrincipalsFile> = self.read_framed(PRINCIPALS)?;
+        let file: Option<PrincipalsFile> =
+            self.read_framed_within(PRINCIPALS, MAX_PRINCIPALS_BYTES)?;
         self.principals = file.map(|f| f.principals).unwrap_or_default();
         Ok(())
     }
@@ -1436,6 +1457,12 @@ impl Journal for FileJournal {
     /// written after it. The journal stays failed until a real process
     /// restart opens it from disk. A reload that fails leaves it failed too
     /// (its in-memory state is gone).
+    fn forget_principals(&mut self, principals: &[String]) {
+        for p in principals {
+            self.principals.remove(p);
+        }
+    }
+
     fn reopen(&mut self) -> Result<(), JournalError> {
         self.retry_undo();
         if !self.undo.is_empty() {

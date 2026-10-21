@@ -133,6 +133,12 @@ pub trait Journal {
     fn take_clean_close(&mut self) -> Option<u64>;
     /// After a restart: reload what is durable and accept appends again.
     fn reopen(&mut self) -> Result<(), JournalError>;
+    /// Forgets the control states of `principals` (the host found they can
+    /// no longer matter): they are left out of every later control write,
+    /// starting with the one that follows at once. Nothing is written here:
+    /// until that write the disk keeps them, which is harmless (more
+    /// history, never less).
+    fn forget_principals(&mut self, principals: &[String]);
 }
 
 /// In-memory journal with failure injection, for tests and the fixtures.
@@ -282,6 +288,12 @@ impl Journal for MemJournal {
 
     fn take_clean_close(&mut self) -> Option<u64> {
         self.clean_close.take()
+    }
+
+    fn forget_principals(&mut self, principals: &[String]) {
+        self.records.retain(
+            |r| !matches!(r, Record::Control { principal, .. } if principals.contains(principal)),
+        );
     }
 
     fn reopen(&mut self) -> Result<(), JournalError> {
