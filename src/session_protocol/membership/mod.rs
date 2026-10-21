@@ -1753,20 +1753,46 @@ fn parse_applied(bytes: &[u8]) -> Option<Applied> {
 
 // ── Unpair and pairing ──
 
-/// The genesis hashes this host was frozen on (`frozen_genesis`).
-pub fn frozen_genesis(pairing: &PairingPaths) -> Vec<Hash32> {
-    store::read_private(&pairing.frozen_genesis)
-        .ok()
-        .flatten()
-        .and_then(|b| parse_json(&b))
-        .and_then(|v| {
+/// The genesis hashes this host was frozen on: `frozen_genesis` and its
+/// mirror (both written at every change, the mirror first), merged. The
+/// two vouch for each other: one missing next to the other is no "never
+/// frozen" (the other holds the list); either one unreadable is an error
+/// (fail closed: it may have held a genesis the other lacks). Only both
+/// missing is a host that never froze.
+pub fn frozen_genesis(pairing: &PairingPaths) -> Result<Vec<Hash32>, String> {
+    let mut list = Vec::new();
+    for path in [&pairing.frozen_genesis_mirror, &pairing.frozen_genesis] {
+        let bytes = match store::read_private(path) {
+            Ok(None) => continue,
+            Ok(Some(bytes)) => bytes,
+            Err(e) => return Err(frozen_genesis_damaged(path, &e.to_string())),
+        };
+        let parsed = parse_json(&bytes).and_then(|v| {
             v.get("genesis")?
                 .as_array()?
                 .iter()
                 .map(|h| Hash32::from_hex(h.as_str()?).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+                .collect::<Option<Vec<_>>>()
+        });
+        let Some(parsed) = parsed else {
+            return Err(frozen_genesis_damaged(path, "not a genesis list"));
+        };
+        for genesis in parsed {
+            if !list.contains(&genesis) {
+                list.push(genesis);
+            }
+        }
+    }
+    Ok(list)
+}
+
+fn frozen_genesis_damaged(path: &Path, why: &str) -> String {
+    format!(
+        "{} can't be read ({why}): this host can't tell which device lists it was frozen on, \
+         so pairing is refused; restore it, or remove frozen_genesis and frozen_genesis.mirror \
+         to forget every frozen device list",
+        path.display()
+    )
 }
 
 /// Why `forget_on_unpair` failed, and whether the removal had begun.
@@ -1900,7 +1926,12 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
             .as_ref()
             .and_then(|v| Hash32::from_hex(v.get("genesis_hash")?.as_str()?).ok())
     {
-        let mut list = frozen_genesis(pairing);
+        // An unreadable list isn't replaced (it may hold a genesis this
+        // write would forget): the unpair stops before anything changed.
+        let mut list = frozen_genesis(pairing).map_err(|message| ForgetError {
+            message,
+            begun: false,
+        })?;
         if !list.contains(&genesis) {
             list.push(genesis);
         }
@@ -1908,9 +1939,11 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
             list.remove(0);
         }
         let file = json!({"v": 1, "genesis": list.iter().map(Hash32::to_hex).collect::<Vec<_>>()});
-        store
-            .replace(DlFile::FrozenGenesis, file.to_string().as_bytes())
-            .map_err(not_begun)?;
+        for target in [DlFile::FrozenGenesisMirror, DlFile::FrozenGenesis] {
+            store
+                .replace(target, file.to_string().as_bytes())
+                .map_err(not_begun)?;
+        }
     }
     // `membership_applied` is the last leftover: it stays until
     // `forget_leftovers`, after the unpair committed the next trust

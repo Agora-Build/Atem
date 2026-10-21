@@ -230,3 +230,47 @@ fn an_interrupted_pin_fails_closed() {
     );
     assert!(opened.is_err(), "leftovers without the list fail closed");
 }
+
+/// Re-review N3: `frozen_genesis` lost while its mirror is kept is no
+/// "never frozen": the mirror still refuses the frozen genesis (and the
+/// other way round).
+#[test]
+fn a_lost_frozen_genesis_is_vouched_for_by_its_mirror() {
+    let frozen = |case: &Case| json!({"v": 1, "genesis": [case.log.genesis_hash().to_hex()]});
+    let case = Case::new();
+    std::fs::create_dir_all(case.pairing.dir()).unwrap();
+    crate::paths::write_test_file(
+        &case.pairing.frozen_genesis_mirror,
+        frozen(&case).to_string().as_bytes(),
+    );
+    let e = case.verify(Some(&case.membership()), |_| {}).unwrap_err();
+    assert!(e.contains("frozen on this host"), "{e}");
+}
+
+/// Re-review N3: an unreadable `frozen_genesis` (or mirror) can't tell
+/// which device lists this host froze on: pairing is refused, never read
+/// as an empty list.
+#[test]
+fn an_unreadable_frozen_genesis_refuses_pairing() {
+    for damaged in [
+        b"{not json".as_slice(),
+        b"\xff",
+        br#"{"v":1,"genesis":["zz"]}"#,
+    ] {
+        for mirror in [false, true] {
+            let case = Case::new();
+            std::fs::create_dir_all(case.pairing.dir()).unwrap();
+            let path = if mirror {
+                &case.pairing.frozen_genesis_mirror
+            } else {
+                &case.pairing.frozen_genesis
+            };
+            crate::paths::write_test_file(path, damaged);
+            let e = case.verify(Some(&case.membership()), |_| {}).unwrap_err();
+            assert!(
+                e.contains("can't be read") && e.contains("pairing is refused"),
+                "{e}"
+            );
+        }
+    }
+}

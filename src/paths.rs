@@ -60,6 +60,9 @@ pub struct PairingPaths {
     /// `frozen_genesis`: genesis hashes this host was frozen on (kept by
     /// `atem unpair`; ≤ 16).
     pub frozen_genesis: PathBuf,
+    /// `frozen_genesis.mirror`: the same list, written first; the two
+    /// vouch for each other (either one lost is no "never frozen").
+    pub frozen_genesis_mirror: PathBuf,
     /// `host_channel_key`: the host's atem-ch1 key (deleted by `atem unpair`).
     pub host_channel_key: PathBuf,
 }
@@ -76,6 +79,7 @@ impl PairingPaths {
             freeze: dir.join("membership.freeze"),
             fault: dir.join("membership.fault"),
             frozen_genesis: dir.join("frozen_genesis"),
+            frozen_genesis_mirror: dir.join("frozen_genesis.mirror"),
             host_channel_key: dir.join("host_channel_key"),
         }
     }

@@ -78,7 +78,7 @@ pub fn verify_pairing_log(
         inputs.host_trust_gen,
         &host_key,
         &astation,
-        &frozen_genesis(pairing),
+        &frozen_genesis(pairing)?,
     )
     .map_err(|refusal| match refusal {
         atem_client::membership::PairingRefusal::FrozenGenesis => {

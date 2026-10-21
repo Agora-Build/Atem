@@ -769,7 +769,7 @@ fn unpair_keeps_a_frozen_genesis_and_removes_the_list() {
         assert!(!rig.exists(file), "{file:?}");
     }
     assert!(!rig.pairing.host_channel_key.exists());
-    assert_eq!(frozen_genesis(&rig.pairing), vec![v.hash("E1")]);
+    assert_eq!(frozen_genesis(&rig.pairing).unwrap(), vec![v.hash("E1")]);
     // The pairing check refuses it.
     let m = pinned(&LOG6, &t0());
     assert!(
@@ -778,24 +778,25 @@ fn unpair_keeps_a_frozen_genesis_and_removes_the_list() {
             1,
             &m.host("host-a").unwrap().host_key,
             &m.member("dev-mac").unwrap().member.auth_key,
-            &frozen_genesis(&rig.pairing),
+            &frozen_genesis(&rig.pairing).unwrap(),
         )
         .is_err()
     );
     // Bounded at 16, oldest first out; an unfrozen list adds nothing.
     let list: Vec<String> = (0..16u8).map(|i| Hash32([i; 32]).to_hex()).collect();
-    std::fs::write(
+    for path in [
         &rig.pairing.frozen_genesis,
-        json!({"v": 1, "genesis": list}).to_string(),
-    )
-    .unwrap();
+        &rig.pairing.frozen_genesis_mirror,
+    ] {
+        std::fs::write(path, json!({"v": 1, "genesis": list}).to_string()).unwrap();
+    }
     rig.pin(&LOG6);
     forget_on_unpair(&rig.pairing).unwrap();
-    assert_eq!(frozen_genesis(&rig.pairing).len(), 16);
+    assert_eq!(frozen_genesis(&rig.pairing).unwrap().len(), 16);
     rig.pin(&LOG6);
     std::fs::write(&rig.pairing.freeze, b"x").unwrap();
     forget_on_unpair(&rig.pairing).unwrap();
-    let kept = frozen_genesis(&rig.pairing);
+    let kept = frozen_genesis(&rig.pairing).unwrap();
     assert_eq!(kept.len(), 16);
     assert_eq!(kept.last(), Some(&v.hash("E1")));
     assert_eq!(kept[0], Hash32([1; 32]), "the oldest went");
@@ -1284,4 +1285,26 @@ fn the_host_channel_key_keeps_its_shape() {
         json!({"v": 1, "seed": atem_client::encoding::b64u(&seed),
                "pub": atem_client::encoding::b64u(&public)})
     );
+}
+
+/// Re-review N3: the unpair of a frozen list never replaces an unreadable
+/// `frozen_genesis` (it may hold a genesis the write would forget): it
+/// stops before anything changed, the host still paired with its list.
+#[test]
+fn an_unpair_never_replaces_an_unreadable_frozen_genesis() {
+    let v = vectors();
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (mut host, mut f) = opened(&rig, 1);
+    host.apply_carriage(&v.carry(&["C6_mac"]), &t0(), &mut f);
+    drop(host);
+    std::fs::write(&rig.pairing.frozen_genesis, b"{not json").unwrap();
+    let e = forget_on_unpair(&rig.pairing).unwrap_err();
+    assert!(!e.begun, "{e:?}");
+    assert!(rig.exists(DlFile::State), "still paired with its list");
+    assert_eq!(
+        std::fs::read(&rig.pairing.frozen_genesis).unwrap(),
+        b"{not json"
+    );
+    assert!(frozen_genesis(&rig.pairing).is_err());
 }

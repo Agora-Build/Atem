@@ -11,6 +11,7 @@
 //! <profile>/pairing/membership.freeze    both entries of a freeze
 //! <profile>/pairing/membership.fault     an observed device-list write fault
 //! <profile>/pairing/frozen_genesis       genesis hashes this host froze on (≤ 16)
+//! <profile>/pairing/frozen_genesis.mirror the same list, written first
 //! <config>/runtime/journal/membership_applied  the head whose fences are durable
 //! ```
 //!
@@ -47,6 +48,8 @@ pub enum DlFile {
     Applied,
     /// `frozen_genesis`.
     FrozenGenesis,
+    /// `frozen_genesis.mirror`.
+    FrozenGenesisMirror,
     /// `host_channel_key`.
     HostChannelKey,
 }
@@ -61,6 +64,7 @@ impl DlFile {
             DlFile::Fault => "membership.fault",
             DlFile::Applied => "membership_applied",
             DlFile::FrozenGenesis => "frozen_genesis",
+            DlFile::FrozenGenesisMirror => "frozen_genesis.mirror",
             DlFile::HostChannelKey => "host_channel_key",
         }
     }
@@ -291,6 +295,7 @@ impl Store {
             DlFile::Fault => self.pairing.fault.clone(),
             DlFile::Applied => self.journal_dir.join("membership_applied"),
             DlFile::FrozenGenesis => self.pairing.frozen_genesis.clone(),
+            DlFile::FrozenGenesisMirror => self.pairing.frozen_genesis_mirror.clone(),
             DlFile::HostChannelKey => self.pairing.host_channel_key.clone(),
         }
     }

@@ -730,7 +730,9 @@ pub(crate) mod tests {
         assert!(!paths.membership.exists() && !paths.freeze.exists());
         assert!(PairingRecord::load(paths).unwrap().is_none());
         assert_eq!(
-            crate::session_protocol::membership::frozen_genesis(paths).len(),
+            crate::session_protocol::membership::frozen_genesis(paths)
+                .unwrap()
+                .len(),
             1
         );
     }

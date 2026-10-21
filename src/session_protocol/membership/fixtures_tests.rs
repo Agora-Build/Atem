@@ -1269,6 +1269,7 @@ impl Runner {
                 )),
                 "frozen_genesis" => {
                     let got: Vec<Value> = frozen_genesis(&host.rig.pairing)
+                        .unwrap()
                         .iter()
                         .map(|h| json!(h.to_hex()))
                         .collect();
@@ -1681,7 +1682,7 @@ impl Runner {
                         1,
                         &m.host("host-a").unwrap().host_key,
                         &m.member("dev-mac").unwrap().member.auth_key,
-                        &frozen_genesis(&host.rig.pairing),
+                        &frozen_genesis(&host.rig.pairing).unwrap(),
                     )
                     .unwrap_err();
                 assert_eq!(step["result"], "refused");
