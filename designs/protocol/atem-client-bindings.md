@@ -51,7 +51,12 @@ In the app:
 - **Storage** (trusted local storage: the app's own container, not shared
   or synced storage):
   - the log's durable snapshot (`MembershipLog.stored_json()`), after every
-    change and before acting on it (§2 "Durable state");
+    change and before acting on it (§2 "Durable state"). **Exclude it from
+    device and cloud backups** (iOS `isExcludedFromBackup`, Android
+    `allowBackup="false"` / `dataExtractionRules`; the same for the
+    writers' `prepared_json()`): restoring a backup rolls the wait clocks
+    and decisions back to an older state the verifier can't tell apart
+    from the current one;
   - **every write in flight, before acting on it**: an `EntryPublisher`'s,
     a `KBackupWriter`'s and a `RestoreSession`'s `prepared_json()` (§R9.4
     rule 1, §R9.5 "Writing a backup" step 2). After a restart the app
@@ -98,46 +103,64 @@ The log object is shared by reference: `extend`, `advance`, a publisher's
 or writer's reply change it in place. `snapshot()` copies.
 
 **Durable state** (Atem #93). `stored_json()` is the log's durable form,
-the same the host keeps in `membership.json` (§R9.3) without the host's
-own fields: the entries, one recovery record per pending-type entry with
-its wait clock (`first_seen_wall`, `boot_id`, `mono_anchor_ms`,
-`mono_waited_ms`) and decision (`decided_at_wall`, `decided_at_seq`,
-`order`, `reason`), the evidence, a freeze and the derived head and
-recovery keys. Rebuilding from `entries()` with `verify` loses what the
-entries can't say: every pending wait would start again at `now`, and a
-wait-ended decision's chain position (which later entries are judged
-against) would be lost.
+versioned (`"v": 1`), the same the host keeps in `membership.json` (§R9.3)
+without the host's own fields: the entries, one recovery record per
+pending-type entry with its wait clock (`first_seen_wall`, `boot_id`,
+`mono_anchor_ms`, `mono_waited_ms`) and decision (`decided_at_wall`,
+`decided_at_seq`, `order`, `reason`), the evidence, a freeze and the
+derived head and recovery keys. Rebuilding from `entries()` with `verify`
+loses what the entries can't say: every pending wait would start again at
+`now`, and a wait-ended decision's chain position (which later entries are
+judged against) would be lost.
 
-- **Export after each change, commit before acting.** After every `extend`,
-  `advance`, publisher or writer reply (`reply_stored`, `reply_conflict`,
-  `put_reply`, `append_stored`, `append_conflict`, `fetched`) and
-  `RestoreSession::attempt` (its `log()`), and at least once a minute while
-  `pending_recovery` is non-empty (so a reboot keeps the time waited; the
-  host does the same), take `stored_json()` and commit it durably (atomic
-  replace and sync in the app's container, the §1 storage rules) **before**
-  acting on the returned effects, showing them, or exposing what they
-  permit (a recovered device's access, a removed member's loss of it). The
-  effects are recomputable from the committed state; an action taken on
-  state that was never committed is not.
+- **The cadence: change, export, commit, act.** Every call that takes a
+  clock reading or changes the log is followed by `stored_json()` and a
+  durable commit (atomic replace and sync in the app's container, the §1
+  storage rules) **before** the app acts on the returned effects, shows
+  them, or exposes what they permit (a recovered device's access, a removed
+  member's loss of it). The calls: `advance(now)`, `extend`, the publisher's
+  and writer's replies (`reply_stored`, `reply_conflict`, `put_reply`,
+  `append_stored`, `append_conflict`, `fetched`), and a `RestoreSession`'s
+  `log()` after `attempt`. While `pending_recovery` is non-empty, run
+  `advance(now)` → `stored_json()` → commit → act on its effects at least
+  once a minute and when the app goes to the background or stops: only
+  `advance` and `extend` record the time waited (`stored_json()` and
+  `pending_recovery(now)` take no reading), so this is what keeps the time
+  waited across a reboot. The effects are recomputable from the committed
+  state; an action taken on state that was never committed is not.
 - **A failed commit halts the adapter.** Don't act on the effects, don't
   sign or publish, don't show the new state as current; keep the last
   committed snapshot as the truth and retry the commit (or reload from it)
   before going on.
-- **After a crash, reload and resume.** `MembershipLog::from_stored(account_id,
+- **After a crash, reload, export, resume.** `MembershipLog::from_stored(account_id,
   genesis_hash, stored_json, now)` with the last committed snapshot, then
-  continue (`advance(now)`, `pending_recovery(now)`, fetch and `extend`):
-  the result is what the log would have been had the app not stopped.
-  Effects of a change whose commit was lost are produced again by repeating
-  the fetch or `advance`.
+  at once `stored_json()` and commit (the load's clock reading re-anchors
+  waits on a new boot only in memory), then continue (`advance(now)`,
+  `pending_recovery(now)`, fetch and `extend`). On the same boot the result
+  is what the log would have been without the restart. Across a reboot it
+  is conservative: time from the last committed reading to the shutdown,
+  and from the boot to the load, isn't counted, so a wait can only end
+  later, never earlier. Effects of a change whose commit was lost are
+  produced again by repeating the fetch or `advance`.
 - **Timing.** `now` at load is the run's first reading of the verifier clock
   (`HostClock`), exactly as the host takes one at start: on the same
   `boot_id` every wait continues from its first sight (its monotonic
-  anchor); on another boot from the persisted `mono_waited_ms` (time while
-  the machine was off, or not yet persisted, never counts: the wait can only
-  get longer). Both clocks must pass: a wall clock set back neither ends a
-  wait early nor restarts it (`first_seen_wall` is kept), a wall clock
-  jumped forward alone ends nothing. No `signed_at`, relay time or host
-  challenge in the snapshot counts as time waited or as freshness.
+  anchor); on another boot from the persisted `mono_waited_ms`. Both clocks
+  must pass: a wall clock set back neither ends a wait early nor restarts
+  it (`first_seen_wall` is kept), a wall clock jumped forward alone ends
+  nothing. No `signed_at`, relay time or host challenge in the snapshot
+  counts as time waited or as freshness. `HostClock` times are
+  milliseconds, at most 2^53 − 1: a larger value (e.g. nanoseconds) is
+  refused by every call that takes one (`Invalid{malformed}`), so
+  `verify`, `extend`, `evaluate`, `advance`, `pending_recovery` and the
+  writers' replies all throw on it.
+- **Versions.** `from_stored` reads snapshot version 1 only and refuses a
+  missing `v` (`malformed`) or any other (`unsupported_version`, e.g. a
+  snapshot written by a newer binding after a downgrade). A later binding
+  that changes the format bumps `v` and must keep reading every earlier
+  version (migrating it), so an app update never strands a committed
+  snapshot; within a version the snapshot must be exactly what that
+  version's `stored_json()` writes.
 - **Checked, bounded, fails closed.** `from_stored` reads at most 16 MiB
   (the host's own bound on `membership.json`: a full log of 1024 entries
   with bodies ≤ 4 KiB, plus records and evidence), strict JSON, then the
@@ -145,23 +168,29 @@ against) would be lost.
   genesis is the pinned one, every entry verifies against the chain before
   it with the recorded decisions at their positions, one record per
   pending-type entry, decisions at positions the chain reached, the stored
-  head, recovery key, retired keys and freeze equal the derived ones; the
-  snapshot must be exactly what `stored_json()` writes (any other field is
-  refused). Any failure is `AtemError::Stored` (§4) and nothing is
-  restored: keep the adapter halted and recover the state with the user
-  (re-verify from the relay's entries with `verify`, which restarts pending
-  waits: conservative), never guess. The snapshot is not integrity-protected
-  (the entries are signed, the clocks and decisions aren't): keep it where
-  only the app can write, like `prepared_json()`.
+  head, recovery key, retired keys and freeze equal the derived ones. A
+  client's snapshot may hold the restore-only `host_confirmed` decision (a
+  kit restore read through a past recovery on a host-signed head); the
+  host's reader refuses that reason. Any failure is `AtemError::Stored`
+  (§4) and nothing is restored: keep the adapter halted and recover the
+  state with the user (re-verify from the relay's entries with `verify`,
+  which restarts pending waits: conservative), never guess. The snapshot
+  is not integrity-protected (the entries are signed, the clocks and
+  decisions aren't): keep it where only the app can write, like
+  `prepared_json()`, and out of backups (§1).
 - **Restoring grants nothing.** The result is a verified log, like
   `verify`'s: no controller session, lease, host authority or channel; the
   app connects and is admitted as before.
 - **Writers keep their own state.** `EntryPublisher`, `KBackupWriter` and
   `RestoreSession` persist their `prepared_json()` as before (§1) and are
-  resumed from it; pass them the restored log (`resume`, then
-  `reply_stored(log, …)`, `put_reply(log, …)`, …). Commit order: a writer's
-  `prepared_json()` before signing or sending, the log's snapshot after
-  the reply that changed it.
+  resumed from it. `EntryPublisher` and `KBackupWriter` take the log in
+  their calls: pass the restored one (`EntryPublisher::resume`, then
+  `reply_stored(log, …)`; `KBackupWriter::resume`, then `put_reply(log, …)`,
+  `append_stored(log, …)`, …). `RestoreSession::resume` takes no log: it
+  holds none until `attempt` succeeds again on a new fetch and host
+  accept; then commit its `log().stored_json()` and use that log from then
+  on. Commit order: a writer's `prepared_json()` before signing or
+  sending, the log's snapshot after the reply that changed it.
 
 ### ClientConnection (§R9.7, §R9.8; r8 session-v1 inside)
 
@@ -452,7 +481,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 
 | variant | `code` (stable) |
 |---|---|
-| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body |
+| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body; `malformed` for a `HostClock` time above 2^53 − 1 |
 | `Membership{code, detail, index}` | `membership_invalid`; `detail` the verifier's (`bad_signature`, `gap`, `signer_not_manager`, `blob_version_not_increasing`, `kit_sig_missing`, …); `index` into what was passed |
 | `Channel{code, detail}` | `handshake_failed`, `stale_target`, `account_frozen`, `busy` (also as the host's clear, advisory error before the channel opens), `unknown_host`, `record_rejected`, `limit`, `too_large`, `closed`, `signing_failed`, `invalid_hello`, `cannot_carry` (a divergence deeper than any carriage) |
 | `Refused{code, detail, error_json, next}` | the host's session error code (`unauthorized`, `membership_invalid`, `membership_incomplete`, `recovery_pending`, `account_frozen`, `unsupported_version`, `busy`, …) |
@@ -461,7 +490,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 | `Restore{code, detail}` | `kit_tag_mismatch`, `genesis_mismatch`, `membership_invalid`, `no_host_reachable`, `log_behind_host`, `kit_not_current`, `no_backup`, `backup_hash_mismatch`, `backup_invalid` |
 | `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
-| `Stored{code, detail}` | `MembershipLog::from_stored` refused the snapshot: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `account_id`/`genesis_hash`), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid` |
+| `Stored{code, detail}` | `MembershipLog::from_stored` refused the snapshot: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid` |
 | `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
@@ -614,7 +643,7 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (the same 36 checks in each language, over
+- **Conformance** (the same 37 checks in each language, over
   `designs/protocol/fixtures/r9-vectors-*.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
@@ -624,8 +653,11 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
-  extended and mismatched snapshots refused, and a restored log driving a
-  resumed `EntryPublisher`, a `KBackupWriter` and a `RestoreSession`'s log.
+  extended, unversioned or newer and mismatched snapshots refused, clock
+  readings above 2^53 − 1 refused, and a restored log driving a resumed
+  `EntryPublisher`, a `KBackupWriter` and a `RestoreSession`'s log
+  (including a read-through restore's `host_confirmed` decision; the host's
+  reader still refuses it: `src/session_protocol/membership/tests.rs`).
 - **Flows** (`bindings/js/flows.mjs`): the K-backup writer and its 409s,
   the restore's enrollment, the publisher's 409, host-role admission, the
   recovery wait, kits, push books, acks and seens, object state errors.
