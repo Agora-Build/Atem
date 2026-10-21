@@ -50,7 +50,8 @@ In the app:
   push hints.
 - **Storage** (trusted local storage: the app's own container, not shared
   or synced storage):
-  - the log's entries (`MembershipLog.entries()`), after every change;
+  - the log's durable snapshot (`MembershipLog.stored_json()`), after every
+    change and before acting on it (§2 "Durable state");
   - **every write in flight, before acting on it**: an `EntryPublisher`'s,
     a `KBackupWriter`'s and a `RestoreSession`'s `prepared_json()` (§R9.4
     rule 1, §R9.5 "Writing a backup" step 2). After a restart the app
@@ -79,8 +80,10 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 
 | call | effect for the app |
 |---|---|
-| `MembershipLog::verify(account_id, genesis_hash, entries, now)` | at start, from the stored entries; `genesis_hash` is the anchor the app holds (pairing, or the kit's) |
-| `entries()` | store these (canonical JSON, in order) after every change |
+| `MembershipLog::from_stored(account_id, genesis_hash, stored_json, now)` | at start, from the committed snapshot; `account_id` and `genesis_hash` are the anchors the app holds (pairing, or the kit's), never the snapshot's own |
+| `stored_json()` | the durable snapshot (canonical JSON): commit it after every change, before acting on it (below) |
+| `MembershipLog::verify(account_id, genesis_hash, entries, now)` | a new log from signed entries alone (first enrollment, a fetch from the genesis): every pending wait starts at `now` |
+| `entries()` | the entries (canonical JSON, in order): to carry or show |
 | `extend(entries, now)` | after fetching `…/entries?after=` from the relay: keeps the valid prefix; check `stop` (`invalid` → report, `need_before` → fetch an earlier window, `deferred` → wait, `conflict:freeze` / `frozen` → show the frozen state, stop signing entries) |
 | `evaluate(entries, now)` | the same without keeping it |
 | `head()`, `relation(head)` | how a head another party signed relates (`same`, `host_behind`, `host_ahead` → fetch and extend, `diverged`) |
@@ -93,6 +96,72 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 
 The log object is shared by reference: `extend`, `advance`, a publisher's
 or writer's reply change it in place. `snapshot()` copies.
+
+**Durable state** (Atem #93). `stored_json()` is the log's durable form,
+the same the host keeps in `membership.json` (§R9.3) without the host's
+own fields: the entries, one recovery record per pending-type entry with
+its wait clock (`first_seen_wall`, `boot_id`, `mono_anchor_ms`,
+`mono_waited_ms`) and decision (`decided_at_wall`, `decided_at_seq`,
+`order`, `reason`), the evidence, a freeze and the derived head and
+recovery keys. Rebuilding from `entries()` with `verify` loses what the
+entries can't say: every pending wait would start again at `now`, and a
+wait-ended decision's chain position (which later entries are judged
+against) would be lost.
+
+- **Export after each change, commit before acting.** After every `extend`,
+  `advance`, publisher or writer reply (`reply_stored`, `reply_conflict`,
+  `put_reply`, `append_stored`, `append_conflict`, `fetched`) and
+  `RestoreSession::attempt` (its `log()`), and at least once a minute while
+  `pending_recovery` is non-empty (so a reboot keeps the time waited; the
+  host does the same), take `stored_json()` and commit it durably (atomic
+  replace and sync in the app's container, the §1 storage rules) **before**
+  acting on the returned effects, showing them, or exposing what they
+  permit (a recovered device's access, a removed member's loss of it). The
+  effects are recomputable from the committed state; an action taken on
+  state that was never committed is not.
+- **A failed commit halts the adapter.** Don't act on the effects, don't
+  sign or publish, don't show the new state as current; keep the last
+  committed snapshot as the truth and retry the commit (or reload from it)
+  before going on.
+- **After a crash, reload and resume.** `MembershipLog::from_stored(account_id,
+  genesis_hash, stored_json, now)` with the last committed snapshot, then
+  continue (`advance(now)`, `pending_recovery(now)`, fetch and `extend`):
+  the result is what the log would have been had the app not stopped.
+  Effects of a change whose commit was lost are produced again by repeating
+  the fetch or `advance`.
+- **Timing.** `now` at load is the run's first reading of the verifier clock
+  (`HostClock`), exactly as the host takes one at start: on the same
+  `boot_id` every wait continues from its first sight (its monotonic
+  anchor); on another boot from the persisted `mono_waited_ms` (time while
+  the machine was off, or not yet persisted, never counts: the wait can only
+  get longer). Both clocks must pass: a wall clock set back neither ends a
+  wait early nor restarts it (`first_seen_wall` is kept), a wall clock
+  jumped forward alone ends nothing. No `signed_at`, relay time or host
+  challenge in the snapshot counts as time waited or as freshness.
+- **Checked, bounded, fails closed.** `from_stored` reads at most 16 MiB
+  (the host's own bound on `membership.json`: a full log of 1024 entries
+  with bodies ≤ 4 KiB, plus records and evidence), strict JSON, then the
+  shared verifier rebuilds the state against the caller's anchors: the
+  genesis is the pinned one, every entry verifies against the chain before
+  it with the recorded decisions at their positions, one record per
+  pending-type entry, decisions at positions the chain reached, the stored
+  head, recovery key, retired keys and freeze equal the derived ones; the
+  snapshot must be exactly what `stored_json()` writes (any other field is
+  refused). Any failure is `AtemError::Stored` (§4) and nothing is
+  restored: keep the adapter halted and recover the state with the user
+  (re-verify from the relay's entries with `verify`, which restarts pending
+  waits: conservative), never guess. The snapshot is not integrity-protected
+  (the entries are signed, the clocks and decisions aren't): keep it where
+  only the app can write, like `prepared_json()`.
+- **Restoring grants nothing.** The result is a verified log, like
+  `verify`'s: no controller session, lease, host authority or channel; the
+  app connects and is admitted as before.
+- **Writers keep their own state.** `EntryPublisher`, `KBackupWriter` and
+  `RestoreSession` persist their `prepared_json()` as before (§1) and are
+  resumed from it; pass them the restored log (`resume`, then
+  `reply_stored(log, …)`, `put_reply(log, …)`, …). Commit order: a writer's
+  `prepared_json()` before signing or sending, the log's snapshot after
+  the reply that changed it.
 
 ### ClientConnection (§R9.7, §R9.8; r8 session-v1 inside)
 
@@ -392,6 +461,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 | `Restore{code, detail}` | `kit_tag_mismatch`, `genesis_mismatch`, `membership_invalid`, `no_host_reachable`, `log_behind_host`, `kit_not_current`, `no_backup`, `backup_hash_mismatch`, `backup_invalid` |
 | `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
+| `Stored{code, detail}` | `MembershipLog::from_stored` refused the snapshot: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `account_id`/`genesis_hash`), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid` |
 | `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
@@ -544,11 +614,18 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (the same 34 checks in each language, over
+- **Conformance** (the same 36 checks in each language, over
   `designs/protocol/fixtures/r9-vectors-*.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
+- **Durable log** (`tests/stored_log.rs`, Rust; one conformance check per
+  language): a partly elapsed wait across a same-boot restart and a reboot,
+  the wall clock set back after restore, a wait-ended decision at its chain
+  position (with the entry that relies on it), pending, approved and vetoed
+  recovery and key-replacement records, a frozen log, corrupted, oversize,
+  extended and mismatched snapshots refused, and a restored log driving a
+  resumed `EntryPublisher`, a `KBackupWriter` and a `RestoreSession`'s log.
 - **Flows** (`bindings/js/flows.mjs`): the K-backup writer and its 409s,
   the restore's enrollment, the publisher's 409, host-role admission, the
   recovery wait, kits, push books, acks and seens, object state errors.
