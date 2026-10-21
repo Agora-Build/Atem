@@ -3991,3 +3991,15 @@ fn status_reports_the_attachment_its_refusals_and_its_welcome() {
         rt.shutdown().await;
     });
 }
+
+#[test]
+fn the_welcome_line_names_the_trust_generation() {
+    assert_eq!(
+        super::welcome_line(None, "a1b2c3d4", 5),
+        "welcome (attachment a1b2c3d4, trust gen 5)"
+    );
+    assert_eq!(
+        super::welcome_line(Some(("a1b2c3d4", "e5f6a7b8")), "e5f6a7b8", 6),
+        "replaced attachment a1b2c3d4 with e5f6a7b8; welcome (trust gen 6)"
+    );
+}

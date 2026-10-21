@@ -151,7 +151,8 @@ Attachments and identity:
   problem: the "Complete verification" UI text is wrong for it (a refused
   `hello` meant the client already had an attachment, never that the device
   needs verifying). runtime.log has one `HH:MM:SS` UTC line per `hello`:
-  `welcome`, `replaced attachment … with …; welcome`, or `refused <code>`.
+  `welcome (attachment …, trust gen N)`, `replaced attachment … with …;
+  welcome (trust gen N)`, or `refused <code>`.
   Every other refused request (an `error` reply, a `rejected` receipt, an
   oversize drop) also gets one line with its family, op, code and session,
   never its content: `refused agentChat/submit kind=approval_rule_revoke
