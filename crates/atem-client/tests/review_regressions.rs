@@ -499,6 +499,20 @@ fn a_restore_reads_through_a_past_recovery() {
     .unwrap();
     assert_eq!(restored.head, log.head());
     assert_eq!(*restored.keys[0].k, [7; 32]);
+    // Its log holds a `host_confirmed` decision: a client's snapshot of it
+    // reloads (Atem #93 fix round 1), a host's reader refuses it.
+    let stored = restored.log.to_stored();
+    let record = &stored["recovery"][0];
+    assert_eq!(record["reason"], "host_confirmed");
+    let reloaded = Membership::from_stored_client(ACCOUNT, &genesis_hash, &stored).unwrap();
+    assert_eq!(reloaded, restored.log);
+    assert_eq!(reloaded.to_stored(), stored);
+    assert_eq!(
+        Membership::from_stored(ACCOUNT, &genesis_hash, &stored)
+            .unwrap_err()
+            .0,
+        "recovery reason"
+    );
     // A head before the subject's entry confirms nothing beyond it, and
     // the restore doesn't go on with the verified prefix (its newest
     // k_backup may be older than the log's): it waits (Task 2 review

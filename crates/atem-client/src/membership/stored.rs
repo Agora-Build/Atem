@@ -85,13 +85,25 @@ fn parse_state(text: &str) -> Option<RecoveryState> {
     })
 }
 
-fn parse_reason(text: &str) -> Option<RecoveryReason> {
+/// Who reads a stored log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    /// The host (`membership.json`).
+    Host,
+    /// A client's own snapshot: also a log a kit restore produced.
+    Client,
+}
+
+fn parse_reason(text: &str, reader: Reader) -> Option<RecoveryReason> {
     Some(match text {
         "approved" => RecoveryReason::Approved,
         "wait_ended" => RecoveryReason::WaitEnded,
         "vetoed" => RecoveryReason::Vetoed,
         "kit_replaced" => RecoveryReason::KitReplaced,
-        // Restore-only (`verify_chain_confirmed`): a host never records it.
+        // Restore-only (`verify_chain_confirmed`): a host never records it,
+        // so a host's file holding it is refused; a client's restored log
+        // holds it.
+        "host_confirmed" if reader == Reader::Client => RecoveryReason::HostConfirmed,
         _ => return None,
     })
 }
@@ -128,7 +140,7 @@ fn record_json(record: &RecoveryRecord) -> Value {
     Value::Object(object)
 }
 
-fn parse_record(value: &Value) -> Result<RecoveryRecord, StoredError> {
+fn parse_record(value: &Value, reader: Reader) -> Result<RecoveryRecord, StoredError> {
     let object = value
         .as_object()
         .ok_or_else(|| bad("a recovery record is not an object"))?;
@@ -152,8 +164,8 @@ fn parse_record(value: &Value) -> Result<RecoveryRecord, StoredError> {
             None
         }
         state => {
-            let reason =
-                parse_reason(str_of(object, "reason")?).ok_or_else(|| bad("recovery reason"))?;
+            let reason = parse_reason(str_of(object, "reason")?, reader)
+                .ok_or_else(|| bad("recovery reason"))?;
             Some(Decision {
                 state,
                 reason,
@@ -217,10 +229,33 @@ impl Membership {
 
     /// Rebuilds a log from [`Membership::to_stored`]'s form, checking it
     /// (module docs). `genesis_hash` is the pin; `account_id` the account.
+    /// The host's reader: a record decided `host_confirmed` (restore-only)
+    /// is refused.
     pub fn from_stored(
         account_id: &str,
         genesis_hash: &Hash32,
         stored: &Value,
+    ) -> Result<Membership, StoredError> {
+        Self::load_stored(account_id, genesis_hash, stored, Reader::Host)
+    }
+
+    /// [`Membership::from_stored`] for a client's own snapshot: the same
+    /// checks, and a record a kit restore decided `host_confirmed` (a
+    /// host-signed head showed it took effect, `verify_chain_confirmed`) is
+    /// accepted. Never for a host's file.
+    pub fn from_stored_client(
+        account_id: &str,
+        genesis_hash: &Hash32,
+        stored: &Value,
+    ) -> Result<Membership, StoredError> {
+        Self::load_stored(account_id, genesis_hash, stored, Reader::Client)
+    }
+
+    fn load_stored(
+        account_id: &str,
+        genesis_hash: &Hash32,
+        stored: &Value,
+        reader: Reader,
     ) -> Result<Membership, StoredError> {
         let object = stored
             .as_object()
@@ -249,7 +284,7 @@ impl Membership {
             .as_array()
             .ok_or_else(|| bad("recovery"))?
             .iter()
-            .map(parse_record)
+            .map(|r| parse_record(r, reader))
             .collect::<Result<_, _>>()?;
         m.decision_order = u64_of(object, "decision_order")?;
         m.evidence = parse_evidence(field(object, "evidence")?)?;

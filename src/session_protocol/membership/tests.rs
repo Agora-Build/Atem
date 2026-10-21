@@ -641,6 +641,31 @@ fn an_applied_head_the_list_doesnt_hold_disables_remote_sessions() {
     );
 }
 
+/// A client's restored log may hold the restore-only `host_confirmed`
+/// decision (Atem #93); a host's `membership.json` never does, so its
+/// reader still refuses one.
+#[test]
+fn a_host_confirmed_decision_in_the_hosts_list_is_refused() {
+    let decided = |reason: &str| {
+        let rig = Rig::new();
+        let mut labels = LOG6.to_vec();
+        labels.push("R7");
+        rig.pin(&labels);
+        let mut state = rig.read(DlFile::State).unwrap();
+        let record = state["recovery"][0].as_object_mut().unwrap();
+        record.insert("state".into(), json!("active"));
+        record.insert("reason".into(), json!(reason));
+        record.insert("decided_at_seq".into(), json!(7));
+        record.insert("decided_at_wall".into(), json!(WALL0));
+        record.insert("order".into(), json!(1));
+        state["decision_order"] = json!(1);
+        std::fs::write(&rig.pairing.membership, state.to_string()).unwrap();
+        rig.open(1, &t0(), &mut remote()).map(|_| ())
+    };
+    decided("wait_ended").expect("the same record as a host decides it");
+    assert!(decided("host_confirmed").is_err());
+}
+
 #[test]
 fn a_missing_applied_record_replays_every_fence_once() {
     let rig = Rig::new();
