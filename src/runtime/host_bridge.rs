@@ -3964,14 +3964,19 @@ fn log_hello(id: &str, effects: &[Effect]) -> Option<HelloOutcome> {
                     }),
                 ..
             } if re == id => match op {
-                Op::Welcome { attachment_gen, .. } => {
-                    let line = match &replaced {
-                        Some((old, new)) => {
-                            format!("replaced attachment {old} with {new}; welcome")
-                        }
-                        None => format!("welcome (attachment {})", short(attachment_gen)),
-                    };
-                    log_handshake(&line);
+                Op::Welcome {
+                    attachment_gen,
+                    host_trust_gen,
+                    ..
+                } => {
+                    let replaced = replaced
+                        .as_ref()
+                        .map(|(old, new)| (old.as_str(), new.as_str()));
+                    log_handshake(&welcome_line(
+                        replaced,
+                        &short(attachment_gen),
+                        *host_trust_gen,
+                    ));
                     return Some(HelloOutcome::Welcomed);
                 }
                 Op::Error { code, .. } => {
@@ -3988,6 +3993,17 @@ fn log_hello(id: &str, effects: &[Effect]) -> Option<HelloOutcome> {
         }
     }
     None
+}
+
+/// runtime.log's welcome line: the attachment (or the one it replaced) and
+/// the host trust generation the welcome carried.
+fn welcome_line(replaced: Option<(&str, &str)>, attachment: &str, trust_gen: u64) -> String {
+    match replaced {
+        Some((old, new)) => {
+            format!("replaced attachment {old} with {new}; welcome (trust gen {trust_gen})")
+        }
+        None => format!("welcome (attachment {attachment}, trust gen {trust_gen})"),
+    }
 }
 
 /// What became of a session `hello`.

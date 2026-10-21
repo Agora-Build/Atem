@@ -7,10 +7,12 @@
 //! ```text
 //! ~/.config/atem/
 //!   login.enc        the user's own login (`atem login`), machine-bound
+//!   pairing.json     legacy (until v0.7.1): read only, a trust generation floor
 //!   pairing/         0700: the one pairing
 //!     pairing.enc    the pairing record, machine-bound
 //!     trust_gen      the host trust generation (+ trust_gen.lock)
 //!   cred/            0700: this device's keys, trust state, cred agent
+//!     trust_gen_floor  a floor copy of the host trust generation
 //! ```
 use std::path::{Path, PathBuf};
 
@@ -21,6 +23,10 @@ pub struct ProfilePaths {
     pub config: PathBuf,
     /// `login.enc`: the user's own login (`credentials::Login`).
     pub login: PathBuf,
+    /// `pairing.json`: before `pairing/` (until v0.7.1) the host trust
+    /// generation lived here; read only, as a witness the generation never
+    /// goes below (`pairing::load`), never written or removed.
+    pub legacy_pairing: PathBuf,
     pub pairing: PairingPaths,
     pub cred: CredPaths,
 }
@@ -31,6 +37,7 @@ impl ProfilePaths {
         Self {
             config: dir.join("config.toml"),
             login: dir.join("login.enc"),
+            legacy_pairing: dir.join("pairing.json"),
             pairing: PairingPaths::in_dir(dir),
             cred: CredPaths::in_dir(dir),
         }
@@ -125,6 +132,10 @@ pub struct CredPaths {
     pub agent_socket: PathBuf,
     /// Output of the detached cred agent.
     pub agent_log: PathBuf,
+    /// `trust_gen_floor`: a copy of the host trust generation beside the
+    /// device id Astation keys its floor by, so losing `pairing/` never
+    /// lowers it (`pairing::load`).
+    pub trust_gen_floor: PathBuf,
 }
 
 impl CredPaths {
@@ -142,6 +153,7 @@ impl CredPaths {
             agent_lock: dir.join("agent.lock"),
             agent_socket: dir.join("agent.socket"),
             agent_log: dir.join("agent.log"),
+            trust_gen_floor: dir.join("trust_gen_floor"),
             dir,
         }
     }
@@ -197,6 +209,7 @@ mod tests {
         let dir = Path::new("/home/u/.config/atem");
         assert_eq!(profile.login, dir.join("login.enc"));
         assert_eq!(profile.config, dir.join("config.toml"));
+        assert_eq!(profile.legacy_pairing, dir.join("pairing.json"));
         assert_eq!(profile.pairing.record, dir.join("pairing/pairing.enc"));
         assert_eq!(profile.pairing.trust_gen, dir.join("pairing/trust_gen"));
         assert_eq!(profile.cred.dir, dir.join("cred"));
@@ -218,6 +231,7 @@ mod tests {
             (&paths.agent_lock, "agent.lock"),
             (&paths.agent_socket, "agent.socket"),
             (&paths.agent_log, "agent.log"),
+            (&paths.trust_gen_floor, "trust_gen_floor"),
         ] {
             assert_eq!(path, &cred.join(name));
         }
