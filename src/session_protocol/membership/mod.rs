@@ -1775,14 +1775,17 @@ fn parse_applied(bytes: &[u8]) -> Option<Applied> {
 // ── Unpair and pairing ──
 
 /// The genesis hashes this host was frozen on: `frozen_genesis` and its
-/// mirror (both written at every change, the mirror first), merged. The
+/// mirror in the runtime's journal directory (another directory: one
+/// directory's loss keeps the other; both written at every change, the
+/// mirror first), merged. The
 /// two vouch for each other: one missing next to the other is no "never
 /// frozen" (the other holds the list); either one unreadable is an error
 /// (fail closed: it may have held a genesis the other lacks). Only both
 /// missing is a host that never froze.
 pub fn frozen_genesis(pairing: &PairingPaths) -> Result<Vec<Hash32>, String> {
     let mut list = Vec::new();
-    for path in [&pairing.frozen_genesis_mirror, &pairing.frozen_genesis] {
+    let mirror = frozen_genesis_mirror(pairing);
+    for path in [&mirror, &pairing.frozen_genesis] {
         let bytes = match store::read_private(path) {
             Ok(None) => continue,
             Ok(Some(bytes)) => bytes,
@@ -1807,11 +1810,16 @@ pub fn frozen_genesis(pairing: &PairingPaths) -> Result<Vec<Hash32>, String> {
     Ok(list)
 }
 
+/// Where `frozen_genesis`'s mirror lives: the runtime's journal directory.
+pub fn frozen_genesis_mirror(pairing: &PairingPaths) -> std::path::PathBuf {
+    Store::new(pairing, &journal_of(pairing)).path(DlFile::FrozenGenesisMirror)
+}
+
 fn frozen_genesis_damaged(path: &Path, why: &str) -> String {
     format!(
         "{} can't be read ({why}): this host can't tell which device lists it was frozen on, \
-         so pairing is refused; restore it, or remove frozen_genesis and frozen_genesis.mirror \
-         to forget every frozen device list",
+         so pairing is refused; restore it, or remove pairing/frozen_genesis and \
+         runtime/journal/frozen_genesis to forget every frozen device list",
         path.display()
     )
 }

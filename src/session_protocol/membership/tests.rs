@@ -786,7 +786,7 @@ fn unpair_keeps_a_frozen_genesis_and_removes_the_list() {
     let list: Vec<String> = (0..16u8).map(|i| Hash32([i; 32]).to_hex()).collect();
     for path in [
         &rig.pairing.frozen_genesis,
-        &rig.pairing.frozen_genesis_mirror,
+        &super::frozen_genesis_mirror(&rig.pairing),
     ] {
         std::fs::write(path, json!({"v": 1, "genesis": list}).to_string()).unwrap();
     }

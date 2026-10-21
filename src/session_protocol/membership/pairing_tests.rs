@@ -240,7 +240,7 @@ fn a_lost_frozen_genesis_is_vouched_for_by_its_mirror() {
     let case = Case::new();
     std::fs::create_dir_all(case.pairing.dir()).unwrap();
     crate::paths::write_test_file(
-        &case.pairing.frozen_genesis_mirror,
+        &super::frozen_genesis_mirror(&case.pairing),
         frozen(&case).to_string().as_bytes(),
     );
     let e = case.verify(Some(&case.membership()), |_| {}).unwrap_err();
@@ -261,11 +261,11 @@ fn an_unreadable_frozen_genesis_refuses_pairing() {
             let case = Case::new();
             std::fs::create_dir_all(case.pairing.dir()).unwrap();
             let path = if mirror {
-                &case.pairing.frozen_genesis_mirror
+                super::frozen_genesis_mirror(&case.pairing)
             } else {
-                &case.pairing.frozen_genesis
+                case.pairing.frozen_genesis.clone()
             };
-            crate::paths::write_test_file(path, damaged);
+            crate::paths::write_test_file(&path, damaged);
             let e = case.verify(Some(&case.membership()), |_| {}).unwrap_err();
             assert!(
                 e.contains("can't be read") && e.contains("pairing is refused"),
@@ -273,4 +273,30 @@ fn an_unreadable_frozen_genesis_refuses_pairing() {
             );
         }
     }
+}
+
+/// Re-review F3: the mirror lives in another directory than
+/// `frozen_genesis`, so losing every `frozen_genesis*` file in `pairing/`
+/// still refuses the frozen genesis.
+#[test]
+fn the_frozen_genesis_mirror_survives_the_loss_of_pairings_copy() {
+    let case = Case::new();
+    let mirror = super::frozen_genesis_mirror(&case.pairing);
+    assert_ne!(mirror.parent(), case.pairing.frozen_genesis.parent());
+    let frozen = json!({"v": 1, "genesis": [case.log.genesis_hash().to_hex()]}).to_string();
+    crate::paths::write_test_file(&case.pairing.frozen_genesis, frozen.as_bytes());
+    crate::paths::write_test_file(&mirror, frozen.as_bytes());
+    for e in std::fs::read_dir(case.pairing.dir())
+        .unwrap()
+        .filter_map(Result::ok)
+    {
+        if e.file_name()
+            .to_string_lossy()
+            .starts_with("frozen_genesis")
+        {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
+    let e = case.verify(Some(&case.membership()), |_| {}).unwrap_err();
+    assert!(e.contains("frozen on this host"), "{e}");
 }
