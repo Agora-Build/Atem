@@ -4266,3 +4266,48 @@ fn a_lost_runtime_epoch_never_restarts_the_counter() {
     let again = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
     assert_eq!(again.host().context().runtime_epoch, epoch + 1);
 }
+
+/// Re-review F2: after the whole journal directory is lost, a surviving
+/// file that names an earlier epoch (the device list's clean checkpoint, a
+/// fault record) makes the counter lost, not fresh, and the next epoch is
+/// above every epoch they name, even one above the wall clock in ms.
+#[test]
+fn a_lost_journal_takes_an_epoch_above_every_recorded_one() {
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let pairing = crate::paths::ProfilePaths::in_dir(&dir.path().join("profile")).pairing;
+    crate::paths::write_test_file(&pairing.membership, b"{}");
+    // Nothing names an epoch: fresh.
+    assert_eq!(
+        super::current_runtime_epoch(&journal, Some(&pairing)).unwrap(),
+        super::PreviousEpoch::Known(0)
+    );
+    let high = 9_000_000_000_000_000u64;
+    for (path, body) in [
+        (
+            pairing.membership.clone(),
+            serde_json::json!({"checkpoint": {"runtime_epoch": high, "at_wall": 1}}),
+        ),
+        (
+            pairing.fault.clone(),
+            serde_json::json!({"v": 1, "runtime_epoch": high + 5}),
+        ),
+        (
+            journal.join("membership_fault"),
+            serde_json::json!({"v": 1, "runtime_epoch": high + 9}),
+        ),
+    ] {
+        crate::paths::write_test_file(&path, body.to_string());
+        assert_eq!(
+            super::current_runtime_epoch(&journal, Some(&pairing)).unwrap(),
+            super::PreviousEpoch::Lost
+        );
+    }
+    let epoch = super::next_runtime_epoch(&journal, Some(&pairing)).unwrap();
+    assert_eq!(epoch, high + 10);
+    assert_eq!(
+        super::next_runtime_epoch(&journal, Some(&pairing)).unwrap(),
+        high + 11
+    );
+}
