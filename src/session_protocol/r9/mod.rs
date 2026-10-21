@@ -1347,7 +1347,7 @@ impl R9Host {
         }
         if family == "session" {
             match data.get("op").and_then(Value::as_str) {
-                Some("membership") => return self.membership_op(att, &data, re.as_deref(), parts),
+                Some("membership") => return self.membership_op(att, plain, re.as_deref(), parts),
                 Some("revoke_grant") => {
                     return self.revoke_grant(att, authority, &data, re.as_deref(), parts);
                 }
@@ -1366,19 +1366,18 @@ impl R9Host {
     fn membership_op<J: Journal>(
         &mut self,
         att: &str,
-        data: &Value,
+        plain: &[u8],
         re: Option<&str>,
         parts: &mut Parts<'_, J>,
     ) -> Vec<Effect> {
         let mono = parts.now.host.mono_ms;
-        let entries: Option<Vec<StrictValue>> = data
-            .get("entries")
-            .and_then(Value::as_array)
-            .and_then(|list| {
-                list.iter()
-                    .map(|e| StrictValue::parse(e.to_string().as_bytes(), usize::MAX).ok())
-                    .collect()
-            });
+        // The record's own bytes, parsed strictly once (duplicate keys,
+        // exact numbers), as the `hello` route judges its carriage.
+        let entries: Option<Vec<StrictValue>> = StrictValue::parse(plain, usize::MAX)
+            .ok()
+            .and_then(|v| v.get("data"))
+            .and_then(|d| d.get("entries"))
+            .and_then(|e| e.items());
         let Some(entries) = entries else {
             self.seal_to(
                 att,

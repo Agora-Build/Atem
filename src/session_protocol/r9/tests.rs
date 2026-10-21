@@ -2084,3 +2084,34 @@ fn router_driven_log_lines_are_rate_limited() {
     // The next window: the summary and the line.
     assert!(rig.engine.input_lines_written() - before <= 22);
 }
+
+/// The `membership` op judges the record's own bytes strictly, as the
+/// `hello` route does: an entry with a duplicate key (a garbage `sig`
+/// before the real one) is `invalid_request`, never re-serialized into a
+/// valid entry (last key wins) and applied.
+#[test]
+fn a_membership_op_with_a_duplicate_key_is_refused() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("ph", phone());
+    let removal = rig.log.remove("svc-bot").to_string();
+    assert!(removal.contains("\"sig\":"));
+    let dup = removal.replacen("\"sig\":", "\"sig\":\"AAAA\",\"sig\":", 1);
+    let plain = format!(
+        r#"{{"type":"session","data":{{"v":1,"op":"membership","id":"aaaaaaaa-0000-4000-8000-0000000000d1","entries":[{dup}]}}}}"#
+    );
+    let head = rig.m.as_ref().unwrap().head();
+    let (att, authority) = match &rig.engine.chans["ph"].phase {
+        Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+        _ => panic!("open"),
+    };
+    rig.run(|e, p| ((), e.on_record(&att, &authority, plain.as_bytes(), p)));
+    rig.pump();
+    let events = rig.events("ph");
+    assert_eq!(
+        Rig::last_error(&events).map(|e| e.0),
+        Some("invalid_request".into()),
+        "{events:?}"
+    );
+    assert_eq!(rig.m.as_ref().unwrap().head(), head);
+}
