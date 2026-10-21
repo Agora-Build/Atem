@@ -753,6 +753,27 @@ journal directory is not a reset: it forgets every revocation (a
 revoked grant still within its lifetime would be admitted again) and the
 session journal with it.
 
+Other host files where "missing" used to mean "fresh" (re-review N3; no
+action for Astation): `pairing/frozen_genesis` now has a mirror
+(`frozen_genesis.mirror`, written first, read as their union): one
+missing is covered by the other, and either one unreadable refuses
+pairing (and the unpair of a frozen list) instead of reading as an
+empty list. The fault record that holds a host has a mirror in
+`runtime/journal/membership_fault`: either one holds the host, so losing
+one file never lifts a hold (still only after an observed write fault).
+At start, a queued request whose principal `principals` doesn't name at
+its `control_gen` (the file lost or older) rejects every queued request
+"authorization history unknown", as without a clean close; a lost
+`refused` list needs nothing (its failed admission write halted the
+journal, so that run never closed cleanly). A `runtime_epoch` missing
+next to the journal's state takes the wall clock in ms (above every
+earlier epoch) and vouches for no clean close. Not changed, for later:
+`floors` (a lost floor could reissue a lease epoch; workers keep their
+own input epoch and drop older writes, so this is availability, not
+authority) and `receipts/<sid>` (a lost log forgets request-id dedupe:
+a retried prompt could run twice; a session without a log is normal,
+so there is no evidence to detect it by without a per-session index).
+
 Artifacts: `atem-client-bindings.md` §7 (SwiftPM, WASM, Kotlin/JVM,
 Android; SHA256SUMS and the source pin).
 
