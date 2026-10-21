@@ -1279,3 +1279,20 @@ fn an_unpairing_marker_beside_the_list_reads_as_no_record() {
         "{err}"
     );
 }
+
+/// `host_channel_key` is written without a `serde_json::Value` in between
+/// (every copy of the seed is wiped) and keeps its JSON shape.
+#[test]
+fn the_host_channel_key_keeps_its_shape() {
+    let seed = [7u8; 32];
+    let bytes = host_key_bytes(&seed);
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes();
+    assert_eq!(
+        v,
+        json!({"v": 1, "seed": atem_client::encoding::b64u(&seed),
+               "pub": atem_client::encoding::b64u(&public)})
+    );
+}

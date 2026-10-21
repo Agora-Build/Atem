@@ -1792,14 +1792,27 @@ thread_local! {
 /// `host_channel_key` (§R9.3): the Ed25519 seed and its public key,
 /// base64url (§R9.1). Plain 0600 like `unlock_auth_key`: it only proves
 /// the host to clients, so it works while the cred agent is locked.
-fn host_key_bytes(seed: &[u8; 32]) -> Vec<u8> {
+fn host_key_bytes(seed: &[u8; 32]) -> zeroize::Zeroizing<Vec<u8>> {
     let public = ed25519_dalek::SigningKey::from_bytes(seed)
         .verifying_key()
         .to_bytes();
-    json!({"v": 1, "seed": atem_client::encoding::b64u(seed),
-           "pub": atem_client::encoding::b64u(&public)})
-    .to_string()
-    .into_bytes()
+    // No `serde_json::Value` in between: every copy of the seed is wiped
+    // (base64url needs no JSON escaping).
+    let seed = zeroize::Zeroizing::new(atem_client::encoding::b64u(seed));
+    let public = atem_client::encoding::b64u(&public);
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(seed.len() + public.len() + 32));
+    out.extend_from_slice(br#"{"v":1,"seed":""#);
+    out.extend_from_slice(seed.as_bytes());
+    out.extend_from_slice(br#"","pub":""#);
+    out.extend_from_slice(public.as_bytes());
+    out.extend_from_slice(br#""}"#);
+    out
+}
+
+/// `host_channel_key` as read: the seed's text is wiped on drop.
+#[derive(serde::Deserialize)]
+struct HostKeyFile {
+    seed: zeroize::Zeroizing<String>,
 }
 
 /// The pinned host's `host_channel_key` seed, checked against the newest
@@ -1826,11 +1839,9 @@ pub fn host_channel_seed(
             path.display()
         )
     };
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| damaged())?;
-    let seed = value
-        .get("seed")
-        .and_then(Value::as_str)
-        .and_then(|t| atem_client::encoding::b64u_decode(t).ok())
+    let file: HostKeyFile = serde_json::from_slice(&bytes).map_err(|_| damaged())?;
+    let seed = atem_client::encoding::b64u_decode(&file.seed)
+        .ok()
         .map(zeroize::Zeroizing::new)
         .ok_or_else(damaged)?;
     let seed: zeroize::Zeroizing<[u8; 32]> =
