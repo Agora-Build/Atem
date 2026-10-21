@@ -618,10 +618,9 @@ fn revoke_live(
     }
     assert!(fenced, "the live browser is fenced by the revocation");
     next_init();
-    let again = router
-        .connect(&format!("{handle}-again"), &rig.log, HOST, identity)
-        .err()
-        .expect("refused after its revocation");
+    let Err(again) = router.connect(&format!("{handle}-again"), &rig.log, HOST, identity) else {
+        panic!("{handle} admitted again after its revocation");
+    };
     if let Some(code) = again_code {
         assert_eq!(again.0, code);
     }
