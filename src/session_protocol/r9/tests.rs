@@ -2731,3 +2731,62 @@ fn set_journal_mtimes(dir: &std::path::Path, wall_ms: u64) {
     }
     set(dir, wall_ms);
 }
+
+/// Re-review F1: a pinned host with none of the revoked grants' files lost
+/// them (the pin seeds them): quarantined from the pinned list's floor,
+/// never fresh. A host without a pinned list and no files is fresh.
+#[test]
+fn a_pinned_host_without_revoked_grants_files_is_quarantined() {
+    let lose = |rig: &Rig| {
+        for f in [REVOKED_GRANTS_FILE, revoked::SIDECAR_FILE] {
+            std::fs::remove_file(rig.journal.join(f)).unwrap();
+        }
+    };
+    let mut rig = Rig::new();
+    lose(&rig);
+    let floor = rig.now.host.wall_ms + 30 * 60_000;
+    rig.engine = R9Host::with_pin(Limits::default(), Some(&rig.journal), Some(floor));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    let b = browser_of(&mut rig, 1);
+    assert_quarantined(&mut rig, "b1", b);
+    // Past now + window on both clocks, below the floor + window.
+    rig.advance(revoked::SAFE_WINDOW_MS + 2000);
+    let b = browser_of(&mut rig, 2);
+    assert_quarantined(&mut rig, "b2", b);
+    rig.advance(30 * 60_000);
+    let b = browser_of(&mut rig, 3);
+    rig.advance(1000);
+    rig.connect("b3", b);
+    rig.attached("b3");
+
+    // No pinned list: fresh.
+    let mut rig = Rig::new();
+    lose(&rig);
+    rig.engine = R9Host::with_pin(Limits::default(), Some(&rig.journal), None);
+    rig.link_up();
+    rig.advance(1000);
+    let b = browser_of(&mut rig, 4);
+    rig.connect("b4", b);
+    rig.attached("b4");
+}
+
+/// Re-review F1: the pin seeds the revoked grants' files (sidecar, then an
+/// empty `revoked_grants`), and keeps files a host already has.
+#[test]
+fn the_pin_seeds_the_revoked_grants_files() {
+    let dir = tempfile::tempdir().unwrap();
+    super::seed_revoked_journal(dir.path(), 1234).unwrap();
+    let side: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join(revoked::SIDECAR_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(side, json!({"v": 1, "until": 0, "high_water": 1234}));
+    let main = dir.path().join(REVOKED_GRANTS_FILE);
+    assert!(
+        matches!(revoked::load(&main), revoked::Loaded::Read { ref revoked, quarantine: None } if revoked.is_empty())
+    );
+    std::fs::write(&main, b"{not json").unwrap();
+    super::seed_revoked_journal(dir.path(), 9999).unwrap();
+    assert_eq!(std::fs::read(&main).unwrap(), b"{not json", "kept as it is");
+}

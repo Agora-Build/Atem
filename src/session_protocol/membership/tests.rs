@@ -1366,3 +1366,15 @@ fn losing_one_fault_record_never_lifts_the_hold() {
         assert!(host.held().is_none(), "{lost:?}: reconciled for good");
     }
 }
+
+/// Re-review F1: a pinned host always has its revoked grants' files (the
+/// pin seeds them), and the list vouches for a wall-time floor.
+#[test]
+fn the_pin_seeds_the_revoked_grants_and_vouches_for_a_floor() {
+    let rig = Rig::new();
+    assert_eq!(super::pin_wall_floor(&rig.pairing), None, "no list: fresh");
+    rig.pin(&LOG6);
+    assert!(rig.journal.join("revoked_quarantine").exists());
+    assert!(rig.journal.join("revoked_grants").exists());
+    assert!(super::pin_wall_floor(&rig.pairing).unwrap() > 0);
+}

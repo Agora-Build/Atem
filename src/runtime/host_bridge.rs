@@ -284,17 +284,11 @@ enum PreviousEpoch {
     Lost,
 }
 
-/// Files only a runtime writes, after it took its epoch: next to one, a
-/// missing `runtime_epoch` was lost (not a fresh journal). The device
-/// list's `membership_applied` is left out: a pairing pins it.
-const JOURNAL_STATE: [&str; 6] = [
-    "principals",
-    "floors",
-    "refused",
-    "clean_close",
-    "revoked_grants",
-    "revoked_quarantine",
-];
+/// Files only the session journal writes, after a run took its epoch:
+/// next to one, a missing `runtime_epoch` was lost (not a fresh journal).
+/// The revoked grants' files and `membership_applied` are left out: a pin
+/// writes them.
+const JOURNAL_STATE: [&str; 4] = ["principals", "floors", "refused", "clean_close"];
 
 fn journal_has_state(dir: &Path) -> bool {
     JOURNAL_STATE
@@ -618,6 +612,8 @@ impl HostBridge {
             None => (None, None, Vec::new()),
         };
         let pairing = profile.map(|p| p.paths.pairing.clone());
+        // §R9.6: a pinned list vouches for the revoked grants' files.
+        let pin_floor = pairing.as_ref().and_then(membership::pin_wall_floor);
         let (host_key, host_key_error) = match (&membership, &pairing) {
             (Some(m), Some(pairing)) => {
                 match membership::host_channel_seed(pairing, m.membership(), &m.pin_of().host_id) {
@@ -665,7 +661,7 @@ impl HostBridge {
         Ok(Self {
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
-            r9: R9Host::new(r9host::Limits::default(), Some(dir)),
+            r9: R9Host::with_pin(r9host::Limits::default(), Some(dir), pin_floor),
             r9_link: None,
             r9_socket: 0,
             pairing,

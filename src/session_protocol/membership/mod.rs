@@ -530,6 +530,10 @@ impl MembershipHost {
         store
             .replace(DlFile::Applied, &applied_bytes(&applied))
             .map_err(|e| e.to_string())?;
+        // §R9.6: a pinned host always has its revoked-grants files, so
+        // their loss is never read as a fresh host.
+        crate::session_protocol::r9::seed_revoked_journal(journal_dir, host_now().wall_ms)
+            .map_err(|e| format!("cannot seed the revoked grants: {e}"))?;
         // The list last: until it is there, whatever was written is a
         // leftover that fails closed.
         store
@@ -2119,6 +2123,38 @@ pub fn passive_status(
         ));
     }
     Some(("open", format!("pinned at seq {}", m.head().seq), pending))
+}
+
+/// The latest wall time a pinned device list vouches for (§R9.6): its
+/// clean checkpoint's `at_wall` and the newest modification time in
+/// `pairing/`. `None` without a pinned list (`membership.json` absent): a
+/// host that never pinned one.
+pub fn pin_wall_floor(pairing: &PairingPaths) -> Option<u64> {
+    if !store::present(&pairing.membership) {
+        return None;
+    }
+    let at_wall = store::read_private(&pairing.membership)
+        .ok()
+        .flatten()
+        .and_then(|b| parse_json(&b))
+        .and_then(|v| v.get("checkpoint")?.get("at_wall")?.as_u64())
+        .unwrap_or(0);
+    let ms = |m: std::fs::Metadata| {
+        m.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64)
+    };
+    let newest = std::fs::read_dir(pairing.dir())
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter_map(|e| std::fs::symlink_metadata(e.path()).ok())
+                .map(ms)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    Some(at_wall.max(newest))
 }
 
 /// The public half `host_channel_key` names (b64u), read without checks.

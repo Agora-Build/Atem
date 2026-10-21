@@ -853,3 +853,55 @@ fn a_live_revocation_during_a_rollback_outlives_one_damage() {
         quarantined(&mut router, &rig, "a-3", &a);
     }
 }
+
+/// Re-review F1: one event, the journal directory removed, is not a fresh
+/// host while the device list is pinned (the pin seeds the revoked grants'
+/// files, and the list's checkpoint and `pairing/` keep the clock floor):
+/// a revoked grant still valid is refused, and with the wall clock two
+/// hours back the quarantine outlives the window on both clocks.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn removing_the_journal_of_a_pinned_host_keeps_revocations_refused() {
+    let mut rig = Rig::new();
+    assert!(
+        rig.journal().join("revoked_quarantine").exists(),
+        "seeded at the pin"
+    );
+    rig.start();
+    let a = grant(&mut rig.log, &rig.clock, GA, 60 * MIN);
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-1", &rig.log, HOST, &phone())
+            .expect("the phone");
+        revoke(&mut router, "ph-1", &mut ph, GA);
+    }
+    rig.stop(false);
+    std::fs::remove_dir_all(rig.sandbox.config().join("runtime")).unwrap();
+    rig.clock.set_wall(-120 * MIN as i64);
+    rig.start();
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-2", &rig.log, HOST, &phone())
+            .expect("the phone (members are unaffected)");
+        // Back at W + 1: A is refused.
+        rig.clock.set_wall(MIN as i64);
+        quarantined(&mut router, &rig, "a-1", &a);
+        // The wall clock two hours back again, and 66 min on both clocks:
+        // the floor from the pinned list holds.
+        rig.clock.set_wall(-54 * MIN as i64);
+        rig.clock.add_mono(66 * MIN);
+        let c = grant(
+            &mut rig.log,
+            &rig.clock,
+            "aaaaaaaa-1111-4111-8111-0000000000c4",
+            50 * MIN,
+        );
+        quarantined(&mut router, &rig, "c-1", &c);
+        // Native revocations still work.
+        revoke(&mut router, "ph-2", &mut ph, GB);
+    }
+    let log = rig.runtime_log();
+    assert!(log.contains("pinned device list"), "{log}");
+}

@@ -112,6 +112,28 @@ const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
 /// grants' bound, `max(until, high_water)` (the clock went back).
 const DETAIL_CLOCK_BACK: &str = "host clock went back";
 
+/// Seeds the revoked-grants files in `journal_dir` when a device list is
+/// pinned (§R9.6): the sidecar (high-water mark `wall`), then an empty
+/// `revoked_grants`, each durable. A pinned host then always has them, so
+/// their loss is never read as a fresh host. Files already there (a host
+/// paired before) are kept as they are.
+pub fn seed_revoked_journal(journal_dir: &Path, wall: u64) -> std::io::Result<()> {
+    let main = journal_dir.join(REVOKED_GRANTS_FILE);
+    let sidecar = journal_dir.join(revoked::SIDECAR_FILE);
+    if main.symlink_metadata().is_ok()
+        || sidecar.symlink_metadata().is_ok()
+        || revoked::damaged_asides(journal_dir)
+    {
+        return Ok(());
+    }
+    let bound = revoked::Bound {
+        until: 0,
+        high_water: wall,
+    };
+    revoked::write_atomic(&sidecar, &revoked::encode_sidecar(bound), None)?;
+    revoked::write_atomic(&main, &revoked::encode(&BTreeMap::new(), None), None)
+}
+
 /// The host's `host_channel_key` behind a provider (plain, §R9.3).
 pub struct HostKey {
     keys: SoftwareKeys,
@@ -379,6 +401,16 @@ impl R9Host {
     /// An engine with these bounds; revoked grants are journaled in
     /// `journal_dir/revoked_grants` (none: memory only, tests).
     pub fn new(limits: Limits, journal_dir: Option<&Path>) -> Self {
+        Self::with_pin(limits, journal_dir, None)
+    }
+
+    /// [`R9Host::new`] on a host whose device list is pinned: `pin_floor`
+    /// is the latest wall time the pinned list vouches for (its clean
+    /// checkpoint, the newest write in `pairing/`). A pinned host always has
+    /// its revoked-grants files (seeded at the pin), so finding none of them
+    /// means they were lost (the journal directory removed), never a fresh
+    /// host: browsers are quarantined from that floor.
+    pub fn with_pin(limits: Limits, journal_dir: Option<&Path>, pin_floor: Option<u64>) -> Self {
         let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
         let mut host = R9Host {
             limits,
@@ -414,7 +446,7 @@ impl R9Host {
             #[cfg(test)]
             revoked_crash: None,
         };
-        host.load_revoked();
+        host.load_revoked(pin_floor);
         host
     }
 
@@ -2034,7 +2066,7 @@ impl R9Host {
 
     // ── Revoked grants journal ──
 
-    fn load_revoked(&mut self) {
+    fn load_revoked(&mut self, pin_floor: Option<u64>) {
         let Some(path) = self.revoked_path.clone() else {
             return;
         };
@@ -2044,12 +2076,27 @@ impl R9Host {
         let side = revoked::load_sidecar(&sidecar);
         let asides = revoked::damaged_asides(&dir);
         // The files vouch for each other (§R9.6): every write leaves both
-        // (the sidecar first), and damage leaves a copy aside. Only a
-        // journal with none of them is fresh.
+        // (the sidecar first), and damage leaves a copy aside. A pinned
+        // device list vouches for them too (the pin seeds them). Only a
+        // host with none of them and no pinned list is fresh.
         if matches!(main, revoked::Loaded::Missing)
             && side == revoked::SidecarLoaded::Missing
             && !asides
         {
+            let Some(floor) = pin_floor else {
+                return;
+            };
+            self.bound = revoked::Bound {
+                until: 0,
+                high_water: floor,
+            };
+            log(&format!(
+                "the revoked grants are missing on a host with a pinned device list (the \
+                 journal directory was removed?); browser grants are refused for at least \
+                 65 min and until the wall clock passes {}",
+                self.bound.floor()
+            ));
+            self.quarantine = Some(revoked::Quarantine::starting(self.bound.floor()));
             return;
         }
         let mut record = None;
@@ -2083,7 +2130,7 @@ impl R9Host {
                 (
                     revoked::Bound {
                         until: 0,
-                        high_water: revoked::newest_mtime(&dir),
+                        high_water: revoked::newest_mtime(&dir).max(pin_floor.unwrap_or(0)),
                     },
                     true,
                 )

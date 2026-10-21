@@ -921,6 +921,16 @@ impl Runner {
                     .to_string()
                     .as_bytes(),
             );
+            // The revoked grants' files, as the pin seeds them (§R9.6).
+            for (name, body) in [
+                (
+                    "revoked_quarantine",
+                    json!({"v": 1, "until": 0, "high_water": 0}),
+                ),
+                ("revoked_grants", json!({"v": 1, "revoked": {}})),
+            ] {
+                private_file(&journal.join(name), body.to_string().as_bytes());
+            }
             let mut state =
                 json!({"v": 1, "host": {"host_id": host_id, "host_trust_gen": trust_gen}});
             for (k, v) in m.to_stored().as_object().unwrap() {

@@ -54,6 +54,8 @@ pub fn write_pin(
         &journal.join("membership_applied"),
         &json!({"seq": head.seq, "hash": head.hash.to_hex()}).to_string(),
     );
+    // The revoked grants' files, as the pin seeds them (§R9.6).
+    seed_revoked(&journal);
     let mut state = log.log.to_stored();
     state["v"] = json!(1);
     state["host"] = json!({"host_id": host_id, "host_trust_gen": host_trust_gen});
@@ -61,6 +63,19 @@ pub fn write_pin(
     let tmp = pairing.join("membership.json.pin");
     private_file(&tmp, &state.to_string());
     std::fs::rename(&tmp, pairing.join("membership.json")).unwrap();
+}
+
+/// The revoked grants' files a pin seeds (`r9::seed_revoked_journal`): the
+/// sidecar, then an empty `revoked_grants`.
+pub fn seed_revoked(journal: &Path) {
+    private_file(
+        &journal.join("revoked_quarantine"),
+        &json!({"v": 1, "until": 0, "high_water": 0}).to_string(),
+    );
+    private_file(
+        &journal.join("revoked_grants"),
+        &json!({"v": 1, "revoked": {}}).to_string(),
+    );
 }
 
 /// A client's monotonic ms.
