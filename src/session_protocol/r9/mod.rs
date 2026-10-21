@@ -32,6 +32,7 @@ mod fixtures_tests;
 pub mod push;
 #[cfg(test)]
 mod push_tests;
+mod revoked;
 #[cfg(test)]
 mod tests;
 
@@ -245,10 +246,16 @@ pub struct R9Host {
     revoked: RevokedGrants,
     revoked_until: BTreeMap<String, u64>,
     revoked_path: Option<PathBuf>,
-    /// The revoked-grants file couldn't be read at start: browser grants
-    /// are refused until this wall time (set at the first wall time seen:
-    /// by then any grant the file could name has expired). Fail closed.
-    revoked_unreadable: Option<Option<u64>>,
+    /// The revoked-grants file couldn't be read (at this start, or at an
+    /// earlier one whose record the file carries): browser grants are
+    /// refused until it ends (`revoked::Quarantine::ended`). Fail closed.
+    quarantine: Option<revoked::Quarantine>,
+    /// The quarantine's record is durable in the file.
+    quarantine_recorded: bool,
+    /// The damaged file is still at `revoked_path`, not kept aside yet.
+    revoked_damaged: bool,
+    /// Monotonic time before which a failed record write isn't retried.
+    quarantine_retry_at: u64,
     /// (approval id, device) pairs whose first `approval_seen` was taken.
     seen: HashSet<(String, String)>,
     /// The error a fenced principal's attachments get before their close.
@@ -264,6 +271,9 @@ pub struct R9Host {
     input_log: LineLimit,
     /// The latest monotonic time seen (for lines without a clock at hand).
     last_mono: u64,
+    /// Tests: the next revoked-grants write "crashes" after this step.
+    #[cfg(test)]
+    pub(super) revoked_crash: Option<revoked::Step>,
 }
 
 fn log(line: &str) {
@@ -377,7 +387,10 @@ impl R9Host {
             revoked: RevokedGrants::new(),
             revoked_until: BTreeMap::new(),
             revoked_path,
-            revoked_unreadable: None,
+            quarantine: None,
+            quarantine_recorded: false,
+            revoked_damaged: false,
+            quarantine_retry_at: 0,
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
             dead: Vec::new(),
@@ -385,6 +398,8 @@ impl R9Host {
             push: push::HostPush::default(),
             input_log: LineLimit::default(),
             last_mono: 0,
+            #[cfg(test)]
+            revoked_crash: None,
         };
         host.load_revoked();
         host
@@ -1031,7 +1046,7 @@ impl R9Host {
                 }
             }
             Principal::Browser { .. } => {
-                if self.browsers_refused(wall) {
+                if self.browsers_refused(wall, now.mono_ms) {
                     Err(error(
                         code::BUSY,
                         re.as_deref(),
@@ -1530,7 +1545,11 @@ impl R9Host {
         self.revoked_until.retain(|_, t| wall < *t);
         let t = self.revoked_until.entry(grant_id.clone()).or_insert(until);
         *t = (*t).max(until);
-        let recorded = self.save_revoked();
+        if let Some(q) = &mut self.quarantine {
+            q.anchor(wall, mono);
+        }
+        // During a quarantine the write carries its record (§R9.6).
+        let recorded = self.save_revoked(wall);
         // In effect at once, recorded or not (fail closed).
         self.fence_errors.insert(
             principal.clone(),
@@ -1957,7 +1976,7 @@ impl R9Host {
         let mono = parts.now.host.mono_ms;
         let wall = parts.now.host.wall_ms;
         self.last_mono = mono;
-        self.browsers_refused(wall);
+        self.browsers_refused(wall, mono);
         let mut effects = self.reap(parts);
         let mut timeouts = Vec::new();
         let mut ended = Vec::new();
@@ -2000,55 +2019,113 @@ impl R9Host {
         let Some(path) = &self.revoked_path else {
             return;
         };
-        let map = match membership::store::read_private(path) {
-            Ok(None) => return,
-            Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
-                .ok()
-                .and_then(|v| v.get("revoked").and_then(Value::as_object).cloned())
-                .and_then(|map| {
-                    map.into_iter()
-                        .map(|(id, until)| until.as_u64().map(|u| (id, u)))
-                        .collect::<Option<Vec<_>>>()
-                }),
-            Err(_) => None,
-        };
-        let Some(map) = map else {
-            // A revocation it held can't be told from none (§R9.6): every
-            // browser grant is refused until any grant it could name has
-            // expired. The next revocation rewrites the file.
-            log("revoked_grants is unreadable; browser grants are refused for 65 min");
-            self.revoked_unreadable = Some(None);
-            return;
-        };
-        for (id, until) in map {
-            self.revoked_until.insert(id.clone(), until);
-            let _ = self.revoked.revoke(&id, until, 0);
-        }
-    }
-
-    /// Whether browser grants are refused at `wall` because the revoked
-    /// grants couldn't be read at start (see `revoked_unreadable`).
-    fn browsers_refused(&mut self, wall: u64) -> bool {
-        match &mut self.revoked_unreadable {
-            None => false,
-            Some(until) => {
-                let until =
-                    *until.get_or_insert(wall + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
-                if wall < until {
-                    return true;
+        match revoked::load(path) {
+            revoked::Loaded::Missing => {}
+            revoked::Loaded::Unreadable => {
+                // A revocation it held can't be told from none (§R9.6):
+                // every browser grant is refused until any grant it could
+                // name has expired. The damaged file is kept aside at the
+                // first pass, and every write carries the quarantine.
+                log("revoked_grants is unreadable; browser grants are refused for at least 65 min");
+                self.quarantine = Some(revoked::Quarantine::default());
+                self.revoked_damaged = true;
+            }
+            revoked::Loaded::Read {
+                revoked: map,
+                quarantine,
+            } => {
+                for (id, until) in map {
+                    self.revoked_until.insert(id.clone(), until);
+                    let _ = self.revoked.revoke(&id, until, 0);
                 }
-                self.revoked_unreadable = None;
-                false
+                if let Some((started_at, until)) = quarantine {
+                    log(&format!(
+                        "revoked_grants records a quarantine until {until}; browser grants \
+                         are refused until then and for 65 min of this process"
+                    ));
+                    self.quarantine = Some(revoked::Quarantine::restored(started_at, until));
+                    self.quarantine_recorded = true;
+                }
             }
         }
     }
 
-    fn save_revoked(&self) -> std::io::Result<()> {
-        let Some(path) = &self.revoked_path else {
+    /// Whether browser grants are refused now because the revoked grants
+    /// couldn't be read (see `quarantine`). Anchors a quarantine found at
+    /// this start, records it durably (retried once a second), and ends it
+    /// (dropping the record from the file).
+    fn browsers_refused(&mut self, wall: u64, mono: u64) -> bool {
+        let Some(q) = &mut self.quarantine else {
+            return false;
+        };
+        q.anchor(wall, mono);
+        if !q.ended(wall, mono) {
+            if !self.quarantine_recorded && mono >= self.quarantine_retry_at {
+                match self.save_revoked(wall) {
+                    Ok(()) => log("the revoked-grants quarantine is recorded"),
+                    Err(e) => {
+                        if self.quarantine_retry_at == 0 {
+                            log(&format!("cannot record the revoked-grants quarantine: {e}"));
+                        }
+                        self.quarantine_retry_at = mono + 1_000;
+                    }
+                }
+            }
+            return true;
+        }
+        self.quarantine = None;
+        self.quarantine_recorded = false;
+        log("the revoked-grants quarantine ended; browser grants are admitted again");
+        if let Err(e) = self.save_revoked(wall) {
+            // The record (or the damaged file) stays: the next start is
+            // quarantined again (fail closed).
+            log(&format!(
+                "cannot drop the revoked-grants quarantine record: {e}"
+            ));
+        }
+        false
+    }
+
+    /// Writes the file: the known revocations and, during a quarantine,
+    /// its record. A damaged file still in place is kept aside first and is
+    /// never replaced unless that worked.
+    fn save_revoked(&mut self, wall: u64) -> std::io::Result<()> {
+        let Some(path) = self.revoked_path.clone() else {
             return Ok(());
         };
-        let body = serde_json::json!({"v": 1, "revoked": self.revoked_until}).to_string();
-        write_private_atomic(path, body.as_bytes())
+        let crash = self.revoked_crash();
+        if self.revoked_damaged {
+            if let Some(aside) = revoked::keep_aside(&path, wall, crash)? {
+                log(&format!(
+                    "the damaged revoked_grants is kept as {}",
+                    aside.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            self.revoked_damaged = false;
+        }
+        let record = match &self.quarantine {
+            None => None,
+            Some(q) => Some(
+                q.wall
+                    .ok_or_else(|| std::io::Error::other("quarantine not anchored"))?,
+            ),
+        };
+        let body = revoked::encode(&self.revoked_until, record);
+        revoked::write_atomic(&path, &body, crash)?;
+        if self.quarantine.is_some() {
+            self.quarantine_recorded = true;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn revoked_crash(&self) -> Option<revoked::Step> {
+        self.revoked_crash
+    }
+
+    #[cfg(not(test))]
+    fn revoked_crash(&self) -> Option<revoked::Step> {
+        None
     }
 }
 
@@ -2180,27 +2257,4 @@ fn scoped(
         _ => {}
     }
     Some(R8Envelope::Session(m))
-}
-
-/// A private file replaced whole: temp (0600, `O_EXCL`), write, fsync,
-/// rename, directory fsync.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("no directory"))?;
-    let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(dir)?.sync_all()
 }

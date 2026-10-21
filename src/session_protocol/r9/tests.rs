@@ -2020,6 +2020,173 @@ fn a_damaged_revoked_grants_file_refuses_browsers_until_any_grant_expired() {
     rig.attached("b3");
 }
 
+/// A restart of the engine over the same journal (the session host stays).
+fn restart_engine(rig: &mut Rig) {
+    rig.link_down();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+}
+
+fn revoked_grant_id(n: u32) -> String {
+    format!("aaaaaaaa-1111-4111-8111-0000000000{n:02}")
+}
+
+/// A browser grant from the phone, issued now, 50 min long.
+fn browser_of(rig: &mut Rig, n: u32) -> Identity {
+    let wall = rig.now.host.wall_ms;
+    let (g, k) = rig.log.grant(
+        "dev-phone",
+        &revoked_grant_id(n),
+        HOST,
+        1,
+        None,
+        &["view"],
+        wall,
+        wall + 50 * 60_000,
+    );
+    Identity::browser(g, k).unwrap()
+}
+
+fn revoke_from(rig: &mut Rig, phone: &str, grant_id: &str) -> Vec<CEvent> {
+    let mono = rig.now.host.mono_ms;
+    let (_, frame) = rig.attached(phone).revoke_grant(grant_id, mono).unwrap();
+    rig.send_frame(phone, &frame);
+    rig.events(phone)
+}
+
+fn assert_quarantined(rig: &mut Rig, handle: &str, identity: Identity) {
+    rig.advance(1000);
+    rig.connect(handle, identity);
+    assert_eq!(
+        rig.refused(handle),
+        ("busy".into(), Some("revoked grants unreadable".into())),
+        "{handle}"
+    );
+}
+
+/// Astation's finding: A revoked and still valid; the file damaged; a
+/// restart quarantines; a native revocation of B during the quarantine
+/// rewrites the file; a restart before A expires must still refuse A (and
+/// every browser grant): the rewrite carries the quarantine record, and the
+/// damaged bytes are kept aside.
+#[test]
+fn a_revocation_during_the_quarantine_keeps_it_across_a_restart() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let a = browser_of(&mut rig, 1);
+    rig.connect("a1", a.clone());
+    rig.attached("a1");
+    let events = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. }))
+    );
+    let file = rig.journal.join(REVOKED_GRANTS_FILE);
+    std::fs::write(&file, b"{not json").unwrap();
+
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    assert_quarantined(&mut rig, "a2", a.clone());
+    let events = revoke_from(&mut rig, "ph2", &revoked_grant_id(2));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. })),
+        "a revocation succeeds during the quarantine: {events:?}"
+    );
+    let aside: Vec<_> = std::fs::read_dir(&rig.journal)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("revoked_grants.damaged-")
+        })
+        .collect();
+    assert_eq!(aside.len(), 1);
+    assert_eq!(std::fs::read(aside[0].path()).unwrap(), b"{not json");
+
+    restart_engine(&mut rig);
+    assert_quarantined(&mut rig, "a3", a.clone());
+    // Most of the window later, another restart: still refused.
+    rig.advance(revoked::SAFE_WINDOW_MS - 5 * 60_000);
+    restart_engine(&mut rig);
+    assert_quarantined(&mut rig, "a4", a.clone());
+    // The wall clock passed the end, but this engine hasn't seen the
+    // window on its monotonic clock.
+    rig.advance(10 * 60_000);
+    let fresh = browser_of(&mut rig, 3);
+    assert_quarantined(&mut rig, "c1", fresh);
+    rig.advance(revoked::SAFE_WINDOW_MS);
+    let fresh = browser_of(&mut rig, 4);
+    rig.advance(1000);
+    rig.connect("c2", fresh);
+    rig.attached("c2");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(!text.contains("quarantine"), "{text}");
+    assert!(text.contains(&revoked_grant_id(2)), "{text}");
+}
+
+/// Interrupted persistence: a crash after each step of the write that
+/// first records the quarantine (keeping the damaged file aside), and of a
+/// later revocation's write over a recorded file, comes back quarantined.
+#[test]
+fn a_crash_at_any_step_of_the_quarantine_writes_comes_back_quarantined() {
+    use revoked::Step;
+    for step in [Step::Aside, Step::TempWritten, Step::Renamed] {
+        // The first write (at the first pass after the damage was found).
+        let mut rig = Rig::new();
+        let file = rig.journal.join(REVOKED_GRANTS_FILE);
+        std::fs::write(&file, b"{not json").unwrap();
+        rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+        rig.engine.revoked_crash = Some(step);
+        rig.link_up();
+        rig.advance(100);
+        // "Crash": a new engine over what is on disk.
+        restart_engine(&mut rig);
+        rig.connect("ph", phone());
+        rig.attached("ph");
+        let b = browser_of(&mut rig, 1);
+        assert_quarantined(&mut rig, "b1", b);
+        let kept = std::fs::read_dir(&rig.journal)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("revoked_grants.damaged-")
+            })
+            .count();
+        assert!(kept >= 1, "{step:?}: the damaged file is kept aside");
+
+        // A later revocation's write, over a recorded file (the damaged
+        // file is aside by then: that write has no `Aside` step).
+        rig.advance(100);
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(text.contains("quarantine"), "{step:?}: {text}");
+        if step == Step::Aside {
+            continue;
+        }
+        rig.engine.revoked_crash = Some(step);
+        let events = revoke_from(&mut rig, "ph", &revoked_grant_id(9));
+        assert_eq!(
+            Rig::last_error(&events),
+            Some(("busy".into(), Some("revocation not recorded".into()))),
+            "{step:?}"
+        );
+        restart_engine(&mut rig);
+        let b = browser_of(&mut rig, 2);
+        assert_quarantined(&mut rig, "b2", b);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("quarantine"), "{step:?}: {text}");
+    }
+}
+
 /// The revoked grants journal full (256 junk ids): a real revocation is
 /// still in effect for the live browser (fenced at once, fail closed),
 /// though answered `busy` "revoked grants journal full".
