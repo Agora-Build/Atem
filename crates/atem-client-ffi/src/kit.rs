@@ -316,7 +316,10 @@ impl RestoreSession {
     }
 
     /// The signed `recovery_add` to send (and resend after an uncertain
-    /// outcome).
+    /// outcome). Returned at once, also right after `resume`; resend it
+    /// only after `attempt` confirmed the log again (an early resend gains
+    /// nothing: the relay's compare-and-set on `expected` refuses a moved
+    /// head).
     pub fn outstanding(&self) -> Option<AppendRequest> {
         self.lock()
             .outstanding()

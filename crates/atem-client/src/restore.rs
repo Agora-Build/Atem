@@ -317,8 +317,11 @@ impl RestoreFlow {
 
     /// After a restart with an enrollment in flight (its persisted
     /// [`RestoreFlow::prepared`]): the kit read again and the prepared
-    /// `recovery_add`, which is resent as is ([`RestoreFlow::outstanding`])
-    /// once [`RestoreFlow::attempt`] has confirmed the log again; `enroll`
+    /// `recovery_add`. [`RestoreFlow::outstanding`] returns it at once (it
+    /// isn't gated); the caller resends it as is only after
+    /// [`RestoreFlow::attempt`] has confirmed the log again (an early
+    /// resend gains nothing: the relay already holds those bytes, and its
+    /// compare-and-set on `expected` refuses a moved head). `enroll`
     /// refuses a new body while it is outstanding.
     pub fn resume(kit: RecoveryKit, prepared: Prepared) -> Self {
         RestoreFlow {
@@ -329,7 +332,9 @@ impl RestoreFlow {
         }
     }
 
-    /// The enrollment to send (and resend after an uncertain outcome).
+    /// The enrollment to send (and resend after an uncertain outcome),
+    /// whether or not `attempt` ran since a `resume` (see
+    /// [`RestoreFlow::resume`] for when to resend).
     pub fn outstanding(&self) -> Option<(&Entry, Head)> {
         self.publisher.outstanding()
     }
