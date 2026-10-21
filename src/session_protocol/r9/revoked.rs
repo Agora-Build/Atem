@@ -16,6 +16,21 @@
 //! synced after). A crash at any step leaves the damaged file (quarantined
 //! again at the next start, with another copy aside) or the new one (its
 //! record restores the quarantine).
+//!
+//! The conservative bound lives in its own small file, independent of any
+//! one damaged `revoked_grants`: `revoked_quarantine`,
+//! `{"v":1,"until":ms,"high_water":ms}` ([`Bound`]): the latest quarantine
+//! end (only ever rises) and the highest host wall time seen at a write
+//! (every write of `revoked_grants` writes it first, durably). A new
+//! quarantine ends no earlier than `max(until, now + 65 min, high_water +
+//! 65 min)`, so damage found after the wall clock went back can't shorten
+//! an earlier one; and while the wall clock is below `high_water` browser
+//! grants are refused (the clock went back: an entry pruned or lost at a
+//! later wall time could name a grant valid again). An unreadable
+//! `revoked_quarantine`, or a missing one with evidence of earlier damage
+//! (a file kept aside, or a quarantine record), fails closed: the bound is
+//! rebuilt from the newest modification time in the journal directory
+//! (see [`newest_mtime`]).
 
 use atem_client::principal::{GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS};
 use serde_json::Value;
@@ -33,8 +48,9 @@ use std::path::{Path, PathBuf};
 /// - any other revocation is kept until `wall + 65 min` (`revoke_grant`).
 ///
 /// Those entries were written before the damage was found, so 65 min after
-/// that (on a wall clock that didn't go back before it was found) none of
-/// them is in effect any more.
+/// that none of them is in effect any more; a wall clock that went back
+/// before it was found is covered by the sidecar's high-water mark
+/// ([`Bound::floor`]).
 pub const SAFE_WINDOW_MS: u64 = GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS;
 
 /// Browser grants refused because the revoked grants couldn't be read.
@@ -47,6 +63,9 @@ pub struct Quarantine {
     /// This process's monotonic time when it took the quarantine (the first
     /// time seen after it found the damage or loaded the record).
     pub mono_from: Option<u64>,
+    /// The earliest end of a quarantine found at this start (`wall` not
+    /// set yet): the previous end and the high-water mark + the window.
+    pub floor: u64,
 }
 
 impl Quarantine {
@@ -54,11 +73,24 @@ impl Quarantine {
         Quarantine {
             wall: Some((started_at, until)),
             mono_from: None,
+            floor: 0,
+        }
+    }
+
+    /// A quarantine found at this start that ends no earlier than `floor`
+    /// (wall ms; see [`Bound::floor`]).
+    pub fn starting(floor: u64) -> Quarantine {
+        Quarantine {
+            wall: None,
+            mono_from: None,
+            floor,
         }
     }
 
     pub fn anchor(&mut self, wall: u64, mono: u64) {
-        self.wall.get_or_insert((wall, wall + SAFE_WINDOW_MS));
+        let floor = self.floor;
+        self.wall
+            .get_or_insert((wall, floor.max(wall + SAFE_WINDOW_MS)));
         self.mono_from.get_or_insert(mono);
     }
 
@@ -135,19 +167,192 @@ pub fn encode(revoked: &BTreeMap<String, u64>, quarantine: Option<(u64, u64)>) -
     body.to_string().into_bytes()
 }
 
+/// The quarantine's sidecar, next to `revoked_grants`.
+pub const SIDECAR_FILE: &str = "revoked_quarantine";
+
+/// The conservative bound kept in [`SIDECAR_FILE`], independent of
+/// `revoked_grants`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Bound {
+    /// The latest quarantine end recorded (wall ms); only ever rises.
+    pub until: u64,
+    /// The highest host wall time seen at a write (wall ms); only rises.
+    pub high_water: u64,
+}
+
+impl Bound {
+    /// The earliest end of a quarantine that starts now, after any damage:
+    /// the previous end, and the window after the high-water mark (a
+    /// revocation written then may be kept that long).
+    pub fn floor(&self) -> u64 {
+        self.until
+            .max(self.high_water.saturating_add(SAFE_WINDOW_MS))
+    }
+
+    /// Wall times below this mean the clock went back.
+    pub fn behind(&self) -> u64 {
+        self.until.max(self.high_water)
+    }
+}
+
+/// What [`load_sidecar`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SidecarLoaded {
+    Missing,
+    Read(Bound),
+    Unreadable,
+}
+
+pub fn load_sidecar(path: &Path) -> SidecarLoaded {
+    let bytes = match super::membership::store::read_private(path) {
+        Ok(None) => return SidecarLoaded::Missing,
+        Ok(Some(bytes)) => bytes,
+        Err(_) => return SidecarLoaded::Unreadable,
+    };
+    let parse = || -> Option<Bound> {
+        let v: Value = serde_json::from_slice(&bytes).ok()?;
+        let o = v.as_object()?;
+        if o.len() != 3 || o.get("v").and_then(Value::as_u64) != Some(1) {
+            return None;
+        }
+        Some(Bound {
+            until: o.get("until")?.as_u64()?,
+            high_water: o.get("high_water")?.as_u64()?,
+        })
+    };
+    parse().map_or(SidecarLoaded::Unreadable, SidecarLoaded::Read)
+}
+
+pub fn encode_sidecar(bound: Bound) -> Vec<u8> {
+    serde_json::json!({"v": 1, "until": bound.until, "high_water": bound.high_water})
+        .to_string()
+        .into_bytes()
+}
+
+fn is_aside(name: &str) -> bool {
+    name.starts_with(&format!("{}.damaged-", super::REVOKED_GRANTS_FILE))
+        || name.starts_with(&format!("{SIDECAR_FILE}.damaged-"))
+}
+
+/// Whether a damaged `revoked_grants` or `revoked_quarantine` was kept
+/// aside in `dir` (evidence of earlier damage).
+pub fn damaged_asides(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|e| is_aside(&e.file_name().to_string_lossy()))
+    })
+}
+
+/// The newest modification time (wall ms) in the journal directory: its
+/// own entries (the files kept aside, `revoked_grants`, the sidecar, the
+/// session journal's files) and those one level down (`receipts/`), at
+/// most 100 000 entries. The recovery's high-water mark when the sidecar
+/// is lost: each write left its wall time there. Never followed through a
+/// symlink.
+pub fn newest_mtime(dir: &Path) -> u64 {
+    fn ms(m: &std::fs::Metadata) -> u64 {
+        m.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64)
+    }
+    let mut newest = std::fs::symlink_metadata(dir).map_or(0, |m| ms(&m));
+    let mut budget = 100_000u32;
+    let mut scan = |d: &Path, newest: &mut u64, sub: &mut Vec<PathBuf>| {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            return;
+        };
+        for e in entries.filter_map(Result::ok) {
+            if budget == 0 {
+                return;
+            }
+            budget -= 1;
+            if let Ok(m) = std::fs::symlink_metadata(e.path()) {
+                *newest = (*newest).max(ms(&m));
+                if m.is_dir() {
+                    sub.push(e.path());
+                }
+            }
+        }
+    };
+    let mut subdirs = Vec::new();
+    scan(dir, &mut newest, &mut subdirs);
+    for d in subdirs {
+        scan(&d, &mut newest, &mut Vec::new());
+    }
+    newest
+}
+
+/// A damaged file still at its path, to keep aside before anything
+/// replaces it. The link is made once per damage: a later step that fails
+/// (permissions, directory fsync) is retried on the same aside name.
+#[derive(Debug, Default)]
+pub struct Damaged {
+    /// The damaged file is still at its path, not kept aside (and synced)
+    /// yet.
+    pub pending: bool,
+    /// The aside link already made for it.
+    pub aside: Option<PathBuf>,
+}
+
+impl Damaged {
+    pub fn found() -> Damaged {
+        Damaged {
+            pending: true,
+            aside: None,
+        }
+    }
+
+    /// Keeps the file at `path` aside unless that is done: the aside path
+    /// when it was kept now.
+    pub fn keep(
+        &mut self,
+        path: &Path,
+        wall: u64,
+        crash: Option<Step>,
+    ) -> io::Result<Option<PathBuf>> {
+        if !self.pending {
+            return Ok(None);
+        }
+        let aside = match &self.aside {
+            Some(a) => a.clone(),
+            None => match link_aside(path, wall, crash)? {
+                Some(a) => {
+                    self.aside = Some(a.clone());
+                    a
+                }
+                None => {
+                    // Gone already: nothing to keep.
+                    self.pending = false;
+                    return Ok(None);
+                }
+            },
+        };
+        seal_aside(path, &aside, crash)?;
+        self.pending = false;
+        Ok(Some(aside))
+    }
+}
+
 /// A step of a write a test can crash after (the step done, nothing after
-/// it).
+/// it), or (`Link`) fail at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    /// The hard link that keeps a damaged file aside fails (an injected
+    /// error, as EPERM on a filesystem without links); nothing done.
+    Link,
     /// The damaged file is linked aside and the directory synced.
     Aside,
+    /// The sidecar (`revoked_quarantine`) is written and synced.
+    SidecarWritten,
     /// The temp is written and synced.
     TempWritten,
     /// The temp is renamed over the file (the directory not synced yet).
     Renamed,
 }
 
-fn checkpoint(step: Step, crash: Option<Step>) -> io::Result<()> {
+pub fn checkpoint(step: Step, crash: Option<Step>) -> io::Result<()> {
     if crash == Some(step) {
         return Err(io::Error::other(format!("injected crash after {step:?}")));
     }
@@ -161,17 +366,18 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// Keeps the damaged file at `path` as `<name>.damaged-<wall>` (another
+/// Links the damaged file at `path` as `<name>.damaged-<wall>` (another
 /// suffix when that exists; never overwritten): a hard link, so the main
 /// path keeps it until it is replaced. `None` when it is gone already.
-pub fn keep_aside(path: &Path, wall: u64, crash: Option<Step>) -> io::Result<Option<PathBuf>> {
-    use std::os::unix::fs::PermissionsExt;
+fn link_aside(path: &Path, wall: u64, crash: Option<Step>) -> io::Result<Option<PathBuf>> {
+    if crash == Some(Step::Link) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("no file name"))?
         .to_string_lossy()
         .into_owned();
-    let mut kept = None;
     for n in 0..1000u32 {
         let aside = if n == 0 {
             path.with_file_name(format!("{name}.damaged-{wall}"))
@@ -179,22 +385,23 @@ pub fn keep_aside(path: &Path, wall: u64, crash: Option<Step>) -> io::Result<Opt
             path.with_file_name(format!("{name}.damaged-{wall}-{n}"))
         };
         match std::fs::hard_link(path, &aside) {
-            Ok(()) => {
-                kept = Some(aside);
-                break;
-            }
+            Ok(()) => return Ok(Some(aside)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         }
     }
-    let aside = kept.ok_or_else(|| io::Error::other("no free name to keep the damaged file"))?;
-    if std::fs::symlink_metadata(&aside).is_ok_and(|m| m.is_file()) {
-        std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o600))?;
+    Err(io::Error::other("no free name to keep the damaged file"))
+}
+
+/// The aside copy private (0600) and its link durable (directory synced).
+fn seal_aside(path: &Path, aside: &Path, crash: Option<Step>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::symlink_metadata(aside).is_ok_and(|m| m.is_file()) {
+        std::fs::set_permissions(aside, std::fs::Permissions::from_mode(0o600))?;
     }
     sync_dir(path)?;
-    checkpoint(Step::Aside, crash)?;
-    Ok(Some(aside))
+    checkpoint(Step::Aside, crash)
 }
 
 /// Replaces `path` whole: temp (0600, `O_EXCL`, `O_NOFOLLOW`), write,

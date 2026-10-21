@@ -2138,7 +2138,12 @@ fn a_revocation_during_the_quarantine_keeps_it_across_a_restart() {
 #[test]
 fn a_crash_at_any_step_of_the_quarantine_writes_comes_back_quarantined() {
     use revoked::Step;
-    for step in [Step::Aside, Step::TempWritten, Step::Renamed] {
+    for step in [
+        Step::Aside,
+        Step::SidecarWritten,
+        Step::TempWritten,
+        Step::Renamed,
+    ] {
         // The first write (at the first pass after the damage was found).
         let mut rig = Rig::new();
         let file = rig.journal.join(REVOKED_GRANTS_FILE);
@@ -2185,6 +2190,191 @@ fn a_crash_at_any_step_of_the_quarantine_writes_comes_back_quarantined() {
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("quarantine"), "{step:?}: {text}");
     }
+}
+
+fn aside_count(rig: &Rig, prefix: &str) -> usize {
+    std::fs::read_dir(&rig.journal)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        .count()
+}
+
+/// The quarantine's sidecar (`revoked_quarantine`) unreadable fails
+/// closed: browser grants are refused `busy` "revoked grants unreadable"
+/// (the bound rebuilt from the journal's newest write time, at least the
+/// window on both clocks); the damaged sidecar is kept aside and a readable
+/// one written; a missing sidecar with a damaged file kept aside is the
+/// same. Members and native revocations are unaffected.
+#[test]
+fn an_unreadable_quarantine_sidecar_fails_closed() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let events = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. }))
+    );
+    let sidecar = rig.journal.join("revoked_quarantine");
+    assert!(sidecar.exists(), "a revocation writes the sidecar first");
+    std::fs::write(&sidecar, b"{\"v\":1,\"until\":").unwrap();
+
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    let b = browser_of(&mut rig, 2);
+    assert_quarantined(&mut rig, "b1", b);
+    let events = revoke_from(&mut rig, "ph2", &revoked_grant_id(3));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. })),
+        "{events:?}"
+    );
+    assert_eq!(aside_count(&rig, "revoked_quarantine.damaged-"), 1);
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    let bound: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        bound["until"].as_u64().unwrap() >= rig.now.host.wall_ms,
+        "{text}"
+    );
+    // Still refused after a restart late in the window.
+    rig.advance(revoked::SAFE_WINDOW_MS - 60_000);
+    restart_engine(&mut rig);
+    let b = browser_of(&mut rig, 4);
+    assert_quarantined(&mut rig, "b2", b);
+    // The window on both clocks of this engine: admitted again.
+    rig.advance(revoked::SAFE_WINDOW_MS + 1000);
+    let b = browser_of(&mut rig, 5);
+    rig.advance(1000);
+    rig.connect("b3", b);
+    rig.attached("b3");
+
+    // A missing sidecar while a damaged file is kept aside: the same.
+    std::fs::remove_file(&sidecar).unwrap();
+    restart_engine(&mut rig);
+    let b = browser_of(&mut rig, 6);
+    assert_quarantined(&mut rig, "b4", b);
+}
+
+/// The wall clock below the high-water mark the revoked grants were
+/// written at (it went back): browser grants are refused `busy` "host
+/// clock went back" until it catches up, across a restart too; a live
+/// browser is still fenced by a native revocation meanwhile.
+#[test]
+fn a_wall_clock_below_the_high_water_mark_refuses_browsers() {
+    let mut rig = Rig::new();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.advance(1000);
+    let live = browser_of(&mut rig, 1);
+    rig.connect("live", live);
+    rig.attached("live");
+    let events = revoke_from(&mut rig, "ph", &revoked_grant_id(9));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. }))
+    );
+    let high_water = rig.now.host.wall_ms;
+
+    // Ten minutes back, in this process.
+    rig.now.host.wall_ms -= 10 * 60_000;
+    rig.advance(1000);
+    let b = browser_of(&mut rig, 2);
+    rig.connect("b1", b);
+    assert_eq!(
+        rig.refused("b1"),
+        ("busy".into(), Some("host clock went back".into()))
+    );
+    // A native revocation still fences the live browser.
+    let events = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CEvent::GrantRevoked { .. })),
+        "{events:?}"
+    );
+    assert_eq!(rig.refused("live").0, "closed");
+
+    // Across a restart.
+    restart_engine(&mut rig);
+    rig.connect("ph2", phone());
+    rig.attached("ph2");
+    rig.advance(1000);
+    let b = browser_of(&mut rig, 3);
+    rig.connect("b2", b);
+    assert_eq!(
+        rig.refused("b2"),
+        ("busy".into(), Some("host clock went back".into()))
+    );
+    // Caught up: admitted.
+    let left = high_water - rig.now.host.wall_ms;
+    rig.advance(left + 1000);
+    let b = browser_of(&mut rig, 4);
+    rig.advance(1000);
+    rig.connect("b3", b);
+    rig.attached("b3");
+}
+
+/// The hard link that keeps a damaged file aside fails (EPERM): the
+/// damaged file is never replaced, a revocation is answered `busy`
+/// "revocation not recorded", and a restart is quarantined again.
+#[test]
+fn a_failing_hard_link_never_replaces_the_damaged_file() {
+    let mut rig = Rig::new();
+    let file = rig.journal.join(REVOKED_GRANTS_FILE);
+    std::fs::write(&file, b"{not json").unwrap();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.engine.revoked_crash = Some(revoked::Step::Link);
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    let b = browser_of(&mut rig, 1);
+    assert_quarantined(&mut rig, "b1", b);
+    let events = revoke_from(&mut rig, "ph", &revoked_grant_id(2));
+    assert_eq!(
+        Rig::last_error(&events),
+        Some(("busy".into(), Some("revocation not recorded".into())))
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), b"{not json");
+    assert_eq!(aside_count(&rig, "revoked_grants.damaged-"), 0);
+    restart_engine(&mut rig);
+    let b = browser_of(&mut rig, 3);
+    assert_quarantined(&mut rig, "b2", b);
+}
+
+/// A persistent failure after the aside link (its directory fsync): the
+/// retries (once a second, and each revocation) reuse the one aside link
+/// instead of making one per retry.
+#[test]
+fn a_persistent_failure_after_the_aside_link_reuses_it() {
+    let mut rig = Rig::new();
+    let file = rig.journal.join(REVOKED_GRANTS_FILE);
+    std::fs::write(&file, b"{not json").unwrap();
+    rig.engine = R9Host::new(Limits::default(), Some(&rig.journal));
+    rig.engine.revoked_crash = Some(revoked::Step::Aside);
+    rig.link_up();
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    for _ in 0..10 {
+        rig.advance(1100);
+    }
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(1));
+    let _ = revoke_from(&mut rig, "ph", &revoked_grant_id(2));
+    assert_eq!(aside_count(&rig, "revoked_grants.damaged-"), 1);
+    assert_eq!(std::fs::read(&file).unwrap(), b"{not json");
+    // Once it works, the same aside is kept and the record written.
+    rig.engine.revoked_crash = None;
+    rig.advance(1100);
+    assert_eq!(aside_count(&rig, "revoked_grants.damaged-"), 1);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("quarantine"), "{text}");
 }
 
 /// The revoked grants journal full (256 junk ids): a real revocation is

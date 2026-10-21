@@ -466,3 +466,128 @@ fn a_wall_clock_set_back_across_a_restart_cant_shorten_the_quarantine() {
             .expect("admitted once the wall clock passed the recorded end");
     }
 }
+
+/// Astation's trace (comment 6307612632): A issued at 12:00 for an hour
+/// and revoked at 12:01; the file damaged at 12:02 (quarantined until
+/// 13:07); the wall clock set back to 10:00, the rewritten file damaged
+/// again and the runtime restarted; 66 min later on both clocks (wall
+/// 11:06) the quarantine must not have lifted, and when the wall clock
+/// returns to 12:10, A (still within its validity, its entry lost with the
+/// second damage) must still be refused. A native revocation during it is
+/// recorded; after the original end a fresh browser is admitted and a
+/// native revocation fences it live.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn a_second_damage_after_the_clock_went_back_keeps_the_earlier_end() {
+    let mut rig = Rig::new();
+    rig.start();
+    // 12:00: A, an hour long.
+    let a = grant(&mut rig.log, &rig.clock, GA, 60 * MIN);
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-1", &rig.log, HOST, &phone())
+            .expect("the phone");
+        next_init();
+        router
+            .connect("a-1", &rig.log, HOST, &a)
+            .expect("A before its revocation");
+        // 12:01: revoked.
+        rig.clock.set_wall(MIN as i64);
+        revoke(&mut router, "ph-1", &mut ph, GA);
+    }
+    rig.stop(true);
+    // 12:02: the first damage.
+    std::fs::write(rig.revoked_file(), b"\x00damaged once").unwrap();
+    rig.clock.set_wall(2 * MIN as i64);
+    rig.start();
+    {
+        let mut router = Router::new(&rig.astation);
+        quarantined(&mut router, &rig, "a-2", &a);
+        within("the first quarantine recorded", || {
+            rig.revoked_text().contains("\"quarantine\"")
+        });
+    }
+    let record: serde_json::Value = serde_json::from_str(&rig.revoked_text()).unwrap();
+    let first_end = record["quarantine"]["until"].as_u64().unwrap();
+    rig.stop(true);
+
+    // 10:00: the wall clock set back; the rewritten file damaged again.
+    rig.clock.set_wall(-120 * MIN as i64);
+    std::fs::write(rig.revoked_file(), b"\x00damaged twice").unwrap();
+    rig.start();
+    {
+        let mut router = Router::new(&rig.astation);
+        let mut ph = router
+            .connect("ph-2", &rig.log, HOST, &phone())
+            .expect("the phone (members are unaffected)");
+        let b = grant(&mut rig.log, &rig.clock, GB, 50 * MIN);
+        quarantined(&mut router, &rig, "b-1", &b);
+        within("the second quarantine recorded", || {
+            rig.revoked_text().contains("\"quarantine\"")
+        });
+        // The second record keeps the first end.
+        let record: serde_json::Value = serde_json::from_str(&rig.revoked_text()).unwrap();
+        assert!(
+            record["quarantine"]["until"].as_u64().unwrap() >= first_end,
+            "{record}"
+        );
+        // A native revocation during it is recorded.
+        revoke(&mut router, "ph-2", &mut ph, GB);
+        assert!(rig.revoked_text().contains(GB), "{}", rig.revoked_text());
+
+        // 11:06: 66 min later on both clocks. The second quarantine alone
+        // would have ended; a fresh grant is still refused.
+        rig.clock.set_wall(-54 * MIN as i64);
+        rig.clock.add_mono(66 * MIN);
+        let c = grant(
+            &mut rig.log,
+            &rig.clock,
+            "aaaaaaaa-1111-4111-8111-0000000000c6",
+            50 * MIN,
+        );
+        quarantined(&mut router, &rig, "c-1", &c);
+
+        // 12:10: the wall clock is back. A is still within its validity
+        // and its entry was lost with the damage: refused.
+        rig.clock.set_wall(10 * MIN as i64);
+        quarantined(&mut router, &rig, "a-3", &a);
+        let c = grant(
+            &mut rig.log,
+            &rig.clock,
+            "aaaaaaaa-1111-4111-8111-0000000000c7",
+            50 * MIN,
+        );
+        quarantined(&mut router, &rig, "c-2", &c);
+
+        // Past the first end (13:07): a fresh grant is admitted and a
+        // native revocation fences it live.
+        rig.clock
+            .set_wall((first_end - r9log::host_now().wall_ms + MIN) as i64);
+        let d_id = "aaaaaaaa-1111-4111-8111-0000000000d8";
+        let d = grant(&mut rig.log, &rig.clock, d_id, 50 * MIN);
+        next_init();
+        let mut live = router
+            .connect("d-1", &rig.log, HOST, &d)
+            .expect("a grant never revoked, after the first end");
+        revoke(&mut router, "ph-2", &mut ph, d_id);
+        let mut fenced = false;
+        while let Ok(events) = router.events("d-1", &mut live) {
+            fenced |= events.iter().any(|e| {
+                matches!(e, CEvent::Fenced(e) | CEvent::Error(e)
+                    if e.code == "unauthorized"
+                        && e.detail.as_deref() == Some("grant revoked"))
+            });
+        }
+        assert!(fenced, "the live browser is fenced by the revocation");
+        next_init();
+        assert_eq!(
+            router.connect("d-2", &rig.log, HOST, &d).unwrap_err().0,
+            "unauthorized"
+        );
+        // A has expired by then; still refused.
+        next_init();
+        assert!(router.connect("a-4", &rig.log, HOST, &a).is_err());
+    }
+    assert_eq!(rig.kept_aside().len(), 2, "{:?}", rig.kept_aside());
+}

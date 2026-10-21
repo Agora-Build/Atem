@@ -108,6 +108,10 @@ const DETAIL_IDENTITY: &str = "host identity differs from the device list";
 pub const REVOKED_GRANTS_FILE: &str = "revoked_grants";
 /// `busy` for a browser while the revoked grants couldn't be read.
 const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
+/// `busy` for a browser while the host's wall clock is below the
+/// high-water mark the revoked grants were written at (the clock went
+/// back).
+const DETAIL_CLOCK_BACK: &str = "host clock went back";
 
 /// The host's `host_channel_key` behind a provider (plain, §R9.3).
 pub struct HostKey {
@@ -252,8 +256,15 @@ pub struct R9Host {
     quarantine: Option<revoked::Quarantine>,
     /// The quarantine's record is durable in the file.
     quarantine_recorded: bool,
-    /// The damaged file is still at `revoked_path`, not kept aside yet.
-    revoked_damaged: bool,
+    /// A damaged file still at `revoked_path`, not kept aside yet.
+    revoked_damaged: revoked::Damaged,
+    /// A damaged sidecar (`revoked_quarantine`), not kept aside yet.
+    sidecar_damaged: revoked::Damaged,
+    /// The conservative bound durable in the sidecar (raised in memory
+    /// only by a prune, written at the next write).
+    bound: revoked::Bound,
+    /// The clock-went-back refusal was logged (until it ends).
+    clock_back_logged: bool,
     /// Monotonic time before which a failed record write isn't retried.
     quarantine_retry_at: u64,
     /// (approval id, device) pairs whose first `approval_seen` was taken.
@@ -389,7 +400,10 @@ impl R9Host {
             revoked_path,
             quarantine: None,
             quarantine_recorded: false,
-            revoked_damaged: false,
+            revoked_damaged: revoked::Damaged::default(),
+            sidecar_damaged: revoked::Damaged::default(),
+            bound: revoked::Bound::default(),
+            clock_back_logged: false,
             quarantine_retry_at: 0,
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
@@ -1046,12 +1060,8 @@ impl R9Host {
                 }
             }
             Principal::Browser { .. } => {
-                if self.browsers_refused(wall, now.mono_ms) {
-                    Err(error(
-                        code::BUSY,
-                        re.as_deref(),
-                        Some(DETAIL_REVOKED_UNREADABLE),
-                    ))
+                if let Some(detail) = self.browsers_refused(wall, now.mono_ms) {
+                    Err(error(code::BUSY, re.as_deref(), Some(detail)))
                 } else if m.is_frozen() {
                     Err(error(code::ACCOUNT_FROZEN, re.as_deref(), None))
                 } else if m.faulted().is_some() {
@@ -2007,7 +2017,13 @@ impl R9Host {
             );
             effects.extend(parts.host.fence_principal(&principal, 0));
         }
+        let before = self.revoked.len();
         self.revoked.prune(wall);
+        if self.revoked.len() < before {
+            // An entry pruned at this wall time would name a valid grant
+            // again if the clock went back below it.
+            self.bound.high_water = self.bound.high_water.max(wall);
+        }
         self.push_recipients(parts);
         self.push.tick(push_suppressed(parts), wall);
         effects
@@ -2016,20 +2032,15 @@ impl R9Host {
     // ── Revoked grants journal ──
 
     fn load_revoked(&mut self) {
-        let Some(path) = &self.revoked_path else {
+        let Some(path) = self.revoked_path.clone() else {
             return;
         };
-        match revoked::load(path) {
-            revoked::Loaded::Missing => {}
-            revoked::Loaded::Unreadable => {
-                // A revocation it held can't be told from none (§R9.6):
-                // every browser grant is refused until any grant it could
-                // name has expired. The damaged file is kept aside at the
-                // first pass, and every write carries the quarantine.
-                log("revoked_grants is unreadable; browser grants are refused for at least 65 min");
-                self.quarantine = Some(revoked::Quarantine::default());
-                self.revoked_damaged = true;
-            }
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let sidecar = path.with_file_name(revoked::SIDECAR_FILE);
+        let mut record = None;
+        let main_damaged = match revoked::load(&path) {
+            revoked::Loaded::Missing => false,
+            revoked::Loaded::Unreadable => true,
             revoked::Loaded::Read {
                 revoked: map,
                 quarantine,
@@ -2038,71 +2049,120 @@ impl R9Host {
                     self.revoked_until.insert(id.clone(), until);
                     let _ = self.revoked.revoke(&id, until, 0);
                 }
-                if let Some((started_at, until)) = quarantine {
-                    log(&format!(
-                        "revoked_grants records a quarantine until {until}; browser grants \
-                         are refused until then and for 65 min of this process"
-                    ));
-                    self.quarantine = Some(revoked::Quarantine::restored(started_at, until));
-                    self.quarantine_recorded = true;
-                }
+                record = quarantine;
+                false
             }
+        };
+        let side = revoked::load_sidecar(&sidecar);
+        // Evidence of earlier damage: a sidecar missing then is lost.
+        let evidence = record.is_some() || revoked::damaged_asides(&dir);
+        let bound = match side {
+            revoked::SidecarLoaded::Read(b) => Some(b),
+            revoked::SidecarLoaded::Missing if !evidence => Some(revoked::Bound::default()),
+            _ => None,
+        };
+        if main_damaged {
+            self.revoked_damaged = revoked::Damaged::found();
+        }
+        let Some(bound) = bound else {
+            // The bound is lost (§R9.6, fail closed): rebuilt as the newest
+            // write time left in the journal directory (each write left
+            // its wall time there), a new quarantine ending no earlier
+            // than that + the window and now + the window, on both clocks.
+            let high_water = revoked::newest_mtime(&dir);
+            let until = record.map_or(0, |(_, u)| u);
+            self.bound = revoked::Bound { until, high_water };
+            if side == revoked::SidecarLoaded::Unreadable {
+                self.sidecar_damaged = revoked::Damaged::found();
+            }
+            log(&format!(
+                "revoked_quarantine is {}; browser grants are refused for at least 65 min \
+                 and until the wall clock passes {}",
+                if side == revoked::SidecarLoaded::Unreadable {
+                    "unreadable"
+                } else {
+                    "missing after earlier damage"
+                },
+                self.bound.floor()
+            ));
+            self.quarantine = Some(revoked::Quarantine::starting(self.bound.floor()));
+            return;
+        };
+        self.bound = bound;
+        if main_damaged {
+            // A revocation it held can't be told from none (§R9.6):
+            // every browser grant is refused until any grant it could
+            // name has expired, and no earlier than the previous end or
+            // the high-water mark + the window (a wall clock set back
+            // can't shorten it). The damaged file is kept aside at the
+            // first pass, and every write carries the quarantine.
+            log("revoked_grants is unreadable; browser grants are refused for at least 65 min");
+            self.quarantine = Some(revoked::Quarantine::starting(bound.floor()));
+        } else if let Some((started_at, until)) = record {
+            let until = until.max(bound.until);
+            log(&format!(
+                "revoked_grants records a quarantine until {until}; browser grants \
+                 are refused until then and for 65 min of this process"
+            ));
+            self.quarantine = Some(revoked::Quarantine::restored(started_at, until));
+            self.quarantine_recorded = true;
         }
     }
 
-    /// Whether browser grants are refused now because the revoked grants
-    /// couldn't be read (see `quarantine`). Anchors a quarantine found at
-    /// this start, records it durably (retried once a second), and ends it
+    /// Why browser grants are refused now, if they are: the revoked grants
+    /// couldn't be read (see `quarantine`), or the wall clock is below the
+    /// high-water mark (it went back). Anchors a quarantine found at this
+    /// start, records it durably (retried once a second), and ends it
     /// (dropping the record from the file).
-    fn browsers_refused(&mut self, wall: u64, mono: u64) -> bool {
-        let Some(q) = &mut self.quarantine else {
-            return false;
-        };
-        q.anchor(wall, mono);
-        if !q.ended(wall, mono) {
-            if !self.quarantine_recorded && mono >= self.quarantine_retry_at {
-                match self.save_revoked(wall) {
-                    Ok(()) => log("the revoked-grants quarantine is recorded"),
-                    Err(e) => {
-                        if self.quarantine_retry_at == 0 {
-                            log(&format!("cannot record the revoked-grants quarantine: {e}"));
+    fn browsers_refused(&mut self, wall: u64, mono: u64) -> Option<&'static str> {
+        if let Some(q) = &mut self.quarantine {
+            q.anchor(wall, mono);
+            if !q.ended(wall, mono) {
+                if !self.quarantine_recorded && mono >= self.quarantine_retry_at {
+                    match self.save_revoked(wall) {
+                        Ok(()) => log("the revoked-grants quarantine is recorded"),
+                        Err(e) => {
+                            if self.quarantine_retry_at == 0 {
+                                log(&format!("cannot record the revoked-grants quarantine: {e}"));
+                            }
+                            self.quarantine_retry_at = mono + 1_000;
                         }
-                        self.quarantine_retry_at = mono + 1_000;
                     }
                 }
+                return Some(DETAIL_REVOKED_UNREADABLE);
             }
-            return true;
+            self.quarantine = None;
+            self.quarantine_recorded = false;
+            log("the revoked-grants quarantine ended; browser grants are admitted again");
+            if let Err(e) = self.save_revoked(wall) {
+                // The record (or the damaged file) stays: the next start is
+                // quarantined again (fail closed).
+                log(&format!(
+                    "cannot drop the revoked-grants quarantine record: {e}"
+                ));
+            }
         }
-        self.quarantine = None;
-        self.quarantine_recorded = false;
-        log("the revoked-grants quarantine ended; browser grants are admitted again");
-        if let Err(e) = self.save_revoked(wall) {
-            // The record (or the damaged file) stays: the next start is
-            // quarantined again (fail closed).
-            log(&format!(
-                "cannot drop the revoked-grants quarantine record: {e}"
-            ));
+        if wall < self.bound.behind() {
+            if !self.clock_back_logged {
+                self.clock_back_logged = true;
+                log(&format!(
+                    "the host wall clock is behind the revoked grants' high-water mark ({}); \
+                     browser grants are refused until it catches up",
+                    self.bound.behind()
+                ));
+            }
+            return Some(DETAIL_CLOCK_BACK);
         }
-        false
+        self.clock_back_logged = false;
+        None
     }
 
     /// Writes the file: the known revocations and, during a quarantine,
-    /// its record. A damaged file still in place is kept aside first and is
-    /// never replaced unless that worked.
+    /// its record. Damaged files still in place are kept aside first (and
+    /// never replaced unless that worked); the sidecar's bound (the record's
+    /// end, the high-water mark raised to `wall`) is durable before the
+    /// file is replaced.
     fn save_revoked(&mut self, wall: u64) -> std::io::Result<()> {
-        let Some(path) = self.revoked_path.clone() else {
-            return Ok(());
-        };
-        let crash = self.revoked_crash();
-        if self.revoked_damaged {
-            if let Some(aside) = revoked::keep_aside(&path, wall, crash)? {
-                log(&format!(
-                    "the damaged revoked_grants is kept as {}",
-                    aside.file_name().unwrap_or_default().to_string_lossy()
-                ));
-            }
-            self.revoked_damaged = false;
-        }
         let record = match &self.quarantine {
             None => None,
             Some(q) => Some(
@@ -2110,6 +2170,32 @@ impl R9Host {
                     .ok_or_else(|| std::io::Error::other("quarantine not anchored"))?,
             ),
         };
+        let mut bound = self.bound;
+        bound.high_water = bound.high_water.max(wall);
+        if let Some((_, until)) = record {
+            bound.until = bound.until.max(until);
+        }
+        let Some(path) = self.revoked_path.clone() else {
+            self.bound = bound;
+            return Ok(());
+        };
+        let sidecar = path.with_file_name(revoked::SIDECAR_FILE);
+        let crash = self.revoked_crash();
+        for (damaged, file) in [
+            (&mut self.revoked_damaged, &path),
+            (&mut self.sidecar_damaged, &sidecar),
+        ] {
+            if let Some(aside) = damaged.keep(file, wall, crash)? {
+                log(&format!(
+                    "the damaged {} is kept as {}",
+                    file.file_name().unwrap_or_default().to_string_lossy(),
+                    aside.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        revoked::write_atomic(&sidecar, &revoked::encode_sidecar(bound), None)?;
+        self.bound = bound;
+        revoked::checkpoint(revoked::Step::SidecarWritten, crash)?;
         let body = revoked::encode(&self.revoked_until, record);
         revoked::write_atomic(&path, &body, crash)?;
         if self.quarantine.is_some() {
