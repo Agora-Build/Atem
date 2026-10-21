@@ -588,6 +588,68 @@ Test target only, never in a release build. Limits: Linux only, the fake
 Claude only (no fake Codex), a fixed flow with no entry point for
 Astation's own router or relay.
 
+**Prebuilt, without a source build** (NON-PRODUCTION test tooling):
+every run of `.github/workflows/atem-client-bindings.yml` uploads the
+artifact `atem-r9-harness-NONPRODUCTION-<version>-linux-x86_64`
+(`scripts/package-atem-r9-harness.sh`; `<version>` is atem's version and
+the commit's first 12 hex digits): `…-linux-x86_64.tar.gz` (`bin/r9_harness`,
+the release test binary; `bin/atem`, a release build of the same commit
+for this harness only, never to be installed; `fake-agent.py`, the fake
+Claude Code; `run-harness.sh`; `README.txt`), `…-sample-transcript.jsonl`
+(the packaged harness unpacked into an empty directory and run as a
+consumer would, default counts), `…-SOURCE.json` (pinned to the PR head,
+`tree_dirty: false` checked in CI) and `…-SHA256SUMS.txt`. Run it on
+Linux x86_64 with python3 in `/usr/bin`: `./run-harness.sh` (the same
+`ATEM_HARNESS_*` variables; it points the harness at the packaged `atem`
+and fake agent through `ATEM_HARNESS_ATEM_BIN` and
+`ATEM_HARNESS_FAKE_AGENT`). Verify the sums and the pin first, as for the
+binding packages. No macOS build: the harness's sandbox finds and cleans
+up the processes it started through `/proc`, so the test target compiles
+to nothing on macOS. The flow is fixed and the routing fake (its fake
+Astation plays the router and the relay).
+
+**Entry point for Astation's own adapters** (follow-up after r9, not
+built; agreed in outline with Astation, #81 6304486807; the bridge schema
+is pinned with that later artifact). It adds no r9 field and no public
+endpoint:
+
+- **Host side.** The packaged runtime dials a configurable
+  `ASTATION_WS` (as today), outbound only. In this mode there is no
+  `FakeAstation`: the relay or Astation's :8080 adapter owns that socket.
+  A Linux container must reach the configured Mac or relay address; any
+  test transport authentication is documented with how the adapter
+  supplies it locally.
+- **Client side.** The prebuilt driver keeps the shared-core handshakes,
+  the independent test keys and the assertions. An Astation-supplied
+  bridge executable, over stdin/stdout NDJSON (test-process I/O, not a
+  production wire format), does open / send / receive / close per logical
+  client and target host, and reports link loss. Each inner `atem-ch1`
+  frame passes as its original JSON; the adapter supplies the client
+  ingress and wraps and unwraps the §R9.7a envelope on the host link. The
+  driver hard-codes no HTTP/WS path or credentials API (the public client
+  ingress is not built).
+- **Routing rules the adapter keeps.** It assigns handles, sets
+  `direct`/`relay`, scopes routes to the current host connection
+  generation, preserves per-channel order, open before frame, and
+  channel-only close (a channel close never closes the host socket); link
+  loss ends every affected channel and needs new handshakes, with no lease
+  restoration or prompt replay.
+- **Bounds.** The 2 MiB serialized envelope (§R9.7a) and, separately,
+  256 KiB per `type:relay` message (§R9.9).
+- **Setup.** A disposable fixture manifest: account, genesis and head,
+  both hosts' ids, keys and trust generations, the signed membership,
+  client labels, roles and scopes, and reproducible test-key references.
+  Test bootstrap only in isolated profiles: no live account pairing,
+  enrollment, recovery or credential extraction.
+- **Push.** Signed push hints and seen go to the real relay ingress, with
+  `push_ack` returned after durable handling; the external mode never
+  acknowledges them in a fake router.
+- **Controls.** Disconnect and reconnect one client; drop and reconnect
+  one host link; hold and release adapter I/O; delay or lose a push
+  acknowledgment.
+- **Transcripts.** One per run, with outcomes, so an adapter-induced stall
+  can be told from Atem's link-writer stall (still engine-only).
+
 ## r9 binding and effect contract (for Astation)
 
 What Astation's apps and router do with `atem-client`. The full call

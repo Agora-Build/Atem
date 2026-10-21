@@ -13,6 +13,12 @@
 //! (no fake Codex yet); the flow is fixed, with no entry point for
 //! Astation's own router or relay (the fake Astation plays both).
 //!
+//! A prebuilt copy (no source build needed) is the CI artifact
+//! `atem-r9-harness-NONPRODUCTION-<version>-linux-x86_64`
+//! (`scripts/package-atem-r9-harness.sh`; its `run-harness.sh` sets
+//! `ATEM_HARNESS_ATEM_BIN` and `ATEM_HARNESS_FAKE_AGENT` to the packaged
+//! `atem` and fake agent).
+//!
 //! Run (Linux; debug or release build):
 //!
 //! ```text
@@ -230,7 +236,7 @@ fn harness() {
     let astation = FakeAstation::start();
     let runtime_log = sandbox.dir.path().join("runtime.log");
     let out = std::fs::File::create(&runtime_log).unwrap();
-    let mut runtime: Child = Command::new(env!("CARGO_BIN_EXE_atem"))
+    let mut runtime: Child = Command::new(support::atem_bin())
         .arg("runtime")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -267,8 +273,12 @@ fn harness() {
 fn agent(sandbox: &Sandbox) -> (String, PathBuf) {
     let fake = sandbox.dir.path().join("fake");
     std::fs::create_dir_all(&fake).unwrap();
-    let script =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approvals/fake-agent.py");
+    // The fake Claude Code: the source tree's, or the packaged copy.
+    let script = std::env::var_os("ATEM_HARNESS_FAKE_AGENT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approvals/fake-agent.py")
+        });
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
     if perms.mode() & 0o111 != 0o111 {
         perms.set_mode(0o755);

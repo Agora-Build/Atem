@@ -15,6 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The `atem` binary under test: the one cargo built, or
+/// `ATEM_HARNESS_ATEM_BIN` when a packaged harness runs outside the source
+/// tree (`scripts/package-atem-r9-harness.sh`; the file must be named
+/// `atem`).
+pub fn atem_bin() -> PathBuf {
+    std::env::var_os("ATEM_HARNESS_ATEM_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_atem")))
+}
+
 /// Waits up to ten seconds for `done`.
 #[track_caller]
 pub fn within(what: &str, mut done: impl FnMut() -> bool) {
@@ -105,7 +115,7 @@ impl Sandbox {
 
     /// `atem <args>` without a terminal; its output (stdout, stderr) and status.
     pub fn atem(&self, args: &[&str]) -> (String, String, bool) {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_atem"))
+        let output = std::process::Command::new(atem_bin())
             .args(args)
             .env_clear()
             .envs(self.env())
@@ -141,7 +151,7 @@ impl Sandbox {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_atem"));
+        let mut command = CommandBuilder::new(atem_bin());
         command.args(args);
         command.env_clear();
         for (name, value) in self.env() {
