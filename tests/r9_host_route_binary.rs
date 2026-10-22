@@ -22,7 +22,10 @@
 //!   makes it Astation's;
 //! - carrier (A): an unpinned host and a held host answer no challenge,
 //!   authenticate to the Mac in the room as before, and the held one is
-//!   reconciled by the Mac's channel over that link.
+//!   reconciled by the Mac's channel over that link;
+//! - after a pin or that reconciliation, the relay link (no proof on it)
+//!   reconnects once, after any running Astation operation, proves its
+//!   route and stays routed with the Mac gone; a local link never does.
 #![cfg(target_os = "linux")]
 
 mod support;
@@ -197,6 +200,56 @@ impl Rig {
         let (out, err, _) = self.sandbox.atem(&["status"]);
         format!("{out}{err}")
     }
+
+    /// Pins the test's device list while the runtime runs (as a pairing's
+    /// verification does).
+    fn pin(&self) {
+        let seed = secret("route host seed");
+        write_pin(&self.sandbox.config(), &self.log, HOST, 1, &seed);
+    }
+
+    /// §R9.7b after a pin or a reconciliation: connection 1 (no proof on
+    /// it) closes, connection 2 proves its route and is routed with the Mac
+    /// offline, held past the old deadline with a phone admitted, and
+    /// nothing reconnects again.
+    fn reconnected_to_prove(&self) {
+        let mut closed = false;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.event(left) {
+                Some(RelayEvent::Closed(1)) => closed = true,
+                Some(RelayEvent::Proof { link: 2, .. }) => break,
+                other => panic!("no reconnect to prove: {other:?}\n{}", self.runtime_log()),
+            }
+        }
+        if !closed {
+            self.closed(1, Duration::from_secs(5));
+        }
+        within("the route to be held", || {
+            self.runtime_log()
+                .contains("relay route held (no Astation)")
+        });
+        assert!(
+            self.event(AUTH_DEADLINE + Duration::from_secs(2)).is_none(),
+            "the routed link was dropped or retried\n{}",
+            self.runtime_log()
+        );
+        let log = self.runtime_log();
+        assert_eq!(
+            log.matches("relay link reconnecting to prove its route")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("host_route ok at head"), "{log}");
+        assert!(self.status().contains("r9 routed (no Astation)"));
+        let mut router = Router::on(&self.relay, 2);
+        let phone = Identity::native("dev-phone", auth("dev-phone"));
+        router
+            .connect("ph1", &self.log, HOST, &phone)
+            .unwrap_or_else(|e| panic!("{e:?}\n{}", self.runtime_log()));
+    }
 }
 
 impl Drop for Rig {
@@ -235,6 +288,17 @@ fn astation_only(_: u64, _: Value) -> Reply {
     Reply::AstationFirst {
         ok: None,
         reply_first: false,
+    }
+}
+
+/// Carrier (A) on the first connection (the Mac in the room, Astation
+/// authenticates the link); later connections find the Mac offline and
+/// are routed on the proof alone.
+fn astation_then_mac_offline(n: u64, head: Value) -> Reply {
+    if n == 1 {
+        astation_only(n, head)
+    } else {
+        ok(n, head)
     }
 }
 
@@ -360,7 +424,13 @@ fn an_unpinned_host_authenticates_over_carrier_a_without_a_proof() {
 /// (the fault record goes, the list is pinned again).
 #[test]
 fn a_held_host_is_reconciled_over_carrier_a() {
-    let rig = Rig::start_full(true, true, true, AuthReply::Authenticated, astation_only);
+    let rig = Rig::start_full(
+        true,
+        true,
+        true,
+        AuthReply::Authenticated,
+        astation_then_mac_offline,
+    );
     let mut router = Router::new(&rig.relay);
     assert!(
         rig.event(Duration::from_secs(1)).is_none(),
@@ -397,7 +467,9 @@ fn a_held_host_is_reconciled_over_carrier_a() {
     assert!(!fault.exists());
     let status = rig.status();
     assert!(status.contains("Device list:    pinned at seq"), "{status}");
-    assert!(rig.event(Duration::from_millis(500)).is_none(), "same link");
+    // Reconciled: the link, which answered no challenge, reconnects once
+    // and proves its route (the Mac offline by then: routed, held).
+    rig.reconnected_to_prove();
 }
 
 /// (a), (d): routed with no Astation, held three times past the old
@@ -726,4 +798,121 @@ fn unpair_drops_a_routed_link_at_once() {
     let (out, err, ok) = rig.sandbox.atem(&["unpair", "--yes"]);
     assert!(ok, "{out}{err}");
     rig.closed(1, Duration::from_secs(3));
+}
+
+/// Task 12 (a): a host paired over carrier (A) (no device list at connect,
+/// so no proof) reconnects once when its list is pinned, proves its route
+/// on the new link, and stays routed with the Mac gone.
+#[test]
+fn a_host_pinned_over_carrier_a_reconnects_once_to_prove_its_route() {
+    let rig = Rig::start_full(
+        true,
+        false,
+        false,
+        AuthReply::Authenticated,
+        astation_then_mac_offline,
+    );
+    let _router = Router::new(&rig.relay);
+    within("the status to show Astation", || {
+        rig.status().contains("connected via relay (")
+    });
+    assert!(rig.event(Duration::from_millis(500)).is_none(), "no proof");
+    rig.pin();
+    rig.reconnected_to_prove();
+}
+
+/// Task 12 (b): a running Astation operation (`atem pair verify` waiting
+/// for Astation's keys) delays the reconnect after a pin until it ends.
+#[test]
+fn a_running_astation_operation_delays_the_reconnect() {
+    let rig = Rig::start_full(
+        false,
+        false,
+        false,
+        AuthReply::Authenticated,
+        astation_then_mac_offline,
+    );
+    let _router = Router::new(&rig.relay);
+    let mut verify = Command::new(env!("CARGO_BIN_EXE_atem"))
+        .args(["pair", "verify"])
+        .env_clear()
+        .envs(rig.sandbox.env())
+        .current_dir(&rig.sandbox.home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rig.relay.events.recv_timeout(left) {
+            Ok(Event::Message(1, v)) if v["type"] == "verifyCommit" => break,
+            Ok(_) => {}
+            Err(_) => panic!("no verifyCommit\n{}", rig.runtime_log()),
+        }
+    }
+    rig.pin();
+    within("the list to be opened", || {
+        rig.runtime_log().contains("device list: opened at seq")
+    });
+    assert!(
+        rig.event(Duration::from_secs(3)).is_none(),
+        "reconnected during the operation\n{}",
+        rig.runtime_log()
+    );
+    assert!(!rig.runtime_log().contains("reconnecting to prove"));
+    // The operation ends (its CLI goes away): then the reconnect.
+    let _ = verify.kill();
+    let _ = verify.wait();
+    rig.reconnected_to_prove();
+}
+
+/// Task 12 (d): a local (loopback) Astation link never answers challenges
+/// and never reconnects for a pin.
+#[test]
+fn a_local_link_never_reconnects_for_a_pin() {
+    let sandbox = Sandbox::new();
+    write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
+    let host_seed = secret("route host seed");
+    let mut log = TestLog::genesis(ACCOUNT, &secret("route astation"));
+    log.add_host(HOST, 1, &host_seed);
+    log.add_native("dev-phone", &["control", "view"]);
+    let astation = FakeAstation::start();
+    let output = std::fs::File::create(sandbox.dir.path().join("runtime.log")).unwrap();
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_atem"))
+        .arg("runtime")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &sandbox.home)
+        .env("XDG_RUNTIME_DIR", &sandbox.run)
+        .env("ASTATION_WS", &astation.url)
+        .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::null())
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let runtime_log =
+        || std::fs::read_to_string(sandbox.dir.path().join("runtime.log")).unwrap_or_default();
+    let _router = Router::new(&astation);
+    write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
+    within("the list to be opened", || {
+        runtime_log().contains("device list: opened at seq")
+    });
+    let until = Instant::now() + Duration::from_secs(4);
+    let mut reconnected = None;
+    while let Ok(event) = astation
+        .events
+        .recv_timeout(until.saturating_duration_since(Instant::now()))
+    {
+        if let Event::Authenticated(n) = event {
+            reconnected = Some(n);
+        }
+    }
+    let text = runtime_log();
+    let _ = runtime.kill();
+    let _ = runtime.wait();
+    assert!(reconnected.is_none(), "{text}");
+    assert!(!text.contains("reconnecting to prove"), "{text}");
 }
