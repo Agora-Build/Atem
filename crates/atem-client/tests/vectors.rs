@@ -237,6 +237,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-browser-grant.json",
             "r9-vectors-channel-handshake.json",
             "r9-vectors-encoding.json",
+            "r9-vectors-host-route.json",
             "r9-vectors-keys.json",
             "r9-vectors-membership-log.json",
             "r9-vectors-pairing.json",
@@ -2155,4 +2156,118 @@ fn pairing() {
         checked += 1;
     }
     assert_eq!(checked, 12);
+}
+
+#[test]
+fn host_route() {
+    use atem_client::host_route::{
+        HostChallenge, HostRouteBody, verify_host_route, verify_host_route_message,
+    };
+    let mut run = Run::new("r9-vectors-host-route");
+    let book = Book::load();
+    let file = load("r9-vectors-membership-log");
+    let ctx = Context::new(&file["log"], &file["others"], genesis_hash());
+    let extra: BTreeMap<String, Entry> = run
+        .get("entries")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let entry = Entry::from_strict(&strict(&v["entry"])).unwrap();
+            assert_eq!(entry.hash().to_hex(), s(v, "entry_hash"));
+            (s(v, "label").to_owned(), entry)
+        })
+        .collect();
+    let chain = |more: &Value| -> Membership {
+        let mut log = ctx.chain(&[]);
+        for label in more.as_array().unwrap() {
+            let entry = &extra[label.as_str().unwrap()];
+            assert_eq!(log.check_next(entry), Check::Valid);
+            let entries: Vec<Entry> = log
+                .entries()
+                .iter()
+                .cloned()
+                .chain([entry.clone()])
+                .collect();
+            log = Membership::verify_chain("acct-test-1", &genesis_hash(), &entries, &ctx.now)
+                .unwrap()
+                .membership;
+        }
+        log
+    };
+    run.pass("entries: H7_* chain on L (dev-mac), entry_hash");
+
+    let challenge = run.get("challenge");
+    let parsed = HostChallenge::parse(challenge["message"].to_string().as_bytes()).unwrap();
+    assert_eq!(hex(&parsed.nonce), s(&challenge, "nonce_hex"));
+    assert_eq!(parsed.room, s(&challenge, "room"));
+    assert_eq!(parsed.to_json(), challenge["message"]);
+    let nonce = parsed.nonce;
+    let room = s(&challenge, "room").to_owned();
+    let atem_id = s(&challenge, "atem_id").to_owned();
+    run.pass("challenge: parsed exactly, rebuilt");
+
+    for case in run.get("valid").as_array().unwrap() {
+        let label = s(case, "label");
+        let log = chain(&case["chain"]);
+        let message = case["message"].to_string();
+        let route = verify_host_route_message(&log, message.as_bytes(), &nonce, &room, &atem_id)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(route.host_id, s(&case["expect"], "host_id"), "{label}");
+        assert_eq!(route.head.to_json(), case["expect"]["head"], "{label}");
+        let proof = case["message"]["proof"].to_string();
+        assert_eq!(
+            verify_host_route(&log, proof.as_bytes(), &nonce, &room, &atem_id),
+            Ok(route)
+        );
+        let object = SignedObject::from_strict(&strict(&case["message"]["proof"])).unwrap();
+        assert_eq!(object.label(), SignLabel::HostRoute);
+        assert_eq!(object.jcs(), s(case, "jcs"));
+        assert_eq!(
+            hex(object.signing_input().as_bytes()),
+            s(case, "signing_input_hex")
+        );
+        // Ed25519 is deterministic: the host's own builder reproduces it.
+        let host = s(&case["expect"], "host_id");
+        let key = log.host(host).unwrap().host_key.clone();
+        let signer = ["host-a", "host-evil"]
+            .into_iter()
+            .find(|k| book.signer_public(k) == key)
+            .unwrap();
+        let body = HostRouteBody {
+            head: Head::from_json(&object.body()["head"]).unwrap(),
+            ..HostRouteBody::at(&log, host, &atem_id, &parsed)
+        };
+        let resigned =
+            atem_client::host_route::sign_host_route(&book.provider, &book.signer(signer), &body)
+                .unwrap();
+        assert_eq!(resigned, object, "{label}");
+        run.pass(format!(
+            "{label}: verifies; signing input and signature reproduced"
+        ));
+    }
+
+    for case in run.get("invalid").as_array().unwrap() {
+        let label = s(case, "label");
+        let log = chain(&case["chain"]);
+        let message = case["message"].to_string();
+        let refusal = verify_host_route_message(&log, message.as_bytes(), &nonce, &room, &atem_id)
+            .expect_err(label);
+        assert_eq!(refusal.code(), s(case, "code"), "{label}: {refusal}");
+        run.pass(format!("{label}: refused {}", s(case, "code")));
+    }
+    for case in run.get("invalid_text").as_array().unwrap() {
+        let label = s(case, "label");
+        let refusal = verify_host_route_message(
+            &ctx.chain(&[]),
+            s(case, "text").as_bytes(),
+            &nonce,
+            &room,
+            &atem_id,
+        )
+        .expect_err(label);
+        assert_eq!(refusal.code(), s(case, "code"), "{label}");
+        run.pass(format!("{label}: refused {}", s(case, "code")));
+    }
+    run.finish();
 }

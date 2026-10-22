@@ -53,6 +53,11 @@
 //!   the host's per-approval seen state and resend outbox;
 //! - [`restore::RestoreFlow`]: the Recovery Kit restore as a client
 //!   machine (withheld until a host-signed head confirms the log).
+//!
+//! The relay route (§R9.7b):
+//!
+//! - [`host_route`]: the host route proof a host signs for the relay's
+//!   challenge, and the relay's verifier against its log.
 
 pub mod backup;
 pub mod backup_writer;
@@ -63,6 +68,7 @@ pub mod connect;
 pub mod domain;
 pub mod encoding;
 pub mod error;
+pub mod host_route;
 pub mod hpke;
 pub mod keys;
 pub mod kit;

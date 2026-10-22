@@ -135,19 +135,9 @@ impl PublicKeyData {
     }
 }
 
-impl From<SignLabel> for SignLabelKind {
-    fn from(label: SignLabel) -> Self {
-        match label {
-            SignLabel::MembershipEntry => SignLabelKind::MembershipEntry,
-            SignLabel::RecoveryCosign => SignLabelKind::RecoveryCosign,
-            SignLabel::BrowserGrant => SignLabelKind::BrowserGrant,
-            SignLabel::PushHint => SignLabelKind::PushHint,
-            SignLabel::Seen => SignLabelKind::Seen,
-            SignLabel::ChannelHost => SignLabelKind::ChannelHost,
-            SignLabel::ChannelClient => SignLabelKind::ChannelClient,
-        }
-    }
-}
+// No `From<SignLabel> for SignLabelKind`: the bindings name the labels an
+// app signs or checks; the host route label (§R9.7b) is the host's only
+// (the relay verifies it in Rust) and has no binding kind.
 
 impl From<SignLabelKind> for SignLabel {
     fn from(label: SignLabelKind) -> Self {
@@ -175,7 +165,9 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
     match input.label() {
         SignLabel::ChannelClient => (SigningPurpose::Channel, None),
         SignLabel::ChannelHost => (SigningPurpose::HostSigning, None),
-        SignLabel::PushHint | SignLabel::Seen => (SigningPurpose::HostSigning, body()),
+        SignLabel::PushHint | SignLabel::Seen | SignLabel::HostRoute => {
+            (SigningPurpose::HostSigning, body())
+        }
         SignLabel::BrowserGrant => (SigningPurpose::BrowserGrant, body()),
         SignLabel::RecoveryCosign => (SigningPurpose::Kit, body()),
         SignLabel::MembershipEntry => {

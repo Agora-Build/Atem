@@ -22,6 +22,8 @@ pub enum SignLabel {
     ChannelHost,
     /// `sig_c` over `th3` (§R9.7).
     ChannelClient,
+    /// `atem-host-route` bodies (§R9.7b).
+    HostRoute,
 }
 
 impl SignLabel {
@@ -34,6 +36,7 @@ impl SignLabel {
             SignLabel::Seen => "atem-seen-v1",
             SignLabel::ChannelHost => "atem-ch1-host-sig-v1",
             SignLabel::ChannelClient => "atem-ch1-client-sig-v1",
+            SignLabel::HostRoute => "atem-host-route-v1",
         }
     }
 
@@ -45,6 +48,7 @@ impl SignLabel {
             "atem-browser-grant" => Some(SignLabel::BrowserGrant),
             "atem-push-hint" => Some(SignLabel::PushHint),
             "atem-seen" => Some(SignLabel::Seen),
+            "atem-host-route" => Some(SignLabel::HostRoute),
             _ => None,
         }
     }
@@ -110,6 +114,7 @@ mod tests {
             SignLabel::Seen,
             SignLabel::ChannelHost,
             SignLabel::ChannelClient,
+            SignLabel::HostRoute,
         ]
         .map(SignLabel::as_str);
         let others = [
