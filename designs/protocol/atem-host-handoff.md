@@ -743,8 +743,10 @@ Router obligations (the relay and Astation's :8080):
   proves no route: it is reconciled over (A), the Mac in the room
   authenticating its relay link (tested over the fake relay). After
   enrollment (the list pinned) or a reconciliation, a relay link that
-  proved no route is dropped once and reconnected, once no Astation
-  operation runs and no request or channel is mid-admission, so the new
+  proved no route (including the link `atem pair` installed) is dropped
+  once and reconnected, once no Astation operation runs and no request or
+  channel is mid-admission (channels: at most 30 s) and only while the
+  host can still answer a challenge, so the new
   link proves its route and the host stays reachable when the Mac goes
   offline (runtime.log `relay link reconnecting to prove its route`; at
   most once per event, never on a local link). Vectors

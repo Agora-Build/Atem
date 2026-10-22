@@ -3117,17 +3117,22 @@ reconciliation answered no challenge (the list was unpinned or held when
 it connected), and a link answers only one challenge, at connect. So
 when the host becomes able to answer (its list pinned, or a held list
 reconciled) and its current relay link sent no proof and got no
-`host_route_ok`, the runtime drops that link once and reconnects at once:
+`host_route_ok` (the link `atem pair` itself opened and installed counts:
+it never answers a challenge), the runtime drops that link once and
+reconnects at once:
 the new link gets the relay's challenge, proves its route and is routed
 over (B), and the Mac, if still in the room, authenticates it as usual
 (the ordering rules above). This waits until no Astation operation runs
 (`atem pair`, `atem pair verify` and `atem cred unlock` are never cut
 off), no connect or re-authentication is under way, no session-family
-request or r9 channel is mid-admission, and the link's channel envelopes
-went out (at most 5 s; e.g. the welcome of the managing device whose
-channel reconciled the list, whose channel then closes with the link and
-is reopened on the new one). runtime.log: `relay link reconnecting to
-prove its route`. At most one reconnect per pin or reconciliation, and
+request is waiting, no r9 channel is mid-admission (at most 30 s, then
+it reconnects anyway, logged), and the link's channel envelopes went out
+(at most 5 s; e.g. the welcome of the managing device whose channel
+reconciled the list, whose channel then closes with the link and is
+reopened on the new one). When it fires, the host must still be able to
+answer a challenge; if the list was held, frozen or faulted meanwhile,
+or its key is gone, the reconnect is dropped (logged once). runtime.log:
+`relay link reconnecting to prove its route`. At most one reconnect per pin or reconciliation, and
 no loop: a new link that still gets no challenge stays as it is. A local
 (loopback/LAN) link, which never sees a challenge, never reconnects for
 this. No wire change.
