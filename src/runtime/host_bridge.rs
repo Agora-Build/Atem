@@ -85,6 +85,7 @@ use crate::session_protocol::membership::{
 };
 use crate::session_protocol::r9::{
     self as r9host, HostKey, Now as R9Now, Parts as R9Parts, R9Host,
+    route::{RouteIdentity, RouteState},
 };
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
@@ -546,7 +547,7 @@ pub struct HostBridge {
     /// The profile's pairing files (the device list is reopened from them).
     pairing: Option<crate::paths::PairingPaths>,
     /// The pinned host's `host_channel_key`; r9 can't serve without it.
-    host_key: Option<HostKey>,
+    host_key: Option<std::sync::Arc<HostKey>>,
     host_key_error: Option<String>,
     /// The loaded key's public half (b64u), to tell a re-pin's new key.
     host_pub: Option<String>,
@@ -672,7 +673,7 @@ impl HostBridge {
         let (host_key, host_key_error) = match (&membership, &pairing) {
             (Some(m), Some(pairing)) => {
                 match membership::host_channel_seed(pairing, m.membership(), &m.pin_of().host_id) {
-                    Ok(seed) => (Some(HostKey::new(&seed)), None),
+                    Ok(seed) => (Some(std::sync::Arc::new(HostKey::new(&seed))), None),
                     Err(error) => {
                         eprintln!(
                             "atem runtime: device list: {error}; r9 remote access is refused"
@@ -991,6 +992,47 @@ impl HostBridge {
         Some(status)
     }
 
+    /// Whether the relay link answers a `host_challenge` now (§R9.7b): only
+    /// with a pinned device list that can serve (not held, frozen or
+    /// faulted; the journal not halted; the host channel key loaded), at
+    /// its head. Push's suppression rules (§R9.9) with the same words.
+    pub(super) fn route_state(&self) -> RouteState {
+        if self.host.journal_halted() {
+            return RouteState::Off("journal halted");
+        }
+        if self.membership_error.is_some() {
+            return RouteState::Off("device list failed");
+        }
+        let Some(m) = &self.membership else {
+            return RouteState::Off(r9host::push::NO_LIST);
+        };
+        let Some(key) = &self.host_key else {
+            return RouteState::Off("no host channel key");
+        };
+        if m.unpaired() {
+            return RouteState::Off(r9host::push::NO_LIST);
+        }
+        if m.is_frozen() {
+            return RouteState::Off("device list frozen");
+        }
+        if m.faulted().is_some() {
+            return RouteState::Off("device list faulted");
+        }
+        if m.held().is_some() {
+            return RouteState::Off("device list held");
+        }
+        let log = m.membership();
+        RouteState::Ready {
+            id: RouteIdentity {
+                account_id: log.account_id().to_owned(),
+                genesis_hash: log.genesis_hash(),
+                host_id: m.pin_of().host_id.clone(),
+                head: m.head(),
+            },
+            key: key.clone(),
+        }
+    }
+
     /// Runs `f` on the r9 host with this bridge's session host, device
     /// list and clocks.
     fn r9_call<T>(&mut self, f: impl FnOnce(&mut R9Host, &mut R9Parts<'_, FileJournal>) -> T) -> T {
@@ -1001,7 +1043,7 @@ impl HostBridge {
             &self.host_key_error,
         ) {
             (_, Some(error), _, _) => r9host::DeviceList::Failed(error),
-            (Some(m), None, Some(key), _) => r9host::DeviceList::Open { m, key },
+            (Some(m), None, Some(key), _) => r9host::DeviceList::Open { m, key: &**key },
             (Some(_), None, None, Some(error)) => r9host::DeviceList::Failed(error),
             (Some(_), None, None, None) => r9host::DeviceList::Failed("no host channel key"),
             (None, None, _, _) => r9host::DeviceList::None,
@@ -1174,7 +1216,7 @@ impl HostBridge {
             {
                 match membership::host_channel_seed(&pairing, m.membership(), &m.pin_of().host_id) {
                     Ok(seed) => {
-                        self.host_key = Some(HostKey::new(&seed));
+                        self.host_key = Some(std::sync::Arc::new(HostKey::new(&seed)));
                         self.host_pub = membership::peek_host_pub(&pairing);
                         self.host_key_error = None;
                     }
@@ -1219,7 +1261,7 @@ impl HostBridge {
                         &m.pin_of().host_id,
                     ) {
                         Ok(seed) => {
-                            self.host_key = Some(HostKey::new(&seed));
+                            self.host_key = Some(std::sync::Arc::new(HostKey::new(&seed)));
                             self.host_pub = membership::peek_host_pub(&pairing);
                         }
                         Err(error) => {
@@ -1492,6 +1534,8 @@ impl HostBridge {
                 .flush_relay(&mut |text| client.try_send_wire(text, false).is_ok());
         }
         self.r9.end_pass();
+        // §R9.7b: the relay link answers challenges at this pass's state.
+        crate::session_protocol::r9::route::set(&app.host_route, self.route_state());
         if let Some(hosted) = app.hosted.as_mut() {
             hosted.sessions = cx
                 .sessions

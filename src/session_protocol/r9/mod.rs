@@ -33,6 +33,7 @@ pub mod push;
 #[cfg(test)]
 mod push_tests;
 mod revoked;
+pub mod route;
 #[cfg(test)]
 mod tests;
 

@@ -4323,3 +4323,119 @@ fn the_welcome_line_names_the_trust_generation() {
         "replaced attachment a1b2c3d4 with e5f6a7b8; welcome (trust gen 6)"
     );
 }
+
+/// §R9.7b: the relay link answers the relay's `host_challenge` only on a
+/// host with a pinned device list that can serve, once per challenge, for
+/// the link's own room; the proof verifies with the shared verifier
+/// against the host's log. Held or frozen: nothing.
+#[test]
+fn the_host_route_is_answered_only_with_a_pinned_list_that_can_serve() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    use crate::session_protocol::r9::route::{self, LinkRoute, MAX_ANSWERS_PER_LINK, RouteState};
+    use atem_client::host_route::{HostChallenge, verify_host_route_message};
+    const ROOM: &str = "astation-room";
+    const ATEM_ID: &str = "hosta-0000000-1a2b3c4d";
+    let dir = short_dir();
+    let sources = crate::profile::Sources::in_dir(&dir.path().join("profile"));
+    let journal = dir.path().join("journal");
+    let challenge = |room: &str| HostChallenge::new(room).to_json().to_string();
+
+    // No device list: no answer.
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    let handle = route::new_handle();
+    route::set(&handle, bridge.route_state());
+    assert!(matches!(
+        bridge.route_state(),
+        RouteState::Off("no device list")
+    ));
+    assert_eq!(
+        LinkRoute::new(handle.clone(), ROOM, ATEM_ID).answer(&challenge(ROOM)),
+        None
+    );
+    drop(bridge);
+
+    // A pinned list: answered at its head, verified by the relay's verifier.
+    let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+    log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+    let pairing = sources.paths.pairing.clone();
+    let pin = HostPin {
+        host_id: DEVICE.into(),
+        host_trust_gen: TRUST_GEN,
+    };
+    MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    route::set(&handle, bridge.route_state());
+    let mut link = LinkRoute::new(handle.clone(), ROOM, ATEM_ID);
+    let first = HostChallenge::new(ROOM);
+    let text = first.to_json().to_string();
+    let answer = link.answer(&text).expect("answered");
+    let route = verify_host_route_message(&log.log, answer.as_bytes(), &first.nonce, ROOM, ATEM_ID)
+        .unwrap();
+    assert_eq!(route.host_id, DEVICE);
+    assert_eq!(route.head, log.log.head());
+    // Once per challenge; never for another room; a malformed one ignored.
+    assert_eq!(link.answer(&text), None);
+    assert_eq!(link.answer(&challenge("another-room")), None);
+    assert_eq!(
+        link.answer(r#"{"type":"relay","op":"host_challenge","v":1,"room":"astation-room"}"#),
+        None
+    );
+    // Each new challenge once, up to the bound per link.
+    for _ in 1..MAX_ANSWERS_PER_LINK {
+        assert!(link.answer(&challenge(ROOM)).is_some());
+    }
+    assert_eq!(link.answer(&challenge(ROOM)), None, "bounded per link");
+    drop(bridge);
+
+    // Held (a fault record): nothing.
+    crate::paths::write_test_file(
+        &pairing.fault,
+        json!({"v": 1, "runtime_epoch": 1}).to_string(),
+    );
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(
+        bridge.route_state(),
+        RouteState::Off("device list held")
+    ));
+    route::set(&handle, bridge.route_state());
+    assert_eq!(
+        LinkRoute::new(handle.clone(), ROOM, ATEM_ID).answer(&challenge(ROOM)),
+        None
+    );
+    drop(bridge);
+}
+
+/// §R9.7b: a frozen device list answers no challenge.
+#[test]
+fn a_frozen_host_answers_no_host_challenge() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    use crate::session_protocol::r9::route::{self, LinkRoute, RouteState};
+    use atem_client::host_route::HostChallenge;
+    let dir = short_dir();
+    let sources = crate::profile::Sources::in_dir(&dir.path().join("profile"));
+    let journal = dir.path().join("journal");
+    let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+    log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+    let pairing = sources.paths.pairing.clone();
+    let pin = HostPin {
+        host_id: DEVICE.into(),
+        host_trust_gen: TRUST_GEN,
+    };
+    MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+    // A freeze file that can't be read: frozen, fail closed.
+    crate::paths::write_test_file(&pairing.freeze, b"{damaged");
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(
+        bridge.route_state(),
+        RouteState::Off("device list frozen")
+    ));
+    let handle = route::new_handle();
+    route::set(&handle, bridge.route_state());
+    let text = HostChallenge::new("astation-room").to_json().to_string();
+    assert_eq!(
+        LinkRoute::new(handle, "astation-room", "atem-x").answer(&text),
+        None
+    );
+}

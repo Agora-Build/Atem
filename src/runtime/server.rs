@@ -240,6 +240,15 @@ pub async fn serve(
             }
         };
     app.hosted = Some(crate::app::hosted::Hosted::default());
+    // §R9.7b: the relay link (already connecting) answers the relay's
+    // challenge from the device list as opened, then as each pass leaves it.
+    crate::session_protocol::r9::route::set(
+        &app.host_route,
+        match &bridge {
+            Some(bridge) => bridge.route_state(),
+            None => crate::session_protocol::r9::route::RouteState::Off("remote sessions disabled"),
+        },
+    );
     let (op_calls, mut op_called) = mpsc::unbounded_channel::<OpCall>();
     let mut server = Server {
         app,

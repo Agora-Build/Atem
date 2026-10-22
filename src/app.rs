@@ -77,6 +77,9 @@ pub struct App {
     /// messages for its session host (see `app/hosted.rs`). `None` in the TUI,
     /// which refuses remote session, terminal and chat messages.
     pub hosted: Option<hosted::Hosted>,
+    /// The host route state the broker keeps current (§R9.7b): the relay
+    /// link answers the relay's `host_challenge` from it.
+    pub host_route: crate::session_protocol::r9::route::RouteHandle,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,
     pub force_terminal_redraw: bool,
@@ -135,6 +138,7 @@ impl App {
             astation_link_gen: 0,
             astation_reconnect: true,
             hosted: None,
+            host_route: crate::session_protocol::r9::route::new_handle(),
             connected_astation_id: None,
             force_terminal_redraw: false,
             show_certificates: false,
@@ -430,6 +434,7 @@ impl App {
         self.config = config.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.astation_connect_rx = Some(rx);
+        let host_route = self.host_route.clone();
         tokio::spawn(async move {
             // Connection priority:
             // 1. Local URL (from config or default ws://127.0.0.1:8080/ws)
@@ -466,7 +471,8 @@ impl App {
                 .map(|record| record.astation_id);
             if let Some(relay_code) = paired {
                 let relay_url = config.astation_relay_url().to_string();
-                let mut relay_client = crate::websocket_client::AstationClient::new();
+                let mut relay_client = crate::websocket_client::AstationClient::new()
+                    .with_host_route(host_route);
                 match relay_client
                     .connect_relay_identity_without_pairing(&relay_url, &relay_code)
                     .await

@@ -524,6 +524,12 @@ pub struct AstationClient {
     is_op_view: bool,
     /// How this client reached Astation, once connected (`atem status`).
     via: Option<LinkVia>,
+    /// The runtime's host route state (§R9.7b): a relay link answers the
+    /// relay's `host_challenge` from it (`with_host_route`).
+    host_route: Option<crate::session_protocol::r9::route::RouteHandle>,
+    /// The room and `atem_id` of the relay link `connect_raw` opens next
+    /// (taken by it): only a relay identity link answers challenges.
+    route_link: Option<(String, String)>,
 }
 
 /// How a link reached Astation, for `atem status`: never a secret (no
@@ -620,7 +626,19 @@ impl AstationClient {
             agent: None,
             is_op_view: false,
             via: None,
+            host_route: None,
+            route_link: None,
         }
+    }
+
+    /// Its relay links answer the relay's `host_challenge` from `handle`
+    /// (§R9.7b; the runtime's links only).
+    pub(crate) fn with_host_route(
+        mut self,
+        handle: crate::session_protocol::r9::route::RouteHandle,
+    ) -> Self {
+        self.host_route = Some(handle);
+        self
     }
 
     /// Encryption messages and reports use `agent` (not this user's).
@@ -952,7 +970,16 @@ impl AstationClient {
     /// Connect WebSocket transport only, without authentication.
     /// Used by relay flow where auth happens separately after code exchange.
     pub async fn connect_raw(&mut self, url: &str) -> Result<()> {
+        // §R9.7b: a relay identity link answers the relay's challenge in its
+        // reader, as it arrives (the authentication reads nothing else).
+        let route_link = self.route_link.take();
         self.abort_transport();
+        let mut route = match (&self.host_route, route_link) {
+            (Some(handle), Some((room, atem_id))) => Some(
+                crate::session_protocol::r9::route::LinkRoute::new(handle.clone(), &room, &atem_id),
+            ),
+            _ => None,
+        };
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async_with_config(url, Some(link_ws_config()), false))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
@@ -992,6 +1019,8 @@ impl AstationClient {
             }
         });
 
+        let route_tx = msg_tx.clone();
+        let mut route_ignored = false;
         // Spawn task to handle incoming messages
         let reader_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
@@ -1038,6 +1067,22 @@ impl AstationClient {
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
                             None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),
+                            // §R9.7b: answered here, once; never passed on.
+                            None if crate::session_protocol::r9::route::is_host_challenge(&text) => {
+                                match route.as_mut() {
+                                    Some(route) => {
+                                        if let Some(answer) = route.answer_when_open(&text).await {
+                                            let _ = route_tx.send(OutboundMessage { message: AstationMessage::SessionWire(answer), delivered: None });
+                                        }
+                                    }
+                                    None if !route_ignored => {
+                                        route_ignored = true;
+                                        eprintln!("atem: r9: a host_challenge on a link that isn't a relay identity link was ignored");
+                                    }
+                                    None => {}
+                                }
+                                None
+                            }
                             None if is_relay_message(&text) => Some(AstationMessage::Relay(text)),
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };
@@ -1892,6 +1937,7 @@ impl AstationClient {
         let atem_id = self.resolved_atem_id(&hostname);
 
         let ws_url = relay_ws_url(&ws_scheme, identity_code, &atem_id);
+        self.route_link = Some((identity_code.to_string(), atem_id.clone()));
         self.connect_raw(&ws_url).await?;
 
         // Send hello to announce ourselves and trigger Astation to send credentials
@@ -2130,6 +2176,121 @@ mod tests {
         assert!(!is_relay_message(r#"{"op":"push_ack"}"#));
         assert!(!is_relay_message("not json"));
         assert_eq!(session_family(r#"{"type":"relay","op":"push_ack"}"#), None);
+    }
+
+    /// A test relay that sends a `host_challenge` for `room` first, then
+    /// returns the challenge and the first `host_route` Atem sends (none
+    /// within 1.5 s: `None`); it then closes the socket.
+    async fn challenging_relay(
+        room: &'static str,
+    ) -> (String, tokio::task::JoinHandle<(atem_client::host_route::HostChallenge, Option<String>)>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let challenge = atem_client::host_route::HostChallenge::new(room);
+            socket.send(Message::Text(challenge.to_json().to_string())).await.unwrap();
+            let answer = tokio::time::timeout(Duration::from_millis(1_500), async {
+                while let Some(Ok(frame)) = socket.next().await {
+                    if let Message::Text(text) = frame
+                        && text.contains("\"host_route\"")
+                    {
+                        return Some(text);
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+            let _ = socket.close(None).await;
+            (challenge, answer)
+        });
+        (format!("http://{address}"), server)
+    }
+
+    /// §R9.7b: a relay identity link answers the relay's `host_challenge` as
+    /// it arrives, before (and without) any Astation authentication, with a
+    /// proof the shared verifier accepts; with no device list, or on a link
+    /// that isn't a relay identity link, nothing is sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relay_identity_link_answers_the_host_challenge_before_authentication() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
+        use atem_client::host_route::verify_host_route_message;
+        let mut log = TestLog::genesis("acct-1", &secret("ws astation"));
+        log.add_host("host-1", 1, &secret("ws host"));
+        let handle = route::new_handle();
+        route::set(
+            &handle,
+            RouteState::Ready {
+                id: RouteIdentity {
+                    account_id: "acct-1".into(),
+                    genesis_hash: log.log.genesis_hash(),
+                    host_id: "host-1".into(),
+                    head: log.log.head(),
+                },
+                key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
+                    "ws host",
+                ))),
+            },
+        );
+        let (state, client) = isolated_client("hosta-0000000-1a2b3c4d");
+        let _profile = crate::test_profile::use_dir(state.path());
+        let mut client = client.with_host_route(handle.clone());
+        let (base, server) = challenging_relay("mac-room").await;
+        // No Astation answers: the connect fails, the proof went out.
+        assert!(client.connect_relay_identity_without_pairing(&base, "mac-room").await.is_err());
+        let (challenge, answer) = server.await.unwrap();
+        let answer = answer.expect("the host answered the challenge");
+        let route = verify_host_route_message(
+            &log.log,
+            answer.as_bytes(),
+            &challenge.nonce,
+            "mac-room",
+            "hosta-0000000-1a2b3c4d",
+        )
+        .unwrap();
+        assert_eq!(route.host_id, "host-1");
+        assert_eq!(route.head, log.log.head());
+
+        // Another room than the link's: no answer.
+        let (base, server) = challenging_relay("another-room").await;
+        assert!(client.connect_relay_identity_without_pairing(&base, "mac-room").await.is_err());
+        assert_eq!(server.await.unwrap().1, None);
+
+        // No device list: no answer.
+        route::set(&handle, RouteState::Off("no device list"));
+        let (base, server) = challenging_relay("mac-room").await;
+        assert!(client.connect_relay_identity_without_pairing(&base, "mac-room").await.is_err());
+        assert_eq!(server.await.unwrap().1, None);
+
+        // A link that isn't a relay identity link (connect_raw alone) never
+        // answers, even with a device list.
+        route::set(
+            &handle,
+            RouteState::Ready {
+                id: RouteIdentity {
+                    account_id: "acct-1".into(),
+                    genesis_hash: log.log.genesis_hash(),
+                    host_id: "host-1".into(),
+                    head: log.log.head(),
+                },
+                key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
+                    "ws host",
+                ))),
+            },
+        );
+        let (base, server) = challenging_relay("mac-room").await;
+        client.connect_raw(&base.replace("http://", "ws://")).await.unwrap();
+        assert_eq!(server.await.unwrap().1, None);
+        // And the challenge never reaches the App as a relay message.
+        assert!(!matches!(
+            client.recv_message_async().await,
+            Some(AstationMessage::Relay(_))
+        ));
     }
 
     /// A delayed success for a connection whose pairing was replaced (atem
