@@ -289,10 +289,9 @@ pub async fn serve(
                 server.op_tick();
                 // §R9.7b: after a pin or reconciliation, once no operation
                 // runs and no r9 channel is mid-admission.
-                let busy = server.op.is_some()
-                    || server.op_waiting.is_some()
-                    || server.bridge.as_ref().is_some_and(HostBridge::r9_admitting);
-                server.app.route_reconnect_due(busy);
+                let op_running = server.op.is_some() || server.op_waiting.is_some();
+                let admitting = server.bridge.as_ref().is_some_and(HostBridge::r9_admitting);
+                server.app.route_reconnect_due(op_running, admitting);
             }
             Some(call) = op_called.recv() => server.op_call(call),
             Some(stream) = accepted.recv() => server.add_client(stream),

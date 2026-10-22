@@ -930,6 +930,13 @@ impl AstationClient {
         self.authenticate_after_challenge(auth_required, false).await
     }
 
+    /// Pretend this is a relay link that answered no challenge (an
+    /// operation's link, §R9.7b).
+    #[cfg(test)]
+    pub(crate) fn relay_link_for_test(&mut self) {
+        self.via = Some(LinkVia::Relay { label: "relay.test as atem-x".into() });
+    }
+
     /// Pretend the relay routed this link (§R9.7b) for `room` and its proof
     /// for `auth_required` used the saved session.
     #[cfg(test)]
@@ -1409,17 +1416,20 @@ impl AstationClient {
         }
     }
 
-    /// A relay identity link of the runtime that has not proved its route
-    /// (§R9.7b): it sent no proof and got no `host_route_ok`. `false` for a
-    /// local or LAN link, which never answers a challenge.
+    /// A relay link that has not proved its route (§R9.7b): it sent no
+    /// proof and got no `host_route_ok`. A relay link with no challenge
+    /// state (one an Astation operation made, e.g. `atem pair`'s) never
+    /// proves, so it counts as unproved. `false` for a local or LAN link,
+    /// which never answers a challenge.
     pub(crate) fn route_unproved(&self) -> bool {
         use std::sync::atomic::Ordering;
-        match (&self.route_ok, &self.route_proved) {
-            (Some(ok), Some(proved)) => {
-                !ok.load(Ordering::SeqCst) && !proved.load(Ordering::SeqCst)
-            }
-            _ => false,
+        if !matches!(self.via, Some(LinkVia::Relay { .. })) {
+            return false;
         }
+        let set = |flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>| {
+            flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
+        };
+        !set(&self.route_ok) && !set(&self.route_proved)
     }
 
     /// Routed for r9 only (§R9.7b): no Astation authenticated this link.

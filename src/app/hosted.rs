@@ -32,6 +32,9 @@ pub const CHANNEL_INBOX_BYTES: usize = 32 << 20;
 /// The route reconnect (§R9.7b) waits this long at most for the link's
 /// unwritten channel envelopes to go out.
 pub const ROUTE_RECONNECT_FLUSH: std::time::Duration = std::time::Duration::from_secs(5);
+/// The route reconnect (§R9.7b) waits this long at most for r9 channels
+/// mid-admission (a client that keeps opening channels can't hold it off).
+pub const ROUTE_RECONNECT_ADMISSION: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One broker session as mark tasks see it.
 #[derive(Debug, Clone)]
@@ -239,16 +242,19 @@ impl App {
 
     /// §R9.7b, after a device list was pinned or a held one reconciled
     /// (`route_reconnect`): once nothing is in flight (no Astation
-    /// operation and no r9 channel mid-admission (`busy`), no connect or
-    /// re-authentication, no session-family message waiting for admission,
-    /// and, for up to [`ROUTE_RECONNECT_FLUSH`], no channel envelope still
-    /// unwritten, e.g. the welcome of the channel that reconciled the
-    /// list), a relay link that proved no route (it answered no challenge
-    /// then) is dropped and reconnected at once, so the new link answers
-    /// the relay's challenge and is routed. Once per event: a local link, a
-    /// link that already proved, or no link at all (the next connect
-    /// proves) ends it too.
-    pub fn route_reconnect_due(&mut self, busy: bool) -> bool {
+    /// operation (`op_running`), no connect or re-authentication, no
+    /// session-family message waiting for admission, for up to
+    /// [`ROUTE_RECONNECT_ADMISSION`] no r9 channel mid-admission
+    /// (`admitting`), and for up to [`ROUTE_RECONNECT_FLUSH`] no channel
+    /// envelope still unwritten, e.g. the welcome of the channel that
+    /// reconciled the list), a relay link that proved no route (it answered
+    /// no challenge then, or it is an operation's link, which never does)
+    /// is dropped and reconnected at once, so the new link answers the
+    /// relay's challenge and is routed. Only while the host can still
+    /// answer one (else the event is dropped, logged). Once per event: a
+    /// local link, a link that already proved, or no link at all (the next
+    /// connect proves) ends it too.
+    pub fn route_reconnect_due(&mut self, op_running: bool, admitting: bool) -> bool {
         let Some(since) = self.route_reconnect else {
             return false;
         };
@@ -257,18 +263,33 @@ impl App {
         });
         let unwritten =
             self.astation_client.channel_unwritten() > 0 && since.elapsed() < ROUTE_RECONNECT_FLUSH;
-        if busy
+        let admitting_now = admitting && since.elapsed() < ROUTE_RECONNECT_ADMISSION;
+        if op_running
             || self.op_route.is_some()
             || self.astation_connect_rx.is_some()
             || self.astation_reauth.is_some()
             || waiting
             || unwritten
+            || admitting_now
         {
             return false;
         }
         self.route_reconnect = None;
         if !self.r9_link_up() || !self.astation_client.route_unproved() {
             return false;
+        }
+        let ready = matches!(
+            *self.host_route.lock().unwrap_or_else(|e| e.into_inner()),
+            crate::session_protocol::r9::route::RouteState::Ready { .. }
+        );
+        if !ready {
+            eprintln!(
+                "atem runtime: r9: relay link not reconnected: the host can't answer a challenge now"
+            );
+            return false;
+        }
+        if admitting {
+            eprintln!("atem runtime: r9: channels still opening after 30 s; reconnecting anyway");
         }
         eprintln!("atem runtime: r9: relay link reconnecting to prove its route");
         self.drop_astation_link("The relay link reconnects to prove its route".into());
@@ -349,9 +370,9 @@ mod tests {
         let _profile = crate::test_profile::temp();
         let mut app = App::new();
         app.hosted = Some(Hosted::default());
-        assert!(!app.route_reconnect_due(false), "no event");
+        assert!(!app.route_reconnect_due(false, false), "no event");
         app.route_reconnect = Some(Instant::now());
-        assert!(!app.route_reconnect_due(true));
+        assert!(!app.route_reconnect_due(true, false));
         assert!(
             app.route_reconnect.is_some(),
             "kept while an operation runs"
@@ -361,11 +382,64 @@ mod tests {
             .unwrap()
             .inbox
             .push_back((1, "{}".into()));
-        assert!(!app.route_reconnect_due(false));
+        assert!(!app.route_reconnect_due(false, false));
         assert!(app.route_reconnect.is_some(), "kept while a request waits");
         app.hosted.as_mut().unwrap().inbox.clear();
-        assert!(!app.route_reconnect_due(false), "no link to reconnect");
+        assert!(
+            !app.route_reconnect_due(false, false),
+            "no link to reconnect"
+        );
         assert!(app.route_reconnect.is_none(), "consumed");
         assert!(app.astation_reconnect_at.is_none());
+    }
+
+    /// §R9.7b review: an operation's relay link (no challenge state) counts
+    /// as unproved; the reconnect fires only while the host can still
+    /// answer a challenge (else the event is dropped); a channel still
+    /// opening holds it for at most 30 s.
+    #[test]
+    fn the_route_reconnect_rechecks_the_route_and_caps_admission() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
+        use std::time::Duration;
+        let _profile = crate::test_profile::temp();
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let ready = RouteState::Ready {
+            id: RouteIdentity {
+                account_id: "acct-1".into(),
+                genesis_hash: log.log.genesis_hash(),
+                host_id: "host-1".into(),
+                head: log.log.head(),
+                chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+            },
+            key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
+                "route host",
+            ))),
+        };
+        let linked = || {
+            let mut app = App::new();
+            app.hosted = Some(Hosted::default());
+            app.astation_client.relay_link_for_test();
+            app.astation_connected = true;
+            app
+        };
+        // Held again before it fired: dropped, the link stays.
+        let mut app = linked();
+        route::set(&app.host_route, RouteState::Off("device list held"));
+        app.route_reconnect = Some(Instant::now());
+        assert!(!app.route_reconnect_due(false, false));
+        assert!(app.route_reconnect.is_none() && app.astation_connected);
+        // Serving: an operation's relay link reconnects; a channel opening
+        // holds it, at most 30 s.
+        let mut app = linked();
+        route::set(&app.host_route, ready.clone());
+        app.route_reconnect = Some(Instant::now());
+        assert!(!app.route_reconnect_due(false, true));
+        assert!(app.route_reconnect.is_some(), "waits for the channel");
+        app.route_reconnect = Instant::now().checked_sub(Duration::from_secs(31));
+        assert!(app.route_reconnect_due(false, true), "capped");
+        assert!(!app.astation_connected);
+        assert!(app.astation_reconnect_at.is_some());
     }
 }
