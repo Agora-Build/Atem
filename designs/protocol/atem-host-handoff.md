@@ -741,7 +741,13 @@ Router obligations (the relay and Astation's :8080):
   failed, its proof sent), is routed, and Astation's grant upgrades the
   link while a denial, expiry or timeout leaves it routed. A held host
   proves no route: it is reconciled over (A), the Mac in the room
-  authenticating its relay link (tested over the fake relay). Vectors
+  authenticating its relay link (tested over the fake relay). After
+  enrollment (the list pinned) or a reconciliation, a relay link that
+  proved no route is dropped once and reconnected, once no Astation
+  operation runs and no request or channel is mid-admission, so the new
+  link proves its route and the host stays reachable when the Mac goes
+  offline (runtime.log `relay link reconnecting to prove its route`; at
+  most once per event, never on a local link). Vectors
   `r9-vectors-host-route` (`relay_replies` for the two verdicts); the real
   runtime with no Astation online: `cargo test --test
   r9_host_route_binary`. §R9.7b.

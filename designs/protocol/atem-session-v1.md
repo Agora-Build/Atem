@@ -3111,6 +3111,27 @@ the Mac in the room authenticated it, which the relay never blocks for
 lack of a proof. The same holds for pairing and the first device
 verification (no pinned list yet).
 
+**After enrollment or reconciliation the host reconnects once to prove
+its route.** The link that carried the pairing, first verification or
+reconciliation answered no challenge (the list was unpinned or held when
+it connected), and a link answers only one challenge, at connect. So
+when the host becomes able to answer (its list pinned, or a held list
+reconciled) and its current relay link sent no proof and got no
+`host_route_ok`, the runtime drops that link once and reconnects at once:
+the new link gets the relay's challenge, proves its route and is routed
+over (B), and the Mac, if still in the room, authenticates it as usual
+(the ordering rules above). This waits until no Astation operation runs
+(`atem pair`, `atem pair verify` and `atem cred unlock` are never cut
+off), no connect or re-authentication is under way, no session-family
+request or r9 channel is mid-admission, and the link's channel envelopes
+went out (at most 5 s; e.g. the welcome of the managing device whose
+channel reconciled the list, whose channel then closes with the link and
+is reopened on the new one). runtime.log: `relay link reconnecting to
+prove its route`. At most one reconnect per pin or reconciliation, and
+no loop: a new link that still gets no challenge stays as it is. A local
+(loopback/LAN) link, which never sees a challenge, never reconnects for
+this. No wire change.
+
 Vectors: `r9-vectors-host-route` (proofs at the head, at an ancestor, on
 a verifier ahead, after a key rotation; refused: extra fields in the
 body, message and proof, a short nonce, `head.seq` 0, duplicate keys,
