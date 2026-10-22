@@ -107,6 +107,18 @@ impl Rig {
             )
             .unwrap();
         }
+        Self::run(sandbox, log, auth, plan)
+    }
+
+    /// No pairing at all (`atem pair` then runs over the relay), no list.
+    fn start_unpaired(auth: AuthReply, plan: fn(u64, Value) -> Reply) -> Rig {
+        let mut log = TestLog::genesis(ACCOUNT, &secret("route astation"));
+        log.add_host(HOST, 1, &secret("route host seed"));
+        log.add_native("dev-phone", &["control", "view"]);
+        Self::run(Sandbox::new(), log, auth, plan)
+    }
+
+    fn run(sandbox: Sandbox, log: TestLog, auth: AuthReply, plan: fn(u64, Value) -> Reply) -> Rig {
         let head = head_json(&log);
         let (relay, seen) = FakeAstation::start_relay(move |n| plan(n, head.clone()));
         *relay.auth.lock().unwrap() = auth;
@@ -213,18 +225,26 @@ impl Rig {
     /// offline, held past the old deadline with a phone admitted, and
     /// nothing reconnects again.
     fn reconnected_to_prove(&self) {
+        self.reconnected_to_prove_from(1);
+    }
+
+    /// [`Rig::reconnected_to_prove`] from connection `old` to `old + 1`
+    /// (an earlier connection's close is ignored).
+    fn reconnected_to_prove_from(&self, old: u64) {
+        let new = old + 1;
         let mut closed = false;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.event(left) {
-                Some(RelayEvent::Closed(1)) => closed = true,
-                Some(RelayEvent::Proof { link: 2, .. }) => break,
+                Some(RelayEvent::Closed(n)) if n == old => closed = true,
+                Some(RelayEvent::Closed(n)) if n < old => {}
+                Some(RelayEvent::Proof { link, .. }) if link == new => break,
                 other => panic!("no reconnect to prove: {other:?}\n{}", self.runtime_log()),
             }
         }
         if !closed {
-            self.closed(1, Duration::from_secs(5));
+            self.closed(old, Duration::from_secs(5));
         }
         within("the route to be held", || {
             self.runtime_log()
@@ -244,7 +264,7 @@ impl Rig {
         );
         assert!(log.contains("host_route ok at head"), "{log}");
         assert!(self.status().contains("r9 routed (no Astation)"));
-        let mut router = Router::on(&self.relay, 2);
+        let mut router = Router::on(&self.relay, new);
         let phone = Identity::native("dev-phone", auth("dev-phone"));
         router
             .connect("ph1", &self.log, HOST, &phone)
@@ -915,4 +935,81 @@ fn a_local_link_never_reconnects_for_a_pin() {
     let _ = runtime.wait();
     assert!(reconnected.is_none(), "{text}");
     assert!(!text.contains("reconnecting to prove"), "{text}");
+}
+
+/// Fix round 1 (H1): the first enrollment through the real `atem pair`
+/// over the relay. Its pairing-code room (connection 1) delivers
+/// `credentialSync`; the operation's own relay identity link (connection
+/// 2, Astation in the room: carrier A, no proof) is installed as the
+/// runtime's link and verification starts on it (`verifyCommit`). The pin
+/// the ceremony would apply at `deviceVerified` is written here (the fake
+/// can't sign Astation's ceremony), and the operation ends (its CLI goes
+/// away): then that link reconnects once, connection 3 proves its route,
+/// gets `host_route_ok` and stays routed with the Mac gone.
+#[test]
+fn the_link_atem_pair_installed_reconnects_once_after_the_pin() {
+    let rig = Rig::start_unpaired(
+        AuthReply::Grant {
+            session_id: "session-1".into(),
+            token: "token-1".into(),
+        },
+        |n, head| match n {
+            1 => Reply::Serve,
+            2 => astation_only(n, head),
+            _ => ok(n, head),
+        },
+    );
+    let cli_log = std::fs::File::create(rig.sandbox.dir.path().join("pair.log")).unwrap();
+    let mut pair = Command::new(env!("CARGO_BIN_EXE_atem"))
+        .args(["pair", "--save"])
+        .env_clear()
+        .envs(rig.sandbox.env())
+        .env("ASTATION_RELAY_URL", &rig.relay.url)
+        .current_dir(&rig.sandbox.home)
+        .stdin(Stdio::null())
+        .stdout(cli_log.try_clone().unwrap())
+        .stderr(cli_log)
+        .spawn()
+        .unwrap();
+    let pair_log =
+        || std::fs::read_to_string(rig.sandbox.dir.path().join("pair.log")).unwrap_or_default();
+    let mut verifying = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !verifying {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rig.relay.events.recv_timeout(left) {
+            Ok(Event::Message(1, v)) if v["type"] == "pairSavePreference" => rig.relay.send(
+                1,
+                json!({"type": "credentialSync", "data": {"access_token": "AT",
+                    "refresh_token": "RT", "expires_at": 4_000_000_000u64, "login_id": "u",
+                    "astation_id": ASTATION, "save_credentials": true}})
+                .to_string(),
+            ),
+            Ok(Event::Message(2, v)) if v["type"] == "verifyCommit" => verifying = true,
+            Ok(_) => {}
+            Err(_) => panic!(
+                "atem pair never verified\n{}\n{}",
+                pair_log(),
+                rig.runtime_log()
+            ),
+        }
+    }
+    // The operation's link is a carrier (A) link: no proof on it.
+    assert!(!rig.runtime_log().contains("host_challenge answered"));
+    rig.pin();
+    within("the list to be opened", || {
+        rig.runtime_log().contains("device list: opened at seq")
+    });
+    let quiet_until = Instant::now() + Duration::from_secs(2);
+    while let Some(event) = rig.event(quiet_until.saturating_duration_since(Instant::now())) {
+        assert!(
+            matches!(event, RelayEvent::Closed(1)),
+            "during the operation: {event:?}\n{}",
+            rig.runtime_log()
+        );
+    }
+    assert!(!rig.runtime_log().contains("reconnecting to prove"));
+    let _ = pair.kill();
+    let _ = pair.wait();
+    rig.reconnected_to_prove_from(2);
 }

@@ -13,6 +13,9 @@ use tokio_tungstenite::tungstenite::Message;
 /// The Astation id the fake peer announces.
 pub const ASTATION: &str = "astation-fixtures";
 
+/// The pairing code the fake relay's `POST /api/pair` hands out.
+pub const PAIR_CODE: &str = "PAIRCODE";
+
 pub enum Event {
     /// Connection `n` authenticated.
     Authenticated(u64),
@@ -242,6 +245,10 @@ pub enum Reply {
     Nothing,
     /// `host_route_ok`, then the relay closes the connection at once.
     OkThenClose { host_id: String, head: Value },
+    /// No verdict and no proof expected: after the challenge the link
+    /// carries what the test sends (a pairing-code room's link, which
+    /// answers no challenge, gets `credentialSync` from the test).
+    Serve,
     /// The room's owner is in the room (carrier A): `host_challenge`, then
     /// Astation's `auth_required` at once (before any verdict). Atem's
     /// `auth` is answered as `auth` says. `ok`: once both the proof and the
@@ -302,6 +309,12 @@ impl FakeAstation {
                     let Ok((stream, _)) = listener.accept().await else {
                         return;
                     };
+                    // `atem pair`'s registration: no host connection.
+                    let mut head = [0u8; 5];
+                    if matches!(stream.peek(&mut head).await, Ok(5)) && &head == b"POST " {
+                        tokio::spawn(pair_registration(stream));
+                        continue;
+                    }
                     next += 1;
                     let n = next;
                     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -330,6 +343,44 @@ impl FakeAstation {
             relay,
         )
     }
+}
+
+/// `POST /api/pair`: `{"code": PAIR_CODE}` (the request is read to its
+/// end, headers and `Content-Length` body).
+async fn pair_registration(mut stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let Ok(n) = stream.read(&mut buf).await else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        request.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&request);
+        if let Some(end) = text.find("\r\n\r\n") {
+            let length = text[..end]
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if request.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+    let body = json!({"code": PAIR_CODE}).to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 fn ok_message(host_id: &str, head: &Value) -> String {
@@ -381,6 +432,11 @@ async fn relay_link(
         .await
         .is_err()
     {
+        let _ = relay.send(RelayEvent::Closed(n));
+        return;
+    }
+    if let Reply::Serve = reply {
+        serve(n, socket, events, commands, auth).await;
         let _ = relay.send(RelayEvent::Closed(n));
         return;
     }
@@ -450,7 +506,8 @@ async fn relay_link(
             let _ = relay.send(RelayEvent::Closed(n));
             return;
         }
-        Reply::Unsolicited { .. } | Reply::Nothing | Reply::AstationFirst { .. } => {}
+        Reply::Unsolicited { .. } | Reply::Nothing | Reply::AstationFirst { .. } | Reply::Serve => {
+        }
     }
     serve(n, socket, events, commands, auth).await;
     let _ = relay.send(RelayEvent::Closed(n));
