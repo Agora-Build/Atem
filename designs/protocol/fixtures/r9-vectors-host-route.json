@@ -643,6 +643,75 @@
   "kind": "vectors",
   "name": "r9-vectors-host-route",
   "note": "Host route proof (R9.7b). Body signed by the host's host_channel_key (Ed25519) over enc([\"atem-host-route-v1\", jcs(body)]). Verified against log L of r9-vectors-membership-log (E1..E6) followed by `chain` (entries of `entries`, signed by dev-mac), with the relay's `challenge` (nonce, room) and atem_id. Refusal order: malformed, frozen, wrong_account, unknown_host, bad_signature, stale_log, fork, nonce_mismatch, room_mismatch, atem_id_mismatch. `invalid_text` holds raw messages (duplicate keys) a strict parser refuses.",
+  "relay_replies": {
+    "invalid": [
+      {
+        "label": "ok_extra_field",
+        "reason": "a field beyond type/op/v/host_id/head",
+        "text": "{\"extra\":1,\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"host_id\":\"host-a\",\"op\":\"host_route_ok\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "ok_v2",
+        "reason": "v is not 1",
+        "text": "{\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"host_id\":\"host-a\",\"op\":\"host_route_ok\",\"type\":\"relay\",\"v\":2}"
+      },
+      {
+        "label": "ok_head_seq_zero",
+        "reason": "head.seq 0",
+        "text": "{\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":0},\"host_id\":\"host-a\",\"op\":\"host_route_ok\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "ok_no_host_id",
+        "reason": "host_id missing",
+        "text": "{\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"host_route_ok\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "refused_unknown_code",
+        "reason": "a code the verifier never returns",
+        "text": "{\"code\":\"nope\",\"op\":\"host_route_refused\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "refused_duplicate_key",
+        "reason": "code twice (strict I-JSON)",
+        "text": "{\"code\":\"stale_log\",\"code\":\"fork\",\"op\":\"host_route_refused\",\"type\":\"relay\",\"v\":1}"
+      }
+    ],
+    "note": "The relay's reply after verifying a proof: host_route_ok (the verified host_id and the proof's head) or host_route_refused (one of the verifier's codes; the relay closes the connection after it). Strictly parsed; `invalid` texts are refused as malformed.",
+    "valid": [
+      {
+        "expect": {
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_id": "host-a"
+        },
+        "label": "ok_at_head",
+        "message": {
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_id": "host-a",
+          "op": "host_route_ok",
+          "type": "relay",
+          "v": 1
+        }
+      },
+      {
+        "expect": {
+          "code": "stale_log"
+        },
+        "label": "refused_stale_log",
+        "message": {
+          "code": "stale_log",
+          "op": "host_route_refused",
+          "type": "relay",
+          "v": 1
+        }
+      }
+    ]
+  },
   "requires": "r9",
   "valid": [
     {

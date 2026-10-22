@@ -285,6 +285,94 @@ pub fn host_route_message(proof: &SignedObject) -> Value {
     json!({"type": "relay", "op": "host_route", "v": 1, "proof": proof.to_json()})
 }
 
+// ------------------------------------------------------- relay replies
+
+/// The refusal codes, by `code()` (a `host_route_refused` names one).
+pub const REFUSAL_CODES: [&str; 10] = [
+    "malformed",
+    "frozen",
+    "wrong_account",
+    "unknown_host",
+    "bad_signature",
+    "stale_log",
+    "fork",
+    "nonce_mismatch",
+    "room_mismatch",
+    "atem_id_mismatch",
+];
+
+/// The relay's answer to a proof: `host_route_ok` once it verified it
+/// (the route is the host's), or `host_route_refused` with the
+/// verifier's code (the relay closes the connection after it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayReply {
+    /// `{"type":"relay","op":"host_route_ok","v":1,"host_id","head":{"seq","hash"}}`.
+    Ok { host_id: String, head: Head },
+    /// `{"type":"relay","op":"host_route_refused","v":1,"code"}`.
+    Refused { code: String },
+}
+
+impl RelayReply {
+    /// The relay's `host_route_ok` for a verified route.
+    pub fn ok(route: &HostRoute) -> Self {
+        RelayReply::Ok {
+            host_id: route.host_id.clone(),
+            head: route.head,
+        }
+    }
+
+    /// The relay's `host_route_refused` for a refusal.
+    pub fn refused(refusal: &HostRouteRefusal) -> Self {
+        RelayReply::Refused {
+            code: refusal.code().to_owned(),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        match self {
+            RelayReply::Ok { host_id, head } => json!({"type": "relay", "op": "host_route_ok",
+                "v": 1, "host_id": host_id, "head": head.to_json()}),
+            RelayReply::Refused { code } => json!({"type": "relay", "op": "host_route_refused",
+                "v": 1, "code": code}),
+        }
+    }
+
+    /// Exactly one of the two replies (strict I-JSON, exact fields, a
+    /// known refusal code); `None` for any other relay message.
+    pub fn parse(bytes: &[u8]) -> Option<std::result::Result<Self, HostRouteRefusal>> {
+        let op = serde_json::from_slice::<Value>(bytes)
+            .ok()?
+            .get("op")?
+            .as_str()?
+            .to_owned();
+        Some(match op.as_str() {
+            "host_route_ok" => relay_message(bytes, "host_route_ok", &["host_id", "head"])
+                .and_then(|o| {
+                    Ok(RelayReply::Ok {
+                        host_id: id_field(&o, "host_id")?.to_owned(),
+                        head: o
+                            .get("head")
+                            .and_then(Head::from_json)
+                            .ok_or(malformed("head"))?,
+                    })
+                }),
+            "host_route_refused" => {
+                relay_message(bytes, "host_route_refused", &["code"]).and_then(|o| {
+                    let code = o
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .filter(|c| REFUSAL_CODES.contains(c))
+                        .ok_or(malformed("code"))?;
+                    Ok(RelayReply::Refused {
+                        code: code.to_owned(),
+                    })
+                })
+            }
+            _ => return None,
+        })
+    }
+}
+
 // --------------------------------------------------------- verification
 
 /// A verified proof: the host may hold its route.

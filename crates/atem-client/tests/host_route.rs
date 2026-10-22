@@ -172,3 +172,39 @@ fn the_builder_refuses_ids_outside_their_bounds_and_signs_nothing_else() {
         Err(HostRouteRefusal::Malformed("type"))
     );
 }
+
+#[test]
+fn every_refusal_code_is_a_reply_code_and_replies_round_trip() {
+    use atem_client::host_route::{HostRoute, REFUSAL_CODES, RelayReply};
+    let all = [
+        HostRouteRefusal::Malformed("x"),
+        HostRouteRefusal::Frozen,
+        HostRouteRefusal::WrongAccount,
+        HostRouteRefusal::UnknownHost,
+        HostRouteRefusal::BadSignature,
+        HostRouteRefusal::StaleLog,
+        HostRouteRefusal::Fork,
+        HostRouteRefusal::NonceMismatch,
+        HostRouteRefusal::RoomMismatch,
+        HostRouteRefusal::AtemIdMismatch,
+    ];
+    assert_eq!(all.each_ref().map(|r| r.code()), REFUSAL_CODES);
+    for refusal in &all {
+        let reply = RelayReply::refused(refusal);
+        let text = reply.to_json().to_string();
+        assert_eq!(RelayReply::parse(text.as_bytes()), Some(Ok(reply)));
+    }
+    let (v, clock) = (Vectors::load(), Clock::at(1_793_264_000_000));
+    let log = log_l(&v, &clock);
+    let ok = RelayReply::ok(&HostRoute {
+        host_id: "host-a".into(),
+        head: log.head(),
+    });
+    let text = ok.to_json().to_string();
+    assert_eq!(RelayReply::parse(text.as_bytes()), Some(Ok(ok)));
+    // Other relay messages are none of these.
+    assert_eq!(
+        RelayReply::parse(br#"{"type":"relay","op":"push_ack","acks":[]}"#),
+        None
+    );
+}

@@ -2269,5 +2269,32 @@ fn host_route() {
         assert_eq!(refusal.code(), s(case, "code"), "{label}");
         run.pass(format!("{label}: refused {}", s(case, "code")));
     }
+    let replies = run.get("relay_replies");
+    for case in replies["valid"].as_array().unwrap() {
+        use atem_client::host_route::RelayReply;
+        let label = s(case, "label");
+        let reply = RelayReply::parse(case["message"].to_string().as_bytes())
+            .expect(label)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(reply.to_json(), case["message"], "{label}");
+        match &reply {
+            RelayReply::Ok { host_id, head } => {
+                assert_eq!(host_id, s(&case["expect"], "host_id"));
+                assert_eq!(head.to_json(), case["expect"]["head"]);
+            }
+            RelayReply::Refused { code } => assert_eq!(code, s(&case["expect"], "code")),
+        }
+        run.pass(format!("relay reply {label}: parsed, rebuilt"));
+    }
+    for case in replies["invalid"].as_array().unwrap() {
+        let label = s(case, "label");
+        let parsed = atem_client::host_route::RelayReply::parse(s(case, "text").as_bytes());
+        assert!(
+            matches!(parsed, Some(Err(ref e)) if e.code() == "malformed")
+                || (label == "refused_duplicate_key" && !matches!(parsed, Some(Ok(_)))),
+            "{label}: {parsed:?}"
+        );
+        run.pass(format!("relay reply {label}: refused"));
+    }
     run.finish();
 }
