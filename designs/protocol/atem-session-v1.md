@@ -2931,6 +2931,13 @@ Atem opens no port.
 2. Proof (host → relay), at most once per challenge, only by a host with
    a pinned device list:
    `{"type":"relay","op":"host_route","v":1,"proof":{"body":{…},"sig":"<b64u>"}}`
+3. Verdict (relay → host), once the relay checked the proof:
+   `{"type":"relay","op":"host_route_ok","v":1,"host_id":"…","head":{"seq":n,"hash":"…"}}`
+   (the verified `host_id` and the proof's `head`) after it verified it and
+   bound the route, or
+   `{"type":"relay","op":"host_route_refused","v":1,"code":"…"}` (one of
+   the verifier's codes below), after which the relay closes the
+   connection.
 
 The body is a signed object of type `atem-host-route` (R9.1), exactly
 these fields:
@@ -2993,6 +3000,32 @@ proof signed with the old key.
   replayed (ciphertext, leases, uncertain submissions).
 - Without a valid proof an r9 host gets no routing. There is no fallback.
 
+**The held link.** The verdict sustains the r9 carrier only. On
+`host_route_ok` (strictly parsed; its `host_id` this host's and its `head`
+the host's applied head or an ancestor; sent after this link's own proof)
+a host with a pinned list whose link no Astation authenticated keeps the
+link **routed**: no 10 s wait for `auth_required`, no 30 s retry loop. A
+routed link carries channel envelopes (R9.7a; every channel admitted by
+`atem-ch1` and R9.6/R9.8 as always, identity never inferred from the
+route) and push relay messages (`push_hint`, `push_seen`, `push_ack`,
+R9.9), nothing else: no r8 session-family message is served, no Astation
+operation (pair, pair verify, cred unlock/projects, the token refresh)
+runs on it, no `credentialSync` or encryption message is applied, no mark
+task is taken or reported. Astation's `auth_required` on the same link is
+answered as a re-authentication (the pairing's saved session, pinned to
+the pairing's Astation = the room) and, once accepted, the link is an
+authenticated Astation link (a new link generation: channels reopen). A
+`host_route_ok` that is malformed, unsolicited (no proof sent on this
+link, e.g. a late one on a retried link), for another host or for a head
+the host doesn't hold is ignored with a log line and holds nothing.
+`host_route_refused`, a closed socket, or neither Astation's
+`auth_required` nor a valid `host_route_ok` within 10 s: dropped and
+retried as before. A new link (a new route) fences the old one's channels
+as any link loss does. `atem status` shows `Authorization: r9 routed (no
+Astation)` and `Relay: routed via relay (<relay host> as <atem_id>; no
+Astation)`; runtime.log gets one line per verdict (`host_route ok at head
+N`, `host_route refused: <code>`).
+
 **The host (Atem).** The runtime's relay identity link
 (`/ws?role=atem&code=<room>&atem_id=<atem_id>`) answers the challenge in
 its reader as it arrives, before and independent of Astation's
@@ -3012,7 +3045,8 @@ a verifier ahead, after a key rotation; refused: extra fields in the
 body, message and proof, a short nonce, `head.seq` 0, duplicate keys,
 another account, another genesis, an unknown host, another host's key, a
 tampered field, `stale_log`, `fork`, each mismatch, a removed host and a
-replaced key, also for a proof at an ancestor head).
+replaced key, also for a proof at an ancestor head; `relay_replies`:
+`host_route_ok` and `host_route_refused`, and malformed ones).
 
 ### R9.8 r9 hello, welcome and new session ops
 

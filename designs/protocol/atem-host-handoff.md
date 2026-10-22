@@ -712,9 +712,16 @@ Router obligations (the relay and Astation's :8080):
   the room code, a login or an old pairing. Atem answers on its relay
   identity link in the link's reader, before and independent of
   Astation's authentication, once per challenge, only with a pinned list
-  that can serve (not held, frozen or faulted). Vectors
-  `r9-vectors-host-route`; the real runtime with no Astation online:
-  `cargo test --test r9_host_route_binary`. §R9.7b.
+  that can serve (not held, frozen or faulted). After verifying, the
+  relay sends `host_route_ok{host_id, head}` (the link is then held for
+  r9 only with no Astation: channels and push, never r8, Astation
+  operations, credentials or mark tasks; Astation's later
+  `auth_required` on it upgrades it to an authenticated link), or
+  `host_route_refused{code}` and closes. Atem ignores an unsolicited
+  `ok`, one for another host or a head it doesn't hold. Vectors
+  `r9-vectors-host-route` (`relay_replies` for the two verdicts); the real
+  runtime with no Astation online: `cargo test --test
+  r9_host_route_binary`. §R9.7b.
 
 Host state behind two of these answers (no action for Astation): a
 revoked browser grant is kept in `runtime/journal/revoked_grants` until
