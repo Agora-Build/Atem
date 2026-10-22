@@ -1,0 +1,276 @@
+name: atem-client-bindings
+
+# atem-client's bindings (crates/atem-client-ffi): the shared r9 vectors
+# through Kotlin (UniFFI + JNA), WASM (Node) and Swift, the binding end-to-end
+# test (a Kotlin phone and a Node/WASM browser against a test host over
+# loopback TCP), and the production packages for Astation (no test
+# features), uploaded as workflow artifacts, each with its SHA-256 sums and
+# source pin: the SwiftPM package with its xcframework, the WASM package, the
+# Kotlin/JVM bindings and the Android libraries (arm64-v8a, armeabi-v7a,
+# x86_64) with their Kotlin (designs/protocol/atem-client-bindings.md §7).
+# The prebuilt r9 harness is r9-harness.yml.
+# Nothing is published to a registry; no secret is used.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "designs/protocol/fixtures/**"
+      - "scripts/check-atem-client-bindings.sh"
+      - "scripts/package-atem-client-apple.sh"
+      - "scripts/package-atem-client-bindings.sh"
+      - "scripts/check-atem-client-packages.sh"
+      - "scripts/test-check-atem-client-packages.sh"
+      - "scripts/atem-client-source-pin.sh"
+      - ".github/workflows/atem-client-bindings.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "designs/protocol/fixtures/**"
+      - "scripts/check-atem-client-bindings.sh"
+      - "scripts/package-atem-client-apple.sh"
+      - "scripts/package-atem-client-bindings.sh"
+      - "scripts/check-atem-client-packages.sh"
+      - "scripts/test-check-atem-client-packages.sh"
+      - "scripts/atem-client-source-pin.sh"
+      - ".github/workflows/atem-client-bindings.yml"
+  workflow_dispatch:
+
+# Read-only token: nothing here writes to the repository. Actions are pinned
+# by tag, as in the repository's other workflows.
+permissions:
+  contents: read
+
+concurrency:
+  group: atem-client-bindings-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Toolchains, pinned with their published checksums (the Kotlin release's
+  # .sha256 and GitHub asset digest; JNA's Maven Central SHA-1 and the
+  # maintainer's PGP signature, recorded here as SHA-256).
+  KOTLIN_VERSION: "2.4.21"
+  KOTLIN_SHA256: "7cc140e76daf416a0424a5557f99afd7ca89ebd463ea1101261e3e01c33e75cd"
+  JNA_VERSION: "5.19.1"
+  JNA_SHA256: "4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae"
+  # Must equal the wasm-bindgen version crates/atem-client-ffi pins.
+  WASM_BINDGEN_VERSION: "0.2.101"
+  # The Android NDK (r28c), installed by the runner's sdkmanager, which
+  # verifies the package's checksum; the packaging script checks its
+  # Pkg.Revision. minSdk of the Android libraries.
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  ANDROID_API: "24"
+
+jobs:
+  linux:
+    name: Rust, Kotlin, WASM, end to end (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The packages are built from (and their pin names) the commit under
+          # review: a pull request's head, never GitHub's synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Rust tests (atem-client, atem-client-ffi)
+        run: cargo test -p atem-client -p atem-client-ffi
+
+      - name: The atem binary links no binding crate
+        run: |
+          if cargo tree -p atem -e normal --prefix none | grep -E '^(atem-client-ffi|uniffi|wasm-bindgen) '; then
+            echo "atem must not depend on the binding crates" >&2
+            exit 1
+          fi
+
+      - name: Fetch the Kotlin compiler and JNA (checksums verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kotlin-dl" "$RUNNER_TEMP/kotlin" "$RUNNER_TEMP/jna"
+          curl -fsSL -o "$RUNNER_TEMP/kotlin-dl/kotlin.zip" \
+            "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip"
+          echo "${KOTLIN_SHA256}  $RUNNER_TEMP/kotlin-dl/kotlin.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/kotlin-dl/kotlin.zip" -d "$RUNNER_TEMP/kotlin"
+          curl -fsSL -o "$RUNNER_TEMP/jna/jna.jar" \
+            "https://repo1.maven.org/maven2/net/java/dev/jna/jna/${JNA_VERSION}/jna-${JNA_VERSION}.jar"
+          echo "${JNA_SHA256}  $RUNNER_TEMP/jna/jna.jar" | sha256sum -c -
+
+      - name: wasm-bindgen CLI
+        run: cargo install --locked --root "$RUNNER_TEMP/wasm-bindgen" wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
+
+      - name: Kotlin and WASM conformance, binding end to end
+        run: |
+          KOTLINC="$RUNNER_TEMP/kotlin/kotlinc/bin/kotlinc" \
+          JNA_JAR="$RUNNER_TEMP/jna/jna.jar" \
+          JAVA="$JAVA_HOME/bin/java" \
+          WASM_BINDGEN="$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen" \
+          ./scripts/check-atem-client-bindings.sh kotlin wasm e2e
+
+      - name: Package version
+        run: |
+          set -euo pipefail
+          CRATE=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "ATEM_CLIENT_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Production packages (WASM, Kotlin/JVM; no test features)
+        run: |
+          set -euo pipefail
+          export WASM_BINDGEN="$RUNNER_TEMP/wasm-bindgen/bin/wasm-bindgen"
+          export KOTLINC="$RUNNER_TEMP/kotlin/kotlinc/bin/kotlinc" JNA_JAR="$RUNNER_TEMP/jna/jna.jar"
+          ./scripts/package-atem-client-bindings.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-wasm" wasm
+          ./scripts/package-atem-client-bindings.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-kotlin" kotlin
+
+      - name: Check the packages as Astation does (sums, pin, exports, a call each)
+        run: |
+          set -euo pipefail
+          export JNA_JAR="$RUNNER_TEMP/jna/jna.jar" JAVA="$JAVA_HOME/bin/java" JAVAC="$JAVA_HOME/bin/javac"
+          export KOTLIN_STDLIB="$RUNNER_TEMP/kotlin/kotlinc/lib/kotlin-stdlib.jar"
+          export EXPECT_COMMIT="$ATEM_CLIENT_HEAD"
+          ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-wasm"
+          ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-kotlin"
+
+      - name: Upload the WASM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-wasm-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-wasm/
+          if-no-files-found: error
+
+      - name: Upload the Kotlin/JVM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-kotlin-jvm-linux-x86-64-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-kotlin/
+          if-no-files-found: error
+
+  android:
+    name: Android libraries (arm64-v8a, armeabi-v7a, x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The packages are built from (and their pin names) the commit under
+          # review: a pull request's head, never GitHub's synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Android NDK (pinned)
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          (yes || true) | "$SDKMANAGER" --install "ndk;${ANDROID_NDK_VERSION}" >/dev/null
+          NDK="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
+          grep -qx "Pkg.Revision = ${ANDROID_NDK_VERSION}" "$NDK/source.properties"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      - name: Package version
+        run: |
+          set -euo pipefail
+          CRATE=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "ATEM_CLIENT_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Production package (Android libraries + Kotlin; no test features, no host)
+        run: |
+          set -euo pipefail
+          EXPECT_NDK="$ANDROID_NDK_VERSION" \
+            ./scripts/package-atem-client-bindings.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-android" android
+
+      - name: Check the package as Astation does (sums, pin, ELF machine, 16 KB alignment, exports)
+        run: |
+          set -euo pipefail
+          file "$RUNNER_TEMP"/pkg-android/*.zip
+          EXPECT_COMMIT="$ATEM_CLIENT_HEAD" READELF=readelf \
+            ./scripts/check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-android"
+          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["toolchain"]["android-ndk"] == sys.argv[2], p' \
+            "$RUNNER_TEMP/pkg-android/atem-client-$ATEM_CLIENT_VERSION-SOURCE.json" "$ANDROID_NDK_VERSION"
+          mkdir -p "$RUNNER_TEMP/android-x"
+          unzip -q "$RUNNER_TEMP/pkg-android/atem-client-$ATEM_CLIENT_VERSION-android.zip" -d "$RUNNER_TEMP/android-x"
+          file "$RUNNER_TEMP"/android-x/atem-client-android/jniLibs/*/libatem_client_ffi.so
+
+      - name: The check refuses a host-role symbol, a missing export, 4 KB alignment
+        run: READELF=readelf ./scripts/test-check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-android"
+
+      - name: Upload the Android package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-android-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-android/
+          if-no-files-found: error
+
+  macos:
+    name: Swift conformance, Apple package (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The packages are built from (and their pin names) the commit under
+          # review: a pull request's head, never GitHub's synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Swift conformance (CryptoKit provider through the foreign trait)
+        run: ./scripts/check-atem-client-bindings.sh swift
+
+      - name: Package version
+        run: |
+          set -euo pipefail
+          CRATE=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "atem-client-ffi"][0])')
+          HEAD_SHA=$(git rev-parse HEAD)
+          test "$HEAD_SHA" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "ATEM_CLIENT_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "ATEM_CLIENT_VERSION=${CRATE}-${HEAD_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Production package (xcframework + SwiftPM, no test features)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/pkg-apple"
+          ./scripts/package-atem-client-apple.sh "$ATEM_CLIENT_VERSION" "$OUT"
+          test -s "$OUT/atem-client-$ATEM_CLIENT_VERSION-apple-swiftpm.zip"
+          (cd "$OUT" && shasum -a 256 -c "atem-client-$ATEM_CLIENT_VERSION-SHA256SUMS.txt")
+          # The pin names the commit under review, built from a clean tree.
+          python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["commit"] == sys.argv[2] and p["tree_dirty"] is False and p["crates"]["uniffi"], p' \
+            "$OUT/atem-client-$ATEM_CLIENT_VERSION-SOURCE.json" "$ATEM_CLIENT_HEAD"
+          # The shipped package builds without the test features, and
+          # carries no test-only or host-role export.
+          (cd "$OUT/AtemClient" && swift build)
+          if grep -qE 'SoftwareKeyStore|signSeen|admitCarrier|AdmissionInfo' "$OUT/AtemClient/Sources/AtemClient/atem_client_ffi.swift"; then
+            echo "a test-only or host-role export is in the package" >&2
+            exit 1
+          fi
+          # Only what Astation downloads goes up (not the unzipped package).
+          rm -rf "$OUT/AtemClient"
+
+      - name: Upload the SwiftPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: atem-client-apple-swiftpm-${{ env.ATEM_CLIENT_VERSION }}
+          path: ${{ runner.temp }}/pkg-apple/
+          if-no-files-found: error

@@ -1,5 +1,8 @@
 # Atem host handoff: atem-session r8 on `feat/r8` (r6 runtime, r7 approvals)
 
+r9 (on `feat/r9`, PR #89): "Shared fixtures (r9) against the real runtime"
+and "r9 binding and effect contract (for Astation)" below.
+
 ## atem-session r8 on `feat/r8` (2026-10-18)
 
 Atem's host now speaks **r8 only** ([atem-session-v1.md](atem-session-v1.md),
@@ -359,9 +362,10 @@ slack; a hook read after its npm-wrapper parent exited is dropped (harmless).
 
 Two runners execute `fixtures/` (format in `fixtures/schema.md`):
 
-Both runners report the 34 drafted `r9-*` fixtures (7 vector files, 27
-scenarios; appendix "r9" of `atem-session-v1.md`) as NOT RUN ("requires
-r9 …") and only check that they parse; the counts below are r8's.
+The core runner reports the `r9-*` fixtures as not run (they have their
+own runners); the real-runtime runner runs them in a test of their own (see
+"Shared fixtures (r9) against the real runtime"). The counts below are
+r8's.
 
 - **Core runner** (`src/session_protocol/fixtures.rs`, `cargo test --bin
   atem session_protocol::fixtures`): `SessionHost` through the fixtures' fake
@@ -487,6 +491,378 @@ Not honoured against real processes: `timers: false` (the broker's loop runs
 `set_permissions`, `drop`, `replace_process`, `change_trust_gen`,
 `approval_rules`, `chat_evict`, `worker_gap`, and more than one client per
 scenario.
+
+## Shared fixtures (r9) against the real runtime
+
+`cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture`
+(Linux, debug build; `ATEM_FIXTURE=<name>[,<name>…]` runs some;
+`ATEM_R9_PARALLEL` sets how many runtimes run at once, default 6) takes
+every one of the 76 `r9-*` files. Each host scenario runs against the
+`atem runtime` binary (runner: `tests/r9_runner/`):
+
+- a temp profile verified as the fixture's account and host, its device
+  list pinned to the vectors' log (`setup.pinned`) exactly as `atem pair`
+  writes it, with host-a's `host_channel_key` from `r9-vectors-keys`;
+- real `atem worker`s running the fake Claude Code (chat hooks, a
+  transcript, the real PermissionRequest hook), launched with the
+  fixture's session ids (signed browser grants name them);
+- the clients (phones, Macs, services, browsers) speak `atem-ch1` with the
+  vectors' keys in the §R9.7a envelope on the runtime's link to a fake
+  Astation, which also plays the relay (`push_hint`/`push_seen` in,
+  `push_ack` out): every `connect` is a full handshake and a `hello` with
+  exactly the fixture's entries;
+- clocks, faults and crashes through debug-only hooks
+  (`src/runtime/test_hooks.rs`): the host clock and the session clock are
+  files the harness moves; `fail_next_membership_write`,
+  `crash_after_membership_commit` (the runtime kills itself),
+  `hold_dispatch`, PTY write holds; `restart_runtime` is SIGTERM,
+  `crash_runtime` SIGKILL; a lost rename (`disk: rename_lost`) puts the
+  file's earlier bytes back while the runtime is down; `unpair` is the real
+  `atem unpair --yes`; `expect_local_status` reads the real `atem status`;
+- what the fixtures assert of the host comes from the runtime itself: its
+  state dump after each pass (device list, leases, receipts, control
+  generations, channels, attachments), cross-checked with the real files
+  (`membership_applied`, the fault, carriage and freeze records,
+  `frozen_genesis`, `membership.json`), the fake agent's input and hook
+  answers, and the `written` acks.
+
+**Result: 48 host scenarios run against the real runtime and all 48 pass
+(714 items checked); 25 items of them can't be expressed there (below);
+the 28 other files have no host side.** A changed expectation fails the
+run at the changed step (`r9_changed_expectations_fail_against_the_real_runtime`:
+seven mutations). Each assert reads a state dump from a pass after the
+step began.
+
+Items not expressible against real processes (each printed by the run):
+
+| scenario | items | why |
+|---|---|---|
+| `r9-handshake-success`, `-replay`, `-tampered-transcript` | the vector's exact record bytes, `channel_id` value, fixed `e_h`/`n_h`; the client's side | the vectors use fixed ephemeral keys and nonces: atem-client's `channel_fixtures` checks the bytes; here every step runs on a live handshake |
+| `r9-chain-conflict-by-a-current-manager-freezes` | `pair` refused `frozen genesis` | re-pairing needs Astation's signed `deviceVerified` (the §R9.2 ceremony, Touch ID); the refusal runs on the real store in the in-process host runner; the `frozen_genesis` file this runtime wrote is checked |
+| `r9-envelope-bounds` | `stall_link`, `fill_queue`, the `busy` close after it, `unstall_link`, the assert after | not expressed without a hook that stalls Atem's link writer: the link is a real WebSocket, and a peer that stops reading leaves up to `tcp_wmem` + `tcp_rmem` (4 + 6 MiB here) in kernel buffers before Atem queues anything, so "queued output passes 4 MiB" can't be produced from outside at a known step; the bound runs on the engine (`r9::fixtures_tests`) |
+| `r9-chain-relay-cas-failure-freezes-both-hosts` | the two channels to host B; the phone's welcome there (`op`, `principal`, `revision`, `client_kind`, `permissions`); the mac's `account_frozen` there (`op`, `code`); the fence of the phone's admission there | host-b's `add_host` is outside the vectors (the fixture's note): the real runtime refuses every r9 channel to a host its list doesn't name, and an `add_host` signed with the vectors' dev-mac key would take seq 6 (E6's and S6_phone's). Host B is a second real runtime on its own profile: the carriages reach it as its own relay fetch (`carry.json`, §R9.3); what is checked there is its real state only: the welcome's `head` against B's head after S6_phone, and B's freeze by the scenario's `frozen` assert. No reply is made up for a channel that can't exist |
+
+| files | why they have no host side |
+|---|---|
+| 10 vector files: 9 `r9-vectors-*`, `r9-envelope-vectors` | known-answer bytes, no host process: `crates/atem-client/tests/vectors.rs` (and `channel_fixtures.rs`), the envelope tests in `src/session_protocol/r9/envelope.rs` |
+| 8 client scenarios: `r9-handshake-wrong-head`, `r9-recovery-k-backup-*` (4), `r9-recovery-restore-*` (2), `r9-recovery-stale-head-withholds-the-recovery` | the client's machines, no host acts: `channel_fixtures.rs`, `scenarios.rs` |
+| 10 relay scenarios: `r9-chain-honest-concurrent-appends-never-fork`, `r9-push-*` (6), `r9-seen-after-…`, `r9-seen-before-…`, `r9-seen-from-another-…` | the relay's side (Astation's relay); Atem runs them against atem-client's reference relay (`r9_fixtures.rs`, `scenarios.rs`) |
+
+**Supplementary: two hosts both enrolled** (`cargo test --test
+r9_two_hosts_binary`; a separate test, not a fixture change, no vector
+bytes). It covers what the table above leaves out for
+`r9-chain-relay-cas-failure-freezes-both-hosts`, as additional evidence
+only: the fixture's host-B items stay listed as not expressible. A device
+list signed in the test with `atem-client` and test keys names `host-a`
+and `host-b`, each with its own `host_channel_key`, plus the Mac (manager)
+and a phone; two real runtimes on two temp profiles, each with its own
+link and a fake-Claude session. Checked on **both** hosts: live r9
+admission of the Mac and the phone and their welcomes (principal,
+account, `atem_device_id`, trust generation, head, permissions); a
+channel addressed to the other host is refused; a prompt that acquires
+the lease and stays queued (dispatch held); then the relay's CAS fails
+(two entries by the Mac at the same `seq`), each host applies its own
+branch first, the other branch arrives and each freezes: every channel
+there gets `account_frozen` and is closed, the queued prompt is
+`rejected` "control revoked" and never reaches the agent, the head stays
+on the host's own branch, `membership.freeze` is written, `atem status`
+says frozen, the session keeps running and a new channel is refused
+`account_frozen`. The link-writer stall of `r9-envelope-bounds` stays
+engine-only.
+
+Found by this run and fixed (not fixture changes):
+- the link's r8 attachment, never welcomed on an r9 host, dropped the whole
+  link at 24 h, closing every r9 channel daily: a host that refuses r8
+  keeps its link now (an r8 host's link ends at 24 h as before);
+- the 100 ms pass (recovery waits, service expiry, push resends) also runs
+  when the host clock moved, not only the session clock.
+
+**Headless multi-device harness** (for Astation): `cargo test --test
+r9_harness -- --nocapture` runs one real host and N simulated clients
+(`ATEM_HARNESS_PHONES`, `ATEM_HARNESS_BOTS`, `ATEM_HARNESS_BROWSERS`;
+defaults 2, 1, 1) through admission, the registry, a lease, a prompt to its
+turn's end (a bot's `lease_held`), an approval with sealed push hints
+verified and opened per device, a `seen` (`push_seen` verified; a view-only
+browser's refused) and a lease-free answer with its resolved hint. It
+prints a transcript; `ATEM_HARNESS_OUT=<file>` writes it as JSON lines.
+Test target only, never in a release build. Limits: Linux only, the fake
+Claude only (no fake Codex), a fixed flow with no entry point for
+Astation's own router or relay.
+
+**Prebuilt, without a source build** (NON-PRODUCTION test tooling):
+every run of `.github/workflows/r9-harness.yml` uploads the
+artifact `atem-r9-harness-NONPRODUCTION-<version>-linux-x86_64`
+(`scripts/package-atem-r9-harness.sh`; `<version>` is atem's version and
+the commit's first 12 hex digits): `…-linux-x86_64.tar.gz` (`bin/r9_harness`,
+the release test binary; `bin/atem`, a release build of the same commit
+for this harness only, never to be installed; `fake-agent.py`, the fake
+Claude Code; `run-harness.sh`; `README.txt`), `…-sample-transcript.jsonl`
+(the packaged harness unpacked into an empty directory and run as a
+consumer would, default counts), `…-SOURCE.json` (pinned to the PR head,
+`tree_dirty: false` checked in CI) and `…-SHA256SUMS.txt`. Run it on
+Linux x86_64 with python3 in `/usr/bin`: `./run-harness.sh` (the same
+`ATEM_HARNESS_*` variables; it points the harness at the packaged `atem`
+and fake agent through `ATEM_HARNESS_ATEM_BIN` and
+`ATEM_HARNESS_FAKE_AGENT`). Verify the sums and the pin first, as for the
+binding packages. No macOS build: the harness's sandbox finds and cleans
+up the processes it started through `/proc`, so the test target compiles
+to nothing on macOS. The flow is fixed and the routing fake (its fake
+Astation plays the router and the relay).
+
+**Entry point for Astation's own adapters** (follow-up after r9, not
+built; agreed in outline with Astation, #81 6304486807; the bridge schema
+is pinned with that later artifact). It adds no r9 field and no public
+endpoint:
+
+- **Host side.** The packaged runtime dials a configurable
+  `ASTATION_WS` (as today), outbound only. In this mode there is no
+  `FakeAstation`: the relay or Astation's :8080 adapter owns that socket.
+  A Linux container must reach the configured Mac or relay address; any
+  test transport authentication is documented with how the adapter
+  supplies it locally.
+- **Client side.** The prebuilt driver keeps the shared-core handshakes,
+  the independent test keys and the assertions. An Astation-supplied
+  bridge executable, over stdin/stdout NDJSON (test-process I/O, not a
+  production wire format), does open / send / receive / close per logical
+  client and target host, and reports link loss. Each inner `atem-ch1`
+  frame passes as its original JSON; the adapter supplies the client
+  ingress and wraps and unwraps the §R9.7a envelope on the host link. The
+  driver hard-codes no HTTP/WS path or credentials API (the public client
+  ingress is not built).
+- **Routing rules the adapter keeps.** It assigns handles, sets
+  `direct`/`relay`, scopes routes to the current host connection
+  generation, preserves per-channel order, open before frame, and
+  channel-only close (a channel close never closes the host socket); link
+  loss ends every affected channel and needs new handshakes, with no lease
+  restoration or prompt replay.
+- **Bounds.** The 2 MiB serialized envelope (§R9.7a) and, separately,
+  256 KiB per `type:relay` message (§R9.9).
+- **Setup.** A disposable fixture manifest: account, genesis and head,
+  both hosts' ids, keys and trust generations, the signed membership,
+  client labels, roles and scopes, and reproducible test-key references.
+  Test bootstrap only in isolated profiles: no live account pairing,
+  enrollment, recovery or credential extraction.
+- **Push.** Signed push hints and seen go to the real relay ingress, with
+  `push_ack` returned after durable handling; the external mode never
+  acknowledges them in a fake router.
+- **Controls.** Disconnect and reconnect one client; drop and reconnect
+  one host link; hold and release adapter I/O; delay or lose a push
+  acknowledgment.
+- **Transcripts.** One per run, with outcomes, so an adapter-induced stall
+  can be told from Atem's link-writer stall (still engine-only).
+
+## r9 binding and effect contract (for Astation)
+
+What Astation's apps and router do with `atem-client`. The full call
+order and every effect are in `atem-client-bindings.md` (cited as B§n);
+the normative rules are the r9 appendix of `atem-session-v1.md`. This
+section only says where each obligation lives.
+
+| effect / output | the native app or router must | where |
+|---|---|---|
+| `SignRequest` (purposes `Channel`, `Entry`, `KeyBackup`, `BrowserGrant`, …) | sign through its `AppKeyProvider` (Secure Enclave / Keystore), one fresh owner confirmation per entry or grant body; refuse `HostSigning` | B§3; §R9.1, §R9.4 rule 2 |
+| `prepared_json()` of `EntryPublisher`, `KBackupWriter`, `RestoreSession` | persist it before performing the returned step, resume from it after a restart, never start a second write for the device while one is saved | B§1 "Storage", B§2; §R9.4 rules 1 and 4, §R9.5 step 2 |
+| `MembershipLog::entries()` | persist after every change; the host's head stays authoritative | B§2 MembershipLog; §R9.3 |
+| frames from `start`/`on_accept`/`finish_with_signature`/`Outgoing`, `ClientEvent::Outgoing` | send at once on that connection's virtual channel only; pass every received frame to `on_frame` | B§1 "Transport", B§2 ClientConnection; §R9.7 |
+| `AtemError::Refused{next}`, `BadWelcome`, `Fenced`, channel errors | reconnect / wait for recovery / retry later / stop as `next` says; a fence or channel error closes that channel only | B§2 ClientConnection, B§4; §R9.8, §R9.11 |
+| `WelcomeInfo.fetch_to`, `ClientEvent::MembershipHead` | fetch to that head and `extend` the log; never adopt a head unverified | B§2; §R9.3 |
+| `pending_recovery`, frozen log | render it (approve / cancel; frozen state), stop signing entries while frozen | B§2 MembershipLog; §R9.4, §R9.5 |
+| approval events (r8 §G inside the channel) | render the card; answer with `submit_approval` | B§2; r8 §G, §R9.8 |
+| `approval_seen` | send only when the card was rendered in a focused foreground window and the user was active in the last 60 s; never from a background delivery or a notification | B§2 "Push hints and seen"; §R9.9 |
+| push hint (APNs/FCM payload) | `verify_push_hint`, `book.offer`, `hint.open` by the device's own key; a locked device shows a generic hint | B§2 "Push hints and seen"; §R9.9 |
+
+Router obligations (the relay and Astation's :8080):
+
+- **Outbound-only channel envelope.** Atem opens no port; every client,
+  the Mac's own Astation included, reaches it over Atem's one outbound
+  link. The router wraps each client's `atem-ch1` frames in the
+  `channel` envelope (`open` / `frame` / `close`, exact fields). The
+  handle is a routing id only, never authority (that is `atem-ch1`), and
+  the app's binding never sees it. §R9.7a; fixtures `r9-envelope-*`.
+- **2 MiB envelope.** The router never forwards an envelope over
+  2 097 152 bytes as received; Atem closes an over-limit one
+  `too_large` (or drops one it can't address). §R9.7a "Limits".
+- **256 KiB relay messages.** Every relay message on Atem's link
+  (`push_hint`, `push_seen`, `push_ack`), either direction, is at most
+  262 144 bytes as sent; the relay splits its acknowledgments, Atem drops
+  a larger one unread. §R9.9.
+- **Native channel lifetime.** A native principal's channel lasts 24 h
+  on the monotonic clock only (a key-rotation bound: a suspend doesn't
+  end it, removal from the device list does at once); it counts in
+  `welcome.authorization_ms_left`, which the binding enforces. Reconnect
+  with a new channel when it ends. Services and browsers end at their
+  expiry (wall and monotonic). An r9 host keeps its Astation link past the
+  r8 attachment's 24 h (that attachment is never welcomed). §R9.6,
+  §R9.7 "Limits".
+- **Host route proof.** Two carriers. (A) owner-present room: while the
+  paired Astation (the Mac) is in the room, the host joins and
+  authenticates to it as before, no proof required; pairing, the first
+  device verification, a managing device's reconciliation of a held host
+  and everything else while the Mac is online use (A), and the relay
+  never isolates or refuses a host on (A) for lack of a proof. (B)
+  proved host route: only to create or hold the room without its owner
+  and to route r9 channel traffic independently; isolation, binding and
+  fencing below apply to (B) only. A held, frozen, faulted or unpinned
+  host answers no challenge and only has (A). On every new host
+  connection the relay sends
+  `{"type":"relay","op":"host_challenge","v":1,"nonce","room"}` before
+  anything is routed over (B), even when the ephemeral room is gone; it
+  keeps the candidate socket isolated from (B) traffic (never replacing
+  the incumbent route) until
+  `atem_client::host_route::verify_host_route_message` accepts the
+  `host_route` answer against its current durable log (membership and
+  key at that head, never at the proof's `head`; refusal codes
+  `malformed`, `frozen`, `wrong_account`, `unknown_host`,
+  `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`,
+  `room_mismatch`, `atem_id_mismatch`), then persists the binding
+  `(genesis_hash, host_id) → room/atem_id` and fences the replaced
+  connection across replicas before exposing the route. Removal or
+  replacement of the host drops the binding and closes the connection; a
+  bound live route survives presence sweeps; nothing is replayed. No
+  valid proof, no route of its own (B): no fallback to the query-string
+  `atem_id`, the room code, a login or an old pairing. Atem answers on its relay
+  identity link in the link's reader, before and independent of
+  Astation's authentication, once per challenge, only with a pinned list
+  that can serve (not held, frozen or faulted). After verifying, the
+  relay sends `host_route_ok{host_id, head}` (the link is then held for
+  r9 only with no Astation: channels and push, never r8, Astation
+  operations, credentials or mark tasks; Astation's later
+  `auth_required` on it upgrades it to an authenticated link), or
+  `host_route_refused{code}` and closes. Atem answers one challenge per
+  link, only before it is routed or authenticated, and takes a verdict
+  only for its own proof, once (an unsolicited `ok` or `refused`, one for
+  another host or a head it doesn't hold is ignored). `type:"relay"`
+  messages are never forwarded between room members. If Astation denies
+  the routed link's authentication, the link stays routed for r9 (advice
+  logged, no reconnect until Astation challenges again). The verdict may
+  come before or after the relay exposes the host to the room's owner:
+  with `auth_required` first, Atem records a valid `ok` that arrives
+  while it waits for Astation's reply (or within 10 s after Astation
+  failed, its proof sent), is routed, and Astation's grant upgrades the
+  link while a denial, expiry or timeout leaves it routed. A held host
+  proves no route: it is reconciled over (A), the Mac in the room
+  authenticating its relay link (tested over the fake relay). After
+  enrollment (the list pinned) or a reconciliation, a relay link that
+  proved no route (including the link `atem pair` installed) is dropped
+  once and reconnected, once no Astation operation runs and no request or
+  channel is mid-admission (channels: at most 30 s) and only while the
+  host can still answer a challenge, so the new
+  link proves its route and the host stays reachable when the Mac goes
+  offline (runtime.log `relay link reconnecting to prove its route`; at
+  most once per event, never on a local link). Vectors
+  `r9-vectors-host-route` (`relay_replies` for the two verdicts); the real
+  runtime with no Astation online: `cargo test --test
+  r9_host_route_binary`. §R9.7b.
+
+Host state behind two of these answers (no action for Astation): a
+revoked browser grant is kept in `runtime/journal/revoked_grants` until
+its grant's expiry (at most 256; a full journal answers `revoke_grant`
+`busy` "revoked grants journal full" but still fences a live browser at
+once); if that file can't be read at start, it is kept aside
+(`revoked_grants.damaged-<ms>`) and every browser grant is refused `busy`
+"revoked grants unreadable" for at least 65 min (grant lifetime + issue
+slack). The rewritten file records that quarantine and every later write
+keeps the record, so a revocation during it or a restart can't end it
+early; it ends once the wall clock passed the recorded end and the running
+process saw 65 min on its monotonic clock. The conservative bound also
+lives in its own sidecar, `runtime/journal/revoked_quarantine`
+(`{"v":1,"until","high_water"}`), written durably before every write of
+`revoked_grants`: `until` is the latest quarantine end, `high_water` the
+high-water mark; both only rise. At every write the high-water mark is
+raised to at least the host's wall time and every retained entry's
+`until − 65 min`. The host's trusted time is `max(wall, high_water)`:
+a revocation of a grant that isn't live is kept until trusted time + 65
+min, and a quarantine ends no earlier than the previous end, the
+high-water mark + 65 min and trusted time + 65 min, so no retained
+entry outlives it, whatever wall time it was written at, and damage
+found again after the wall clock went back can't shorten an earlier
+quarantine (Astation's 12:00 / 10:00 / 12:10 trace, comment
+6307612632). While the host's wall clock is below `max(until,
+high_water)`, browser grants are refused `busy` "host clock went back"
+until it catches up. The two files vouch for each other (comment
+6308222846): `revoked_grants` missing or unreadable while the sidecar or
+a `*.damaged-<ms>` file exists, or the sidecar missing or unreadable
+while `revoked_grants` or a `*.damaged-<ms>` file exists, is lost and
+fails closed the same way: `busy` "revoked grants unreadable", until
+the bound above and 65 min on the monotonic clock. A lost sidecar's
+bound is rebuilt from what is left (the entries and the quarantine
+record in `revoked_grants`) with the newest modification time in the
+journal directory as an extra floor; the damaged sidecar is kept aside
+(`revoked_quarantine.damaged-<ms>`). The bound also has a copy outside
+the journal directory, `pairing/revoked_floor` (the same format, only
+ever raised, written durably before the sidecar at every write that
+raises it and at the pin; `atem unpair` keeps it): it floors the bound
+everywhere, and a sidecar below it (the journal restored or rolled back)
+or an unreadable copy on a pinned host fails closed the same way. A pin
+seeds the copy and both journal files (a re-pin over an existing journal
+raises its sidecar to the copy, so it isn't read as a rollback; a
+running engine reads the copy before each write, so neither file is ever
+lowered), so a host with a pinned device
+list always has them: with a pinned list and neither journal file nor a
+copy aside (`runtime/journal/` or `runtime/` removed, or only the two
+files, one event, clock behind or not), they were lost and browsers are
+quarantined to `max(the copy, the list's clean checkpoint at_wall, the
+newest write in pairing/ and in the journal) + 65 min` and trusted time
++ 65 min, plus 65 min on the monotonic clock. Only a host without a
+pinned list and with none of these files is fresh. Members, native revocations and the
+fencing of live browsers are unaffected throughout.
+
+`busy` details a browser `hello` or a `revoke_grant` can get from this:
+"revoked grants unreadable" (the quarantine), "host clock went back"
+(the wall clock below the bound), "revocation not recorded" (a
+`revoke_grant` whose sidecar or `revoked_grants` write failed: the
+revocation is in effect in memory and a live browser is fenced, but it
+may not survive a restart; send it again) and "revoked grants journal
+full".
+
+Limits: losing `runtime/` or the revoked-grants files is covered, clock
+behind or not. A revocation can still be forgotten when both `pairing/`
+and `runtime/` are deliberately removed (that is an unpair, and pairing
+again needs Astation's ceremony), when both are restored from an older
+backup, or by same-user tampering (out of scope, as everywhere in
+Atem). A host whose high-water mark is far in the future (one write
+while the wall clock was wrong) refuses browsers "host clock went back"
+until the clock reaches it; there is no override, and the only path is
+to wait for the clock. Removing `runtime/`, `runtime/journal/` or the
+revoked-grants files is no way out: `pairing/revoked_floor` keeps the
+bound and the host quarantines again (and the session journal is lost
+with it).
+
+Other host files where "missing" used to mean "fresh" (re-review N3; no
+action for Astation): `pairing/frozen_genesis` now has a mirror in
+another directory (`runtime/journal/frozen_genesis`, written first, read
+as their union): one missing is covered by the other, and either one
+unreadable refuses pairing (and the unpair of a frozen list) instead of
+reading as an empty list. It is checked right after `verifyKeys`, before
+the codes and Touch ID: `verifyAbort` "this host's record of frozen
+device lists can't be read; pairing is refused until it is restored on
+the host" (no local path; the remedy, naming Atem's config directory,
+is shown in the CLI). A `pairing/frozen_genesis.mirror` left by an
+earlier dev build is ignored (it always matched `frozen_genesis`) and
+can be deleted. The fault record that holds a host has a mirror in
+`runtime/journal/membership_fault`: either one holds the host, so losing
+one file never lifts a hold (still only after an observed write fault).
+At start, a queued request whose principal `principals` doesn't name at
+its `control_gen` (the file lost or older) rejects every queued request
+"authorization history unknown", as without a clean close; a lost
+`refused` list needs nothing (its failed admission write halted the
+journal, so that run never closed cleanly). A `runtime_epoch` missing
+next to the session journal's state, or while a surviving file names an
+earlier epoch (the device list's clean checkpoint, a fault record), was
+lost: the run vouches for no clean close and takes an epoch above every
+epoch a surviving file names, and at least the wall clock in ms. An
+epoch no surviving file records can be reused after a second loss with
+the clock set back; no authority depends on it (the clean close needs
+the exact previous epoch and is consumed at each start; a checkpoint
+match decides only a log line). Not changed, for later:
+`floors` (a lost floor could reissue a lease epoch; workers keep their
+own input epoch and drop older writes, so this is availability, not
+authority) and `receipts/<sid>` (a lost log forgets request-id dedupe:
+a retried prompt could run twice; a session without a log is normal,
+so there is no evidence to detect it by without a per-session index).
+
+Artifacts: `atem-client-bindings.md` §7 (SwiftPM, WASM, Kotlin/JVM,
+Android; SHA256SUMS and the source pin).
 
 ## Approvals (r7 §6a, on `feat/approvals`)
 

@@ -514,6 +514,12 @@ pub async fn spawn(
         crate::session::check_env(&env.to_os()).map_err(|e| anyhow!(e))?;
     }
     let sid = request.session_id.as_str();
+    // The launch project (git runs here, off the runtime's pass).
+    let cwd = request.cwd.clone();
+    let project_key =
+        tokio::task::spawn_blocking(move || crate::memory::project::project_key_for(&cwd))
+            .await
+            .ok();
     let spec = WorkerSpec {
         session_id: sid.to_string(),
         process_gen: request.process_gen.clone(),
@@ -523,6 +529,7 @@ pub async fn spawn(
         rows: request.rows,
         cols: request.cols,
         socket: paths.socket_dir.join(format!("{sid}.sock")),
+        project_key,
     };
     write_spec(&paths.state, &spec)?;
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));

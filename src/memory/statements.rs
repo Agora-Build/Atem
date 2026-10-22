@@ -525,6 +525,12 @@ impl FakeAstation {
         self.enc.to_bytes()
     }
 
+    /// The P-256 signing key's secret scalar (r9 tests sign device-list
+    /// entries with it, as Astation's ceremony identity).
+    pub fn sign_secret_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes().into()
+    }
+
     pub fn sign_pub(&self) -> Vec<u8> {
         self.key
             .verifying_key()

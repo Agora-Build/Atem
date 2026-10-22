@@ -1,0 +1,168 @@
+{
+  "name": "r9-envelope-vectors",
+  "requires": "r9",
+  "kind": "vectors",
+  "note": "R9.7a: the channel envelope's shapes, handle rules and bounds. Sizes are of compact JSON; a harness builds the largest legal record (1 MiB of plaintext under the channel's keys) and checks each serialized size exactly. `invalid_envelopes` are refused by the envelope parser (`close` is the reason Atem sends when the handle names a live channel; for any other handle nothing is sent); `refused_by_the_channel` are valid envelopes whose frame the channel refuses.",
+  "events": {
+    "open": {
+      "type": "channel",
+      "event": "open",
+      "channel": "ch-01",
+      "transport": "relay"
+    },
+    "open_direct": {
+      "type": "channel",
+      "event": "open",
+      "channel": "ch-02",
+      "transport": "direct"
+    },
+    "frame": {
+      "type": "channel",
+      "event": "frame",
+      "channel": "ch-01",
+      "frame": {
+        "ch": "atem-ch1",
+        "op": "rec",
+        "ct": "AAAAAAAAAAAAAAAAAAAAAA"
+      }
+    },
+    "close": {
+      "type": "channel",
+      "event": "close",
+      "channel": "ch-01",
+      "reason": "unknown_channel"
+    },
+    "close_bare": {
+      "type": "channel",
+      "event": "close",
+      "channel": "ch-01"
+    }
+  },
+  "handles": {
+    "valid": [
+      "a",
+      "ch-01",
+      "A_b-9",
+      "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+    ],
+    "invalid": [
+      "",
+      "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+      "ch 01",
+      "ch.01",
+      "ch/01",
+      "ç",
+      "ch:1"
+    ]
+  },
+  "reasons": {
+    "valid": [
+      "closed",
+      "unknown_channel",
+      "busy",
+      "too_large",
+      "malformed",
+      "handshake_failed",
+      "expired"
+    ],
+    "invalid": [
+      "",
+      "Busy",
+      "too-large",
+      "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    ]
+  },
+  "invalid_envelopes": [
+    {
+      "case": "unknown field on open",
+      "envelope": {
+        "type": "channel",
+        "event": "open",
+        "channel": "ch-01",
+        "transport": "relay",
+        "client_ip": "10.0.0.2"
+      },
+      "close": "malformed"
+    },
+    {
+      "case": "open without transport",
+      "envelope": {
+        "type": "channel",
+        "event": "open",
+        "channel": "ch-01"
+      },
+      "close": "malformed"
+    },
+    {
+      "case": "other transport",
+      "envelope": {
+        "type": "channel",
+        "event": "open",
+        "channel": "ch-01",
+        "transport": "lan"
+      },
+      "close": "malformed"
+    },
+    {
+      "case": "frame as a string",
+      "envelope": {
+        "type": "channel",
+        "event": "frame",
+        "channel": "ch-01",
+        "frame": "{\"ch\":\"atem-ch1\"}"
+      },
+      "close": "malformed"
+    },
+    {
+      "case": "unknown event",
+      "envelope": {
+        "type": "channel",
+        "event": "reset",
+        "channel": "ch-01"
+      },
+      "close": "malformed"
+    },
+    {
+      "case": "duplicate key",
+      "raw": "{\"type\":\"channel\",\"event\":\"close\",\"channel\":\"ch-01\",\"channel\":\"ch-02\"}",
+      "close": "malformed"
+    }
+  ],
+  "bounds": {
+    "plaintext_bytes": 1048576,
+    "tag_bytes": 16,
+    "max_ct_chars": 1398123,
+    "max_frame_bytes": 1398159,
+    "max_record_envelope": {
+      "handle": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+      "bytes": 1398279
+    },
+    "envelope_bytes": 2097152,
+    "open_channels_per_link": 64,
+    "handshakes_per_link": 16,
+    "queued_bytes_per_channel": 4194304,
+    "unknown_channel_handles_per_link": 1024,
+    "unknown_channel_closes_per_second": 16,
+    "inits_per_link_per_second": 1,
+    "max_finish_frame_bytes": 1398162,
+    "max_frame_bytes_note": "max_frame_bytes is the largest legal `rec`; a `finish` (op is 3 characters longer) is at most max_finish_frame_bytes; a frame whose `ct` is over max_ct_chars is too_large",
+    "global_closes": 1024
+  },
+  "refused_by_the_channel": [
+    {
+      "envelope": {
+        "type": "channel",
+        "event": "frame",
+        "channel": "ch-01",
+        "frame": {
+          "ch": "atem-ch2",
+          "op": "rec",
+          "ct": "AAAAAAAAAAAAAAAAAAAAAA"
+        }
+      },
+      "case": "a well-formed envelope whose frame is of another suite",
+      "close": "closed",
+      "note": "the envelope is valid; its channel refuses the frame (malformed atem-ch1) and closes"
+    }
+  ]
+}

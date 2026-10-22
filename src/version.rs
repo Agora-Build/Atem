@@ -125,6 +125,7 @@ mod tests {
                 astation: true,
                 host_error: None,
                 worker_protocol: Some(1),
+                device_list: None,
             },
             status: Some(RuntimeStatus {
                 sessions,

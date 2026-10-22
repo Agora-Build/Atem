@@ -645,6 +645,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         agent_pid,
         agent_start_time: agent_pid.and_then(process_start_time),
         exited: None,
+        project_key: spec.project_key.clone(),
     };
     if let Err(error) = write_record(&options.state, &record) {
         let _ = pty.resize_handle.stop();
@@ -1615,6 +1616,7 @@ mod approval_settings_tests {
             rows: 24,
             cols: 80,
             socket: PathBuf::from("/nonexistent.sock"),
+            project_key: None,
         }
     }
 

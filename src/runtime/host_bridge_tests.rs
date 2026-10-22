@@ -1843,6 +1843,59 @@ fn the_link_is_fenced_and_dropped_at_its_authorization_deadline() {
     });
 }
 
+/// Review I1 of Task 9a: an r8 host (no device list) whose link was never
+/// welcomed (no `hello` yet) still loses it at the 24 h authorization
+/// deadline, so the reconnect gets a fresh attachment (never a link whose
+/// every `hello` is `paused`).
+#[test]
+fn an_r8_link_never_welcomed_is_still_dropped_at_its_deadline() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        // The link authenticated; Astation never says hello.
+        rt.peer.drain(Duration::from_millis(300)).await;
+        rt.clock.skip(super::LINK_AUTHORIZATION_MS + 1);
+        tokio::time::timeout(WAIT, async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await
+        .expect("an unwelcomed r8 link stayed open past its authorization");
+        rt.shutdown().await;
+    });
+}
+
+/// §R9, §R9.7a: an r9 host's link carries no session authority (r8 is
+/// refused, its attachment never welcomed); 24 h on either clock doesn't
+/// drop it (each r9 channel has its own lifetime).
+#[test]
+fn an_r9_hosts_link_outlives_the_r8_authorization() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+        log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.dir.path().join("profile")).pairing;
+        let journal = rt.dir.path().join("state").join("journal");
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: TRUST_GEN,
+        };
+        MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+        let peer = &mut rt.peer;
+        let id = peer.request("hello", json!({"revision": 8}));
+        let refused = peer.reply(&id).await;
+        assert_eq!(refused["revision"], 9, "the list is in force: {refused}");
+        rt.clock.skip(super::LINK_AUTHORIZATION_MS + 1);
+        rt.clock.skip_wall(super::LINK_AUTHORIZATION_MS + 1);
+        let closed = tokio::time::timeout(Duration::from_millis(1_500), async {
+            while rt.peer.from_atem.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_err(), "the r9 host dropped its link at 24 h");
+        rt.shutdown().await;
+    });
+}
+
 /// `atem unpair` took effect without telling the runtime (no `reload`
 /// delivered): the broker notices the changed pairing on its own and drops
 /// the link with its attachment.
@@ -3992,6 +4045,273 @@ fn status_reports_the_attachment_its_refusals_and_its_welcome() {
     });
 }
 
+/// r9 §R9.3: a device list that can't be opened is a typed state (Task 7
+/// refuses r9 admission on it), distinct from "no device list", and leaves
+/// r8 alone (no `host_error`).
+#[test]
+fn a_device_list_that_cant_be_opened_is_reported_apart_from_none() {
+    use crate::session_protocol::membership::DeviceList;
+    let dir = short_dir();
+    let profile = dir.path().join("profile");
+    let sources = crate::profile::Sources::in_dir(&profile);
+    let journal = dir.path().join("journal");
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(bridge.device_list(), DeviceList::None));
+    drop(bridge);
+    let pairing = &sources.paths.pairing;
+    crate::session_protocol::membership::store::private_dir(pairing.dir()).unwrap();
+    std::fs::write(&pairing.membership, b"{damaged").unwrap();
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(bridge.device_list(), DeviceList::Failed));
+    assert!(bridge.host_error().is_none(), "r8 is unaffected");
+}
+
+/// Re-review Minor 4: the device-list reason goes with the carriage's own
+/// link drop only, never with a later, unrelated one.
+#[test]
+fn a_device_list_drop_reason_never_outlives_its_drop() {
+    let dir = short_dir();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    // A carriage that dropped nothing: no reason, no drop.
+    bridge.carriage_closed(false);
+    assert_eq!(bridge.take_close(), None);
+    // A later refusal drop keeps its own reason.
+    bridge.close_link = true;
+    assert_eq!(bridge.take_close(), Some(super::REFUSAL_DROP));
+    // A drop already due before the carriage keeps its reason.
+    bridge.close_link = true;
+    bridge.carriage_closed(true);
+    assert_eq!(bridge.take_close(), Some(super::REFUSAL_DROP));
+    // The carriage's own drop: its reason, once.
+    bridge.carriage_closed(false);
+    bridge.close_link = true;
+    bridge.carriage_closed(false);
+    assert_eq!(bridge.take_close(), Some(super::DEVICE_LIST_DROP));
+    bridge.close_link = true;
+    assert_eq!(bridge.take_close(), Some(super::REFUSAL_DROP));
+    assert_eq!(bridge.take_close(), None);
+}
+
+/// r9 (§R9.9): once a device list is pinned while the runtime runs, the
+/// relay gets nothing in clear: not the resolve of an approval pushed
+/// before the pin, and no new push.
+#[test]
+fn a_pinned_host_sends_no_clear_push_even_for_an_earlier_approval() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt.launch_approval_agent(&mut client, "codex", &fake).await;
+        let sid = session.id.clone();
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        ask(
+            &fake,
+            1,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo build"}}),
+        );
+        let request = peer.wait(|v| is_session(v, "approval_request")).await;
+        let aid = request["data"]["approval_id"].as_str().unwrap().to_string();
+        peer.wait_from(0, |v| is_relay(v, "push_approval", &aid))
+            .await;
+        // A pairing pins a list for this host while the runtime runs.
+        let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+        log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.dir.path().join("profile")).pairing;
+        let journal = rt.dir.path().join("state").join("journal");
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: TRUST_GEN,
+        };
+        MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+        let peer = &mut rt.peer;
+        let id = peer.request("hello", json!({"revision": 8}));
+        let refused = peer.reply(&id).await;
+        assert_eq!(refused["revision"], 9, "the list is in force: {refused}");
+        // The approval ends (released by local input): no push_resolved.
+        attach_client(&mut client, &sid, 24, 80).await;
+        client.send(&ClientMsg::input(&sid, b"L")).await.unwrap();
+        agent_event(&fake, "answer 1 none ").await;
+        let peer = &mut rt.peer;
+        peer.drain(Duration::from_millis(500)).await;
+        assert!(
+            !peer.seen.iter().any(|v| is_relay(v, "push_resolved", &aid)),
+            "no clear resolve on an r9 host"
+        );
+        // Nor a new push.
+        ask(
+            &fake,
+            2,
+            json!({"tool_name": "shell", "tool_input": {"command": "cargo test"}}),
+        );
+        peer.drain(Duration::from_millis(800)).await;
+        assert_eq!(
+            peer.seen
+                .iter()
+                .filter(|v| v["type"] == "relay" && v["data"]["op"] == "push_approval")
+                .count(),
+            1
+        );
+        rt.shutdown().await;
+    });
+}
+
+/// M-b (66ea556): a pin seen half written (its key and applied head, the
+/// list not yet) is opened once it is finished, even when the list lands
+/// right after the reopen read the files: the stamp kept is the one read
+/// before opening, so the next pass sees the change. With the stamp read
+/// again after the open, the list landing in that window would never be
+/// opened.
+#[test]
+fn a_pin_finished_right_after_a_reopen_is_opened_on_the_next_pass() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        rt.peer.hello().await;
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.dir.path().join("profile")).pairing;
+        let journal = rt.dir.path().join("state").join("journal");
+        // The whole pin, written elsewhere first.
+        let staging = rt.dir.path().join("staging");
+        let staged = crate::paths::ProfilePaths::in_dir(&staging).pairing;
+        let staged_journal = staging.join("journal");
+        crate::session_protocol::membership::store::private_dir(&staged_journal).unwrap();
+        let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+        log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: TRUST_GEN,
+        };
+        MembershipHost::pin(
+            &staged,
+            &staged_journal,
+            &pin,
+            &log.log,
+            &secret("bridge host"),
+        )
+        .unwrap();
+        // The list lands right after the reopen that saw the rest.
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let (list_from, list_to, flag) = (
+            staged.membership.clone(),
+            pairing.membership.clone(),
+            fired.clone(),
+        );
+        super::AFTER_REOPEN.lock().unwrap().push((
+            pairing.dir().to_path_buf(),
+            Box::new(move || {
+                std::fs::copy(&list_from, &list_to).unwrap();
+                flag.store(true, Ordering::SeqCst);
+            }),
+        ));
+        // The key and the applied head first, as the pin writes them.
+        crate::session_protocol::membership::store::private_dir(pairing.dir()).unwrap();
+        std::fs::copy(&staged.host_channel_key, &pairing.host_channel_key).unwrap();
+        std::fs::copy(
+            staged_journal.join("membership_applied"),
+            journal.join("membership_applied"),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = status(&mut client).await.device_list.map(|d| d.state);
+            if fired.load(Ordering::SeqCst) && state.as_deref() == Some("open") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the finished pin was never opened (hook fired: {}, state {state:?})",
+                fired.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        rt.shutdown().await;
+    });
+}
+
+/// Re-review N3: a missing `runtime_epoch` next to the journal's state was
+/// lost, not fresh: the counter never restarts at 1 (a reused epoch could
+/// match an old clean close or clean checkpoint). The previous run isn't
+/// vouched for, even by a clean close naming the old epoch, and the new
+/// epoch is above every earlier one.
+#[test]
+fn a_lost_runtime_epoch_never_restarts_the_counter() {
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    let first = bridge.host().context().runtime_epoch;
+    assert_eq!(first, 1);
+    bridge.close_cleanly();
+    drop(bridge);
+    assert!(journal.join("clean_close").exists());
+    std::fs::remove_file(journal.join("runtime_epoch")).unwrap();
+    let bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert!(
+        !bridge.host().previous_run_clean(),
+        "a lost counter vouches for no clean close"
+    );
+    let epoch = bridge.host().context().runtime_epoch;
+    assert!(
+        epoch > 1_000_000_000_000,
+        "above every earlier epoch: {epoch}"
+    );
+    assert!(bridge.host_error().is_none());
+    drop(bridge);
+    let again = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert_eq!(again.host().context().runtime_epoch, epoch + 1);
+}
+
+/// Re-review F2: after the whole journal directory is lost, a surviving
+/// file that names an earlier epoch (the device list's clean checkpoint, a
+/// fault record) makes the counter lost, not fresh, and the next epoch is
+/// above every epoch they name, even one above the wall clock in ms.
+#[test]
+fn a_lost_journal_takes_an_epoch_above_every_recorded_one() {
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let pairing = crate::paths::ProfilePaths::in_dir(&dir.path().join("profile")).pairing;
+    crate::paths::write_test_file(&pairing.membership, b"{}");
+    // Nothing names an epoch: fresh.
+    assert_eq!(
+        super::current_runtime_epoch(&journal, Some(&pairing)).unwrap(),
+        super::PreviousEpoch::Known(0)
+    );
+    let high = 9_000_000_000_000_000u64;
+    for (path, body) in [
+        (
+            pairing.membership.clone(),
+            serde_json::json!({"checkpoint": {"runtime_epoch": high, "at_wall": 1}}),
+        ),
+        (
+            pairing.fault.clone(),
+            serde_json::json!({"v": 1, "runtime_epoch": high + 5}),
+        ),
+        (
+            journal.join("membership_fault"),
+            serde_json::json!({"v": 1, "runtime_epoch": high + 9}),
+        ),
+    ] {
+        crate::paths::write_test_file(&path, body.to_string());
+        assert_eq!(
+            super::current_runtime_epoch(&journal, Some(&pairing)).unwrap(),
+            super::PreviousEpoch::Lost
+        );
+    }
+    let epoch = super::next_runtime_epoch(&journal, Some(&pairing)).unwrap();
+    assert_eq!(epoch, high + 10);
+    assert_eq!(
+        super::next_runtime_epoch(&journal, Some(&pairing)).unwrap(),
+        high + 11
+    );
+}
+
 #[test]
 fn the_welcome_line_names_the_trust_generation() {
     assert_eq!(
@@ -4001,5 +4321,120 @@ fn the_welcome_line_names_the_trust_generation() {
     assert_eq!(
         super::welcome_line(Some(("a1b2c3d4", "e5f6a7b8")), "e5f6a7b8", 6),
         "replaced attachment a1b2c3d4 with e5f6a7b8; welcome (trust gen 6)"
+    );
+}
+
+/// §R9.7b: the relay link answers the relay's `host_challenge` only on a
+/// host with a pinned device list that can serve, once per challenge, for
+/// the link's own room; the proof verifies with the shared verifier
+/// against the host's log. Held or frozen: nothing.
+#[test]
+fn the_host_route_is_answered_only_with_a_pinned_list_that_can_serve() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    use crate::session_protocol::r9::route::{self, LinkRoute, RouteState};
+    use atem_client::host_route::{HostChallenge, verify_host_route_message};
+    const ROOM: &str = "astation-room";
+    const ATEM_ID: &str = "hosta-0000000-1a2b3c4d";
+    let dir = short_dir();
+    let sources = crate::profile::Sources::in_dir(&dir.path().join("profile"));
+    let journal = dir.path().join("journal");
+    let challenge = |room: &str| HostChallenge::new(room).to_json().to_string();
+
+    // No device list: no answer.
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    let handle = route::new_handle();
+    route::set(&handle, bridge.route_state());
+    assert!(matches!(
+        bridge.route_state(),
+        RouteState::Off("no device list")
+    ));
+    assert_eq!(
+        LinkRoute::new(handle.clone(), ROOM, ATEM_ID).answer(&challenge(ROOM)),
+        None
+    );
+    drop(bridge);
+
+    // A pinned list: answered at its head, verified by the relay's verifier.
+    let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+    log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+    let pairing = sources.paths.pairing.clone();
+    let pin = HostPin {
+        host_id: DEVICE.into(),
+        host_trust_gen: TRUST_GEN,
+    };
+    MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    route::set(&handle, bridge.route_state());
+    let mut link = LinkRoute::new(handle.clone(), ROOM, ATEM_ID);
+    let first = HostChallenge::new(ROOM);
+    let text = first.to_json().to_string();
+    let answer = link.answer(&text).expect("answered");
+    let route = verify_host_route_message(&log.log, answer.as_bytes(), &first.nonce, ROOM, ATEM_ID)
+        .unwrap();
+    assert_eq!(route.host_id, DEVICE);
+    assert_eq!(route.head, log.log.head());
+    // One challenge per link: a repeat or a new one is ignored.
+    assert_eq!(link.answer(&text), None);
+    assert_eq!(link.answer(&challenge(ROOM)), None, "one per link");
+    // Never for another room; a malformed one ignored.
+    let mut fresh = LinkRoute::new(handle.clone(), ROOM, ATEM_ID);
+    assert_eq!(fresh.answer(&challenge("another-room")), None);
+    assert_eq!(
+        fresh.answer(r#"{"type":"relay","op":"host_challenge","v":1,"room":"astation-room"}"#),
+        None
+    );
+    assert!(fresh.answer(&challenge(ROOM)).is_some());
+    drop(bridge);
+
+    // Held (a fault record): nothing.
+    crate::paths::write_test_file(
+        &pairing.fault,
+        json!({"v": 1, "runtime_epoch": 1}).to_string(),
+    );
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(
+        bridge.route_state(),
+        RouteState::Off("device list held")
+    ));
+    route::set(&handle, bridge.route_state());
+    assert_eq!(
+        LinkRoute::new(handle.clone(), ROOM, ATEM_ID).answer(&challenge(ROOM)),
+        None
+    );
+    drop(bridge);
+}
+
+/// §R9.7b: a frozen device list answers no challenge.
+#[test]
+fn a_frozen_host_answers_no_host_challenge() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    use crate::session_protocol::r9::route::{self, LinkRoute, RouteState};
+    use atem_client::host_route::HostChallenge;
+    let dir = short_dir();
+    let sources = crate::profile::Sources::in_dir(&dir.path().join("profile"));
+    let journal = dir.path().join("journal");
+    let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+    log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+    let pairing = sources.paths.pairing.clone();
+    let pin = HostPin {
+        host_id: DEVICE.into(),
+        host_trust_gen: TRUST_GEN,
+    };
+    MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("bridge host")).unwrap();
+    // A freeze file that can't be read: frozen, fail closed.
+    crate::paths::write_test_file(&pairing.freeze, b"{damaged");
+    let bridge = super::HostBridge::open(&journal, Some(&sources), Clock::default()).unwrap();
+    assert!(matches!(
+        bridge.route_state(),
+        RouteState::Off("device list frozen")
+    ));
+    let handle = route::new_handle();
+    route::set(&handle, bridge.route_state());
+    let text = HostChallenge::new("astation-room").to_json().to_string();
+    assert_eq!(
+        LinkRoute::new(handle, "astation-room", "atem-x").answer(&text),
+        None
     );
 }

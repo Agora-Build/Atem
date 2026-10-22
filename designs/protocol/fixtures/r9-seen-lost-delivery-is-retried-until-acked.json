@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.9: Atem resends the same signed push_seen bytes every 10 s (and at each link reconnect) until the relay acks it with the full identity, and the resolved hint likewise; a repeated client seen is answered and never re-signed; after the ack nothing more is sent.",
+  "note": "R9.9: Atem resends the same signed push_seen bytes every 10 s (and at each link reconnect) until the relay acks it with the full identity, and the resolved hint likewise; a repeated client seen is answered and never re-signed; after the ack nothing more is sent. The open hints are acked as soon as they are pushed (amended: unacked hints are resent every 10 s, R9.9), so only the seen is resent while the relay is lost.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -67,7 +67,7 @@
         "op": "approval_request"
       },
       "capture": {
-        "ap": "approval.approval_id"
+        "ap": "approval_id"
       }
     },
     {
@@ -81,6 +81,37 @@
         "op": "push_hint",
         "hints.#": 2,
         "hints.0.body.state": "open"
+      }
+    },
+    {
+      "relay_ack": {
+        "op": "push_ack",
+        "acks": [
+          {
+            "kind": "hint",
+            "account_id": "acct-test-1",
+            "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+            "host_id": "host-a",
+            "host_trust_gen": 1,
+            "session_id": "ses-aaaaaaaaaaaa",
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "approval_id": "${ap}",
+            "state": "open",
+            "device_id": "dev-mac"
+          },
+          {
+            "kind": "hint",
+            "account_id": "acct-test-1",
+            "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+            "host_id": "host-a",
+            "host_trust_gen": 1,
+            "session_id": "ses-aaaaaaaaaaaa",
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "approval_id": "${ap}",
+            "state": "open",
+            "device_id": "dev-phone"
+          }
+        ]
       }
     },
     {

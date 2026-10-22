@@ -108,6 +108,14 @@
       }
     },
     {
+      "expect": "svc",
+      "type": "terminal",
+      "match": {
+        "op": "error",
+        "code": "forbidden"
+      }
+    },
+    {
       "send_membership": "phone",
       "entries": [
         "E7"
@@ -145,7 +153,7 @@
         "membership_halted": true,
         "attachments": 1,
         "pty_writes_remote": 0,
-        "pty_writes_dropped": 1,
+        "pty_writes_dropped": 0,
         "receipts": {
           "bbbbbbbb-0000-4000-8000-000000000001": {
             "state": "rejected",
@@ -163,7 +171,8 @@
           "v": 1,
           "op": "acquire",
           "id": "aaaaaaaa-0000-4000-8000-000000000071",
-          "binding": "${binding:phone:ses-aaaaaaaaaaaa}"
+          "binding": "${binding:phone:ses-aaaaaaaaaaaa}",
+          "takeover": false
         }
       }
     },

@@ -193,15 +193,17 @@ Astation's API-level merge fixture (a delayed HTTP page against newer SSE
 versions) is Astation's; the host side of it is
 `r8-history-page-and-live-events-share-one-ordered-stream`.
 
-## r9 fixtures (draft; not run)
+## r9 fixtures
 
-`r9-*.json` files carry `"requires": "r9"` and exercise the drafted
-appendix "r9" of `../atem-session-v1.md`. r9 isn't implemented: both
+`r9-*.json` files carry `"requires": "r9"` and exercise appendix "r9" of
+`../atem-session-v1.md`, implemented by Atem. They run in
+`crates/atem-client`'s tests (vectors, client and relay sides) and in
+Atem's `tests/r9_runner` (host side, against the real runtime; results and
+the items no channel can express in `../atem-host-handoff.md`). The r8
 runners report every one as NOT RUN ("requires r9 …",
 `revision::R9_NOT_RUN`) and only check that it parses, is named after its
-file and has a known `kind`. They become runnable in `crates/atem-client`
-(vectors, client and relay sides) and the Atem host harness (host side)
-when r9 is built; the steps below are the contract for those harnesses.
+file and has a known `kind`. The steps below are the contract for the r9
+harnesses.
 
 `kind: "vectors"` — known-answer values computed with this crate's own
 dependencies (`p256`, `ed25519-dalek`, `x25519-dalek`, `hkdf`,
@@ -217,9 +219,12 @@ and `negative`/`invalid` cases must be refused for the stated reason.
 | `r9-vectors-keys` | every test key (P-256, Ed25519, X25519 secrets and publics), the Recovery Kit `R` and `kit_tag`, and the substitute chain's `host-evil` and `K-evil` |
 | `r9-vectors-encoding` | `enc`, `u64`, `jcs`, a P-256 low-S signature and its refused high-S twin, an Ed25519 signature |
 | `r9-vectors-membership-log` | log L = E1–E6 (genesis, add_host, three members, a service, a removal) with signing inputs, signatures and `entry_hash`; alternatives used by the scenarios: `C6_ipad`, `C6_mac`, `S6_phone`, `E7`, `E7_retry`, `X8_badsig`, `X7_ipad`, `X5_svc91d`, `R7`, `R7_wrong_key`, `R7_roles`, `R7_remove`, `R6_conflict`; recovery decisions and kits (R9.5): `R7_backdated`, `A8`, `V8`, `A8_ipad`, `V8_ipad`, `N8`, `K7_current` (with `kit_sig`), `K7_current_no_kit_sig`, `R8_oldkit`, `R8_newkit`, `K7_lost`, `V8_k`, `A8_k_self`, `R8_oldkit_after_lost`, `KB7`, `KB8`, `KB8_stale`, `KB8_badct` (names an envelope that fails to open); the substitute chain `SUB1`–`SUB3` (another genesis reusing kit 1's public key, refused by a restore) |
+| `r9-vectors-host-route` | the host route proof (R9.7b): the relay's challenge, H7 entries on log L (`H7_remove_host`, `H7_rekey_host_a`, `H7_add_host_b`), valid proofs (`message`, `jcs`, `signing_input_hex`, the `chain` the verifier holds after L, the expected `host_id` and `head`) and refused ones with their `code` (`invalid`; `invalid_text` for raw messages) |
 | `r9-vectors-recovery` | `R` → signing seed, recovery key (= E1's) and its X25519 form; the `R7` entry; `atem-k-backup-v2` envelopes sealed to kit 1 (`k_backup`, version 3; `k_backup_rotated`, version 4) with `info`, `ikmE`, `backup_hash`; `kit_2` (the replacement kit) and the envelope re-sealed to it; each kit's genesis binding (`kit`, `kit_2.kit`: `account_id`, `genesis_hash`, `kit_tag`); `substitute_chain` (its envelope sealed to kit 1, opening with kit 1, refused `genesis_mismatch`) |
 | `r9-vectors-channel-handshake` | a full `atem-ch1` handshake (every input, `th2`, `sig_h`, `ss`, `hs`, `k_finish`, `th3`, `sig_c`, the `finish` ciphertext, `th4`, `channel_id`, both record keys, three records) and the negative cases |
 | `r9-vectors-browser-grant` | a signed QR grant, its hash, the browser's `th3`/`sig_c`, and two invalid grants |
+| `r9-vectors-pairing` | `verifyCommit` with `host_trust_gen` (§R9.2): valid and invalid messages as exact bytes, the `add_host` generation checks, and when a verification attempt is void |
+| `r9-envelope-vectors` | the channel envelope (R9.7a): the three event shapes, valid and invalid handles and reasons, envelopes Atem refuses, and every bound (the largest legal record and its exact serialized sizes) |
 | `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints |
 
 `kind: "scenario"` — `{name, requires, kind, side, log, note, setup,
@@ -283,6 +288,28 @@ stand for the client's current read / lease binding. New:
 | `{"relay_lost": true}`, `{"relay_ack": {op, acks}}` | host side: the last relay message Atem sent was lost; the relay acknowledges |
 | `{"restore": {kit, relay_log, relay_blob, host_heads}, "tamper"?: {…}, "result": "restored"\|"refused", "detail"?, "freshness"?, "kids"?, "published": false\|{…}}` | client side: a Recovery Kit restore against that relay log and envelope with those host-signed heads; `published` is the `recovery_add` it then signs (none when refused) |
 | `{"client_data": {"kid": k}, "result": r}` | client side: the restored device meets data sealed under `kid` |
+
+Channel envelope steps (R9.7a; `r9-envelope-*`, host side). Every
+`connect` that names a `channel` runs inside the envelope on Atem's
+link: the router's `open` with that handle and `transport`, then each
+`atem-ch1` frame wrapped in a `frame` event; every expectation on a
+client's records unwraps them. Without `link_up` no link exists.
+
+| step | meaning |
+|---|---|
+| `{"link_up": true}` / `{"link_down": true}` | Atem's link authenticates (a new link generation) / drops (every channel on it closes) |
+| `{"connect": c, "channel": h, "transport": "relay"\|"direct", …, "expect_init_refused"?: code}` | the router opens `h` for client c, then a full handshake inside it; `expect_init_refused`: Atem answers the `init` with that clear error frame |
+| `{"envelope_in": {…}}` / `{"envelope_in_bytes": {"channel": h, "bytes": n}}` | the router sends this envelope as is / a `frame` envelope for `h` whose serialized size is exactly `n` bytes (the harness pads the frame's `ct`) |
+| `{"close_channel": h, "reason"?: r}` | the router closes `h` (the client went away) |
+| `{"expect_envelope": {"match": {…}}}` / `{"expect_no_envelope": {"channel"?: h, "for_ms": n}}` | the next envelope Atem sends outside any client's records (a `close`) / none (for that handle) |
+| `{"expect_channel_open": c}` | c's channel is still open and its attachment live |
+| `{"send_record": c, "tamper": "tag"}` | c sends its next record with one bit of the tag flipped |
+| `{"send_frame": c, "frame_of_plaintext_bytes": n, "expect_envelope_bytes"?: m, "unchecked"?: true}` | c sends a record of `n` plaintext bytes (any valid session message padded to size); `expect_envelope_bytes`: its compact envelope is exactly `m` bytes; `unchecked`: sent past the sender's own bound |
+| `{"stall_link": true}` / `{"unstall_link": true}` | Atem's link stops taking messages / takes them again (queued output builds up) |
+| `{"fill_queue": c, "bytes": n}` | c's requests make Atem queue at least `n` bytes for c's channel while the link is stalled |
+
+New `assert` keys: `channels` (channels open on the link),
+`attachments` (as r8).
 
 In r9 scenarios `advance_ms` moves the host's (or relay's) monotonic
 and wall clocks together, and `set_wall_clock` the wall clock only.

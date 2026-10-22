@@ -67,8 +67,9 @@
 //! that fails the link is closed without a reply. An orderly stop with a
 //! healthy journal writes the clean-close record (`close_cleanly`). At start
 //! (`recover`) recovered queued work is resolved in the appendix's order:
-//! refused (`acceptance not confirmed`), no clean close (`authorization
-//! history unknown`), trust changed, an older `control_gen` (`control
+//! refused (`acceptance not confirmed`), no clean close or lost control
+//! history (`authorization history unknown`: a queued request whose
+//! principal `principals` doesn't name at its `control_gen`), trust changed, an older `control_gen` (`control
 //! revoked`), else it waits for its principal to be welcomed with `control`
 //! and is `control not confirmed` 60 s after the start.
 //!
@@ -99,6 +100,10 @@ use super::wire::{
 use crate::chat::history::valid_page_id;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+/// The prefix of a browser grant's principal (r9 §R9.6): one per grant,
+/// pruned from the control states once it can no longer matter.
+pub const BROWSER_PRINCIPAL: &str = "browser:";
 
 /// A lease lasts this long from its grant or renewal (§5).
 pub const LEASE_MS: u64 = 15_000;
@@ -154,6 +159,8 @@ pub const DETAIL_REPAIR: &str = "host counters exhausted; pair again";
 /// A completed `prompt` receipt's `detail`: its turn's outcome (chat-v1
 /// `complete.outcome`), kept in the journal as one of these two words.
 pub const DETAIL_TURN_DONE: &str = "done";
+/// An r8 `hello` on a host with a device list (r9 "No compatibility").
+pub const R8_REFUSED: &str = "this host has a device list: connect with atem-session revision 9";
 pub const DETAIL_TURN_INTERRUPTED: &str = "interrupted";
 
 // ── Inputs and outputs ────────────────────────────────────────────────────
@@ -440,6 +447,8 @@ struct PrincipalState {
     control: bool,
     control_gen: u64,
     confirmed: bool,
+    /// r9: the newest membership entry whose fence raised `control_gen`.
+    fence_seq: u64,
 }
 
 /// What §F's admission planned for the lease.
@@ -592,6 +601,14 @@ pub struct SessionHost<J: Journal> {
     /// How the request being refused is answered beyond its code.
     refused: Refused,
     out: Vec<Effect>,
+    /// r9 (§R9.7a 7, "No compatibility"): a device list exists, so an r8
+    /// `hello` is refused (`unsupported_version`, `revision: 9`) and no
+    /// attachment is welcomed outside the channel.
+    refuse_r8: bool,
+    /// Fixtures (`hold_dispatch`; debug builds only, the real runtime's
+    /// fixture hook): accepted work stays queued.
+    #[cfg(any(test, debug_assertions))]
+    dispatch_held: bool,
 }
 
 type Checked<T = ()> = Result<T, ErrorCode>;
@@ -650,6 +667,9 @@ impl<J: Journal> SessionHost<J> {
             waiting: BTreeSet::new(),
             refused: Refused::default(),
             out: Vec::new(),
+            refuse_r8: false,
+            #[cfg(any(test, debug_assertions))]
+            dispatch_held: false,
         };
         host.reload()?;
         Ok(host)
@@ -689,6 +709,9 @@ impl<J: Journal> SessionHost<J> {
         if self.journal_halted {
             return false;
         }
+        if let Record::Control { principal, .. } = &record {
+            self.prune_principals(principal);
+        }
         if self.journal.append(record).is_ok() {
             return true;
         }
@@ -710,6 +733,63 @@ impl<J: Journal> SessionHost<J> {
         }
     }
 
+    /// r9 (§R9.6): each browser grant is its own principal
+    /// (`browser:<grant_id>`), so their control states would grow the
+    /// `principals` file without bound. Before each control write, the
+    /// browser principals that can no longer matter are forgotten (in
+    /// memory and in what the journal writes next, this write): no live
+    /// attachment, no lease, no request `accepted` or `executing`. A
+    /// `control_gen` exists to order such work against a fence (§H); with
+    /// none left, nothing is ever compared with it. A browser is never
+    /// admitted on the strength of a control state: a revoked grant is
+    /// refused from the revoked-grants journal, an issuer without
+    /// `control` at admission, an expired grant by its expiry. If the same
+    /// grant connects again it starts a new control state, which no earlier
+    /// work can use. Members and Astation principals are bounded by the
+    /// device list and the pairing and are kept.
+    fn prune_principals(&mut self, writing: &str) {
+        if !self
+            .principals
+            .keys()
+            .any(|p| p.starts_with(BROWSER_PRINCIPAL) && p != writing)
+        {
+            return;
+        }
+        let mut live: HashSet<&str> = self
+            .attachments
+            .values()
+            .map(|a| a.principal.as_str())
+            .collect();
+        live.extend(
+            self.sessions
+                .values()
+                .filter_map(|s| s.lease.as_ref().map(|l| l.principal.as_str())),
+        );
+        live.extend(
+            self.receipts
+                .values()
+                .filter(|e| !journal::is_final(e.stored.state))
+                .map(|e| e.stored.principal.as_str()),
+        );
+        let gone: Vec<String> = self
+            .principals
+            .keys()
+            .filter(|p| {
+                p.starts_with(BROWSER_PRINCIPAL)
+                    && p.as_str() != writing
+                    && !live.contains(p.as_str())
+            })
+            .cloned()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for p in &gone {
+            self.principals.remove(p);
+        }
+        self.journal.forget_principals(&gone);
+    }
+
     /// The principal's control state (a principal the journal doesn't
     /// know holds no `control` yet, at generation 1).
     fn principal(&self, principal: &str) -> PrincipalState {
@@ -720,6 +800,7 @@ impl<J: Journal> SessionHost<J> {
                 control: false,
                 control_gen: 1,
                 confirmed: false,
+                fence_seq: 0,
             })
     }
 
@@ -751,6 +832,20 @@ impl<J: Journal> SessionHost<J> {
 
     fn take(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.out)
+    }
+
+    /// The session host's wall clock (ms): an offset plus its monotonic
+    /// clock (r8 receipts and descriptors, `welcome.server_time`).
+    pub fn wall_ms(&self) -> u64 {
+        self.wall()
+    }
+
+    /// Sets the wall clock's offset (`wall - monotonic`). The runtime
+    /// recomputes it from the host clock every pass: the monotonic clock
+    /// stands still while the machine sleeps, so an offset fixed at the
+    /// start would leave every displayed time behind by the time slept.
+    pub fn set_wall_offset(&mut self, offset_ms: u64) {
+        self.config.wall_offset_ms = offset_ms;
     }
 
     fn wall(&self) -> u64 {
@@ -880,6 +975,7 @@ impl<J: Journal> SessionHost<J> {
                 principal: principal.to_string(),
                 control: true,
                 control_gen: st.control_gen,
+                fence_seq: st.fence_seq,
             });
             self.principals.insert(
                 principal.to_string(),
@@ -901,25 +997,47 @@ impl<J: Journal> SessionHost<J> {
     /// restart rejects the same requests (no clean close). Executing work
     /// isn't cancelled.
     fn revoke_control(&mut self, principal: &str) {
+        self.fence(principal, true, 0, false);
+    }
+
+    /// The §H fence of `principal`: when `raise`, its raised `control_gen`
+    /// (naming membership entry `fence_seq`, 0 for none) is written durably
+    /// (in memory only once the journal halted); its live attachments are
+    /// fenced (all of them with `all_attachments`, else those with
+    /// `control`), every lease held by one of its attachments (live or
+    /// gone) is revoked, and each of its accepted requests not yet executing
+    /// is rejected (`control revoked`), in memory when a write fails.
+    fn fence(&mut self, principal: &str, raise: bool, fence_seq: u64, all_attachments: bool) {
         let st = self.principal(principal);
-        let raised = st.control_gen.saturating_add(1).min(MAX_SAFE_INTEGER);
-        let mut durable = self.append(Record::Control {
-            principal: principal.to_string(),
-            control: false,
-            control_gen: raised,
-        });
-        self.principals.insert(
-            principal.to_string(),
-            PrincipalState {
+        let mut durable = true;
+        if raise {
+            let raised = st.control_gen.saturating_add(1).min(MAX_SAFE_INTEGER);
+            let fence_seq = fence_seq.max(st.fence_seq);
+            durable = self.append(Record::Control {
+                principal: principal.to_string(),
                 control: false,
                 control_gen: raised,
-                confirmed: false,
-            },
-        );
+                fence_seq,
+            });
+            self.principals.insert(
+                principal.to_string(),
+                PrincipalState {
+                    control: false,
+                    control_gen: raised,
+                    confirmed: false,
+                    fence_seq,
+                },
+            );
+        } else if let Some(p) = self.principals.get_mut(principal) {
+            p.control = false;
+            p.confirmed = false;
+        }
         let fenced: Vec<String> = self
             .attachments
             .iter()
-            .filter(|(_, a)| a.principal == principal && a.can(Permission::Control))
+            .filter(|(_, a)| {
+                a.principal == principal && (all_attachments || a.can(Permission::Control))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in fenced {
@@ -950,6 +1068,108 @@ impl<J: Journal> SessionHost<J> {
                 self.reject_in_memory(&rid, DETAIL_CONTROL_REVOKED);
             }
         }
+    }
+
+    // ── r9 membership fences (§R9.3, §R9.4) ──
+
+    /// The newest membership entry that fenced `principal` (0: none).
+    pub fn fence_seq(&self, principal: &str) -> u64 {
+        self.principal(principal).fence_seq
+    }
+
+    /// The durable `control_gen` of `principal` (1 for one never seen).
+    pub fn control_gen(&self, principal: &str) -> u64 {
+        self.principal(principal).control_gen
+    }
+
+    /// r9 §R9.3 step 4: membership entry `seq` (a removal, `set_roles`,
+    /// `remove_host` of this host, an expiry shortening; 0 for a freeze,
+    /// which names no entry) fences `principal` through §H: the
+    /// `control_revoked` fence (its raised `control_gen`, naming `seq`) is
+    /// written, every attachment of the principal is fenced (view ones too),
+    /// its leases revoked and its accepted work not yet executing rejected
+    /// (`control revoked`). Idempotent per entry: a principal already fenced
+    /// by `seq` (or a later entry) isn't raised again, its live attachments
+    /// are still fenced. Before the start's resolution (`recover`) only the
+    /// fence is written: recovered work is then resolved by §H's start rules
+    /// (no clean close → `authorization history unknown`, an older
+    /// `control_gen` → `control revoked`). A failed write follows §H "A
+    /// failed revocation write" (in memory, the journal halts).
+    pub fn fence_principal(&mut self, principal: &str, seq: u64) -> Vec<Effect> {
+        let raise = seq == 0 || self.principal(principal).fence_seq < seq;
+        if !self.resolved {
+            if raise {
+                let st = self.principal(principal);
+                let raised = st.control_gen.saturating_add(1).min(MAX_SAFE_INTEGER);
+                let fence_seq = seq.max(st.fence_seq);
+                self.append(Record::Control {
+                    principal: principal.to_string(),
+                    control: false,
+                    control_gen: raised,
+                    fence_seq,
+                });
+                self.principals.insert(
+                    principal.to_string(),
+                    PrincipalState {
+                        control: false,
+                        control_gen: raised,
+                        confirmed: false,
+                        fence_seq,
+                    },
+                );
+            }
+            return self.take();
+        }
+        self.fence(principal, raise, seq, true);
+        self.take()
+    }
+
+    /// Every principal the host knows to be remote: attachments, lease
+    /// holders, accepted work and principals holding `control` (§R9.3
+    /// "every remote principal").
+    pub fn remote_principals(&self) -> Vec<String> {
+        let mut all: BTreeSet<String> = self
+            .attachments
+            .values()
+            .map(|a| a.principal.clone())
+            .collect();
+        for s in self.sessions.values() {
+            if let Some(lease) = &s.lease {
+                all.insert(lease.principal.clone());
+            }
+        }
+        for e in self.receipts.values() {
+            if e.stored.state == ReceiptState::Accepted && !e.stored.principal.is_empty() {
+                all.insert(e.stored.principal.clone());
+            }
+        }
+        for (p, st) in &self.principals {
+            if st.control {
+                all.insert(p.clone());
+            }
+        }
+        all.into_iter().collect()
+    }
+
+    /// r9 §R9.3 "A failed write": a device-list write failed, so the durable
+    /// state is uncertain. In the same step, in memory: each of
+    /// `principals` (every remote principal when `None`: Atem can't tell
+    /// which) has its attachments fenced, its leases revoked (the input
+    /// epoch rises, so queued raw bytes are dropped at the write boundary)
+    /// and its accepted work not yet executing rejected (`control
+    /// revoked`); then the journal halts (§I) until the restart, which
+    /// replays the carriage record and the fences.
+    pub fn membership_fault(&mut self, principals: Option<&[String]>) -> Vec<Effect> {
+        self.resolve_once();
+        self.halt_journal();
+        let list = match principals {
+            Some(list) => list.to_vec(),
+            None => self.remote_principals(),
+        };
+        for p in list {
+            self.fence(&p, true, 0, true);
+        }
+        self.take()
     }
 
     /// A rejection the journal couldn't take (it halted): the request is
@@ -1628,12 +1848,14 @@ impl<J: Journal> SessionHost<J> {
                     ControlState {
                         control,
                         control_gen,
+                        fence_seq,
                     },
                 )| {
                     let st = PrincipalState {
                         control,
                         control_gen,
                         confirmed: false,
+                        fence_seq,
                     };
                     (p, st)
                 },
@@ -1765,13 +1987,24 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| (e.stored.order, e.stored.request_id.clone()))
             .collect();
         queued.sort();
+        // Every queued request's principal held `control` durably when it
+        // was accepted (`principals`), at a generation no lower than the
+        // request's: one the file doesn't name, or names lower, means the
+        // control history was lost (a missing or older `principals`), and a
+        // fence it held can't be told from none.
+        let history_lost = queued.iter().any(|(_, rid)| {
+            let s = &self.receipts[rid].stored;
+            self.principals
+                .get(&s.principal)
+                .is_none_or(|p| p.control_gen < s.control_gen)
+        });
         for (_, rid) in queued {
             debug_assert!(!on_list.contains(&rid));
             let (principal, control_gen, trust) = {
                 let s = &self.receipts[&rid].stored;
                 (s.principal.clone(), s.control_gen, s.target.host_trust_gen)
             };
-            let detail = if !self.previous_clean {
+            let detail = if !self.previous_clean || history_lost {
                 Some(DETAIL_HISTORY_UNKNOWN)
             } else if trust != self.ctx.host_trust_gen {
                 Some(DETAIL_TRUST_CHANGED)
@@ -1921,6 +2154,18 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| self.render(&e.stored))
     }
 
+    /// Every receipt's request id, every registered session's id and
+    /// every principal with a control state (debug builds: the real
+    /// runtime's fixture state dump).
+    #[cfg(any(test, debug_assertions))]
+    pub fn debug_ids(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            self.receipts.keys().cloned().collect(),
+            self.sessions.keys().cloned().collect(),
+            self.principals.keys().cloned().collect(),
+        )
+    }
+
     /// Receipts `attachment` could read with `receipt_query` (view
     /// permission, current trust generation, a visible session).
     pub fn receipts_visible(&self, attachment: &str) -> usize {
@@ -2050,6 +2295,70 @@ impl<J: Journal> SessionHost<J> {
         self.send(attachment, re, op);
     }
 
+    /// r9 "No compatibility": once a device list exists, an r8 `hello` (any
+    /// revision) is `unsupported_version` naming revision 9, and nothing
+    /// else happens: r9 clients come through `atem-ch1` (§R9.7a).
+    fn refuse_r8_hello(&mut self, attachment: &str, re: Option<String>) {
+        let op = Op::Error {
+            code: ErrorCode::UnsupportedVersion,
+            detail: Some(R8_REFUSED.to_string()),
+            revision: Some(atem_client::session::r9::REVISION),
+            controller: None,
+        };
+        self.send(attachment, re, op);
+    }
+
+    /// r9: refuse (true) or allow r8 admission (a device list appeared or
+    /// went away while the runtime runs).
+    pub fn set_refuse_r8(&mut self, refuse: bool) {
+        self.refuse_r8 = refuse;
+    }
+
+    pub fn refuses_r8(&self) -> bool {
+        self.refuse_r8
+    }
+
+    /// r9 (§R9.8): welcomes the connected attachment `att` admitted through
+    /// `atem-ch1` (no r8 `hello`: the channel's `hello` was judged by the
+    /// r9 admission). Returns its new `controller_session` and the
+    /// authorization left. Refused like an r8 `hello`: `busy` once the
+    /// journal halted (r8 §I), `paused` past the authorization deadline.
+    /// A principal welcomed with `control` is confirmed (r8 §H).
+    pub fn welcome_r9(&mut self, att: &str, now: u64) -> Result<(String, u64), ErrorCode> {
+        self.tick(now);
+        let Some(a) = self.attachments.get(att) else {
+            return Err(ErrorCode::Unauthorized);
+        };
+        if self.journal_halted || self.halted {
+            return Err(ErrorCode::Busy);
+        }
+        if a.welcomed() {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        if self.now >= a.authorization_deadline {
+            return Err(ErrorCode::Paused);
+        }
+        let ms_left = a.authorization_deadline - self.now;
+        let controller_session = self.new_id();
+        self.attachments.get_mut(att).unwrap().controller_session =
+            Some(controller_session.clone());
+        if self.attachments[att].can(Permission::Control) {
+            let principal = self.attachments[att].principal.clone();
+            self.confirm(&principal);
+        }
+        Ok((controller_session, ms_left))
+    }
+
+    /// The principal attachment `att` speaks for.
+    pub fn attachment_principal(&self, att: &str) -> Option<&str> {
+        self.attachments.get(att).map(|a| a.principal.as_str())
+    }
+
+    /// The pending effects (r9 admission's `welcome_r9` and fences).
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        self.take()
+    }
+
     /// Checks shared by every request after `welcome`. After a journal halt
     /// every request is `busy`, on a welcomed attachment or not (r8 §I).
     fn admit_request(&self, att: &str) -> Checked {
@@ -2073,6 +2382,10 @@ impl<J: Journal> SessionHost<J> {
     fn on_session(&mut self, att: &str, m: SessionMessage) {
         let re = Some(m.id.clone());
         let result = match m.op {
+            Op::Hello { .. } if self.refuse_r8 => {
+                self.refuse_r8_hello(att, re);
+                return;
+            }
             Op::Hello { revision, .. } if revision != Some(REVISION) => {
                 self.refuse_hello(att, re);
                 return;
@@ -2338,6 +2651,13 @@ impl<J: Journal> SessionHost<J> {
             self.send(att, None, op);
         }
         Ok(())
+    }
+
+    /// The session's descriptor again to every subscribed viewer, though
+    /// it didn't change: who may see it did (an r9 project scope became
+    /// known, §R9.6). Its effects are taken with [`SessionHost::take_effects`].
+    pub fn registry_resend(&mut self, sid: &str) {
+        self.registry_changed(sid);
     }
 
     /// Sends the session's complete new descriptor to every subscribed viewer.
@@ -2890,9 +3210,27 @@ impl<J: Journal> SessionHost<J> {
         })
     }
 
+    /// Fixtures (`hold_dispatch`): accepted work stays queued, not
+    /// executing. Debug builds only (also the real runtime's fixture hook,
+    /// `runtime::test_hooks::hold_dispatch`).
+    #[cfg(any(test, debug_assertions))]
+    pub fn hold_dispatch(&mut self, hold: bool) {
+        self.dispatch_held = hold;
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn dispatch_held(&self) -> bool {
+        self.dispatch_held
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn dispatch_held(&self) -> bool {
+        false
+    }
+
     fn pump_queue(&mut self, sid: &str) {
         // r8 §H: nothing queued is dispatched after a journal halt.
-        while !self.journal_halted && !self.prompt_executing(sid) {
+        while !self.journal_halted && !self.dispatch_held() && !self.prompt_executing(sid) {
             let Some(rid) = self
                 .sessions
                 .get_mut(sid)
@@ -3019,7 +3357,26 @@ impl<J: Journal> SessionHost<J> {
         now: u64,
     ) -> (Result<String, String>, Vec<Effect>) {
         self.tick(now);
-        let opened = self.open_checked(session_id, process_gen, info);
+        let wall = self.wall();
+        let opened = self.open_checked(session_id, process_gen, info, wall);
+        (opened, self.take())
+    }
+
+    /// [`SessionHost::open_approval`] with its `created_at` taken from the
+    /// caller's wall clock `wall` (the runtime's host clock, §R9.5: the
+    /// session host's own wall is an offset fixed at its start plus a
+    /// monotonic clock that stands still while the machine sleeps; the
+    /// approval's `created_at` is the card's and its push hints', §R9.9).
+    pub fn open_approval_at(
+        &mut self,
+        session_id: &str,
+        process_gen: &str,
+        info: ApprovalInfo,
+        now: u64,
+        wall: u64,
+    ) -> (Result<String, String>, Vec<Effect>) {
+        self.tick(now);
+        let opened = self.open_checked(session_id, process_gen, info, wall);
         (opened, self.take())
     }
 
@@ -3028,6 +3385,7 @@ impl<J: Journal> SessionHost<J> {
         session_id: &str,
         process_gen: &str,
         info: ApprovalInfo,
+        wall: u64,
     ) -> Result<String, String> {
         wire::validate_approval_info(&info.tool, &info.summary, &info.always_rules)?;
         if self.halted || self.journal_halted {
@@ -3053,7 +3411,7 @@ impl<J: Journal> SessionHost<J> {
             process_gen: process_gen.to_string(),
             tool: info.tool,
             summary: info.summary,
-            created_at: self.wall(),
+            created_at: wall.min(MAX_SAFE_INTEGER),
             always_rules: info.always_rules,
         };
         self.approvals_opened += 1;

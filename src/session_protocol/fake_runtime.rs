@@ -168,6 +168,14 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     out: Vec<(String, Envelope)>,
     /// Every effect the host produced, in order.
     pub effects: Vec<Effect>,
+    /// Sends and closes for attachments this runtime doesn't play (r9
+    /// channels, served by `session_protocol::r9`), and the push requests
+    /// (r9's sealed push), in order.
+    pub foreign: Vec<Effect>,
+    /// The runtime's host clock (wall ms) when the harness plays one (r9):
+    /// approvals are stamped with it, as the runtime's are. `None`: the
+    /// session host's own wall clock.
+    pub host_wall: Option<u64>,
     now: u64,
     /// r8: the chat of each session with `chat`, and its conversations.
     chats: HashMap<String, FakeChat>,
@@ -316,6 +324,8 @@ impl<J: Journal> FakeRuntime<J> {
             sessions: Vec::new(),
             out: Vec::new(),
             effects: Vec::new(),
+            foreign: Vec::new(),
+            host_wall: None,
             now: 0,
             chats: HashMap::new(),
             history_key: HistoryKey::random(),
@@ -572,10 +582,17 @@ impl<J: Journal> FakeRuntime<J> {
                     });
                     if let Some(name) = self.live.get(&attachment) {
                         self.out.push((name.clone(), message));
+                    } else {
+                        self.foreign.push(Effect::Send {
+                            attachment,
+                            message,
+                        });
                     }
                 }
                 Effect::Close { attachment } => {
-                    self.live.remove(&attachment);
+                    if self.live.remove(&attachment).is_none() {
+                        self.foreign.push(Effect::Close { attachment });
+                    }
                 }
                 // A second `hello` replaced the client's attachment on the
                 // same transport: its messages go to the new one.
@@ -689,18 +706,27 @@ impl<J: Journal> FakeRuntime<J> {
                     }
                 }
                 Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
-                Effect::PushApproval { request } => self
-                    .pty
-                    .pushes
-                    .push(json!({"op": "push_approval", "approval_id": request.approval_id})),
+                Effect::PushApproval { request } => {
+                    self.pty
+                        .pushes
+                        .push(json!({"op": "push_approval", "approval_id": request.approval_id}));
+                    // r9's sealed push is the r9 host's (`r9::push`).
+                    self.foreign.push(Effect::PushApproval { request });
+                }
                 Effect::PushResolved {
                     approval_id,
                     reason,
-                } => self.pty.pushes.push(json!({
-                    "op": "push_resolved",
-                    "approval_id": approval_id,
-                    "reason": reason,
-                })),
+                } => {
+                    self.pty.pushes.push(json!({
+                        "op": "push_resolved",
+                        "approval_id": approval_id,
+                        "reason": reason,
+                    }));
+                    self.foreign.push(Effect::PushResolved {
+                        approval_id,
+                        reason,
+                    });
+                }
                 Effect::Reconcile { request_id, .. } => {
                     let answer = self.reconcile_answer.clone();
                     work.extend(self.host.dispatch_report(&request_id, answer));
@@ -1342,10 +1368,11 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                     always_rules: always_rules.clone(),
                 };
                 let process_gen = self.process_gen(session_id);
+                let wall = self.host_wall.unwrap_or_else(|| self.host.wall_ms());
                 // Refused: the agent's own prompt asks; nothing is sent.
-                let (opened, fx) = self
-                    .host
-                    .open_approval(session_id, &process_gen, info, now_ms);
+                let (opened, fx) =
+                    self.host
+                        .open_approval_at(session_id, &process_gen, info, now_ms, wall);
                 self.apply(fx);
                 if let (Ok(approval_id), true) = (opened, self.chats.contains_key(session_id)) {
                     let card = ApprovalCard {

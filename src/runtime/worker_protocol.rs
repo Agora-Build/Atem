@@ -52,6 +52,11 @@ pub struct WorkerSpec {
     pub cols: u16,
     /// The worker's socket.
     pub socket: PathBuf,
+    /// The launch project key of `cwd` (`memory::project::project_key_for`),
+    /// recorded at launch: service `projects` scopes compare its keyed hash
+    /// (atem-session-v1.md §R9.6); a later `cd` never changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
 }
 
 /// The worker record, `<state>/workers/<session_id>.json` (0600, replaced
@@ -73,6 +78,10 @@ pub struct WorkerRecord {
     /// The agent's exit status, once it exited (kept until a broker heard it).
     #[serde(default)]
     pub exited: Option<String>,
+    /// The launch project key from the spec (§R9.6), kept here because the
+    /// spec is removed once the worker read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
 }
 
 /// Broker → worker.

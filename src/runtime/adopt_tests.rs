@@ -60,6 +60,7 @@ async fn start_with(
         rows: 24,
         cols: 80,
         socket: dir.path().join("sock").join(format!("{sid}.sock")),
+        project_key: None,
     };
     let listener = worker::listen(&spec.socket).unwrap();
     let extra = extra_env(dir.path());
@@ -428,6 +429,7 @@ fn gone_record(state: &Path) -> WorkerRecord {
         agent_pid: None,
         agent_start_time: None,
         exited: None,
+        project_key: None,
     }
 }
 
@@ -507,6 +509,7 @@ fn records_and_specs_are_private_files() {
         rows: 24,
         cols: 80,
         socket: "/tmp/x.sock".into(),
+        project_key: None,
     };
     worker::write_spec(&state, &spec).unwrap();
     let text = std::fs::read_to_string(worker::spec_path(&state, &spec.session_id)).unwrap();
@@ -573,6 +576,7 @@ async fn a_silent_connection_does_not_use_up_the_first_connect_window() {
         rows: 24,
         cols: 80,
         socket: dir.path().join("sock").join(format!("{sid}.sock")),
+        project_key: None,
     };
     let listener = worker::listen(&spec.socket).unwrap();
     let options = WorkerOptions {

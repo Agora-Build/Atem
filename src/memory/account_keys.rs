@@ -180,9 +180,18 @@ impl AccountKeys {
                         STANDARD.encode(&plain[..]),
                     )))
                 }
-                CryptOp::KeyedHash { value } => {
+                CryptOp::KeyedHash { value, kid } => {
                     let value = decode_bytes(&value, "hash input")?;
-                    Ok(CryptOut::Hashed(keyed_hash(&ring.current, &value)))
+                    let key = match kid.as_deref() {
+                        None => &ring.current,
+                        Some(kid) if kid == ring.current.kid => &ring.current,
+                        Some(kid) => ring
+                            .previous
+                            .iter()
+                            .find(|key| key.kid == kid)
+                            .ok_or_else(|| anyhow!("no retained key {kid}"))?,
+                    };
+                    Ok(CryptOut::Hashed(keyed_hash(key, &value)))
                 }
             })
             .collect()
@@ -281,8 +290,14 @@ pub enum CryptOp {
         field: String,
         value: String,
     },
-    /// `value` is base64 of the bytes to HMAC.
-    KeyedHash { value: Zeroizing<String> },
+    /// `value` is base64 of the bytes to HMAC; under the current key, or
+    /// the retained key `kid` names (a service scope's `h1.<kid>.` entry,
+    /// §R9.6).
+    KeyedHash {
+        value: Zeroizing<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kid: Option<String>,
+    },
 }
 
 impl CryptOp {
@@ -305,6 +320,16 @@ impl CryptOp {
     pub fn keyed_hash(value: &[u8]) -> Self {
         Self::KeyedHash {
             value: Zeroizing::new(STANDARD.encode(value)),
+            kid: None,
+        }
+    }
+
+    /// [`CryptOp::keyed_hash`] under the retained key `kid` (current or
+    /// previous).
+    pub fn keyed_hash_under(value: &[u8], kid: &str) -> Self {
+        Self::KeyedHash {
+            value: Zeroizing::new(STANDARD.encode(value)),
+            kid: Some(kid.to_string()),
         }
     }
 
@@ -318,7 +343,7 @@ impl CryptOp {
         match self {
             Self::Seal { plain, .. } => decoded(plain),
             Self::Open { value, .. } => value.len(),
-            Self::KeyedHash { value } => decoded(value),
+            Self::KeyedHash { value, .. } => decoded(value),
         }
     }
 
@@ -335,7 +360,9 @@ impl CryptOp {
                 field,
                 value,
             } => record.len() + field.len() + value.len() * 2 + 96,
-            Self::KeyedHash { value } => value.len() + 160,
+            Self::KeyedHash { value, kid } => {
+                value.len() + 160 + kid.as_ref().map_or(0, |k| k.len() + 8)
+            }
         }
     }
 }
@@ -576,6 +603,33 @@ mod tests {
         let last = tampered.len() - 2;
         tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
         assert!(open("mem-1", "content", std::str::from_utf8(&tampered).unwrap()).is_err());
+    }
+
+    /// §R9.6: a service scope names its `h1.` entry's kid; the hash is made
+    /// under that retained key (current or previous), never another.
+    #[test]
+    fn a_keyed_hash_under_a_named_kid_uses_that_key() {
+        let mut keys = keys_with(KID, 7);
+        keys.install("acct", "4567cdef", Zeroizing::new([8; 32]));
+        let hash = |kid: Option<&str>| {
+            let op = match kid {
+                Some(kid) => CryptOp::keyed_hash_under(b"github.com/agora/atem", kid),
+                None => CryptOp::keyed_hash(b"github.com/agora/atem"),
+            };
+            keys.crypt("acct", EncryptionMode::Enabling, Some("4567cdef"), vec![op])
+                .map(|mut out| out.remove(0).into_text().unwrap())
+        };
+        let previous = hash(Some(KID)).unwrap();
+        let current = hash(None).unwrap();
+        assert!(previous.starts_with(&format!("h1.{KID}.")), "{previous}");
+        assert!(current.starts_with("h1.4567cdef."), "{current}");
+        assert_eq!(hash(Some("4567cdef")).unwrap(), current);
+        assert!(hash(Some("89abcdef")).is_err());
+        // The wire form stays the old one without a kid.
+        assert_eq!(
+            serde_json::to_string(&CryptOp::keyed_hash_under(b"hi", KID)).unwrap(),
+            format!(r#"{{"keyed_hash":{{"value":"aGk=","kid":"{KID}"}}}}"#)
+        );
     }
 
     #[test]

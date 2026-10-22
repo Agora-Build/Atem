@@ -134,6 +134,21 @@ pub fn format_list(client: &super::client::Welcome, sessions: &[SessionSummary])
     if let Some(error) = &client.host_error {
         text.push_str(&format!("{error}\n"));
     }
+    // r9: a device list that isn't plainly open says so (Failed included:
+    // `host_error` doesn't report it).
+    if let Some(list) = client
+        .device_list
+        .as_ref()
+        .filter(|l| l.state != "open" || !l.pending_recovery.is_empty())
+    {
+        text.push_str(&format!("Device list: {}\n", list.text));
+        for p in &list.pending_recovery {
+            text.push_str(&format!(
+                "Device list: recovery pending: {} ({}); see atem status\n",
+                p.subject, p.action
+            ));
+        }
+    }
     if sessions.is_empty() {
         text.push_str("No sessions. Start one: atem agent launch claude|codex\n");
         return text;
@@ -214,6 +229,54 @@ mod tests {
         }
     }
 
+    /// r9: a device list that isn't plainly open (failed included, which
+    /// `host_error` doesn't report) and a pending recovery head the list.
+    #[test]
+    fn the_list_says_when_the_device_list_needs_attention() {
+        use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus};
+        let mut welcome = super::super::client::Welcome {
+            protocol: 1,
+            build: "b".into(),
+            pid: 42,
+            astation: true,
+            host_error: None,
+            worker_protocol: None,
+            device_list: Some(DeviceListStatus {
+                state: "failed".into(),
+                text: "failed (x is damaged; re-pair this host (atem unpair, then atem pair)); remote access is off".into(),
+                label: Some("Remote off".into()),
+                ..Default::default()
+            }),
+        };
+        let text = format_list(&welcome, &[]);
+        assert!(
+            text.contains("Device list: failed (x is damaged; re-pair"),
+            "{text}"
+        );
+        welcome.device_list = Some(DeviceListStatus {
+            state: "open".into(),
+            text: "pinned at seq 5 (1 remote client)".into(),
+            pending_recovery: vec![PendingRecoveryStatus {
+                subject: "dev-new".into(),
+                action: "recovery_add".into(),
+                effective_at: 1,
+            }],
+            ..Default::default()
+        });
+        let text = format_list(&welcome, &[]);
+        assert!(
+            text.contains("recovery pending: dev-new (recovery_add)"),
+            "{text}"
+        );
+        welcome
+            .device_list
+            .as_mut()
+            .unwrap()
+            .pending_recovery
+            .clear();
+        assert!(!format_list(&welcome, &[]).contains("Device list"));
+    }
+
     #[test]
     fn the_list_shows_the_runtime_and_one_row_per_session() {
         let welcome = super::super::client::Welcome {
@@ -223,6 +286,7 @@ mod tests {
             astation: false,
             host_error: None,
             worker_protocol: None,
+            device_list: None,
         };
         let text = format_list(&welcome, &[]);
         assert!(text.starts_with("Runtime pid 42 \u{b7} protocol 1 \u{b7} build 0.7.0+1"));

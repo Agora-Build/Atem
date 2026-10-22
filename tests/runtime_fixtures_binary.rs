@@ -71,6 +71,10 @@
 //! The harness's `hello` carries `revision: 8` and the welcome must echo it
 //! and advertise exactly this host's features.
 //!
+//! The `r9-*` fixtures run in `r9_fixtures_run_against_the_real_runtime`
+//! (the runner is `r9_runner/`: several clients over the §R9.7a channel
+//! envelope on the one link, the device list pinned to the vectors' log).
+//!
 //! A scenario the real runtime fails would be listed in `KNOWN_DEVIATIONS`
 //! with the failure it must keep showing, and why (none today).
 //!
@@ -93,10 +97,13 @@
 
 mod support;
 
+/// The r9 host scenarios against the real runtime.
+mod r9_runner;
+
 /// r8 revision and features, and which `r8-*` fixtures can run: the same
 /// list the core runner gates on.
 #[allow(dead_code)]
-#[path = "../src/session_protocol/revision.rs"]
+#[path = "../crates/atem-client/src/session/revision.rs"]
 mod revision;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -1961,16 +1968,121 @@ fn scenarios() -> Vec<Value> {
         .iter()
         .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
         .filter(|v: &Value| v.get("side").is_none_or(|s| s == "host"))
+        // The r9 ones run in `r9_fixtures_run_against_the_real_runtime`.
+        .filter(|v: &Value| !revision::is_r9_fixture(v["name"].as_str().unwrap()))
         .collect()
+}
+
+/// Every `r9-*` fixture file, sorted by name.
+fn r9_files() -> Vec<Value> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("designs/protocol/fixtures");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "json")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("r9-"))
+        })
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+        .collect()
+}
+
+/// Every `r9-*` fixture: each host scenario against the real runtime
+/// (`r9_runner`), each other file with the reason it has no host side.
+/// Prints the tally (run, passed, not expressible with reasons, and the
+/// items of run scenarios that can't be expressed); `ATEM_FIXTURE=<name>`
+/// (or a comma-separated list) runs those only. Run with `-- --nocapture` for the tally.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only fixture hooks (src/runtime/test_hooks.rs)"
+)]
+fn r9_fixtures_run_against_the_real_runtime() {
+    let files = r9_files();
+    assert_eq!(files.len(), 76, "the r9 fixture files");
+    let only = std::env::var("ATEM_FIXTURE").ok();
+    let mut not_expressible = Vec::new();
+    let mut runnable = Vec::new();
+    for f in &files {
+        let name = f["name"].as_str().unwrap().to_string();
+        if only
+            .as_deref()
+            .is_some_and(|o| !o.split(',').any(|o| o == name))
+        {
+            continue;
+        }
+        match r9_runner::not_expressible(f) {
+            Some(why) => not_expressible.push((name, why)),
+            None => runnable.push(f.clone()),
+        }
+    }
+    // A few runtimes at a time: each runs workers and fake agents.
+    let parallel: usize = std::env::var("ATEM_R9_PARALLEL")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(6);
+    let mut results = Vec::new();
+    for chunk in runnable.chunks(parallel) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|s| {
+                    let name = s["name"].as_str().unwrap().to_string();
+                    (name, scope.spawn(|| r9_runner::run(s)))
+                })
+                .collect();
+            for (name, h) in handles {
+                let result = h.join().unwrap_or_else(|_| Err("panicked".into()));
+                results.push((name, result));
+            }
+        });
+    }
+    let mut failed = Vec::new();
+    let (mut passed, mut checked, mut items) = (0, 0, 0);
+    for (name, result) in &results {
+        match result {
+            Ok(outcome) => {
+                passed += 1;
+                checked += outcome.checked;
+                items += outcome.pending.len();
+                eprintln!(
+                    "PASS     {name}: {} checked, {} not expressible",
+                    outcome.checked,
+                    outcome.pending.len()
+                );
+                for (what, why) in &outcome.pending {
+                    eprintln!("           not expressible: {what}: {why}");
+                }
+            }
+            Err(e) => {
+                eprintln!("FAIL     {name}");
+                failed.push(format!("{name}: {e}"));
+            }
+        }
+    }
+    for (name, why) in &not_expressible {
+        eprintln!("NOT RUN  {name}: {why}");
+    }
+    eprintln!(
+        "r9 fixtures: {} files; {} run against the real runtime, {passed} passed ({checked} items checked, {items} items not expressible); {} not expressible (no host side)",
+        results.len() + not_expressible.len(),
+        results.len(),
+        not_expressible.len()
+    );
+    assert!(failed.is_empty(), "{}", failed.join("\n\n"));
 }
 
 /// Why a scenario waits for host work (an `r8-*` one whose work isn't
 /// implemented).
 fn waiting(scenario: &Value) -> Option<String> {
     let name = scenario["name"].as_str().unwrap();
-    if revision::is_r9_fixture(name) {
-        Some(revision::R9_NOT_RUN.to_string())
-    } else if name.starts_with("r8-") {
+    if name.starts_with("r8-") {
         revision::r8_fixture_runnable(name).err()
     } else {
         None
@@ -2055,7 +2167,10 @@ fn run_named(scenarios: &[Value], only: Option<&str>) -> Vec<(String, Result<(),
 }
 
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the fixture clock and PTY faults of a debug build (src/runtime/test_hooks.rs)")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the fixture clock and PTY faults of a debug build (src/runtime/test_hooks.rs)"
+)]
 fn shared_host_fixtures_run_against_the_real_runtime() {
     let scenarios = scenarios();
     assert!(scenarios.len() >= 13, "host fixtures missing");
@@ -2096,7 +2211,10 @@ fn shared_host_fixtures_run_against_the_real_runtime() {
 /// The harness fails a scenario whose expectation or counter is changed, so
 /// a pass means the runtime produced what the fixture says.
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the fixture clock and PTY faults of a debug build (src/runtime/test_hooks.rs)")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the fixture clock and PTY faults of a debug build (src/runtime/test_hooks.rs)"
+)]
 fn a_changed_expectation_fails_against_the_real_runtime() {
     let scenarios = scenarios();
     let named = |name: &str| {
@@ -2212,4 +2330,77 @@ fn removed_ops_have_no_effect_on_one_attachment() {
     if let Err(e) = run(&single) {
         panic!("{e}");
     }
+}
+
+/// The r9 runner fails a scenario whose expectation is changed (a welcome's
+/// head, a receipt's detail, the lease holder, a recovery's state, a relay
+/// message, a file the runtime wrote, `expect_none`), so a pass means the
+/// real runtime produced what the fixture says.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only fixture hooks (src/runtime/test_hooks.rs)"
+)]
+fn r9_changed_expectations_fail_against_the_real_runtime() {
+    let files = r9_files();
+    let named = |name: &str| files.iter().find(|s| s["name"] == name).unwrap().clone();
+    let step_with = |s: &mut Value, pick: &dyn Fn(&Value) -> bool| -> usize {
+        let i = s["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(pick)
+            .unwrap();
+        s["mutated_step"] = json!(i);
+        i
+    };
+    let mut cases = Vec::new();
+    let mut s = named("r9-multi-device-mac-and-phone-online");
+    let i = step_with(&mut s, &|st| st["match"]["op"] == "welcome");
+    s["steps"][i]["match"]["head.hash"] = json!("${hash:E5}");
+    cases.push(s);
+    let mut s = named("r9-chain-membership-write-fault-fences-in-memory-and-halts");
+    let i = step_with(&mut s, &|st| st["assert"].get("receipts").is_some());
+    let rid = "bbbbbbbb-0000-4000-8000-000000000001";
+    s["steps"][i]["assert"]["receipts"][rid]["detail"] = json!("something else");
+    cases.push(s);
+    let mut s = named("r9-multi-device-takeover");
+    let i = step_with(&mut s, &|st| st["assert"].get("lease_holder").is_some());
+    s["steps"][i]["assert"]["lease_holder"] = json!("mac");
+    cases.push(s);
+    let mut s = named("r9-recovery-pending-then-in-effect-after-24h");
+    let i = step_with(&mut s, &|st| st["assert"]["pending"]["R7"] == "active");
+    s["steps"][i]["assert"]["pending"]["R7"] = json!("pending");
+    cases.push(s);
+    let mut s = named("r9-approval-seen");
+    let i = step_with(&mut s, &|st| st["expect_relay"]["hints.#"] == 2);
+    s["steps"][i]["expect_relay"]["hints.#"] = json!(3);
+    cases.push(s);
+    let mut s = named("r9-chain-conflict-by-a-current-manager-freezes");
+    let i = step_with(&mut s, &|st| st["assert"].get("frozen_genesis").is_some());
+    s["steps"][i]["assert"]["frozen_genesis"] = json!(["${hash:E2}"]);
+    cases.push(s);
+    // The service gets the approval card it must not get.
+    let mut s = named("r9-service-scope-and-expiry");
+    let i = step_with(&mut s, &|st| st.get("expect_none").is_some());
+    s["steps"][i] = json!({"expect": "svc", "match": {"op": "approval_request"}});
+    cases.push(s);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|s| {
+                (
+                    s["name"].as_str().unwrap(),
+                    scope.spawn(|| r9_runner::run(s)),
+                )
+            })
+            .collect();
+        for (name, h) in handles {
+            let result = h.join().unwrap_or_else(|_| Err("panicked".into()));
+            let error = result.expect_err(name);
+            let i = cases.iter().find(|c| c["name"] == name).unwrap()["mutated_step"].clone();
+            // The mutated step itself fails (not a flaky or unrelated one).
+            assert!(error.starts_with(&format!("step {i} ")), "{name}: {error}");
+        }
+    });
 }

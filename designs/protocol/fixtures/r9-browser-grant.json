@@ -96,7 +96,8 @@
           "v": 1,
           "op": "acquire",
           "id": "aaaaaaaa-0000-4000-8000-000000000021",
-          "binding": "${binding:browser:ses-aaaaaaaaaaaa}"
+          "binding": "${binding:browser:ses-aaaaaaaaaaaa}",
+          "takeover": false
         }
       }
     },

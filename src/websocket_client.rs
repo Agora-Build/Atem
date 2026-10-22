@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 
 use crate::config::AtemConfig;
 
@@ -16,6 +16,10 @@ pub(crate) enum AuthResponse {
     SessionExpired,
     Denied(String),
 }
+
+/// How long a relay identity link whose route proof went out waits for the
+/// relay's verdict once Astation's authentication failed first (§R9.7b).
+const ROUTE_VERDICT_GRACE: Duration = Duration::from_secs(10);
 
 /// What a session Astation grants may do with the pairing record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,20 @@ pub(crate) fn session_family(text: &str) -> Option<&'static str> {
     }
 }
 
+/// A relay message for Atem (`{"type":"relay",…}`, atem-session-v1.md
+/// §R9.9: the relay's `push_ack`), from its `type`.
+pub(crate) fn is_relay_message(text: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Peek {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    serde_json::from_str::<Peek>(text)
+        .ok()
+        .and_then(|p| p.kind)
+        .is_some_and(|kind| kind == "relay")
+}
+
 /// Message types removed in atem-session r6 (§0): no compatibility, but
 /// still answered, so a sender learns they are gone.
 pub(crate) const REMOVED_OPS: &[&str] = &[
@@ -115,6 +133,21 @@ pub(crate) fn is_removed_op(text: &str) -> bool {
         .ok()
         .and_then(|p| p.kind)
         .is_some_and(|kind| REMOVED_OPS.contains(&kind.as_str()))
+}
+
+/// The link's WebSocket limits: no message (or frame) larger than the
+/// §R9.7a envelope bound plus a margin is ever buffered; a larger one
+/// ends the link (tungstenite's default would be 64 MiB).
+pub(crate) const MAX_LINK_MESSAGE_BYTES: usize =
+    crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES + (2 << 20);
+
+/// The link's WebSocket configuration (the limits above).
+pub(crate) fn link_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_LINK_MESSAGE_BYTES),
+        max_frame_size: Some(MAX_LINK_MESSAGE_BYTES),
+        ..Default::default()
+    }
 }
 
 /// The `data.id` of a `session` message, when it has one (no other check).
@@ -160,6 +193,34 @@ pub enum AstationMessage {
     /// `error` `unsupported_version` and no effect.
     #[serde(skip)]
     RemovedOp,
+
+    /// An r9 channel envelope (`{"type":"channel",…}`, atem-session-v1.md
+    /// §R9.7a) as its raw JSON text: demultiplexed before every other
+    /// message on the link, parsed strictly by the runtime's r9 host.
+    /// Outbound, the text is written as is.
+    #[serde(skip)]
+    Channel(String),
+
+    /// An r9 channel envelope over its 2 MiB bound (not kept, not
+    /// parsed): its handle, closed `too_large`.
+    #[serde(skip)]
+    ChannelTooLarge(String),
+
+    /// A relay message for Atem (`{"type":"relay",…}`, §R9.9: `push_ack`)
+    /// as its raw JSON text, for the runtime's r9 push.
+    #[serde(skip)]
+    Relay(String),
+
+    /// The relay verified this link's host route proof (§R9.7b,
+    /// `host_route_ok`, checked by the link's reader: this host, a head it
+    /// holds): the route is this host's.
+    #[serde(skip)]
+    HostRouted,
+
+    /// The relay refused this link's host route proof (`host_route_refused`,
+    /// the verifier's code); it closes the connection.
+    #[serde(skip)]
+    HostRouteRefused(String),
 
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
@@ -310,16 +371,36 @@ pub enum AstationMessage {
     /// Atem → Astation: start device verification with a commitment to keys
     /// atem hasn't revealed yet. All values base64.
     #[serde(rename = "verifyCommit")]
-    VerifyCommit { device_id: String, commitment: String },
+    /// r9 (§R9.2 "Pairing"): `host_trust_gen` is the binding's host trust
+    /// generation (1 ≤ n ≤ 2^53−1), public; Astation copies it into the
+    /// signed `add_host`.
+    VerifyCommit { device_id: String, commitment: String, host_trust_gen: u64 },
 
     /// Astation → Atem: Astation's public keys and nonce, sent only after it
     /// stored the commitment. `sign_pub` is a 65-byte SEC1 P-256 point.
+    /// r9 (§R9.2 "Pairing"): `genesis_hash` (hex) names the account's
+    /// device list; a verifyKeys without it can't pin one and is refused.
     #[serde(rename = "verifyKeys")]
-    VerifyKeys { sign_pub: String, enc_pub: String, recovery_sign_pub: String, nonce: String },
+    VerifyKeys {
+        sign_pub: String,
+        enc_pub: String,
+        recovery_sign_pub: String,
+        nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        genesis_hash: Option<String>,
+    },
 
     /// Atem → Astation: the keys and nonce behind the commitment.
+    /// r9: `host_channel_pub` (base64url, §R9.1) is this host's new
+    /// `host_channel_key`, inside the commitment.
     #[serde(rename = "verifyReveal")]
-    VerifyReveal { device_pub: String, device_sign_pub: String, unlock_auth_pub: String, nonce: String },
+    VerifyReveal {
+        device_pub: String,
+        device_sign_pub: String,
+        unlock_auth_pub: String,
+        host_channel_pub: String,
+        nonce: String,
+    },
 
     /// Astation → Atem: after Touch ID, the signed device certificate, the
     /// signed account state, and signed grants (`K` when it exists).
@@ -329,6 +410,10 @@ pub enum AstationMessage {
         account_state: crate::memory::statements::SignedWire,
         #[serde(default)]
         grants: Vec<crate::memory::grant::GrantWire>,
+        /// r9: `{"entries": [...]}`, the device list from its genesis to
+        /// the `add_host` naming this host (§R9.2 "Pairing").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        membership: Option<serde_json::Value>,
     },
 
     /// Either side: verification was cancelled; discard everything from it.
@@ -406,8 +491,15 @@ pub struct SystemStatus {
     pub projects: i32,
 }
 
+/// Channel envelopes handed to the link and not yet written, at most (bytes):
+/// beyond it `try_send_channel` refuses and the r9 host's per-channel
+/// queues hold the rest (§R9.7a "Bounds").
+const CHANNEL_INFLIGHT_BYTES: usize = 8 << 20;
+
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<OutboundMessage>>,
+    /// Bytes of channel envelopes queued on `sender` and not yet written.
+    channel_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     terminal_sender: Option<mpsc::Sender<OutboundMessage>>,
     receiver: Option<mpsc::Receiver<AstationMessage>>,
     transport_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -417,6 +509,9 @@ pub struct AstationClient {
     local_token_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
+    /// Counts the sockets this client opened (`connect_raw`): a link
+    /// generation's channels live on one socket only (§R9.7a).
+    socket_gen: u64,
     connected_astation_id: Option<String>,
     /// The newest challenge answered on this socket, as (astation_id,
     /// challenge): a repeat of it is spent and is not answered again.
@@ -444,6 +539,54 @@ pub struct AstationClient {
     is_op_view: bool,
     /// How this client reached Astation, once connected (`atem status`).
     via: Option<LinkVia>,
+    /// The runtime's host route state (§R9.7b): a relay link answers the
+    /// relay's `host_challenge` from it (`with_host_route`).
+    host_route: Option<crate::session_protocol::r9::route::RouteHandle>,
+    /// The room and `atem_id` of the relay link `connect_raw` opens next
+    /// (taken by it): only a relay identity link answers challenges.
+    route_link: Option<(String, String)>,
+    /// A relay identity link the relay routed on a host route proof
+    /// (§R9.7b) before any Astation authenticated it: the Astation (room)
+    /// it is for. Only r9 traffic goes over it; Astation's `auth_required`
+    /// upgrades it (`upgrade_routed`).
+    routed: Option<String>,
+    /// The link's "Astation authenticated it" flag, shared with its
+    /// reader's `LinkRoute` (no challenge is answered after it, §R9.7b).
+    route_authenticated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The link's "its route proof went out" flag, shared with its
+    /// reader's `LinkRoute` (§R9.7b).
+    route_proved: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The link's "the relay's `host_route_ok` came" flag, shared with its
+    /// reader's `LinkRoute` (§R9.7b): `None` on a link that answers no
+    /// challenge (local, LAN, or not the runtime's).
+    route_ok: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// While the connect path authenticates a relay identity link after
+    /// Astation's `auth_required` came first (§R9.7b): the relay's verdict
+    /// on the link's proof, recorded whenever it arrives.
+    route_wait: Option<RouteWait>,
+    /// A link routed while Astation was authenticating it (§R9.7b), for the
+    /// App to take with the link: that authentication still pending, or
+    /// failed.
+    routed_auth: Option<RoutedAuth>,
+}
+
+/// The relay's verdict while the connect path waits for Astation (§R9.7b).
+#[derive(Default)]
+struct RouteWait {
+    /// An `ok` hands the authentication over to the routed link (the App
+    /// finishes it as for any routed link); never while pairing.
+    hand_over: bool,
+    /// `Some(true)`: `host_route_ok`; `Some(false)`: `host_route_refused`.
+    verdict: Option<bool>,
+}
+
+/// What became of Astation's authentication of a link the relay routed
+/// while it ran (§R9.7b, the verdict after `auth_required`).
+pub(crate) enum RoutedAuth {
+    /// The proof is out; Astation's reply goes to the routed link.
+    Pending,
+    /// Astation denied, expired or didn't finish: the link stays routed.
+    Failed(anyhow::Error),
 }
 
 /// How a link reached Astation, for `atem status`: never a secret (no
@@ -521,6 +664,7 @@ impl AstationClient {
     pub fn new() -> Self {
         Self {
             sender: None,
+            channel_inflight: Default::default(),
             receiver: None,
             terminal_sender: None,
             transport_tasks: Vec::new(),
@@ -529,6 +673,7 @@ impl AstationClient {
             #[cfg(test)]
             local_token_path_override: None,
             ws_closed: false,
+            socket_gen: 0,
             connected_astation_id: None,
             answered_challenge: None,
             held_encryption: Vec::new(),
@@ -538,7 +683,25 @@ impl AstationClient {
             agent: None,
             is_op_view: false,
             via: None,
+            host_route: None,
+            route_link: None,
+            routed: None,
+            route_authenticated: None,
+            route_proved: None,
+            route_ok: None,
+            route_wait: None,
+            routed_auth: None,
         }
+    }
+
+    /// Its relay links answer the relay's `host_challenge` from `handle`
+    /// (§R9.7b; the runtime's links only).
+    pub(crate) fn with_host_route(
+        mut self,
+        handle: crate::session_protocol::r9::route::RouteHandle,
+    ) -> Self {
+        self.host_route = Some(handle);
+        self
     }
 
     /// Encryption messages and reports use `agent` (not this user's).
@@ -596,6 +759,7 @@ impl AstationClient {
         let (tx, rx) = mpsc::channel(64);
         let mut view = Self::new();
         view.sender = self.sender.clone();
+        view.channel_inflight = self.channel_inflight.clone();
         view.terminal_sender = self.terminal_sender.clone();
         view.receiver = Some(rx);
         view.atem_id_override = self.atem_id_override.clone();
@@ -660,8 +824,10 @@ impl AstationClient {
 
     /// The saved session is still the one the proof used (when one was).
     fn check_session(&self, capture: &crate::pairing::Captured) -> Result<()> {
+        // A routed link being authenticated is checked against the
+        // Astation it is pinned to, as the connect path checks its own.
         let (Some((session_id, token)), Some(astation_id)) =
-            (&capture.session, self.connected_astation_id.as_deref())
+            (&capture.session, self.pinned_astation_id())
         else {
             return Ok(());
         };
@@ -764,6 +930,27 @@ impl AstationClient {
         self.authenticate_after_challenge(auth_required, false).await
     }
 
+    /// Pretend this is a relay link that answered no challenge (an
+    /// operation's link, §R9.7b).
+    #[cfg(test)]
+    pub(crate) fn relay_link_for_test(&mut self) {
+        self.via = Some(LinkVia::Relay { label: "relay.test as atem-x".into() });
+    }
+
+    /// Pretend the relay routed this link (§R9.7b) for `room` and its proof
+    /// for `auth_required` used the saved session.
+    #[cfg(test)]
+    pub(crate) fn route_for_test(&mut self, room: &str) {
+        self.routed = Some(room.to_string());
+        let profile = self.profile_sources().expect("a test profile");
+        let mut capture = crate::pairing::Captured::now(&profile).unwrap();
+        capture.session = self
+            .saved_session(room)
+            .unwrap()
+            .map(|s| (s.session_id, s.token));
+        self.capture = Some(capture);
+    }
+
     /// Pretend the connect-time authentication pinned `astation_id`.
     #[cfg(test)]
     /// Also captures the profile's pairing and saved session, as the
@@ -837,6 +1024,8 @@ impl AstationClient {
         self.ws_closed = true;
         self.answered_challenge = None;
         self.capture = None;
+        self.routed = None;
+        self.routed_auth = None;
     }
 
     /// Connect WebSocket and authenticate (local Astation connections).
@@ -869,8 +1058,20 @@ impl AstationClient {
     /// Connect WebSocket transport only, without authentication.
     /// Used by relay flow where auth happens separately after code exchange.
     pub async fn connect_raw(&mut self, url: &str) -> Result<()> {
+        // §R9.7b: a relay identity link answers the relay's challenge in its
+        // reader, as it arrives (the authentication reads nothing else).
+        let route_link = self.route_link.take();
         self.abort_transport();
-        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
+        let mut route = match (&self.host_route, route_link) {
+            (Some(handle), Some((room, atem_id))) => Some(
+                crate::session_protocol::r9::route::LinkRoute::new(handle.clone(), &room, &atem_id),
+            ),
+            _ => None,
+        };
+        self.route_authenticated = route.as_ref().map(|route| route.authenticated_flag());
+        self.route_proved = route.as_ref().map(|route| route.proved_flag());
+        self.route_ok = route.as_ref().map(|route| route.routed_ok_flag());
+        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async_with_config(url, Some(link_ws_config()), false))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
             .map_err(|e| anyhow!("Failed to connect to WebSocket: {}", e))?;
@@ -880,6 +1081,9 @@ impl AstationClient {
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
         let (terminal_tx, mut terminal_rx) = mpsc::channel::<OutboundMessage>(32);
+        // A new socket: nothing of the old one is in flight.
+        self.channel_inflight = Default::default();
+        let inflight = self.channel_inflight.clone();
 
         // Spawn task to handle outgoing messages
         let writer_task = tokio::spawn(async move {
@@ -889,8 +1093,11 @@ impl AstationClient {
                     outbound = terminal_rx.recv() => outbound,
                 };
                 let Some(outbound) = outbound else { break; };
+                if let AstationMessage::Channel(text) = &outbound.message {
+                    inflight.fetch_sub(text.len(), std::sync::atomic::Ordering::Relaxed);
+                }
                 let encoded = match &outbound.message {
-                    AstationMessage::SessionWire(text) => Ok(text.clone()),
+                    AstationMessage::SessionWire(text) | AstationMessage::Channel(text) => Ok(text.clone()),
                     message => serde_json::to_string(message),
                 };
                 let result = match encoded {
@@ -903,17 +1110,78 @@ impl AstationClient {
             }
         });
 
+        let route_tx = msg_tx.clone();
+        let mut route_ignored = false;
         // Spawn task to handle incoming messages
         let reader_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
+                        // §R9.7a 7: channel traffic is demultiplexed first;
+                        // one over its bound is never parsed (its handle only,
+                        // from its first bytes, for the `too_large` close).
+                        if text.len() > crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES {
+                            use crate::session_protocol::r9::envelope::{oversize_envelope, Oversize};
+                            match oversize_envelope(&text) {
+                                Oversize::Channel(handle) => {
+                                    if tx.send(AstationMessage::ChannelTooLarge(handle)).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Oversize::Unaddressed => {
+                                    eprintln!("atem: r9: an oversize channel envelope without a readable handle was dropped ({} bytes)", text.len());
+                                    continue;
+                                }
+                                // Over every bound of its family too: answered
+                                // as oversize, its id unread (never parsed).
+                                Oversize::Other(family) if matches!(family.as_str(), "session" | "terminal" | "agentChat") => {
+                                    if tx.send(AstationMessage::SessionOversize { id: None, family }).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Oversize::Other(_) | Oversize::Unreadable => {
+                                    eprintln!("atem: an oversize message whose type its first bytes don't name as a session family was dropped unread ({} bytes)", text.len());
+                                    continue;
+                                }
+                            }
+                        } else if crate::session_protocol::r9::envelope::is_envelope(&text) {
+                            if tx.send(AstationMessage::Channel(text)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         let astation_msg = match session_family(&text) {
                             Some(family) if text.len() > if family == "terminal" { 32 * 1024 } else { crate::session_protocol::wire::MAX_MESSAGE_BYTES } => {
                                 Some(AstationMessage::SessionOversize { id: session_message_id(&text), family: family.to_string() })
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
                             None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),
+                            // §R9.7b: answered here, once; never passed on.
+                            None if crate::session_protocol::r9::route::is_host_challenge(&text) => {
+                                match route.as_mut() {
+                                    Some(route) => {
+                                        if let Some(answer) = route.answer_when_open(&text).await {
+                                            let _ = route_tx.send(OutboundMessage { message: AstationMessage::SessionWire(answer), delivered: None });
+                                        }
+                                    }
+                                    None if !route_ignored => {
+                                        route_ignored = true;
+                                        eprintln!("atem: r9: a host_challenge on a link that isn't a relay identity link was ignored");
+                                    }
+                                    None => {}
+                                }
+                                None
+                            }
+                            // §R9.7b: the relay's reply to this link's proof,
+                            // checked here (never passed on raw).
+                            None if is_relay_message(&text) => match route.as_mut().map(|route| (route.on_reply(&text), atem_client::host_route::RelayReply::parse(text.as_bytes()).is_some())) {
+                                Some((Some(crate::session_protocol::r9::route::RouteResult::Routed { .. }), _)) => Some(AstationMessage::HostRouted),
+                                Some((Some(crate::session_protocol::r9::route::RouteResult::Refused(code)), _)) => Some(AstationMessage::HostRouteRefused(code)),
+                                Some((None, true)) => None,
+                                _ => Some(AstationMessage::Relay(text)),
+                            },
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };
                         if let Some(astation_msg) = astation_msg
@@ -938,8 +1206,14 @@ impl AstationClient {
         self.receiver = Some(rx);
         self.transport_tasks = vec![writer_task, reader_task];
         self.ws_closed = false;
+        self.socket_gen += 1;
 
         Ok(())
+    }
+
+    /// The socket the client uses now (a new one after every reconnect).
+    pub fn socket_gen(&self) -> u64 {
+        self.socket_gen
     }
 
     /// Authenticate with Astation after WebSocket connection.
@@ -972,6 +1246,214 @@ impl AstationClient {
         result
     }
 
+    /// A relay identity link: Astation's `auth_required` (authenticated as
+    /// [`Self::authenticate`] does), or the relay's verdict on this host's
+    /// route proof (§R9.7b), whichever comes first within
+    /// `challenge_timeout`. `host_route_ok` leaves the link routed for r9
+    /// only (`routed`), pinned to the pairing's Astation `room` for a later
+    /// `auth_required`; `host_route_refused` fails the connect.
+    ///
+    /// The verdict counts in either order: when `auth_required` comes
+    /// first, an `ok` arriving while Astation authenticates (or, once
+    /// Astation failed, within [`ROUTE_VERDICT_GRACE`] of a proof that went
+    /// out) routes the link; Astation's reply then goes to the routed link
+    /// (`RoutedAuth::Pending`), and a denial, expiry or timeout leaves it
+    /// routed (`RoutedAuth::Failed`), as on a link routed first.
+    async fn authenticate_or_route(
+        &mut self,
+        room: &str,
+        challenge_timeout: Duration,
+        completion_timeout: Duration,
+        allow_pairing: bool,
+    ) -> Result<()> {
+        let first = tokio::time::timeout(
+            challenge_timeout,
+            self.wait_for_message(|m| {
+                is_auth_required(m)
+                    || matches!(m, AstationMessage::HostRouted | AstationMessage::HostRouteRefused(_))
+            }),
+        )
+        .await
+        .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
+        .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
+        match first {
+            AstationMessage::HostRouted => {
+                // Under the pairing it was opened for: `atem unpair` (or a
+                // new pairing) drops it like an authenticated link.
+                self.capture = Some(crate::pairing::Captured::now(&self.profile_sources()?)?);
+                self.routed = Some(room.to_string());
+                Ok(())
+            }
+            AstationMessage::HostRouteRefused(code) => {
+                Err(anyhow!("the relay refused this host's route ({code})"))
+            }
+            auth_required => {
+                self.route_wait = Some(RouteWait {
+                    hand_over: !allow_pairing,
+                    verdict: None,
+                });
+                let result = tokio::time::timeout(
+                    completion_timeout,
+                    self.authenticate_after_challenge(auth_required, allow_pairing),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("Authentication timed out")));
+                let wait = self.route_wait.take().unwrap_or_default();
+                match (result, wait.verdict) {
+                    // Handed over: Astation's reply goes to the routed link.
+                    (Ok(()), Some(true)) if wait.hand_over => {
+                        self.route_while_authenticating(room, RoutedAuth::Pending)
+                    }
+                    (Ok(()), _) => {
+                        self.mark_route_authenticated();
+                        let _ = self.report_credential_projects().await;
+                        Ok(())
+                    }
+                    (Err(error), verdict) => {
+                        let routed = match verdict {
+                            Some(routed) => routed,
+                            None => self.late_route_verdict().await,
+                        };
+                        if routed && !self.is_ws_closed() {
+                            self.route_while_authenticating(room, RoutedAuth::Failed(error))
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Astation failed first on a link whose proof went out and has no
+    /// verdict yet: the relay's verdict, waited for at most
+    /// [`ROUTE_VERDICT_GRACE`] (`true`: routed). No proof: `false` at once.
+    async fn late_route_verdict(&mut self) -> bool {
+        let proved = self
+            .route_proved
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+        if !proved || self.is_ws_closed() {
+            return false;
+        }
+        let verdict = tokio::time::timeout(
+            ROUTE_VERDICT_GRACE,
+            self.wait_for_message(|m| {
+                matches!(m, AstationMessage::HostRouted | AstationMessage::HostRouteRefused(_))
+            }),
+        )
+        .await;
+        matches!(verdict, Ok(Some(AstationMessage::HostRouted)))
+    }
+
+    /// The relay routed this link while Astation authenticated it
+    /// (§R9.7b): routed for r9 only, pinned to `room`, under the capture
+    /// that authentication took (the session its proof used), with what
+    /// became of Astation's authentication for the App.
+    fn route_while_authenticating(&mut self, room: &str, auth: RoutedAuth) -> Result<()> {
+        if self.capture.is_none() {
+            self.capture = Some(crate::pairing::Captured::now(&self.profile_sources()?)?);
+        }
+        self.connected_astation_id = None;
+        self.routed = Some(room.to_string());
+        self.routed_auth = Some(auth);
+        Ok(())
+    }
+
+    /// What became of Astation's authentication of a link routed while it
+    /// ran (taken once, by the App installing the link).
+    pub(crate) fn take_routed_auth(&mut self) -> Option<RoutedAuth> {
+        self.routed_auth.take()
+    }
+
+    /// Astation authenticated this link: its reader answers no challenge
+    /// from now on (§R9.7b).
+    fn mark_route_authenticated(&self) {
+        if let Some(flag) = &self.route_authenticated {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Astation's reply while it authenticates a routed link (§R9.7b), with
+    /// the connect path's semantics: a granted session saved under the
+    /// link's capture (`UpdateBound`), the connect path's errors (a denial
+    /// is `Refused`, an expiry `PairingRequired`, both with the session
+    /// advice). `Ok(None)`: not an auth reply. On success the link is
+    /// Astation's (`upgrade_routed`).
+    pub(crate) fn routed_auth_response(&mut self, msg: &AstationMessage) -> Result<Option<()>> {
+        let astation_id = self
+            .routed
+            .clone()
+            .ok_or_else(|| anyhow!("this link isn't routed"))?;
+        let Some((response, saved)) =
+            self.auth_response_saving(msg, &astation_id, GrantSave::UpdateBound)?
+        else {
+            return Ok(None);
+        };
+        if let (Some(saved), Some(capture)) = (saved, self.capture.as_mut()) {
+            capture.session = Some(saved);
+        }
+        match response {
+            AuthResponse::Authenticated => {
+                self.upgrade_routed();
+                self.guarded(|| {
+                    self.refresh_saved_session(&astation_id);
+                    Ok(())
+                })?;
+                Ok(Some(()))
+            }
+            AuthResponse::Denied(message) => Err(SessionError::new(
+                SessionProblem::Refused,
+                false,
+                format!("Authentication denied: {message}"),
+            )
+            .into()),
+            AuthResponse::SessionExpired => Err(self.no_session(
+                SessionProblem::PairingRequired,
+                "Pairing required",
+                "Pairing required; run 'atem pair'",
+            )),
+        }
+    }
+
+    /// A relay link that has not proved its route (§R9.7b): it sent no
+    /// proof and got no `host_route_ok`. A relay link with no challenge
+    /// state (one an Astation operation made, e.g. `atem pair`'s) never
+    /// proves, so it counts as unproved. `false` for a local or LAN link,
+    /// which never answers a challenge.
+    pub(crate) fn route_unproved(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if !matches!(self.via, Some(LinkVia::Relay { .. })) {
+            return false;
+        }
+        let set = |flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>| {
+            flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
+        };
+        !set(&self.route_ok) && !set(&self.route_proved)
+    }
+
+    /// Routed for r9 only (§R9.7b): no Astation authenticated this link.
+    pub fn routed(&self) -> bool {
+        self.routed.is_some() && self.connected_astation_id.is_none()
+    }
+
+    /// The Astation a later `auth_required` must come from: the one this
+    /// link authenticated, else the one a routed link was opened for.
+    pub(crate) fn pinned_astation_id(&self) -> Option<&str> {
+        self.connected_astation_id.as_deref().or(self.routed.as_deref())
+    }
+
+    /// Astation authenticated a routed link (its `auth_required` answered
+    /// and accepted): the link is Astation's from now on.
+    pub(crate) fn upgrade_routed(&mut self) {
+        if let Some(room) = self.routed.take()
+            && self.connected_astation_id.is_none()
+        {
+            self.connected_astation_id = Some(room);
+        }
+        self.mark_route_authenticated();
+    }
+
     async fn authenticate_after_challenge(
         &mut self,
         auth_required: AstationMessage,
@@ -998,6 +1480,11 @@ impl AstationClient {
             self.answered_challenge = Some((astation_id.clone(), challenge.challenge.clone()));
             let save = if allow_pairing { GrantSave::Pairing } else { GrantSave::UpdateBound };
             let response = self.wait_for_auth_response(&astation_id, save).await?;
+            // §R9.7b: the relay routed the link meanwhile; Astation's reply
+            // goes to the routed link (`authenticate_or_route`).
+            if self.route_wait.as_ref().is_some_and(|w| w.hand_over && w.verdict == Some(true)) {
+                return Ok(());
+            }
             if challenge.transport == "loopback" {
                 return match response {
                     Some(AuthResponse::Authenticated) => self.guarded(|| Ok(())),
@@ -1184,8 +1671,7 @@ impl AstationClient {
     pub(crate) async fn answer_auth_required(&mut self, auth_required: &AstationMessage) -> Result<()> {
         let challenge = AuthChallenge::parse(auth_required)?;
         let pinned = self
-            .connected_astation_id
-            .as_deref()
+            .pinned_astation_id()
             .ok_or_else(|| anyhow!("this connection never authenticated an Astation"))?;
         if challenge.astation_id != pinned {
             return Err(anyhow!(
@@ -1196,7 +1682,7 @@ impl AstationClient {
         // Only for the pairing and session this connection authenticated
         // with: never answer with a replacement's session.
         self.guarded(|| Ok(()))?;
-        let (proof, _) = self
+        let (proof, used) = self
             .auth_proof(&challenge)?
             .ok_or_else(|| {
                 self.no_session(
@@ -1205,6 +1691,13 @@ impl AstationClient {
                     "no saved session for this Astation; run `atem pair`",
                 )
             })?;
+        // A routed link is authenticated as the connect path does: later
+        // checks compare against the session this proof used.
+        if self.routed()
+            && let Some(capture) = self.capture.as_mut()
+        {
+            capture.session = used;
+        }
         self.send_message(proof).await?;
         self.answered_challenge = Some((challenge.astation_id, challenge.challenge));
         Ok(())
@@ -1295,6 +1788,25 @@ impl AstationClient {
     /// `save` allows).
     async fn wait_for_auth_response(&mut self, astation_id: &str, save: GrantSave) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
+            // §R9.7b: the relay's verdict on this link's proof (its reader
+            // checked it) counts after `auth_required` too: recorded, and an
+            // `ok` ends the wait when it hands the authentication over.
+            if let Some(wait) = self.route_wait.as_mut() {
+                match msg {
+                    AstationMessage::HostRouted => {
+                        wait.verdict = Some(true);
+                        if wait.hand_over {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    AstationMessage::HostRouteRefused(_) => {
+                        wait.verdict = Some(false);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if let Some((response, saved)) = self.auth_response_saving(&msg, astation_id, save)? {
                 // A grant saved a new session (under the captured pairing):
                 // later checks compare against that one. One kept in memory
@@ -1342,6 +1854,32 @@ impl AstationClient {
         self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?
             .send(outbound)
             .map_err(|e| anyhow!("Failed to send message: {}", e))
+    }
+
+    /// An r9 channel envelope for the link (§R9.7a). `false` when the link
+    /// is gone or already holds `CHANNEL_INFLIGHT_BYTES` of unwritten
+    /// envelopes: the caller keeps it queued and tries again.
+    /// Channel envelopes handed to the link and not written yet (bytes).
+    pub(crate) fn channel_unwritten(&self) -> usize {
+        self.channel_inflight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn try_send_channel(&self, text: String) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(sender) = self.sender.as_ref() else { return false };
+        let len = text.len();
+        if self.channel_inflight.load(Ordering::Relaxed) + len > CHANNEL_INFLIGHT_BYTES
+            && self.channel_inflight.load(Ordering::Relaxed) > 0
+        {
+            return false;
+        }
+        self.channel_inflight.fetch_add(len, Ordering::Relaxed);
+        let outbound = OutboundMessage { message: AstationMessage::Channel(text), delivered: None };
+        if sender.send(outbound).is_err() {
+            self.channel_inflight.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     pub async fn send_message(&self, message: AstationMessage) -> Result<()> {
@@ -1638,6 +2176,10 @@ impl AstationClient {
         success: bool,
         message: &str,
     ) -> Result<()> {
+        // A link routed for r9 only carries nothing of Astation's.
+        if self.routed() {
+            return Err(anyhow!("the link is routed for r9 only; no Astation"));
+        }
         let msg = AstationMessage::MarkTaskResult {
             task_id: task_id.to_string(),
             success,
@@ -1740,6 +2282,8 @@ impl AstationClient {
         let atem_id = self.resolved_atem_id(&hostname);
 
         let ws_url = relay_ws_url(&ws_scheme, identity_code, &atem_id);
+        self.route_link = Some((identity_code.to_string(), atem_id.clone()));
+        self.routed = None;
         self.connect_raw(&ws_url).await?;
 
         // Send hello to announce ourselves and trigger Astation to send credentials
@@ -1753,7 +2297,8 @@ impl AstationClient {
             })
             .await?;
 
-            self.authenticate(
+            self.authenticate_or_route(
+                identity_code,
                 Duration::from_secs(10),
                 Duration::from_secs(300),
                 allow_pairing,
@@ -1969,6 +2514,177 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// §R9.9: the relay's `push_ack` (any `{"type":"relay",…}`) is kept
+    /// raw for the runtime's r9 push; nothing else is taken for one.
+    #[test]
+    fn relay_messages_are_told_by_their_type() {
+        assert!(is_relay_message(r#"{"type":"relay","op":"push_ack","acks":[]}"#));
+        assert!(!is_relay_message(r#"{"type":"session","data":{"op":"relay"}}"#));
+        assert!(!is_relay_message(r#"{"op":"push_ack"}"#));
+        assert!(!is_relay_message("not json"));
+        assert_eq!(session_family(r#"{"type":"relay","op":"push_ack"}"#), None);
+    }
+
+    /// A test relay that sends a `host_challenge` for `room` first, then
+    /// returns the challenge and the first `host_route` Atem sends (none
+    /// within 1.5 s: `None`); it then closes the socket.
+    async fn challenging_relay(
+        room: &'static str,
+    ) -> (String, tokio::task::JoinHandle<(atem_client::host_route::HostChallenge, Option<String>)>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let challenge = atem_client::host_route::HostChallenge::new(room);
+            socket.send(Message::Text(challenge.to_json().to_string())).await.unwrap();
+            let answer = tokio::time::timeout(Duration::from_millis(1_500), async {
+                while let Some(Ok(frame)) = socket.next().await {
+                    if let Message::Text(text) = frame
+                        && text.contains("\"host_route\"")
+                    {
+                        return Some(text);
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+            let _ = socket.close(None).await;
+            (challenge, answer)
+        });
+        (format!("http://{address}"), server)
+    }
+
+    /// §R9.7b: a relay identity link answers the relay's `host_challenge` as
+    /// it arrives, before (and without) any Astation authentication, with a
+    /// proof the shared verifier accepts; with no device list, or on a link
+    /// that isn't a relay identity link, nothing is sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relay_identity_link_answers_the_host_challenge_before_authentication() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
+        use atem_client::host_route::verify_host_route_message;
+        let mut log = TestLog::genesis("acct-1", &secret("ws astation"));
+        log.add_host("host-1", 1, &secret("ws host"));
+        let handle = route::new_handle();
+        route::set(
+            &handle,
+            RouteState::Ready {
+                id: RouteIdentity {
+                    account_id: "acct-1".into(),
+                    genesis_hash: log.log.genesis_hash(),
+                    host_id: "host-1".into(),
+                    head: log.log.head(),
+                    chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+                },
+                key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
+                    "ws host",
+                ))),
+            },
+        );
+        let (state, client) = isolated_client("hosta-0000000-1a2b3c4d");
+        let _profile = crate::test_profile::use_dir(state.path());
+        let mut client = client.with_host_route(handle.clone());
+        let (base, server) = challenging_relay("mac-room").await;
+        // No Astation answers: the connect fails, the proof went out.
+        assert!(client.connect_relay_identity_without_pairing(&base, "mac-room").await.is_err());
+        let (challenge, answer) = server.await.unwrap();
+        let answer = answer.expect("the host answered the challenge");
+        let route = verify_host_route_message(
+            &log.log,
+            answer.as_bytes(),
+            &challenge.nonce,
+            "mac-room",
+            "hosta-0000000-1a2b3c4d",
+        )
+        .unwrap();
+        assert_eq!(route.host_id, "host-1");
+        assert_eq!(route.head, log.log.head());
+
+        // Another room than the link's: no answer.
+        let (base, server) = challenging_relay("another-room").await;
+        assert!(client.connect_relay_identity_without_pairing(&base, "mac-room").await.is_err());
+        assert_eq!(server.await.unwrap().1, None);
+
+        // No device list: no answer.
+        route::set(&handle, RouteState::Off("no device list"));
+        let (base, server) = challenging_relay("mac-room").await;
+        assert!(client.connect_relay_identity_without_pairing(&base, "mac-room").await.is_err());
+        assert_eq!(server.await.unwrap().1, None);
+
+        // A link that isn't a relay identity link (connect_raw alone) never
+        // answers, even with a device list.
+        route::set(
+            &handle,
+            RouteState::Ready {
+                id: RouteIdentity {
+                    account_id: "acct-1".into(),
+                    genesis_hash: log.log.genesis_hash(),
+                    host_id: "host-1".into(),
+                    head: log.log.head(),
+                    chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+                },
+                key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
+                    "ws host",
+                ))),
+            },
+        );
+        let (base, server) = challenging_relay("mac-room").await;
+        client.connect_raw(&base.replace("http://", "ws://")).await.unwrap();
+        assert_eq!(server.await.unwrap().1, None);
+        // And the challenge never reaches the App as a relay message.
+        assert!(!matches!(
+            client.recv_message_async().await,
+            Some(AstationMessage::Relay(_))
+        ));
+    }
+
+    /// §R9.7b (N1): the upgrade of a routed link saves a granted session
+    /// only while the saved one is still the one its proof used, as the
+    /// connect path checks; otherwise nothing is saved and the upgrade fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_routed_upgrade_saves_a_grant_only_over_the_session_its_proof_used() {
+        let granted = |id: &str| AstationMessage::StatusUpdate {
+            status: "auth".into(),
+            data: std::collections::HashMap::from([
+                ("status".to_string(), "granted".to_string()),
+                ("session_id".to_string(), id.to_string()),
+                ("token".to_string(), format!("{id}-token")),
+            ]),
+        };
+        // The session the proof used is still saved: the grant is saved.
+        let (state, mut client) = isolated_client("atem-test-routed-grant");
+        let _profile = crate::test_profile::use_dir(state.path());
+        crate::pairing::tests::bound_profile(state.path(), "mac-a");
+        crate::pairing::tests::set_session(state.path(), "mac-a", "old-session", "old-token");
+        client.route_for_test("mac-a");
+        assert_eq!(client.routed_auth_response(&granted("granted-1")).unwrap(), Some(()));
+        assert_eq!(
+            crate::pairing::tests::session_id(state.path()).as_deref(),
+            Some("granted-1")
+        );
+        assert!(!client.routed());
+        drop(client);
+
+        // The saved session changed meanwhile: nothing is saved.
+        let (state, mut client) = isolated_client("atem-test-routed-changed");
+        let _profile = crate::test_profile::use_dir(state.path());
+        crate::pairing::tests::bound_profile(state.path(), "mac-a");
+        crate::pairing::tests::set_session(state.path(), "mac-a", "old-session", "old-token");
+        client.route_for_test("mac-a");
+        crate::pairing::tests::set_session(state.path(), "mac-a", "other-session", "other-token");
+        assert!(client.routed_auth_response(&granted("granted-2")).is_err());
+        assert_eq!(
+            crate::pairing::tests::session_id(state.path()).as_deref(),
+            Some("other-session")
+        );
+        assert!(client.routed(), "still routed, not Astation's");
+    }
+
     /// A delayed success for a connection whose pairing was replaced (atem
     /// unpair, then atem pair) while the proof was out is not adopted: no
     /// session refresh, no relay code, no connection.
@@ -2029,6 +2745,53 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+
+    /// N10 and the reader's cap: over the 2 MiB envelope bound nothing is
+    /// parsed (a handle from the first bytes, a session family answered
+    /// as oversize, anything else dropped), and a message over the link's
+    /// cap ends the link instead of being buffered.
+    #[tokio::test]
+    async fn oversize_messages_are_never_parsed_and_the_reader_is_capped() {
+        use crate::session_protocol::r9::envelope::MAX_ENVELOPE_BYTES;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pad = |head: &str, total: usize| format!("{head}{}\"}}}}", "A".repeat(total - head.len() - 3));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let config = super::link_ws_config();
+            let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig { max_message_size: Some(64 << 20), max_frame_size: Some(64 << 20), ..config };
+            let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(config)).await.unwrap();
+            let big = MAX_ENVELOPE_BYTES + 1000;
+            // A channel envelope with its handle in its first bytes.
+            socket.send(Message::Text(pad(r#"{"type":"channel","event":"frame","channel":"h1","frame":{"ct":""#, big))).await.unwrap();
+            // Its first 4 KiB end inside a nested value before any type.
+            socket.send(Message::Text(pad(&format!(r#"{{"x":{{"y":"{}"#, "z".repeat(5000)), big))).await.unwrap();
+            // A session message over every bound: answered, never parsed.
+            socket.send(Message::Text(pad(r#"{"type":"session","data":{"x":""#, big))).await.unwrap();
+            // Another type: dropped.
+            socket.send(Message::Text(pad(r#"{"type":"heartbeat","data":{"x":""#, big))).await.unwrap();
+            socket.send(Message::Text(r#"{"type":"channel","event":"open","channel":"h2","transport":"relay"}"#.into())).await.unwrap();
+            // Over the reader's cap: the link ends.
+            let _ = socket.send(Message::Text(pad(r#"{"type":"channel","event":"frame","channel":"h3","frame":{"ct":""#, super::MAX_LINK_MESSAGE_BYTES + 1))).await;
+            let _ = socket.next().await;
+        });
+        let mut client = AstationClient::new();
+        client.connect_raw(&format!("ws://{address}")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !client.is_ws_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the link ends at a message over its cap");
+        let mut got = Vec::new();
+        while let Some(message) = client.recv_message() {
+            got.push(message);
+        }
+        assert!(matches!(&got[0], AstationMessage::ChannelTooLarge(h) if h == "h1"), "{got:?}");
+        assert!(matches!(&got[1], AstationMessage::SessionOversize { id: None, family } if family == "session"), "{got:?}");
+        assert!(matches!(&got[2], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
+        assert_eq!(got.len(), 3, "nothing else was delivered: {got:?}");
+        server.abort();
     }
 
     #[tokio::test]
@@ -3425,9 +4188,11 @@ mod tests {
 
     #[test]
     fn verify_messages_round_trip() {
-        let message = AstationMessage::VerifyCommit { device_id: "d".into(), commitment: "c".into() };
+        let message = AstationMessage::VerifyCommit { device_id: "d".into(), commitment: "c".into(), host_trust_gen: 3 };
         let json = serde_json::to_string(&message).unwrap();
-        assert_eq!(json, r#"{"type":"verifyCommit","data":{"device_id":"d","commitment":"c"}}"#);
+        assert_eq!(json, r#"{"type":"verifyCommit","data":{"device_id":"d","commitment":"c","host_trust_gen":3}}"#);
+        // As Astation must read it (§R9.2).
+        assert_eq!(atem_client::ceremony::verify_commit_host_trust_gen(json.as_bytes()), Ok(3));
     }
 
     #[test]

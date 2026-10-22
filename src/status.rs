@@ -76,6 +76,8 @@ pub struct StatusReport {
     pub authorization: Line,
     pub relay: Line,
     pub local_agents: Line,
+    /// The runtime's r9 device list, when it has one (`Device list:`).
+    pub device_list: Option<Line>,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
 }
@@ -312,6 +314,11 @@ pub fn gather_full(
         if welcome.build != crate::memory::cred_agent::build_id());
     let (credentials, notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
     let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
+    let device_list = match runtime {
+        Look::Running { .. } => device_list_line(runtime, local_datetime),
+        // No runtime: what the files say (read only).
+        _ => passive_device_list_line(&src.paths.pairing, local_datetime),
+    };
     StatusReport {
         account: account_line(src, crate::credentials::now_secs()),
         pairing: pairing_line,
@@ -320,8 +327,61 @@ pub fn gather_full(
         authorization,
         relay,
         local_agents,
+        device_list,
         notes,
     }
+}
+
+/// `Device list:` from the files when no runtime runs (read only; held is
+/// as the files record it, the runtime decides at its start).
+pub fn passive_device_list_line(
+    pairing: &crate::paths::PairingPaths,
+    datetime: impl Fn(u64) -> String,
+) -> Option<Line> {
+    let (_, text, pending) = crate::session_protocol::membership::passive_status(pairing)?;
+    let mut text = format!("{text} (from disk; no runtime running)");
+    for (subject, action, at) in pending {
+        text.push_str(&format!(
+            "; recovery pending: {subject} ({action}) takes effect at {} unless a managing device vetoes it",
+            datetime(at)
+        ));
+    }
+    Some(Line::new(text))
+}
+
+/// `Device list:` from the running runtime (r9, §R9.3, §R9.5): pinned,
+/// held, frozen, paused or failed, with what to do, each pending
+/// recovery with when it takes effect, and the push hints and seens the
+/// relay hasn't acknowledged yet (§R9.9).
+pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Line> {
+    let Look::Running {
+        status: Some(status),
+        ..
+    } = look
+    else {
+        return None;
+    };
+    let list = status.device_list.as_ref()?;
+    let mut text = list.text.clone();
+    for p in &list.pending_recovery {
+        text.push_str(&format!(
+            "; recovery pending: {} ({}) takes effect at {} unless a managing device vetoes it",
+            p.subject,
+            p.action,
+            hhmm(p.effective_at)
+        ));
+    }
+    if list.push_pending > 0 {
+        let oldest = list
+            .push_oldest_ms
+            .map(|ms| format!(", oldest {} s", ms / 1000))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "; push: {} waiting for the relay's acknowledgment{oldest}",
+            list.push_pending
+        ));
+    }
+    Some(Line::new(text))
 }
 
 /// The status from `src`, asking an already running cred agent when
@@ -351,6 +411,23 @@ fn local_hhmm(at: u64) -> String {
         return "?".into();
     }
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// A Unix ms time as local `YYYY-MM-DD HH:MM`.
+fn local_datetime(at: u64) -> String {
+    let t = (at / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return "?".into();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
 }
 
 /// What is left of an authorization: `23 h left`, `5 min left`.
@@ -408,6 +485,8 @@ pub fn runtime_lines(look: &Look, hhmm: impl Fn(u64) -> String) -> (Line, Line, 
         "paused (journal halted; run atem runtime restart)".into()
     } else if status.reauthenticating {
         "not authorized (Astation is authenticating the link again)".into()
+    } else if !status.astation && status.routed {
+        "r9 routed (no Astation)".into()
     } else if !status.astation {
         "not authorized (Astation not connected)".into()
     } else if !status.attachment {
@@ -434,6 +513,10 @@ pub fn runtime_lines(look: &Look, hhmm: impl Fn(u64) -> String) -> (Line, Line, 
         "not authorized (Astation connected but no session hello yet)".into()
     };
     let relay = match (status.astation || status.reauthenticating, status.transport) {
+        (false, Some(Transport::Relay)) if status.routed => match &status.relay {
+            Some(label) => format!("routed via relay ({label}; no Astation)"),
+            None => "routed via relay (no Astation)".into(),
+        },
         (true, Some(Transport::Relay)) => match &status.relay {
             Some(label) => format!("connected via relay ({label})"),
             None => "connected via relay".into(),
@@ -489,6 +572,9 @@ pub fn render(report: &StatusReport) -> String {
     let mut out = String::new();
     for (label, line) in rows {
         out.push_str(&format!("{label:<16}{}\n", line.value));
+    }
+    if let Some(line) = &report.device_list {
+        out.push_str(&format!("{:<16}{}\n", "Device list:", line.value));
     }
     for note in &report.notes {
         out.push_str(note);
@@ -645,6 +731,127 @@ pub(crate) mod tests {
         gather_with(&Sources::in_dir(dir), None)
     }
 
+    /// r9: the runtime's device list is its own line, pending recoveries
+    /// with when they take effect; none without a list.
+    #[test]
+    fn the_device_list_line_says_what_to_do() {
+        use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus, RuntimeStatus};
+        let look = |list: Option<DeviceListStatus>| Look::Running {
+            status: Some(RuntimeStatus {
+                device_list: list,
+                ..Default::default()
+            }),
+            welcome: crate::runtime::client::Welcome {
+                protocol: 1,
+                build: "b".into(),
+                pid: 1,
+                astation: false,
+                host_error: None,
+                worker_protocol: None,
+                device_list: None,
+            },
+        };
+        assert_eq!(device_list_line(&look(None), |_| "?".into()), None);
+        let held = DeviceListStatus {
+            state: "held".into(),
+            text: "held (a device-list write fault was recorded); remote access waits".into(),
+            pending_recovery: vec![PendingRecoveryStatus {
+                subject: "dev-new".into(),
+                action: "recovery_add".into(),
+                effective_at: 7,
+            }],
+            ..Default::default()
+        };
+        let line = device_list_line(&look(Some(held)), |ms| format!("@{ms}")).unwrap();
+        assert_eq!(
+            line.value,
+            "held (a device-list write fault was recorded); remote access waits; recovery pending: dev-new (recovery_add) takes effect at @7 unless a managing device vetoes it"
+        );
+        let mut report = StatusReport {
+            account: Line::new("a"),
+            pairing: Line::new("p"),
+            verification: Line::new("v"),
+            credentials: Line::new("c"),
+            authorization: Line::new("au"),
+            relay: Line::new("r"),
+            local_agents: Line::new("l"),
+            device_list: Some(line),
+            notes: Vec::new(),
+        };
+        assert!(render(&report).contains("\nDevice list:    held ("));
+        let open = DeviceListStatus {
+            state: "open".into(),
+            text: "pinned at seq 4 (1 remote client)".into(),
+            push_pending: 3,
+            push_oldest_ms: Some(21_500),
+            ..Default::default()
+        };
+        let line = device_list_line(&look(Some(open)), |_| "?".into()).unwrap();
+        assert_eq!(
+            line.value,
+            "pinned at seq 4 (1 remote client); push: 3 waiting for the relay's acknowledgment, oldest 21 s"
+        );
+        report.device_list = None;
+        assert!(!render(&report).contains("Device list"));
+        assert_eq!(device_list_line(&Look::NotRunning, |_| "?".into()), None);
+    }
+
+    /// With no runtime running, the device list is read from the files
+    /// (read only): pinned with a pending recovery, held, failed.
+    #[test]
+    fn the_device_list_line_without_a_runtime_reads_the_files() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::membership::{HostPin, MembershipHost};
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(report(dir.path()).device_list, None);
+        let mut log = TestLog::genesis("acct-s", &secret("s astation"));
+        log.add_host("host-s", 1, &secret("s host"));
+        log.recovery_add("dev-new");
+        let journal = crate::runtime::state_dir(dir.path()).join("journal");
+        crate::session_protocol::membership::store::private_dir(&journal).unwrap();
+        let pin = HostPin {
+            host_id: "host-s".into(),
+            host_trust_gen: 1,
+        };
+        MembershipHost::pin(
+            &src.paths.pairing,
+            &journal,
+            &pin,
+            &log.log,
+            &secret("s host"),
+        )
+        .unwrap();
+        let line = report(dir.path()).device_list.unwrap().value;
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        // An unfinished write after a plain crash: replayed at the next
+        // start, no managing device asked for (Astation's review of
+        // 66ea556).
+        for file in [&src.paths.pairing.carriage, &src.paths.pairing.intent] {
+            std::fs::write(file, b"{}").unwrap();
+            let line = report(dir.path()).device_list.unwrap().value;
+            assert!(
+                line.starts_with(
+                    "pinned at seq 3; an unfinished device-list write is replayed at the next start"
+                ),
+                "{line}"
+            );
+            assert!(!line.starts_with("held"), "{line}");
+            std::fs::remove_file(file).unwrap();
+        }
+        // A recorded fault holds for a managing device, with or without an
+        // unfinished write.
+        std::fs::write(&src.paths.pairing.carriage, b"{}").unwrap();
+        std::fs::write(&src.paths.pairing.fault, b"{}").unwrap();
+        let line = report(dir.path()).device_list.unwrap().value;
+        assert!(line.starts_with("held ("), "{line}");
+        assert!(line.contains("managing device"), "{line}");
+        std::fs::write(&src.paths.pairing.membership, b"{}").unwrap();
+        let line = report(dir.path()).device_list.unwrap().value;
+        assert!(line.starts_with("failed ("), "{line}");
+        assert!(line.contains("atem unpair, then atem pair"), "{line}");
+    }
+
     #[test]
     fn render_aligns_every_label() {
         let report = StatusReport {
@@ -655,6 +862,7 @@ pub(crate) mod tests {
             authorization: Line::new("authorized (r8, since 18:25, 23 h left)"),
             relay: Line::new("connected locally"),
             local_agents: Line::new("2 running (claude ready, codex ready)"),
+            device_list: None,
             notes: Vec::new(),
         };
         assert_eq!(
@@ -1037,6 +1245,7 @@ pub(crate) mod tests {
             astation: true,
             host_error: None,
             worker_protocol: Some(1),
+            device_list: None,
         }
     }
 
@@ -1151,6 +1360,24 @@ pub(crate) mod tests {
         assert!(lines(&running(unverified))[0].contains("isn't a verified pairing"));
     }
 
+    /// §R9.7b: a relay link routed for r9 only, no Astation.
+    #[test]
+    fn a_routed_link_says_so() {
+        let routed = RuntimeStatus {
+            astation: false,
+            attachment: false,
+            routed: true,
+            ..connected(Transport::Relay)
+        };
+        assert_eq!(
+            lines(&running(routed))[..2],
+            [
+                "r9 routed (no Astation)",
+                "routed via relay (station.agora.build as Genie-dc1649f-956631ec; no Astation)"
+            ]
+        );
+    }
+
     #[test]
     fn a_disconnected_link_and_a_halted_journal() {
         let retrying = RuntimeStatus {
@@ -1225,6 +1452,7 @@ pub(crate) mod tests {
                             astation: true,
                             host_error: None,
                             worker_protocol: Some(1),
+                            device_list: None,
                         }
                     }
                     Ok(ClientMsg::Status) => match status.clone() {

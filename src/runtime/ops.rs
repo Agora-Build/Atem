@@ -450,6 +450,10 @@ async fn pair_verify<U: OpUi>(
     verified
 }
 
+/// `verifyAbort` reason when this host's record of frozen device lists
+/// can't be read (no local path; the remedy is shown locally).
+pub(crate) const FROZEN_GENESIS_UNREADABLE: &str = "this host's record of frozen device lists can't be read; pairing is refused until it is restored on the host";
+
 /// The CLI's answer to "does the code match?".
 fn code_answer(answer: Option<AnswerValue>) -> CodeAnswer {
     match answer {
@@ -504,10 +508,19 @@ pub(crate) async fn verify_device<U: OpUi>(
         blocking(move || device_keys_for_verification(&paths, agent.as_ref())).await?
     };
     let handshake = Handshake::start(keys);
+    // r9 (§R9.2): the binding's generation, captured with the commitment
+    // for this attempt (the capture never changes; a new pairing voids it).
+    let host_trust_gen = capture.bound_to(astation_id)?.host_trust_gen;
+    if !(1..=atem_client::canonical::MAX_SAFE_INTEGER).contains(&host_trust_gen) {
+        bail!(
+            "the host trust generation {host_trust_gen} can't be sent; run atem unpair, then atem pair"
+        );
+    }
     client
         .send_message(AstationMessage::VerifyCommit {
             device_id: device_id.clone(),
             commitment: STANDARD.encode(handshake.commitment()),
+            host_trust_gen,
         })
         .await?;
 
@@ -539,7 +552,44 @@ pub(crate) async fn verify_device<U: OpUi>(
                 enc_pub,
                 recovery_sign_pub,
                 nonce,
-            } => AstationKeys::from_wire(&sign_pub, &enc_pub, &recovery_sign_pub, &nonce)?,
+                genesis_hash,
+            } => {
+                // r9 (no compatibility): the ceremony pins the account's
+                // device list; an Astation that names none can't pair.
+                let Some(genesis_hash) = genesis_hash else {
+                    let failure = VerifyFailure::local(
+                        "Atem needs a device list (atem-session r9)",
+                        anyhow!(
+                            "This Astation doesn't send a device list yet (atem-session r9). Update Astation, then run `atem pair verify`."
+                        ),
+                    );
+                    return Err(
+                        abandon_verification(client, &paths.trust, astation_id, failure).await,
+                    );
+                };
+                match AstationKeys::from_wire(
+                    &sign_pub,
+                    &enc_pub,
+                    &recovery_sign_pub,
+                    &nonce,
+                    &genesis_hash,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        let failure = VerifyFailure::local(
+                            format!("atem refused verifyKeys: {error:#}"),
+                            error,
+                        );
+                        return Err(abandon_verification(
+                            client,
+                            &paths.trust,
+                            astation_id,
+                            failure,
+                        )
+                        .await);
+                    }
+                }
+            }
             AstationMessage::VerifyAbort { reason } => {
                 bail!("Astation stopped device verification: {}", shown(&reason))
             }
@@ -547,12 +597,29 @@ pub(crate) async fn verify_device<U: OpUi>(
         },
     };
 
+    // r9 (§R9.4): this host's frozen device lists must be readable before
+    // the codes are compared and Touch ID is asked (the certificate's list
+    // is checked against them); an unreadable copy fails now, the remedy
+    // shown here, a short reason without a local path sent to Astation.
+    let pairing = capture.sources().paths.pairing.clone();
+    let frozen = blocking(move || {
+        Ok(crate::session_protocol::membership::frozen_genesis(
+            &pairing,
+        ))
+    })
+    .await?;
+    if let Err(error) = frozen {
+        let failure = VerifyFailure::local(FROZEN_GENESIS_UNREADABLE, anyhow!(error));
+        return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+    }
+
     let reveal = handshake.reveal();
     client
         .send_message(AstationMessage::VerifyReveal {
             device_pub: STANDARD.encode(reveal.device_pub),
             device_sign_pub: STANDARD.encode(reveal.device_sign_pub),
             unlock_auth_pub: STANDARD.encode(reveal.unlock_auth_pub),
+            host_channel_pub: atem_client::encoding::b64u(&reveal.host_channel_pub),
             nonce: STANDARD.encode(reveal.nonce_a),
         })
         .await?;
@@ -610,8 +677,14 @@ pub(crate) async fn verify_device<U: OpUi>(
         // The raw agent: the whole apply holds the pairing lock already.
         let (paths, agent, capture) = (paths.clone(), raw_agent.clone(), capture.clone());
         let astation_id = astation_id.to_string();
-        let keys = handshake.into_keys();
+        let (keys, host_seed) = handshake.into_parts();
+        let (astation, host_id) = (astation.clone(), device_id.clone());
         blocking(move || {
+            let host = crate::pair_verify::HostPinning {
+                astation: &astation,
+                host_id: &host_id,
+                host_seed: &host_seed,
+            };
             crate::pair_verify::apply_device_verified(
                 &capture,
                 &paths,
@@ -619,6 +692,7 @@ pub(crate) async fn verify_device<U: OpUi>(
                 &astation_id,
                 keys,
                 &reply,
+                &host,
             )
         })
         .await

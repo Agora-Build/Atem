@@ -961,6 +961,7 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
             agent_pid: None,
             agent_start_time: None,
             exited: None,
+            project_key: None,
         };
         super::worker::write_record(&runtime.state(), &record).unwrap();
         let lock = super::worker::lock_path(&runtime.state(), &sid);
@@ -1091,6 +1092,7 @@ impl FakeWorker {
             agent_pid: None,
             agent_start_time: None,
             exited: None,
+            project_key: None,
         };
         super::worker::write_record(&root.join("state"), &record).unwrap();
         let hello = encode_worker(&WorkerMsg::Hello {
@@ -1732,6 +1734,7 @@ fn a_runtime_of_another_worker_protocol_is_kept() {
                         astation: false,
                         host_error: None,
                         worker_protocol: Some(9),
+                        device_list: None,
                     },
                     ClientMsg::List => RuntimeMsg::Sessions {
                         sessions: vec![SessionSummary {
@@ -1814,6 +1817,7 @@ fn a_replacement_already_done_by_another_client_is_joined() {
                                     astation: false,
                                     host_error: None,
                                     worker_protocol: Some(1),
+                                    device_list: None,
                                 }
                             }
                             ClientMsg::Restart => {

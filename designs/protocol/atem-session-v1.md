@@ -12,12 +12,23 @@ rule (§I, which removes §6's double-I/O exception). Atem's host speaks only
 r8: a `hello` without `revision: 8` is refused, so Astation must send it.
 The shared fixtures and where they run are in `atem-host-handoff.md`; the
 consolidated Astation note is `r8-astation-handoff.md`.
-**r9 (draft, 2026-10-19; not implemented):** the appendix "r9" at the end
-specifies remote clients that reach Atem without the Mac (native members,
-scoped services, browser grants) over the end-to-end channel `atem-ch1`,
-authorized by a signed membership log pinned at pairing; its fixtures
-(`fixtures/r9-*.json`, `requires: "r9"`) are reported NOT RUN. r8 stays
+**r9 (signed off 2026-10-19; implemented by Atem 2026-10-20, PR #89, not
+yet merged):** the appendix "r9" at the end specifies remote clients that
+reach Atem without the Mac (native members, scoped services, browser
+grants) over the end-to-end channel `atem-ch1`, authorized by a signed
+membership log pinned at pairing. Atem implements it in `atem-client`
+(with its Swift, Kotlin and WASM bindings) and the runtime host; its
+fixtures (`fixtures/r9-*.json`, `requires: "r9"`) run in atem-client's
+tests and against the real runtime (`atem-host-handoff.md`). r8 stays
 authoritative until r9 ships on both sides.
+r9 note (2026-10-20), a clarification of signed-off r8 text, not a
+change: §3's replaced-attachment sentence read "its leases end (none is
+carried over)", which a reader could take to mean a dropped or
+re-authenticated attachment's lease ends at once too, against §5 (left to
+expire). It now says a replaced attachment's leases end at once while after
+a drop or re-authentication they expire (§5), which is what r8 Atem does;
+no wire, fixture or behavior changed. Agreed with Astation (PR #80,
+comment 6291951066).
 r8 (2026-10-18) changelog: implemented in Atem (`src/session_protocol/`,
 `src/chat/history.rs`, `src/runtime/host_bridge.rs`); welcome advertises all
 nine features. The implementation corrected the appendix where it was
@@ -207,7 +218,10 @@ Every request that targets a session carries one **binding** object:
   with `resume`, and any `resume_proof`, is refused `unauthorized`. A second
   `hello` (without `resume`) on an attachment that was already welcomed
   replaces it (r7.1): the host fences the old attachment as a transport drop
-  or re-authentication would — its leases end (none is carried over), its
+  or re-authentication would, except that its leases end at once (after a
+  drop or re-authentication a lease is left to expire, §5; either way none
+  is carried over; *clarification of the signed-off r8 text, see the r9
+  note in the header*) — its
   subscriptions, streams and chat conversations close, its pending replies
   are dropped — and answers `welcome` on a new attachment over the same
   authenticated transport: new `attachment_gen` and `controller_session`,
@@ -1685,14 +1699,17 @@ crash before the grant: no lease, and after the restart `rejected`
 | `invalid_request` | new: a well-formed message of a known op whose fields break its rules (history selector count, field formats or lengths; §F's `acquire`/`takeover`/`expected_controller` rules and a prompt's static checks) |
 | `stale_target` | also: a `next` token used out of its context or stale; a `before` no longer retained |
 | `busy` | also: more than 8 history requests a second in a conversation; an acquiring Send to a session without `chat-v1` (§F); a failed admission write (`detail:"acceptance not recorded"`, a definitive refusal) and every request after it, or after any other failed journal write such as a revocation's (§H), until restart (`journal halted; restart Atem`) (§I) |
-| `rejected` receipt details | new: `control revoked` (the submitter principal lost `control`, §H), `control not confirmed` (recovered work whose principal wasn't confirmed within 60 s after a clean close, §H), `authorization history unknown` (recovered work not yet executing after a run that didn't end with a clean close, §H), `acceptance not confirmed` (a request refused `busy` for a failed write, resolved at restart, §I) |
+| `rejected` receipt details | new: `control revoked` (the submitter principal lost `control`, §H), `control not confirmed` (recovered work whose principal wasn't confirmed within 60 s after a clean close, §H), `authorization history unknown` (recovered work not yet executing after a run that didn't end with a clean close, §H; it also covers a lost or older `principals` file: a recovered request whose principal the host's durable control history doesn't name at the request's `control_gen` or higher), `acceptance not confirmed` (a request refused `busy` for a failed write, resolved at restart, §I) |
 | `lease_held` | now carries `controller{controller_session, lease_epoch}` (also for §5 `acquire`); also: an acquiring Send while another holds the lease, or a takeover whose `expected_controller` is no longer the holder (§F) |
 | `forbidden` | also: a Send or approval answer from an attachment without `control`, checked before any lease state (§F, §G) |
 
-## Appendix: r9 (draft, 2026-10-19; not implemented, r8 stays authoritative)
+## Appendix: r9 (signed off 2026-10-19; implemented by Atem 2026-10-20)
 
-Status: **draft for joint review.** Nothing here is emitted or accepted by
-Atem until r9 ships on both sides; until then r8 (above) is the contract.
+Status: **implemented by Atem** (2026-10-20: `crates/atem-client`, its
+bindings and the runtime host; PR #89, merged only once Astation ships its
+side). Released Atem speaks r8 until r9 ships on both sides; until then r8
+(above) is the contract. A build of the PR (its packages and harness)
+already refuses r8 on a host once a device list is pinned.
 r9 adds remote clients that reach Atem independently of the Mac: native
 members (Mac, iPhone, iPad, Android), scoped bots (`service`) and short
 browser grants, all over one end-to-end channel (`atem-ch1`) whose
@@ -1703,7 +1720,8 @@ reviews of r2, of the first r9 pin `ffe840d` (its r3 review) and of
 `016abe7` (its r4 review, both 2026-10-19; "Astation r4 review N" in
 this appendix means the latter) are answered point by point in `remote-agent-api-atem.md`
 §10. Fixtures: `fixtures/r9-*.json`
-(`requires: "r9"`; every runner reports them NOT RUN until r9 is built),
+(`requires: "r9"`; run by atem-client's tests and, host side, against the
+real runtime; the r8 runners report them NOT RUN),
 format in `fixtures/schema.md` "r9 fixtures".
 
 **What r9 keeps.** Every r8 operation, error and journal rule (§A–§I)
@@ -1717,7 +1735,8 @@ how it is authenticated, and how revocation reaches the host.
 **No compatibility.** An r9 host refuses r8 admission: the "paired
 Astation over its authenticated link" principal of §H is removed, and the
 Mac is the genesis member using the same channel as every other client
-(over its link, the relay or direct :8080). Its link stays for pairing,
+(over Atem's link to the relay or to Astation's :8080, inside the
+channel envelope of R9.7a). Its link stays for pairing,
 `cred unlock`, `credentialSync`, key grants and relay messages.
 
 ### R9.1 Encodings and signed objects
@@ -1740,6 +1759,7 @@ Mac is the genesis member using the same channel as every other client
 | `atem-browser-grant` | `atem-browser-grant-v1` | a native member with `control` (R9.6) |
 | `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
+| `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
 
 Other domain strings (never signing inputs of another kind):
 `atem-membership-hash-v1`, `atem-browser-grant-hash-v1`,
@@ -1829,11 +1849,29 @@ a new member (or a new `add_host`).
 Log limits: ≤ 1024 entries, ≤ 256 members, ≤ 64 hosts. A full log is
 `membership_invalid` "device list full; re-pair to start a new one".
 Vectors: `r9-vectors-membership-log` (E1–E6 and the alternatives used
-by the scenarios).
+by the scenarios); `r9-vectors-pairing` (`verifyCommit` and its
+`host_trust_gen` cases).
 
-**Pairing (ceremony changes).** `verifyKeys` gains `genesis_hash`;
-`verifyReveal` gains `host_channel_pub` (Ed25519, R9.6), inside the
-commitment; the safety code becomes `base32(SHA-256(enc(["atem-safety-code-v2",
+**Pairing (ceremony changes).** `verifyCommit` gains `host_trust_gen`:
+the binding's host trust generation, public, a JSON integer with
+1 ≤ n ≤ 2^53−1 (R9.1), in the existing message's payload:
+`{"type":"verifyCommit","data":{"device_id":"<atem_device_id>",
+"commitment":"<base64>","host_trust_gen":3}}`. It is required (no
+compatibility): Astation refuses (`verifyAbort`) a `verifyCommit`
+without it, or with a value that isn't an integer in that range, and
+copies it unchanged into the signed `add_host`. Both sides capture it
+with the commitment for that verification attempt and never change it
+while the owner's confirmation is pending; the attempt is void after a
+reconnect of the link or a new pairing (`atem pair`, `atem unpair`) on
+either side. No secrecy or commitment binding is needed: Atem compares
+the `add_host` it receives with its own host id, key and generation and
+refuses any other. `verifyKeys` gains `genesis_hash`
+(lowercase hex); `verifyReveal` gains `host_channel_pub` (the 32-byte
+Ed25519 key, R9.6, in base64url without padding as R9.1 says; the
+ceremony's older fields stay standard base64), inside the commitment,
+whose label is unchanged: `C = SHA-256(enc(["atem-verify-commit-v1",
+device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub,
+nonce_a]))`; the safety code becomes `base32(SHA-256(enc(["atem-safety-code-v2",
 device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub,
 astation_sign_pub, astation_enc_pub, recovery_sign_pub, genesis_hash,
 nonce_a, nonce_s])))[:12]`. After Touch ID the pairing manager appends
@@ -2599,7 +2637,12 @@ expires_at`), with a grant's `issued_at` ≤ `now + 300 000`; while
 attached, a timer fences the principal at expiry (wall and monotonic,
 whichever first, as §3's authorization deadline). `welcome.
 authorization_ms_left` = min(expiry − now, the channel's remaining
-lifetime).
+lifetime). A browser principal with no attachment, lease or unfinished
+request may be dropped from the journal (only browser principals are
+dropped; every other principal keeps §H's `control_gen`); one that attaches again with a
+still-valid grant starts at `control_gen` 1, since nothing refers to the
+old value and revocation, issuer fencing and expiry are checked at
+admission.
 
 **Keys and owner confirmation — requirements on clients** (Atem can't
 observe them; the shared core exposes signing as an effect):
@@ -2632,7 +2675,8 @@ observe them; the shared core exposes signing as an effect):
 One suite, no negotiation, no rekeying, no resumption, no 0-RTT. Every
 connection is a full handshake and a new attachment (no lease is
 carried, §3). Transport messages are JSON text frames, identical over
-the Astation link, the relay and direct :8080:
+the relay and Astation's :8080, each carried in the channel envelope of
+R9.7a on Atem's one outbound link:
 
 | # | dir | message |
 |---|---|---|
@@ -2707,9 +2751,13 @@ channel without a reply and wipes its keys.
 **Limits** (a new channel is required before any is reached; the side
 that reaches one first sends nothing more and closes; the client
 reconnects, a new attachment): 2^32 records or 2^36 plaintext bytes per
-direction; lifetime 24 h for native principals, the expiry for
-service/browser; `accept` within 10 s of `init`, `finish` within 10 s of
-`accept`, else closed. The host keeps no state for an `init` beyond its
+direction; lifetime 24 h for native principals, on the monotonic clock
+only (a key-rotation bound: native members never expire, so a suspend
+doesn't end it, removal from the device list does at once; it still
+counts in `welcome.authorization_ms_left`), the expiry for
+service/browser (wall and monotonic, "Time rules for authority");
+`accept` within 10 s of `init`, `finish` within 10 s of `accept`, else
+closed. The host keeps no state for an `init` beyond its
 ephemeral key and answers at most one `init` a second per transport.
 
 **Errors.** Before `finish` opens they are clear, then close:
@@ -2738,6 +2786,364 @@ Vectors: `r9-vectors-channel-handshake` (every intermediate value, the
 first records, and the negative cases: tampered head, tampered finish,
 replayed finish, replayed record, direction confusion, zero shared
 secret).
+
+### R9.7a Channel envelope (routing on Atem's link)
+
+Atem is outbound-only (user decision, 2026-10-20): it opens no listening
+port. Every r9 client (the Mac's own Astation included) reaches it over
+Atem's one existing outbound link: the relay room (`role=atem`) or
+Astation's local :8080. The router (the relay, or Astation on :8080)
+wraps each client's `atem-ch1` frames (R9.7) in an envelope that names a
+routing handle, so several clients share the link. Agreed with Astation
+(#81 6287955132, PR #80 6287954583); fixtures `r9-envelope-*`.
+
+| event | dir | message |
+|---|---|---|
+| `open` | router → Atem | `{"type":"channel","event":"open","channel":"<h>","transport":"relay"\|"direct"}` |
+| `frame` | both | `{"type":"channel","event":"frame","channel":"<h>","frame":{<one atem-ch1 frame, R9.7>}}` |
+| `close` | both | `{"type":"channel","event":"close","channel":"<h>","reason"?:"<code>"}` |
+
+**Fields.** Exactly these fields per event (I-JSON, `parse_strict`, no
+other field: `open` carries no client address, device identity, roles
+or other metadata; routing hints never grant membership, host identity
+or authorization). `channel` (the handle): 1–64 characters of
+`[A-Za-z0-9_-]`, assigned by the router. `transport` is the router's
+label (`relay` for the relay room, `direct` for :8080); Atem logs it and
+never trusts it. `reason`: 1–32 characters of `[a-z_]`. `frame` is the
+`atem-ch1` frame object itself (not a string). Non-compact JSON is
+accepted; every bound below applies to the bytes as received.
+
+**Scope of a handle.** A handle is valid only within one generation of
+Atem's link (one authenticated WebSocket connection): Atem keys channels
+by (link generation, handle). The router never reuses a handle while
+that link lives; a stale handle, or a delayed callback of an earlier
+link, never binds to a channel of a new link. The handle is a routing
+id only, distinct from the cryptographic `channel_id = hex(th4[0..16])`
+(R9.7); neither stands in for the other, and authentication is entirely
+`atem-ch1` (R9.7) and the principal checks (R9.6).
+
+**Lifecycle.**
+
+1. `open` comes before the channel's first `frame`; each direction is
+   delivered in order per channel (a gap or reorder fails the `atem-ch1`
+   counter and closes that channel only).
+2. A duplicate `open` of a live handle is ignored: it never replaces the
+   live handshake, keys or attachment.
+3. A `frame` for a handle Atem doesn't hold (never opened, closed, or of
+   an earlier link) is answered with one `close{reason:"unknown_channel"}`
+   for that handle per link generation (Atem remembers at most 1024 such
+   handles per link and sends at most 16 such closes a second; beyond
+   either it drops the frame and counts it in runtime.log). No reply ever
+   answers a `close`: a `close` from either side ends the channel at once,
+   a repeated or unknown `close` is ignored, so no close loops.
+4. Atem's `close` ends a client's channel (after its last record, e.g. a
+   refusal or a fence); the router's `close` reports that the client
+   went away. Either one fences that channel's attachment (§3: no lease
+   is carried) and releases only that channel: every other channel and
+   attachment on the link stays.
+5. Any failure of one channel (malformed envelope or frame, a failed
+   tag, replay or reorder, an exceeded bound, a handshake timeout)
+   closes that channel only.
+6. **Link loss closes every channel** on it and fences their
+   attachments. When Atem ends every channel while its socket stays up
+   (its device list was pinned again or removed, or the link is
+   re-authenticated, a new generation), it first sends `close{closed}`
+   for each live handle. A reconnect is a new link generation: clients open new
+   channels, run full handshakes and catch up authoritatively (`sessions`
+   snapshot, history pages, `receipt_query`); no lease is restored and
+   no prompt is replayed.
+7. Dispatch order on Atem: an incoming message whose `type` is
+   `channel` is demultiplexed before any other handling of the link's
+   messages. Once a device list exists (R9.3), r8 admission is refused
+   (`hello` → `unsupported_version`, `revision: 9`): neither the link
+   itself nor routing possession bypasses r9 admission.
+
+**Bounds** (each exceeded bound closes the channel, or refuses a new
+one, with a `close` naming the reason; records are never silently
+dropped and queues never grow without bound):
+
+| bound | value | exceeded |
+|---|---|---|
+| record plaintext (R9.7) | 1 048 576 bytes | the sender refuses it locally; a peer past it fails the channel |
+| inner frame (compact) | a `ct` of at most 1 398 123 base64url characters (1 MiB + the 16-byte tag): the largest legal `rec` is 1 398 159 bytes, the largest `finish` 1 398 162 | `close{reason:"too_large"}` |
+| envelope as received | 2 097 152 bytes (2 MiB); the largest legal record with a 64-character handle is 1 398 279 bytes compact | `close{reason:"too_large"}` when its first 4 KiB name its top-level `type` `channel` and `channel` (before `frame`; the message is never parsed), else dropped and logged |
+| open channels per link | 64 | the new channel: `close{reason:"busy"}` |
+| handshakes in progress per link (opened, not yet welcomed) | 16 | the new channel: `close{reason:"busy"}` |
+| bytes queued from Atem per channel (not yet taken by the link) | 4 MiB | that channel: `close{reason:"busy"}` |
+| `close`s Atem queues outside any channel (refused `open`s, `unknown_channel`, and envelopes refused unread: `busy` when the broker's inbox is full, `too_large` over the envelope bound) | 1024 queued, 16 a second together, on one clock | dropped and counted in runtime.log |
+| `init`s per link (R9.7 "per transport") | 1 a second | clear `busy` error frame, then `close{reason:"busy"}` |
+
+**Overload.** When the link takes nothing (its writer is backed up), Atem
+keeps only what the bounds above allow: each channel's queue (4 MiB, then
+that channel is closed `busy`) and the closes queued outside a channel
+(1024; more are dropped and counted, never queued). When the link takes
+again, the queued closes go first, then the channels in turn, one
+message per channel per round, each round starting with the channel the
+link last refused, so one busy channel can't hold the others back and
+none is skipped. Restarting the channels on a live socket (6 above)
+keeps the closes already queued and queues a `close{closed}` per live
+handle behind them. Each such close holds its channel's slot until the
+link takes it: while open channels plus these pending closes number 64, a
+new `open` is refused `busy` (a close outside a channel, under its bounds
+above), so however many restarts come, at most 64 of them are pending and
+at most 1024 + 64 closes are queued in all; none of them is dropped while
+the link generation lasts. A new link generation on the same socket hands
+the old generation's queued closes to the socket before anything of the
+new one; what the socket doesn't take then is dropped and counted (a
+handle is scoped to its generation, so a late close could end a new
+channel).
+
+**The router enforces the envelope bound.** The router (the relay, or
+Astation on :8080) never forwards to Atem an envelope over 2 MiB: a client
+frame that would make one is refused at the router and that client's
+channel closed there (`too_large`). Atem's link reader takes at most 4 MiB
+per WebSocket message (the 2 MiB bound plus a margin); a larger message
+ends Atem's **whole link**, every channel on it (each device reconnects),
+so a router that forwarded one would cut off every device, not just the
+sender. Between 2 and 4 MiB Atem applies the bound itself (the row above).
+
+Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
+fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
+`handshake_failed` (a clear handshake error frame was sent first),
+`expired` (the channel's lifetime ended, R9.7 "Limits").
+
+**Clients and bindings.** A client implementation holds one
+`ClientConnection` (the shared core's per-channel state) per virtual
+channel; closing it closes only its channel, never the shared link or
+another client's channel (`atem-client-bindings.md`).
+
+### R9.7b Host route proof
+
+An enrolled r9 host restores its own relay route with no Astation online
+(after a host or relay restart, a lost ephemeral directory, an expired
+room): the relay creates or holds a room for a host without its owner
+only once the host proved, against the signed device list, that it may
+hold the route. A query-string `atem_id`, the room code, an account login
+or an old pairing never creates that authority, and nothing falls back to
+them. Messages travel on the host's existing outbound link inside the
+relay envelope (`{"type":"relay",…}`); Atem opens no port.
+
+**Two carriers.** A host's relay link reaches the room one of two ways:
+
+- **(A) Owner-present room** (today's path). While the paired Astation
+  (the Mac, the room's owner) is in the room, the host joins it and
+  authenticates to that Astation as before (`auth_required` → the saved
+  session's proof, or pairing), with no route proof required. Pairing,
+  initial device verification (no pinned list yet), reconciliation of a
+  held host by a managing device (R9.3, its channel carried on the
+  Astation-authenticated link), and everything else while the Mac is
+  online use (A). The relay must not isolate or refuse a host on (A) for
+  lack of a proof; Astation's authentication is the authority there, as
+  in r8.
+- **(B) Proved host route.** Only to create or hold the room without its
+  owner (the Mac offline), and to route r9 channel traffic independently
+  of Astation's authentication: the challenge, proof and verdict below.
+  Candidate isolation until verification, the durable binding and
+  fencing (relay obligations) apply to (B) only.
+
+A held, frozen or faulted host, and a host without a pinned list,
+answers no challenge, so it only ever has carrier (A).
+
+**Wire.**
+
+1. Challenge (relay → host), on every new host connection, before
+   anything is routed over (B):
+   `{"type":"relay","op":"host_challenge","v":1,"nonce":"<b64u, 32 random bytes>","room":"<room code>"}`
+2. Proof (host → relay), at most once per challenge, only by a host with
+   a pinned device list:
+   `{"type":"relay","op":"host_route","v":1,"proof":{"body":{…},"sig":"<b64u>"}}`
+3. Verdict (relay → host), once the relay checked the proof:
+   `{"type":"relay","op":"host_route_ok","v":1,"host_id":"…","head":{"seq":n,"hash":"…"}}`
+   (the verified `host_id` and the proof's `head`) after it verified it and
+   bound the route, or
+   `{"type":"relay","op":"host_route_refused","v":1,"code":"…"}` (one of
+   the verifier's codes below), after which the relay closes the
+   connection.
+
+The body is a signed object of type `atem-host-route` (R9.1), exactly
+these fields:
+
+```
+{"type":"atem-host-route","v":1,"account_id","genesis_hash","host_id",
+ "atem_id","room","nonce","head":{"seq","hash"}}
+```
+
+`sig` is Ed25519 by the host's `host_channel_key` over
+`enc(["atem-host-route-v1", jcs(body)])`. `account_id`, `genesis_hash`
+and `host_id` are the pinned list's (`genesis_hash` lowercase hex),
+`head` the host's head when it signs, `atem_id` the one in the link's
+URL, `room` and `nonce` the challenge's (`nonce` b64u of 32 bytes).
+`account_id`, `host_id`, `atem_id` and `room` are 1 to 256 bytes; both
+messages at most 16 KiB; the body's `jcs` at most 4096 bytes (R9.1).
+
+**Verification** (shared, `atem_client::host_route::verify_host_route(log,
+proof_json, expected_nonce, expected_room, expected_atem_id) →
+HostRoute{host_id, head}`, or `verify_host_route_message` on the whole
+message; Rust only, the relay links `atem-client`). In this order, the
+first failure is the refusal code:
+
+| check | code |
+|---|---|
+| strict I-JSON, exact fields (message, `proof`, body), no duplicate keys, encodings and bounds above | `malformed` |
+| the verifier's log isn't frozen (R9.4) | `frozen` |
+| `account_id` and `genesis_hash` are the log's | `wrong_account` |
+| `host_id` is a current host (`add_host`, not removed) **at the verifier's current head** | `unknown_host` |
+| `sig` verifies with that host's **newest** `host_channel_key` at the verifier's current head | `bad_signature` |
+| `head.seq` ≤ the verifier's head (a newer head: the relay's log is behind; fetch it, then challenge again) | `stale_log` |
+| `head` is the verifier's head or an entry of its chain (same `seq`, another hash: a fork) | `fork` |
+| `nonce` equals the challenge's | `nonce_mismatch` |
+| `room` equals the relay's | `room_mismatch` |
+| `atem_id` equals the relay's | `atem_id_mismatch` |
+
+Membership and the key are always taken at the verifier's current head,
+never at the proof's `head`: a proof naming an ancestor head is accepted
+only while the host is still a current host with the same key. A host
+removed after that head is `unknown_host`; a host whose key was replaced
+(a later `add_host` of the same `host_id`) is `bad_signature` for a
+proof signed with the old key.
+
+**Relay obligations** (Astation; `r9-host-routing-lifecycle.md`):
+
+- The challenge must be reachable even when the ephemeral room is
+  absent (after a sweep, a restart with a fresh directory): an enrolled
+  host's connection is accepted and challenged, never answered 404.
+- (B) only: keep the candidate socket isolated from proved-route
+  traffic until its proof verifies against the relay's current durable
+  log: nothing is routed to or from it over (B) before, and it never
+  replaces the incumbent (B) route before verification. This never
+  isolates a host on carrier (A): the room's owner present, its
+  `auth_required` and the host's authentication flow as before.
+- Keep a durable binding `(genesis_hash, host_id) → room/atem_id`.
+  Persist it, and fence the replaced connection across replicas, before
+  the new route is exposed; a newly verified proof replaces and fences
+  the older connection before any routed effect.
+- When the log removes or replaces the host, drop the binding and close
+  the connection. A bound live route survives presence sweeps; empty
+  pairing rooms keep their bounded lifetime.
+- Fresh connections and channels after every recovery; nothing is
+  replayed (ciphertext, leases, uncertain submissions).
+- Without a valid proof an r9 host gets no route of its own (B): no room
+  created or held for it without its owner, and no r9 traffic routed to
+  it except over (A) while the owner is present and authenticated it.
+  There is no other fallback.
+- `type:"relay"` messages (`host_challenge`, `host_route`, the verdicts,
+  push) are relay-originated or relay-consumed only: never forwarded
+  between room members (a peer's `host_challenge` reaching the host, or
+  the host's `host_route` reaching a peer, would make the host a signing
+  oracle for another connection's nonce).
+- The verdict may be sent before or after the relay exposes the host to
+  the room's owner (Astation's `auth_required`); the host handles both
+  orders (below).
+
+**Ordering.** A valid `host_route_ok` counts whichever order it arrives
+in relative to Astation's `auth_required` and its auth replies on the
+same link. Verdict first: the link is routed, and a later
+`auth_required` authenticates it as below. `auth_required` first: the
+host answers it as on any link and records a valid verdict that arrives
+while it waits for Astation's reply (never consumed and ignored); once
+the verdict is recorded the link is routed and Astation's reply finishes
+that authentication as on a link routed first: a grant makes it an
+authenticated Astation link, a denial, an expiry or no reply within the
+bound leaves it routed (the held-link rule below: advice surfaced, no
+reconnect until the next `auth_required`, backoff unchanged). If
+Astation's reply fails before the verdict arrived and this link's proof
+went out, the host waits for the verdict up to 10 s more and is routed
+on an `ok`. The verdict rules are unchanged: only after this link's
+proof, only the first one.
+
+**The held link.** The verdict sustains the r9 carrier only. On
+`host_route_ok` (strictly parsed; its `host_id` this host's and its `head`
+the host's applied head or an ancestor; sent after this link's own proof)
+a host with a pinned list whose link no Astation authenticated keeps the
+link **routed**: no 10 s wait for `auth_required`, no 30 s retry loop. A
+routed link carries channel envelopes (R9.7a; every channel admitted by
+`atem-ch1` and R9.6/R9.8 as always, identity never inferred from the
+route) and push relay messages (`push_hint`, `push_seen`, `push_ack`,
+R9.9), nothing else: r8 session-family messages are dropped unanswered, no Astation
+operation (pair, pair verify, cred unlock/projects, the token refresh)
+runs on it, no `credentialSync` or encryption message is applied, no mark
+task is taken or reported. Astation's `auth_required` on the same link is
+answered with the connect path's semantics (the pairing's saved session,
+pinned to the pairing's Astation = the room; a granted session is saved;
+the connect path's session advice and its 300 s completion bound); the
+r9 carrier runs on meanwhile. Once accepted, the link is an authenticated
+Astation link (a new link generation: the channels opened while it was
+routed are closed, clients connect again). If Astation denies or expires
+the session, or doesn't finish in time, the link **stays routed** (an
+Astation-only reason never drops the r9 carrier): the session advice
+("expired or was refused …") goes to runtime.log, the notices and any
+waiting Astation operation, and nothing is retried until Astation sends
+another `auth_required`. A routed link that drops within 10 s of its
+verdict or of a failed Astation authentication reconnects after the usual
+30 s, never at once (no connect/prove/close loop). A verdict counts only for this link's own proof,
+once: a `host_route_ok` or `host_route_refused` that is malformed,
+unsolicited (no proof sent on this link, e.g. a late one on a retried
+link, or any on a host without a list), a second one, an `ok` for another
+host or for a head the host doesn't hold is ignored with a log line and
+holds or drops nothing. A valid `host_route_refused`, a closed socket, or
+neither Astation's
+`auth_required` nor a valid `host_route_ok` within 10 s: dropped and
+retried as before. A new link (a new route) fences the old one's channels
+as any link loss does. `atem status` shows `Authorization: r9 routed (no
+Astation)` and `Relay: routed via relay (<relay host> as <atem_id>; no
+Astation)`; runtime.log gets one line per verdict (`host_route ok at head
+N`, `host_route refused: <code>`).
+
+**The host (Atem).** The runtime's relay identity link
+(`/ws?role=atem&code=<room>&atem_id=<atem_id>`) answers the challenge in
+its reader as it arrives, before and independent of Astation's
+authentication, signed at the device list's current head for the link's
+own room and `atem_id`. It answers only with a pinned list that can
+serve: not held, frozen or faulted, the session journal not halted, the
+host key loaded; a challenge that arrives while the broker is still
+opening its list waits for it (at most 5 s). Exactly one challenge is
+answered per link, and only before the link is routed or authenticated by
+Astation; a later one is ignored and logged, as is a malformed one, one naming another room than
+the link's, or any challenge on a host without a list is ignored, with
+one bounded runtime.log line and never its content. The challenge is
+authority for nothing else and is never passed on. A relay that sends no
+challenge changes nothing. A local (loopback/LAN) link never answers.
+
+A held, frozen or faulted host answers no challenge, so it proves no
+route and only has carrier (A): reconciling a held host (R9.3, a
+managing device's `hello` in a channel) runs over its relay link once
+the Mac in the room authenticated it, which the relay never blocks for
+lack of a proof. The same holds for pairing and the first device
+verification (no pinned list yet).
+
+**After enrollment or reconciliation the host reconnects once to prove
+its route.** The link that carried the pairing, first verification or
+reconciliation answered no challenge (the list was unpinned or held when
+it connected), and a link answers only one challenge, at connect. So
+when the host becomes able to answer (its list pinned, or a held list
+reconciled) and its current relay link sent no proof and got no
+`host_route_ok` (the link `atem pair` itself opened and installed counts:
+it never answers a challenge), the runtime drops that link once and
+reconnects at once:
+the new link gets the relay's challenge, proves its route and is routed
+over (B), and the Mac, if still in the room, authenticates it as usual
+(the ordering rules above). This waits until no Astation operation runs
+(`atem pair`, `atem pair verify` and `atem cred unlock` are never cut
+off), no connect or re-authentication is under way, no session-family
+request is waiting, no r9 channel is mid-admission (at most 30 s, then
+it reconnects anyway, logged), and the link's channel envelopes went out
+(at most 5 s; e.g. the welcome of the managing device whose channel
+reconciled the list, whose channel then closes with the link and is
+reopened on the new one). When it fires, the host must still be able to
+answer a challenge; if the list was held, frozen or faulted meanwhile,
+or its key is gone, the reconnect is dropped (logged once). runtime.log:
+`relay link reconnecting to prove its route`. At most one reconnect per pin or reconciliation, and
+no loop: a new link that still gets no challenge stays as it is. A local
+(loopback/LAN) link, which never sees a challenge, never reconnects for
+this. No wire change.
+
+Vectors: `r9-vectors-host-route` (proofs at the head, at an ancestor, on
+a verifier ahead, after a key rotation; refused: extra fields in the
+body, message and proof, a short nonce, `head.seq` 0, duplicate keys,
+another account, another genesis, an unknown host, another host's key, a
+tampered field, `stale_log`, `fork`, each mismatch, a removed host and a
+replaced key, also for a proof at an ancestor head; `relay_replies`:
+`host_route_ok` and `host_route_refused`, and malformed ones).
 
 ### R9.8 r9 hello, welcome and new session ops
 
@@ -2824,6 +3230,35 @@ approval's `expires_at + 300 000` passes. A broker restart ends the
 approvals (§G) and with them the resends; the relay's own guard (below)
 bounds what it still sends.
 
+Every relay message on Atem's link, in either direction, is at most
+262 144 bytes (256 KiB) as sent: Atem splits the hints due together over
+several `push_hint` messages (one hint, about 0.8–1.5 KiB, always fits),
+and the relay splits its acknowledgments over several `push_ack`
+messages (about 340 bytes an identity). Atem drops a larger relay
+message unread (counted in its log); what it would have acknowledged is
+resent and acknowledged again.
+
+What Atem keeps for delivery is bounded, and a bound never cuts a
+lifecycle the relay may already hold: once an approval's open hints were
+handed to the link, Atem keeps them while the approval is pending, and
+its resolved hint until the relay acknowledges it (or `expires_at +
+300 000` passes). So, within one runtime and while push isn't
+suppressed, every published approval gets its cancellation. The
+exceptions, where Atem drops every unacknowledged hint and seen,
+published lifecycles included, and sends no resolved hint for them:
+push is suppressed (the device list is held, frozen, faulted or failed
+to open, §R9.3, or the journal halted, §I); the device list is pinned
+again or removed (a re-pin or an unpair: the hints belong to the old
+identity); a broker restart (above). In each case the relay's own guard (below) bounds what
+it still sends: an open hint whose cancellation never comes can still
+escalate to a push until the guard (`expires_at − margin`). To
+make room Atem only forgets an approval with nothing left to send, then
+one whose opens were never published. When every tracked approval holds
+a published lifecycle, a **new** approval gets no push hint at all (Atem
+logs it, without content); it is still an approval like any other:
+`approval_request` to attached clients with `control`, answerable over
+the channel. Atem's bound is at least 64 approvals.
+
 **Clients:** a notification extension that can't use the device's
 `enc_key` while the screen is locked shows a generic "Atem on <host>
 needs approval" and the app reconnects; there is no separate push key
@@ -2846,6 +3281,15 @@ acknowledged), then signs and sends `{"type":"relay","op":"push_seen","seen":
  "approval_id":"<uuid>","session_id":"ses-…","process_gen":"<uuid>","created_at":1793264405000,
  "device_id":"dev-phone","seen_at":1793264425000}
 ```
+
+Atem signs a seen only for a device that is a recipient of the
+approval's open hints (a native member with `control` at its head). A
+service with `approval` (or a browser grant) may send `approval_seen`
+under the same checks and is answered `seen`, but nothing is signed or
+sent: it is never a hint recipient, so its seen could only wait as
+pending at the relay, taking room from real devices' seens (the 256 per
+account below). The relay never gets a `push_seen` naming a service or
+grant.
 
 Host-signed, so seen needs no manager biometric: the host authenticated
 the device over `atem-ch1` at its current head. The relay checks the
@@ -2925,9 +3369,10 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
+| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9` |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
+| relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused`) |
 
 ### R9.12 Fixtures
 
@@ -2936,7 +3381,8 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
-`r9-vectors-browser-grant`, `r9-vectors-push-hint`. Scenarios
+`r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
+`r9-vectors-host-route`. Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,
@@ -2976,7 +3422,9 @@ expiry, browser grant, push hints (sign and verify,
 `seen-after-resolution-reopens-nothing`,
 `seen-lost-delivery-is-retried-until-acked`), and the multi-device set
 (Mac and phone online, Mac off, takeover, approval while another holds
-the lease).
+the lease), and the channel envelope (R9.7a): `r9-envelope-vectors`,
+`r9-envelope-several-channels`, `r9-envelope-unknown-and-duplicate`,
+`r9-envelope-link-loss`, `r9-envelope-bounds`.
 
 ### R9.13 Open questions for Astation
 

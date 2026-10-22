@@ -8,17 +8,17 @@ use std::path::Path;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+use crate::memory::cred_agent::{CredAgentApi, LOCKED};
 use crate::memory::crypto::EncryptionMode;
 use crate::memory::device_keys::{DeviceKeys, DevicePublics, PublicKeys, UnlockAuthKey};
 use crate::memory::encoding::{base32_prefix, dec, enc};
 use crate::memory::grant::{GrantWire, open_grant};
-use crate::memory::cred_agent::{CredAgentApi, LOCKED};
-use crate::paths::CredPaths;
 use crate::memory::statements::{AccountState, SignedWire};
 use crate::memory::storage_key::{
     SealedDeviceKeys, StorageRotation, new_storage_key, new_storage_kid,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
+use crate::paths::CredPaths;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AstationKeys {
@@ -27,6 +27,9 @@ pub struct AstationKeys {
     pub enc_pub: [u8; 32],
     pub recovery_sign_pub: [u8; 32],
     pub nonce_s: [u8; 32],
+    /// r9 (§R9.2 "Pairing"): the genesis of the account's device list,
+    /// which the safety code covers and the pinned log must start from.
+    pub genesis_hash: [u8; 32],
 }
 
 fn decode_exact<const N: usize>(value: &str, what: &str) -> Result<[u8; N]> {
@@ -38,11 +41,14 @@ fn decode_exact<const N: usize>(value: &str, what: &str) -> Result<[u8; N]> {
 }
 
 impl AstationKeys {
+    /// `verifyKeys`: keys and nonce in base64, `genesis_hash` in lowercase
+    /// hex (§R9.1: hashes are hex).
     pub fn from_wire(
         sign_pub: &str,
         enc_pub: &str,
         recovery_sign_pub: &str,
         nonce: &str,
+        genesis_hash: &str,
     ) -> Result<Self> {
         let sign_pub = STANDARD
             .decode(sign_pub)
@@ -61,6 +67,9 @@ impl AstationKeys {
             enc_pub: decode_exact(enc_pub, "Astation encryption key")?,
             recovery_sign_pub: decode_exact(recovery_sign_pub, "recovery signing key")?,
             nonce_s: decode_exact(nonce, "Astation nonce")?,
+            genesis_hash: atem_client::encoding::Hash32::from_hex(genesis_hash)
+                .map_err(|_| anyhow!("the genesis hash must be 64 lowercase hex characters"))?
+                .0,
         })
     }
 }
@@ -70,29 +79,42 @@ pub struct Reveal {
     pub device_pub: [u8; 32],
     pub device_sign_pub: [u8; 32],
     pub unlock_auth_pub: [u8; 32],
+    /// r9: the Ed25519 `host_channel_key` this pairing creates (§R9.6),
+    /// revealed in `verifyReveal` and inside the commitment.
+    pub host_channel_pub: [u8; 32],
     pub nonce_a: [u8; 32],
 }
 
+/// `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub,
+/// unlock_auth_pub, host_channel_pub, nonce_a))`: r9 puts the host channel
+/// key inside the commitment (§R9.2 "Pairing"); the label is unchanged.
 pub fn commitment_for(reveal: &Reveal) -> [u8; 32] {
     Sha256::digest(enc(&[
         b"atem-verify-commit-v1",
         &reveal.device_pub,
         &reveal.device_sign_pub,
         &reveal.unlock_auth_pub,
+        &reveal.host_channel_pub,
         &reveal.nonce_a,
     ]))
     .into()
 }
 
+/// §R9.2: `base32(SHA-256(enc(["atem-safety-code-v2", device_pub,
+/// device_sign_pub, unlock_auth_pub, host_channel_pub, astation_sign_pub,
+/// astation_enc_pub, recovery_sign_pub, genesis_hash, nonce_a,
+/// nonce_s])))[:12]`, shown as three groups of four.
 pub fn safety_code(reveal: &Reveal, astation: &AstationKeys) -> String {
     let digest = Sha256::digest(enc(&[
-        b"atem-safety-code-v1",
+        atem_client::domain::SAFETY_CODE.as_bytes(),
         &reveal.device_pub,
         &reveal.device_sign_pub,
         &reveal.unlock_auth_pub,
+        &reveal.host_channel_pub,
         &astation.sign_pub,
         &astation.enc_pub,
         &astation.recovery_sign_pub,
+        &astation.genesis_hash,
         &reveal.nonce_a,
         &astation.nonce_s,
     ]));
@@ -151,16 +173,29 @@ impl PublicKeys for VerificationKeys {
 pub struct Handshake {
     keys: VerificationKeys,
     nonce_a: [u8; 32],
+    /// A fresh `host_channel_key` seed per pairing (r9: "unpair rotates
+    /// it"); written to disk only when the device list is pinned.
+    host_channel_seed: zeroize::Zeroizing<[u8; 32]>,
 }
 
 impl Handshake {
     pub fn start(keys: impl Into<VerificationKeys>) -> Self {
         let mut nonce_a = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce_a);
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(seed.as_mut());
         Self {
             keys: keys.into(),
             nonce_a,
+            host_channel_seed: seed,
         }
+    }
+
+    /// The host channel key's public half.
+    pub fn host_channel_pub(&self) -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&self.host_channel_seed)
+            .verifying_key()
+            .to_bytes()
     }
 
     pub fn reveal(&self) -> Reveal {
@@ -168,6 +203,7 @@ impl Handshake {
             device_pub: self.keys.device_pub(),
             device_sign_pub: self.keys.device_sign_pub(),
             unlock_auth_pub: self.keys.unlock_auth_pub(),
+            host_channel_pub: self.host_channel_pub(),
             nonce_a: self.nonce_a,
         }
     }
@@ -188,8 +224,14 @@ impl Handshake {
         &self.keys
     }
 
+    #[cfg(test)]
     pub fn into_keys(self) -> VerificationKeys {
         self.keys
+    }
+
+    /// The keys, and the host channel key's seed.
+    pub fn into_parts(self) -> (VerificationKeys, zeroize::Zeroizing<[u8; 32]>) {
+        (self.keys, self.host_channel_seed)
     }
 }
 
@@ -227,7 +269,10 @@ pub fn apply_account_state(
     }
     let Some(state) = trust.accept_account_state(astation_id, signed)? else {
         if let Some(state) = stored_state(trust.verified(astation_id).unwrap())?
-            && matches!(state.mode, EncryptionMode::Enabling | EncryptionMode::Disabling)
+            && matches!(
+                state.mode,
+                EncryptionMode::Enabling | EncryptionMode::Disabling
+            )
         {
             return Ok(Applied::MigrationPending(state));
         }
@@ -286,7 +331,9 @@ pub(crate) fn newest_states(
         // Entries come in Astation id order: strictly newer replaces, so the
         // smallest id keeps an equal epoch.
         if let Some(state) = state
-            && slot.as_ref().is_none_or(|current| state.epoch > current.epoch)
+            && slot
+                .as_ref()
+                .is_none_or(|current| state.epoch > current.epoch)
         {
             *slot = Some(state);
         }
@@ -459,7 +506,9 @@ pub fn complete_verification(
     let granted_kids = grants
         .iter()
         .map(|grant| match &keys {
-            VerificationKeys::Fresh(fresh) => open_grant(&entry, fresh, grant).map(|opened| opened.kid),
+            VerificationKeys::Fresh(fresh) => {
+                open_grant(&entry, fresh, grant).map(|opened| opened.kid)
+            }
             // The staged pins: they aren't saved until everything holds.
             VerificationKeys::Sealed(_) => agent.check_grant(grant, &entry),
         })
@@ -502,8 +551,10 @@ pub fn complete_verification(
         let first = current.verified(astation_id).is_none();
         // Accounts the Astations verified before this one name: what is
         // stored for them may be theirs, so a first verification keeps it.
-        let named_elsewhere: std::collections::BTreeSet<String> =
-            current.verified_entries().map(|entry| entry.data_account.clone()).collect();
+        let named_elsewhere: std::collections::BTreeSet<String> = current
+            .verified_entries()
+            .map(|entry| entry.data_account.clone())
+            .collect();
         current.confirm_since(astation_id, device_verified, checked_epoch)?;
         let newer = current
             .verified(astation_id)
@@ -526,7 +577,10 @@ pub fn complete_verification(
             // names that account. Lock order: cred/state.json's lock (held)
             // before project_names.lock.
             if !named_elsewhere.contains(&state.account) {
-                crate::memory::project_names::forget_account_at(&paths.project_names, &state.account)?;
+                crate::memory::project_names::forget_account_at(
+                    &paths.project_names,
+                    &state.account,
+                )?;
             }
         }
         current.save_to(&paths.trust)?;
@@ -537,19 +591,20 @@ pub fn complete_verification(
     let install_kid = match write() {
         Ok(kid) => kid,
         Err(error) => {
-            if let (Some((written, unlock_auth)), VerificationKeys::Fresh(fresh)) = (&sealed, &keys) {
+            if let (Some((written, unlock_auth)), VerificationKeys::Fresh(fresh)) = (&sealed, &keys)
+            {
                 // Undo the fresh keys entirely: no sealed file without its
                 // verification, and no agent holding keys that aren't on disk.
                 // Only files this call wrote go: a concurrent pairing run's stay.
                 // With the files gone the agent accepts the lock.
-                if SealedDeviceKeys::load_from(&paths.device_keys_sealed)
-                    .is_ok_and(|file| file.is_some_and(|file| file.storage_kid == written.storage_kid))
-                {
+                if SealedDeviceKeys::load_from(&paths.device_keys_sealed).is_ok_and(|file| {
+                    file.is_some_and(|file| file.storage_kid == written.storage_kid)
+                }) {
                     let _ = remove_if_exists(&paths.device_keys_sealed);
                 }
-                if UnlockAuthKey::load_from(&paths.unlock_auth_key)
-                    .is_ok_and(|file| file.is_some_and(|file| file.public() == unlock_auth.public()))
-                {
+                if UnlockAuthKey::load_from(&paths.unlock_auth_key).is_ok_and(|file| {
+                    file.is_some_and(|file| file.public() == unlock_auth.public())
+                }) {
                     let _ = remove_if_exists(&paths.unlock_auth_key);
                 }
                 if DeviceKeys::load_from(&paths.device_keys).is_ok_and(|file| {
@@ -705,11 +760,21 @@ pub fn set_aside_revoked_keys(
         moved.push(name.into_owned());
     }
     let revoked = TrustStore::update(&paths.trust, |store| Ok(store.forget_revoked_keys()))?;
-    let by = revoked.map_or_else(String::new, |revoked| format!(" by Astation {}", revoked.astation_id));
-    let dir = paths.trust.parent().map(|dir| dir.display().to_string()).unwrap_or_default();
+    let by = revoked.map_or_else(String::new, |revoked| {
+        format!(" by Astation {}", revoked.astation_id)
+    });
+    let dir = paths
+        .trust
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
     Ok(Some(format!(
         "This device was revoked{by}: its old keys were moved aside ({} renamed to *.revoked-{stamp} in {dir}); the next `atem pair` verifies it with new keys.",
-        if moved.is_empty() { "no key files".to_string() } else { moved.join(", ") }
+        if moved.is_empty() {
+            "no key files".to_string()
+        } else {
+            moved.join(", ")
+        }
     )))
 }
 
@@ -752,6 +817,7 @@ mod tests {
             enc_pub: [5; 32],
             recovery_sign_pub: [6; 32],
             nonce_s: [7; 32],
+            genesis_hash: [8; 32],
         }
     }
 
@@ -799,6 +865,19 @@ mod tests {
         let mut nonce = astation();
         nonce.nonce_s = [8; 32];
         assert_ne!(code, handshake.safety_code(&nonce));
+        // r9: the genesis and the host channel key are covered too.
+        let mut genesis = astation();
+        genesis.genesis_hash = [9; 32];
+        assert_ne!(code, handshake.safety_code(&genesis));
+        let mut reveal = handshake.reveal();
+        let before = safety_code(&reveal, &astation());
+        reveal.host_channel_pub = [1; 32];
+        assert_ne!(before, safety_code(&reveal, &astation()));
+        assert_ne!(
+            commitment_for(&handshake.reveal()),
+            commitment_for(&reveal),
+            "the host channel key is inside the commitment"
+        );
     }
 
     #[test]
@@ -809,16 +888,33 @@ mod tests {
             &STANDARD.encode([5u8; 32]),
             &STANDARD.encode([6u8; 32]),
             &STANDARD.encode([7u8; 32]),
+            &"ab".repeat(32),
         )
         .unwrap();
         assert_eq!(keys.enc_pub, [5; 32]);
-        assert!(AstationKeys::from_wire("", &STANDARD.encode([5u8; 31]), "", "").is_err());
+        assert_eq!(keys.genesis_hash, [0xab; 32]);
+        assert!(AstationKeys::from_wire("", &STANDARD.encode([5u8; 31]), "", "", "").is_err());
+        // The genesis is 64 lowercase hex characters.
+        for bad in ["AB".repeat(32), "ab".repeat(31), String::new()] {
+            assert!(
+                AstationKeys::from_wire(
+                    &STANDARD.encode(FakeAstation::new().sign_pub()),
+                    &STANDARD.encode([5u8; 32]),
+                    &STANDARD.encode([6u8; 32]),
+                    &STANDARD.encode([7u8; 32]),
+                    &bad,
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
         let rest = |sign_pub: &[u8]| {
             AstationKeys::from_wire(
                 &STANDARD.encode(sign_pub),
                 &STANDARD.encode([5u8; 32]),
                 &STANDARD.encode([6u8; 32]),
                 &STANDARD.encode([7u8; 32]),
+                &"ab".repeat(32),
             )
         };
         // 65 bytes but not a point on the curve.
@@ -830,9 +926,9 @@ mod tests {
         assert!(rest(key.to_encoded_point(true).as_bytes()).is_err());
     }
 
+    use crate::memory::cred_agent::{CredAgent, holds_k, test_agent};
     use crate::memory::crypto::EncryptionMode;
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::cred_agent::{CredAgent, holds_k, test_agent};
     use crate::memory::statements::{AccountState, DeviceVerified, FakeAstation};
     use crate::memory::trust::TrustStore;
 
@@ -860,7 +956,12 @@ mod tests {
     fn verify(
         dir: &std::path::Path,
         mode: EncryptionMode,
-    ) -> (CredPaths, std::sync::Mutex<CredAgent>, FakeAstation, [u8; 32]) {
+    ) -> (
+        CredPaths,
+        std::sync::Mutex<CredAgent>,
+        FakeAstation,
+        [u8; 32],
+    ) {
         let paths = CredPaths::in_dir(dir);
         let agent = test_agent(&paths);
         let fake = FakeAstation::new();
@@ -870,6 +971,7 @@ mod tests {
             enc_pub: [5; 32],
             recovery_sign_pub: [6; 32],
             nonce_s: [7; 32],
+            genesis_hash: [3; 32],
         };
         let code = handshake.safety_code(&astation);
         let transcript = handshake.transcript(&astation);
@@ -963,14 +1065,20 @@ mod tests {
             .replace("\"account_state\": {", "\"account_state_was\": {");
         crate::paths::write_test_file(&paths.trust, raw);
         let error = format!("{:#}", account_mode(&paths.trust, ASTATION_ID).unwrap_err());
-        assert!(error.contains("waiting for Astation's signed encryption state"), "{error}");
+        assert!(
+            error.contains("waiting for Astation's signed encryption state"),
+            "{error}"
+        );
     }
 
     #[test]
     fn verification_installs_signed_state_and_key() {
         let dir = tempfile::tempdir().unwrap();
         let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::On);
-        assert_eq!(account_mode(&paths.trust, ASTATION_ID).unwrap().mode, EncryptionMode::On);
+        assert_eq!(
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
+            EncryptionMode::On
+        );
         assert!(holds_k(&agent, ASTATION_ID));
         assert!(
             paths.device_keys.exists(),
@@ -1107,10 +1215,10 @@ mod tests {
 #[cfg(test)]
 mod ceremony_tests {
     use super::*;
+    use crate::memory::cred_agent::{error_of, holds_k, test_agent};
     use crate::memory::crypto::EncryptionMode;
     use crate::memory::fake_astation::FakeKeyServer;
     use crate::memory::grant::seal_k_grant;
-    use crate::memory::cred_agent::{error_of, holds_k, test_agent};
     use crate::memory::statements::{DeviceVerified, FakeAstation, StorageRotate, verify_device};
 
     const ASTATION_ID: &str = "astation-1";
@@ -1148,6 +1256,7 @@ mod ceremony_tests {
             enc_pub: fake.enc_pub(),
             recovery_sign_pub: [6; 32],
             nonce_s: [nonce_s; 32],
+            genesis_hash: [3; 32],
         };
         let code = handshake.safety_code(&astation);
         let transcript = handshake.transcript(&astation);
@@ -1216,7 +1325,10 @@ mod ceremony_tests {
         );
         assert!(result.is_err(), "a replayed certificate must be rejected");
 
-        assert_eq!(account_mode(&paths.trust, ASTATION_ID).unwrap().mode, EncryptionMode::On);
+        assert_eq!(
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
+            EncryptionMode::On
+        );
         assert!(holds_k(&agent, ASTATION_ID), "K must survive");
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert_eq!(trust.verified(ASTATION_ID).unwrap().account_epoch, 2);
@@ -1259,7 +1371,10 @@ mod ceremony_tests {
         )
         .unwrap();
 
-        assert_eq!(account_mode(&paths.trust, ASTATION_ID).unwrap().mode, EncryptionMode::On);
+        assert_eq!(
+            account_mode(&paths.trust, ASTATION_ID).unwrap().mode,
+            EncryptionMode::On
+        );
         assert!(holds_k(&agent, ASTATION_ID), "K must survive");
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         let entry = trust.verified(ASTATION_ID).unwrap();
@@ -1281,7 +1396,10 @@ mod ceremony_tests {
             !paths.unlock_auth_key.exists(),
             "unlock_auth_key must not be written"
         );
-        assert!(!paths.project_names.exists(), "project_names.json must not be written");
+        assert!(
+            !paths.project_names.exists(),
+            "project_names.json must not be written"
+        );
     }
 
     /// Runs a first verification with certificate epoch `cert_epoch`, the
@@ -1408,13 +1526,29 @@ mod ceremony_tests {
         let dir = tempfile::tempdir().unwrap();
         // A project name stored for the account before any Astation
         // verified it: not trusted, dropped by the first verification.
-        let (paths, result) = first_verification_with(dir.path(), 1, |paths| {
-            crate::memory::project_names::remember(&paths.project_names, "acct", [("h1.11112222.aa".to_string(), "github.com/agora/atem".to_string())]).unwrap();
-        }, |fake, _| {
-            (state(fake, EncryptionMode::On, Some("89abcdef"), 2), vec![])
-        });
+        let (paths, result) = first_verification_with(
+            dir.path(),
+            1,
+            |paths| {
+                crate::memory::project_names::remember(
+                    &paths.project_names,
+                    "acct",
+                    [(
+                        "h1.11112222.aa".to_string(),
+                        "github.com/agora/atem".to_string(),
+                    )],
+                )
+                .unwrap();
+            },
+            |fake, _| (state(fake, EncryptionMode::On, Some("89abcdef"), 2), vec![]),
+        );
         result.unwrap();
-        assert_eq!(crate::memory::project_names::ProjectNames::load_from(&paths.project_names).unwrap().len("acct"), 0);
+        assert_eq!(
+            crate::memory::project_names::ProjectNames::load_from(&paths.project_names)
+                .unwrap()
+                .len("acct"),
+            0
+        );
     }
 
     #[test]
@@ -1443,7 +1577,10 @@ mod ceremony_tests {
         assert!(!result.unwrap().key_needed);
         let empty = tempfile::tempdir().unwrap();
         let locked = test_agent(&CredPaths::in_dir(empty.path()));
-        assert!(!key_needed(&paths, &locked, ASTATION_ID).unwrap(), "off needs no K");
+        assert!(
+            !key_needed(&paths, &locked, ASTATION_ID).unwrap(),
+            "off needs no K"
+        );
         assert!(!key_needed(&paths, &locked, "never-verified").unwrap());
     }
 
@@ -1579,7 +1716,11 @@ mod ceremony_tests {
         // The plain file holds exactly the verified keys, 0600.
         let plain = DeviceKeys::load_from(&paths.device_keys).unwrap().unwrap();
         assert_eq!(
-            (plain.device_pub(), plain.device_sign_pub(), plain.unlock_auth_pub()),
+            (
+                plain.device_pub(),
+                plain.device_sign_pub(),
+                plain.unlock_auth_pub()
+            ),
             (
                 certificate.device_pub,
                 certificate.device_sign_pub,
@@ -1711,7 +1852,9 @@ mod ceremony_tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|file| {
                 file.strip_prefix(&format!("{name}.revoked-"))
-                    .is_some_and(|stamp| !stamp.is_empty() && stamp.chars().all(|c| c.is_ascii_digit()))
+                    .is_some_and(|stamp| {
+                        !stamp.is_empty() && stamp.chars().all(|c| c.is_ascii_digit())
+                    })
             })
             .collect()
     }
@@ -1727,7 +1870,11 @@ mod ceremony_tests {
         escrow_first(&agent, &fake, &certificate, outcome);
         let sealed_before = std::fs::read(&paths.device_keys_sealed).unwrap();
         // Leftovers of a rotation and a plain file: all set aside too.
-        for path in [&paths.device_keys_next, &paths.device_keys_prev, &paths.device_keys] {
+        for path in [
+            &paths.device_keys_next,
+            &paths.device_keys_prev,
+            &paths.device_keys,
+        ] {
             std::fs::write(path, b"old").unwrap();
         }
         crate::paths::write_test_file(&paths.project_names, b"{}");
@@ -1756,9 +1903,18 @@ mod ceremony_tests {
             let aside = set_aside(&paths.dir, name);
             assert_eq!(aside.len(), 1, "{name}: {aside:?}");
         }
-        let name = paths.device_keys_sealed.file_name().unwrap().to_str().unwrap();
+        let name = paths
+            .device_keys_sealed
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
         let aside = set_aside(&paths.dir, name);
-        assert_eq!(std::fs::read(paths.dir.join(&aside[0])).unwrap(), sealed_before, "renamed, not rewritten");
+        assert_eq!(
+            std::fs::read(paths.dir.join(&aside[0])).unwrap(),
+            sealed_before,
+            "renamed, not rewritten"
+        );
         assert_eq!(std::fs::read(&paths.project_names).unwrap(), b"{}");
         let trust = TrustStore::load_from(&paths.trust).unwrap();
         assert!(trust.verified(ASTATION_ID).is_none());
@@ -1825,7 +1981,12 @@ mod ceremony_tests {
             VerificationKeys::Sealed(_)
         ));
         assert!(paths.device_keys_sealed.exists());
-        assert!(TrustStore::load_from(&paths.trust).unwrap().verified(ASTATION_ID).is_some());
+        assert!(
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .verified(ASTATION_ID)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1844,6 +2005,7 @@ mod ceremony_tests {
             enc_pub: [5; 32],
             recovery_sign_pub: [6; 32],
             nonce_s: [9; 32],
+            genesis_hash: [3; 32],
         };
         let transcript = handshake.transcript(&astation);
         let mut trust = TrustStore::load_from(&paths.trust).unwrap();
@@ -1903,7 +2065,12 @@ mod ceremony_tests {
         let fake = FakeAstation::new();
         verified_device(&paths, &agent, &fake, EncryptionMode::Off, None);
         // Names of "acct", which astation-1 (verified) names.
-        crate::memory::project_names::remember(&paths.project_names, "acct", [("h1.0123abcd.aa".to_string(), "p".to_string())]).unwrap();
+        crate::memory::project_names::remember(
+            &paths.project_names,
+            "acct",
+            [("h1.0123abcd.aa".to_string(), "p".to_string())],
+        )
+        .unwrap();
 
         let other = FakeAstation::new();
         let handshake = Handshake::start(device_keys_for_verification(&paths, &agent).unwrap());
@@ -1912,10 +2079,18 @@ mod ceremony_tests {
             enc_pub: [5; 32],
             recovery_sign_pub: [6; 32],
             nonce_s: [9; 32],
+            genesis_hash: [3; 32],
         };
         let transcript = handshake.transcript(&astation);
         let mut trust = TrustStore::load_from(&paths.trust).unwrap();
-        trust.set_pending("astation-2", "dev-1", handshake.keys(), &astation, &handshake.safety_code(&astation), &transcript);
+        trust.set_pending(
+            "astation-2",
+            "dev-1",
+            handshake.keys(),
+            &astation,
+            &handshake.safety_code(&astation),
+            &transcript,
+        );
         trust.save_to(&paths.trust).unwrap();
         let reveal = handshake.reveal();
         let second = DeviceVerified {
@@ -1938,7 +2113,13 @@ mod ceremony_tests {
             &[],
         )
         .unwrap();
-        assert_eq!(crate::memory::project_names::ProjectNames::load_from(&paths.project_names).unwrap().len("acct"), 1, "astation-1 still names it");
+        assert_eq!(
+            crate::memory::project_names::ProjectNames::load_from(&paths.project_names)
+                .unwrap()
+                .len("acct"),
+            1,
+            "astation-1 still names it"
+        );
     }
 
     #[test]
@@ -2040,7 +2221,10 @@ mod ceremony_tests {
 
     /// A first verification (state on, kid 0123abcd, its grant) through
     /// `agent`.
-    fn verify_on_with_grant(paths: &CredPaths, agent: &dyn CredAgentApi) -> Result<VerificationOutcome> {
+    fn verify_on_with_grant(
+        paths: &CredPaths,
+        agent: &dyn CredAgentApi,
+    ) -> Result<VerificationOutcome> {
         let fake = FakeAstation::new();
         let (handshake, certificate) = start(paths, &fake, DeviceKeys::generate(), 7, 1);
         let grant = seal_k_grant(
@@ -2073,9 +2257,17 @@ mod ceremony_tests {
         };
         let outcome = verify_on_with_grant(&paths, &agent).expect("the verification is saved");
         let warning = outcome.warning.expect("a warning");
-        assert!(warning.contains("couldn't be stored in the cred agent"), "{warning}");
+        assert!(
+            warning.contains("couldn't be stored in the cred agent"),
+            "{warning}"
+        );
         assert!(outcome.key_needed, "K is asked for again");
-        assert!(TrustStore::load_from(&paths.trust).unwrap().verified(ASTATION_ID).is_some());
+        assert!(
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .verified(ASTATION_ID)
+                .is_some()
+        );
         assert!(!holds_k(&agent.agent, ASTATION_ID));
     }
 
@@ -2092,7 +2284,12 @@ mod ceremony_tests {
         assert!(outcome.key_needed, "an unknown answer counts as K missing");
         let warning = outcome.warning.expect("a warning");
         assert!(warning.contains("unreadable reply"), "{warning}");
-        assert!(TrustStore::load_from(&paths.trust).unwrap().verified(ASTATION_ID).is_some());
+        assert!(
+            TrustStore::load_from(&paths.trust)
+                .unwrap()
+                .verified(ASTATION_ID)
+                .is_some()
+        );
     }
 
     #[test]
@@ -2258,7 +2455,10 @@ mod ceremony_tests {
             &self,
             request: crate::memory::cred_agent::Request,
         ) -> Result<crate::memory::cred_agent::Reply> {
-            let load = matches!(request, crate::memory::cred_agent::Request::LoadUnlocked { .. });
+            let load = matches!(
+                request,
+                crate::memory::cred_agent::Request::LoadUnlocked { .. }
+            );
             let reply = self.agent.call(request)?;
             if load {
                 SealedDeviceKeys::seal(&self.other, "dev-1", "7a7b7c7d", &new_storage_key())
@@ -2291,7 +2491,10 @@ mod ceremony_tests {
             &self,
             request: crate::memory::cred_agent::Request,
         ) -> Result<crate::memory::cred_agent::Reply> {
-            let load = matches!(request, crate::memory::cred_agent::Request::LoadUnlocked { .. });
+            let load = matches!(
+                request,
+                crate::memory::cred_agent::Request::LoadUnlocked { .. }
+            );
             let reply = self.agent.call(request)?;
             if load {
                 TrustStore::update(&self.paths.trust, |store| {
@@ -2366,7 +2569,10 @@ mod ceremony_tests {
                 .device_sign_pub(),
             other_sign
         );
-        assert!(!agent.status().unwrap().unlocked, "this run's keys are dropped");
+        assert!(
+            !agent.status().unwrap().unlocked,
+            "this run's keys are dropped"
+        );
     }
 
     /// Forwards to `agent`; right after it first opens a grant, another
@@ -2383,7 +2589,10 @@ mod ceremony_tests {
             &self,
             request: crate::memory::cred_agent::Request,
         ) -> Result<crate::memory::cred_agent::Reply> {
-            let open = matches!(request, crate::memory::cred_agent::Request::CheckGrant { .. });
+            let open = matches!(
+                request,
+                crate::memory::cred_agent::Request::CheckGrant { .. }
+            );
             let reply = self.agent.call(request)?;
             if open && let Some(newer) = self.newer.lock().unwrap().take() {
                 assert!(matches!(
@@ -2458,7 +2667,14 @@ mod ceremony_tests {
         ));
         let mode = account_mode(&paths.trust, ASTATION_ID).unwrap();
         assert_eq!(mode.mode, EncryptionMode::On);
-        assert_eq!(mode.kid.as_deref(), Some("89abcdef"), "the older state isn't re-applied");
-        assert_eq!(agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some("89abcdef"));
+        assert_eq!(
+            mode.kid.as_deref(),
+            Some("89abcdef"),
+            "the older state isn't re-applied"
+        );
+        assert_eq!(
+            agent.held_kid(ASTATION_ID).unwrap().as_deref(),
+            Some("89abcdef")
+        );
     }
 }

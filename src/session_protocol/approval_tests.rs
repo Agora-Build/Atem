@@ -824,6 +824,14 @@ fn unstarted_answer_after_restart(clean: bool) {
     let payload = json!({"approval_id": AID, "decision": "allow_once"});
     use super::journal::Journal;
     journal
+        .append(Record::Control {
+            principal: "c1".into(),
+            control: true,
+            control_gen: 1,
+            fence_seq: 0,
+        })
+        .unwrap();
+    journal
         .append(Record::Accepted {
             request_id: rid(1),
             target: t,

@@ -1,0 +1,36 @@
+[package]
+name = "atem-client"
+version = "0.1.0"
+edition = "2024"
+description = "atem-session r9 shared client core: canonical encoding, domain-separated signing, Recovery Kit and K-backup formats (sans-I/O)"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+subtle = "2"
+zeroize = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
+
+[features]
+# An in-memory `KeyProvider` (`SoftwareKeys`): for tests and for bots
+# (`service` principals hold a software key, R9.6 rule 5). Native members
+# use a platform provider (Secure Enclave, Android Keystore, WebCrypto).
+software-keys = []
+# Deterministic HPKE ephemerals (`seal_with_ikm`) for known-answer vectors.
+# Never enabled by the bindings or by atem's build (atem's tests only:
+# its host fixture runner seals the hellos a fixture overrides).
+test-vectors = []
+
+[dev-dependencies]
+# The vector runner signs with the software provider.
+atem-client = { path = ".", features = ["software-keys", "test-vectors"] }

@@ -66,6 +66,9 @@ pub struct View {
     /// The stream position the next output byte has.
     pub next_offset: u64,
     pub astation: bool,
+    /// The runtime's r9 device list, when it has one (the row shows its
+    /// label: held, frozen, paused, failed, recovery pending).
+    pub device_list: Option<crate::runtime::protocol::DeviceListStatus>,
     pub ui: terminal_view::State,
     /// The agent's exit status once it ended.
     pub exited: Option<String>,
@@ -93,6 +96,7 @@ impl View {
             parser: vt100::Parser::new(24, 80, crate::pty_session::SCROLLBACK_ROWS),
             next_offset: 0,
             astation,
+            device_list: None,
             ui: terminal_view::State::new(prefix),
             exited: None,
             redraw: false,
@@ -155,6 +159,15 @@ impl View {
                 return Applied::Reattach;
             }
             RuntimeMsg::Astation { connected } => self.astation = connected,
+            RuntimeMsg::DeviceList { status } => {
+                // A new state is a notice (its text says what to do).
+                if let Some(s) = status.as_ref().filter(|s| s.label.is_some())
+                    && self.device_list.as_ref().map(|d| &d.text) != Some(&s.text)
+                {
+                    self.notice(format!("Device list: {}", s.text));
+                }
+                self.device_list = status;
+            }
             RuntimeMsg::Notice { text } => self.notice(text),
             RuntimeMsg::Error { text, op } if op.as_deref() == Some("attach") => {
                 return Applied::Failed(text);
@@ -207,12 +220,20 @@ impl View {
             "Local"
         };
         let link = if self.astation { "✓" } else { "✗" };
+        let list = self
+            .device_list
+            .as_ref()
+            .and_then(|d| d.label.as_deref())
+            .map(|label| format!(" | {label}"))
+            .unwrap_or_default();
         let notice = if self.ui.messages.is_empty() {
             ""
         } else {
             " | Notice"
         };
-        format!("Atem | {provider} | {control} | Astation {link}{notice} | {prefix} then ?:help")
+        format!(
+            "Atem | {provider} | {control} | Astation {link}{list}{notice} | {prefix} then ?:help"
+        )
     }
 
     /// History at `offset` rows back, from the local parser.
@@ -347,6 +368,7 @@ pub async fn attach_in<B: Backend>(
         .unwrap_or_default()
         .terminal_prefix;
     let mut view = View::new(sid, client.welcome.astation, prefix.as_deref());
+    view.device_list = client.welcome.device_list.clone();
     let mut client = client;
     loop {
         let (mut reader, mut writer) = client.split();
@@ -381,6 +403,7 @@ pub async fn attach_in<B: Backend>(
                 terminal.draw(|frame| view.draw(frame))?;
                 client = RuntimeClient::reconnect().await?;
                 view.astation = client.welcome.astation;
+                view.device_list = client.welcome.device_list.clone();
             }
         }
     }
@@ -683,6 +706,43 @@ mod tests {
         attached(&mut view, "fresh", 99);
         assert_eq!(view.parser.screen().contents().trim_end(), "fresh");
         assert_eq!(view.next_offset, 99);
+    }
+
+    /// r9: the row shows the device list's short state (held, frozen,
+    /// paused, failed, a pending recovery), and a new state is a notice
+    /// saying what to do; back to normal, the segment goes.
+    #[test]
+    fn the_status_row_shows_the_device_list_state() {
+        use crate::runtime::protocol::DeviceListStatus;
+        let mut view = View::new(SID, true, None);
+        attached(&mut view, "x", 0);
+        let held = DeviceListStatus {
+            state: "held".into(),
+            text: "held (a device-list write fault was recorded); ...".into(),
+            label: Some("Remote held".into()),
+            ..Default::default()
+        };
+        view.apply(RuntimeMsg::DeviceList { status: Some(held) });
+        view.ui.feedback = None;
+        let row = view.status_line();
+        assert!(
+            row.contains("| Astation ✓ | Remote held | Notice |"),
+            "{row}"
+        );
+        assert!(
+            view.ui
+                .messages
+                .iter()
+                .any(|m| m.contains("Device list: held"))
+        );
+        view.apply(RuntimeMsg::DeviceList {
+            status: Some(DeviceListStatus {
+                state: "open".into(),
+                text: "pinned at seq 4 (0 remote clients)".into(),
+                ..Default::default()
+            }),
+        });
+        assert!(!view.status_line().contains("Remote held"));
     }
 
     #[test]

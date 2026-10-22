@@ -252,7 +252,7 @@ pub type HostFactory<'a> = &'a dyn Fn(&Setup) -> Result<Box<dyn HostUnderTest>, 
 pub enum Outcome {
     Passed,
     Skipped,
-    /// Needs host work not implemented yet (the reason names it).
+    /// Not run by this runner (the reason names where it runs).
     NotRun(String),
 }
 
@@ -316,8 +316,9 @@ pub fn run_all(dir: &Path, host: Option<HostFactory>) -> Report {
 
 /// Runs one scenario (the parsed JSON of a fixture file).
 pub fn run_scenario(file: &Value, host: Option<HostFactory>) -> Result<Outcome, String> {
-    // r9 fixtures (vectors and scenarios of the drafted appendix) have
-    // their own shapes; they are reported as not run until r9 is built.
+    // r9 fixtures (vectors and scenarios of appendix r9) have their own
+    // shapes and runners (atem-client's tests, tests/r9_runner); this r8
+    // runner reports them as not run.
     let name = file["name"].as_str().unwrap_or_default();
     let r9 = file["requires"].as_str() == Some("r9");
     if revision::is_r9_fixture(name) || r9 {
@@ -1557,9 +1558,9 @@ mod tests {
         }
     }
 
-    /// The r9 draft's fixtures (vectors and scenarios) parse, carry
-    /// `"requires": "r9"` and a known kind, and every runner reports them as
-    /// not run until r9 is implemented.
+    /// r9's fixtures (vectors and scenarios) parse, carry `"requires":
+    /// "r9"` and a known kind, and both r8 runners (with and without the
+    /// fake runtime) report them as not run: r9's own runners run them.
     #[test]
     fn r9_fixtures_parse_and_are_not_run() {
         let mut names = Vec::new();
