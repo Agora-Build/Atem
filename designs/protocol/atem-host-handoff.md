@@ -717,8 +717,14 @@ Router obligations (the relay and Astation's :8080):
   r9 only with no Astation: channels and push, never r8, Astation
   operations, credentials or mark tasks; Astation's later
   `auth_required` on it upgrades it to an authenticated link), or
-  `host_route_refused{code}` and closes. Atem ignores an unsolicited
-  `ok`, one for another host or a head it doesn't hold. Vectors
+  `host_route_refused{code}` and closes. Atem answers one challenge per
+  link, only before it is routed or authenticated, and takes a verdict
+  only for its own proof, once (an unsolicited `ok` or `refused`, one for
+  another host or a head it doesn't hold is ignored). `type:"relay"`
+  messages are never forwarded between room members. If Astation denies
+  the routed link's authentication, the link stays routed for r9 (advice
+  logged, no reconnect until Astation challenges again). A held host
+  proves no route: reconciling it needs the Mac online. Vectors
   `r9-vectors-host-route` (`relay_replies` for the two verdicts); the real
   runtime with no Astation online: `cargo test --test
   r9_host_route_binary`. §R9.7b.

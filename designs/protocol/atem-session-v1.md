@@ -2999,6 +2999,11 @@ proof signed with the old key.
 - Fresh connections and channels after every recovery; nothing is
   replayed (ciphertext, leases, uncertain submissions).
 - Without a valid proof an r9 host gets no routing. There is no fallback.
+- `type:"relay"` messages (`host_challenge`, `host_route`, the verdicts,
+  push) are relay-originated or relay-consumed only: never forwarded
+  between room members (a peer's `host_challenge` reaching the host, or
+  the host's `host_route` reaching a peer, would make the host a signing
+  oracle for another connection's nonce).
 
 **The held link.** The verdict sustains the r9 carrier only. On
 `host_route_ok` (strictly parsed; its `host_id` this host's and its `head`
@@ -3008,17 +3013,27 @@ link **routed**: no 10 s wait for `auth_required`, no 30 s retry loop. A
 routed link carries channel envelopes (R9.7a; every channel admitted by
 `atem-ch1` and R9.6/R9.8 as always, identity never inferred from the
 route) and push relay messages (`push_hint`, `push_seen`, `push_ack`,
-R9.9), nothing else: no r8 session-family message is served, no Astation
+R9.9), nothing else: r8 session-family messages are dropped unanswered, no Astation
 operation (pair, pair verify, cred unlock/projects, the token refresh)
 runs on it, no `credentialSync` or encryption message is applied, no mark
 task is taken or reported. Astation's `auth_required` on the same link is
-answered as a re-authentication (the pairing's saved session, pinned to
-the pairing's Astation = the room) and, once accepted, the link is an
-authenticated Astation link (a new link generation: channels reopen). A
-`host_route_ok` that is malformed, unsolicited (no proof sent on this
-link, e.g. a late one on a retried link), for another host or for a head
-the host doesn't hold is ignored with a log line and holds nothing.
-`host_route_refused`, a closed socket, or neither Astation's
+answered with the connect path's semantics (the pairing's saved session,
+pinned to the pairing's Astation = the room; a granted session is saved;
+the connect path's session advice and its 300 s completion bound); the
+r9 carrier runs on meanwhile. Once accepted, the link is an authenticated
+Astation link (a new link generation: the channels opened while it was
+routed are closed, clients connect again). If Astation denies or expires
+the session, or doesn't finish in time, the link **stays routed** (an
+Astation-only reason never drops the r9 carrier): the session advice
+("expired or was refused …") goes to runtime.log, the notices and any
+waiting Astation operation, and nothing is retried until Astation sends
+another `auth_required`. A verdict counts only for this link's own proof,
+once: a `host_route_ok` or `host_route_refused` that is malformed,
+unsolicited (no proof sent on this link, e.g. a late one on a retried
+link, or any on a host without a list), a second one, an `ok` for another
+host or for a head the host doesn't hold is ignored with a log line and
+holds or drops nothing. A valid `host_route_refused`, a closed socket, or
+neither Astation's
 `auth_required` nor a valid `host_route_ok` within 10 s: dropped and
 retried as before. A new link (a new route) fences the old one's channels
 as any link loss does. `atem status` shows `Authorization: r9 routed (no
@@ -3033,12 +3048,17 @@ authentication, signed at the device list's current head for the link's
 own room and `atem_id`. It answers only with a pinned list that can
 serve: not held, frozen or faulted, the session journal not halted, the
 host key loaded; a challenge that arrives while the broker is still
-opening its list waits for it (at most 5 s). Each challenge is answered
-once (at most 16 a link); a malformed one, one naming another room than
+opening its list waits for it (at most 5 s). Exactly one challenge is
+answered per link, and only before the link is routed or authenticated by
+Astation; a later one is ignored and logged, as is a malformed one, one naming another room than
 the link's, or any challenge on a host without a list is ignored, with
 one bounded runtime.log line and never its content. The challenge is
 authority for nothing else and is never passed on. A relay that sends no
 challenge changes nothing. A local (loopback/LAN) link never answers.
+
+A held, frozen or faulted host answers no challenge, so it proves no
+route: reconciling a held host (R9.3, a managing device's `hello`) needs
+a link Astation authenticated, i.e. the Mac online.
 
 Vectors: `r9-vectors-host-route` (proofs at the head, at an ancestor, on
 a verifier ahead, after a key rotation; refused: extra fields in the
@@ -3275,7 +3295,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9` |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
-| relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the relay's own, never sent to the host) |
+| relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused`) |
 
 ### R9.12 Fixtures
 
