@@ -17,9 +17,10 @@
 //! record's binding and the legacy `pairing.json` (where it lived until
 //! v0.7.1; moving here restarted it at 1, below generations Astation had
 //! already accepted), so losing `pairing/` or either file never lowers it.
-//! An unreadable one fails closed. A new generation goes to the floor copy
-//! first; a file found below the generation is raised to it under the lock
-//! (`capture`); `pairing.json` is only read, never written or removed.
+//! An unreadable one fails closed; its error says how to recover (`damaged`).
+//! A new generation goes to the floor copy first; a file found below the
+//! generation is raised to it under the lock (`capture`); `pairing.json` is
+//! only read, never written or removed.
 //!
 //! Asynchronous Astation work (authentication, re-authentication,
 //! verification, unlock, rotation, escrow, credential reports, credentials
@@ -307,6 +308,33 @@ fn read_legacy_gen(path: &std::path::Path) -> Result<u64> {
     Ok(legacy.host_trust_gen)
 }
 
+/// `error` (reading the generation file at `path`) with what to do about it.
+/// Both copies are written before a generation is used, so with the other
+/// one readable (`copy`) the damaged one can go: the next capture rebuilds
+/// it from the copy. Otherwise nothing proves which generation Astation last
+/// accepted, and a lower one makes Astation refuse this host.
+fn damaged(
+    error: anyhow::Error,
+    path: &std::path::Path,
+    copy: Option<(&std::path::PathBuf, u64)>,
+) -> anyhow::Error {
+    match copy {
+        Some((copy, generation)) if generation > 0 => anyhow!(
+            "{error:#}. {copy} holds a copy of the host trust generation \
+             ({generation}): move {path} aside (`mv {path} {path}.damaged`) \
+             and Atem rebuilds it from that copy",
+            copy = copy.display(),
+            path = path.display(),
+        ),
+        _ => anyhow!(
+            "{error:#}. No other copy holds the host trust generation: restore \
+             {path} from a backup (removing it could lower the generation below \
+             one Astation already accepted, and Astation then refuses this host)",
+            path = path.display(),
+        ),
+    }
+}
+
 /// What the profile holds of the generation: `pairing/trust_gen`, the floor
 /// copy `cred/trust_gen_floor`, the legacy `pairing.json` and the record.
 struct Generations {
@@ -325,14 +353,28 @@ impl Generations {
         })
     }
 
-    /// The files only, without the record.
+    /// The files only, without the record. An unreadable one fails closed
+    /// with what to do about it (`damaged`).
     fn files(src: &Sources) -> Result<Self> {
-        Ok(Self {
-            file: read_gen_file(&src.paths.pairing.trust_gen)?,
-            floor: read_gen_file(&src.paths.cred.trust_gen_floor)?,
-            legacy: read_legacy_gen(&src.paths.legacy_pairing)?,
-            record: None,
-        })
+        let file_path = &src.paths.pairing.trust_gen;
+        let floor_path = &src.paths.cred.trust_gen_floor;
+        let legacy_path = &src.paths.legacy_pairing;
+        match (
+            read_gen_file(file_path),
+            read_gen_file(floor_path),
+            read_legacy_gen(legacy_path),
+        ) {
+            (Ok(file), Ok(floor), Ok(legacy)) => Ok(Self {
+                file,
+                floor,
+                legacy,
+                record: None,
+            }),
+            (Err(error), Ok(floor), _) => Err(damaged(error, file_path, Some((floor_path, floor)))),
+            (Ok(file), Err(error), _) => Err(damaged(error, floor_path, Some((file_path, file)))),
+            (Err(error), Err(_), _) => Err(damaged(error, file_path, None)),
+            (Ok(_), Ok(_), Err(error)) => Err(damaged(error, legacy_path, None)),
+        }
     }
 
     /// The generation: the highest of the two files and the record's
@@ -791,6 +833,58 @@ pub(crate) mod tests {
         std::fs::write(&paths.record, b"not encrypted").unwrap();
         assert!(load(&src).is_err());
         assert!(PairingRecord::load(paths).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_copy_says_how_to_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let file = &src.paths.pairing.trust_gen;
+        let floor = &src.paths.cred.trust_gen_floor;
+        for (damaged, copy) in [(file, floor), (floor, file)] {
+            crate::paths::write_test_file(copy, b"7\n");
+            crate::paths::write_test_file(damaged, b"not a number");
+            let error = format!("{:#}", load(&src).unwrap_err());
+            assert!(
+                error.contains(&format!("{} is unreadable", damaged.display())),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("{} holds a copy", copy.display())),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("mv {d} {d}.damaged", d = damaged.display())),
+                "{error}"
+            );
+            // Following the advice keeps the generation and rebuilds the file.
+            std::fs::rename(damaged, damaged.with_extension("damaged")).unwrap();
+            assert_eq!(capture(&src).unwrap().host_trust_gen, 7);
+            assert_eq!(std::fs::read(damaged).unwrap(), b"7\n");
+        }
+        // No readable copy: restore from a backup, never remove.
+        crate::paths::write_test_file(file, b"x");
+        crate::paths::write_test_file(floor, b"y");
+        let error = format!("{:#}", capture(&src).unwrap_err());
+        assert!(
+            error.contains("restore") && !error.contains("mv "),
+            "{error}"
+        );
+        std::fs::remove_file(floor).unwrap();
+        let error = format!("{:#}", unpair(&src).unwrap_err());
+        assert!(
+            error.contains("restore") && !error.contains("mv "),
+            "{error}"
+        );
+        // The legacy pairing.json has no copy either.
+        crate::paths::write_test_file(file, b"7\n");
+        crate::paths::write_test_file(floor, b"7\n");
+        std::fs::write(&src.paths.legacy_pairing, b"not json").unwrap();
+        let error = format!("{:#}", load(&src).unwrap_err());
+        assert!(
+            error.contains("restore") && error.contains("pairing.json"),
+            "{error}"
+        );
     }
 
     #[test]
