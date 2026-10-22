@@ -207,6 +207,17 @@ pub enum AstationMessage {
     #[serde(skip)]
     Relay(String),
 
+    /// The relay verified this link's host route proof (§R9.7b,
+    /// `host_route_ok`, checked by the link's reader: this host, a head it
+    /// holds): the route is this host's.
+    #[serde(skip)]
+    HostRouted,
+
+    /// The relay refused this link's host route proof (`host_route_refused`,
+    /// the verifier's code); it closes the connection.
+    #[serde(skip)]
+    HostRouteRefused(String),
+
     #[serde(rename = "terminal")]
     Terminal(crate::terminal_share::Envelope),
 
@@ -530,6 +541,11 @@ pub struct AstationClient {
     /// The room and `atem_id` of the relay link `connect_raw` opens next
     /// (taken by it): only a relay identity link answers challenges.
     route_link: Option<(String, String)>,
+    /// A relay identity link the relay routed on a host route proof
+    /// (§R9.7b) before any Astation authenticated it: the Astation (room)
+    /// it is for. Only r9 traffic goes over it; Astation's `auth_required`
+    /// upgrades it (`upgrade_routed`).
+    routed: Option<String>,
 }
 
 /// How a link reached Astation, for `atem status`: never a secret (no
@@ -628,6 +644,7 @@ impl AstationClient {
             via: None,
             host_route: None,
             route_link: None,
+            routed: None,
         }
     }
 
@@ -938,6 +955,7 @@ impl AstationClient {
         self.ws_closed = true;
         self.answered_challenge = None;
         self.capture = None;
+        self.routed = None;
     }
 
     /// Connect WebSocket and authenticate (local Astation connections).
@@ -1083,7 +1101,14 @@ impl AstationClient {
                                 }
                                 None
                             }
-                            None if is_relay_message(&text) => Some(AstationMessage::Relay(text)),
+                            // §R9.7b: the relay's reply to this link's proof,
+                            // checked here (never passed on raw).
+                            None if is_relay_message(&text) => match route.as_mut().map(|route| (route.on_reply(&text), atem_client::host_route::RelayReply::parse(text.as_bytes()).is_some())) {
+                                Some((Some(crate::session_protocol::r9::route::RouteResult::Routed { .. }), _)) => Some(AstationMessage::HostRouted),
+                                Some((Some(crate::session_protocol::r9::route::RouteResult::Refused(code)), _)) => Some(AstationMessage::HostRouteRefused(code)),
+                                Some((None, true)) => None,
+                                _ => Some(AstationMessage::Relay(text)),
+                            },
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };
                         if let Some(astation_msg) = astation_msg
@@ -1146,6 +1171,74 @@ impl AstationClient {
         .map_err(|_| anyhow!("Authentication timed out"))?;
         if result.is_ok() { let _ = self.report_credential_projects().await; }
         result
+    }
+
+    /// A relay identity link: Astation's `auth_required` (authenticated as
+    /// [`Self::authenticate`] does), or the relay's verdict on this host's
+    /// route proof (§R9.7b), whichever comes first within
+    /// `challenge_timeout`. `host_route_ok` leaves the link routed for r9
+    /// only (`routed`), pinned to the pairing's Astation `room` for a later
+    /// `auth_required`; `host_route_refused` fails the connect.
+    async fn authenticate_or_route(
+        &mut self,
+        room: &str,
+        challenge_timeout: Duration,
+        completion_timeout: Duration,
+        allow_pairing: bool,
+    ) -> Result<()> {
+        let first = tokio::time::timeout(
+            challenge_timeout,
+            self.wait_for_message(|m| {
+                is_auth_required(m)
+                    || matches!(m, AstationMessage::HostRouted | AstationMessage::HostRouteRefused(_))
+            }),
+        )
+        .await
+        .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
+        .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
+        match first {
+            AstationMessage::HostRouted => {
+                // Under the pairing it was opened for: `atem unpair` (or a
+                // new pairing) drops it like an authenticated link.
+                self.capture = Some(crate::pairing::Captured::now(&self.profile_sources()?)?);
+                self.routed = Some(room.to_string());
+                Ok(())
+            }
+            AstationMessage::HostRouteRefused(code) => {
+                Err(anyhow!("the relay refused this host's route ({code})"))
+            }
+            auth_required => {
+                let result = tokio::time::timeout(
+                    completion_timeout,
+                    self.authenticate_after_challenge(auth_required, allow_pairing),
+                )
+                .await
+                .map_err(|_| anyhow!("Authentication timed out"))?;
+                if result.is_ok() { let _ = self.report_credential_projects().await; }
+                result
+            }
+        }
+    }
+
+    /// Routed for r9 only (§R9.7b): no Astation authenticated this link.
+    pub fn routed(&self) -> bool {
+        self.routed.is_some() && self.connected_astation_id.is_none()
+    }
+
+    /// The Astation a later `auth_required` must come from: the one this
+    /// link authenticated, else the one a routed link was opened for.
+    pub(crate) fn pinned_astation_id(&self) -> Option<&str> {
+        self.connected_astation_id.as_deref().or(self.routed.as_deref())
+    }
+
+    /// Astation authenticated a routed link (its `auth_required` answered
+    /// and accepted): the link is Astation's from now on.
+    pub(crate) fn upgrade_routed(&mut self) {
+        if let Some(room) = self.routed.take()
+            && self.connected_astation_id.is_none()
+        {
+            self.connected_astation_id = Some(room);
+        }
     }
 
     async fn authenticate_after_challenge(
@@ -1360,8 +1453,7 @@ impl AstationClient {
     pub(crate) async fn answer_auth_required(&mut self, auth_required: &AstationMessage) -> Result<()> {
         let challenge = AuthChallenge::parse(auth_required)?;
         let pinned = self
-            .connected_astation_id
-            .as_deref()
+            .pinned_astation_id()
             .ok_or_else(|| anyhow!("this connection never authenticated an Astation"))?;
         if challenge.astation_id != pinned {
             return Err(anyhow!(
@@ -1835,6 +1927,10 @@ impl AstationClient {
         success: bool,
         message: &str,
     ) -> Result<()> {
+        // A link routed for r9 only carries nothing of Astation's.
+        if self.routed() {
+            return Err(anyhow!("the link is routed for r9 only; no Astation"));
+        }
         let msg = AstationMessage::MarkTaskResult {
             task_id: task_id.to_string(),
             success,
@@ -1938,6 +2034,7 @@ impl AstationClient {
 
         let ws_url = relay_ws_url(&ws_scheme, identity_code, &atem_id);
         self.route_link = Some((identity_code.to_string(), atem_id.clone()));
+        self.routed = None;
         self.connect_raw(&ws_url).await?;
 
         // Send hello to announce ourselves and trigger Astation to send credentials
@@ -1951,7 +2048,8 @@ impl AstationClient {
             })
             .await?;
 
-            self.authenticate(
+            self.authenticate_or_route(
+                identity_code,
                 Duration::from_secs(10),
                 Duration::from_secs(300),
                 allow_pairing,
@@ -2231,6 +2329,7 @@ mod tests {
                     genesis_hash: log.log.genesis_hash(),
                     host_id: "host-1".into(),
                     head: log.log.head(),
+                    chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
                 },
                 key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
                     "ws host",
@@ -2277,6 +2376,7 @@ mod tests {
                     genesis_hash: log.log.genesis_hash(),
                     host_id: "host-1".into(),
                     head: log.log.head(),
+                    chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
                 },
                 key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
                     "ws host",

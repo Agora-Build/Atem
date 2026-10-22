@@ -1,126 +1,75 @@
 //! The host route proof (atem-session-v1.md §R9.7b) in the real `atem
-//! runtime` process: a temp profile paired with a fake Astation that is
-//! offline (its local URL refuses connections), a pinned device list, and a
-//! fake relay that sends `host_challenge` the moment the runtime's relay
-//! identity link opens. The runtime answers before any Astation could
-//! authenticate it, and the relay's shared verifier
-//! (`atem_client::host_route`) accepts the proof against the host's log,
-//! for the room and `atem_id` of the link's URL. A held host answers
-//! nothing.
+//! runtime` process, with no Astation anywhere: a temp profile paired with
+//! an Astation that is offline (its local URL refuses connections), a
+//! pinned device list, and a fake relay (`FakeAstation::start_relay`) that
+//! sends `host_challenge` the moment the runtime's relay identity link
+//! opens and answers the proof as each test plans. The relay's shared
+//! verifier (`atem_client::host_route`) checks every proof for the room and
+//! `atem_id` of the link's URL.
+//!
+//! - `host_route_ok` holds the link with no Astation, well past the old
+//!   10 s authentication deadline, for r9 only: a phone is admitted over
+//!   it, an r8 `hello` and an Astation operation are not served, and a
+//!   later Astation `auth_required` makes it an authenticated link;
+//! - an `ok` that isn't for this link's proof (before the challenge,
+//!   another host, a head the host doesn't hold, a late one on a retried
+//!   link) is ignored and never holds the link;
+//! - `host_route_refused` closes it and the runtime retries;
+//! - a held host answers no challenge.
 #![cfg(target_os = "linux")]
 
 mod support;
 
-use atem_client::host_route::{HostChallenge, verify_host_route_message};
-use futures_util::{SinkExt, StreamExt};
+use atem_client::connect::Identity;
+use atem_client::host_route::verify_host_route_message;
+use serde_json::{Value, json};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
-use support::astation::{ASTATION, write_verified_pairing};
-use support::r9::write_pin;
-use support::r9log::{TestLog, secret};
+use std::time::{Duration, Instant};
+use support::astation::{
+    ASTATION, Event, FakeAstation, RelayEvent, Reply, auth_required, write_verified_pairing,
+};
+use support::r9::{Router, write_pin};
+use support::r9log::{TestLog, auth, secret};
 use support::{Sandbox, within};
-use tokio_tungstenite::tungstenite::Message;
 
 const ACCOUNT: &str = "acct-route";
 const HOST: &str = "host-route";
-
-/// What the fake relay saw on one host connection.
-struct Seen {
-    /// The query of the connection's URL (`role`, `code`, `atem_id`).
-    query: Vec<(String, String)>,
-    challenge: HostChallenge,
-    /// The first `host_route` Atem sent within 5 s.
-    answer: Option<String>,
-}
-
-/// A relay that challenges every host connection, then closes it.
-// The handshake callback's `Err` is tungstenite's own response type.
-#[allow(clippy::result_large_err)]
-fn fake_relay() -> (String, mpsc::Receiver<Seen>) {
-    let (url_tx, url_rx) = mpsc::channel();
-    let (seen_tx, seen) = mpsc::channel();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            url_tx
-                .send(format!("http://{}", listener.local_addr().unwrap()))
-                .unwrap();
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut query = String::new();
-                let callback =
-                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                     response| {
-                        query = request.uri().query().unwrap_or_default().to_owned();
-                        Ok(response)
-                    };
-                let Ok(mut socket) = tokio_tungstenite::accept_hdr_async(stream, callback).await
-                else {
-                    continue;
-                };
-                let query: Vec<(String, String)> = query
-                    .split('&')
-                    .filter_map(|kv| kv.split_once('='))
-                    .map(|(k, v)| (k.to_owned(), urlencoding::decode(v).unwrap().into_owned()))
-                    .collect();
-                let code = query
-                    .iter()
-                    .find(|(k, _)| k == "code")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-                let challenge = HostChallenge::new(&code);
-                if socket
-                    .send(Message::Text(challenge.to_json().to_string()))
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-                let answer = tokio::time::timeout(Duration::from_secs(5), async {
-                    while let Some(Ok(frame)) = socket.next().await {
-                        if let Message::Text(text) = frame
-                            && text.contains("\"host_route\"")
-                        {
-                            return Some(text);
-                        }
-                    }
-                    None
-                })
-                .await
-                .ok()
-                .flatten();
-                let _ = socket.close(None).await;
-                let _ = seen_tx.send(Seen {
-                    query,
-                    challenge,
-                    answer,
-                });
-            }
-        });
-    });
-    (url_rx.recv_timeout(Duration::from_secs(5)).unwrap(), seen)
-}
+/// The old deadline for Astation's `auth_required` on a new link.
+const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+/// The runtime's retry after a failed connect.
+const RETRY: Duration = Duration::from_secs(30);
 
 struct Rig {
     sandbox: Sandbox,
     log: TestLog,
-    relay: mpsc::Receiver<Seen>,
+    relay: FakeAstation,
+    seen: mpsc::Receiver<RelayEvent>,
     runtime: Child,
+}
+
+fn head_json(log: &TestLog) -> Value {
+    let head = log.log.head();
+    json!({"seq": head.seq, "hash": head.hash.to_hex()})
 }
 
 impl Rig {
     /// Paired with `ASTATION` (offline) and a pinned device list naming
-    /// this host; `held`: a recorded device-list write fault.
-    fn start(held: bool) -> Rig {
+    /// this host and a phone; `held`: a recorded device-list write fault.
+    /// `plan(n, head)`: the relay's reply on its `n`th host connection.
+    fn start(held: bool, plan: fn(u64, Value) -> Reply) -> Rig {
+        Self::start_with(true, held, plan)
+    }
+
+    /// [`Rig::start`]; `verified: false`: paired, device not verified yet
+    /// (`atem pair verify` then runs as an Astation operation).
+    fn start_with(verified: bool, held: bool, plan: fn(u64, Value) -> Reply) -> Rig {
         let sandbox = Sandbox::new();
-        write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
+        if verified {
+            write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
+        } else {
+            support::profile::write_pairing(&sandbox.config(), ASTATION, 1);
+        }
         let host_seed = secret("route host seed");
         let mut log = TestLog::genesis(ACCOUNT, &secret("route astation"));
         log.add_host(HOST, 1, &host_seed);
@@ -133,7 +82,8 @@ impl Rig {
             )
             .unwrap();
         }
-        let (relay_url, relay) = fake_relay();
+        let head = head_json(&log);
+        let (relay, seen) = FakeAstation::start_relay(move |n| plan(n, head.clone()));
         let output = std::fs::File::create(sandbox.dir.path().join("runtime.log")).unwrap();
         let runtime = Command::new(env!("CARGO_BIN_EXE_atem"))
             .arg("runtime")
@@ -143,7 +93,7 @@ impl Rig {
             .env("XDG_RUNTIME_DIR", &sandbox.run)
             // No Astation anywhere: the local link is refused.
             .env("ASTATION_WS", "ws://127.0.0.1:1/ws")
-            .env("ASTATION_RELAY_URL", &relay_url)
+            .env("ASTATION_RELAY_URL", &relay.url)
             .stdin(Stdio::null())
             .stdout(output.try_clone().unwrap())
             .stderr(output)
@@ -157,6 +107,7 @@ impl Rig {
             sandbox,
             log,
             relay,
+            seen,
             runtime,
         }
     }
@@ -165,10 +116,63 @@ impl Rig {
         std::fs::read_to_string(self.sandbox.dir.path().join("runtime.log")).unwrap_or_default()
     }
 
-    fn next_connection(&self) -> Seen {
-        self.relay
-            .recv_timeout(Duration::from_secs(20))
-            .unwrap_or_else(|_| panic!("no relay connection: {}", self.runtime_log()))
+    fn event(&self, wait: Duration) -> Option<RelayEvent> {
+        self.seen.recv_timeout(wait).ok()
+    }
+
+    /// The proof on connection `n`, verified by the shared verifier.
+    fn proof(&self, n: u64, wait: Duration) {
+        match self.event(wait) {
+            Some(RelayEvent::Proof {
+                link,
+                query,
+                nonce,
+                room,
+                message,
+            }) => {
+                assert_eq!(link, n);
+                let param = |key: &str| {
+                    query
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| panic!("no {key} in {query:?}"))
+                };
+                assert_eq!(param("role"), "atem");
+                assert_eq!(param("code"), ASTATION);
+                assert_eq!(room, ASTATION);
+                let route = verify_host_route_message(
+                    &self.log.log,
+                    message.as_bytes(),
+                    &nonce,
+                    ASTATION,
+                    &param("atem_id"),
+                )
+                .unwrap();
+                assert_eq!(route.host_id, HOST);
+                assert_eq!(route.head, self.log.log.head());
+            }
+            other => panic!(
+                "no proof on connection {n}: {other:?}\n{}",
+                self.runtime_log()
+            ),
+        }
+    }
+
+    /// Connection `n` ends within `wait`.
+    fn closed(&self, n: u64, wait: Duration) {
+        match self.event(wait) {
+            Some(RelayEvent::Closed(link)) => assert_eq!(link, n),
+            other => panic!(
+                "connection {n} wasn't closed: {other:?}\n{}",
+                self.runtime_log()
+            ),
+        }
+    }
+
+    fn status(&self) -> String {
+        let (out, err, _) = self.sandbox.atem(&["status"]);
+        format!("{out}{err}")
     }
 }
 
@@ -179,45 +183,193 @@ impl Drop for Rig {
     }
 }
 
-fn param<'a>(seen: &'a Seen, key: &str) -> &'a str {
-    seen.query
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
-        .unwrap_or_else(|| panic!("no {key} in {:?}", seen.query))
+fn ok(_: u64, head: Value) -> Reply {
+    Reply::Ok {
+        host_id: HOST.into(),
+        head,
+    }
 }
 
+/// (a), (d): routed with no Astation, held three times past the old
+/// deadline while a phone is admitted over it; r8 and an Astation
+/// operation are not served; Astation's later `auth_required` upgrades it.
 #[test]
-fn a_pinned_host_proves_its_route_with_no_astation_online() {
-    let rig = Rig::start(false);
-    let seen = rig.next_connection();
-    assert_eq!(param(&seen, "role"), "atem");
-    assert_eq!(param(&seen, "code"), ASTATION);
-    let answer = seen
-        .answer
-        .as_deref()
-        .unwrap_or_else(|| panic!("no host_route: {}", rig.runtime_log()));
-    let route = verify_host_route_message(
-        &rig.log.log,
-        answer.as_bytes(),
-        &seen.challenge.nonce,
-        ASTATION,
-        param(&seen, "atem_id"),
-    )
-    .unwrap();
-    assert_eq!(route.host_id, HOST);
-    assert_eq!(route.head, rig.log.log.head());
-    // Never content in the log: the line names the head only.
+fn a_routed_host_is_held_for_r9_only_until_astation_authenticates_it() {
+    let rig = Rig::start(false, ok);
+    rig.proof(1, Duration::from_secs(20));
+    // Held well past the old deadline: no close, no retry.
+    assert!(
+        rig.event(AUTH_DEADLINE * 3).is_none(),
+        "the routed link was dropped or retried\n{}",
+        rig.runtime_log()
+    );
     let log = rig.runtime_log();
-    assert!(log.contains("host_challenge answered at head"), "{log}");
-    assert!(!log.contains(&atem_client::encoding::b64u(&seen.challenge.nonce)));
+    assert!(log.contains("host_route ok at head"), "{log}");
+    assert!(log.contains("relay route held (no Astation)"), "{log}");
+    let status = rig.status();
+    assert!(status.contains("r9 routed (no Astation)"), "{status}");
+    assert!(status.contains("routed via relay ("), "{status}");
+
+    // A phone is admitted over it (its identity checked as always).
+    let mut router = Router::on(&rig.relay, 1);
+    let phone = Identity::native("dev-phone", auth("dev-phone"));
+    let attached = router.connect("ph1", &rig.log, HOST, &phone);
+    assert!(attached.is_ok(), "{:?}", attached.err());
+    // An r8 hello is not served on it.
+    router.send_raw(
+        json!({"type": "session", "data": {"v": 1, "op": "hello", "id": "r8-hello",
+                                          "revision": 8}})
+        .to_string(),
+    );
+    let until = Instant::now() + Duration::from_millis(1_500);
+    while let Some(v) = router.other_within(until.saturating_duration_since(Instant::now())) {
+        assert_ne!(v["type"], "session", "an r8 reply on the routed link: {v}");
+    }
+    // Astation authenticates the same link later: it becomes Astation's.
+    rig.relay.send(1, auth_required("relay").to_string());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rig.relay.events.recv_timeout(left) {
+            Ok(Event::Authenticated(1)) => break,
+            Ok(_) => {}
+            Err(_) => panic!(
+                "Astation never authenticated the link\n{}",
+                rig.runtime_log()
+            ),
+        }
+    }
+    within("the status to show Astation", || {
+        let status = rig.status();
+        !status.contains("r9 routed") && status.contains("connected via relay (")
+    });
+    assert!(
+        rig.runtime_log()
+            .contains("Astation authenticated the routed relay link")
+    );
+    assert!(rig.event(Duration::from_millis(500)).is_none(), "same link");
 }
 
+/// Route acknowledgement only carries r9: an Astation operation (`atem
+/// pair verify` on a device not verified yet) never runs on a routed link;
+/// it waits for an Astation link and fails, and the routed link stays.
+#[test]
+fn an_astation_operation_is_refused_on_a_routed_link() {
+    let rig = Rig::start_with(false, false, ok);
+    rig.proof(1, Duration::from_secs(20));
+    within("the route to be held", || {
+        rig.runtime_log().contains("relay route held (no Astation)")
+    });
+    let (out, err, ok) = rig.sandbox.atem(&["pair", "verify"]);
+    let text = format!("{out}{err}");
+    assert!(!ok, "{text}");
+    assert!(text.contains("isn't connected to Astation"), "{text}");
+    assert!(!rig.relay.events.try_iter().any(|e| matches!(
+        e,
+        Event::Message(_, v) if v["type"] == "verifyCommit"
+    )));
+    assert!(
+        rig.event(Duration::from_millis(200)).is_none(),
+        "the routed link stays"
+    );
+    assert!(rig.status().contains("r9 routed (no Astation)"));
+}
+
+/// (c): `host_route_refused` closes the link; the runtime retries.
+#[test]
+fn a_refused_route_is_closed_and_retried() {
+    let rig = Rig::start(false, |n, head| {
+        if n == 1 {
+            Reply::Refused("unknown_host")
+        } else {
+            ok(n, head)
+        }
+    });
+    rig.proof(1, Duration::from_secs(20));
+    rig.closed(1, Duration::from_secs(5));
+    // The retry: a new connection, a new proof, routed this time.
+    rig.proof(2, RETRY + Duration::from_secs(15));
+    assert!(rig.event(Duration::from_secs(12)).is_none(), "held");
+    let log = rig.runtime_log();
+    assert!(log.contains("host_route refused: unknown_host"), "{log}");
+}
+
+/// (b): an `ok` before the challenge holds nothing: the link is dropped at
+/// the old deadline.
+#[test]
+fn an_unsolicited_ok_never_holds_the_link() {
+    let rig = Rig::start(false, |_, head| Reply::Unsolicited {
+        host_id: HOST.into(),
+        head,
+    });
+    rig.proof(1, Duration::from_secs(20));
+    rig.closed(1, AUTH_DEADLINE + Duration::from_secs(5));
+    let log = rig.runtime_log();
+    assert!(log.contains("ok ignored: no proof was sent"), "{log}");
+}
+
+/// (b): an `ok` naming another host never holds the link.
+#[test]
+fn an_ok_for_another_host_never_holds_the_link() {
+    let rig = Rig::start(false, |_, head| Reply::Ok {
+        host_id: "host-other".into(),
+        head,
+    });
+    rig.proof(1, Duration::from_secs(20));
+    rig.closed(1, AUTH_DEADLINE + Duration::from_secs(5));
+    let log = rig.runtime_log();
+    assert!(log.contains("ok ignored: another host"), "{log}");
+}
+
+/// (b): an `ok` naming a head the host doesn't hold never holds the link.
+#[test]
+fn an_ok_for_an_unknown_head_never_holds_the_link() {
+    let rig = Rig::start(false, |_, head| {
+        let mut unknown = head;
+        unknown["seq"] = json!(unknown["seq"].as_u64().unwrap() + 1);
+        Reply::Ok {
+            host_id: HOST.into(),
+            head: unknown,
+        }
+    });
+    rig.proof(1, Duration::from_secs(20));
+    rig.closed(1, AUTH_DEADLINE + Duration::from_secs(5));
+    let log = rig.runtime_log();
+    assert!(
+        log.contains("ok ignored: a head this host doesn't hold"),
+        "{log}"
+    );
+}
+
+/// (b): a late `ok` (sent after the link it was for dropped, arriving on
+/// the retried link before its challenge) never holds the new link.
+#[test]
+fn a_late_ok_on_a_retried_link_never_holds_it() {
+    let rig = Rig::start(false, |n, head| {
+        if n == 1 {
+            Reply::Nothing
+        } else {
+            Reply::Unsolicited {
+                host_id: HOST.into(),
+                head,
+            }
+        }
+    });
+    rig.proof(1, Duration::from_secs(20));
+    rig.closed(1, AUTH_DEADLINE + Duration::from_secs(5));
+    rig.proof(2, RETRY + Duration::from_secs(15));
+    rig.closed(2, AUTH_DEADLINE + Duration::from_secs(5));
+}
+
+/// A held host answers no challenge (§R9.7b).
 #[test]
 fn a_held_host_answers_no_challenge() {
-    let rig = Rig::start(true);
-    let seen = rig.next_connection();
-    assert_eq!(seen.answer, None);
+    let rig = Rig::start(true, ok);
+    // No proof: the relay gives up on it.
+    match rig.event(Duration::from_secs(20)) {
+        Some(RelayEvent::Closed(1)) => {}
+        other => panic!("{other:?}"),
+    }
     let log = rig.runtime_log();
     assert!(
         log.contains("host_challenge not answered: device list held"),

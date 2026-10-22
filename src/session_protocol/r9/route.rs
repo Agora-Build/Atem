@@ -18,7 +18,9 @@
 //! [`RouteHandle`] the broker keeps current each pass ([`RouteState`]).
 use super::HostKey;
 use atem_client::encoding::Hash32;
-use atem_client::host_route::{HostChallenge, HostRouteBody, host_route_message, sign_host_route};
+use atem_client::host_route::{
+    HostChallenge, HostRouteBody, RelayReply, host_route_message, sign_host_route,
+};
 use atem_client::membership::Head;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,18 @@ pub struct RouteIdentity {
     pub genesis_hash: Hash32,
     pub host_id: String,
     pub head: Head,
+    /// The entry hashes from seq 1 to `head` (a relay's `host_route_ok`
+    /// must name one of them).
+    pub chain: Arc<Vec<Hash32>>,
+}
+
+/// What the relay said of this link's proof (§R9.7b), checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteResult {
+    /// `host_route_ok` naming this host and a head it holds.
+    Routed { host_id: String, head: Head },
+    /// `host_route_refused` with the verifier's code.
+    Refused(String),
 }
 
 /// Whether the host answers a challenge now.
@@ -53,7 +67,6 @@ pub enum RouteState {
         key: Arc<HostKey>,
     },
 }
-
 
 impl RouteState {
     /// The same answer (identity and key) as `other`.
@@ -190,6 +203,62 @@ impl LinkRoute {
     }
 }
 
+impl LinkRoute {
+    /// The relay's reply to this link's proof, or `None` when `text` isn't
+    /// one or is ignored (logged): malformed, before any proof went out,
+    /// naming another host, or a head this host doesn't hold.
+    pub fn on_reply(&mut self, text: &str) -> Option<RouteResult> {
+        let reply = match RelayReply::parse(text.as_bytes())? {
+            Ok(reply) => reply,
+            Err(refusal) => {
+                self.log_reply(&format!("ignored: {refusal}"));
+                return None;
+            }
+        };
+        let (host_id, head) = match reply {
+            RelayReply::Refused { code } => {
+                self.log_reply(&format!("refused: {code}"));
+                return Some(RouteResult::Refused(code));
+            }
+            RelayReply::Ok { host_id, head } => (host_id, head),
+        };
+        if self.answered.is_empty() {
+            self.log_reply("ok ignored: no proof was sent on this link");
+            return None;
+        }
+        let state = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let RouteState::Ready { id, .. } = state else {
+            self.log_reply("ok ignored: the device list can't serve now");
+            return None;
+        };
+        if host_id != id.host_id {
+            self.log_reply("ok ignored: another host");
+            return None;
+        }
+        let known = usize::try_from(head.seq)
+            .ok()
+            .and_then(|seq| id.chain.get(seq.checked_sub(1)?))
+            .is_some_and(|hash| *hash == head.hash);
+        if !known {
+            self.log_reply("ok ignored: a head this host doesn't hold");
+            return None;
+        }
+        self.log_reply(&format!("ok at head {}", head.seq));
+        Some(RouteResult::Routed { host_id, head })
+    }
+
+    fn log_reply(&mut self, line: &str) {
+        if self.lines < MAX_LINES_PER_LINK {
+            self.lines += 1;
+            eprintln!("atem runtime: r9: host_route {line}");
+        }
+    }
+}
+
 /// Whether `text` is a `host_challenge` relay message (by its `op`; the
 /// parse itself is [`LinkRoute::answer`]'s).
 pub fn is_host_challenge(text: &str) -> bool {
@@ -199,4 +268,112 @@ pub fn is_host_challenge(text: &str) -> bool {
             v.get("type").and_then(|t| t.as_str()) == Some("relay")
                 && v.get("op").and_then(|o| o.as_str()) == Some("host_challenge")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use atem_client::host_route::{HostRouteRefusal, RelayReply};
+
+    const ROOM: &str = "astation-room";
+
+    fn ready(log: &TestLog) -> RouteHandle {
+        let handle = new_handle();
+        set(
+            &handle,
+            RouteState::Ready {
+                id: RouteIdentity {
+                    account_id: "acct-1".into(),
+                    genesis_hash: log.log.genesis_hash(),
+                    host_id: "host-1".into(),
+                    head: log.log.head(),
+                    chain: Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+                },
+                key: Arc::new(HostKey::new(&secret("route host"))),
+            },
+        );
+        handle
+    }
+
+    fn ok(host_id: &str, head: Head) -> String {
+        RelayReply::Ok {
+            host_id: host_id.into(),
+            head,
+        }
+        .to_json()
+        .to_string()
+    }
+
+    /// §R9.7b: `host_route_ok` holds the link only after this link sent a
+    /// proof, for this host, at a head it holds (its head or an ancestor);
+    /// anything else is ignored. `host_route_refused` is the relay's code.
+    #[test]
+    fn the_relays_reply_is_taken_only_for_this_links_proof() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        log.add_native("dev-phone", &["control", "view"]);
+        let handle = ready(&log);
+        let head = log.log.head();
+        let mut link = LinkRoute::new(handle.clone(), ROOM, "atem-x");
+        // Unsolicited: no proof went out on this link yet.
+        assert_eq!(link.on_reply(&ok("host-1", head)), None);
+        let challenge = HostChallenge::new(ROOM).to_json().to_string();
+        assert!(link.answer(&challenge).is_some());
+        // Another host, an unknown head, a malformed reply: ignored.
+        assert_eq!(link.on_reply(&ok("host-2", head)), None);
+        let unknown = Head {
+            seq: head.seq + 1,
+            hash: head.hash,
+        };
+        assert_eq!(link.on_reply(&ok("host-1", unknown)), None);
+        let fork = Head {
+            seq: head.seq,
+            hash: Hash32([7; 32]),
+        };
+        assert_eq!(link.on_reply(&ok("host-1", fork)), None);
+        assert_eq!(
+            link.on_reply(r#"{"type":"relay","op":"host_route_ok","v":1,"host_id":"host-1"}"#),
+            None
+        );
+        // Not a reply at all: not ours to take.
+        assert_eq!(
+            link.on_reply(r#"{"type":"relay","op":"push_ack","acks":[]}"#),
+            None
+        );
+        // This host at its head, or at an ancestor: routed.
+        assert_eq!(
+            link.on_reply(&ok("host-1", head)),
+            Some(RouteResult::Routed {
+                host_id: "host-1".into(),
+                head
+            })
+        );
+        let ancestor = Head {
+            seq: 2,
+            hash: log.log.entry(2).unwrap().hash(),
+        };
+        assert!(matches!(
+            link.on_reply(&ok("host-1", ancestor)),
+            Some(RouteResult::Routed { .. })
+        ));
+        // A refusal carries the verifier's code; an unknown code is ignored.
+        let refused = RelayReply::refused(&HostRouteRefusal::StaleLog)
+            .to_json()
+            .to_string();
+        assert_eq!(
+            link.on_reply(&refused),
+            Some(RouteResult::Refused("stale_log".into()))
+        );
+        assert_eq!(
+            link.on_reply(r#"{"type":"relay","op":"host_route_refused","v":1,"code":"nope"}"#),
+            None
+        );
+        // A device list that can't serve any more: an ok is ignored.
+        set(&handle, RouteState::Off("device list held"));
+        assert_eq!(link.on_reply(&ok("host-1", head)), None);
+        // A late ok on a new link (the old one dropped): unsolicited there.
+        let mut next = LinkRoute::new(ready(&log), ROOM, "atem-x");
+        assert_eq!(next.on_reply(&ok("host-1", head)), None);
+    }
 }

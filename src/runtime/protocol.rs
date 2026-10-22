@@ -358,6 +358,10 @@ pub struct RuntimeStatus {
     /// The socket is open but Astation asked to authenticate again.
     #[serde(default)]
     pub reauthenticating: bool,
+    /// The relay link is routed for r9 only on a host route proof
+    /// (§R9.7b): no Astation authenticated it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub routed: bool,
     /// The link has a session attachment (a verified pairing).
     #[serde(default)]
     pub attachment: bool,

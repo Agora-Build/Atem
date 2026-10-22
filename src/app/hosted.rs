@@ -125,7 +125,7 @@ impl App {
     /// An r9 channel envelope for the broker's r9 host (§R9.7a), while the
     /// link is authenticated.
     pub(super) fn channel_envelope(&mut self, text: String) {
-        if !self.astation_connected || self.astation_client.is_ws_closed() {
+        if !self.r9_link_up() {
             return;
         }
         let link = self.astation_link_gen;
@@ -159,7 +159,7 @@ impl App {
     /// link is authenticated; beyond the bound it is dropped (what it
     /// acknowledged is resent and acknowledged again).
     pub(super) fn relay_message(&mut self, text: String) {
-        if !self.astation_connected || self.astation_client.is_ws_closed() {
+        if !self.r9_link_up() {
             return;
         }
         let link = self.astation_link_gen;
@@ -186,7 +186,7 @@ impl App {
     /// An r9 channel envelope refused unread (over its bound): its channel
     /// is closed with `why` by the broker.
     pub(super) fn channel_refused(&mut self, handle: String, why: &'static str) {
-        if !self.astation_connected || self.astation_client.is_ws_closed() {
+        if !self.r9_link_up() {
             return;
         }
         let link = self.astation_link_gen;
@@ -228,11 +228,22 @@ impl App {
             .try_send_wire(error_detail_text(re, code, detail), false);
     }
 
+    /// The link carries r9 traffic: authenticated by Astation, or routed
+    /// for r9 only on a host route proof (§R9.7b); open either way.
+    pub(crate) fn r9_link_up(&self) -> bool {
+        (self.astation_connected || self.astation_routed) && !self.astation_client.is_ws_closed()
+    }
+
     /// Drops the Astation link (closing its socket) and schedules the
     /// normal reconnect, which authenticates it again.
     pub fn drop_astation_link(&mut self, reason: String) {
+        let was_connected = self.astation_connected;
         self.astation_connected = false;
-        self.on_astation_disconnect();
+        self.astation_routed = false;
+        // A routed link was never Astation's: its drop starts no grace.
+        if was_connected {
+            self.on_astation_disconnect();
+        }
         self.astation_client = crate::websocket_client::AstationClient::new();
         self.rebuild_menu();
         self.status_message = Some(reason);

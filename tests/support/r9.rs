@@ -121,6 +121,17 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// The router on link `link` (one the test knows is up, e.g. a relay
+    /// link routed on a host route proof with no Astation).
+    pub fn on(astation: &'a FakeAstation, link: u64) -> Router<'a> {
+        Router {
+            astation,
+            link,
+            channels: HashMap::new(),
+            other: VecDeque::new(),
+        }
+    }
+
     fn pump(&mut self, wait: Duration) -> bool {
         match self.astation.events.recv_timeout(wait) {
             Ok(Event::Message(link, value)) if link == self.link => {

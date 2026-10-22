@@ -84,21 +84,36 @@ async fn link(
     n: u64,
     stream: tokio::net::TcpStream,
     events: mpsc::Sender<Event>,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
 ) {
     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
-    let challenge = json!({"type": "statusUpdate", "data": {"status": "auth_required",
-        "data": {"astation_id": ASTATION, "challenge": "b".repeat(64),
-                 "transport": "lan", "protocol": "2"}}});
     if socket
-        .send(Message::Text(challenge.to_string()))
+        .send(Message::Text(auth_required("lan").to_string()))
         .await
         .is_err()
     {
         return;
     }
+    serve(n, socket, events, commands).await;
+}
+
+/// Astation's `auth_required` for a link over `transport`.
+pub fn auth_required(transport: &str) -> Value {
+    json!({"type": "statusUpdate", "data": {"status": "auth_required",
+        "data": {"astation_id": ASTATION, "challenge": "b".repeat(64),
+                 "transport": transport, "protocol": "2"}}})
+}
+
+/// The rest of a link: Atem's messages as events (an `auth` answered
+/// `authenticated`), the test's commands sent.
+async fn serve(
+    n: u64,
+    mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    events: mpsc::Sender<Event>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+) {
     loop {
         tokio::select! {
             frame = socket.next() => {
@@ -147,4 +162,182 @@ pub fn write_verified_pairing(config: &Path, account: &str, device: &str, trust_
         json!({"version": 1, "astations": {ASTATION: entry}}).to_string(),
     )
     .unwrap();
+}
+
+/// How the fake relay answers a host connection's route proof (§R9.7b).
+#[derive(Clone, Debug)]
+pub enum Reply {
+    /// `host_route_ok` for this host and head after the proof.
+    Ok { host_id: String, head: Value },
+    /// `host_route_ok` before any challenge, then the challenge and no
+    /// reply to the proof.
+    Unsolicited { host_id: String, head: Value },
+    /// `host_route_refused` with this code, then the relay closes.
+    Refused(&'static str),
+    /// No reply to the proof.
+    Nothing,
+}
+
+/// What the fake relay saw of one host connection.
+#[derive(Debug)]
+pub enum RelayEvent {
+    /// The proof Atem sent for this connection's challenge.
+    Proof {
+        link: u64,
+        query: Vec<(String, String)>,
+        nonce: [u8; 32],
+        room: String,
+        message: String,
+    },
+    /// The connection ended (either side).
+    Closed(u64),
+}
+
+impl FakeAstation {
+    /// A relay with no Astation behind it: every host connection
+    /// (`/ws?role=atem&code=…&atem_id=…`) gets `host_challenge` for its
+    /// `code` first and `plan(n)`'s reply to the proof; the link then
+    /// carries what the test sends (an `auth_required` from Astation
+    /// included: an `auth` is answered `authenticated`).
+    pub fn start_relay(
+        plan: impl Fn(u64) -> Reply + Send + Sync + 'static,
+    ) -> (Self, mpsc::Receiver<RelayEvent>) {
+        let (url_tx, url_rx) = mpsc::channel();
+        let (events_tx, events) = mpsc::channel();
+        let (relay_tx, relay) = mpsc::channel();
+        let links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>> =
+            Arc::default();
+        let shared = links.clone();
+        let plan = Arc::new(plan);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                url_tx
+                    .send(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+                let mut next = 0u64;
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    next += 1;
+                    let n = next;
+                    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+                    shared.lock().unwrap().insert(n, cmd_tx);
+                    let reply = plan(n);
+                    tokio::spawn(relay_link(
+                        n,
+                        stream,
+                        reply,
+                        events_tx.clone(),
+                        relay_tx.clone(),
+                        cmd_rx,
+                    ));
+                }
+            });
+        });
+        let url = url_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (Self { url, events, links }, relay)
+    }
+}
+
+fn ok_message(host_id: &str, head: &Value) -> String {
+    json!({"type": "relay", "op": "host_route_ok", "v": 1, "host_id": host_id, "head": head})
+        .to_string()
+}
+
+// The handshake callback's `Err` is tungstenite's own response type.
+#[allow(clippy::result_large_err)]
+async fn relay_link(
+    n: u64,
+    stream: tokio::net::TcpStream,
+    reply: Reply,
+    events: mpsc::Sender<Event>,
+    relay: mpsc::Sender<RelayEvent>,
+    commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+) {
+    let mut query = String::new();
+    let callback = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                    response| {
+        query = request.uri().query().unwrap_or_default().to_owned();
+        Ok(response)
+    };
+    let Ok(mut socket) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
+        return;
+    };
+    let query: Vec<(String, String)> = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_owned(), urlencoding::decode(v).unwrap().into_owned()))
+        .collect();
+    let room = query
+        .iter()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    if let Reply::Unsolicited { host_id, head } = &reply {
+        let _ = socket.send(Message::Text(ok_message(host_id, head))).await;
+    }
+    let challenge = atem_client::host_route::HostChallenge::new(&room);
+    if socket
+        .send(Message::Text(challenge.to_json().to_string()))
+        .await
+        .is_err()
+    {
+        let _ = relay.send(RelayEvent::Closed(n));
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let proof = loop {
+        let frame = tokio::time::timeout_at(deadline, socket.next()).await;
+        let Ok(Some(Ok(frame))) = frame else {
+            break None;
+        };
+        let Message::Text(text) = frame else { continue };
+        if text.contains("\"host_route\"") {
+            break Some(text);
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            let _ = events.send(Event::Message(n, value));
+        }
+    };
+    let Some(message) = proof else {
+        let _ = socket.close(None).await;
+        let _ = relay.send(RelayEvent::Closed(n));
+        return;
+    };
+    let _ = relay.send(RelayEvent::Proof {
+        link: n,
+        query,
+        nonce: challenge.nonce,
+        room,
+        message,
+    });
+    match reply {
+        Reply::Ok { host_id, head } => {
+            if socket
+                .send(Message::Text(ok_message(&host_id, &head)))
+                .await
+                .is_err()
+            {
+                let _ = relay.send(RelayEvent::Closed(n));
+                return;
+            }
+        }
+        Reply::Refused(code) => {
+            let refused =
+                json!({"type": "relay", "op": "host_route_refused", "v": 1, "code": code});
+            let _ = socket.send(Message::Text(refused.to_string())).await;
+            let _ = socket.close(None).await;
+            let _ = relay.send(RelayEvent::Closed(n));
+            return;
+        }
+        Reply::Unsolicited { .. } | Reply::Nothing => {}
+    }
+    serve(n, socket, events, commands).await;
+    let _ = relay.send(RelayEvent::Closed(n));
 }

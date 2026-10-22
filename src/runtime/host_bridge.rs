@@ -549,6 +549,9 @@ pub struct HostBridge {
     /// The pinned host's `host_channel_key`; r9 can't serve without it.
     host_key: Option<std::sync::Arc<HostKey>>,
     host_key_error: Option<String>,
+    /// The device list's entry hashes up to its head, built once per head
+    /// (§R9.7b: a relay's `host_route_ok` must name one of them).
+    route_chain: std::cell::RefCell<Option<std::sync::Arc<Vec<atem_client::encoding::Hash32>>>>,
     /// The loaded key's public half (b64u), to tell a re-pin's new key.
     host_pub: Option<String>,
     /// Envelopes of an ended link generation dropped so far.
@@ -725,6 +728,7 @@ impl HostBridge {
             host_pub,
             stale_envelopes: 0,
             host_key_error,
+            route_chain: Default::default(),
             list_stamp,
             host,
             dir: dir.to_path_buf(),
@@ -1022,12 +1026,25 @@ impl HostBridge {
             return RouteState::Off("device list held");
         }
         let log = m.membership();
+        let head = m.head();
+        let mut cached = self.route_chain.borrow_mut();
+        let current = cached.as_ref().is_some_and(|chain| {
+            usize::try_from(head.seq).is_ok_and(|n| chain.len() == n)
+                && chain.last() == Some(&head.hash)
+        });
+        if !current {
+            *cached = Some(std::sync::Arc::new(
+                log.entries().iter().map(|e| e.hash()).collect(),
+            ));
+        }
+        let chain = cached.clone().expect("built above");
         RouteState::Ready {
             id: RouteIdentity {
                 account_id: log.account_id().to_owned(),
                 genesis_hash: log.genesis_hash(),
                 host_id: m.pin_of().host_id.clone(),
-                head: m.head(),
+                head,
+                chain,
             },
             key: key.clone(),
         }
@@ -1433,7 +1450,7 @@ impl HostBridge {
             // `atem unpair` (or a new pairing) changed the pairing this link
             // authenticated under, even if no `reload` reached the runtime:
             // drop the link with its attachment.
-            let stale = app.astation_connected
+            let stale = (app.astation_connected || app.astation_routed)
                 && app
                     .astation_client
                     .capture()
@@ -1454,7 +1471,7 @@ impl HostBridge {
                 eprintln!("atem runtime: {error}");
             }
         }
-        self.sync_r9_link(app_link(app), &mut cx);
+        self.sync_r9_link(r9_app_link(app), &mut cx);
         if !adopting
             && app
                 .hosted
@@ -3898,6 +3915,13 @@ impl ProjectHasher for NoHasher {
     fn hash(&self, _: &[(String, String)]) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("no profile")
     }
+}
+
+/// The link generation r9 traffic runs on: authenticated by Astation, or
+/// routed for r9 only on a host route proof (§R9.7b). Never while Astation
+/// is authenticating it again.
+fn r9_app_link(app: &App) -> Option<u64> {
+    (app.r9_link_up() && app.astation_reauth.is_none()).then_some(app.astation_link_gen)
 }
 
 fn app_link(app: &App) -> Option<u64> {

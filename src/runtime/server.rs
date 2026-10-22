@@ -1108,7 +1108,8 @@ impl Server {
         use crate::websocket_client::LinkVia;
         let app = &self.app;
         let connected = app.astation_connected && !app.astation_client.is_ws_closed();
-        let (transport, relay) = match app.astation_client.via().filter(|_| connected) {
+        let routed = app.astation_routed && !connected && !app.astation_client.is_ws_closed();
+        let (transport, relay) = match app.astation_client.via().filter(|_| connected || routed) {
             Some(LinkVia::Local) => (Some(Transport::Local), None),
             Some(LinkVia::Relay { label }) => (Some(Transport::Relay), Some(label.clone())),
             None => (None, None),
@@ -1125,6 +1126,7 @@ impl Server {
             retrying: !connected
                 && (app.astation_connect_rx.is_some() || app.astation_reconnect_at.is_some()),
             reauthenticating: connected && app.astation_reauth.is_some(),
+            routed: routed && app.astation_reauth.is_none(),
             attachment: link.as_ref().is_some_and(|l| l.attachment),
             welcomed: link.as_ref().and_then(|l| l.welcomed.clone()),
             refused: link.as_ref().and_then(|l| l.refused.clone()),

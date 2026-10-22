@@ -20,7 +20,9 @@ impl App {
         if is_auth_required(message) {
             // Only a connection that authenticated before is challenged again;
             // anything else here is a socket the TUI already gave up on.
-            if self.astation_connected || self.astation_reauth.is_some() {
+            // A link routed for r9 only (§R9.7b) is authenticated the same
+            // way, which makes it Astation's.
+            if self.astation_connected || self.astation_routed || self.astation_reauth.is_some() {
                 self.answer_astation_challenge(message).await;
             }
             return true;
@@ -30,7 +32,7 @@ impl App {
         }
         let astation_id = self
             .astation_client
-            .connected_astation_id()
+            .pinned_astation_id()
             .unwrap_or_default()
             .to_string();
         match self
@@ -108,9 +110,12 @@ impl App {
     /// schedule (saved session only, never pairing) takes over.
     fn fail_astation_reauth(&mut self, reason: String) {
         self.astation_reauth = None;
+        let routed = std::mem::take(&mut self.astation_routed);
         self.suspend_astation();
         self.status_message = Some(reason);
-        self.on_astation_disconnect();
+        if !routed {
+            self.on_astation_disconnect();
+        }
         // Dropping the client aborts its transport, closing the socket.
         self.astation_client = AstationClient::new();
         self.astation_reconnect_at = Some(Instant::now());
@@ -119,6 +124,8 @@ impl App {
     /// Back online, as a new link: the session host gives it a new
     /// attachment (clients `hello` again); no lease or input is resumed.
     async fn finish_astation_reauth(&mut self) {
+        // A routed link (§R9.7b) is Astation's from now on.
+        self.astation_client.upgrade_routed();
         // A success for a pairing or session replaced meanwhile (atem unpair,
         // atem pair) is dropped: nothing is refreshed and the link stays down.
         if let Err(error) = self.astation_client.refresh_session() {
@@ -126,8 +133,13 @@ impl App {
             return;
         }
         self.astation_reauth = None;
+        let upgraded = std::mem::take(&mut self.astation_routed);
         self.astation_connected = true;
         self.astation_link_gen += 1;
+        if upgraded {
+            eprintln!("atem runtime: r9: Astation authenticated the routed relay link");
+            let _ = self.astation_client.report_credential_projects().await;
+        }
         self.rebuild_menu();
         self.status_message = Some("Astation reconnected".to_string());
     }

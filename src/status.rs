@@ -485,6 +485,8 @@ pub fn runtime_lines(look: &Look, hhmm: impl Fn(u64) -> String) -> (Line, Line, 
         "paused (journal halted; run atem runtime restart)".into()
     } else if status.reauthenticating {
         "not authorized (Astation is authenticating the link again)".into()
+    } else if !status.astation && status.routed {
+        "r9 routed (no Astation)".into()
     } else if !status.astation {
         "not authorized (Astation not connected)".into()
     } else if !status.attachment {
@@ -511,6 +513,10 @@ pub fn runtime_lines(look: &Look, hhmm: impl Fn(u64) -> String) -> (Line, Line, 
         "not authorized (Astation connected but no session hello yet)".into()
     };
     let relay = match (status.astation || status.reauthenticating, status.transport) {
+        (false, Some(Transport::Relay)) if status.routed => match &status.relay {
+            Some(label) => format!("routed via relay ({label}; no Astation)"),
+            None => "routed via relay (no Astation)".into(),
+        },
         (true, Some(Transport::Relay)) => match &status.relay {
             Some(label) => format!("connected via relay ({label})"),
             None => "connected via relay".into(),
@@ -1352,6 +1358,24 @@ pub(crate) mod tests {
             ..connected(Transport::Local)
         };
         assert!(lines(&running(unverified))[0].contains("isn't a verified pairing"));
+    }
+
+    /// §R9.7b: a relay link routed for r9 only, no Astation.
+    #[test]
+    fn a_routed_link_says_so() {
+        let routed = RuntimeStatus {
+            astation: false,
+            attachment: false,
+            routed: true,
+            ..connected(Transport::Relay)
+        };
+        assert_eq!(
+            lines(&running(routed))[..2],
+            [
+                "r9 routed (no Astation)",
+                "routed via relay (station.agora.build as Genie-dc1649f-956631ec; no Astation)"
+            ]
+        );
     }
 
     #[test]

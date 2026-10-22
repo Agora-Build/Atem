@@ -68,6 +68,12 @@ pub struct App {
     pub status_message: Option<String>,
     pub astation_client: AstationClient,
     pub astation_connected: bool,
+    /// Inside `atem runtime`: the relay link is routed for r9 only on a host
+    /// route proof (§R9.7b), no Astation authenticated it. It carries channel
+    /// envelopes and push relay messages, nothing of Astation's; held
+    /// (no reconnect) until it drops, is refused, or Astation's
+    /// `auth_required` makes it an authenticated link.
+    pub astation_routed: bool,
     /// Counts the times the Astation link became authenticated (a connect or
     /// a re-authentication): the session host gives each one its own attachment.
     pub astation_link_gen: u64,
@@ -135,6 +141,7 @@ impl App {
             status_message: None,
             astation_client: AstationClient::new(),
             astation_connected: false,
+            astation_routed: false,
             astation_link_gen: 0,
             astation_reconnect: true,
             hosted: None,
@@ -425,7 +432,7 @@ impl App {
     /// Spawn a background task that connects to Astation without blocking.
     /// Poll the result each loop tick with `poll_astation_connect()`.
     pub fn spawn_astation_connect(&mut self) {
-        if self.astation_connected || self.astation_connect_rx.is_some() {
+        if self.astation_connected || self.astation_routed || self.astation_connect_rx.is_some() {
             return;
         }
         // Pairing can learn the relay identity while the TUI is already running.
@@ -496,6 +503,20 @@ impl App {
     pub fn poll_astation_connect(&mut self) {
         if let Some(rx) = &mut self.astation_connect_rx {
             match rx.try_recv() {
+                Ok(Ok((client, code))) if client.routed() => {
+                    // §R9.7b: the relay routed this host on its proof; no
+                    // Astation authenticated the link (r9 traffic only).
+                    self.astation_connect_rx = None;
+                    self.astation_reconnect_at = None;
+                    self.astation_client = client;
+                    self.astation_routed = true;
+                    self.astation_link_gen += 1;
+                    self.astation_connect_error = None;
+                    self.pairing_code = code;
+                    self.rebuild_menu();
+                    eprintln!("atem runtime: r9: relay route held (no Astation)");
+                    self.status_message = Some("Relay route held (no Astation)".to_string());
+                }
                 Ok(Ok((client, code))) => {
                     self.astation_connect_rx = None;
                     self.astation_reconnect_at = None; // Clear any pending retry
@@ -536,6 +557,24 @@ impl App {
 
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
         if self.intercept_astation_reauth(&message).await {
+            return;
+        }
+        // §R9.7b: a link routed for r9 only serves channel envelopes and
+        // push relay messages; nothing of Astation's (operations,
+        // credentials, encryption, mark tasks, r8 session messages).
+        if self.astation_routed && !self.astation_connected {
+            match message {
+                AstationMessage::Channel(text) => self.channel_envelope(text),
+                AstationMessage::Relay(text) => self.relay_message(text),
+                AstationMessage::ChannelTooLarge(handle) => self.channel_refused(
+                    handle,
+                    crate::session_protocol::r9::envelope::reason::TOO_LARGE,
+                ),
+                AstationMessage::HostRouteRefused(code) => {
+                    self.drop_astation_link(format!("The relay refused this host's route ({code}); reconnecting"));
+                }
+                _ => {}
+            }
             return;
         }
         // A running pairing or unlock's replies are its own.
@@ -918,6 +957,13 @@ impl App {
         self.check_astation_reauth_deadline();
 
         // Detect WebSocket disconnect (channel closed after draining remaining messages)
+        if self.astation_routed && self.astation_client.is_ws_closed() {
+            // The routed link dropped: reconnect as today.
+            self.astation_routed = false;
+            self.astation_client = crate::websocket_client::AstationClient::new();
+            self.astation_reconnect_at = Some(Instant::now());
+            self.status_message = Some("The relay route dropped — reconnecting…".to_string());
+        }
         if self.astation_connected && self.astation_client.is_ws_closed() {
             self.astation_connected = false;
             self.on_astation_disconnect();
@@ -942,7 +988,7 @@ impl App {
     /// This means the retry timer only counts awake time — no battery drain while
     /// the device is suspended, and no OS wake lock is held.
     pub fn check_astation_reconnect(&mut self) {
-        if self.astation_connected || self.astation_connect_rx.is_some() {
+        if self.astation_connected || self.astation_routed || self.astation_connect_rx.is_some() {
             // Already connected or a connect attempt is already in flight — clear retry
             self.astation_reconnect_at = None;
             return;
