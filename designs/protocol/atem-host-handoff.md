@@ -694,10 +694,21 @@ Router obligations (the relay and Astation's :8080):
   expiry (wall and monotonic). An r9 host keeps its Astation link past the
   r8 attachment's 24 h (that attachment is never welcomed). §R9.6,
   §R9.7 "Limits".
-- **Host route proof.** On every new host connection the relay sends
+- **Host route proof.** Two carriers. (A) owner-present room: while the
+  paired Astation (the Mac) is in the room, the host joins and
+  authenticates to it as before, no proof required; pairing, the first
+  device verification, a managing device's reconciliation of a held host
+  and everything else while the Mac is online use (A), and the relay
+  never isolates or refuses a host on (A) for lack of a proof. (B)
+  proved host route: only to create or hold the room without its owner
+  and to route r9 channel traffic independently; isolation, binding and
+  fencing below apply to (B) only. A held, frozen, faulted or unpinned
+  host answers no challenge and only has (A). On every new host
+  connection the relay sends
   `{"type":"relay","op":"host_challenge","v":1,"nonce","room"}` before
-  anything is routed, even when the ephemeral room is gone; it keeps the
-  candidate socket isolated (never replacing the incumbent) until
+  anything is routed over (B), even when the ephemeral room is gone; it
+  keeps the candidate socket isolated from (B) traffic (never replacing
+  the incumbent route) until
   `atem_client::host_route::verify_host_route_message` accepts the
   `host_route` answer against its current durable log (membership and
   key at that head, never at the proof's `head`; refusal codes
@@ -708,8 +719,8 @@ Router obligations (the relay and Astation's :8080):
   connection across replicas before exposing the route. Removal or
   replacement of the host drops the binding and closes the connection; a
   bound live route survives presence sweeps; nothing is replayed. No
-  valid proof, no routing: no fallback to the query-string `atem_id`,
-  the room code, a login or an old pairing. Atem answers on its relay
+  valid proof, no route of its own (B): no fallback to the query-string
+  `atem_id`, the room code, a login or an old pairing. Atem answers on its relay
   identity link in the link's reader, before and independent of
   Astation's authentication, once per challenge, only with a pinned list
   that can serve (not held, frozen or faulted). After verifying, the
@@ -723,8 +734,14 @@ Router obligations (the relay and Astation's :8080):
   another host or a head it doesn't hold is ignored). `type:"relay"`
   messages are never forwarded between room members. If Astation denies
   the routed link's authentication, the link stays routed for r9 (advice
-  logged, no reconnect until Astation challenges again). A held host
-  proves no route: reconciling it needs the Mac online. Vectors
+  logged, no reconnect until Astation challenges again). The verdict may
+  come before or after the relay exposes the host to the room's owner:
+  with `auth_required` first, Atem records a valid `ok` that arrives
+  while it waits for Astation's reply (or within 10 s after Astation
+  failed, its proof sent), is routed, and Astation's grant upgrades the
+  link while a denial, expiry or timeout leaves it routed. A held host
+  proves no route: it is reconciled over (A), the Mac in the room
+  authenticating its relay link (tested over the fake relay). Vectors
   `r9-vectors-host-route` (`relay_replies` for the two verdicts); the real
   runtime with no Astation online: `cargo test --test
   r9_host_route_binary`. §R9.7b.

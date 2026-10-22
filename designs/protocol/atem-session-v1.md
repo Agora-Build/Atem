@@ -2916,17 +2916,38 @@ another client's channel (`atem-client-bindings.md`).
 
 An enrolled r9 host restores its own relay route with no Astation online
 (after a host or relay restart, a lost ephemeral directory, an expired
-room): the relay routes to a host only once the host proved, against the
-signed device list, that it may hold the route. A query-string `atem_id`,
-the room code, an account login or an old pairing never creates that
-authority, and nothing falls back to them. Messages travel on the host's
-existing outbound link inside the relay envelope (`{"type":"relay",…}`);
-Atem opens no port.
+room): the relay creates or holds a room for a host without its owner
+only once the host proved, against the signed device list, that it may
+hold the route. A query-string `atem_id`, the room code, an account login
+or an old pairing never creates that authority, and nothing falls back to
+them. Messages travel on the host's existing outbound link inside the
+relay envelope (`{"type":"relay",…}`); Atem opens no port.
+
+**Two carriers.** A host's relay link reaches the room one of two ways:
+
+- **(A) Owner-present room** (today's path). While the paired Astation
+  (the Mac, the room's owner) is in the room, the host joins it and
+  authenticates to that Astation as before (`auth_required` → the saved
+  session's proof, or pairing), with no route proof required. Pairing,
+  initial device verification (no pinned list yet), reconciliation of a
+  held host by a managing device (R9.3, its channel carried on the
+  Astation-authenticated link), and everything else while the Mac is
+  online use (A). The relay must not isolate or refuse a host on (A) for
+  lack of a proof; Astation's authentication is the authority there, as
+  in r8.
+- **(B) Proved host route.** Only to create or hold the room without its
+  owner (the Mac offline), and to route r9 channel traffic independently
+  of Astation's authentication: the challenge, proof and verdict below.
+  Candidate isolation until verification, the durable binding and
+  fencing (relay obligations) apply to (B) only.
+
+A held, frozen or faulted host, and a host without a pinned list,
+answers no challenge, so it only ever has carrier (A).
 
 **Wire.**
 
 1. Challenge (relay → host), on every new host connection, before
-   anything is routed:
+   anything is routed over (B):
    `{"type":"relay","op":"host_challenge","v":1,"nonce":"<b64u, 32 random bytes>","room":"<room code>"}`
 2. Proof (host → relay), at most once per challenge, only by a host with
    a pinned device list:
@@ -2986,9 +3007,12 @@ proof signed with the old key.
 - The challenge must be reachable even when the ephemeral room is
   absent (after a sweep, a restart with a fresh directory): an enrolled
   host's connection is accepted and challenged, never answered 404.
-- Keep the candidate socket isolated until its proof verifies against
-  the relay's current durable log: nothing is routed to or from it
-  before, and it never replaces the incumbent before verification.
+- (B) only: keep the candidate socket isolated from proved-route
+  traffic until its proof verifies against the relay's current durable
+  log: nothing is routed to or from it over (B) before, and it never
+  replaces the incumbent (B) route before verification. This never
+  isolates a host on carrier (A): the room's owner present, its
+  `auth_required` and the host's authentication flow as before.
 - Keep a durable binding `(genesis_hash, host_id) → room/atem_id`.
   Persist it, and fence the replaced connection across replicas, before
   the new route is exposed; a newly verified proof replaces and fences
@@ -2998,12 +3022,34 @@ proof signed with the old key.
   pairing rooms keep their bounded lifetime.
 - Fresh connections and channels after every recovery; nothing is
   replayed (ciphertext, leases, uncertain submissions).
-- Without a valid proof an r9 host gets no routing. There is no fallback.
+- Without a valid proof an r9 host gets no route of its own (B): no room
+  created or held for it without its owner, and no r9 traffic routed to
+  it except over (A) while the owner is present and authenticated it.
+  There is no other fallback.
 - `type:"relay"` messages (`host_challenge`, `host_route`, the verdicts,
   push) are relay-originated or relay-consumed only: never forwarded
   between room members (a peer's `host_challenge` reaching the host, or
   the host's `host_route` reaching a peer, would make the host a signing
   oracle for another connection's nonce).
+- The verdict may be sent before or after the relay exposes the host to
+  the room's owner (Astation's `auth_required`); the host handles both
+  orders (below).
+
+**Ordering.** A valid `host_route_ok` counts whichever order it arrives
+in relative to Astation's `auth_required` and its auth replies on the
+same link. Verdict first: the link is routed, and a later
+`auth_required` authenticates it as below. `auth_required` first: the
+host answers it as on any link and records a valid verdict that arrives
+while it waits for Astation's reply (never consumed and ignored); once
+the verdict is recorded the link is routed and Astation's reply finishes
+that authentication as on a link routed first: a grant makes it an
+authenticated Astation link, a denial, an expiry or no reply within the
+bound leaves it routed (the held-link rule below: advice surfaced, no
+reconnect until the next `auth_required`, backoff unchanged). If
+Astation's reply fails before the verdict arrived and this link's proof
+went out, the host waits for the verdict up to 10 s more and is routed
+on an `ok`. The verdict rules are unchanged: only after this link's
+proof, only the first one.
 
 **The held link.** The verdict sustains the r9 carrier only. On
 `host_route_ok` (strictly parsed; its `host_id` this host's and its `head`
@@ -3059,8 +3105,11 @@ authority for nothing else and is never passed on. A relay that sends no
 challenge changes nothing. A local (loopback/LAN) link never answers.
 
 A held, frozen or faulted host answers no challenge, so it proves no
-route: reconciling a held host (R9.3, a managing device's `hello`) needs
-a link Astation authenticated, i.e. the Mac online.
+route and only has carrier (A): reconciling a held host (R9.3, a
+managing device's `hello` in a channel) runs over its relay link once
+the Mac in the room authenticated it, which the relay never blocks for
+lack of a proof. The same holds for pairing and the first device
+verification (no pinned list yet).
 
 Vectors: `r9-vectors-host-route` (proofs at the head, at an ancestor, on
 a verifier ahead, after a key rotation; refused: extra fields in the
