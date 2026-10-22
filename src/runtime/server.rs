@@ -1077,12 +1077,12 @@ impl Server {
                     .astation_client
                     .capture()
                     .is_some_and(|capture| capture.check().is_err());
-                if self.app.astation_connected && stale {
+                if (self.app.astation_connected || self.app.astation_routed) && stale {
                     self.app.drop_astation_link(
                         "The Astation pairing changed; the link was dropped".into(),
                     );
                 }
-                if !self.app.astation_connected {
+                if !self.app.astation_connected && !self.app.astation_routed {
                     // Credentials or pairing may have changed: try again now.
                     self.app.astation_reconnect_at = Some(Instant::now());
                 }
@@ -1108,6 +1108,7 @@ impl Server {
         use crate::websocket_client::LinkVia;
         let app = &self.app;
         let connected = app.astation_connected && !app.astation_client.is_ws_closed();
+        // Shown while Astation authenticates it too (§R9.7b).
         let routed = app.astation_routed && !connected && !app.astation_client.is_ws_closed();
         let (transport, relay) = match app.astation_client.via().filter(|_| connected || routed) {
             Some(LinkVia::Local) => (Some(Transport::Local), None),
@@ -1126,7 +1127,7 @@ impl Server {
             retrying: !connected
                 && (app.astation_connect_rx.is_some() || app.astation_reconnect_at.is_some()),
             reauthenticating: connected && app.astation_reauth.is_some(),
-            routed: routed && app.astation_reauth.is_none(),
+            routed,
             attachment: link.as_ref().is_some_and(|l| l.attachment),
             welcomed: link.as_ref().and_then(|l| l.welcomed.clone()),
             refused: link.as_ref().and_then(|l| l.refused.clone()),
@@ -1229,7 +1230,12 @@ impl Server {
                 reply,
             } => {
                 self.op_waiting = Some((encryption, credentials, reply));
-                if !self.app.astation_connected && self.app.astation_connect_rx.is_none() {
+                // A routed link (§R9.7b) retries nothing: its last advice,
+                // if Astation refused it, answers the operation.
+                if !self.app.astation_connected
+                    && !self.app.astation_routed
+                    && self.app.astation_connect_rx.is_none()
+                {
                     // Try now rather than at the next retry; only that
                     // attempt's failure answers this operation.
                     self.app.astation_connect_error = None;
@@ -1286,7 +1292,12 @@ impl Server {
         }
         if !self.app.astation_connected
             && self.op_waiting.is_some()
-            && let Some(advice) = self.app.astation_connect_error.take()
+            && let Some(advice) = if self.app.astation_routed {
+                // Kept for every operation until Astation authenticates it.
+                self.app.astation_connect_error.clone()
+            } else {
+                self.app.astation_connect_error.take()
+            }
             && let Some((_, _, reply)) = self.op_waiting.take()
         {
             let _ = reply.send(Err(advice));

@@ -27,9 +27,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use support::astation::{
-    ASTATION, Event, FakeAstation, RelayEvent, Reply, auth_required, write_verified_pairing,
+    ASTATION, AuthReply, Event, FakeAstation, RelayEvent, Reply, auth_required,
+    write_verified_pairing,
 };
-use support::r9::{Router, write_pin};
+use support::r9::{Out, Router, write_pin};
 use support::r9log::{TestLog, auth, secret};
 use support::{Sandbox, within};
 
@@ -225,20 +226,22 @@ fn a_routed_host_is_held_for_r9_only_until_astation_authenticates_it() {
     while let Some(v) = router.other_within(until.saturating_duration_since(Instant::now())) {
         assert_ne!(v["type"], "session", "an r8 reply on the routed link: {v}");
     }
-    // Astation authenticates the same link later: it becomes Astation's.
+    // Astation authenticates the same link later (granting a new session,
+    // as on a connect): it becomes Astation's, the session is saved, and
+    // the channel opened while it was routed is closed (a new link
+    // generation; the phone connects again).
+    *rig.relay.auth.lock().unwrap() = AuthReply::Grant {
+        session_id: "session-2".into(),
+        token: "token-2".into(),
+    };
     rig.relay.send(1, auth_required("relay").to_string());
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match rig.relay.events.recv_timeout(left) {
-            Ok(Event::Authenticated(1)) => break,
-            Ok(_) => {}
-            Err(_) => panic!(
-                "Astation never authenticated the link\n{}",
-                rig.runtime_log()
-            ),
-        }
+    match router.next("ph1") {
+        Out::Close(reason) => assert_eq!(reason.as_deref(), Some("closed")),
+        Out::Frame(_) => panic!("ph1 wasn't closed on the upgrade"),
     }
+    within("the granted session to be saved", || {
+        support::profile::saved_session_id(&rig.sandbox.config()).as_deref() == Some("session-2")
+    });
     within("the status to show Astation", || {
         let status = rig.status();
         !status.contains("r9 routed") && status.contains("connected via relay (")
@@ -248,6 +251,108 @@ fn a_routed_host_is_held_for_r9_only_until_astation_authenticates_it() {
             .contains("Astation authenticated the routed relay link")
     );
     assert!(rig.event(Duration::from_millis(500)).is_none(), "same link");
+}
+
+/// H1: Astation is online but denies the routed link's authentication:
+/// the link stays routed for r9 (the phone stays admitted and served), the
+/// session advice is logged and answers a waiting command at once, and
+/// nothing reconnects until Astation challenges again.
+#[test]
+fn a_denied_astation_authentication_keeps_the_routed_link() {
+    let rig = Rig::start_with(false, false, ok);
+    rig.proof(1, Duration::from_secs(20));
+    within("the route to be held", || {
+        rig.runtime_log().contains("relay route held (no Astation)")
+    });
+    let mut router = Router::on(&rig.relay, 1);
+    let phone = Identity::native("dev-phone", auth("dev-phone"));
+    let mut attached = router
+        .connect("ph1", &rig.log, HOST, &phone)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    *rig.relay.auth.lock().unwrap() = AuthReply::Deny("session revoked".into());
+    rig.relay.send(1, auth_required("relay").to_string());
+    within("the denial to be logged", || {
+        rig.runtime_log()
+            .contains("Astation didn't authenticate the routed relay link")
+    });
+    let log = rig.runtime_log();
+    assert!(log.contains("expired or was refused"), "{log}");
+    // The phone is still admitted and served on the same channel.
+    assert!(router.list("ph1", &mut attached).is_empty());
+    // No reconnect: one connection at the relay, still open.
+    assert!(
+        rig.event(AUTH_DEADLINE + Duration::from_secs(2)).is_none(),
+        "the link was dropped or a new connection opened\n{}",
+        rig.runtime_log()
+    );
+    assert!(rig.status().contains("r9 routed (no Astation)"));
+    // An Astation operation gets the advice at once (no 15 s wait).
+    let started = Instant::now();
+    let (out, err, ok) = rig.sandbox.atem(&["pair", "verify"]);
+    let text = format!("{out}{err}");
+    assert!(!ok, "{text}");
+    assert!(text.contains("expired or was refused"), "{text}");
+    assert!(started.elapsed() < Duration::from_secs(10), "{text}");
+    // Astation challenges again and accepts: the link becomes Astation's.
+    *rig.relay.auth.lock().unwrap() = AuthReply::Authenticated;
+    rig.relay.send(
+        1,
+        auth_required("relay")
+            .to_string()
+            .replace(&"b".repeat(64), &"c".repeat(64)),
+    );
+    within("the upgrade", || {
+        rig.runtime_log()
+            .contains("Astation authenticated the routed relay link")
+    });
+    assert!(rig.event(Duration::from_millis(500)).is_none(), "same link");
+}
+
+/// M1: a later `host_challenge` on a routed link is ignored (one per link).
+#[test]
+fn a_routed_link_answers_no_second_challenge() {
+    let rig = Rig::start(false, ok);
+    rig.proof(1, Duration::from_secs(20));
+    within("the route to be held", || {
+        rig.runtime_log().contains("relay route held (no Astation)")
+    });
+    let challenge = atem_client::host_route::HostChallenge::new(ASTATION);
+    rig.relay.send(1, challenge.to_json().to_string());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while let Ok(event) = rig
+        .relay
+        .events
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        if let Event::Message(_, v) = event {
+            assert_ne!(v["op"], "host_route", "a second proof: {v}");
+        }
+    }
+    let log = rig.runtime_log();
+    assert!(
+        log.contains("host_challenge ignored: the link is already routed or authenticated"),
+        "{log}"
+    );
+}
+
+/// M2: a `host_route_refused` before this link's proof is not its verdict:
+/// ignored, and the proof's `ok` then routes the link.
+#[test]
+fn a_refusal_before_the_proof_is_ignored() {
+    let rig = Rig::start(false, |_, head| Reply::RefusedFirst {
+        host_id: HOST.into(),
+        head,
+    });
+    rig.proof(1, Duration::from_secs(20));
+    within("the route to be held", || {
+        rig.runtime_log().contains("relay route held (no Astation)")
+    });
+    let log = rig.runtime_log();
+    assert!(
+        log.contains("host_route refused ignored: no proof was sent on this link"),
+        "{log}"
+    );
+    assert!(rig.event(Duration::from_secs(2)).is_none(), "held");
 }
 
 /// Route acknowledgement only carries r9: an Astation operation (`atem

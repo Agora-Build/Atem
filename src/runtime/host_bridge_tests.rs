@@ -4332,7 +4332,7 @@ fn the_welcome_line_names_the_trust_generation() {
 fn the_host_route_is_answered_only_with_a_pinned_list_that_can_serve() {
     use crate::session_protocol::membership::r9log::{TestLog, secret};
     use crate::session_protocol::membership::{HostPin, MembershipHost};
-    use crate::session_protocol::r9::route::{self, LinkRoute, MAX_ANSWERS_PER_LINK, RouteState};
+    use crate::session_protocol::r9::route::{self, LinkRoute, RouteState};
     use atem_client::host_route::{HostChallenge, verify_host_route_message};
     const ROOM: &str = "astation-room";
     const ATEM_ID: &str = "hosta-0000000-1a2b3c4d";
@@ -4374,18 +4374,17 @@ fn the_host_route_is_answered_only_with_a_pinned_list_that_can_serve() {
         .unwrap();
     assert_eq!(route.host_id, DEVICE);
     assert_eq!(route.head, log.log.head());
-    // Once per challenge; never for another room; a malformed one ignored.
+    // One challenge per link: a repeat or a new one is ignored.
     assert_eq!(link.answer(&text), None);
-    assert_eq!(link.answer(&challenge("another-room")), None);
+    assert_eq!(link.answer(&challenge(ROOM)), None, "one per link");
+    // Never for another room; a malformed one ignored.
+    let mut fresh = LinkRoute::new(handle.clone(), ROOM, ATEM_ID);
+    assert_eq!(fresh.answer(&challenge("another-room")), None);
     assert_eq!(
-        link.answer(r#"{"type":"relay","op":"host_challenge","v":1,"room":"astation-room"}"#),
+        fresh.answer(r#"{"type":"relay","op":"host_challenge","v":1,"room":"astation-room"}"#),
         None
     );
-    // Each new challenge once, up to the bound per link.
-    for _ in 1..MAX_ANSWERS_PER_LINK {
-        assert!(link.answer(&challenge(ROOM)).is_some());
-    }
-    assert_eq!(link.answer(&challenge(ROOM)), None, "bounded per link");
+    assert!(fresh.answer(&challenge(ROOM)).is_some());
     drop(bridge);
 
     // Held (a fault record): nothing.

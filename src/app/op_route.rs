@@ -123,6 +123,7 @@ impl App {
         self.connected_astation_id = client.connected_astation_id().map(str::to_string);
         self.astation_client = client;
         self.astation_connected = true;
+        self.astation_routed = false;
         self.astation_link_gen += 1;
         self.pairing_code = None;
         self.last_session_refresh = Some(Instant::now());

@@ -24,9 +24,23 @@ enum Cmd {
     Close,
 }
 
+/// How the fake answers Atem's `auth` (its proof).
+#[derive(Clone, Debug, Default)]
+pub enum AuthReply {
+    /// `authenticated` (no session granted).
+    #[default]
+    Authenticated,
+    /// `auth{status: granted}` with a new session to save.
+    Grant { session_id: String, token: String },
+    /// `auth{status: denied}` with this message.
+    Deny(String),
+}
+
 pub struct FakeAstation {
     pub url: String,
     pub events: mpsc::Receiver<Event>,
+    /// How every link answers an `auth` from now on.
+    pub auth: Arc<Mutex<AuthReply>>,
     /// The command channel of each connection, by number.
     links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>>,
 }
@@ -38,6 +52,8 @@ impl FakeAstation {
         let links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>> =
             Arc::default();
         let shared = links.clone();
+        let auth: Arc<Mutex<AuthReply>> = Arc::default();
+        let answers = auth.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -58,12 +74,17 @@ impl FakeAstation {
                     let events = events_tx.clone();
                     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
                     shared.lock().unwrap().insert(n, cmd_tx);
-                    tokio::spawn(link(n, stream, events, cmd_rx));
+                    tokio::spawn(link(n, stream, events, cmd_rx, answers.clone()));
                 }
             });
         });
         let url = url_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        Self { url, events, links }
+        Self {
+            url,
+            events,
+            auth,
+            links,
+        }
     }
 
     pub fn send(&self, link: u64, text: String) {
@@ -85,6 +106,7 @@ async fn link(
     stream: tokio::net::TcpStream,
     events: mpsc::Sender<Event>,
     commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    auth: Arc<Mutex<AuthReply>>,
 ) {
     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
@@ -96,7 +118,7 @@ async fn link(
     {
         return;
     }
-    serve(n, socket, events, commands).await;
+    serve(n, socket, events, commands, auth).await;
 }
 
 /// Astation's `auth_required` for a link over `transport`.
@@ -113,6 +135,7 @@ async fn serve(
     mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     events: mpsc::Sender<Event>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    auth: Arc<Mutex<AuthReply>>,
 ) {
     loop {
         tokio::select! {
@@ -121,12 +144,25 @@ async fn serve(
                 let Message::Text(text) = frame else { continue };
                 let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
                 if value["type"] == "statusUpdate" && value["data"]["status"] == "auth" {
-                    let ok = json!({"type": "statusUpdate",
-                                    "data": {"status": "authenticated", "data": {}}});
-                    if socket.send(Message::Text(ok.to_string())).await.is_err() {
+                    let answer = auth.lock().unwrap().clone();
+                    let (reply, accepted) = match answer {
+                        AuthReply::Authenticated => (json!({"type": "statusUpdate",
+                            "data": {"status": "authenticated", "data": {}}}), true),
+                        AuthReply::Grant { session_id, token } => (json!({"type": "statusUpdate",
+                            "data": {"status": "auth", "data": {"status": "granted",
+                                "session_id": session_id, "token": token}}}), true),
+                        AuthReply::Deny(message) => (json!({"type": "statusUpdate",
+                            "data": {"status": "auth", "data": {"status": "denied",
+                                "message": message}}}), false),
+                    };
+                    if socket.send(Message::Text(reply.to_string())).await.is_err() {
                         return;
                     }
-                    let _ = events.send(Event::Authenticated(n));
+                    let _ = events.send(if accepted {
+                        Event::Authenticated(n)
+                    } else {
+                        Event::Message(n, value)
+                    });
                 } else {
                     let _ = events.send(Event::Message(n, value));
                 }
@@ -174,6 +210,9 @@ pub enum Reply {
     Unsolicited { host_id: String, head: Value },
     /// `host_route_refused` with this code, then the relay closes.
     Refused(&'static str),
+    /// `host_route_refused` before the challenge (not for any proof), then
+    /// the challenge and `host_route_ok` for the proof.
+    RefusedFirst { host_id: String, head: Value },
     /// No reply to the proof.
     Nothing,
 }
@@ -208,6 +247,8 @@ impl FakeAstation {
         let links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>> =
             Arc::default();
         let shared = links.clone();
+        let auth: Arc<Mutex<AuthReply>> = Arc::default();
+        let answers = auth.clone();
         let plan = Arc::new(plan);
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -236,12 +277,21 @@ impl FakeAstation {
                         events_tx.clone(),
                         relay_tx.clone(),
                         cmd_rx,
+                        answers.clone(),
                     ));
                 }
             });
         });
         let url = url_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        (Self { url, events, links }, relay)
+        (
+            Self {
+                url,
+                events,
+                auth,
+                links,
+            },
+            relay,
+        )
     }
 }
 
@@ -259,6 +309,7 @@ async fn relay_link(
     events: mpsc::Sender<Event>,
     relay: mpsc::Sender<RelayEvent>,
     commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    auth: Arc<Mutex<AuthReply>>,
 ) {
     let mut query = String::new();
     let callback = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
@@ -281,6 +332,11 @@ async fn relay_link(
         .unwrap_or_default();
     if let Reply::Unsolicited { host_id, head } = &reply {
         let _ = socket.send(Message::Text(ok_message(host_id, head))).await;
+    }
+    if let Reply::RefusedFirst { .. } = &reply {
+        let refused =
+            json!({"type": "relay", "op": "host_route_refused", "v": 1, "code": "unknown_host"});
+        let _ = socket.send(Message::Text(refused.to_string())).await;
     }
     let challenge = atem_client::host_route::HostChallenge::new(&room);
     if socket
@@ -318,7 +374,7 @@ async fn relay_link(
         message,
     });
     match reply {
-        Reply::Ok { host_id, head } => {
+        Reply::Ok { host_id, head } | Reply::RefusedFirst { host_id, head } => {
             if socket
                 .send(Message::Text(ok_message(&host_id, &head)))
                 .await
@@ -338,6 +394,6 @@ async fn relay_link(
         }
         Reply::Unsolicited { .. } | Reply::Nothing => {}
     }
-    serve(n, socket, events, commands).await;
+    serve(n, socket, events, commands, auth).await;
     let _ = relay.send(RelayEvent::Closed(n));
 }

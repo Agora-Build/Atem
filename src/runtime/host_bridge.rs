@@ -3919,9 +3919,11 @@ impl ProjectHasher for NoHasher {
 
 /// The link generation r9 traffic runs on: authenticated by Astation, or
 /// routed for r9 only on a host route proof (§R9.7b). Never while Astation
-/// is authenticating it again.
+/// is authenticating an authenticated link again (a routed one keeps it).
 fn r9_app_link(app: &App) -> Option<u64> {
-    (app.r9_link_up() && app.astation_reauth.is_none()).then_some(app.astation_link_gen)
+    // A routed link keeps its r9 carrier while Astation authenticates it.
+    (app.r9_link_up() && (app.astation_reauth.is_none() || app.astation_routed))
+        .then_some(app.astation_link_gen)
 }
 
 fn app_link(app: &App) -> Option<u64> {

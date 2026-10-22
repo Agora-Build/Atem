@@ -22,11 +22,9 @@ use atem_client::host_route::{
     HostChallenge, HostRouteBody, RelayReply, host_route_message, sign_host_route,
 };
 use atem_client::membership::Head;
-use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Challenges answered on one link at most (each once); more are ignored.
-pub const MAX_ANSWERS_PER_LINK: usize = 16;
 /// runtime.log lines about challenges on one link at most.
 const MAX_LINES_PER_LINK: u32 = 8;
 /// How long a challenge that arrives while the runtime is still opening its
@@ -98,12 +96,16 @@ pub fn set(handle: &RouteHandle, state: RouteState) {
 }
 
 /// One link's challenge state: the room and `atem_id` it was opened with,
-/// the nonces answered, the lines written.
+/// whether its one proof went out and the relay's verdict came, whether
+/// Astation authenticated it, the lines written.
 pub struct LinkRoute {
     handle: RouteHandle,
     room: String,
     atem_id: String,
-    answered: HashSet<[u8; 32]>,
+    proof_sent: bool,
+    verdict: bool,
+    /// Set by the link's client once Astation authenticated it.
+    authenticated: Arc<AtomicBool>,
     lines: u32,
 }
 
@@ -113,9 +115,17 @@ impl LinkRoute {
             handle,
             room: room.to_owned(),
             atem_id: atem_id.to_owned(),
-            answered: HashSet::new(),
+            proof_sent: false,
+            verdict: false,
+            authenticated: Arc::default(),
             lines: 0,
         }
+    }
+
+    /// The flag the link's client sets once Astation authenticated the
+    /// link: no challenge is answered after it.
+    pub fn authenticated_flag(&self) -> Arc<AtomicBool> {
+        self.authenticated.clone()
     }
 
     fn log(&mut self, line: &str) {
@@ -139,12 +149,14 @@ impl LinkRoute {
             self.log("ignored: another room than this link's");
             return None;
         }
-        if self.answered.contains(&challenge.nonce) {
-            self.log("ignored: already answered");
+        // One challenge per link, only before it is routed or
+        // Astation-authenticated (a later one is no new connection).
+        if self.verdict || self.authenticated.load(Ordering::SeqCst) {
+            self.log("ignored: the link is already routed or authenticated");
             return None;
         }
-        if self.answered.len() >= MAX_ANSWERS_PER_LINK {
-            self.log("ignored: too many challenges on this link");
+        if self.proof_sent {
+            self.log("ignored: this link already answered a challenge");
             return None;
         }
         let state = self
@@ -174,7 +186,7 @@ impl LinkRoute {
         };
         match sign_host_route(&key.keys, &key.id, &body) {
             Ok(proof) => {
-                self.answered.insert(challenge.nonce);
+                self.proof_sent = true;
                 self.log(&format!("answered at head {}", body.head.seq));
                 Some(host_route_message(&proof).to_string())
             }
@@ -215,17 +227,27 @@ impl LinkRoute {
                 return None;
             }
         };
+        // A verdict counts only for this link's own proof, once.
+        let what = match &reply {
+            RelayReply::Ok { .. } => "ok",
+            RelayReply::Refused { .. } => "refused",
+        };
+        if !self.proof_sent {
+            self.log_reply(&format!("{what} ignored: no proof was sent on this link"));
+            return None;
+        }
+        if self.verdict {
+            self.log_reply(&format!("{what} ignored: this link already has a verdict"));
+            return None;
+        }
         let (host_id, head) = match reply {
             RelayReply::Refused { code } => {
+                self.verdict = true;
                 self.log_reply(&format!("refused: {code}"));
                 return Some(RouteResult::Refused(code));
             }
             RelayReply::Ok { host_id, head } => (host_id, head),
         };
-        if self.answered.is_empty() {
-            self.log_reply("ok ignored: no proof was sent on this link");
-            return None;
-        }
         let state = self
             .handle
             .lock()
@@ -247,6 +269,7 @@ impl LinkRoute {
             self.log_reply("ok ignored: a head this host doesn't hold");
             return None;
         }
+        self.verdict = true;
         self.log_reply(&format!("ok at head {}", head.seq));
         Some(RouteResult::Routed { host_id, head })
     }
@@ -341,7 +364,12 @@ mod tests {
             link.on_reply(r#"{"type":"relay","op":"push_ack","acks":[]}"#),
             None
         );
-        // This host at its head, or at an ancestor: routed.
+        // An unknown code is ignored (no verdict yet).
+        assert_eq!(
+            link.on_reply(r#"{"type":"relay","op":"host_route_refused","v":1,"code":"nope"}"#),
+            None
+        );
+        // This host at its head: routed, once.
         assert_eq!(
             link.on_reply(&ok("host-1", head)),
             Some(RouteResult::Routed {
@@ -349,31 +377,68 @@ mod tests {
                 head
             })
         );
+        let refused = RelayReply::refused(&HostRouteRefusal::StaleLog)
+            .to_json()
+            .to_string();
+        assert_eq!(link.on_reply(&ok("host-1", head)), None, "one verdict");
+        assert_eq!(link.on_reply(&refused), None, "one verdict");
+        // A routed link answers no further challenge.
+        assert_eq!(
+            link.answer(&HostChallenge::new(ROOM).to_json().to_string()),
+            None
+        );
+        // At an ancestor: routed.
+        let mut other = LinkRoute::new(handle.clone(), ROOM, "atem-x");
+        assert!(other.answer(&challenge).is_some());
         let ancestor = Head {
             seq: 2,
             hash: log.log.entry(2).unwrap().hash(),
         };
         assert!(matches!(
-            link.on_reply(&ok("host-1", ancestor)),
+            other.on_reply(&ok("host-1", ancestor)),
             Some(RouteResult::Routed { .. })
         ));
-        // A refusal carries the verifier's code; an unknown code is ignored.
-        let refused = RelayReply::refused(&HostRouteRefusal::StaleLog)
-            .to_json()
-            .to_string();
+        // A refusal for this link's proof carries the verifier's code.
+        let mut refusing = LinkRoute::new(handle.clone(), ROOM, "atem-x");
+        assert_eq!(refusing.on_reply(&refused), None, "no proof yet: ignored");
+        assert!(refusing.answer(&challenge).is_some());
         assert_eq!(
-            link.on_reply(&refused),
+            refusing.on_reply(&refused),
             Some(RouteResult::Refused("stale_log".into()))
         );
-        assert_eq!(
-            link.on_reply(r#"{"type":"relay","op":"host_route_refused","v":1,"code":"nope"}"#),
-            None
-        );
         // A device list that can't serve any more: an ok is ignored.
+        let mut late = LinkRoute::new(handle.clone(), ROOM, "atem-x");
+        assert!(late.answer(&challenge).is_some());
         set(&handle, RouteState::Off("device list held"));
-        assert_eq!(link.on_reply(&ok("host-1", head)), None);
+        assert_eq!(late.on_reply(&ok("host-1", head)), None);
         // A late ok on a new link (the old one dropped): unsolicited there.
         let mut next = LinkRoute::new(ready(&log), ROOM, "atem-x");
         assert_eq!(next.on_reply(&ok("host-1", head)), None);
+    }
+
+    /// M1: one challenge per link, never after the link was routed or
+    /// Astation authenticated it; M2: an r8 host (no list, no proof) ignores
+    /// an unsolicited refusal.
+    #[test]
+    fn one_challenge_per_link_and_no_verdict_without_a_proof() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let challenge = || HostChallenge::new(ROOM).to_json().to_string();
+        let mut link = LinkRoute::new(ready(&log), ROOM, "atem-x");
+        assert!(link.answer(&challenge()).is_some());
+        assert_eq!(link.answer(&challenge()), None, "a second challenge");
+        // Astation authenticated the link first: no challenge answered.
+        let mut authed = LinkRoute::new(ready(&log), ROOM, "atem-x");
+        authed.authenticated_flag().store(true, Ordering::SeqCst);
+        assert_eq!(authed.answer(&challenge()), None);
+        // An r8 host: no list, so no proof; a refusal is not its verdict.
+        let off = new_handle();
+        set(&off, RouteState::Off("no device list"));
+        let mut r8 = LinkRoute::new(off, ROOM, "atem-x");
+        assert_eq!(r8.answer(&challenge()), None);
+        let refused = RelayReply::refused(&HostRouteRefusal::UnknownHost)
+            .to_json()
+            .to_string();
+        assert_eq!(r8.on_reply(&refused), None);
     }
 }

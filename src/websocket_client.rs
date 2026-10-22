@@ -546,6 +546,9 @@ pub struct AstationClient {
     /// it is for. Only r9 traffic goes over it; Astation's `auth_required`
     /// upgrades it (`upgrade_routed`).
     routed: Option<String>,
+    /// The link's "Astation authenticated it" flag, shared with its
+    /// reader's `LinkRoute` (no challenge is answered after it, §R9.7b).
+    route_authenticated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// How a link reached Astation, for `atem status`: never a secret (no
@@ -645,6 +648,7 @@ impl AstationClient {
             host_route: None,
             route_link: None,
             routed: None,
+            route_authenticated: None,
         }
     }
 
@@ -998,6 +1002,7 @@ impl AstationClient {
             ),
             _ => None,
         };
+        self.route_authenticated = route.as_ref().map(|route| route.authenticated_flag());
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async_with_config(url, Some(link_ws_config()), false))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
@@ -1214,9 +1219,62 @@ impl AstationClient {
                 )
                 .await
                 .map_err(|_| anyhow!("Authentication timed out"))?;
-                if result.is_ok() { let _ = self.report_credential_projects().await; }
+                if result.is_ok() {
+                    self.mark_route_authenticated();
+                    let _ = self.report_credential_projects().await;
+                }
                 result
             }
+        }
+    }
+
+    /// Astation authenticated this link: its reader answers no challenge
+    /// from now on (§R9.7b).
+    fn mark_route_authenticated(&self) {
+        if let Some(flag) = &self.route_authenticated {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Astation's reply while it authenticates a routed link (§R9.7b), with
+    /// the connect path's semantics: a granted session saved under the
+    /// link's capture (`UpdateBound`), the connect path's errors (a denial
+    /// is `Refused`, an expiry `PairingRequired`, both with the session
+    /// advice). `Ok(None)`: not an auth reply. On success the link is
+    /// Astation's (`upgrade_routed`).
+    pub(crate) fn routed_auth_response(&mut self, msg: &AstationMessage) -> Result<Option<()>> {
+        let astation_id = self
+            .routed
+            .clone()
+            .ok_or_else(|| anyhow!("this link isn't routed"))?;
+        let Some((response, saved)) =
+            self.auth_response_saving(msg, &astation_id, GrantSave::UpdateBound)?
+        else {
+            return Ok(None);
+        };
+        if let (Some(saved), Some(capture)) = (saved, self.capture.as_mut()) {
+            capture.session = Some(saved);
+        }
+        match response {
+            AuthResponse::Authenticated => {
+                self.upgrade_routed();
+                self.guarded(|| {
+                    self.refresh_saved_session(&astation_id);
+                    Ok(())
+                })?;
+                Ok(Some(()))
+            }
+            AuthResponse::Denied(message) => Err(SessionError::new(
+                SessionProblem::Refused,
+                false,
+                format!("Authentication denied: {message}"),
+            )
+            .into()),
+            AuthResponse::SessionExpired => Err(self.no_session(
+                SessionProblem::PairingRequired,
+                "Pairing required",
+                "Pairing required; run 'atem pair'",
+            )),
         }
     }
 
@@ -1239,6 +1297,7 @@ impl AstationClient {
         {
             self.connected_astation_id = Some(room);
         }
+        self.mark_route_authenticated();
     }
 
     async fn authenticate_after_challenge(
@@ -1464,7 +1523,7 @@ impl AstationClient {
         // Only for the pairing and session this connection authenticated
         // with: never answer with a replacement's session.
         self.guarded(|| Ok(()))?;
-        let (proof, _) = self
+        let (proof, used) = self
             .auth_proof(&challenge)?
             .ok_or_else(|| {
                 self.no_session(
@@ -1473,6 +1532,13 @@ impl AstationClient {
                     "no saved session for this Astation; run `atem pair`",
                 )
             })?;
+        // A routed link is authenticated as the connect path does: later
+        // checks compare against the session this proof used.
+        if self.routed()
+            && let Some(capture) = self.capture.as_mut()
+        {
+            capture.session = used;
+        }
         self.send_message(proof).await?;
         self.answered_challenge = Some((challenge.astation_id, challenge.challenge));
         Ok(())
