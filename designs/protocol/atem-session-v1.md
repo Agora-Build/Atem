@@ -1759,6 +1759,7 @@ channel envelope of R9.7a). Its link stays for pairing,
 | `atem-browser-grant` | `atem-browser-grant-v1` | a native member with `control` (R9.6) |
 | `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
+| `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
 
 Other domain strings (never signing inputs of another kind):
 `atem-membership-hash-v1`, `atem-browser-grant-hash-v1`,
@@ -2911,6 +2912,108 @@ fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
 channel; closing it closes only its channel, never the shared link or
 another client's channel (`atem-client-bindings.md`).
 
+### R9.7b Host route proof
+
+An enrolled r9 host restores its own relay route with no Astation online
+(after a host or relay restart, a lost ephemeral directory, an expired
+room): the relay routes to a host only once the host proved, against the
+signed device list, that it may hold the route. A query-string `atem_id`,
+the room code, an account login or an old pairing never creates that
+authority, and nothing falls back to them. Messages travel on the host's
+existing outbound link inside the relay envelope (`{"type":"relay",…}`);
+Atem opens no port.
+
+**Wire.**
+
+1. Challenge (relay → host), on every new host connection, before
+   anything is routed:
+   `{"type":"relay","op":"host_challenge","v":1,"nonce":"<b64u, 32 random bytes>","room":"<room code>"}`
+2. Proof (host → relay), at most once per challenge, only by a host with
+   a pinned device list:
+   `{"type":"relay","op":"host_route","v":1,"proof":{"body":{…},"sig":"<b64u>"}}`
+
+The body is a signed object of type `atem-host-route` (R9.1), exactly
+these fields:
+
+```
+{"type":"atem-host-route","v":1,"account_id","genesis_hash","host_id",
+ "atem_id","room","nonce","head":{"seq","hash"}}
+```
+
+`sig` is Ed25519 by the host's `host_channel_key` over
+`enc(["atem-host-route-v1", jcs(body)])`. `account_id`, `genesis_hash`
+and `host_id` are the pinned list's (`genesis_hash` lowercase hex),
+`head` the host's head when it signs, `atem_id` the one in the link's
+URL, `room` and `nonce` the challenge's (`nonce` b64u of 32 bytes).
+`account_id`, `host_id`, `atem_id` and `room` are 1 to 256 bytes; both
+messages at most 16 KiB; the body's `jcs` at most 4096 bytes (R9.1).
+
+**Verification** (shared, `atem_client::host_route::verify_host_route(log,
+proof_json, expected_nonce, expected_room, expected_atem_id) →
+HostRoute{host_id, head}`, or `verify_host_route_message` on the whole
+message; Rust only, the relay links `atem-client`). In this order, the
+first failure is the refusal code:
+
+| check | code |
+|---|---|
+| strict I-JSON, exact fields (message, `proof`, body), no duplicate keys, encodings and bounds above | `malformed` |
+| the verifier's log isn't frozen (R9.4) | `frozen` |
+| `account_id` and `genesis_hash` are the log's | `wrong_account` |
+| `host_id` is a current host (`add_host`, not removed) **at the verifier's current head** | `unknown_host` |
+| `sig` verifies with that host's **newest** `host_channel_key` at the verifier's current head | `bad_signature` |
+| `head.seq` ≤ the verifier's head (a newer head: the relay's log is behind; fetch it, then challenge again) | `stale_log` |
+| `head` is the verifier's head or an entry of its chain (same `seq`, another hash: a fork) | `fork` |
+| `nonce` equals the challenge's | `nonce_mismatch` |
+| `room` equals the relay's | `room_mismatch` |
+| `atem_id` equals the relay's | `atem_id_mismatch` |
+
+Membership and the key are always taken at the verifier's current head,
+never at the proof's `head`: a proof naming an ancestor head is accepted
+only while the host is still a current host with the same key. A host
+removed after that head is `unknown_host`; a host whose key was replaced
+(a later `add_host` of the same `host_id`) is `bad_signature` for a
+proof signed with the old key.
+
+**Relay obligations** (Astation; `r9-host-routing-lifecycle.md`):
+
+- The challenge must be reachable even when the ephemeral room is
+  absent (after a sweep, a restart with a fresh directory): an enrolled
+  host's connection is accepted and challenged, never answered 404.
+- Keep the candidate socket isolated until its proof verifies against
+  the relay's current durable log: nothing is routed to or from it
+  before, and it never replaces the incumbent before verification.
+- Keep a durable binding `(genesis_hash, host_id) → room/atem_id`.
+  Persist it, and fence the replaced connection across replicas, before
+  the new route is exposed; a newly verified proof replaces and fences
+  the older connection before any routed effect.
+- When the log removes or replaces the host, drop the binding and close
+  the connection. A bound live route survives presence sweeps; empty
+  pairing rooms keep their bounded lifetime.
+- Fresh connections and channels after every recovery; nothing is
+  replayed (ciphertext, leases, uncertain submissions).
+- Without a valid proof an r9 host gets no routing. There is no fallback.
+
+**The host (Atem).** The runtime's relay identity link
+(`/ws?role=atem&code=<room>&atem_id=<atem_id>`) answers the challenge in
+its reader as it arrives, before and independent of Astation's
+authentication, signed at the device list's current head for the link's
+own room and `atem_id`. It answers only with a pinned list that can
+serve: not held, frozen or faulted, the session journal not halted, the
+host key loaded; a challenge that arrives while the broker is still
+opening its list waits for it (at most 5 s). Each challenge is answered
+once (at most 16 a link); a malformed one, one naming another room than
+the link's, or any challenge on a host without a list is ignored, with
+one bounded runtime.log line and never its content. The challenge is
+authority for nothing else and is never passed on. A relay that sends no
+challenge changes nothing. A local (loopback/LAN) link never answers.
+
+Vectors: `r9-vectors-host-route` (proofs at the head, at an ancestor, on
+a verifier ahead, after a key rotation; refused: extra fields in the
+body, message and proof, a short nonce, `head.seq` 0, duplicate keys,
+another account, another genesis, an unknown host, another host's key, a
+tampered field, `stale_log`, `fork`, each mismatch, a removed host and a
+replaced key, also for a proof at an ancestor head).
+
 ### R9.8 r9 hello, welcome and new session ops
 
 | op | dir | fields |
@@ -3138,6 +3241,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9` |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
+| relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the relay's own, never sent to the host) |
 
 ### R9.12 Fixtures
 
@@ -3146,7 +3250,8 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
-`r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`. Scenarios
+`r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
+`r9-vectors-host-route`. Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,

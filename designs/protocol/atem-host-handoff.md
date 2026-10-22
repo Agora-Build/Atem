@@ -497,7 +497,7 @@ scenario.
 `cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture`
 (Linux, debug build; `ATEM_FIXTURE=<name>[,<name>…]` runs some;
 `ATEM_R9_PARALLEL` sets how many runtimes run at once, default 6) takes
-every one of the 75 `r9-*` files. Each host scenario runs against the
+every one of the 76 `r9-*` files. Each host scenario runs against the
 `atem runtime` binary (runner: `tests/r9_runner/`):
 
 - a temp profile verified as the fixture's account and host, its device
@@ -528,7 +528,7 @@ every one of the 75 `r9-*` files. Each host scenario runs against the
 
 **Result: 48 host scenarios run against the real runtime and all 48 pass
 (714 items checked); 25 items of them can't be expressed there (below);
-the 27 other files have no host side.** A changed expectation fails the
+the 28 other files have no host side.** A changed expectation fails the
 run at the changed step (`r9_changed_expectations_fail_against_the_real_runtime`:
 seven mutations). Each assert reads a state dump from a pass after the
 step began.
@@ -544,7 +544,7 @@ Items not expressible against real processes (each printed by the run):
 
 | files | why they have no host side |
 |---|---|
-| 9 vector files: 8 `r9-vectors-*`, `r9-envelope-vectors` | known-answer bytes, no host process: `crates/atem-client/tests/vectors.rs` (and `channel_fixtures.rs`), the envelope tests in `src/session_protocol/r9/envelope.rs` |
+| 10 vector files: 9 `r9-vectors-*`, `r9-envelope-vectors` | known-answer bytes, no host process: `crates/atem-client/tests/vectors.rs` (and `channel_fixtures.rs`), the envelope tests in `src/session_protocol/r9/envelope.rs` |
 | 8 client scenarios: `r9-handshake-wrong-head`, `r9-recovery-k-backup-*` (4), `r9-recovery-restore-*` (2), `r9-recovery-stale-head-withholds-the-recovery` | the client's machines, no host acts: `channel_fixtures.rs`, `scenarios.rs` |
 | 10 relay scenarios: `r9-chain-honest-concurrent-appends-never-fork`, `r9-push-*` (6), `r9-seen-after-…`, `r9-seen-before-…`, `r9-seen-from-another-…` | the relay's side (Astation's relay); Atem runs them against atem-client's reference relay (`r9_fixtures.rs`, `scenarios.rs`) |
 
@@ -694,6 +694,27 @@ Router obligations (the relay and Astation's :8080):
   expiry (wall and monotonic). An r9 host keeps its Astation link past the
   r8 attachment's 24 h (that attachment is never welcomed). §R9.6,
   §R9.7 "Limits".
+- **Host route proof.** On every new host connection the relay sends
+  `{"type":"relay","op":"host_challenge","v":1,"nonce","room"}` before
+  anything is routed, even when the ephemeral room is gone; it keeps the
+  candidate socket isolated (never replacing the incumbent) until
+  `atem_client::host_route::verify_host_route_message` accepts the
+  `host_route` answer against its current durable log (membership and
+  key at that head, never at the proof's `head`; refusal codes
+  `malformed`, `frozen`, `wrong_account`, `unknown_host`,
+  `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`,
+  `room_mismatch`, `atem_id_mismatch`), then persists the binding
+  `(genesis_hash, host_id) → room/atem_id` and fences the replaced
+  connection across replicas before exposing the route. Removal or
+  replacement of the host drops the binding and closes the connection; a
+  bound live route survives presence sweeps; nothing is replayed. No
+  valid proof, no routing: no fallback to the query-string `atem_id`,
+  the room code, a login or an old pairing. Atem answers on its relay
+  identity link in the link's reader, before and independent of
+  Astation's authentication, once per challenge, only with a pinned list
+  that can serve (not held, frozen or faulted). Vectors
+  `r9-vectors-host-route`; the real runtime with no Astation online:
+  `cargo test --test r9_host_route_binary`. §R9.7b.
 
 Host state behind two of these answers (no action for Astation): a
 revoked browser grant is kept in `runtime/journal/revoked_grants` until

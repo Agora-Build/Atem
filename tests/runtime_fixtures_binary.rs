@@ -2005,7 +2005,7 @@ fn r9_files() -> Vec<Value> {
 )]
 fn r9_fixtures_run_against_the_real_runtime() {
     let files = r9_files();
-    assert_eq!(files.len(), 75, "the r9 fixture files");
+    assert_eq!(files.len(), 76, "the r9 fixture files");
     let only = std::env::var("ATEM_FIXTURE").ok();
     let mut not_expressible = Vec::new();
     let mut runnable = Vec::new();
