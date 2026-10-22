@@ -87,12 +87,20 @@ pub fn new_handle() -> RouteHandle {
     Arc::new(Mutex::new(RouteState::default()))
 }
 
-/// Sets `handle` to `state` (only when it changed).
-pub fn set(handle: &RouteHandle, state: RouteState) {
+/// Sets `handle` to `state` (only when it changed). `true` when the host
+/// can answer challenges again after it couldn't (`Off` to `Ready`: a list
+/// pinned, a held list reconciled): a link opened meanwhile answered none,
+/// so the broker reconnects it once to prove its route (§R9.7b). The first
+/// state after `Starting` is no such event (a link waits for it).
+pub fn set(handle: &RouteHandle, state: RouteState) -> bool {
     let mut current = handle.lock().unwrap_or_else(|e| e.into_inner());
-    if !current.same(&state) {
-        *current = state;
+    if current.same(&state) {
+        return false;
     }
+    let serving_again =
+        matches!(*current, RouteState::Off(_)) && matches!(state, RouteState::Ready { .. });
+    *current = state;
+    serving_again
 }
 
 /// One link's challenge state: the room and `atem_id` it was opened with,
@@ -108,6 +116,8 @@ pub struct LinkRoute {
     authenticated: Arc<AtomicBool>,
     /// Set here once the proof went out (read by the link's client).
     proved: Arc<AtomicBool>,
+    /// Set here once the relay's `host_route_ok` for that proof came.
+    routed_ok: Arc<AtomicBool>,
     lines: u32,
 }
 
@@ -121,6 +131,7 @@ impl LinkRoute {
             verdict: false,
             authenticated: Arc::default(),
             proved: Arc::default(),
+            routed_ok: Arc::default(),
             lines: 0,
         }
     }
@@ -135,6 +146,12 @@ impl LinkRoute {
     /// relay's verdict even when Astation's authentication failed first.
     pub fn proved_flag(&self) -> Arc<AtomicBool> {
         self.proved.clone()
+    }
+
+    /// Set once the relay's `host_route_ok` for this link's proof came: the
+    /// link proved its route (§R9.7b).
+    pub fn routed_ok_flag(&self) -> Arc<AtomicBool> {
+        self.routed_ok.clone()
     }
 
     fn log(&mut self, line: &str) {
@@ -280,6 +297,7 @@ impl LinkRoute {
             return None;
         }
         self.verdict = true;
+        self.routed_ok.store(true, Ordering::SeqCst);
         self.log_reply(&format!("ok at head {}", head.seq));
         Some(RouteResult::Routed { host_id, head })
     }
@@ -424,6 +442,29 @@ mod tests {
         // A late ok on a new link (the old one dropped): unsolicited there.
         let mut next = LinkRoute::new(ready(&log), ROOM, "atem-x");
         assert_eq!(next.on_reply(&ok("host-1", head)), None);
+    }
+
+    /// §R9.7b: `set` reports the host becoming able to answer challenges
+    /// again (`Off` to `Ready`: pinned, reconciled), once per event; the
+    /// first state after `Starting`, a new head while serving, and the
+    /// same state again are no such event.
+    #[test]
+    fn set_reports_serving_again_once() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let state = |log: &TestLog| ready(log).lock().unwrap().clone();
+        let handle = new_handle();
+        assert!(!set(&handle, state(&log)), "Starting to Ready");
+        assert!(!set(&handle, RouteState::Off("device list held")));
+        assert!(!set(&handle, RouteState::Off("device list held")));
+        let serving = state(&log);
+        assert!(set(&handle, serving.clone()), "reconciled");
+        assert!(!set(&handle, serving), "the same state again");
+        let starting = new_handle();
+        assert!(!set(&starting, RouteState::Off("no device list")));
+        assert!(set(&starting, state(&log)), "pinned");
+        log.add_native("dev-phone", &["control", "view"]);
+        assert!(!set(&starting, state(&log)), "a new head while serving");
     }
 
     /// M1: one challenge per link, never after the link was routed or

@@ -1331,6 +1331,11 @@ impl HostBridge {
         }
     }
 
+    /// An r9 channel is mid-admission (§R9.7b: the route reconnect waits).
+    pub fn r9_admitting(&self) -> bool {
+        self.r9.admitting()
+    }
+
     /// The link may attach now (its pairing was just verified): it is
     /// considered again at the next pass, unless it is attached already.
     pub fn reconsider(&mut self) {
@@ -1551,8 +1556,11 @@ impl HostBridge {
                 .flush_relay(&mut |text| client.try_send_wire(text, false).is_ok());
         }
         self.r9.end_pass();
-        // §R9.7b: the relay link answers challenges at this pass's state.
-        crate::session_protocol::r9::route::set(&app.host_route, self.route_state());
+        // §R9.7b: the relay link answers challenges at this pass's state;
+        // able to again (pinned, reconciled): its link proves its route.
+        if crate::session_protocol::r9::route::set(&app.host_route, self.route_state()) {
+            app.route_reconnect = Some(std::time::Instant::now());
+        }
         if let Some(hosted) = app.hosted.as_mut() {
             hosted.sessions = cx
                 .sessions

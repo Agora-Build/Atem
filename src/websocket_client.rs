@@ -556,6 +556,10 @@ pub struct AstationClient {
     /// The link's "its route proof went out" flag, shared with its
     /// reader's `LinkRoute` (§R9.7b).
     route_proved: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The link's "the relay's `host_route_ok` came" flag, shared with its
+    /// reader's `LinkRoute` (§R9.7b): `None` on a link that answers no
+    /// challenge (local, LAN, or not the runtime's).
+    route_ok: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// While the connect path authenticates a relay identity link after
     /// Astation's `auth_required` came first (§R9.7b): the relay's verdict
     /// on the link's proof, recorded whenever it arrives.
@@ -684,6 +688,7 @@ impl AstationClient {
             routed: None,
             route_authenticated: None,
             route_proved: None,
+            route_ok: None,
             route_wait: None,
             routed_auth: None,
         }
@@ -1058,6 +1063,7 @@ impl AstationClient {
         };
         self.route_authenticated = route.as_ref().map(|route| route.authenticated_flag());
         self.route_proved = route.as_ref().map(|route| route.proved_flag());
+        self.route_ok = route.as_ref().map(|route| route.routed_ok_flag());
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async_with_config(url, Some(link_ws_config()), false))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
@@ -1400,6 +1406,19 @@ impl AstationClient {
                 "Pairing required",
                 "Pairing required; run 'atem pair'",
             )),
+        }
+    }
+
+    /// A relay identity link of the runtime that has not proved its route
+    /// (§R9.7b): it sent no proof and got no `host_route_ok`. `false` for a
+    /// local or LAN link, which never answers a challenge.
+    pub(crate) fn route_unproved(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match (&self.route_ok, &self.route_proved) {
+            (Some(ok), Some(proved)) => {
+                !ok.load(Ordering::SeqCst) && !proved.load(Ordering::SeqCst)
+            }
+            _ => false,
         }
     }
 
@@ -1830,6 +1849,11 @@ impl AstationClient {
     /// An r9 channel envelope for the link (§R9.7a). `false` when the link
     /// is gone or already holds `CHANNEL_INFLIGHT_BYTES` of unwritten
     /// envelopes: the caller keeps it queued and tries again.
+    /// Channel envelopes handed to the link and not written yet (bytes).
+    pub(crate) fn channel_unwritten(&self) -> usize {
+        self.channel_inflight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn try_send_channel(&self, text: String) -> bool {
         use std::sync::atomic::Ordering;
         let Some(sender) = self.sender.as_ref() else { return false };

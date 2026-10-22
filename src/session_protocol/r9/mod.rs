@@ -515,6 +515,12 @@ impl R9Host {
         self.by_attachment.keys().cloned().collect()
     }
 
+    /// A channel is mid-admission (its handshake runs): the broker doesn't
+    /// reconnect the link under it to prove its route (§R9.7b).
+    pub fn admitting(&self) -> bool {
+        self.chans.values().any(Chan::handshaking)
+    }
+
     /// Whether `att` is an r9 attachment (its messages go back here).
     pub fn owns(&self, att: &str) -> bool {
         self.by_attachment.contains_key(att)

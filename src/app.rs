@@ -90,6 +90,12 @@ pub struct App {
     /// The host route state the broker keeps current (§R9.7b): the relay
     /// link answers the relay's `host_challenge` from it.
     pub host_route: crate::session_protocol::r9::route::RouteHandle,
+    /// The host became able to answer the relay's challenge (a device list
+    /// pinned, a held one reconciled) while its relay link may have answered
+    /// none: the link reconnects once to prove its route (§R9.7b), when no
+    /// Astation operation runs (`hosted::App::route_reconnect_due`): when
+    /// that happened.
+    pub route_reconnect: Option<Instant>,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,
     pub force_terminal_redraw: bool,
@@ -151,6 +157,7 @@ impl App {
             astation_reconnect: true,
             hosted: None,
             host_route: crate::session_protocol::r9::route::new_handle(),
+            route_reconnect: None,
             connected_astation_id: None,
             force_terminal_redraw: false,
             show_certificates: false,

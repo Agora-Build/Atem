@@ -29,6 +29,9 @@ pub const RELAY_LIMIT: usize = 64;
 /// is at most 2 MiB, §R9.7a). Beyond it the envelope's channel is closed
 /// (`busy`), never silently short of a frame.
 pub const CHANNEL_INBOX_BYTES: usize = 32 << 20;
+/// The route reconnect (§R9.7b) waits this long at most for the link's
+/// unwritten channel envelopes to go out.
+pub const ROUTE_RECONNECT_FLUSH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One broker session as mark tasks see it.
 #[derive(Debug, Clone)]
@@ -234,6 +237,44 @@ impl App {
         (self.astation_connected || self.astation_routed) && !self.astation_client.is_ws_closed()
     }
 
+    /// §R9.7b, after a device list was pinned or a held one reconciled
+    /// (`route_reconnect`): once nothing is in flight (no Astation
+    /// operation and no r9 channel mid-admission (`busy`), no connect or
+    /// re-authentication, no session-family message waiting for admission,
+    /// and, for up to [`ROUTE_RECONNECT_FLUSH`], no channel envelope still
+    /// unwritten, e.g. the welcome of the channel that reconciled the
+    /// list), a relay link that proved no route (it answered no challenge
+    /// then) is dropped and reconnected at once, so the new link answers
+    /// the relay's challenge and is routed. Once per event: a local link, a
+    /// link that already proved, or no link at all (the next connect
+    /// proves) ends it too.
+    pub fn route_reconnect_due(&mut self, busy: bool) -> bool {
+        let Some(since) = self.route_reconnect else {
+            return false;
+        };
+        let waiting = self.hosted.as_ref().is_some_and(|h| {
+            !h.inbox.is_empty() || !h.channels.is_empty() || !h.channel_overflow.is_empty()
+        });
+        let unwritten =
+            self.astation_client.channel_unwritten() > 0 && since.elapsed() < ROUTE_RECONNECT_FLUSH;
+        if busy
+            || self.op_route.is_some()
+            || self.astation_connect_rx.is_some()
+            || self.astation_reauth.is_some()
+            || waiting
+            || unwritten
+        {
+            return false;
+        }
+        self.route_reconnect = None;
+        if !self.r9_link_up() || !self.astation_client.route_unproved() {
+            return false;
+        }
+        eprintln!("atem runtime: r9: relay link reconnecting to prove its route");
+        self.drop_astation_link("The relay link reconnects to prove its route".into());
+        true
+    }
+
     /// Drops the Astation link (closing its socket) and schedules the
     /// normal reconnect, which authenticates it again.
     pub fn drop_astation_link(&mut self, reason: String) {
@@ -294,4 +335,37 @@ pub fn error_detail_text(re: Option<String>, code: ErrorCode, detail: Option<&st
         },
     });
     String::from_utf8(wire::encode(&message)).expect("wire JSON is UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §R9.7b: the reconnect after a pin waits for a running operation (or
+    /// a session-family message waiting for admission); with no relay link
+    /// that proved no route (none at all here) the event ends unused.
+    #[test]
+    fn the_route_reconnect_waits_and_happens_once_per_event() {
+        let _profile = crate::test_profile::temp();
+        let mut app = App::new();
+        app.hosted = Some(Hosted::default());
+        assert!(!app.route_reconnect_due(false), "no event");
+        app.route_reconnect = Some(Instant::now());
+        assert!(!app.route_reconnect_due(true));
+        assert!(
+            app.route_reconnect.is_some(),
+            "kept while an operation runs"
+        );
+        app.hosted
+            .as_mut()
+            .unwrap()
+            .inbox
+            .push_back((1, "{}".into()));
+        assert!(!app.route_reconnect_due(false));
+        assert!(app.route_reconnect.is_some(), "kept while a request waits");
+        app.hosted.as_mut().unwrap().inbox.clear();
+        assert!(!app.route_reconnect_due(false), "no link to reconnect");
+        assert!(app.route_reconnect.is_none(), "consumed");
+        assert!(app.astation_reconnect_at.is_none());
+    }
 }
