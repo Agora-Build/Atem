@@ -17,6 +17,10 @@ pub(crate) enum AuthResponse {
     Denied(String),
 }
 
+/// How long a relay identity link whose route proof went out waits for the
+/// relay's verdict once Astation's authentication failed first (§R9.7b).
+const ROUTE_VERDICT_GRACE: Duration = Duration::from_secs(10);
+
 /// What a session Astation grants may do with the pairing record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantSave {
@@ -549,6 +553,36 @@ pub struct AstationClient {
     /// The link's "Astation authenticated it" flag, shared with its
     /// reader's `LinkRoute` (no challenge is answered after it, §R9.7b).
     route_authenticated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The link's "its route proof went out" flag, shared with its
+    /// reader's `LinkRoute` (§R9.7b).
+    route_proved: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// While the connect path authenticates a relay identity link after
+    /// Astation's `auth_required` came first (§R9.7b): the relay's verdict
+    /// on the link's proof, recorded whenever it arrives.
+    route_wait: Option<RouteWait>,
+    /// A link routed while Astation was authenticating it (§R9.7b), for the
+    /// App to take with the link: that authentication still pending, or
+    /// failed.
+    routed_auth: Option<RoutedAuth>,
+}
+
+/// The relay's verdict while the connect path waits for Astation (§R9.7b).
+#[derive(Default)]
+struct RouteWait {
+    /// An `ok` hands the authentication over to the routed link (the App
+    /// finishes it as for any routed link); never while pairing.
+    hand_over: bool,
+    /// `Some(true)`: `host_route_ok`; `Some(false)`: `host_route_refused`.
+    verdict: Option<bool>,
+}
+
+/// What became of Astation's authentication of a link the relay routed
+/// while it ran (§R9.7b, the verdict after `auth_required`).
+pub(crate) enum RoutedAuth {
+    /// The proof is out; Astation's reply goes to the routed link.
+    Pending,
+    /// Astation denied, expired or didn't finish: the link stays routed.
+    Failed(anyhow::Error),
 }
 
 /// How a link reached Astation, for `atem status`: never a secret (no
@@ -649,6 +683,9 @@ impl AstationClient {
             route_link: None,
             routed: None,
             route_authenticated: None,
+            route_proved: None,
+            route_wait: None,
+            routed_auth: None,
         }
     }
 
@@ -976,6 +1013,7 @@ impl AstationClient {
         self.answered_challenge = None;
         self.capture = None;
         self.routed = None;
+        self.routed_auth = None;
     }
 
     /// Connect WebSocket and authenticate (local Astation connections).
@@ -1019,6 +1057,7 @@ impl AstationClient {
             _ => None,
         };
         self.route_authenticated = route.as_ref().map(|route| route.authenticated_flag());
+        self.route_proved = route.as_ref().map(|route| route.proved_flag());
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async_with_config(url, Some(link_ws_config()), false))
             .await
             .map_err(|_| anyhow!("WebSocket connection timed out after 5s"))?
@@ -1200,6 +1239,13 @@ impl AstationClient {
     /// `challenge_timeout`. `host_route_ok` leaves the link routed for r9
     /// only (`routed`), pinned to the pairing's Astation `room` for a later
     /// `auth_required`; `host_route_refused` fails the connect.
+    ///
+    /// The verdict counts in either order: when `auth_required` comes
+    /// first, an `ok` arriving while Astation authenticates (or, once
+    /// Astation failed, within [`ROUTE_VERDICT_GRACE`] of a proof that went
+    /// out) routes the link; Astation's reply then goes to the routed link
+    /// (`RoutedAuth::Pending`), and a denial, expiry or timeout leaves it
+    /// routed (`RoutedAuth::Failed`), as on a link routed first.
     async fn authenticate_or_route(
         &mut self,
         room: &str,
@@ -1229,19 +1275,82 @@ impl AstationClient {
                 Err(anyhow!("the relay refused this host's route ({code})"))
             }
             auth_required => {
+                self.route_wait = Some(RouteWait {
+                    hand_over: !allow_pairing,
+                    verdict: None,
+                });
                 let result = tokio::time::timeout(
                     completion_timeout,
                     self.authenticate_after_challenge(auth_required, allow_pairing),
                 )
                 .await
-                .map_err(|_| anyhow!("Authentication timed out"))?;
-                if result.is_ok() {
-                    self.mark_route_authenticated();
-                    let _ = self.report_credential_projects().await;
+                .unwrap_or_else(|_| Err(anyhow!("Authentication timed out")));
+                let wait = self.route_wait.take().unwrap_or_default();
+                match (result, wait.verdict) {
+                    // Handed over: Astation's reply goes to the routed link.
+                    (Ok(()), Some(true)) if wait.hand_over => {
+                        self.route_while_authenticating(room, RoutedAuth::Pending)
+                    }
+                    (Ok(()), _) => {
+                        self.mark_route_authenticated();
+                        let _ = self.report_credential_projects().await;
+                        Ok(())
+                    }
+                    (Err(error), verdict) => {
+                        let routed = match verdict {
+                            Some(routed) => routed,
+                            None => self.late_route_verdict().await,
+                        };
+                        if routed && !self.is_ws_closed() {
+                            self.route_while_authenticating(room, RoutedAuth::Failed(error))
+                        } else {
+                            Err(error)
+                        }
+                    }
                 }
-                result
             }
         }
+    }
+
+    /// Astation failed first on a link whose proof went out and has no
+    /// verdict yet: the relay's verdict, waited for at most
+    /// [`ROUTE_VERDICT_GRACE`] (`true`: routed). No proof: `false` at once.
+    async fn late_route_verdict(&mut self) -> bool {
+        let proved = self
+            .route_proved
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+        if !proved || self.is_ws_closed() {
+            return false;
+        }
+        let verdict = tokio::time::timeout(
+            ROUTE_VERDICT_GRACE,
+            self.wait_for_message(|m| {
+                matches!(m, AstationMessage::HostRouted | AstationMessage::HostRouteRefused(_))
+            }),
+        )
+        .await;
+        matches!(verdict, Ok(Some(AstationMessage::HostRouted)))
+    }
+
+    /// The relay routed this link while Astation authenticated it
+    /// (§R9.7b): routed for r9 only, pinned to `room`, under the capture
+    /// that authentication took (the session its proof used), with what
+    /// became of Astation's authentication for the App.
+    fn route_while_authenticating(&mut self, room: &str, auth: RoutedAuth) -> Result<()> {
+        if self.capture.is_none() {
+            self.capture = Some(crate::pairing::Captured::now(&self.profile_sources()?)?);
+        }
+        self.connected_astation_id = None;
+        self.routed = Some(room.to_string());
+        self.routed_auth = Some(auth);
+        Ok(())
+    }
+
+    /// What became of Astation's authentication of a link routed while it
+    /// ran (taken once, by the App installing the link).
+    pub(crate) fn take_routed_auth(&mut self) -> Option<RoutedAuth> {
+        self.routed_auth.take()
     }
 
     /// Astation authenticated this link: its reader answers no challenge
@@ -1342,6 +1451,11 @@ impl AstationClient {
             self.answered_challenge = Some((astation_id.clone(), challenge.challenge.clone()));
             let save = if allow_pairing { GrantSave::Pairing } else { GrantSave::UpdateBound };
             let response = self.wait_for_auth_response(&astation_id, save).await?;
+            // §R9.7b: the relay routed the link meanwhile; Astation's reply
+            // goes to the routed link (`authenticate_or_route`).
+            if self.route_wait.as_ref().is_some_and(|w| w.hand_over && w.verdict == Some(true)) {
+                return Ok(());
+            }
             if challenge.transport == "loopback" {
                 return match response {
                     Some(AuthResponse::Authenticated) => self.guarded(|| Ok(())),
@@ -1645,6 +1759,25 @@ impl AstationClient {
     /// `save` allows).
     async fn wait_for_auth_response(&mut self, astation_id: &str, save: GrantSave) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
+            // §R9.7b: the relay's verdict on this link's proof (its reader
+            // checked it) counts after `auth_required` too: recorded, and an
+            // `ok` ends the wait when it hands the authentication over.
+            if let Some(wait) = self.route_wait.as_mut() {
+                match msg {
+                    AstationMessage::HostRouted => {
+                        wait.verdict = Some(true);
+                        if wait.hand_over {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    AstationMessage::HostRouteRefused(_) => {
+                        wait.verdict = Some(false);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if let Some((response, saved)) = self.auth_response_saving(&msg, astation_id, save)? {
                 // A grant saved a new session (under the captured pairing):
                 // later checks compare against that one. One kept in memory

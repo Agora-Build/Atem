@@ -522,6 +522,21 @@ impl App {
                     self.rebuild_menu();
                     eprintln!("atem runtime: r9: relay route held (no Astation)");
                     self.status_message = Some("Relay route held (no Astation)".to_string());
+                    // Routed while Astation was authenticating it (its
+                    // `auth_required` came first): finished as on a link
+                    // routed first (`app/reauth.rs`).
+                    match self.astation_client.take_routed_auth() {
+                        Some(crate::websocket_client::RoutedAuth::Pending) => {
+                            self.astation_reauth =
+                                Some(Instant::now() + reauth::ROUTED_AUTH_TIMEOUT);
+                            self.status_message =
+                                Some("Astation authenticating the routed link…".to_string());
+                        }
+                        Some(crate::websocket_client::RoutedAuth::Failed(error)) => {
+                            self.fail_routed_auth(error)
+                        }
+                        None => {}
+                    }
                 }
                 Ok(Ok((client, code))) => {
                     self.astation_connect_rx = None;

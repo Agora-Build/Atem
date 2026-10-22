@@ -106,6 +106,8 @@ pub struct LinkRoute {
     verdict: bool,
     /// Set by the link's client once Astation authenticated it.
     authenticated: Arc<AtomicBool>,
+    /// Set here once the proof went out (read by the link's client).
+    proved: Arc<AtomicBool>,
     lines: u32,
 }
 
@@ -118,6 +120,7 @@ impl LinkRoute {
             proof_sent: false,
             verdict: false,
             authenticated: Arc::default(),
+            proved: Arc::default(),
             lines: 0,
         }
     }
@@ -126,6 +129,12 @@ impl LinkRoute {
     /// link: no challenge is answered after it.
     pub fn authenticated_flag(&self) -> Arc<AtomicBool> {
         self.authenticated.clone()
+    }
+
+    /// Set once this link's proof went out: its client then waits for the
+    /// relay's verdict even when Astation's authentication failed first.
+    pub fn proved_flag(&self) -> Arc<AtomicBool> {
+        self.proved.clone()
     }
 
     fn log(&mut self, line: &str) {
@@ -187,6 +196,7 @@ impl LinkRoute {
         match sign_host_route(&key.keys, &key.id, &body) {
             Ok(proof) => {
                 self.proof_sent = true;
+                self.proved.store(true, Ordering::SeqCst);
                 self.log(&format!("answered at head {}", body.head.seq));
                 Some(host_route_message(&proof).to_string())
             }
