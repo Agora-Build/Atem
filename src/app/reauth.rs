@@ -144,7 +144,11 @@ impl App {
         }
         // Dropping the client aborts its transport, closing the socket.
         self.astation_client = AstationClient::new();
-        self.astation_reconnect_at = Some(Instant::now());
+        self.astation_reconnect_at = Some(if routed {
+            self.routed_retry_at()
+        } else {
+            Instant::now()
+        });
     }
 
     /// Astation's authentication of a routed link failed (denied, expired,
@@ -154,6 +158,7 @@ impl App {
     /// is retried until Astation sends another `auth_required`.
     pub(super) fn fail_routed_auth(&mut self, error: anyhow::Error) {
         self.astation_reauth = None;
+        self.astation_routed_at = Some(Instant::now());
         let advice = format!("{:#}", crate::runtime::ops::session_advice(error));
         eprintln!(
             "atem runtime: r9: Astation didn't authenticate the routed relay link: {advice}; the link stays routed for r9"

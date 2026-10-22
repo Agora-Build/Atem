@@ -74,6 +74,10 @@ pub struct App {
     /// (no reconnect) until it drops, is refused, or Astation's
     /// `auth_required` makes it an authenticated link.
     pub astation_routed: bool,
+    /// When the routed link was routed, or Astation last failed to
+    /// authenticate it: a routed link that drops soon after either retries
+    /// in 30 s, never at once (`routed_retry_at`).
+    pub astation_routed_at: Option<Instant>,
     /// Counts the times the Astation link became authenticated (a connect or
     /// a re-authentication): the session host gives each one its own attachment.
     pub astation_link_gen: u64,
@@ -142,6 +146,7 @@ impl App {
             astation_client: AstationClient::new(),
             astation_connected: false,
             astation_routed: false,
+            astation_routed_at: None,
             astation_link_gen: 0,
             astation_reconnect: true,
             hosted: None,
@@ -510,6 +515,7 @@ impl App {
                     self.astation_reconnect_at = None;
                     self.astation_client = client;
                     self.astation_routed = true;
+                    self.astation_routed_at = Some(Instant::now());
                     self.astation_link_gen += 1;
                     self.astation_connect_error = None;
                     self.pairing_code = code;
@@ -961,7 +967,7 @@ impl App {
             // The routed link dropped: reconnect as today.
             self.astation_routed = false;
             self.astation_client = crate::websocket_client::AstationClient::new();
-            self.astation_reconnect_at = Some(Instant::now());
+            self.astation_reconnect_at = Some(self.routed_retry_at());
             self.status_message = Some("The relay route dropped — reconnecting…".to_string());
         }
         if self.astation_connected && self.astation_client.is_ws_closed() {
@@ -978,6 +984,20 @@ impl App {
         if message_count > 0 && self.last_session_refresh.is_none_or(|last| last.elapsed() >= Duration::from_secs(60)) {
             self.last_session_refresh = Some(Instant::now());
             let _ = self.astation_client.refresh_session();
+        }
+    }
+
+    /// When to reconnect after a routed link dropped (§R9.7b): at once,
+    /// unless it dropped within 10 s of being routed or of a failed
+    /// Astation authentication; then after the usual 30 s, so a relay or
+    /// Astation that closes at once can't make a connect/prove/close loop.
+    pub fn routed_retry_at(&self) -> Instant {
+        let now = Instant::now();
+        match self.astation_routed_at {
+            Some(at) if now.duration_since(at) < Duration::from_secs(10) => {
+                now + Duration::from_secs(30)
+            }
+            _ => now,
         }
     }
 

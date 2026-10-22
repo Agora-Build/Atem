@@ -481,3 +481,40 @@ fn a_held_host_answers_no_challenge() {
         "{log}"
     );
 }
+
+/// N2: a relay that closes right after `host_route_ok` can't make a tight
+/// connect/prove/close loop: a routed link that drops within 10 s retries
+/// after the usual 30 s.
+#[test]
+fn a_routed_link_closed_at_once_retries_after_30_s() {
+    let rig = Rig::start(false, |_, head| Reply::OkThenClose {
+        host_id: HOST.into(),
+        head,
+    });
+    rig.proof(1, Duration::from_secs(20));
+    rig.closed(1, Duration::from_secs(5));
+    let started = Instant::now();
+    let mut proofs = 0;
+    while started.elapsed() < Duration::from_secs(25) {
+        let left = Duration::from_secs(25).saturating_sub(started.elapsed());
+        if let Some(RelayEvent::Proof { .. }) = rig.event(left) {
+            proofs += 1;
+        }
+    }
+    assert_eq!(proofs, 0, "reconnected within 25 s\n{}", rig.runtime_log());
+    // Then the usual retry.
+    rig.proof(2, Duration::from_secs(15));
+}
+
+/// L3: `atem unpair` (its reload) drops a routed link at once.
+#[test]
+fn unpair_drops_a_routed_link_at_once() {
+    let rig = Rig::start(false, ok);
+    rig.proof(1, Duration::from_secs(20));
+    within("the route to be held", || {
+        rig.runtime_log().contains("relay route held (no Astation)")
+    });
+    let (out, err, ok) = rig.sandbox.atem(&["unpair", "--yes"]);
+    assert!(ok, "{out}{err}");
+    rig.closed(1, Duration::from_secs(3));
+}

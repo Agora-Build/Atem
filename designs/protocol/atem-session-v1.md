@@ -3027,7 +3027,9 @@ the session, or doesn't finish in time, the link **stays routed** (an
 Astation-only reason never drops the r9 carrier): the session advice
 ("expired or was refused …") goes to runtime.log, the notices and any
 waiting Astation operation, and nothing is retried until Astation sends
-another `auth_required`. A verdict counts only for this link's own proof,
+another `auth_required`. A routed link that drops within 10 s of its
+verdict or of a failed Astation authentication reconnects after the usual
+30 s, never at once (no connect/prove/close loop). A verdict counts only for this link's own proof,
 once: a `host_route_ok` or `host_route_refused` that is malformed,
 unsolicited (no proof sent on this link, e.g. a late one on a retried
 link, or any on a host without a list), a second one, an `ok` for another

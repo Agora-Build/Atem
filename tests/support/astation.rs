@@ -215,6 +215,8 @@ pub enum Reply {
     RefusedFirst { host_id: String, head: Value },
     /// No reply to the proof.
     Nothing,
+    /// `host_route_ok`, then the relay closes the connection at once.
+    OkThenClose { host_id: String, head: Value },
 }
 
 /// What the fake relay saw of one host connection.
@@ -388,6 +390,14 @@ async fn relay_link(
             let refused =
                 json!({"type": "relay", "op": "host_route_refused", "v": 1, "code": code});
             let _ = socket.send(Message::Text(refused.to_string())).await;
+            let _ = socket.close(None).await;
+            let _ = relay.send(RelayEvent::Closed(n));
+            return;
+        }
+        Reply::OkThenClose { host_id, head } => {
+            let _ = socket
+                .send(Message::Text(ok_message(&host_id, &head)))
+                .await;
             let _ = socket.close(None).await;
             let _ = relay.send(RelayEvent::Closed(n));
             return;

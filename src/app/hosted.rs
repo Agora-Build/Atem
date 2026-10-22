@@ -238,6 +238,7 @@ impl App {
     /// normal reconnect, which authenticates it again.
     pub fn drop_astation_link(&mut self, reason: String) {
         let was_connected = self.astation_connected;
+        let was_routed = self.astation_routed;
         self.astation_connected = false;
         self.astation_routed = false;
         // A routed link was never Astation's: its drop starts no grace.
@@ -247,7 +248,11 @@ impl App {
         self.astation_client = crate::websocket_client::AstationClient::new();
         self.rebuild_menu();
         self.status_message = Some(reason);
-        self.astation_reconnect_at = Some(Instant::now());
+        self.astation_reconnect_at = Some(if was_routed && !was_connected {
+            self.routed_retry_at()
+        } else {
+            Instant::now()
+        });
     }
 
     /// The broker could not write a mark task's prompt: the task fails.

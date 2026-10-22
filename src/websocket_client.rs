@@ -782,8 +782,10 @@ impl AstationClient {
 
     /// The saved session is still the one the proof used (when one was).
     fn check_session(&self, capture: &crate::pairing::Captured) -> Result<()> {
+        // A routed link being authenticated is checked against the
+        // Astation it is pinned to, as the connect path checks its own.
         let (Some((session_id, token)), Some(astation_id)) =
-            (&capture.session, self.connected_astation_id.as_deref())
+            (&capture.session, self.pinned_astation_id())
         else {
             return Ok(());
         };
@@ -884,6 +886,20 @@ impl AstationClient {
             .await
             .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
         self.authenticate_after_challenge(auth_required, false).await
+    }
+
+    /// Pretend the relay routed this link (§R9.7b) for `room` and its proof
+    /// for `auth_required` used the saved session.
+    #[cfg(test)]
+    pub(crate) fn route_for_test(&mut self, room: &str) {
+        self.routed = Some(room.to_string());
+        let profile = self.profile_sources().expect("a test profile");
+        let mut capture = crate::pairing::Captured::now(&profile).unwrap();
+        capture.session = self
+            .saved_session(room)
+            .unwrap()
+            .map(|s| (s.session_id, s.token));
+        self.capture = Some(capture);
     }
 
     /// Pretend the connect-time authentication pinned `astation_id`.
@@ -2457,6 +2473,49 @@ mod tests {
             client.recv_message_async().await,
             Some(AstationMessage::Relay(_))
         ));
+    }
+
+    /// §R9.7b (N1): the upgrade of a routed link saves a granted session
+    /// only while the saved one is still the one its proof used, as the
+    /// connect path checks; otherwise nothing is saved and the upgrade fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_routed_upgrade_saves_a_grant_only_over_the_session_its_proof_used() {
+        let granted = |id: &str| AstationMessage::StatusUpdate {
+            status: "auth".into(),
+            data: std::collections::HashMap::from([
+                ("status".to_string(), "granted".to_string()),
+                ("session_id".to_string(), id.to_string()),
+                ("token".to_string(), format!("{id}-token")),
+            ]),
+        };
+        // The session the proof used is still saved: the grant is saved.
+        let (state, mut client) = isolated_client("atem-test-routed-grant");
+        let _profile = crate::test_profile::use_dir(state.path());
+        crate::pairing::tests::bound_profile(state.path(), "mac-a");
+        crate::pairing::tests::set_session(state.path(), "mac-a", "old-session", "old-token");
+        client.route_for_test("mac-a");
+        assert_eq!(client.routed_auth_response(&granted("granted-1")).unwrap(), Some(()));
+        assert_eq!(
+            crate::pairing::tests::session_id(state.path()).as_deref(),
+            Some("granted-1")
+        );
+        assert!(!client.routed());
+        drop(client);
+
+        // The saved session changed meanwhile: nothing is saved.
+        let (state, mut client) = isolated_client("atem-test-routed-changed");
+        let _profile = crate::test_profile::use_dir(state.path());
+        crate::pairing::tests::bound_profile(state.path(), "mac-a");
+        crate::pairing::tests::set_session(state.path(), "mac-a", "old-session", "old-token");
+        client.route_for_test("mac-a");
+        crate::pairing::tests::set_session(state.path(), "mac-a", "other-session", "other-token");
+        assert!(client.routed_auth_response(&granted("granted-2")).is_err());
+        assert_eq!(
+            crate::pairing::tests::session_id(state.path()).as_deref(),
+            Some("other-session")
+        );
+        assert!(client.routed(), "still routed, not Astation's");
     }
 
     /// A delayed success for a connection whose pairing was replaced (atem
