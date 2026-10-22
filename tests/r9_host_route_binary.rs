@@ -15,7 +15,14 @@
 //!   another host, a head the host doesn't hold, a late one on a retried
 //!   link) is ignored and never holds the link;
 //! - `host_route_refused` closes it and the runtime retries;
-//! - a held host answers no challenge.
+//! - a held host answers no challenge;
+//! - with Astation in the room challenging first (`Reply::AstationFirst`),
+//!   an `ok` that arrives during the authentication (before or after
+//!   Astation's reply) routes the link: a denial leaves it routed, a grant
+//!   makes it Astation's;
+//! - carrier (A): an unpinned host and a held host answer no challenge,
+//!   authenticate to the Mac in the room as before, and the held one is
+//!   reconciled by the Mac's channel over that link.
 #![cfg(target_os = "linux")]
 
 mod support;
@@ -31,7 +38,7 @@ use support::astation::{
     write_verified_pairing,
 };
 use support::r9::{Out, Router, write_pin};
-use support::r9log::{TestLog, auth, secret};
+use support::r9log::{MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
 
 const ACCOUNT: &str = "acct-route";
@@ -65,6 +72,18 @@ impl Rig {
     /// [`Rig::start`]; `verified: false`: paired, device not verified yet
     /// (`atem pair verify` then runs as an Astation operation).
     fn start_with(verified: bool, held: bool, plan: fn(u64, Value) -> Reply) -> Rig {
+        Self::start_full(verified, held, true, AuthReply::Authenticated, plan)
+    }
+
+    /// [`Rig::start_with`]; `pinned: false`: no device list (an r8 host);
+    /// `auth`: how Astation answers Atem's `auth` from the first link on.
+    fn start_full(
+        verified: bool,
+        held: bool,
+        pinned: bool,
+        auth: AuthReply,
+        plan: fn(u64, Value) -> Reply,
+    ) -> Rig {
         let sandbox = Sandbox::new();
         if verified {
             write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
@@ -75,7 +94,9 @@ impl Rig {
         let mut log = TestLog::genesis(ACCOUNT, &secret("route astation"));
         log.add_host(HOST, 1, &host_seed);
         log.add_native("dev-phone", &["control", "view"]);
-        write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
+        if pinned {
+            write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
+        }
         if held {
             std::fs::write(
                 sandbox.config().join("pairing").join("membership.fault"),
@@ -85,6 +106,7 @@ impl Rig {
         }
         let head = head_json(&log);
         let (relay, seen) = FakeAstation::start_relay(move |n| plan(n, head.clone()));
+        *relay.auth.lock().unwrap() = auth;
         let output = std::fs::File::create(sandbox.dir.path().join("runtime.log")).unwrap();
         let runtime = Command::new(env!("CARGO_BIN_EXE_atem"))
             .arg("runtime")
@@ -189,6 +211,193 @@ fn ok(_: u64, head: Value) -> Reply {
         host_id: HOST.into(),
         head,
     }
+}
+
+/// Astation (in the room) challenges first; the relay's `ok` comes while
+/// Atem waits for Astation's reply, before it.
+fn ok_after_auth_required(_: u64, head: Value) -> Reply {
+    Reply::AstationFirst {
+        ok: Some((HOST.into(), head)),
+        reply_first: false,
+    }
+}
+
+/// [`ok_after_auth_required`], the `ok` after Astation's reply.
+fn ok_after_astation_reply(_: u64, head: Value) -> Reply {
+    Reply::AstationFirst {
+        ok: Some((HOST.into(), head)),
+        reply_first: true,
+    }
+}
+
+/// Carrier (A) with no verdict: Astation challenges and answers.
+fn astation_only(_: u64, _: Value) -> Reply {
+    Reply::AstationFirst {
+        ok: None,
+        reply_first: false,
+    }
+}
+
+/// Ordering (a): Astation's `auth_required` first, then the relay's `ok`,
+/// then Astation's denial (or, `reply_first`, the denial before the `ok`):
+/// the link stays routed for r9 (a phone admitted over it), the advice is
+/// logged, nothing reconnects, and a later challenge Astation accepts
+/// makes it Astation's.
+fn denied_after_auth_required_keeps_the_route(plan: fn(u64, Value) -> Reply) {
+    let rig = Rig::start_full(
+        true,
+        false,
+        true,
+        AuthReply::Deny("session revoked".into()),
+        plan,
+    );
+    rig.proof(1, Duration::from_secs(20));
+    within("the denial to be logged", || {
+        rig.runtime_log()
+            .contains("Astation didn't authenticate the routed relay link")
+    });
+    let log = rig.runtime_log();
+    assert!(log.contains("host_route ok at head"), "{log}");
+    assert!(log.contains("relay route held (no Astation)"), "{log}");
+    assert!(log.contains("expired or was refused"), "{log}");
+    assert!(rig.status().contains("r9 routed (no Astation)"));
+    let mut router = Router::on(&rig.relay, 1);
+    let phone = Identity::native("dev-phone", auth("dev-phone"));
+    let mut attached = router
+        .connect("ph1", &rig.log, HOST, &phone)
+        .unwrap_or_else(|e| panic!("{e:?}\n{}", rig.runtime_log()));
+    assert!(router.list("ph1", &mut attached).is_empty());
+    // No drop, no reconnect loop: one connection, still open.
+    assert!(
+        rig.event(AUTH_DEADLINE + Duration::from_secs(2)).is_none(),
+        "the link was dropped or a new connection opened\n{}",
+        rig.runtime_log()
+    );
+    // Astation challenges again and accepts: the link becomes Astation's.
+    *rig.relay.auth.lock().unwrap() = AuthReply::Authenticated;
+    rig.relay.send(
+        1,
+        auth_required("relay")
+            .to_string()
+            .replace(&"b".repeat(64), &"c".repeat(64)),
+    );
+    within("the upgrade", || {
+        rig.runtime_log()
+            .contains("Astation authenticated the routed relay link")
+    });
+    assert!(rig.event(Duration::from_millis(500)).is_none(), "same link");
+}
+
+#[test]
+fn an_ok_after_auth_required_survives_astations_denial() {
+    denied_after_auth_required_keeps_the_route(ok_after_auth_required);
+}
+
+#[test]
+fn an_ok_after_astations_denial_still_routes_the_link() {
+    denied_after_auth_required_keeps_the_route(ok_after_astation_reply);
+}
+
+/// Ordering (b): `auth_required`, then the relay's `ok`, then Astation's
+/// grant: the link ends authenticated, the granted session saved, on the
+/// same connection.
+#[test]
+fn an_ok_after_auth_required_then_a_grant_authenticates_the_link() {
+    let rig = Rig::start_full(
+        true,
+        false,
+        true,
+        AuthReply::Grant {
+            session_id: "session-2".into(),
+            token: "token-2".into(),
+        },
+        ok_after_auth_required,
+    );
+    rig.proof(1, Duration::from_secs(20));
+    within("the granted session to be saved", || {
+        support::profile::saved_session_id(&rig.sandbox.config()).as_deref() == Some("session-2")
+    });
+    within("the status to show Astation", || {
+        let status = rig.status();
+        !status.contains("r9 routed") && status.contains("connected via relay (")
+    });
+    let log = rig.runtime_log();
+    assert!(log.contains("host_route ok at head"), "{log}");
+    assert!(
+        log.contains("Astation authenticated the routed relay link"),
+        "{log}"
+    );
+    assert!(!log.contains("didn't authenticate"), "{log}");
+    assert!(rig.event(Duration::from_secs(2)).is_none(), "same link");
+}
+
+/// Carrier (A), (c): a host without a device list (an r8 host, as at
+/// pairing and first verification) answers no challenge, sends no proof
+/// and authenticates to its Astation in the room as before (its saved
+/// session; the pairing ceremony itself is `astation_op_binary`'s).
+#[test]
+fn an_unpinned_host_authenticates_over_carrier_a_without_a_proof() {
+    let rig = Rig::start_full(true, false, false, AuthReply::Authenticated, astation_only);
+    let _router = Router::new(&rig.relay);
+    assert!(
+        rig.event(Duration::from_secs(2)).is_none(),
+        "a proof or a close"
+    );
+    within("the status to show Astation", || {
+        let status = rig.status();
+        !status.contains("routed") && status.contains("connected via relay (")
+    });
+    let log = rig.runtime_log();
+    assert!(log.contains("host_challenge not answered"), "{log}");
+    assert!(!log.contains("host_challenge answered"), "{log}");
+    assert!(!log.contains("relay route held"), "{log}");
+}
+
+/// Carrier (A), (d): a held host answers no challenge but authenticates to
+/// the Mac in the room as before, and a managing device's r9 channel over
+/// that link reaches the held list: a phone is refused `busy` "device
+/// list not reconciled", the Mac (a manager at the head) reconciles it
+/// (the fault record goes, the list is pinned again).
+#[test]
+fn a_held_host_is_reconciled_over_carrier_a() {
+    let rig = Rig::start_full(true, true, true, AuthReply::Authenticated, astation_only);
+    let mut router = Router::new(&rig.relay);
+    assert!(
+        rig.event(Duration::from_secs(1)).is_none(),
+        "a proof or a close"
+    );
+    let log = rig.runtime_log();
+    assert!(
+        log.contains("host_challenge not answered: device list held"),
+        "{log}"
+    );
+    within("the status to show Astation", || {
+        rig.status().contains("connected via relay (")
+    });
+    let status = rig.status();
+    assert!(status.contains("Device list:    held ("), "{status}");
+    let phone = Identity::native("dev-phone", auth("dev-phone"));
+    assert_eq!(
+        router.connect("ph1", &rig.log, HOST, &phone).unwrap_err(),
+        (
+            "busy".to_string(),
+            Some("device list not reconciled".to_string())
+        )
+    );
+    // The host takes one channel init a second.
+    std::thread::sleep(Duration::from_millis(1_100));
+    router
+        .connect("mac", &rig.log, HOST, &Identity::native(MAC, auth(MAC)))
+        .unwrap_or_else(|e| panic!("the Mac reconciles: {e:?}\n{}", rig.runtime_log()));
+    let fault = rig
+        .sandbox
+        .config()
+        .join("pairing")
+        .join("membership.fault");
+    assert!(!fault.exists());
+    let status = rig.status();
+    assert!(status.contains("Device list:    pinned at seq"), "{status}");
+    assert!(rig.event(Duration::from_millis(500)).is_none(), "same link");
 }
 
 /// (a), (d): routed with no Astation, held three times past the old

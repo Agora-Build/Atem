@@ -143,26 +143,10 @@ async fn serve(
                 let Some(Ok(frame)) = frame else { return };
                 let Message::Text(text) = frame else { continue };
                 let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
-                if value["type"] == "statusUpdate" && value["data"]["status"] == "auth" {
-                    let answer = auth.lock().unwrap().clone();
-                    let (reply, accepted) = match answer {
-                        AuthReply::Authenticated => (json!({"type": "statusUpdate",
-                            "data": {"status": "authenticated", "data": {}}}), true),
-                        AuthReply::Grant { session_id, token } => (json!({"type": "statusUpdate",
-                            "data": {"status": "auth", "data": {"status": "granted",
-                                "session_id": session_id, "token": token}}}), true),
-                        AuthReply::Deny(message) => (json!({"type": "statusUpdate",
-                            "data": {"status": "auth", "data": {"status": "denied",
-                                "message": message}}}), false),
-                    };
-                    if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                if is_auth(&value) {
+                    if !answer_auth(n, &mut socket, &events, &auth, value).await {
                         return;
                     }
-                    let _ = events.send(if accepted {
-                        Event::Authenticated(n)
-                    } else {
-                        Event::Message(n, value)
-                    });
                 } else {
                     let _ = events.send(Event::Message(n, value));
                 }
@@ -180,6 +164,47 @@ async fn serve(
             },
         }
     }
+}
+
+fn is_auth(value: &Value) -> bool {
+    value["type"] == "statusUpdate" && value["data"]["status"] == "auth"
+}
+
+/// Answers Atem's `auth` (`value`) as `auth` says: `Event::Authenticated`
+/// when accepted, else the `auth` as a message. `false`: the socket failed.
+async fn answer_auth(
+    n: u64,
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    events: &mpsc::Sender<Event>,
+    auth: &Arc<Mutex<AuthReply>>,
+    value: Value,
+) -> bool {
+    let answer = auth.lock().unwrap().clone();
+    let (reply, accepted) = match answer {
+        AuthReply::Authenticated => (
+            json!({"type": "statusUpdate", "data": {"status": "authenticated", "data": {}}}),
+            true,
+        ),
+        AuthReply::Grant { session_id, token } => (
+            json!({"type": "statusUpdate", "data": {"status": "auth", "data": {"status": "granted",
+                "session_id": session_id, "token": token}}}),
+            true,
+        ),
+        AuthReply::Deny(message) => (
+            json!({"type": "statusUpdate", "data": {"status": "auth", "data": {"status": "denied",
+                "message": message}}}),
+            false,
+        ),
+    };
+    if socket.send(Message::Text(reply.to_string())).await.is_err() {
+        return false;
+    }
+    let _ = events.send(if accepted {
+        Event::Authenticated(n)
+    } else {
+        Event::Message(n, value)
+    });
+    true
 }
 
 /// Writes `config` (an atem config dir) as paired with `ASTATION` in
@@ -217,6 +242,16 @@ pub enum Reply {
     Nothing,
     /// `host_route_ok`, then the relay closes the connection at once.
     OkThenClose { host_id: String, head: Value },
+    /// The room's owner is in the room (carrier A): `host_challenge`, then
+    /// Astation's `auth_required` at once (before any verdict). Atem's
+    /// `auth` is answered as `auth` says. `ok`: once both the proof and the
+    /// `auth` arrived, `host_route_ok` is sent before Astation's reply, or
+    /// after it with `reply_first`. `None`: no verdict (a proof is still
+    /// reported); Astation's reply as soon as the `auth` arrives.
+    AstationFirst {
+        ok: Option<(String, Value)>,
+        reply_first: bool,
+    },
 }
 
 /// What the fake relay saw of one host connection.
@@ -349,6 +384,19 @@ async fn relay_link(
         let _ = relay.send(RelayEvent::Closed(n));
         return;
     }
+    if let Reply::AstationFirst { ok, reply_first } = reply {
+        astation_first(
+            n,
+            socket,
+            query,
+            room,
+            challenge.nonce,
+            (ok, reply_first),
+            (events, relay, commands, auth),
+        )
+        .await;
+        return;
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let proof = loop {
         let frame = tokio::time::timeout_at(deadline, socket.next()).await;
@@ -402,7 +450,84 @@ async fn relay_link(
             let _ = relay.send(RelayEvent::Closed(n));
             return;
         }
-        Reply::Unsolicited { .. } | Reply::Nothing => {}
+        Reply::Unsolicited { .. } | Reply::Nothing | Reply::AstationFirst { .. } => {}
+    }
+    serve(n, socket, events, commands, auth).await;
+    let _ = relay.send(RelayEvent::Closed(n));
+}
+
+/// [`Reply::AstationFirst`]: the rest of a host connection whose room's
+/// owner challenges it before the relay's verdict.
+#[allow(clippy::type_complexity)]
+async fn astation_first(
+    n: u64,
+    mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    query: Vec<(String, String)>,
+    room: String,
+    nonce: [u8; 32],
+    (ok, reply_first): (Option<(String, Value)>, bool),
+    (events, relay, commands, auth): (
+        mpsc::Sender<Event>,
+        mpsc::Sender<RelayEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+        Arc<Mutex<AuthReply>>,
+    ),
+) {
+    if socket
+        .send(Message::Text(auth_required("relay").to_string()))
+        .await
+        .is_err()
+    {
+        let _ = relay.send(RelayEvent::Closed(n));
+        return;
+    }
+    let mut proof = false;
+    let mut pending_auth: Option<Value> = None;
+    let mut answered = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut query = Some(query);
+    while !(answered && (proof || ok.is_none())) {
+        let frame = tokio::time::timeout_at(deadline, socket.next()).await;
+        let Ok(Some(Ok(frame))) = frame else {
+            let _ = socket.close(None).await;
+            let _ = relay.send(RelayEvent::Closed(n));
+            return;
+        };
+        let Message::Text(text) = frame else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if value["op"] == "host_route" {
+            proof = true;
+            let _ = relay.send(RelayEvent::Proof {
+                link: n,
+                query: query.take().unwrap_or_default(),
+                nonce,
+                room: room.clone(),
+                message: text.to_string(),
+            });
+        } else if is_auth(&value) {
+            pending_auth = Some(value);
+        } else {
+            let _ = events.send(Event::Message(n, value));
+        }
+        // Astation answers at once without a verdict to order; else once
+        // the proof and the `auth` both arrived, in the planned order.
+        let ready = ok.is_none() || proof;
+        if ready && let Some(value) = pending_auth.take() {
+            let verdict = ok.as_ref().map(|(host_id, head)| ok_message(host_id, head));
+            if !reply_first && let Some(verdict) = &verdict {
+                let _ = socket.send(Message::Text(verdict.clone())).await;
+            }
+            if !answer_auth(n, &mut socket, &events, &auth, value).await {
+                let _ = relay.send(RelayEvent::Closed(n));
+                return;
+            }
+            if reply_first && let Some(verdict) = &verdict {
+                let _ = socket.send(Message::Text(verdict.clone())).await;
+            }
+            answered = true;
+        }
     }
     serve(n, socket, events, commands, auth).await;
     let _ = relay.send(RelayEvent::Closed(n));
