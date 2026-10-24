@@ -412,6 +412,18 @@ fn an_approval_reaches_a_service_with_the_approval_op_which_answers_it() {
     let ap = request["approval_id"].as_str().unwrap().to_string();
     assert_eq!(request["tool"], "Bash", "{request}");
     m.wait(&mut router, |v| v["op"] == "approval_request");
+    // The relay channel does carry this approval's pushes (the sealed
+    // hints for the native members with control), so the absence of a
+    // `push_seen` below means something.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let v = router
+            .other_within(deadline.saturating_duration_since(Instant::now()))
+            .expect("the approval's push_hint on the relay channel");
+        if v["type"] == "relay" && v["op"] == "push_hint" {
+            break;
+        }
+    }
     for d in [&mut bot, &mut view] {
         let seen = d.gather(&mut router, Duration::from_millis(1_500));
         assert!(
