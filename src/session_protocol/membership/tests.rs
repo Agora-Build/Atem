@@ -1407,23 +1407,23 @@ fn the_pin_seeds_the_revoked_grants_and_vouches_for_a_floor() {
 // ── Capacity (D23) ──
 
 fn capacity(entries: u64, members: u64) -> atem_client::membership::Capacity {
-    atem_client::membership::Capacity::of(entries, members)
+    atem_client::membership::Capacity::of(entries, members, 1)
 }
 
 #[test]
 fn the_status_names_the_lists_use_of_its_limits_and_warns_from_90_percent() {
     assert_eq!(
         capacity_text(&capacity(6, 3)),
-        "6/1024 entries, 3/256 members"
+        "6/1024 entries, 3/256 members, 1/64 hosts"
     );
     assert_eq!(
         capacity_text(&capacity(922, 3)),
-        "922/1024 entries, 3/256 members; nearly full: renewals use one entry each; a full list needs re-pairing"
+        "922/1024 entries, 3/256 members, 1/64 hosts; nearly full: renewals use one entry each; a full list needs re-pairing"
     );
     assert!(capacity_text(&capacity(40, 231)).contains("; nearly full: "));
     assert_eq!(
         capacity_text(&capacity(1024, 3)),
-        "1024/1024 entries, 3/256 members; full: no device can be added, renewed or removed; a full list needs re-pairing"
+        "1024/1024 entries, 3/256 members, 1/64 hosts; full: no device can be added, renewed or removed; a full list needs re-pairing"
     );
     assert!(
         capacity_text(&capacity(300, 256))
@@ -1439,7 +1439,7 @@ fn runtime_log_gets_one_line_when_a_limit_crosses_into_nearly_full_or_full() {
     assert_eq!(
         line((921, 3), (922, 3)).as_deref(),
         Some(
-            "922/1024 entries, 3/256 members; nearly full: renewals use one entry each; a full list needs re-pairing"
+            "922/1024 entries, 3/256 members, 1/64 hosts; nearly full: renewals use one entry each; a full list needs re-pairing"
         )
     );
     // Not again on every commit while nearly full, nor when it empties.
@@ -1456,6 +1456,22 @@ fn runtime_log_gets_one_line_when_a_limit_crosses_into_nearly_full_or_full() {
 }
 
 #[test]
+fn hosts_have_their_own_level_warning_and_crossing() {
+    use atem_client::membership::Capacity;
+    assert!(
+        capacity_text(&Capacity::of(10, 3, 64))
+            .ends_with("10/1024 entries, 3/256 members, 64/64 hosts; no room for another host: remove one before adding one")
+    );
+    assert!(capacity_text(&Capacity::of(10, 3, 58)).contains("; nearly full: "));
+    assert_eq!(
+        capacity_text(&Capacity::of(10, 3, 57)),
+        "10/1024 entries, 3/256 members, 57/64 hosts"
+    );
+    assert!(capacity_crossing(&Capacity::of(10, 3, 57), &Capacity::of(11, 3, 58)).is_some());
+    assert!(capacity_crossing(&Capacity::of(11, 3, 58), &Capacity::of(12, 3, 58)).is_none());
+}
+
+#[test]
 fn the_runtime_status_line_carries_the_capacity() {
     let rig = Rig::new();
     rig.pin(&LOG6);
@@ -1466,6 +1482,6 @@ fn the_runtime_status_line_carries_the_capacity() {
     // removed: its id stays used, its place is free).
     assert_eq!(
         status.text,
-        "pinned at seq 6 (1 remote client); 6/1024 entries, 3/256 members"
+        "pinned at seq 6 (1 remote client); 6/1024 entries, 3/256 members, 1/64 hosts"
     );
 }

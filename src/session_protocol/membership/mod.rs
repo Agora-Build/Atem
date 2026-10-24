@@ -433,11 +433,12 @@ fn log(line: &str) {
 }
 
 /// The device list's use of its limits for `atem status` (D23): `N/1024
-/// entries, M/256 members`, then what a nearly full or full list means.
+/// entries, M/256 members, H/64 hosts`, then what a nearly full or full
+/// list means.
 pub fn capacity_text(c: &Capacity) -> String {
     let mut text = format!(
-        "{}/{} entries, {}/{} members",
-        c.entries, c.max_entries, c.members, c.max_members
+        "{}/{} entries, {}/{} members, {}/{} hosts",
+        c.entries, c.max_entries, c.members, c.max_members, c.hosts, c.max_hosts
     );
     if let Some(warning) = capacity_warning(c) {
         text.push_str("; ");
@@ -446,13 +447,15 @@ pub fn capacity_text(c: &Capacity) -> String {
     text
 }
 
-/// What a nearly full or full list means (`None` below 90 % of both
-/// limits). Advisory: the host still accepts every valid entry.
+/// What a nearly full or full list means (`None` below 90 % of every
+/// limit). Advisory: the host still accepts every valid entry.
 fn capacity_warning(c: &Capacity) -> Option<&'static str> {
     if c.entries_level() == CapacityLevel::Full {
         Some("full: no device can be added, renewed or removed; a full list needs re-pairing")
     } else if c.members_level() == CapacityLevel::Full {
         Some("no room for another device: remove one before adding one")
+    } else if c.hosts_level() == CapacityLevel::Full {
+        Some("no room for another host: remove one before adding one")
     } else if c.level == CapacityLevel::NearlyFull {
         Some("nearly full: renewals use one entry each; a full list needs re-pairing")
     } else {
@@ -465,7 +468,8 @@ fn capacity_warning(c: &Capacity) -> Option<&'static str> {
 fn capacity_crossing(before: &Capacity, after: &Capacity) -> Option<String> {
     let rose = |b: CapacityLevel, a: CapacityLevel| a > b && a != CapacityLevel::Ok;
     (rose(before.entries_level(), after.entries_level())
-        || rose(before.members_level(), after.members_level()))
+        || rose(before.members_level(), after.members_level())
+        || rose(before.hosts_level(), after.hosts_level()))
     .then(|| capacity_text(after))
 }
 

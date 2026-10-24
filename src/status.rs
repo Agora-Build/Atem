@@ -829,7 +829,7 @@ pub(crate) mod tests {
         .unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
         // Three entries; the mac and the pending dev-new count as members.
-        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members; recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
         // An unfinished write after a plain crash: replayed at the next
         // start, no managing device asked for (Astation's review of
         // 66ea556).
