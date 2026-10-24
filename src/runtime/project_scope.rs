@@ -12,8 +12,10 @@
 //! its generation is retained: a lock or an absent agent never drops it
 //! (the spec's "until the first unlock"), but every [`REVALIDATE`] each
 //! cached kid is hashed again, and when the agent answers that it no
-//! longer retains that `K` generation ("no retained key"), every hash
-//! under it is dropped at once (the sessions leave the scopes that name
+//! longer retains that `K` generation (`account_keys::NOT_RETAINED`) or
+//! that encryption is off for the account (`account_keys::ENCRYPTION_OFF`:
+//! no hash will be made again, so fail closed as a fresh runtime would),
+//! every hash under it is dropped at once (the sessions leave the scopes that name
 //! it; asked again like a kid never held). A kid no scope names any more
 //! is forgotten too, so it is learned (and its retention checked) afresh.
 use crate::memory::account_keys::CryptOp;
@@ -29,9 +31,7 @@ use std::time::{Duration, Instant};
 pub const RETRY: Duration = Duration::from_secs(5);
 /// How often a cached kid is checked to still be retained by the agent.
 pub const REVALIDATE: Duration = Duration::from_secs(10);
-/// The agent's refusal of a kid it doesn't hold
-/// (`memory::account_keys`; the test table's too).
-const NOT_RETAINED: &str = "no retained key";
+use crate::memory::account_keys::{ENCRYPTION_OFF, NOT_RETAINED};
 /// Hashes per `Crypt` request.
 const BATCH: usize = 64;
 
@@ -128,7 +128,7 @@ impl ProjectHasher for TableHasher {
                 table[key][kid]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| anyhow!("no retained key {kid} (test table)"))
+                    .ok_or_else(|| anyhow!("{NOT_RETAINED} {kid} (test table)"))
             })
             .collect()
     }
@@ -157,6 +157,9 @@ pub struct TableAgent {
     pub table: std::sync::Mutex<HashMap<Pair, String>>,
     pub unlocked: std::sync::Mutex<bool>,
     pub requests: std::sync::Mutex<usize>,
+    /// When set, every `Crypt` is refused with this text (an account
+    /// switched off, a grant gap).
+    pub refusal: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -166,6 +169,7 @@ impl TableAgent {
             table: Default::default(),
             unlocked: std::sync::Mutex::new(unlocked),
             requests: Default::default(),
+            refusal: Default::default(),
         })
     }
 }
@@ -186,6 +190,9 @@ impl crate::memory::cred_agent::CredAgentApi for TableAgent {
         if !*self.unlocked.lock().unwrap() {
             anyhow::bail!("the cred agent is locked; run atem cred unlock");
         }
+        if let Some(why) = self.refusal.lock().unwrap().clone() {
+            anyhow::bail!(why);
+        }
         let table = self.table.lock().unwrap();
         let results = ops
             .into_iter()
@@ -199,7 +206,7 @@ impl crate::memory::cred_agent::CredAgentApi for TableAgent {
                         .get(&(key, kid.clone()))
                         .cloned()
                         .map(CryptOut::Hashed)
-                        .ok_or_else(|| anyhow!("no retained key {kid}"))
+                        .ok_or_else(|| anyhow!("{NOT_RETAINED} {kid}"))
                 }
                 _ => Err(anyhow!("unexpected op")),
             })
@@ -304,14 +311,15 @@ impl ProjectScopes {
                             self.checked.insert(kid, now);
                         }
                     }
-                    Err(why) if why.contains(NOT_RETAINED) => {
+                    Err(why) if why.contains(NOT_RETAINED) || why.contains(ENCRYPTION_OFF) => {
                         eprintln!(
-                            "atem runtime: project scopes: the cred agent no longer retains {kid}; its hashes are dropped (sessions leave the services that name it)"
+                            "atem runtime: project scopes: the cred agent no longer hashes under {kid} ({why}); its hashes are dropped (sessions leave the services that name it)"
                         );
                         fresh.extend(self.drop_kid(&kid));
                     }
-                    // Locked or absent: kept (never dropped by a lock),
-                    // checked again later.
+                    // Locked, absent, or the current kid not granted yet
+                    // (`MISSING_KEY`): kept (never dropped by a lock or a
+                    // grant gap), checked again later.
                     Err(_) => {
                         if self.checked.contains_key(&kid) {
                             self.checked.insert(kid, now);
@@ -524,7 +532,7 @@ mod tests {
         assert!(
             p.failure
                 .get("k0-unheld")
-                .is_some_and(|why| why.contains("no retained key")),
+                .is_some_and(|why| why.contains(NOT_RETAINED)),
             "{:?}",
             p.failure
         );
@@ -623,6 +631,59 @@ mod tests {
         let only_old: BTreeSet<String> = ["k-old".to_string()].into();
         p.pass(&only_old, now);
         assert_eq!(p.matches("ses-a", "h1.k-new.bb"), None);
+    }
+
+    /// Re-review R2: a grant gap (`MISSING_KEY`: the signed state's current
+    /// kid isn't held yet) keeps cached hashes; encryption switched off for
+    /// the account (`ENCRYPTION_OFF`) drops them (fail closed: no hash will
+    /// be made again, and a fresh runtime would leave the session out).
+    #[test]
+    fn encryption_off_drops_cached_hashes_and_a_grant_gap_keeps_them() {
+        use crate::memory::account_keys::MISSING_KEY;
+        let agent = TableAgent::new(true);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert(("proj".into(), "k1".into()), "h1.k1.aa".into());
+        let mut p = ProjectScopes::new(Arc::new(CredAgentHasher {
+            agent: agent.clone(),
+            astation_id: "astation-1".into(),
+        }));
+        p.session("ses-a", Some("proj".into()));
+        let kids: BTreeSet<String> = ["k1".to_string()].into();
+        let t0 = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while p.matches("ses-a", "h1.k1.aa").is_none() || p.pending.is_some() {
+            assert!(Instant::now() < deadline, "never learned");
+            p.pass(&kids, t0);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // One retention check at `now` under `refusal`; settled.
+        let check = |p: &mut ProjectScopes, now: Instant| {
+            let before = *agent.requests.lock().unwrap();
+            let mut fresh = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while *agent.requests.lock().unwrap() == before || p.pending.is_some() {
+                assert!(Instant::now() < deadline, "no retention check");
+                fresh.extend(p.pass(&kids, now));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            fresh
+        };
+        *agent.refusal.lock().unwrap() = Some(MISSING_KEY.to_string());
+        assert!(check(&mut p, t0 + REVALIDATE).is_empty());
+        assert_eq!(
+            p.matches("ses-a", "h1.k1.aa"),
+            Some(true),
+            "a grant gap keeps it"
+        );
+        *agent.refusal.lock().unwrap() = Some(ENCRYPTION_OFF.to_string());
+        assert_eq!(
+            check(&mut p, t0 + REVALIDATE * 2),
+            vec!["ses-a".to_string()]
+        );
+        assert_eq!(p.matches("ses-a", "h1.k1.aa"), None, "off: dropped");
     }
 
     /// Review N2: an agent answering under another key than the one asked

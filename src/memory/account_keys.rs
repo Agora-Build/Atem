@@ -24,6 +24,18 @@ use crate::memory::device_keys::decode32;
 pub const MISSING_KEY: &str =
     "this account requires encryption; connect to Astation to receive the encryption key";
 
+/// The agent's refusal of a kid it doesn't hold (neither current nor a
+/// retained previous generation): `"<NOT_RETAINED> <kid>"`. The runtime's
+/// project scopes drop every cached hash under that kid on it
+/// (`runtime::project_scope`), so the text is matched, never reworded
+/// apart from this constant.
+pub const NOT_RETAINED: &str = "no retained key";
+
+/// The refusal while the account's signed state has encryption off: no
+/// `e1.`/`h1.` operation runs. Project scopes drop their cached hashes on
+/// it (fail closed, as a fresh runtime would leave those sessions out).
+pub const ENCRYPTION_OFF: &str = "encryption is off for this account";
+
 #[derive(Clone)]
 pub struct AccountKey {
     pub kid: String,
@@ -151,7 +163,7 @@ impl AccountKeys {
         ops: Vec<CryptOp>,
     ) -> Result<Vec<CryptOut>> {
         if mode == EncryptionMode::Off {
-            bail!("encryption is off for this account");
+            bail!(ENCRYPTION_OFF);
         }
         let ring = self
             .rings
@@ -192,7 +204,7 @@ impl AccountKeys {
                             .previous
                             .iter()
                             .find(|key| key.kid == kid)
-                            .ok_or_else(|| anyhow!("no retained key {kid}"))?,
+                            .ok_or_else(|| anyhow!("{NOT_RETAINED} {kid}"))?,
                     };
                     Ok(CryptOut::Hashed(keyed_hash(key, &value)))
                 }
@@ -627,7 +639,21 @@ mod tests {
         assert!(previous.starts_with(&format!("h1.{KID}.")), "{previous}");
         assert!(current.starts_with("h1.4567cdef."), "{current}");
         assert_eq!(hash(Some("4567cdef")).unwrap(), current);
-        assert!(hash(Some("89abcdef")).is_err());
+        // The texts the runtime's project scopes match (`NOT_RETAINED`,
+        // `ENCRYPTION_OFF`): built from the shared constants.
+        let refused = hash(Some("89abcdef")).unwrap_err().to_string();
+        assert_eq!(refused, format!("{NOT_RETAINED} 89abcdef"));
+        let off = keys
+            .crypt(
+                "acct",
+                EncryptionMode::Off,
+                Some("4567cdef"),
+                vec![CryptOp::keyed_hash(b"x")],
+            )
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(off, ENCRYPTION_OFF);
         // The wire form stays the old one without a kid.
         assert_eq!(
             serde_json::to_string(&CryptOp::keyed_hash_under(b"hi", KID)).unwrap(),

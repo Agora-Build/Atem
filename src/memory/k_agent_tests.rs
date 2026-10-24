@@ -806,7 +806,7 @@ fn project_scopes_learn_a_kid_installed_later_and_keep_matches_after_a_lock() {
         "C: pending, out of scope"
     );
     assert!(
-        scopes.failure_of(C).unwrap().contains("no retained key"),
+        scopes.failure_of(C).unwrap().contains(crate::memory::account_keys::NOT_RETAINED),
         "{:?}",
         scopes.failure_of(C)
     );
