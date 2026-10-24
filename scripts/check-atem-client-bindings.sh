@@ -5,8 +5,9 @@
 #   kotlin  UniFFI-generated Kotlin + JNA on the JVM (Linux, macOS)
 #   wasm    the wasm-bindgen build under Node (vectors, then the stateful flows)
 #   swift   the UniFFI-generated Swift package (macOS only: swift test)
-#   e2e     the binding end-to-end test: a Kotlin phone and a Node/WASM
-#           browser against a test host over loopback TCP (needs kotlin+wasm)
+#   e2e     the binding end-to-end tests: a Kotlin phone and a Node/WASM
+#           browser, and a Node/WASM service bot, against a test host over
+#           loopback TCP (needs kotlin+wasm)
 #
 # Usage: scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e]
 #        (no argument: kotlin wasm e2e, plus swift on macOS)

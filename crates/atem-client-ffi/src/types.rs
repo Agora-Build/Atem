@@ -255,6 +255,30 @@ data_enum! {
     }
 }
 
+record! {
+    /// A service scope (§R9.6) to build an `add` or `set_roles` from: the
+    /// lists in any order (the builder sorts them and drops duplicates);
+    /// `view` is added to `ops`; `projects`/`sessions` absent don't
+    /// restrict. Also what `MembershipLog::service_grant` returns
+    /// (canonical order).
+    pub struct ServiceScopeInfo {
+        pub hosts: Vec<String>,
+        /// `h1.<kid>.<64 hex>` launch project hashes (`project_hash`).
+        pub projects: Option<Vec<String>>,
+        /// `ses-…` session ids.
+        pub sessions: Option<Vec<String>>,
+        pub ops: Vec<String>,
+    }
+}
+
+record! {
+    /// A service member's grant in effect: its scope and expiry.
+    pub struct ServiceGrantInfo {
+        pub scope: ServiceScopeInfo,
+        pub expires_at: u64,
+    }
+}
+
 data_enum! {
     /// A state change the verifier committed (or would commit).
     pub enum MembershipEffect {

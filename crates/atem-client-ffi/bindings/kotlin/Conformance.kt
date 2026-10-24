@@ -278,6 +278,67 @@ fun main(args: Array<String>) {
         throwsCode("membership_invalid") { log.checkChange("{\"action\":\"remove\"}", at) }
     }
 
+    check("service builders: add, set_roles, renewal, narrowing (§R9.6)") {
+        val log = logL()
+        val e5 = byLabel.getValue("E5")["entry"]["body"]
+        val svc = e5["member"]
+        val at = e5["signed_at"].l().toULong()
+        val exp = svc["expires_at"].l().toULong()
+        val day = 86_400_000uL
+        val svcKey = PublicKeyData(KeyAlg.ED25519, unhex(keys["svc-discord"]["auth"]["pub_hex"].s()))
+        fun strs(v: Any?) = v.arr().map { it.s() }
+        val hosts = strs(svc["scope"]["hosts"])
+        val projects = strs(svc["scope"]["projects"])
+        val ops = strs(svc["scope"]["ops"])
+        // E5's member, rebuilt from its parts in another order: the vector's bytes.
+        val shuffled = ServiceScopeInfo(hosts, projects.reversed(), null, listOf("prompt", "interrupt"))
+        eq(serviceAddAction("svc-discord", svcKey, shuffled, exp, at), canonicalJson(Json.write(mapOf("action" to "add", "member" to svc))))
+        eq(log.serviceGrant("svc-discord"), ServiceGrantInfo(ServiceScopeInfo(hosts, projects, null, ops), exp))
+        eq(log.serviceGrant("dev-phone"), null)
+        val newSvc = serviceAddAction("svc-new", svcKey, ServiceScopeInfo(listOf("host-a"), null, listOf("ses-bbbbbbbbbbbb", "ses-aaaaaaaaaaaa"), listOf("prompt")), at + 3_600_000uL, at)
+        eq(Json.write(Json.parse(newSvc)["member"]["scope"]), "{\"hosts\":[\"host-a\"],\"ops\":[\"prompt\",\"view\"],\"sessions\":[\"ses-aaaaaaaaaaaa\",\"ses-bbbbbbbbbbbb\"]}")
+        log.draftEntry("dev-phone", at, newSvc)
+        eq(log.checkChange(newSvc, at), null, "an add with room")
+        fun change(o: List<String>, e: ULong) = canonicalJson(Json.write(mapOf(
+            "action" to "set_roles", "device_id" to "svc-discord", "roles" to listOf("service"),
+            "scope" to svc["scope"].obj() + ("ops" to o), "expires_at" to e.toLong())))
+        val renew = log.serviceRenewalAction("svc-discord", exp + day, at + day)
+        eq(renew, change(ops, exp + day), "renewal")
+        eq(log.checkChange(renew, at + 3_600_000uL), ChangeRefusalInfo.ServiceChangeTooSoon(at, at + day), "a renewal is paced")
+        val viewOnly = ServiceScopeInfo(hosts, projects, null, listOf("view"))
+        val narrow = log.serviceNarrowingAction("svc-discord", viewOnly, null, at + 3_600_000uL)
+        eq(narrow, change(listOf("view"), exp), "narrowing")
+        eq(log.checkChange(narrow, at + 3_600_000uL), null, "a narrowing isn't paced")
+        eq(serviceSetRolesAction("svc-discord", viewOnly, exp, at), narrow)
+        throwsCode("not_a_narrowing") { log.serviceNarrowingAction("svc-discord", ServiceScopeInfo(hosts, projects, null, listOf("stop", "view")), null, at) }
+        throwsCode("not_a_narrowing") { log.serviceNarrowingAction("svc-discord", ServiceScopeInfo(hosts, projects, null, ops), null, at) }
+        throwsCode("not_a_renewal") { log.serviceRenewalAction("svc-discord", exp, at) }
+        throwsCode("not_a_service") { log.serviceRenewalAction("dev-phone", exp + day, at) }
+        throwsCode("bad_scope") { serviceSetRolesAction("svc-discord", ServiceScopeInfo(listOf(), null, null, listOf("view")), exp, at) }
+        throwsCode("bad_scope") { serviceSetRolesAction("svc-discord", ServiceScopeInfo(listOf("host-a"), null, null, listOf("fly")), exp, at) }
+        throwsCode("service_expiry") { serviceSetRolesAction("svc-discord", ServiceScopeInfo(listOf("host-a"), null, null, listOf()), at + 90uL * day + 1uL, at) }
+        throwsCode("wrong_alg") { serviceAddAction("svc-x", PublicKeyData(KeyAlg.X25519, unhex(keys["dev-phone"]["enc"]["pub_hex"].s())), ServiceScopeInfo(listOf("host-a"), null, null, listOf()), at, at) }
+    }
+    // The host's own vector (src/memory/account_keys.rs H1_VECTOR): h1. of
+    // "github.com/agora/atem" under K = [7; 32], kid 0123abcd.
+    val h1Vector = "h1.0123abcd.777eda018c9c9736a84728e10308571167773f209924bf052477a1283cfd7cb6"
+    check("project keys and hashes (§R9.6)") {
+        eq(projectKeyOfRemote("git@github.com:Agora-Build/Atem.git"), "github.com/agora-build/atem")
+        eq(projectKeyOfRemote("https://user:tok@github.com/Agora-Build/Atem.git/"), "github.com/agora-build/atem")
+        eq(projectKeyOfRemote("file:///srv/repo.git"), null)
+        eq(localProjectKey("Scratch"), "local:Scratch")
+        eq(hex(projectHashInput("github.com/agora/atem")), hex(utf8("github.com/agora/atem")))
+        eq(projectHash(AccountKey("0123abcd", ByteArray(32) { 7 }), "github.com/agora/atem"), h1Vector)
+        val hmac = javax.crypto.Mac.getInstance("HmacSHA256")
+        hmac.init(javax.crypto.spec.SecretKeySpec(ByteArray(32) { 7 }, "HmacSHA256"))
+        val mac = hmac.doFinal(projectHashInput("github.com/agora/atem"))
+        eq(projectHashFromMac("0123abcd", mac), h1Vector)
+        throwsCode("malformed") { projectHashFromMac("01.23", mac) }
+        throwsCode("malformed") { projectHashFromMac("0123abcd", ByteArray(31)) }
+        eq(isProjectHash(byLabel.getValue("E5")["entry"]["body"]["member"]["scope"]["projects"][0].s()), true)
+        eq(isProjectHash("h1.0123abcd.zz"), false)
+    }
+
     // ------------------------------------------------------------ recovery
     fun kit1() = RecoveryKitHandle.read(unhex(rec["R_hex"].s()), rec["kit"]["account_id"].s(), rec["kit"]["genesis_hash"].s(), unhex(rec["kit"]["kit_tag_hex"].s()))
     check("kit 1: tag, recovery key, X25519 key") {

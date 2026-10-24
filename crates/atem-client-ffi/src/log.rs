@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use atem_client::SignedObject;
 use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::channel::HeadRelation;
-use atem_client::encoding::{Hash32, b64u};
+use atem_client::encoding::Hash32;
 use atem_client::membership::{
     Action, CapacityLevel, ChangeRefusal, Conflict, Effect, Entry, Evaluation, Head, HostNow,
     Invalid, Member, MemberKind, MemberStatus, Membership, Stop,
@@ -228,20 +228,11 @@ fn carriage_result(eval: &Evaluation, committed: bool) -> CarriageResult {
 }
 
 /// A structural check of an unsigned body with the verifier's own parser
-/// (the signature is checked against the chain later): so the owner is
-/// only asked to confirm a body the verifier would accept.
+/// (`atem_client::membership::check_body`; the signature is checked
+/// against the chain later): so the owner is only asked to confirm a body
+/// the verifier would accept.
 pub(crate) fn structural_entry(body: &serde_json::Value) -> std::result::Result<Entry, Invalid> {
-    let zero = b64u(&[0u8; 64]);
-    let mut object = serde_json::json!({"body": body, "sig": zero});
-    if body["action"] == "set_recovery_key" && body["kit"] == "current" {
-        object["kit_sig"] = serde_json::json!(zero);
-    }
-    let object = SignedObject::parse(
-        canonical(&object)
-            .map_err(|_| Invalid::Malformed("outside the canonical domain"))?
-            .as_bytes(),
-    )?;
-    Entry::parse(object)
+    atem_client::membership::check_body(body)
 }
 
 /// A verified membership log.
@@ -792,7 +783,7 @@ mod tests {
                         change: RolesChange::Native(roles),
                     },
                 );
-                let wire = serde_json::json!({"body": body, "sig": b64u(&[0u8; 64])});
+                let wire = serde_json::json!({"body": body, "sig": atem_client::encoding::b64u(&[0u8; 64])});
                 let entry = Entry::parse_bytes(wire.to_string().as_bytes()).unwrap();
                 m.append_unchecked_for_tests(entry, &host_now);
                 i += 1;
