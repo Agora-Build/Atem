@@ -1855,19 +1855,25 @@ host accepts every valid entry regardless. The member limit counts
 members in effect and the subjects of pending `recovery_add`s (removed
 and cancelled ones free their place); the host limit counts current
 hosts. A list is *nearly full* at ≥ 90 % of any limit (922 entries, 231
-members, 58 hosts). Signer guidance
-(`atem_client::membership::check_change`, `MembershipLog::check_change`
-in the bindings): draft nothing on a full log, no `add` with full
-members, no `add_host` of a new host with full hosts, and no service
-`set_roles` that grants anything new (a later
-`expires_at` included) within 24 h of that service's last `add` or
-`set_roles` by `signed_at` (a product default,
-`SERVICE_CHANGE_MIN_INTERVAL_MS`); narrowing and `remove` are never
-paced. `signed_at` is the signers' own clock: the guard is advisory by
-design, never a verifier rule. Managing devices show a warning from nearly full
-(`MembershipLog::capacity`); `atem status` shows `N/1024 entries, M/256
-members, H/64 hosts` and the warning, and runtime.log gets one line when a commit
-moves a limit into nearly full or full.
+members, 58 hosts). A full member list (like a full log) also refuses a
+Recovery Kit's `recovery_add`, the account's way back after losing every
+managing device: keep expired or unused services removed so a place
+stays free. Signer guidance (`atem_client::membership::check_change`,
+`MembershipLog::check_change` in the bindings): draft nothing on a full
+log, no `add` or `recovery_add` with full members, no `add_host` of a
+new host with full hosts, and no service `set_roles` that grants
+anything new (a later `expires_at` included) within 24 h of that
+service's last grant (its `add`, or a `set_roles` that granted something
+new; a narrowing doesn't restart the clock) by `signed_at` (a product
+default, `SERVICE_CHANGE_MIN_INTERVAL_MS`); narrowing and `remove` are
+never paced. `signed_at` is the signers' own clock: the guard is
+advisory by design, never a verifier rule. Managing devices show a
+warning from nearly full (`MembershipLog::capacity`); `atem status`
+shows `N/1024 entries, M/256 members, H/64 hosts` and a warning per
+limit at nearly full or full; runtime.log gets one line naming the
+limits when a commit moves a limit into nearly full or full, and one
+when a list opens already there.
+
 Vectors: `r9-vectors-membership-log` (E1–E6 and the alternatives used
 by the scenarios); `r9-vectors-pairing` (`verifyCommit` and its
 `host_trust_gen` cases).
