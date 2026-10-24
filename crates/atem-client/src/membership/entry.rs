@@ -601,7 +601,7 @@ fn scope(value: &Value) -> Result<Scope, Invalid> {
 }
 
 /// `h1.<kid>.<64 lowercase hex>` (memory sync's keyed project hash).
-fn project_hash_ok(text: &str) -> bool {
+pub(crate) fn project_hash_ok(text: &str) -> bool {
     let mut parts = text.splitn(3, '.');
     matches!(
         (parts.next(), parts.next(), parts.next()),

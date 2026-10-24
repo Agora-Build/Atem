@@ -174,3 +174,20 @@ pub fn sign_entry_cosigned(
     object.cosign(kit, kit_key)?;
     Entry::parse(object)
 }
+
+/// The verifier's structural check of an unsigned body (`draft`'s output):
+/// it is wrapped with a placeholder signature (and `kit_sig` for a
+/// `set_recovery_key` with `kit: "current"`) and parsed exactly as a
+/// received entry is (canonical arrays, every field rule of its action).
+/// The signature itself is checked against the chain later, so a body
+/// that passes here is one the verifier accepts for its shape.
+pub fn check_body(body: &Value) -> Result<Entry, Invalid> {
+    let zero = crate::encoding::b64u(&[0u8; 64]);
+    let mut object = json!({"body": body, "sig": zero});
+    if body["action"] == "set_recovery_key" && body["kit"] == "current" {
+        object["kit_sig"] = json!(zero);
+    }
+    let text = crate::canonical::jcs(&object)
+        .map_err(|_| Invalid::Malformed("outside the canonical domain"))?;
+    Entry::parse(SignedObject::parse(text.as_bytes())?)
+}

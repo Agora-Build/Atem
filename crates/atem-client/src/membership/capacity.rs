@@ -274,7 +274,7 @@ fn last_grant(log: &Membership, device_id: &str) -> Option<u64> {
 
 /// The new scope and expiry grant nothing the current ones don't, and
 /// differ from them (the same grant again would only use an entry).
-fn narrows(scope: &Scope, expires_at: u64, new: &Scope, new_expiry: u64) -> bool {
+pub(crate) fn narrows(scope: &Scope, expires_at: u64, new: &Scope, new_expiry: u64) -> bool {
     let within = |new: &[String], cur: &[String]| new.iter().all(|i| cur.contains(i));
     let list_within = |new: &Option<Vec<String>>, cur: &Option<Vec<String>>| match (new, cur) {
         (_, None) => true,

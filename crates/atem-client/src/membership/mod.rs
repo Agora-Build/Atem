@@ -53,6 +53,7 @@ pub mod capacity;
 pub mod draft;
 pub mod entry;
 pub mod publish;
+pub mod service;
 pub mod stored;
 pub mod wait;
 
@@ -60,10 +61,14 @@ pub use capacity::{
     Capacity, CapacityLevel, ChangeRefusal, NEARLY_FULL_PERCENT, SERVICE_CHANGE_MIN_INTERVAL_MS,
     check_change,
 };
-pub use draft::{draft_on, sign_entry, sign_entry_cosigned};
+pub use draft::{check_body, draft_on, sign_entry, sign_entry_cosigned};
 pub use entry::{
     Action, Entry, HostRecord, KBackupRecord, KitMode, Member, MemberKind, RECOVERY_SIGNER, Role,
     RolesChange, Scope,
+};
+pub use service::{
+    ServiceChangeError, ServiceScope, service_add, service_grant, service_narrowing,
+    service_renewal, service_set_roles,
 };
 pub use wait::{HostNow, RECOVERY_WAIT_MS, WaitClock};
 
