@@ -1336,6 +1336,153 @@ fn credentials_astation_sends_go_to_the_links_profile() {
     });
 }
 
+/// An App on a link to the fake Astation for the bound profile at `profile`,
+/// reached `via`.
+async fn linked_app(profile: &Path, via: crate::websocket_client::LinkVia) -> (App, Peer) {
+    let (url, peer) = Peer::listen().await;
+    let mut app = App::new();
+    app.last_session_refresh = Some(Instant::now());
+    app.astation_reconnect = false;
+    app.astation_client = AstationClient::new_with_test_state(ATEM_ID, profile);
+    app.astation_client.connect_raw(&url).await.unwrap();
+    app.astation_client.pin_astation_for_test(ASTATION);
+    app.astation_client.set_via_for_test(via);
+    app.astation_connected = true;
+    (app, peer)
+}
+
+fn relay() -> crate::websocket_client::LinkVia {
+    crate::websocket_client::LinkVia::Relay {
+        label: "relay".into(),
+    }
+}
+
+/// `transportPolicy` is kept in the link's bound pairing and acknowledged
+/// with the value stored; a relay link stays, and `false` clears it.
+#[test]
+fn transport_policy_is_kept_in_the_bound_pairing_and_acknowledged() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        for relay_only in [true, false] {
+            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only })
+                .await;
+            let ack = peer.next("transportPolicyAck").await;
+            assert_eq!(ack["data"], json!({"relay_only": relay_only}));
+            assert_eq!(record(&profile).relay_only, relay_only);
+            assert!(app.astation_connected, "a relay link stays");
+        }
+    });
+}
+
+/// Without the pairing the link authenticated under (removed meanwhile),
+/// nothing is stored, no record appears and nothing is acknowledged.
+#[test]
+fn transport_policy_without_a_bound_pairing_is_ignored() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        crate::pairing::unpair(&crate::profile::Sources::in_dir(&profile)).unwrap();
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            !peer.seen.iter().any(|m| m["type"] == "transportPolicyAck"),
+            "{:#?}",
+            peer.seen
+        );
+        assert!(
+            !crate::paths::ProfilePaths::in_dir(&profile)
+                .pairing
+                .record
+                .exists(),
+            "never re-creates the pairing"
+        );
+        assert!(
+            app.status_message
+                .unwrap()
+                .starts_with("Transport policy not saved")
+        );
+    });
+}
+
+/// Relay only arriving on a local link: stored, acknowledged, then the
+/// local link is dropped so the reconnect goes through the relay.
+#[test]
+fn relay_only_drops_a_local_link_after_the_ack() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) =
+            linked_app(&profile, crate::websocket_client::LinkVia::Local).await;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        let ack = peer.next("transportPolicyAck").await;
+        assert_eq!(ack["data"], json!({"relay_only": true}));
+        assert!(record(&profile).relay_only);
+        assert!(!app.astation_connected);
+        assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
+        assert!(peer.drain(WAIT).await, "the local socket closed");
+        // Relay only off on a local link: kept, no reconnect.
+        let (mut app, mut peer) =
+            linked_app(&profile, crate::websocket_client::LinkVia::Local).await;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: false })
+            .await;
+        peer.next("transportPolicyAck").await;
+        assert!(!record(&profile).relay_only);
+        assert!(app.astation_connected);
+    });
+}
+
+/// The connect loop skips the local `astation_ws` while the pairing says
+/// relay only (and tries it otherwise).
+#[test]
+fn the_connect_loop_skips_local_while_relay_only() {
+    for relay_only in [true, false] {
+        local(async {
+            let config = crate::config::AtemConfig::config_dir();
+            paired(&config);
+            crate::records::PairingRecord::update(
+                &crate::paths::ProfilePaths::in_dir(&config).pairing,
+                ASTATION,
+                Some("binding-1"),
+                |record| record.relay_only = relay_only,
+            )
+            .unwrap();
+            let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            std::fs::write(
+                config.join("config.toml"),
+                format!(
+                    "astation_ws = \"ws://{}/ws\"\nastation_relay_url = \"http://127.0.0.1:1\"\natem_id = \"{ATEM_ID}\"\n",
+                    local.local_addr().unwrap()
+                ),
+            )
+            .unwrap();
+            let mut app = App::new();
+            app.spawn_astation_connect();
+            let tried = tokio::time::timeout(Duration::from_millis(500), local.accept())
+                .await
+                .is_ok();
+            assert_eq!(tried, !relay_only, "relay_only {relay_only}");
+            if relay_only {
+                let rx = app.astation_connect_rx.take().unwrap();
+                assert!(
+                    tokio::time::timeout(WAIT, rx)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_err()
+                );
+            }
+        });
+    }
+}
+
 /// A runtime of another build is never replaced while an Astation
 /// operation runs: `restart` is refused and the client keeps it, saying why.
 #[test]
