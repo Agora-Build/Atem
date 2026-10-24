@@ -1483,7 +1483,9 @@ fn relay_only_drops_a_local_link_after_the_ack() {
         let ack = peer.next("transportPolicyAck").await;
         assert_eq!(ack["data"], stored(true));
         assert!(record(&profile).relay_only);
-        assert!(!app.astation_connected);
+        // The pass drops it once the ack was written.
+        pass_until_dropped(&mut app, WAIT).await;
+        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
         assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
         assert!(peer.drain(WAIT).await, "the local socket closed");
         // Relay only off on a local link: kept, no reconnect.
@@ -1534,6 +1536,63 @@ fn relay_only_waits_for_the_operation_on_the_local_link() {
 
 /// The status after relay only dropped a local link.
 const RELAY_ONLY_RECONNECT: &str = "Astation allows only the relay; reconnecting through it";
+
+/// Runs passes (each prompt) until the Astation link is dropped, within `limit`.
+async fn pass_until_dropped(app: &mut App, limit: Duration) {
+    let started = Instant::now();
+    while app.astation_connected {
+        assert!(started.elapsed() < limit, "the link was not dropped");
+        let pass = Instant::now();
+        app.process_astation_messages().await;
+        assert!(
+            pass.elapsed() < Duration::from_secs(1),
+            "the pass never waits"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(app.relay_only_drop.is_none());
+}
+
+/// Relay only on a local link with no operation: the pass returns at once
+/// while the writer holds the ack and keeps the link; once the ack is
+/// written the link is dropped; the peer gets the ack, then the close.
+#[test]
+fn relay_only_immediate_drop_waits_for_the_ack_without_holding_the_pass() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        let paused = app.astation_client.pause_writer_for_test();
+        let started = Instant::now();
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(1), "never waits");
+        assert!(record(&profile).relay_only);
+        for _ in 0..10 {
+            let pass = Instant::now();
+            app.process_astation_messages().await;
+            assert!(
+                pass.elapsed() < Duration::from_secs(1),
+                "the pass never waits"
+            );
+            assert!(app.astation_connected, "the ack isn't written yet");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!peer.drain(Duration::from_millis(100)).await);
+        assert!(acks(&peer).is_empty(), "held by the writer");
+        paused.resume();
+        pass_until_dropped(&mut app, WAIT).await;
+        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
+        assert!(app.astation_reconnect_at.is_some());
+        assert!(peer.drain(WAIT).await, "the local socket closed");
+        assert_eq!(
+            acks(&peer),
+            vec![stored(true)],
+            "the ack arrived before the close"
+        );
+    });
+}
 
 /// An operation running on `app`'s current link.
 fn op_on_link(app: &mut App) -> mpsc::Receiver<AstationMessage> {
@@ -1805,13 +1864,16 @@ fn relay_only_drops_the_local_link_when_the_ack_flush_times_out() {
         let profile = dir.path().join("profile");
         paired(&profile);
         let (mut app, _peer) = linked_app(&profile, local_via()).await;
-        let _stalled = app.astation_client.stall_writer_for_test();
+        // Held, never resumed (the real writer stays alive).
+        let _paused = app.astation_client.pause_writer_for_test();
         let started = Instant::now();
         app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
             .await;
-        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1), "never waits");
         assert!(record(&profile).relay_only);
-        assert!(!app.astation_connected);
+        pass_until_dropped(&mut app, Duration::from_secs(8)).await;
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
         assert!(app.astation_reconnect_at.is_some());
     });
 }

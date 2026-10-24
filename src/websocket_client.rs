@@ -794,15 +794,6 @@ impl AstationClient {
         self.authenticate_after_challenge(auth_required, false).await
     }
 
-    /// A writer that never writes: a flushed send waits out its timeout.
-    /// Returns the queue so it stays open.
-    #[cfg(test)]
-    pub(crate) fn stall_writer_for_test(&mut self) -> Box<dyn std::any::Any> {
-        let (tx, rx) = mpsc::unbounded_channel::<OutboundMessage>();
-        self.sender = Some(tx);
-        Box::new(rx)
-    }
-
     /// Holds back everything sent from now on until the returned handle's
     /// `resume`, which hands it to the real writer in order.
     #[cfg(test)]

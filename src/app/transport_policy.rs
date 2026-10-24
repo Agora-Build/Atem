@@ -7,12 +7,12 @@ use super::App;
 use crate::websocket_client::{AstationMessage, DeliveryReceipt, LinkVia};
 use std::time::{Duration, Instant};
 
-/// How long a deferred drop waits for its ack to be written once the
-/// operation ended (as `send_message_flushed` waits on the immediate path).
+/// How long a drop waits for its ack to be written once no operation runs
+/// on the link.
 const ACK_FLUSH: Duration = Duration::from_secs(5);
 
-/// A local link drop relay only deferred while an Astation operation ran on
-/// that link (`App::relay_only_drop`).
+/// A local link drop relay only scheduled (`App::relay_only_drop`): after
+/// any Astation operation on that link and the ack's delivery.
 #[derive(Debug)]
 pub struct RelayOnlyDrop {
     /// The link it applies to; a replaced link forgets it.
@@ -20,8 +20,8 @@ pub struct RelayOnlyDrop {
     /// The latest ack's delivery: the socket closes only once it was
     /// written (or failed), so the ack reaches Astation before the close.
     receipt: Option<DeliveryReceipt>,
-    /// Set when the operation ended: the drop happens by then even if the
-    /// writer never wrote the ack.
+    /// Set once no operation runs on the link: the drop happens by then
+    /// even if the writer never wrote the ack.
     due: Option<Instant>,
 }
 
@@ -68,8 +68,9 @@ impl App {
     /// Stores `relay_only` under the link's bound pairing and acknowledges
     /// the result (`stored`, else `stored: false` with a reason; another
     /// binding is never touched). A stored `true` on a local link drops it
-    /// after the ack, so the reconnect takes the relay; while an Astation
-    /// operation runs on that link the drop waits until it ends.
+    /// once the ack was written (at most 5 s), so the reconnect takes the
+    /// relay; while an Astation operation runs on that link the drop waits
+    /// until it ends. Never waits itself (`check_relay_only_drop` polls).
     pub(super) async fn transport_policy(&mut self, relay_only: bool) {
         let ack = match self.store_transport_policy(relay_only) {
             Ok(()) => AstationMessage::TransportPolicyAck {
@@ -100,9 +101,11 @@ impl App {
         } else if !local {
             // A relay link: nothing more to do.
             let _ = self.astation_client.send_message(ack).await;
-        } else if self.op_on_link() || self.drop_waits() {
-            // The drop waits for the operation, then for this ack's
-            // delivery (a repeat's ack is the later one, written last).
+        } else {
+            // A local link: dropped by `check_relay_only_drop` (this pass,
+            // never waiting in it) once no operation runs on it and this
+            // ack was written, at most 5 s later. A repeat's ack is the
+            // later one (the writer keeps the order), so it is the barrier.
             let receipt = self.astation_client.send_message_with_receipt(ack).ok();
             match &mut self.relay_only_drop {
                 Some(pending) if pending.link_gen == self.astation_link_gen => {
@@ -116,10 +119,6 @@ impl App {
                     });
                 }
             }
-        } else {
-            // Written before the socket closes (or given up after 5 s).
-            let _ = self.astation_client.send_message_flushed(ack).await;
-            self.drop_astation_link(RELAY_ONLY_RECONNECT.into());
         }
     }
 
@@ -161,17 +160,16 @@ impl App {
             .is_some_and(|route| route.link_gen == self.astation_link_gen && !route.tx.is_closed())
     }
 
-    /// Whether a deferred drop of the current link is still waiting.
+    /// Whether a drop of the current link is still waiting.
     fn drop_waits(&self) -> bool {
         self.relay_only_drop
             .as_ref()
             .is_some_and(|pending| pending.link_gen == self.astation_link_gen)
     }
 
-    /// The local link drop relay only deferred: done once the operation on
-    /// that link ended and the ack was written (at most `ACK_FLUSH` after
-    /// the operation ended, never waiting in the pass); forgotten when the
-    /// link already went.
+    /// The local link drop relay only scheduled: done once no operation runs
+    /// on that link and the ack was written (at most `ACK_FLUSH` after that,
+    /// never waiting in the pass); forgotten when the link already went.
     pub(super) fn check_relay_only_drop(&mut self) {
         if self.relay_only_drop.is_none() {
             return;
