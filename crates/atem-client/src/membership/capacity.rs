@@ -1,6 +1,7 @@
 //! How full a verified log is, and the signer-side guard on service changes
 //! (decision D23: no log compaction). The log holds at most
-//! [`MAX_ENTRIES`] entries and [`MAX_MEMBERS`] current members (§R9.2); ids
+//! [`MAX_ENTRIES`] entries, [`MAX_MEMBERS`] current members and
+//! [`MAX_HOSTS`] current hosts (§R9.2); ids
 //! are never reused, every renewal and removal takes one entry, and a full
 //! log means re-pairing.
 //!
@@ -10,18 +11,19 @@
 //! drift; [`check_change`] is what a managing device asks before it drafts
 //! an entry, so a bot's renewals can't use up the list.
 use super::entry::{Action, MemberKind, RolesChange, Scope};
-use super::{MAX_ENTRIES, MAX_MEMBERS, MemberStatus, Membership};
+use super::{MAX_ENTRIES, MAX_HOSTS, MAX_MEMBERS, MemberStatus, Membership};
 
-/// A limit counts as nearly full from this share of it (%), for either
-/// limit: 922 of 1024 entries, 231 of 256 members.
+/// A limit counts as nearly full from this share of it (%), for each
+/// limit: 922 of 1024 entries, 231 of 256 members, 58 of 64 hosts.
 pub const NEARLY_FULL_PERCENT: u64 = 90;
 
 /// A product default, not a protocol rule: a signer doesn't widen or renew
 /// a service (a `set_roles` that grants anything new, e.g. a later
 /// `expires_at`) within 24 h of that service's last entry (`add` or
 /// `set_roles`), measured on the entries' `signed_at` (the signers' own
-/// clocks: display only for a verifier, so a host never applies it).
-/// Narrowing and removal are never rate-limited.
+/// clocks: display only for a verifier, so a host never applies it; the
+/// guard is advisory by design). Narrowing and removal are never
+/// rate-limited.
 pub const SERVICE_CHANGE_MIN_INTERVAL_MS: u64 = 86_400_000;
 
 /// How close a log (or one of its limits) is to full.
@@ -30,7 +32,8 @@ pub enum CapacityLevel {
     Ok,
     /// At or above [`NEARLY_FULL_PERCENT`] of a limit.
     NearlyFull,
-    /// A limit reached: no entry at all (entries), or no `add` (members).
+    /// A limit reached: no entry at all (entries), no `add` (members), or
+    /// no `add_host` of a new host (hosts).
     Full,
 }
 
@@ -65,21 +68,30 @@ pub struct Capacity {
     /// cancelled ones aren't counted (their ids stay used).
     pub members: u64,
     pub max_members: u64,
-    /// The higher of the two limits' levels.
+    /// Hosts the verifier's host limit counts: current ones (a removed
+    /// host frees its place).
+    pub hosts: u64,
+    pub max_hosts: u64,
+    /// The highest of the three limits' levels.
     pub level: CapacityLevel,
 }
 
 impl Capacity {
-    /// `entries` and `members` against the verifier's limits.
-    pub fn of(entries: u64, members: u64) -> Capacity {
+    /// `entries`, `members` and `hosts` against the verifier's limits.
+    pub fn of(entries: u64, members: u64, hosts: u64) -> Capacity {
         let mut capacity = Capacity {
             entries,
             max_entries: MAX_ENTRIES,
             members,
             max_members: MAX_MEMBERS as u64,
+            hosts,
+            max_hosts: MAX_HOSTS as u64,
             level: CapacityLevel::Ok,
         };
-        capacity.level = capacity.entries_level().max(capacity.members_level());
+        capacity.level = capacity
+            .entries_level()
+            .max(capacity.members_level())
+            .max(capacity.hosts_level());
         capacity
     }
 
@@ -90,12 +102,20 @@ impl Capacity {
     pub fn members_level(&self) -> CapacityLevel {
         CapacityLevel::of(self.members, self.max_members)
     }
+
+    pub fn hosts_level(&self) -> CapacityLevel {
+        CapacityLevel::of(self.hosts, self.max_hosts)
+    }
 }
 
 impl Membership {
     /// How full this log is, by the verifier's own counts and limits.
     pub fn capacity(&self) -> Capacity {
-        Capacity::of(self.head().seq, self.derived.current_member_count() as u64)
+        Capacity::of(
+            self.head().seq,
+            self.derived.current_member_count() as u64,
+            self.derived.current_hosts() as u64,
+        )
     }
 }
 
@@ -107,6 +127,9 @@ pub enum ChangeRefusal {
     LogFull,
     /// [`MAX_MEMBERS`] members: no `add` until one is removed.
     MembersFull,
+    /// [`MAX_HOSTS`] current hosts: no `add_host` of a new host until one
+    /// is removed (a current host's new key still fits).
+    HostsFull,
     /// The service had an entry signed at `last_signed_at`; a change that
     /// grants anything new waits until `retry_at`
     /// ([`SERVICE_CHANGE_MIN_INTERVAL_MS`]).
@@ -118,6 +141,7 @@ impl ChangeRefusal {
         match self {
             ChangeRefusal::LogFull => "log_full",
             ChangeRefusal::MembersFull => "members_full",
+            ChangeRefusal::HostsFull => "hosts_full",
             ChangeRefusal::TooSoon { .. } => "service_change_too_soon",
         }
     }
@@ -138,6 +162,7 @@ impl std::error::Error for ChangeRefusal {}
 ///
 /// - a full log ([`MAX_ENTRIES`]) refuses every action;
 /// - full members refuse `add` and `recovery_add`;
+/// - full hosts refuse an `add_host` of a host that isn't current;
 /// - a service's `set_roles` that grants anything new (a later
 ///   `expires_at`, a host, op, project or session it didn't have, or a
 ///   list it was restricted by dropped) within
@@ -154,6 +179,12 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
             if capacity.members_level() == CapacityLevel::Full =>
         {
             Err(ChangeRefusal::MembersFull)
+        }
+        Action::AddHost { host }
+            if capacity.hosts_level() == CapacityLevel::Full
+                && log.host(&host.host_id).is_none() =>
+        {
+            Err(ChangeRefusal::HostsFull)
         }
         Action::SetRoles {
             device_id,
@@ -217,7 +248,7 @@ mod tests {
     use crate::encoding::Hash32;
     use crate::kit::RecoveryKit;
     use crate::membership::Entry;
-    use crate::membership::entry::{Member, Role};
+    use crate::membership::entry::{HostRecord, Member, Role};
     use crate::membership::{HostNow, RECOVERY_SIGNER, draft, sign_entry};
     use crate::provider::KeyProvider;
 
@@ -376,6 +407,8 @@ mod tests {
                 max_entries: 1024,
                 members: 1,
                 max_members: 256,
+                hosts: 0,
+                max_hosts: 64,
                 level: CapacityLevel::Ok,
             }
         );
@@ -460,6 +493,59 @@ mod tests {
         assert_eq!(log.m.capacity().members, 255);
         assert_eq!(check_change(&log.m, &add, T0), Ok(()));
         assert_eq!(log.sign_check(&add, T0), super::super::Check::Valid);
+    }
+
+    #[test]
+    fn hosts_count_as_the_verifiers_host_limit_does() {
+        let mut log = Log::new();
+        let add_host = |id: &str, trust_gen: u64| Action::AddHost {
+            host: HostRecord {
+                host_id: id.into(),
+                host_trust_gen: trust_gen,
+                host_key: keys(7).recovery_key(),
+            },
+        };
+        for i in 0..MAX_HOSTS {
+            log.push_unsigned(add_host(&format!("host-{i}"), 1), T0);
+            if i == 56 {
+                // 57 of 64: 89.1 %.
+                assert_eq!(log.m.capacity().hosts_level(), CapacityLevel::Ok);
+            }
+            if i == 57 {
+                assert_eq!(log.m.capacity().level, CapacityLevel::NearlyFull);
+            }
+        }
+        let c = log.m.capacity();
+        assert_eq!((c.hosts, c.level), (64, CapacityLevel::Full));
+        assert_eq!(
+            (c.entries_level(), c.members_level()),
+            (CapacityLevel::Ok, CapacityLevel::Ok)
+        );
+        // A new host: the verifier and the guard refuse it.
+        let new_host = add_host("host-new", 1);
+        assert_eq!(
+            log.sign_check(&new_host, T0),
+            super::super::Check::Invalid(super::super::Invalid::LogFull)
+        );
+        assert_eq!(
+            check_change(&log.m, &new_host, T0),
+            Err(ChangeRefusal::HostsFull)
+        );
+        // A current host's new key still fits; members and other entries go on.
+        let rekey = add_host("host-3", 2);
+        assert_eq!(log.sign_check(&rekey, T0), super::super::Check::Valid);
+        assert_eq!(check_change(&log.m, &rekey, T0), Ok(()));
+        assert_eq!(check_change(&log.m, &add_service("svc"), T0), Ok(()));
+        // A removed host frees its place.
+        log.push(
+            Action::RemoveHost {
+                host_id: "host-0".into(),
+            },
+            T0,
+        );
+        assert_eq!(log.m.capacity().hosts, 63);
+        assert_eq!(check_change(&log.m, &new_host, T0), Ok(()));
+        assert_eq!(log.sign_check(&new_host, T0), super::super::Check::Valid);
     }
 
     #[test]
