@@ -443,7 +443,7 @@ impl MembershipLog {
         to_js(&self.0.capacity())
     }
     /// `null` to go ahead, else `{type: "log_full" | "members_full" |
-    /// "hosts_full" | "too_soon", lastSignedAt?, retryAt?}` (advisory, for
+    /// "hosts_full" | "service_change_too_soon", lastSignedAt?, retryAt?}` (advisory, for
     /// signers).
     #[wasm_bindgen(js_name = checkChange)]
     pub fn check_change(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {

@@ -268,7 +268,7 @@ fun main(args: Array<String>) {
             "action" to "set_roles", "device_id" to "svc-discord", "roles" to listOf("service"),
             "scope" to svc["scope"].obj() + ("ops" to ops), "expires_at" to expiresAt))
         val renew = change(svc["scope"]["ops"], svc["expires_at"].l() + day)
-        eq(log.checkChange(renew, at + 3_600_000uL), ChangeRefusalInfo.TooSoon(at, at + day.toULong()), "a renewal within 24 h")
+        eq(log.checkChange(renew, at + 3_600_000uL), ChangeRefusalInfo.ServiceChangeTooSoon(at, at + day.toULong()), "a renewal within 24 h")
         eq(log.checkChange(renew, at + day.toULong()), null, "after 24 h")
         eq(log.checkChange(change(listOf("view"), svc["expires_at"].l()), at + 3_600_000uL), null, "narrowing")
         eq(log.checkChange("{\"action\":\"remove\",\"device_id\":\"svc-discord\"}", at + 3_600_000uL), null, "removal")

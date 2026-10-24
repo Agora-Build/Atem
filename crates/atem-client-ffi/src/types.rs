@@ -241,7 +241,9 @@ data_enum! {
     pub enum ChangeRefusalInfo {
         /// 1024 entries: no verifier takes another, a removal included.
         LogFull,
-        /// 256 members: no `add` until one is removed.
+        /// 256 members: no `add`, and no `recovery_add` either (a Recovery
+        /// Kit can't bring the account back), until one is removed: keep
+        /// expired or unused services removed so a place stays free.
         MembersFull,
         /// 64 current hosts: no `add_host` of a new host until one is
         /// removed (a current host's new key still fits).
@@ -249,7 +251,7 @@ data_enum! {
         /// A service change that grants anything new within 24 h of that
         /// service's last entry (signed at `last_signed_at`): retry at
         /// `retry_at`.
-        TooSoon { last_signed_at: u64, retry_at: u64 },
+        ServiceChangeTooSoon { last_signed_at: u64, retry_at: u64 },
     }
 }
 

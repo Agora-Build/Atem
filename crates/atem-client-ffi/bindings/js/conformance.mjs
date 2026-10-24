@@ -225,7 +225,7 @@ check("capacity and the service change guard (D23)", () => {
   const day = 86400000;
   const change = (ops, expiresAt) => str({ action: "set_roles", device_id: "svc-discord", roles: ["service"], scope: { ...svc.scope, ops }, expires_at: expiresAt });
   const renew = change(svc.scope.ops, svc.expires_at + day);
-  eq(log.checkChange(renew, at + 3600000), { type: "too_soon", lastSignedAt: at, retryAt: at + day }, "a renewal within 24 h");
+  eq(log.checkChange(renew, at + 3600000), { type: "service_change_too_soon", lastSignedAt: at, retryAt: at + day }, "a renewal within 24 h");
   eq(log.checkChange(renew, at + day), null, "after 24 h");
   eq(log.checkChange(change(["view"], svc.expires_at), at + 3600000), null, "narrowing");
   eq(log.checkChange(str({ action: "remove", device_id: "svc-discord" }), at + 3600000), null, "removal");

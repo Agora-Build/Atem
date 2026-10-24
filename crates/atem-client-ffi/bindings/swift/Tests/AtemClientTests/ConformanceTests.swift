@@ -295,7 +295,7 @@ final class ConformanceTests: XCTestCase {
                 return js(["action": "set_roles", "device_id": "svc-discord", "roles": ["service"], "scope": scope, "expires_at": expiresAt] as [String: Any])
             }
             let renew = change(o(svc["scope"])["ops"]!, u(svc["expires_at"]) + day)
-            try eq(try log.checkChange(actionJson: renew, nowMs: at + 3_600_000), .tooSoon(lastSignedAt: at, retryAt: at + day), "a renewal within 24 h")
+            try eq(try log.checkChange(actionJson: renew, nowMs: at + 3_600_000), .serviceChangeTooSoon(lastSignedAt: at, retryAt: at + day), "a renewal within 24 h")
             try eq(try log.checkChange(actionJson: renew, nowMs: at + day), nil, "after 24 h")
             try eq(try log.checkChange(actionJson: change(["view"], u(svc["expires_at"])), nowMs: at + 3_600_000), nil, "narrowing")
             try eq(try log.checkChange(actionJson: "{\"action\":\"remove\",\"device_id\":\"svc-discord\"}", nowMs: at + 3_600_000), nil, "removal")
