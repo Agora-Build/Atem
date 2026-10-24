@@ -126,7 +126,9 @@ pub fn project_hash_from_mac(kid: String, mac: Vec<u8>) -> Result<String> {
 }
 
 /// The software form: `h1.<kid>.<hex HMAC-SHA256(k, project key)>` under
-/// an account key (as `seal_k_backup` takes it).
+/// an account key (as `seal_k_backup` takes it). Only for an app that
+/// already holds `K` bytes in memory (restore, K backups); otherwise use
+/// `project_hash_from_mac` with the key in the platform key store.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn project_hash(key: AccountKey, project_key: String) -> Result<String> {
     let AccountKey { kid, k } = key;
@@ -150,7 +152,9 @@ pub fn is_project_hash(text: String) -> bool {
 
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl MembershipLog {
-    /// The scope and expiry of the service `device_id` in effect here.
+    /// The scope and expiry of the active service member `device_id`
+    /// (its membership status only: an expired service is still returned;
+    /// compare `expires_at` with the time yourself).
     pub fn service_grant(&self, device_id: String) -> Option<ServiceGrantInfo> {
         let log = self.lock();
         atem_client::membership::service_grant(&log, &device_id).map(|(scope, expires_at)| {

@@ -231,8 +231,10 @@ pub fn service_set_roles(
     )
 }
 
-/// The scope and expiry of the service member `device_id` in effect in
-/// `log`.
+/// The scope and expiry of the service member `device_id` whose status in
+/// `log` is active. Expiry is the caller's check: this passes the
+/// membership status through only, so an expired service is still returned
+/// (with its past `expires_at`; a renewal of it brings it back).
 pub fn service_grant<'a>(log: &'a Membership, device_id: &str) -> Option<(&'a Scope, u64)> {
     let state = log.member(device_id)?;
     match (&state.member.kind, &state.status) {

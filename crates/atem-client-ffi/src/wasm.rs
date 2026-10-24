@@ -454,7 +454,8 @@ impl MembershipLog {
         err(self.0.check_member(member_json))
     }
     /// `{scope: {hosts, projects?, sessions?, ops}, expiresAt}` of the
-    /// service in effect, or `null`.
+    /// active service member, or `null` (status only: an expired service is
+    /// still returned; compare `expiresAt` with the time yourself).
     #[wasm_bindgen(js_name = serviceGrant)]
     pub fn service_grant(&self, device_id: String) -> JsResult<JsValue> {
         to_js(&self.0.service_grant(device_id))
