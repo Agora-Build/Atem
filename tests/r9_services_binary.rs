@@ -511,7 +511,7 @@ fn session_and_host_restrictions_scope_what_a_service_sees() {
         let s = m.sessions(&mut router);
         s.contains(&sid) && s.contains(&sid2)
     });
-    assert_eq!(one.sessions(&mut router), [sid.clone()]);
+    assert_eq!(one.sessions(&mut router), std::slice::from_ref(&sid));
 
     next_init();
     let mut other = Dev::connect(
