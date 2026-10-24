@@ -86,6 +86,8 @@ pub struct StatusReport {
 pub struct Pairing {
     pub astation_id: String,
     pub session_expired: bool,
+    /// Astation's transport policy (`transportPolicy`): relay only.
+    pub relay_only: bool,
 }
 
 /// The pairing, if this profile has one (an unreadable record reads as
@@ -94,6 +96,7 @@ pub fn pairing(src: &Sources) -> Option<Pairing> {
     let record = PairingRecord::load(&src.paths.pairing).ok()??;
     Some(Pairing {
         session_expired: record.session_expired(),
+        relay_only: record.relay_only,
         astation_id: record.astation_id,
     })
 }
@@ -266,8 +269,15 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
         Verification::Revoked { by } => format!("revoked by {by}"),
         Verification::Unknown(error) => format!("unknown ({error})"),
     };
+    let relay_only = if pairing.relay_only {
+        "; relay only (set by Astation)"
+    } else {
+        ""
+    };
     (
-        Line::new(format!("paired ({astation_id}{trust}{expired})")),
+        Line::new(format!(
+            "paired ({astation_id}{trust}{expired}){relay_only}"
+        )),
         Line::new(verification),
     )
 }
@@ -696,6 +706,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn relay_only_set_by_astation_is_shown_on_the_pairing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        crate::pairing::tests::edit(dir.path(), |record| record.relay_only = true);
+        assert_eq!(
+            report(dir.path()).pairing.value,
+            "paired (astation-1, trust gen 1); relay only (set by Astation)"
+        );
+    }
+
+    #[test]
     fn paired_and_verified_shows_the_safety_code_and_lock_state() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
@@ -766,6 +787,7 @@ pub(crate) mod tests {
             Some(Pairing {
                 astation_id: "astation-0".into(),
                 session_expired: false,
+                relay_only: false,
             })
         );
         // Not a pairing: `atem pair` proceeds and replaces it.
