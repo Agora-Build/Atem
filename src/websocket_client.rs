@@ -287,6 +287,20 @@ pub enum AstationMessage {
         save_credentials: bool,
     },
 
+    /// Astation → Atem, after every authentication and on change: while
+    /// `relay_only`, reach Astation only through its relay identity room
+    /// (never the local `astation_ws`). Kept in the pairing record.
+    #[serde(rename = "transportPolicy")]
+    TransportPolicy {
+        relay_only: bool,
+    },
+
+    /// Atem → Astation: the transport policy Atem stored.
+    #[serde(rename = "transportPolicyAck")]
+    TransportPolicyAck {
+        relay_only: bool,
+    },
+
     /// Astation → Atem: the account's encryption mode, as a signed
     /// `atem-account-state-v1` statement. Messages without one are ignored.
     #[serde(rename = "encryptionMode")]
@@ -762,6 +776,12 @@ impl AstationClient {
             .await
             .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
         self.authenticate_after_challenge(auth_required, false).await
+    }
+
+    /// Pretend the link reached Astation `via`.
+    #[cfg(test)]
+    pub(crate) fn set_via_for_test(&mut self, via: LinkVia) {
+        self.via = Some(via);
     }
 
     /// Pretend the connect-time authentication pinned `astation_id`.
@@ -3413,6 +3433,37 @@ mod tests {
                 assert!(!save_credentials);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── TransportPolicy ───────────────────────────────────
+
+    #[test]
+    fn transport_policy_roundtrip() {
+        for relay_only in [true, false] {
+            let wire = format!(r#"{{"type":"transportPolicy","data":{{"relay_only":{relay_only}}}}}"#);
+            let parsed: AstationMessage = serde_json::from_str(&wire).unwrap();
+            assert!(
+                matches!(parsed, AstationMessage::TransportPolicy { relay_only: r } if r == relay_only)
+            );
+            let json: serde_json::Value = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(json, serde_json::from_str::<serde_json::Value>(&wire).unwrap());
+        }
+    }
+
+    #[test]
+    fn transport_policy_ack_roundtrip() {
+        for relay_only in [true, false] {
+            let msg = AstationMessage::TransportPolicyAck { relay_only };
+            let json = serde_json::to_value(&msg).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"type": "transportPolicyAck", "data": {"relay_only": relay_only}})
+            );
+            let parsed: AstationMessage = serde_json::from_value(json).unwrap();
+            assert!(
+                matches!(parsed, AstationMessage::TransportPolicyAck { relay_only: r } if r == relay_only)
+            );
         }
     }
 
