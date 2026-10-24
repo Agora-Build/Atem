@@ -4,7 +4,38 @@
 //! authenticated under (`PairingRecord::relay_only`), so `atem unpair` clears
 //! it, and the connect loop (`App::spawn_astation_connect`) reads it.
 use super::App;
-use crate::websocket_client::{AstationMessage, LinkVia};
+use crate::websocket_client::{AstationMessage, DeliveryReceipt, LinkVia};
+use std::time::{Duration, Instant};
+
+/// How long a deferred drop waits for its ack to be written once the
+/// operation ended (as `send_message_flushed` waits on the immediate path).
+const ACK_FLUSH: Duration = Duration::from_secs(5);
+
+/// A local link drop relay only deferred while an Astation operation ran on
+/// that link (`App::relay_only_drop`).
+#[derive(Debug)]
+pub struct RelayOnlyDrop {
+    /// The link it applies to; a replaced link forgets it.
+    link_gen: u64,
+    /// The latest ack's delivery: the socket closes only once it was
+    /// written (or failed), so the ack reaches Astation before the close.
+    receipt: Option<DeliveryReceipt>,
+    /// Set when the operation ended: the drop happens by then even if the
+    /// writer never wrote the ack.
+    due: Option<Instant>,
+}
+
+impl RelayOnlyDrop {
+    /// Whether the ack was written (or can no longer be): no wait.
+    fn delivered(&mut self) -> bool {
+        self.receipt.as_mut().is_none_or(|receipt| {
+            !matches!(
+                receipt.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )
+        })
+    }
+}
 
 /// The status after a local link was dropped for relay only.
 pub(super) const RELAY_ONLY_RECONNECT: &str =
@@ -66,12 +97,25 @@ impl App {
                 self.relay_only_drop = None;
             }
             let _ = self.astation_client.send_message(ack).await;
-        } else if !local || self.relay_only_drop == Some(self.astation_link_gen) {
-            // A relay link, or a repeat while the drop waits: nothing to do.
+        } else if !local {
+            // A relay link: nothing more to do.
             let _ = self.astation_client.send_message(ack).await;
-        } else if self.op_on_link() {
-            let _ = self.astation_client.send_message(ack).await;
-            self.relay_only_drop = Some(self.astation_link_gen);
+        } else if self.op_on_link() || self.drop_waits() {
+            // The drop waits for the operation, then for this ack's
+            // delivery (a repeat's ack is the later one, written last).
+            let receipt = self.astation_client.send_message_with_receipt(ack).ok();
+            match &mut self.relay_only_drop {
+                Some(pending) if pending.link_gen == self.astation_link_gen => {
+                    pending.receipt = receipt;
+                }
+                _ => {
+                    self.relay_only_drop = Some(RelayOnlyDrop {
+                        link_gen: self.astation_link_gen,
+                        receipt,
+                        due: None,
+                    });
+                }
+            }
         } else {
             // Written before the socket closes (or given up after 5 s).
             let _ = self.astation_client.send_message_flushed(ack).await;
@@ -117,15 +161,35 @@ impl App {
             .is_some_and(|route| route.link_gen == self.astation_link_gen && !route.tx.is_closed())
     }
 
+    /// Whether a deferred drop of the current link is still waiting.
+    fn drop_waits(&self) -> bool {
+        self.relay_only_drop
+            .as_ref()
+            .is_some_and(|pending| pending.link_gen == self.astation_link_gen)
+    }
+
     /// The local link drop relay only deferred: done once the operation on
-    /// that link ended; forgotten when the link already went.
+    /// that link ended and the ack was written (at most `ACK_FLUSH` after
+    /// the operation ended, never waiting in the pass); forgotten when the
+    /// link already went.
     pub(super) fn check_relay_only_drop(&mut self) {
-        let Some(link_gen) = self.relay_only_drop else {
+        if self.relay_only_drop.is_none() {
+            return;
+        }
+        if !self.astation_connected || !self.drop_waits() {
+            self.relay_only_drop = None;
+            return;
+        }
+        if self.op_on_link() {
+            return;
+        }
+        let Some(pending) = self.relay_only_drop.as_mut() else {
             return;
         };
-        if !self.astation_connected || self.astation_link_gen != link_gen {
-            self.relay_only_drop = None;
-        } else if !self.op_on_link() {
+        let due = *pending
+            .due
+            .get_or_insert_with(|| Instant::now() + ACK_FLUSH);
+        if pending.delivered() || Instant::now() >= due {
             self.relay_only_drop = None;
             self.drop_astation_link(RELAY_ONLY_RECONNECT.into());
         }

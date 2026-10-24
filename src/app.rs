@@ -32,6 +32,9 @@ use crate::runtime::protocol::SessionSummary;
 use crate::websocket_client::{AstationClient, AstationMessage};
 
 /// A mark task whose file no live Claude session's directory has.
+/// Why the connect loop tried nothing: the pairing record can't be read.
+pub const PAIRING_UNREADABLE: &str = "the pairing record can't be read; not connecting to Astation (neither locally nor through the relay). Restore it from a backup, or run `atem unpair`, then `atem pair`";
+
 pub const NO_PROJECT_SESSION: &str =
     "no Claude session for this project; run `atem agent launch claude` there";
 
@@ -115,9 +118,9 @@ pub struct App {
     /// Why the last background connect failed, when the saved session was
     /// the problem (shown to a pairing or unlock waiting for the link).
     pub astation_connect_error: Option<String>,
-    /// The local link (its `astation_link_gen`) relay only drops once the
-    /// Astation operation running on it ends (`app/transport_policy.rs`).
-    pub relay_only_drop: Option<u64>,
+    /// The local link relay only drops once the Astation operation running
+    /// on it ends and the ack was written (`app/transport_policy.rs`).
+    pub relay_only_drop: Option<transport_policy::RelayOnlyDrop>,
 }
 
 impl App {
@@ -454,15 +457,26 @@ impl App {
                 }
             };
 
-            // An unreadable record (or profile) reads as none: local may be
-            // tried, as before relay only (there is no relay room to use either).
-            let record = crate::profile::Sources::current()
-                .ok()
-                .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing).ok().flatten());
+            // An unreadable record (or profile) is not "no pairing": it might
+            // say relay only, so local is never tried, and without its
+            // Astation id there is no relay room either. Fail closed: no
+            // attempt, a logged error, the normal retry in 30 s.
+            let loaded = crate::profile::Sources::current()
+                .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing));
+            let local_allowed = crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref));
+            let record = match loaded {
+                Ok(record) => record,
+                Err(error) => {
+                    let text = format!("{PAIRING_UNREADABLE} ({error:#})");
+                    crate::diagnostics::warn(format!("atem runtime: {text}"));
+                    let _ = tx.send(Err(anyhow::Error::new(crate::runtime::ops::SessionAdvice(text))));
+                    return;
+                }
+            };
 
             // Local first: the pairing's saved session, else the loopback
             // bootstrap proof (never pairing).
-            if crate::records::PairingRecord::local_allowed(record.as_ref()) {
+            if local_allowed {
                 match client.connect_without_pairing(local_url).await {
                     Ok(()) => {
                         let _ = tx.send(Ok((client, Some("local".to_string()))));

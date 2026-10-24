@@ -135,6 +135,9 @@ fn session_message_id(text: &str) -> Option<String> {
         .filter(|id| crate::session_protocol::wire::is_uuid_v4(id))
 }
 
+/// Resolves once the writer wrote a frame (`Ok`) or couldn't (`Err`).
+pub(crate) type DeliveryReceipt = tokio::sync::oneshot::Receiver<Result<(), String>>;
+
 struct OutboundMessage {
     message: AstationMessage,
     delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -800,6 +803,15 @@ impl AstationClient {
         Box::new(rx)
     }
 
+    /// Holds back everything sent from now on until the returned handle's
+    /// `resume`, which hands it to the real writer in order.
+    #[cfg(test)]
+    pub(crate) fn pause_writer_for_test(&mut self) -> PausedWriter {
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        let writer = self.sender.replace(tx).expect("a connected client");
+        PausedWriter { rx, writer }
+    }
+
     /// Pretend the link reached Astation `via`.
     #[cfg(test)]
     pub(crate) fn set_via_for_test(&mut self, via: LinkVia) {
@@ -1400,13 +1412,21 @@ impl AstationClient {
         Ok(())
     }
 
-    /// Sends and waits (at most 5 s) until the writer has written the frame,
-    /// so a client dropped right after doesn't lose it.
-    pub(crate) async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+    /// Queues `message` and returns its delivery receipt, which resolves once
+    /// the writer has written the frame (or failed to); the caller polls it
+    /// instead of waiting (`send_message_flushed` waits).
+    pub(crate) fn send_message_with_receipt(&self, message: AstationMessage) -> Result<DeliveryReceipt> {
         let sender = self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?;
         let (delivered, receipt) = tokio::sync::oneshot::channel();
         sender.send(OutboundMessage { message, delivered: Some(delivered) })
             .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?;
+        Ok(receipt)
+    }
+
+    /// Sends and waits (at most 5 s) until the writer has written the frame,
+    /// so a client dropped right after doesn't lose it.
+    pub(crate) async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+        let receipt = self.send_message_with_receipt(message)?;
         tokio::time::timeout(Duration::from_secs(5), receipt).await
             .map_err(|_| anyhow!("WebSocket delivery timed out; retry this command"))?
             .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?
@@ -1846,6 +1866,25 @@ impl AstationClient {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
+    }
+}
+
+/// A writer `pause_writer_for_test` held back.
+#[cfg(test)]
+pub(crate) struct PausedWriter {
+    rx: mpsc::UnboundedReceiver<OutboundMessage>,
+    writer: mpsc::UnboundedSender<OutboundMessage>,
+}
+
+#[cfg(test)]
+impl PausedWriter {
+    /// Hands what was held back (and what comes later) to the real writer.
+    pub(crate) fn resume(mut self) {
+        tokio::spawn(async move {
+            while let Some(outbound) = self.rx.recv().await {
+                if self.writer.send(outbound).is_err() { break; }
+            }
+        });
     }
 }
 

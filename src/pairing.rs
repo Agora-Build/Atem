@@ -169,21 +169,31 @@ impl PairingRecord {
 
     /// Astation's transport policy for this pairing (`transportPolicy`).
     /// Never creates a pairing: false when the one with `astation_id` is
-    /// gone. Callers hold the lock (`Captured::apply`).
+    /// gone. A value already stored is not written again (still true).
+    /// Callers hold the lock (`Captured::apply`).
     pub fn set_relay_only(
         paths: &PairingPaths,
         astation_id: &str,
         relay_only: bool,
     ) -> Result<bool> {
-        Self::update_locked(paths, astation_id, |record| {
-            record.relay_only = relay_only;
-        })
+        match Self::load(paths)? {
+            Some(mut record) if record.astation_id == astation_id => {
+                if record.relay_only != relay_only {
+                    record.relay_only = relay_only;
+                    record.save(paths)?;
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
-    /// Whether a connect may try the local `astation_ws`: not while the
-    /// pairing's Astation says relay only. First pairing (no record) may.
-    pub fn local_allowed(record: Option<&Self>) -> bool {
-        !record.is_some_and(|record| record.relay_only)
+    /// Whether a connect may try the local `astation_ws`, given what loading
+    /// the record gave: not while the pairing's Astation says relay only, and
+    /// never when the record (or the profile) can't be read, since it might
+    /// say relay only (fail closed). First pairing (no record) may.
+    pub fn local_allowed<E>(loaded: Result<Option<&Self>, E>) -> bool {
+        matches!(loaded, Ok(record) if !record.is_some_and(|record| record.relay_only))
     }
 
     /// The valid session for `astation_id`.
@@ -812,11 +822,15 @@ pub(crate) mod tests {
     #[test]
     fn relay_only_decides_whether_local_may_be_tried() {
         // First pairing: no record.
-        assert!(PairingRecord::local_allowed(None));
+        assert!(PairingRecord::local_allowed::<()>(Ok(None)));
+        assert!(
+            !PairingRecord::local_allowed::<()>(Err(())),
+            "an unreadable record never allows local"
+        );
         let mut record = paired_record("astation-1");
-        assert!(PairingRecord::local_allowed(Some(&record)));
+        assert!(PairingRecord::local_allowed::<()>(Ok(Some(&record))));
         record.relay_only = true;
-        assert!(!PairingRecord::local_allowed(Some(&record)));
+        assert!(!PairingRecord::local_allowed::<()>(Ok(Some(&record))));
         // Kept only when set; an older record reads as false.
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["relay_only"], true);
@@ -847,6 +861,25 @@ pub(crate) mod tests {
         unpair(&src).unwrap();
         assert!(!PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
         assert!(!paths.record.exists());
+    }
+
+    /// A repeated value is not written again (the file stays the same
+    /// inode); a change replaces it.
+    #[test]
+    fn relay_only_repeated_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let paths = &captured.sources().paths.pairing;
+        let inode = || std::fs::metadata(&paths.record).unwrap().ino();
+        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
+        let written = inode();
+        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
+        assert_eq!(inode(), written, "a repeat writes nothing");
+        assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
+        assert!(PairingRecord::set_relay_only(paths, "astation-1", false).unwrap());
+        assert_ne!(inode(), written, "a change is written");
+        assert!(!PairingRecord::load(paths).unwrap().unwrap().relay_only);
     }
 
     #[test]

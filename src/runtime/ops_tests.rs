@@ -1526,9 +1526,212 @@ fn relay_only_waits_for_the_operation_on_the_local_link() {
         app.process_astation_messages().await;
         assert!(!app.astation_connected, "dropped once the operation ended");
         assert!(app.astation_reconnect_at.is_some());
-        assert_eq!(app.relay_only_drop, None);
+        assert!(app.relay_only_drop.is_none());
         assert!(peer.drain(WAIT).await, "the local socket closed");
         assert_eq!(acks(&peer).len(), 2);
+    });
+}
+
+/// The status after relay only dropped a local link.
+const RELAY_ONLY_RECONNECT: &str = "Astation allows only the relay; reconnecting through it";
+
+/// An operation running on `app`'s current link.
+fn op_on_link(app: &mut App) -> mpsc::Receiver<AstationMessage> {
+    let (tx, rx) = mpsc::channel(4);
+    app.op_route = Some(crate::app::op_route::OpRoute {
+        link_gen: app.astation_link_gen,
+        tx,
+        encryption: false,
+        credentials: false,
+    });
+    rx
+}
+
+/// The deferred drop keeps a delivery barrier: the operation ends while the
+/// writer still holds the ack, so the link stays (the pass never waits for
+/// it) until the ack is written; the peer gets the ack, then the close.
+#[test]
+fn relay_only_deferred_drop_waits_for_the_ack_to_be_written() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        let _op = op_on_link(&mut app);
+        let paused = app.astation_client.pause_writer_for_test();
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        assert!(record(&profile).relay_only);
+        app.close_op_route();
+        for _ in 0..10 {
+            let started = Instant::now();
+            app.process_astation_messages().await;
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "the pass never waits"
+            );
+            assert!(app.astation_connected, "the ack isn't written yet");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!peer.drain(Duration::from_millis(100)).await);
+        assert!(acks(&peer).is_empty(), "held by the writer");
+        paused.resume();
+        let started = Instant::now();
+        while app.astation_connected {
+            assert!(started.elapsed() < WAIT, "dropped once the ack was written");
+            app.process_astation_messages().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(app.astation_reconnect_at.is_some());
+        assert!(app.relay_only_drop.is_none());
+        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
+        assert!(peer.drain(WAIT).await, "the local socket closed");
+        assert_eq!(
+            acks(&peer),
+            vec![stored(true)],
+            "the ack arrived before the close"
+        );
+    });
+}
+
+/// A deferred drop whose ack is never written still happens, 5 s after the
+/// operation ended (the same bound as the immediate path's flush).
+#[test]
+fn relay_only_deferred_drop_gives_up_on_the_ack_after_5_s() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, _peer) = linked_app(&profile, local_via()).await;
+        let _op = op_on_link(&mut app);
+        // Held, never resumed (the real writer stays alive).
+        let _paused = app.astation_client.pause_writer_for_test();
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        app.close_op_route();
+        let ended = Instant::now();
+        while app.astation_connected {
+            assert!(ended.elapsed() < Duration::from_secs(8));
+            app.process_astation_messages().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ended.elapsed() >= Duration::from_secs(5));
+        assert!(app.astation_reconnect_at.is_some());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(RELAY_ONLY_RECONNECT),
+            "dropped for relay only, not a closed socket"
+        );
+    });
+}
+
+/// A deferred drop is cancelled by a later stored `false`, and forgotten
+/// when its link is replaced (it never drops another link).
+#[test]
+fn relay_only_deferred_drop_is_cancelled_by_false_and_fenced_by_a_new_link() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        // Cancelled by false.
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        let _op = op_on_link(&mut app);
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: false })
+            .await;
+        assert!(app.relay_only_drop.is_none());
+        app.close_op_route();
+        app.process_astation_messages().await;
+        assert!(app.astation_connected, "false cancelled the drop");
+        peer.drain(Duration::from_millis(200)).await;
+        assert_eq!(acks(&peer), vec![stored(true), stored(false)]);
+        assert!(!record(&profile).relay_only);
+        // Fenced: the link is replaced before the operation ends.
+        let (mut app, _old) = linked_app(&profile, local_via()).await;
+        let _op = op_on_link(&mut app);
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        assert!(app.relay_only_drop.is_some());
+        let (url, mut new) = Peer::listen().await;
+        app.astation_client = link_to(&profile, &url, local_via()).await;
+        app.astation_link_gen += 1;
+        app.close_op_route();
+        app.process_astation_messages().await;
+        assert!(app.relay_only_drop.is_none(), "forgotten with its link");
+        assert!(app.astation_connected, "the new link is not dropped");
+        assert!(!new.drain(Duration::from_millis(200)).await);
+    });
+}
+
+/// A record that can't be written: `stored: false` with `save_failed`,
+/// nothing stored, and the local link stays.
+#[test]
+fn transport_policy_save_failure_is_acked_save_failed() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        let before = std::fs::read(&paths.record).unwrap();
+        let _failing = crate::memory::crypto::fail_writes_to(&paths.record);
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        let ack = peer.next("transportPolicyAck").await;
+        assert_eq!(ack["data"], not_stored(true, "save_failed"));
+        assert_eq!(
+            std::fs::read(&paths.record).unwrap(),
+            before,
+            "nothing stored"
+        );
+        assert!(!record(&profile).relay_only);
+        app.process_astation_messages().await;
+        assert!(app.astation_connected, "no disconnect");
+        assert!(app.relay_only_drop.is_none());
+        assert!(!peer.drain(Duration::from_millis(200)).await);
+        assert!(
+            app.status_message
+                .unwrap()
+                .starts_with("Transport policy not saved")
+        );
+    });
+}
+
+/// A repeated value is acknowledged `stored: true` without rewriting the
+/// record (same inode); the binding and session are still checked (a stale
+/// link's repeat is `pairing_changed`).
+#[test]
+fn a_repeated_transport_policy_is_not_rewritten() {
+    use std::os::unix::fs::MetadataExt;
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        let inode = || std::fs::metadata(&paths.record).unwrap().ino();
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
+        let written = inode();
+        {
+            // Even a write that would fail is not attempted.
+            let _failing = crate::memory::crypto::fail_writes_to(&paths.record);
+            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+                .await;
+            assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
+        }
+        assert_eq!(inode(), written, "not rewritten");
+        // A stale link's repeat is still refused.
+        let src = crate::profile::Sources::in_dir(&profile);
+        crate::pairing::unpair(&src).unwrap();
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        assert_eq!(
+            peer.next("transportPolicyAck").await["data"],
+            not_stored(true, "pairing_changed")
+        );
     });
 }
 
@@ -1658,6 +1861,64 @@ fn the_connect_loop_skips_local_while_relay_only() {
                 assert!(!app.astation_connected);
                 let retry = app.astation_reconnect_at.expect("a retry");
                 assert!(retry >= Instant::now() + Duration::from_secs(25), "no spin");
+            }
+        });
+    }
+}
+
+/// An unreadable pairing record is not "no pairing": the connect loop
+/// tries neither the local `astation_ws` (it might say relay only) nor the
+/// relay (no Astation id), says why to a waiting operation and retries in
+/// 30 s; a new App (a restarted runtime) does the same. A missing record
+/// still tries local (first pairing).
+#[test]
+fn the_connect_loop_never_tries_local_with_an_unreadable_record() {
+    for damaged in [true, false] {
+        local(async {
+            let config = crate::config::AtemConfig::config_dir();
+            std::fs::create_dir_all(&config).unwrap();
+            let paths = crate::paths::ProfilePaths::in_dir(&config).pairing;
+            if damaged {
+                paired(&config);
+                std::fs::write(&paths.record, b"not a sealed record").unwrap();
+            }
+            let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            std::fs::write(
+                config.join("config.toml"),
+                format!(
+                    "astation_ws = \"ws://{}/ws\"\nastation_relay_url = \"http://127.0.0.1:1\"\natem_id = \"{ATEM_ID}\"\n",
+                    local.local_addr().unwrap()
+                ),
+            )
+            .unwrap();
+            for _restart in 0..2 {
+                let mut app = App::new();
+                app.spawn_astation_connect();
+                let tried = tokio::time::timeout(Duration::from_millis(500), local.accept())
+                    .await
+                    .is_ok();
+                assert_eq!(tried, !damaged, "damaged {damaged}");
+                if !damaged {
+                    break;
+                }
+                let started = Instant::now();
+                while app.astation_connect_rx.is_some() {
+                    assert!(started.elapsed() < WAIT);
+                    app.poll_astation_connect();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!app.astation_connected);
+                let retry = app.astation_reconnect_at.expect("a retry");
+                assert!(retry >= Instant::now() + Duration::from_secs(25), "no spin");
+                let error = app
+                    .astation_connect_error
+                    .expect("the reason, for an operation");
+                assert!(error.starts_with(crate::app::PAIRING_UNREADABLE), "{error}");
+                assert_eq!(
+                    std::fs::read(&paths.record).unwrap(),
+                    b"not a sealed record",
+                    "left as it was"
+                );
             }
         });
     }
