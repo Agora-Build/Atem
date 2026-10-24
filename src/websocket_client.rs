@@ -287,6 +287,25 @@ pub enum AstationMessage {
         save_credentials: bool,
     },
 
+    /// Astation → Atem, after every authentication and on change: while
+    /// `relay_only`, reach Astation only through its relay identity room
+    /// (never the local `astation_ws`). Kept in the pairing record.
+    #[serde(rename = "transportPolicy")]
+    TransportPolicy {
+        relay_only: bool,
+    },
+
+    /// Atem → Astation: the transport policy Atem stored (`stored`, then
+    /// `relay_only` is the stored value), or the requested one it couldn't
+    /// store, with `reason` (`not_paired`, `pairing_changed`, `save_failed`).
+    #[serde(rename = "transportPolicyAck")]
+    TransportPolicyAck {
+        relay_only: bool,
+        stored: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Astation → Atem: the account's encryption mode, as a signed
     /// `atem-account-state-v1` statement. Messages without one are ignored.
     #[serde(rename = "encryptionMode")]
@@ -689,6 +708,14 @@ impl AstationClient {
         self.guarded(apply)
     }
 
+    /// Whether the pairing state and saved session this connection's
+    /// authentication captured are still current (no lock held).
+    pub(crate) fn capture_current(&self) -> bool {
+        self.capture
+            .as_ref()
+            .is_some_and(|capture| capture.check().is_ok() && self.check_session(capture).is_ok())
+    }
+
     /// A saved session may answer `astation_id` only when the captured
     /// pairing binding is with it: after an `atem unpair` that stopped before
     /// removing the sessions (or one for another Astation), it is never used.
@@ -762,6 +789,21 @@ impl AstationClient {
             .await
             .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
         self.authenticate_after_challenge(auth_required, false).await
+    }
+
+    /// A writer that never writes: a flushed send waits out its timeout.
+    /// Returns the queue so it stays open.
+    #[cfg(test)]
+    pub(crate) fn stall_writer_for_test(&mut self) -> Box<dyn std::any::Any> {
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        self.sender = Some(tx);
+        Box::new(rx)
+    }
+
+    /// Pretend the link reached Astation `via`.
+    #[cfg(test)]
+    pub(crate) fn set_via_for_test(&mut self, via: LinkVia) {
+        self.via = Some(via);
     }
 
     /// Pretend the connect-time authentication pinned `astation_id`.
@@ -3414,6 +3456,47 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // ── TransportPolicy ───────────────────────────────────
+
+    #[test]
+    fn transport_policy_roundtrip() {
+        for relay_only in [true, false] {
+            let wire = format!(r#"{{"type":"transportPolicy","data":{{"relay_only":{relay_only}}}}}"#);
+            let parsed: AstationMessage = serde_json::from_str(&wire).unwrap();
+            assert!(
+                matches!(parsed, AstationMessage::TransportPolicy { relay_only: r } if r == relay_only)
+            );
+            let json: serde_json::Value = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(json, serde_json::from_str::<serde_json::Value>(&wire).unwrap());
+        }
+    }
+
+    #[test]
+    fn transport_policy_ack_roundtrip() {
+        for relay_only in [true, false] {
+            let msg = AstationMessage::TransportPolicyAck { relay_only, stored: true, reason: None };
+            let json = serde_json::to_value(&msg).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"type": "transportPolicyAck", "data": {"relay_only": relay_only, "stored": true}})
+            );
+            let parsed: AstationMessage = serde_json::from_value(json).unwrap();
+            assert!(matches!(
+                parsed,
+                AstationMessage::TransportPolicyAck { relay_only: r, stored: true, reason: None } if r == relay_only
+            ));
+        }
+        let refused = AstationMessage::TransportPolicyAck {
+            relay_only: true,
+            stored: false,
+            reason: Some("pairing_changed".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            serde_json::json!({"type": "transportPolicyAck", "data": {"relay_only": true, "stored": false, "reason": "pairing_changed"}})
+        );
     }
 
     #[test]

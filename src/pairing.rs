@@ -74,6 +74,7 @@ impl PairingRecord {
             shared: None,
             save_credentials: false,
             disconnected_at: None,
+            relay_only: false,
         }
     }
 
@@ -164,6 +165,25 @@ impl PairingRecord {
             );
         }
         Ok(())
+    }
+
+    /// Astation's transport policy for this pairing (`transportPolicy`).
+    /// Never creates a pairing: false when the one with `astation_id` is
+    /// gone. Callers hold the lock (`Captured::apply`).
+    pub fn set_relay_only(
+        paths: &PairingPaths,
+        astation_id: &str,
+        relay_only: bool,
+    ) -> Result<bool> {
+        Self::update_locked(paths, astation_id, |record| {
+            record.relay_only = relay_only;
+        })
+    }
+
+    /// Whether a connect may try the local `astation_ws`: not while the
+    /// pairing's Astation says relay only. First pairing (no record) may.
+    pub fn local_allowed(record: Option<&Self>) -> bool {
+        !record.is_some_and(|record| record.relay_only)
     }
 
     /// The valid session for `astation_id`.
@@ -490,6 +510,9 @@ pub fn bind_new(src: &Sources, expected: &TrustState, astation_id: &str) -> Resu
         .filter(|record| record.astation_id == astation_id)
         .unwrap_or_else(|| PairingRecord::new(astation_id));
     record.binding = Some(binding.clone());
+    // A transport policy belongs to the binding it arrived under; Astation
+    // sends it again after this pairing authenticates.
+    record.relay_only = false;
     commit_generation(src, host_trust_gen)?;
     record.save(paths)?;
     Ok(TrustState {
@@ -784,6 +807,46 @@ pub(crate) mod tests {
         let record = PairingRecord::load(paths).unwrap().unwrap();
         assert_eq!(record.session_for("astation-1").unwrap().token, "token");
         assert!(record.shared.is_some());
+    }
+
+    #[test]
+    fn relay_only_decides_whether_local_may_be_tried() {
+        // First pairing: no record.
+        assert!(PairingRecord::local_allowed(None));
+        let mut record = paired_record("astation-1");
+        assert!(PairingRecord::local_allowed(Some(&record)));
+        record.relay_only = true;
+        assert!(!PairingRecord::local_allowed(Some(&record)));
+        // Kept only when set; an older record reads as false.
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["relay_only"], true);
+        record.relay_only = false;
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("relay_only").is_none());
+        let old: PairingRecord = serde_json::from_value(json).unwrap();
+        assert!(!old.relay_only);
+    }
+
+    #[test]
+    fn relay_only_is_never_saved_without_the_pairing_and_a_new_binding_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let src = captured.sources().clone();
+        let paths = &src.paths.pairing;
+        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
+        assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
+        // Another Astation's policy is not this pairing's.
+        assert!(!PairingRecord::set_relay_only(paths, "astation-2", false).unwrap());
+        assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
+        // A new binding starts without one (Astation sends it again).
+        interrupted_unpair(dir.path());
+        let before = load(&src).unwrap();
+        bind_new(&src, &before, "astation-1").unwrap();
+        assert!(!PairingRecord::load(paths).unwrap().unwrap().relay_only);
+        // Unpair removes it with the record; nothing re-creates it.
+        unpair(&src).unwrap();
+        assert!(!PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
+        assert!(!paths.record.exists());
     }
 
     #[test]

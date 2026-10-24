@@ -1336,6 +1336,333 @@ fn credentials_astation_sends_go_to_the_links_profile() {
     });
 }
 
+/// An App on a link to the fake Astation for the bound profile at `profile`,
+/// reached `via`.
+async fn linked_app(profile: &Path, via: crate::websocket_client::LinkVia) -> (App, Peer) {
+    let (url, peer) = Peer::listen().await;
+    let mut app = App::new();
+    app.last_session_refresh = Some(Instant::now());
+    app.astation_reconnect = false;
+    app.astation_client = link_to(profile, &url, via).await;
+    app.astation_connected = true;
+    (app, peer)
+}
+
+/// A client authenticated (pinned) with `ASTATION` over `url`.
+async fn link_to(
+    profile: &Path,
+    url: &str,
+    via: crate::websocket_client::LinkVia,
+) -> AstationClient {
+    let mut client = AstationClient::new_with_test_state(ATEM_ID, profile);
+    client.connect_raw(url).await.unwrap();
+    client.pin_astation_for_test(ASTATION);
+    client.set_via_for_test(via);
+    client
+}
+
+fn relay() -> crate::websocket_client::LinkVia {
+    crate::websocket_client::LinkVia::Relay {
+        label: "relay".into(),
+    }
+}
+
+fn local_via() -> crate::websocket_client::LinkVia {
+    crate::websocket_client::LinkVia::Local
+}
+
+fn stored(relay_only: bool) -> Value {
+    json!({"relay_only": relay_only, "stored": true})
+}
+
+fn not_stored(relay_only: bool, reason: &str) -> Value {
+    json!({"relay_only": relay_only, "stored": false, "reason": reason})
+}
+
+fn acks(peer: &Peer) -> Vec<Value> {
+    peer.seen
+        .iter()
+        .filter(|m| m["type"] == "transportPolicyAck")
+        .map(|m| m["data"].clone())
+        .collect()
+}
+
+/// `transportPolicy` is kept in the link's bound pairing and acknowledged
+/// `stored: true` with the value stored; a repeat is the same no-op, a relay
+/// link stays, and `false` clears it.
+#[test]
+fn transport_policy_is_kept_in_the_bound_pairing_and_acknowledged() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        for relay_only in [true, true, false, false] {
+            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only })
+                .await;
+            let ack = peer.next("transportPolicyAck").await;
+            assert_eq!(ack["data"], stored(relay_only));
+            assert_eq!(record(&profile).relay_only, relay_only);
+            assert!(app.astation_connected, "a relay link stays");
+        }
+    });
+}
+
+/// A link without a bound pairing (the loopback proof on a profile never
+/// paired) stores nothing, creates no pairing and says `not_paired`.
+#[test]
+fn transport_policy_on_a_link_without_a_pairing_is_not_paired() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        let ack = peer.next("transportPolicyAck").await;
+        assert_eq!(ack["data"], not_stored(true, "not_paired"));
+        let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        assert!(!paths.record.exists(), "never creates a pairing");
+        assert!(
+            app.astation_connected,
+            "nothing stored: the local link stays"
+        );
+    });
+}
+
+/// A stale link (its pairing removed, or replaced by a new pairing) gets
+/// `pairing_changed`; the new binding is never touched and nothing comes back.
+#[test]
+fn transport_policy_on_a_stale_link_is_pairing_changed() {
+    for re_pair in [false, true] {
+        local(async {
+            let dir = short_dir();
+            let profile = dir.path().join("profile");
+            paired(&profile);
+            let (mut app, mut peer) = linked_app(&profile, relay()).await;
+            let src = crate::profile::Sources::in_dir(&profile);
+            crate::pairing::unpair(&src).unwrap();
+            if re_pair {
+                let before = crate::pairing::capture(&src).unwrap();
+                crate::pairing::bind_new(&src, &before, ASTATION).unwrap();
+            }
+            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+                .await;
+            let ack = peer.next("transportPolicyAck").await;
+            assert_eq!(
+                ack["data"],
+                not_stored(true, "pairing_changed"),
+                "re_pair {re_pair}"
+            );
+            let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+            if re_pair {
+                assert!(!record(&profile).relay_only, "the new binding is untouched");
+            } else {
+                assert!(!paths.record.exists(), "never re-creates the pairing");
+            }
+            assert!(
+                app.status_message
+                    .unwrap()
+                    .starts_with("Transport policy not saved")
+            );
+        });
+    }
+}
+
+/// Relay only arriving on a local link: stored, acknowledged, then the
+/// local link is dropped so the reconnect goes through the relay.
+#[test]
+fn relay_only_drops_a_local_link_after_the_ack() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        let ack = peer.next("transportPolicyAck").await;
+        assert_eq!(ack["data"], stored(true));
+        assert!(record(&profile).relay_only);
+        assert!(!app.astation_connected);
+        assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
+        assert!(peer.drain(WAIT).await, "the local socket closed");
+        // Relay only off on a local link: kept, no reconnect.
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: false })
+            .await;
+        assert_eq!(peer.next("transportPolicyAck").await["data"], stored(false));
+        assert!(!record(&profile).relay_only);
+        assert!(app.astation_connected);
+    });
+}
+
+/// While an Astation operation runs on the local link, relay only is stored
+/// and acknowledged at once (a repeat too) but the link stays until the
+/// operation ends; then it is dropped, once.
+#[test]
+fn relay_only_waits_for_the_operation_on_the_local_link() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
+        let (tx, _op) = mpsc::channel(4);
+        app.op_route = Some(crate::app::op_route::OpRoute {
+            link_gen: app.astation_link_gen,
+            tx,
+            encryption: false,
+            credentials: false,
+        });
+        for _ in 0..2 {
+            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+                .await;
+            assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
+        }
+        assert!(record(&profile).relay_only);
+        app.process_astation_messages().await;
+        assert!(app.astation_connected, "the operation keeps its link");
+        assert!(!peer.drain(Duration::from_millis(200)).await);
+        app.close_op_route();
+        app.process_astation_messages().await;
+        assert!(!app.astation_connected, "dropped once the operation ended");
+        assert!(app.astation_reconnect_at.is_some());
+        assert_eq!(app.relay_only_drop, None);
+        assert!(peer.drain(WAIT).await, "the local socket closed");
+        assert_eq!(acks(&peer).len(), 2);
+    });
+}
+
+/// A policy arriving while the link re-authenticates is dropped like every
+/// other request; Astation's resend after the authentication is applied.
+#[test]
+fn transport_policy_during_re_authentication_is_dropped_then_applied() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        app.astation_reauth = Some(Instant::now() + Duration::from_secs(15));
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        peer.drain(Duration::from_millis(200)).await;
+        assert!(acks(&peer).is_empty(), "{:#?}", peer.seen);
+        assert!(!record(&profile).relay_only);
+        // Authenticated again; Astation sends it after every authentication.
+        app.astation_reauth = None;
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
+        assert!(record(&profile).relay_only);
+    });
+}
+
+/// A replaced connection: what the old link still had queued is never read
+/// (no ack, no effect); the new link's policies apply in order, the later
+/// one winning.
+#[test]
+fn the_later_link_s_transport_policy_wins() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, mut old) = linked_app(&profile, relay()).await;
+        old.send(&AstationMessage::TransportPolicy { relay_only: true });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The link is replaced (a reconnect) before the old one's message is read.
+        app.drop_astation_link("replaced".into());
+        let (url, mut new) = Peer::listen().await;
+        app.astation_client = link_to(&profile, &url, relay()).await;
+        app.astation_connected = true;
+        app.astation_link_gen += 1;
+        new.send(&AstationMessage::TransportPolicy { relay_only: true });
+        new.send(&AstationMessage::TransportPolicy { relay_only: false });
+        for _ in 0..50 {
+            app.process_astation_messages().await;
+            if acks(&new).len() == 2 {
+                break;
+            }
+            new.drain(Duration::from_millis(20)).await;
+        }
+        assert_eq!(acks(&new), vec![stored(true), stored(false)]);
+        assert!(!record(&profile).relay_only, "the later value");
+        old.drain(Duration::from_millis(200)).await;
+        assert!(
+            acks(&old).is_empty(),
+            "the old link's message was never applied"
+        );
+    });
+}
+
+/// The ack's flush gives up after 5 s (a writer that never writes): the
+/// local link is dropped anyway, with the policy stored.
+#[test]
+fn relay_only_drops_the_local_link_when_the_ack_flush_times_out() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (mut app, _peer) = linked_app(&profile, local_via()).await;
+        let _stalled = app.astation_client.stall_writer_for_test();
+        let started = Instant::now();
+        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
+            .await;
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(record(&profile).relay_only);
+        assert!(!app.astation_connected);
+        assert!(app.astation_reconnect_at.is_some());
+    });
+}
+
+/// The connect loop skips the local `astation_ws` while the stored policy
+/// says relay only, also in a new App (a restarted runtime); with the relay
+/// unreachable it fails without trying local and retries in 30 s (no spin).
+/// Without relay only it tries local.
+#[test]
+fn the_connect_loop_skips_local_while_relay_only() {
+    for relay_only in [true, false] {
+        local(async {
+            let config = crate::config::AtemConfig::config_dir();
+            paired(&config);
+            {
+                // Stored by an earlier runtime's link.
+                let (mut app, mut peer) = linked_app(&config, relay()).await;
+                app.handle_astation_message(AstationMessage::TransportPolicy { relay_only })
+                    .await;
+                assert_eq!(
+                    peer.next("transportPolicyAck").await["data"],
+                    stored(relay_only)
+                );
+            }
+            let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            std::fs::write(
+                config.join("config.toml"),
+                format!(
+                    "astation_ws = \"ws://{}/ws\"\nastation_relay_url = \"http://127.0.0.1:1\"\natem_id = \"{ATEM_ID}\"\n",
+                    local.local_addr().unwrap()
+                ),
+            )
+            .unwrap();
+            let mut app = App::new();
+            app.spawn_astation_connect();
+            let tried = tokio::time::timeout(Duration::from_millis(500), local.accept())
+                .await
+                .is_ok();
+            assert_eq!(tried, !relay_only, "relay_only {relay_only}");
+            if relay_only {
+                let started = Instant::now();
+                while app.astation_connect_rx.is_some() {
+                    assert!(started.elapsed() < WAIT);
+                    app.poll_astation_connect();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!app.astation_connected);
+                let retry = app.astation_reconnect_at.expect("a retry");
+                assert!(retry >= Instant::now() + Duration::from_secs(25), "no spin");
+            }
+        });
+    }
+}
+
 /// A runtime of another build is never replaced while an Astation
 /// operation runs: `restart` is refused and the client keeps it, saying why.
 #[test]
