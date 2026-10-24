@@ -259,7 +259,7 @@ fun main(args: Array<String>) {
 
     check("capacity and the service change guard (D23)") {
         val log = logL()
-        eq(log.capacity(), CapacityInfo(6uL, 1024uL, 3uL, 256uL, CapacityLevelKind.OK, CapacityLevelKind.OK, CapacityLevelKind.OK))
+        eq(log.capacity(), CapacityInfo(6uL, 1024uL, 3uL, 256uL, 1uL, 64uL, CapacityLevelKind.OK, CapacityLevelKind.OK, CapacityLevelKind.OK, CapacityLevelKind.OK))
         val e5 = byLabel.getValue("E5")["entry"]["body"]
         val svc = e5["member"]
         val at = e5["signed_at"].l().toULong()
@@ -272,6 +272,9 @@ fun main(args: Array<String>) {
         eq(log.checkChange(renew, at + day.toULong()), null, "after 24 h")
         eq(log.checkChange(change(listOf("view"), svc["expires_at"].l()), at + 3_600_000uL), null, "narrowing")
         eq(log.checkChange("{\"action\":\"remove\",\"device_id\":\"svc-discord\"}", at + 3_600_000uL), null, "removal")
+        val hostKey = byLabel.getValue("E2")["entry"]["body"]["host"]["host_key"]
+        val addHost = Json.write(mapOf("action" to "add_host", "host" to mapOf("host_id" to "host-b", "host_trust_gen" to 1L, "host_key" to hostKey)))
+        eq(log.checkChange(addHost, at), null, "a host with room")
         throwsCode("membership_invalid") { log.checkChange("{\"action\":\"remove\"}", at) }
     }
 

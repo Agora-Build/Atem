@@ -437,13 +437,14 @@ impl MembershipLog {
         err(self.0.draft_entry(signer, ms(signed_at)?, action_json))
     }
     /// How full the log is: `{entries, maxEntries, members, maxMembers,
-    /// level, entriesLevel, membersLevel}` (levels `ok`, `nearly_full`,
-    /// `full`).
+    /// hosts, maxHosts, level, entriesLevel, membersLevel, hostsLevel}`
+    /// (levels `ok`, `nearly_full`, `full`).
     pub fn capacity(&self) -> JsResult<JsValue> {
         to_js(&self.0.capacity())
     }
     /// `null` to go ahead, else `{type: "log_full" | "members_full" |
-    /// "too_soon", lastSignedAt?, retryAt?}` (advisory, for signers).
+    /// "hosts_full" | "too_soon", lastSignedAt?, retryAt?}` (advisory, for
+    /// signers).
     #[wasm_bindgen(js_name = checkChange)]
     pub fn check_change(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.check_change(action_json, ms(now_ms)?))

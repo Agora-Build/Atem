@@ -208,7 +208,8 @@ unit_enum! {
         /// At or above 90 % of a limit: renewals use one entry each.
         NearlyFull,
         /// A limit reached: no entry at all (entries; the account needs
-        /// re-pairing), or no `add` (members).
+        /// re-pairing), no `add` (members), or no `add_host` of a new host
+        /// (hosts).
         Full,
     }
 }
@@ -216,16 +217,20 @@ unit_enum! {
 record! {
     /// The log's use of its limits (§R9.2), by the verifier's own counts.
     /// `members` counts members in effect and the subjects of pending
-    /// `recovery_add`s (removed ones free their place; ids stay used).
-    /// `level` is the higher of the two limits' levels.
+    /// `recovery_add`s (removed ones free their place; ids stay used),
+    /// `hosts` current hosts. `level` is the highest of the three limits'
+    /// levels.
     pub struct CapacityInfo {
         pub entries: u64,
         pub max_entries: u64,
         pub members: u64,
         pub max_members: u64,
+        pub hosts: u64,
+        pub max_hosts: u64,
         pub level: CapacityLevelKind,
         pub entries_level: CapacityLevelKind,
         pub members_level: CapacityLevelKind,
+        pub hosts_level: CapacityLevelKind,
     }
 }
 
@@ -238,6 +243,9 @@ data_enum! {
         LogFull,
         /// 256 members: no `add` until one is removed.
         MembersFull,
+        /// 64 current hosts: no `add_host` of a new host until one is
+        /// removed (a current host's new key still fits).
+        HostsFull,
         /// A service change that grants anything new within 24 h of that
         /// service's last entry (signed at `last_signed_at`): retry at
         /// `retry_at`.

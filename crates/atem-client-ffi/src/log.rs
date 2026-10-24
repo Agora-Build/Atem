@@ -614,8 +614,8 @@ impl MembershipLog {
         canonical(&body)
     }
 
-    /// How full the log is (D23): entries and members against the
-    /// verifier's limits (1024, 256), nearly full from 90 %. Show a warning
+    /// How full the log is (D23): entries, members and hosts against the
+    /// verifier's limits (1024, 256, 64), nearly full from 90 %. Show a warning
     /// from `nearly_full`: renewals use one entry each, and a full log
     /// needs re-pairing.
     pub fn capacity(&self) -> CapacityInfo {
@@ -625,15 +625,18 @@ impl MembershipLog {
             max_entries: c.max_entries,
             members: c.members,
             max_members: c.max_members,
+            hosts: c.hosts,
+            max_hosts: c.max_hosts,
             level: level_kind(c.level),
             entries_level: level_kind(c.entries_level()),
             members_level: level_kind(c.members_level()),
+            hosts_level: level_kind(c.hosts_level()),
         }
     }
 
     /// Whether to draft `action_json` (as `draft_entry` takes it) as the
     /// next entry at `now_ms` (the time it would be signed): `None` to go
-    /// ahead, else why not (`LogFull`, `MembersFull`, or `TooSoon` for a
+    /// ahead, else why not (`LogFull`, `MembersFull`, `HostsFull`, or `TooSoon` for a
     /// service change that grants anything new, e.g. a renewal, within
     /// 24 h of that service's last entry; narrowing and `remove` are never
     /// paced). Advisory, for signers only: hosts accept any valid entry.
@@ -657,6 +660,7 @@ impl MembershipLog {
                 Ok(()) => None,
                 Err(ChangeRefusal::LogFull) => Some(ChangeRefusalInfo::LogFull),
                 Err(ChangeRefusal::MembersFull) => Some(ChangeRefusalInfo::MembersFull),
+                Err(ChangeRefusal::HostsFull) => Some(ChangeRefusalInfo::HostsFull),
                 Err(ChangeRefusal::TooSoon {
                     last_signed_at,
                     retry_at,

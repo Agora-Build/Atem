@@ -218,7 +218,7 @@ check("a draft the verifier would refuse is refused before signing", () => {
 
 check("capacity and the service change guard (D23)", () => {
   const log = logL();
-  eq(log.capacity(), { entries: 6, maxEntries: 1024, members: 3, maxMembers: 256, level: "ok", entriesLevel: "ok", membersLevel: "ok" });
+  eq(log.capacity(), { entries: 6, maxEntries: 1024, members: 3, maxMembers: 256, hosts: 1, maxHosts: 64, level: "ok", entriesLevel: "ok", membersLevel: "ok", hostsLevel: "ok" });
   const e5 = byLabel.E5.entry.body;
   const svc = e5.member;
   const at = e5.signed_at;
@@ -229,6 +229,8 @@ check("capacity and the service change guard (D23)", () => {
   eq(log.checkChange(renew, at + day), null, "after 24 h");
   eq(log.checkChange(change(["view"], svc.expires_at), at + 3600000), null, "narrowing");
   eq(log.checkChange(str({ action: "remove", device_id: "svc-discord" }), at + 3600000), null, "removal");
+  const hostKey = byLabel.E2.entry.body.host.host_key;
+  eq(log.checkChange(str({ action: "add_host", host: { host_id: "host-b", host_trust_gen: 1, host_key: hostKey } }), at), null, "a host with room");
   throwsCode(() => log.checkChange(str({ action: "remove" }), at), "membership_invalid");
 });
 

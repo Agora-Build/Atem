@@ -284,7 +284,7 @@ final class ConformanceTests: XCTestCase {
 
         check("capacity and the service change guard (D23)") {
             let log = try logL()
-            try eq(log.capacity(), CapacityInfo(entries: 6, maxEntries: 1024, members: 3, maxMembers: 256, level: .ok, entriesLevel: .ok, membersLevel: .ok))
+            try eq(log.capacity(), CapacityInfo(entries: 6, maxEntries: 1024, members: 3, maxMembers: 256, hosts: 1, maxHosts: 64, level: .ok, entriesLevel: .ok, membersLevel: .ok, hostsLevel: .ok))
             let e5 = o(o(byLabel["E5"]!["entry"])["body"])
             let svc = o(e5["member"])
             let at = u(e5["signed_at"])
@@ -299,6 +299,9 @@ final class ConformanceTests: XCTestCase {
             try eq(try log.checkChange(actionJson: renew, nowMs: at + day), nil, "after 24 h")
             try eq(try log.checkChange(actionJson: change(["view"], u(svc["expires_at"])), nowMs: at + 3_600_000), nil, "narrowing")
             try eq(try log.checkChange(actionJson: "{\"action\":\"remove\",\"device_id\":\"svc-discord\"}", nowMs: at + 3_600_000), nil, "removal")
+            let hostKey = o(o(o(o(byLabel["E2"]!["entry"])["body"])["host"])["host_key"])
+            let addHost = js(["action": "add_host", "host": ["host_id": "host-b", "host_trust_gen": 1, "host_key": hostKey] as [String: Any]] as [String: Any])
+            try eq(try log.checkChange(actionJson: addHost, nowMs: at), nil, "a host with room")
             try throwsCode("membership_invalid") { _ = try log.checkChange(actionJson: "{\"action\":\"remove\"}", nowMs: at) }
         }
 
