@@ -249,8 +249,8 @@ data_enum! {
         /// removed (a current host's new key still fits).
         HostsFull,
         /// A service change that grants anything new within 24 h of that
-        /// service's last entry (signed at `last_signed_at`): retry at
-        /// `retry_at`.
+        /// service's last grant (its add, or a change that granted
+        /// something new; signed at `last_signed_at`): retry at `retry_at`.
         ServiceChangeTooSoon { last_signed_at: u64, retry_at: u64 },
     }
 }

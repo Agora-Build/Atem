@@ -638,8 +638,8 @@ impl MembershipLog {
     /// next entry at `now_ms` (the time it would be signed): `None` to go
     /// ahead, else why not (`LogFull`, `MembersFull`, `HostsFull`, or `ServiceChangeTooSoon` for a
     /// service change that grants anything new, e.g. a renewal, within
-    /// 24 h of that service's last entry; narrowing and `remove` are never
-    /// paced). Advisory, for signers only: hosts accept any valid entry.
+    /// 24 h of that service's last grant; narrowing and `remove` are never
+    /// paced and never restart the 24 h). Advisory, for signers only: hosts accept any valid entry.
     /// A malformed action is `Invalid`/`Membership` as in `draft_entry`.
     pub fn check_change(
         &self,
