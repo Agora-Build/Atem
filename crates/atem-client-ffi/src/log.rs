@@ -15,15 +15,16 @@ use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::channel::HeadRelation;
 use atem_client::encoding::{Hash32, b64u};
 use atem_client::membership::{
-    Action, Conflict, Effect, Entry, Evaluation, Head, HostNow, Invalid, Member, MemberKind,
-    MemberStatus, Membership, Stop,
+    Action, CapacityLevel, ChangeRefusal, Conflict, Effect, Entry, Evaluation, Head, HostNow,
+    Invalid, Member, MemberKind, MemberStatus, Membership, Stop,
 };
 
 use crate::encoding::{MAX_SAFE, canonical, canonical_lossy, hash_of, safe_int, signed, strict};
 use crate::error::{AtemError, Result};
 use crate::types::{
-    CarriageResult, CarriageStop, FreezeInfo, HeadRelationKind, HostClock, HostInfo, KBackupInfo,
-    LogHead, MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo,
+    CapacityInfo, CapacityLevelKind, CarriageResult, CarriageStop, ChangeRefusalInfo, FreezeInfo,
+    HeadRelationKind, HostClock, HostInfo, KBackupInfo, LogHead, MemberInfo, MemberStatusKind,
+    MembershipEffect, PendingRecoveryInfo,
 };
 
 /// Largest durable snapshot `MembershipLog::from_stored` reads: the host's
@@ -138,6 +139,14 @@ fn member_info(member: &Member, status: MemberStatus) -> MemberInfo {
         scope_json,
         expires_at,
         member_json: canonical_lossy(&member.to_json()),
+    }
+}
+
+fn level_kind(level: CapacityLevel) -> CapacityLevelKind {
+    match level {
+        CapacityLevel::Ok => CapacityLevelKind::Ok,
+        CapacityLevel::NearlyFull => CapacityLevelKind::NearlyFull,
+        CapacityLevel::Full => CapacityLevelKind::Full,
     }
 }
 
@@ -603,6 +612,60 @@ impl MembershipLog {
         let body = self.draft_value(&signer, safe_int(signed_at, "signed_at")?, &action)?;
         structural_entry(&body)?;
         canonical(&body)
+    }
+
+    /// How full the log is (D23): entries and members against the
+    /// verifier's limits (1024, 256), nearly full from 90 %. Show a warning
+    /// from `nearly_full`: renewals use one entry each, and a full log
+    /// needs re-pairing.
+    pub fn capacity(&self) -> CapacityInfo {
+        let c = self.lock().capacity();
+        CapacityInfo {
+            entries: c.entries,
+            max_entries: c.max_entries,
+            members: c.members,
+            max_members: c.max_members,
+            level: level_kind(c.level),
+            entries_level: level_kind(c.entries_level()),
+            members_level: level_kind(c.members_level()),
+        }
+    }
+
+    /// Whether to draft `action_json` (as `draft_entry` takes it) as the
+    /// next entry at `now_ms` (the time it would be signed): `None` to go
+    /// ahead, else why not (`LogFull`, `MembersFull`, or `TooSoon` for a
+    /// service change that grants anything new, e.g. a renewal, within
+    /// 24 h of that service's last entry; narrowing and `remove` are never
+    /// paced). Advisory, for signers only: hosts accept any valid entry.
+    /// A malformed action is `Invalid`/`Membership` as in `draft_entry`.
+    pub fn check_change(
+        &self,
+        action_json: String,
+        now_ms: u64,
+    ) -> Result<Option<ChangeRefusalInfo>> {
+        let action = strict(&action_json)?;
+        // A placeholder signer: who signs isn't judged here.
+        let signer = match action["action"].as_str() {
+            Some("recovery_add") => atem_client::membership::RECOVERY_SIGNER,
+            _ => "change-check",
+        };
+        let body = self.draft_value(signer, safe_int(now_ms, "now_ms")?, &action)?;
+        let entry = structural_entry(&body)?;
+        let log = self.lock();
+        Ok(
+            match atem_client::membership::check_change(&log, &entry.action, now_ms) {
+                Ok(()) => None,
+                Err(ChangeRefusal::LogFull) => Some(ChangeRefusalInfo::LogFull),
+                Err(ChangeRefusal::MembersFull) => Some(ChangeRefusalInfo::MembersFull),
+                Err(ChangeRefusal::TooSoon {
+                    last_signed_at,
+                    retry_at,
+                }) => Some(ChangeRefusalInfo::TooSoon {
+                    last_signed_at,
+                    retry_at,
+                }),
+            },
+        )
     }
 
     /// Checks a member object (`add`/`recovery_add`'s `member`) with the

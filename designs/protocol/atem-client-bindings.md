@@ -97,6 +97,8 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 | `advance(now)` | ends waits that are over on this clock |
 | `draft_entry(signer, signed_at, action_json)` | the next entry's body, checked with the verifier's own schema; show it, then publish (below) |
 | `check_member(member_json)` | a member object for `add` / `recovery_add`, checked |
+| `capacity()` | `CapacityInfo{entries, max_entries, members, max_members, level, entries_level, members_level}`: the verifier's own counts against its limits (1024 entries; 256 members, counting members in effect and pending `recovery_add`s); `level` `ok` / `nearly_full` (≥ 90 % of either) / `full`. From `nearly_full` show "Device list nearly full: renewals use one entry each; a full list needs re-pairing" (D23) |
+| `check_change(action_json, now_ms)` | before `draft_entry` (same `action_json`; `now_ms` the `signed_at` it would carry): `None` to go ahead, else `ChangeRefusalInfo` `LogFull` (no entry fits, a removal included), `MembersFull` (no `add`), `TooSoon{last_signed_at, retry_at}` (a service `set_roles` that grants anything new, e.g. a renewal, within 24 h of that service's last entry; narrowing and `remove` are never paced). Advisory for signers: hosts still accept any valid entry |
 | `admit_carrier(device_id, entries, more, now)` | host role, feature `host` only (never in an app build) |
 
 The log object is shared by reference: `extend`, `advance`, a publisher's
@@ -643,7 +645,7 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (the same 37 checks in each language, over
+- **Conformance** (the same 38 checks in each language, over
   `designs/protocol/fixtures/r9-vectors-*.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`

@@ -216,6 +216,22 @@ check("a draft the verifier would refuse is refused before signing", () => {
   throwsCode(() => logL().draftEntry("dev-phone", 1, str({ action: "remove" })), "membership_invalid");
 });
 
+check("capacity and the service change guard (D23)", () => {
+  const log = logL();
+  eq(log.capacity(), { entries: 6, maxEntries: 1024, members: 3, maxMembers: 256, level: "ok", entriesLevel: "ok", membersLevel: "ok" });
+  const e5 = byLabel.E5.entry.body;
+  const svc = e5.member;
+  const at = e5.signed_at;
+  const day = 86400000;
+  const change = (ops, expiresAt) => str({ action: "set_roles", device_id: "svc-discord", roles: ["service"], scope: { ...svc.scope, ops }, expires_at: expiresAt });
+  const renew = change(svc.scope.ops, svc.expires_at + day);
+  eq(log.checkChange(renew, at + 3600000), { type: "too_soon", lastSignedAt: at, retryAt: at + day }, "a renewal within 24 h");
+  eq(log.checkChange(renew, at + day), null, "after 24 h");
+  eq(log.checkChange(change(["view"], svc.expires_at), at + 3600000), null, "narrowing");
+  eq(log.checkChange(str({ action: "remove", device_id: "svc-discord" }), at + 3600000), null, "removal");
+  throwsCode(() => log.checkChange(str({ action: "remove" }), at), "membership_invalid");
+});
+
 // ---------------------------------------------------------------- recovery
 const kit1 = () => m.RecoveryKit.read(unhex(rec.R_hex), rec.kit.account_id, rec.kit.genesis_hash, unhex(rec.kit.kit_tag_hex));
 check("kit 1: tag, recovery key, X25519 key", () => {

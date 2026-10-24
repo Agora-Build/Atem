@@ -257,6 +257,24 @@ fun main(args: Array<String>) {
         throwsCode("membership_invalid") { logL().draftEntry("dev-phone", 1uL, "{\"action\":\"remove\"}") }
     }
 
+    check("capacity and the service change guard (D23)") {
+        val log = logL()
+        eq(log.capacity(), CapacityInfo(6uL, 1024uL, 3uL, 256uL, CapacityLevelKind.OK, CapacityLevelKind.OK, CapacityLevelKind.OK))
+        val e5 = byLabel.getValue("E5")["entry"]["body"]
+        val svc = e5["member"]
+        val at = e5["signed_at"].l().toULong()
+        val day = 86_400_000L
+        fun change(ops: Any?, expiresAt: Long) = Json.write(mapOf(
+            "action" to "set_roles", "device_id" to "svc-discord", "roles" to listOf("service"),
+            "scope" to svc["scope"].obj() + ("ops" to ops), "expires_at" to expiresAt))
+        val renew = change(svc["scope"]["ops"], svc["expires_at"].l() + day)
+        eq(log.checkChange(renew, at + 3_600_000uL), ChangeRefusalInfo.TooSoon(at, at + day.toULong()), "a renewal within 24 h")
+        eq(log.checkChange(renew, at + day.toULong()), null, "after 24 h")
+        eq(log.checkChange(change(listOf("view"), svc["expires_at"].l()), at + 3_600_000uL), null, "narrowing")
+        eq(log.checkChange("{\"action\":\"remove\",\"device_id\":\"svc-discord\"}", at + 3_600_000uL), null, "removal")
+        throwsCode("membership_invalid") { log.checkChange("{\"action\":\"remove\"}", at) }
+    }
+
     // ------------------------------------------------------------ recovery
     fun kit1() = RecoveryKitHandle.read(unhex(rec["R_hex"].s()), rec["kit"]["account_id"].s(), rec["kit"]["genesis_hash"].s(), unhex(rec["kit"]["kit_tag_hex"].s()))
     check("kit 1: tag, recovery key, X25519 key") {

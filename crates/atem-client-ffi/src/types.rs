@@ -201,6 +201,50 @@ record! {
     }
 }
 
+unit_enum! {
+    /// How close the log (or one of its limits) is to full (D23).
+    pub enum CapacityLevelKind {
+        Ok,
+        /// At or above 90 % of a limit: renewals use one entry each.
+        NearlyFull,
+        /// A limit reached: no entry at all (entries; the account needs
+        /// re-pairing), or no `add` (members).
+        Full,
+    }
+}
+
+record! {
+    /// The log's use of its limits (§R9.2), by the verifier's own counts.
+    /// `members` counts members in effect and the subjects of pending
+    /// `recovery_add`s (removed ones free their place; ids stay used).
+    /// `level` is the higher of the two limits' levels.
+    pub struct CapacityInfo {
+        pub entries: u64,
+        pub max_entries: u64,
+        pub members: u64,
+        pub max_members: u64,
+        pub level: CapacityLevelKind,
+        pub entries_level: CapacityLevelKind,
+        pub members_level: CapacityLevelKind,
+    }
+}
+
+data_enum! {
+    /// Why a signer shouldn't draft a change now
+    /// (`MembershipLog::check_change`; advisory, the verifier still accepts
+    /// any valid entry).
+    pub enum ChangeRefusalInfo {
+        /// 1024 entries: no verifier takes another, a removal included.
+        LogFull,
+        /// 256 members: no `add` until one is removed.
+        MembersFull,
+        /// A service change that grants anything new within 24 h of that
+        /// service's last entry (signed at `last_signed_at`): retry at
+        /// `retry_at`.
+        TooSoon { last_signed_at: u64, retry_at: u64 },
+    }
+}
+
 data_enum! {
     /// A state change the verifier committed (or would commit).
     pub enum MembershipEffect {
