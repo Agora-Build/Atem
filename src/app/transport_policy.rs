@@ -64,6 +64,14 @@ impl NotStored {
     }
 }
 
+/// This profile's pairing record, read the one way every relay-only
+/// decision reads it (the connect loop and `drop_local_link_if_relay_only`):
+/// from the profile's pairing path, which doesn't depend on config.toml, so
+/// a broken config.toml is never taken for a damaged record.
+pub(super) fn stored_record() -> anyhow::Result<Option<crate::records::PairingRecord>> {
+    crate::records::PairingRecord::load(&crate::paths::ProfilePaths::default_paths().pairing)
+}
+
 impl App {
     /// Stores `relay_only` under the link's bound pairing and acknowledges
     /// the result (`stored`, else `stored: false` with a reason; another
@@ -173,10 +181,7 @@ impl App {
         if self.astation_client.via() != Some(&LinkVia::Local) || self.drop_waits() {
             return;
         }
-        let loaded = self
-            .astation_client
-            .profile()
-            .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing));
+        let loaded = stored_record();
         if !crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref)) {
             self.relay_only_drop = Some(RelayOnlyDrop {
                 link_gen: self.astation_link_gen,

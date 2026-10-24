@@ -1723,6 +1723,76 @@ fn relay_only_deferred_drop_is_cancelled_by_false_and_fenced_by_a_new_link() {
     });
 }
 
+/// A link the connect loop hands over (`poll_astation_connect`) like a
+/// runtime's, authenticated with `ASTATION` over `url`, reached locally.
+/// Its profile is then forgotten: `profile()` fails, as a runtime client's
+/// does when config.toml doesn't load; relay-only decisions never need it.
+async fn land_local_link(app: &mut App, url: &str) {
+    let config = crate::config::AtemConfig::config_dir();
+    let mut client = link_to(&config, url, local_via()).await;
+    client.forget_profile_for_test();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tx.send(Ok((client, Some("local".to_string()))))
+        .ok()
+        .unwrap();
+    app.astation_connect_rx = Some(rx);
+}
+
+/// A local link landing while the stored record says relay only (it
+/// changed after the connect loop read it) is dropped by the next pass,
+/// without an ack.
+#[test]
+fn a_local_link_landing_under_relay_only_is_dropped() {
+    local(async {
+        let config = crate::config::AtemConfig::config_dir();
+        paired(&config);
+        let (url, mut peer) = Peer::listen().await;
+        let mut app = App::new();
+        app.last_session_refresh = Some(Instant::now());
+        app.astation_reconnect = false;
+        land_local_link(&mut app, &url).await;
+        crate::pairing::tests::edit(&config, |record| record.relay_only = true);
+        app.poll_astation_connect();
+        assert!(app.astation_connected);
+        assert!(app.relay_only_drop_pending());
+        pass_until_dropped(&mut app, WAIT).await;
+        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
+        assert!(peer.drain(WAIT).await, "the local socket closed");
+        assert!(acks(&peer).is_empty(), "no ack without a policy message");
+    });
+}
+
+/// A config.toml that doesn't parse is not a damaged pairing record: a
+/// local link landing under a readable record that allows local stays (no
+/// drop, so no reconnect loop).
+#[test]
+fn a_broken_config_toml_never_drops_a_local_link() {
+    local(async {
+        let config = crate::config::AtemConfig::config_dir();
+        paired(&config);
+        let (url, mut peer) = Peer::listen().await;
+        let mut app = App::new();
+        app.last_session_refresh = Some(Instant::now());
+        app.astation_reconnect = false;
+        land_local_link(&mut app, &url).await;
+        std::fs::write(config.join("config.toml"), "astation_ws = [not toml").unwrap();
+        assert!(
+            crate::profile::Sources::current().is_err(),
+            "the profile can't load"
+        );
+        app.poll_astation_connect();
+        assert!(app.astation_connected);
+        assert!(!app.relay_only_drop_pending());
+        for _ in 0..10 {
+            app.process_astation_messages().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(app.astation_connected, "kept");
+        assert!(app.astation_reconnect_at.is_none(), "no reconnect");
+        assert!(!peer.drain(Duration::from_millis(200)).await);
+    });
+}
+
 /// A stored `false` after the operation ended, while the writer still holds
 /// the `true` ack (the 5 s window running), cancels the drop: the link stays
 /// once both acks are written.
@@ -2049,6 +2119,21 @@ fn the_connect_loop_never_tries_local_with_an_unreadable_record() {
                 let status = app.status_message.clone().unwrap();
                 assert!(status.contains(crate::app::PAIRING_UNREADABLE), "{status}");
                 assert_eq!(app.pairing_unreadable.as_deref(), Some(error.as_str()));
+                // More retries on the same App: the same error is not new,
+                // so it is not logged again.
+                for _retry in 0..2 {
+                    app.spawn_astation_connect();
+                    while app.astation_connect_rx.is_some() {
+                        assert!(started.elapsed() < WAIT);
+                        app.poll_astation_connect();
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert_eq!(app.pairing_unreadable.as_deref(), Some(error.as_str()));
+                }
+                assert_eq!(
+                    app.pairing_unreadable_logged, 1,
+                    "logged once in 3 failures"
+                );
                 assert_eq!(
                     std::fs::read(&paths.record).unwrap(),
                     b"not a sealed record",

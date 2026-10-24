@@ -794,6 +794,13 @@ impl AstationClient {
         self.authenticate_after_challenge(auth_required, false).await
     }
 
+    /// Drops the injected profile: `profile()` then fails, as a runtime
+    /// client's does when config.toml can't be loaded.
+    #[cfg(test)]
+    pub(crate) fn forget_profile_for_test(&mut self) {
+        self.profile = None;
+    }
+
     /// Holds back everything sent from now on until the returned handle's
     /// `resume`, which hands it to the real writer in order.
     #[cfg(test)]

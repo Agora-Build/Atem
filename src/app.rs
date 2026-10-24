@@ -124,6 +124,9 @@ pub struct App {
     /// The unreadable pairing record error last logged by the connect loop
     /// (logged again only when it changes).
     pub pairing_unreadable: Option<String>,
+    /// How many times the connect loop logged it (tests).
+    #[cfg(test)]
+    pub pairing_unreadable_logged: usize,
 }
 
 impl App {
@@ -165,6 +168,8 @@ impl App {
             astation_connect_error: None,
             relay_only_drop: None,
             pairing_unreadable: None,
+            #[cfg(test)]
+            pairing_unreadable_logged: 0,
         };
         app.rebuild_menu();
         app
@@ -466,8 +471,7 @@ impl App {
             // there is no relay room either. Fail closed: no attempt, the
             // error (logged by `poll_astation_connect`), the 30 s retry.
             // The record's place doesn't depend on config.toml.
-            let paths = crate::paths::ProfilePaths::default_paths();
-            let loaded = crate::records::PairingRecord::load(&paths.pairing);
+            let loaded = transport_policy::stored_record();
             let local_allowed = crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref));
             let record = match loaded {
                 Ok(record) => record,
@@ -549,6 +553,10 @@ impl App {
                     if let Some(text) = unreadable {
                         if self.note_pairing_unreadable(&text) {
                             crate::diagnostics::warn(format!("atem runtime: {text}"));
+                            #[cfg(test)]
+                            {
+                                self.pairing_unreadable_logged += 1;
+                            }
                         }
                         self.status_message = Some(format!("Astation: {text}"));
                     } else {

@@ -386,16 +386,25 @@ mod tests {
 
     /// A local link that re-authenticates while the stored record says
     /// relay only is dropped (no ack: no policy message) and reconnects; one
-    /// that may stay local stays.
+    /// that may stay local stays, also with a config.toml that doesn't parse
+    /// (never taken for a damaged record).
     #[tokio::test]
     async fn a_local_link_re_authenticated_under_relay_only_is_dropped() {
-        for relay_only in [true, false] {
+        for (relay_only, broken_config) in [(true, false), (false, false), (false, true)] {
             let (mut app, mut peer) = connected_app().await;
             app.astation_client
                 .set_via_for_test(crate::websocket_client::LinkVia::Local);
             crate::pairing::tests::edit(peer._state.path(), |record| {
                 record.relay_only = relay_only;
             });
+            if broken_config {
+                std::fs::write(
+                    peer._state.path().join("config.toml"),
+                    "astation_ws = [not toml",
+                )
+                .unwrap();
+                assert!(crate::profile::Sources::current().is_err());
+            }
             peer.send
                 .send(auth_required(ASTATION, &"c".repeat(64)))
                 .unwrap();
