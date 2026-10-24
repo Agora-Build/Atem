@@ -433,44 +433,105 @@ fn log(line: &str) {
 }
 
 /// The device list's use of its limits for `atem status` (D23): `N/1024
-/// entries, M/256 members, H/64 hosts`, then what a nearly full or full
-/// list means.
+/// entries, M/256 members, H/64 hosts`, then what each limit at nearly
+/// full or full means.
 pub fn capacity_text(c: &Capacity) -> String {
     let mut text = format!(
         "{}/{} entries, {}/{} members, {}/{} hosts",
         c.entries, c.max_entries, c.members, c.max_members, c.hosts, c.max_hosts
     );
-    if let Some(warning) = capacity_warning(c) {
-        text.push_str("; ");
-        text.push_str(warning);
+    for (_, _, warning) in limits(c) {
+        if let Some(warning) = warning {
+            text.push_str("; ");
+            text.push_str(warning);
+        }
     }
     text
 }
 
-/// What a nearly full or full list means (`None` below 90 % of every
-/// limit). Advisory: the host still accepts every valid entry.
-fn capacity_warning(c: &Capacity) -> Option<&'static str> {
-    if c.entries_level() == CapacityLevel::Full {
-        Some("full: no device can be added, renewed or removed; a full list needs re-pairing")
-    } else if c.members_level() == CapacityLevel::Full {
-        Some("no room for another device: remove one before adding one")
-    } else if c.hosts_level() == CapacityLevel::Full {
-        Some("no room for another host: remove one before adding one")
-    } else if c.level == CapacityLevel::NearlyFull {
-        Some("nearly full: renewals use one entry each; a full list needs re-pairing")
-    } else {
-        None
+/// Each limit: its name, level and what that level means (`None` below
+/// 90 %). Advisory: the host still accepts every valid entry. A full
+/// member list (and a full log) also refuses a Recovery Kit's
+/// `recovery_add`, so the texts ask for a free place for it.
+fn limits(c: &Capacity) -> [(&'static str, CapacityLevel, Option<&'static str>); 3] {
+    use CapacityLevel::{Full, NearlyFull, Ok};
+    let entries = c.entries_level();
+    let members = c.members_level();
+    let hosts = c.hosts_level();
+    [
+        (
+            "entries",
+            entries,
+            match entries {
+                Ok => None,
+                NearlyFull => Some(
+                    "entries nearly full: renewals use one entry each; a full list needs re-pairing",
+                ),
+                Full => Some(
+                    "entries full: no device can be added, renewed or removed and a Recovery Kit can't recover the account; a full list needs re-pairing",
+                ),
+            },
+        ),
+        (
+            "members",
+            members,
+            match members {
+                Ok => None,
+                NearlyFull => Some(
+                    "members nearly full: remove expired or unused services so a place stays free for a Recovery Kit",
+                ),
+                Full => Some(
+                    "members full: no device can be added and a Recovery Kit can't recover the account; remove expired or unused services",
+                ),
+            },
+        ),
+        (
+            "hosts",
+            hosts,
+            match hosts {
+                Ok => None,
+                NearlyFull => Some("hosts nearly full: remove hosts no longer used"),
+                Full => Some("hosts full: remove a host before adding one"),
+            },
+        ),
+    ]
+}
+
+/// `members nearly full, hosts full`: the limits `pick` names.
+fn limit_names(c: &Capacity, pick: impl Fn(usize, CapacityLevel) -> bool) -> Option<String> {
+    let names: Vec<String> = limits(c)
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, level, _))| pick(*i, *level))
+        .map(|(_, (name, level, _))| format!("{name} {}", level_words(*level)))
+        .collect();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
+fn level_words(level: CapacityLevel) -> &'static str {
+    match level {
+        CapacityLevel::Ok => "ok",
+        CapacityLevel::NearlyFull => "nearly full",
+        CapacityLevel::Full => "full",
     }
 }
 
 /// The runtime.log line when a committed change moves a limit into nearly
-/// full or full (not on every commit, nor when it gets emptier).
+/// full or full (not on every commit, nor when it gets emptier), naming
+/// the limits that crossed.
 fn capacity_crossing(before: &Capacity, after: &Capacity) -> Option<String> {
-    let rose = |b: CapacityLevel, a: CapacityLevel| a > b && a != CapacityLevel::Ok;
-    (rose(before.entries_level(), after.entries_level())
-        || rose(before.members_level(), after.members_level())
-        || rose(before.hosts_level(), after.hosts_level()))
-    .then(|| capacity_text(after))
+    let was = limits(before);
+    let crossed = limit_names(after, |i, level| {
+        level > was[i].1 && level != CapacityLevel::Ok
+    })?;
+    Some(format!("{crossed}: {}", capacity_text(after)))
+}
+
+/// The runtime.log line when a list opens (a start, or the reopen after a
+/// pin) already at nearly full or full.
+fn capacity_at_open(c: &Capacity) -> Option<String> {
+    let names = limit_names(c, |_, level| level != CapacityLevel::Ok)?;
+    Some(format!("opened with {names}: {}", capacity_text(c)))
 }
 
 /// What a failed step makes uncertain: which principals it would fence.
@@ -792,6 +853,9 @@ impl MembershipHost {
             log(&format!(
                 "held ({held:?}): remote access waits for a managing device"
             ));
+        }
+        if let Some(line) = capacity_at_open(&host.m.capacity()) {
+            log(&line);
         }
         Ok(Some((host, fenced)))
     }

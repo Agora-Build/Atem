@@ -1406,69 +1406,99 @@ fn the_pin_seeds_the_revoked_grants_and_vouches_for_a_floor() {
 
 // ── Capacity (D23) ──
 
-fn capacity(entries: u64, members: u64) -> atem_client::membership::Capacity {
-    atem_client::membership::Capacity::of(entries, members, 1)
-}
+use atem_client::membership::Capacity;
+
+const ENTRIES_NEARLY: &str =
+    "entries nearly full: renewals use one entry each; a full list needs re-pairing";
+const MEMBERS_NEARLY: &str = "members nearly full: remove expired or unused services so a place stays free for a Recovery Kit";
+const MEMBERS_FULL: &str = "members full: no device can be added and a Recovery Kit can't recover the account; remove expired or unused services";
 
 #[test]
 fn the_status_names_the_lists_use_of_its_limits_and_warns_from_90_percent() {
     assert_eq!(
-        capacity_text(&capacity(6, 3)),
+        capacity_text(&Capacity::of(6, 3, 1)),
         "6/1024 entries, 3/256 members, 1/64 hosts"
     );
     assert_eq!(
-        capacity_text(&capacity(922, 3)),
-        "922/1024 entries, 3/256 members, 1/64 hosts; nearly full: renewals use one entry each; a full list needs re-pairing"
+        capacity_text(&Capacity::of(922, 3, 1)),
+        format!("922/1024 entries, 3/256 members, 1/64 hosts; {ENTRIES_NEARLY}")
     );
-    assert!(capacity_text(&capacity(40, 231)).contains("; nearly full: "));
     assert_eq!(
-        capacity_text(&capacity(1024, 3)),
-        "1024/1024 entries, 3/256 members, 1/64 hosts; full: no device can be added, renewed or removed; a full list needs re-pairing"
+        capacity_text(&Capacity::of(40, 231, 1)),
+        format!("40/1024 entries, 231/256 members, 1/64 hosts; {MEMBERS_NEARLY}")
     );
-    assert!(
-        capacity_text(&capacity(300, 256))
-            .ends_with("; no room for another device: remove one before adding one")
-    );
-}
-
-#[test]
-fn runtime_log_gets_one_line_when_a_limit_crosses_into_nearly_full_or_full() {
-    let line =
-        |b: (u64, u64), a: (u64, u64)| capacity_crossing(&capacity(b.0, b.1), &capacity(a.0, a.1));
-    assert_eq!(line((900, 3), (921, 3)), None);
     assert_eq!(
-        line((921, 3), (922, 3)).as_deref(),
-        Some(
-            "922/1024 entries, 3/256 members, 1/64 hosts; nearly full: renewals use one entry each; a full list needs re-pairing"
+        capacity_text(&Capacity::of(1024, 3, 1)),
+        "1024/1024 entries, 3/256 members, 1/64 hosts; entries full: no device can be added, renewed or removed and a Recovery Kit can't recover the account; a full list needs re-pairing"
+    );
+    // Every limit at nearly full or full has its own warning, in order.
+    assert_eq!(
+        capacity_text(&Capacity::of(950, 256, 58)),
+        format!(
+            "950/1024 entries, 256/256 members, 58/64 hosts; {ENTRIES_NEARLY}; {MEMBERS_FULL}; hosts nearly full: remove hosts no longer used"
         )
     );
-    // Not again on every commit while nearly full, nor when it empties.
-    assert_eq!(line((922, 3), (960, 3)), None);
-    assert_eq!(line((960, 231), (961, 230)), None);
-    assert!(line((1023, 3), (1024, 3)).unwrap().contains("; full: "));
-    // The other limit crossing while one is already nearly full.
-    assert!(line((950, 230), (951, 231)).is_some());
-    assert!(
-        line((950, 255), (951, 256))
-            .unwrap()
-            .contains("no room for another device")
-    );
-}
-
-#[test]
-fn hosts_have_their_own_level_warning_and_crossing() {
-    use atem_client::membership::Capacity;
     assert!(
         capacity_text(&Capacity::of(10, 3, 64))
-            .ends_with("10/1024 entries, 3/256 members, 64/64 hosts; no room for another host: remove one before adding one")
+            .ends_with("64/64 hosts; hosts full: remove a host before adding one")
     );
-    assert!(capacity_text(&Capacity::of(10, 3, 58)).contains("; nearly full: "));
     assert_eq!(
         capacity_text(&Capacity::of(10, 3, 57)),
         "10/1024 entries, 3/256 members, 57/64 hosts"
     );
-    assert!(capacity_crossing(&Capacity::of(10, 3, 57), &Capacity::of(11, 3, 58)).is_some());
-    assert!(capacity_crossing(&Capacity::of(11, 3, 58), &Capacity::of(12, 3, 58)).is_none());
+}
+
+#[test]
+fn runtime_log_gets_one_line_naming_the_limits_that_cross() {
+    let line = |b: (u64, u64, u64), a: (u64, u64, u64)| {
+        capacity_crossing(&Capacity::of(b.0, b.1, b.2), &Capacity::of(a.0, a.1, a.2))
+    };
+    assert_eq!(line((900, 3, 1), (921, 3, 1)), None);
+    assert_eq!(
+        line((921, 3, 1), (922, 3, 1)).as_deref(),
+        Some(
+            format!(
+                "entries nearly full: 922/1024 entries, 3/256 members, 1/64 hosts; {ENTRIES_NEARLY}"
+            )
+            .as_str()
+        )
+    );
+    // Not again on every commit while nearly full, nor when it empties.
+    assert_eq!(line((922, 3, 1), (960, 3, 1)), None);
+    assert_eq!(line((960, 231, 1), (961, 230, 1)), None);
+    assert!(
+        line((1023, 3, 1), (1024, 3, 1))
+            .unwrap()
+            .starts_with("entries full: ")
+    );
+    // Only the limit that crossed is named, whatever else is full.
+    assert!(
+        line((950, 256, 57), (951, 256, 58))
+            .unwrap()
+            .starts_with("hosts nearly full: 951/1024 entries")
+    );
+    assert!(
+        line((950, 230, 1), (951, 231, 1))
+            .unwrap()
+            .starts_with("members nearly full: ")
+    );
+    assert!(
+        line((10, 230, 57), (11, 231, 58))
+            .unwrap()
+            .starts_with("members nearly full, hosts nearly full: ")
+    );
+}
+
+#[test]
+fn a_list_opened_nearly_full_is_logged_once_at_the_open() {
+    assert_eq!(capacity_at_open(&Capacity::of(6, 3, 1)), None);
+    assert_eq!(
+        capacity_at_open(&Capacity::of(40, 256, 1)).as_deref(),
+        Some(
+            format!("opened with members full: 40/1024 entries, 256/256 members, 1/64 hosts; {MEMBERS_FULL}")
+                .as_str()
+        )
+    );
 }
 
 #[test]
