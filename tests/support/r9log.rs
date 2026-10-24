@@ -231,6 +231,66 @@ impl TestLog {
         self.append(MAC, Action::Add { member })
     }
 
+    /// A service enrolled through the shared core's builder
+    /// (`atem_client::membership::service_add`, §R9.6), its Ed25519 key in
+    /// [`TestLog::keys`].
+    pub fn enroll_service(
+        &mut self,
+        device: &str,
+        scope: &atem_client::membership::ServiceScope,
+        expires_at: u64,
+    ) -> Value {
+        let s = secret(&format!("{device} auth"));
+        self.keys.insert_ed25519(auth(device), &s);
+        let key = PublicKey::new(Alg::Ed25519, &ed_pub(&s)).unwrap();
+        let action =
+            atem_client::membership::service_add(device, key, scope, expires_at, now_wall())
+                .unwrap();
+        self.append(MAC, action)
+    }
+
+    /// A service `set_roles` by the Mac (the builder's
+    /// `service_set_roles`): any change, widening included.
+    pub fn set_service(
+        &mut self,
+        device: &str,
+        scope: &atem_client::membership::ServiceScope,
+        expires_at: u64,
+    ) -> Value {
+        let action =
+            atem_client::membership::service_set_roles(device, scope, expires_at, now_wall())
+                .unwrap();
+        self.append(MAC, action)
+    }
+
+    /// A renewal by the Mac (`service_renewal`: the current scope, a later
+    /// expiry).
+    pub fn renew_service(&mut self, device: &str, expires_at: u64) -> Value {
+        let action =
+            atem_client::membership::service_renewal(&self.log, device, expires_at, now_wall())
+                .unwrap();
+        self.append(MAC, action)
+    }
+
+    /// A narrowing by the Mac (`service_narrowing`; `None`: the expiry
+    /// unchanged).
+    pub fn narrow_service(
+        &mut self,
+        device: &str,
+        scope: &atem_client::membership::ServiceScope,
+        expires_at: Option<u64>,
+    ) -> Value {
+        let action = atem_client::membership::service_narrowing(
+            &self.log,
+            device,
+            scope,
+            expires_at,
+            now_wall(),
+        )
+        .unwrap();
+        self.append(MAC, action)
+    }
+
     fn native_member(&mut self, device: &str, roles: &[&str]) -> Member {
         let s = secret(&format!("{device} auth"));
         self.keys.insert_p256(auth(device), &s).unwrap();
