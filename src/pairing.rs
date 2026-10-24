@@ -168,18 +168,16 @@ impl PairingRecord {
     }
 
     /// Astation's transport policy for this pairing (`transportPolicy`).
-    /// Never creates a pairing: an error when the one with `astation_id` is
+    /// Never creates a pairing: false when the one with `astation_id` is
     /// gone. Callers hold the lock (`Captured::apply`).
-    pub fn set_relay_only(paths: &PairingPaths, astation_id: &str, relay_only: bool) -> Result<()> {
-        let updated = Self::update_locked(paths, astation_id, |record| {
+    pub fn set_relay_only(
+        paths: &PairingPaths,
+        astation_id: &str,
+        relay_only: bool,
+    ) -> Result<bool> {
+        Self::update_locked(paths, astation_id, |record| {
             record.relay_only = relay_only;
-        })?;
-        if !updated {
-            bail!(
-                "the pairing with Astation {astation_id} was removed meanwhile; nothing was saved"
-            );
-        }
-        Ok(())
+        })
     }
 
     /// Whether a connect may try the local `astation_ws`: not while the
@@ -835,10 +833,10 @@ pub(crate) mod tests {
         let captured = bound_profile(dir.path(), "astation-1");
         let src = captured.sources().clone();
         let paths = &src.paths.pairing;
-        PairingRecord::set_relay_only(paths, "astation-1", true).unwrap();
+        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
         assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
         // Another Astation's policy is not this pairing's.
-        assert!(PairingRecord::set_relay_only(paths, "astation-2", false).is_err());
+        assert!(!PairingRecord::set_relay_only(paths, "astation-2", false).unwrap());
         assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
         // A new binding starts without one (Astation sends it again).
         interrupted_unpair(dir.path());
@@ -847,7 +845,7 @@ pub(crate) mod tests {
         assert!(!PairingRecord::load(paths).unwrap().unwrap().relay_only);
         // Unpair removes it with the record; nothing re-creates it.
         unpair(&src).unwrap();
-        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).is_err());
+        assert!(!PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
         assert!(!paths.record.exists());
     }
 

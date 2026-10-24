@@ -115,6 +115,9 @@ pub struct App {
     /// Why the last background connect failed, when the saved session was
     /// the problem (shown to a pairing or unlock waiting for the link).
     pub astation_connect_error: Option<String>,
+    /// The local link (its `astation_link_gen`) relay only drops once the
+    /// Astation operation running on it ends (`app/transport_policy.rs`).
+    pub relay_only_drop: Option<u64>,
 }
 
 impl App {
@@ -154,6 +157,7 @@ impl App {
             task_notices: Vec::new(),
             op_route: None,
             astation_connect_error: None,
+            relay_only_drop: None,
         };
         app.rebuild_menu();
         app
@@ -450,6 +454,8 @@ impl App {
                 }
             };
 
+            // An unreadable record (or profile) reads as none: local may be
+            // tried, as before relay only (there is no relay room to use either).
             let record = crate::profile::Sources::current()
                 .ok()
                 .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing).ok().flatten());
@@ -908,6 +914,7 @@ impl App {
             message_count += 1;
         }
         self.check_astation_reauth_deadline();
+        self.check_relay_only_drop();
 
         // Detect WebSocket disconnect (channel closed after draining remaining messages)
         if self.astation_connected && self.astation_client.is_ws_closed() {
