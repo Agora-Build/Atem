@@ -374,9 +374,10 @@ impl Dev {
 }
 
 /// §R9.6 + r8 §G: an approval reaches a service whose ops have `approval`
-/// (`approval_request` on its attachment), whatever lease anyone holds; it
-/// marks the card seen (`seen`, nothing signed for a service) and answers
-/// it lease-free: the receipt completes, the agent gets the allow, and the
+/// (`approval_request` on its attachment) while another client (`svc-bot`)
+/// holds the session's lease; it marks the card seen (answered `seen`, and
+/// no `push_seen` goes to the relay: a service is never a hint recipient,
+/// so nothing is signed for it) and answers it lease-free: the receipt completes, the agent gets the allow, and the
 /// Mac hears `approval_closed` `answered_remote`. A service with control
 /// but without `approval` (`svc-bot`) gets no request and its answer is
 /// `forbidden`; a view-only one likewise.
@@ -398,6 +399,13 @@ fn an_approval_reaches_a_service_with_the_approval_op_which_answers_it() {
     for d in [&mut m, &mut appr, &mut bot, &mut view] {
         d.sees(&mut router, &sid);
     }
+    // Another client holds the lease throughout.
+    let binding = bot.read(&sid);
+    let lease = bot.request(
+        &mut router,
+        json!({"op": "acquire", "binding": binding, "takeover": false}),
+    );
+    assert_eq!(lease["op"], "lease", "{lease}");
 
     ask(&fake, 1);
     let request = appr.wait(&mut router, |v| v["op"] == "approval_request");
@@ -422,6 +430,13 @@ fn an_approval_reaches_a_service_with_the_approval_op_which_answers_it() {
         json!({"op": "approval_seen", "binding": binding, "approval_id": ap}),
     );
     assert_eq!(seen["op"], "seen", "{seen}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while let Some(v) = router.other_within(deadline.saturating_duration_since(Instant::now())) {
+        assert_ne!(
+            v["op"], "push_seen",
+            "a service's seen is never signed: {v}"
+        );
+    }
 
     // The answer, without any lease.
     let rid = uuid();
@@ -682,13 +697,21 @@ fn a_grant_revocation_fences_the_browser_and_leaves_the_service_alone() {
 /// §R9.6 and §R9.13 item 4 (`K` rotation with a service attached): the
 /// project-hash table stands in for the cred agent
 /// (`ATEM_TEST_PROJECT_HASHES`), its hashes made by the shared core's
-/// `project_hash` over the session's launch project (`local:home`). A
-/// service scoped to the old generation's hash sees the session; a new
-/// generation is installed (both retained) and the service stays attached
-/// and in scope; the Mac re-issues the scope with both generations'
-/// hashes, then narrows it to the new one (each `set_roles` fences and
-/// readmits the service, which keeps seeing the session); the old
-/// generation is dropped and the service still sees it.
+/// `project_hash` over the session's launch project (`local:home`).
+/// Controls that must not see the session: a scope under a generation the
+/// agent doesn't hold yet (until it does), a scope naming another
+/// project's hash (never), and a scope left on the old generation after
+/// that generation is dropped (from then on).
+///
+/// 1. Old generation only: `svc-proj` and `svc-old-only` (old hash) see
+///    the session; `svc-next` (new hash) and `svc-foreign` don't.
+/// 2. The new generation installed, the old retained: `svc-next` comes
+///    into scope; `svc-proj` stays attached and in scope.
+/// 3. The Mac re-issues `svc-proj` with both generations' hashes, then
+///    narrows it to the new one: each `set_roles` fences and readmits it,
+///    and it keeps seeing the session.
+/// 4. The old generation dropped: `svc-old-only` leaves the scope at the
+///    host's next retention check, `svc-proj` (re-issued) keeps it.
 #[test]
 #[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
 fn k_rotation_with_a_service_attached_re_issues_its_scope() {
@@ -701,6 +724,7 @@ fn k_rotation_with_a_service_attached_re_issues_its_scope() {
     let project = local_project_key("home");
     let old = project_hash(&key("aaaa0001", 1), &project).unwrap();
     let new = project_hash(&key("bbbb0002", 2), &project).unwrap();
+    let foreign = project_hash(&key("aaaa0001", 1), &local_project_key("elsewhere")).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let table = dir.path().join("projects.json");
     let write = |kids: &[(&str, &str)]| {
@@ -714,16 +738,18 @@ fn k_rotation_with_a_service_attached_re_issues_its_scope() {
     };
     write(&[("aaaa0001", &old)]);
     let wall = r9log::host_now().wall_ms;
-    let o = old.clone();
+    let scoped = |hashes: &[&str]| {
+        ServiceScope::new([HOST])
+            .ops(["prompt"])
+            .projects(Some(hashes.iter().map(|h| h.to_string())))
+    };
+    let (o, n, f) = (old.clone(), new.clone(), foreign.clone());
     let mut rig = Rig::new(
         move |log| {
-            log.enroll_service(
-                "svc-proj",
-                &ServiceScope::new([HOST])
-                    .ops(["prompt"])
-                    .projects(Some([o.as_str()])),
-                wall + HOUR,
-            );
+            log.enroll_service("svc-proj", &scoped(&[&o]), wall + HOUR);
+            log.enroll_service("svc-old-only", &scoped(&[&o]), wall + HOUR);
+            log.enroll_service("svc-next", &scoped(&[&n]), wall + HOUR);
+            log.enroll_service("svc-foreign", &scoped(&[&f]), wall + HOUR);
         },
         Some(table.clone()),
         false,
@@ -731,35 +757,54 @@ fn k_rotation_with_a_service_attached_re_issues_its_scope() {
     let (sid, _fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
     let mut m = Dev::connect(&mut router, "mac", &rig.log, &mac());
-    next_init();
-    let mut svc = Dev::connect(&mut router, "proj", &rig.log, &service("svc-proj"));
-    svc.sees(&mut router, &sid);
+    let mut devs = Vec::new();
+    for id in ["svc-proj", "svc-old-only", "svc-next", "svc-foreign"] {
+        next_init();
+        devs.push(Dev::connect(&mut router, id, &rig.log, &service(id)));
+    }
+    let [mut svc, mut old_only, mut next, mut foreign_svc]: [Dev; 4] =
+        devs.try_into().ok().unwrap();
 
-    // A new generation installed, the old one retained: nothing changes
-    // for the attached service.
-    write(&[("aaaa0001", &old), ("bbbb0002", &new)]);
+    // 1. The old generation only.
+    svc.sees(&mut router, &sid);
+    old_only.sees(&mut router, &sid);
+    within("the new kid to be pending", || {
+        std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log"))
+            .unwrap_or_default()
+            .contains("project scopes under bbbb0002 pending")
+    });
     assert!(
-        !svc.gather(&mut router, Duration::from_millis(500))
+        next.sessions(&mut router).is_empty(),
+        "no key for the new kid yet"
+    );
+    assert!(
+        foreign_svc.sessions(&mut router).is_empty(),
+        "another project"
+    );
+
+    // 2. The new generation installed, the old one retained: the scope
+    // under the new kid comes in (learned after the retry); nothing is
+    // fenced.
+    write(&[("aaaa0001", &old), ("bbbb0002", &new)]);
+    next.sees(&mut router, &sid);
+    assert!(
+        !svc.gather(&mut router, Duration::from_millis(300))
             .iter()
             .any(|v| v["__fenced"] == true)
     );
     svc.sees(&mut router, &sid);
+    assert!(foreign_svc.sessions(&mut router).is_empty());
 
-    // Re-issued with both generations' hashes (a widening: a set_roles).
-    let both = rig.log.set_service(
-        "svc-proj",
-        &ServiceScope::new([HOST])
-            .ops(["prompt"])
-            .projects(Some([old.as_str(), new.as_str()])),
-        wall + HOUR,
-    );
+    // 3. Re-issued with both generations' hashes (a widening: a
+    // set_roles), then narrowed to the new one (never paced).
+    let both = rig
+        .log
+        .set_service("svc-proj", &scoped(&[&old, &new]), wall + HOUR);
     m.carry(&mut router, &[both]);
     assert_eq!(svc.fenced(&mut router)["detail"], "roles changed");
     next_init();
     let mut svc = Dev::connect(&mut router, "proj-2", &rig.log, &service("svc-proj"));
     svc.sees(&mut router, &sid);
-
-    // Narrowed to the new generation only (never paced).
     let current = atem_client::membership::service_grant(&rig.log.log, "svc-proj")
         .unwrap()
         .0
@@ -775,10 +820,20 @@ fn k_rotation_with_a_service_attached_re_issues_its_scope() {
     let mut svc = Dev::connect(&mut router, "proj-3", &rig.log, &service("svc-proj"));
     svc.sees(&mut router, &sid);
 
-    // The old generation dropped: the scope no longer needs it.
+    // 4. The old generation dropped: the scope still on it leaves at the
+    // host's next retention check; the re-issued one stays.
     write(&[("bbbb0002", &new)]);
-    std::thread::sleep(Duration::from_millis(500));
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while old_only.sessions(&mut router).contains(&sid) {
+        assert!(
+            Instant::now() < deadline,
+            "a scope under a dropped generation kept matching"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
     svc.sees(&mut router, &sid);
+    next.sees(&mut router, &sid);
+    assert!(foreign_svc.sessions(&mut router).is_empty());
 }
 
 /// §R9.3 "Held": only a managing native device reconciles a held host. A
