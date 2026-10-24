@@ -130,6 +130,8 @@ impl App {
         self.astation_link_gen += 1;
         self.rebuild_menu();
         self.status_message = Some("Astation reconnected".to_string());
+        // A local link stays local only while the record allows it.
+        self.drop_local_link_if_relay_only();
     }
 }
 
@@ -380,6 +382,44 @@ mod tests {
             crate::pairing::tests::session_id(&dir).as_deref(),
             Some(SESSION_ID)
         );
+    }
+
+    /// A local link that re-authenticates while the stored record says
+    /// relay only is dropped (no ack: no policy message) and reconnects; one
+    /// that may stay local stays.
+    #[tokio::test]
+    async fn a_local_link_re_authenticated_under_relay_only_is_dropped() {
+        for relay_only in [true, false] {
+            let (mut app, mut peer) = connected_app().await;
+            app.astation_client
+                .set_via_for_test(crate::websocket_client::LinkVia::Local);
+            crate::pairing::tests::edit(peer._state.path(), |record| {
+                record.relay_only = relay_only;
+            });
+            peer.send
+                .send(auth_required(ASTATION, &"c".repeat(64)))
+                .unwrap();
+            next_auth(&mut app, &mut peer).await;
+            peer.send
+                .send(status("authenticated", &[("method", "session_proof")]))
+                .unwrap();
+            if relay_only {
+                let sent = until_closed(&mut app, &mut peer).await;
+                assert!(
+                    !sent
+                        .iter()
+                        .any(|m| matches!(m, AstationMessage::TransportPolicyAck { .. })),
+                    "no ack without a policy message"
+                );
+                assert!(!app.astation_connected);
+                assert!(app.relay_only_drop.is_none());
+                assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
+            } else {
+                pump(&mut app, &mut peer).await;
+                assert!(app.astation_connected, "local allowed: kept");
+                assert!(app.relay_only_drop.is_none());
+            }
+        }
     }
 
     async fn assert_fails_closed(app: &mut App, peer: &mut Peer, notice: &str) {

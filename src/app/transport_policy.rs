@@ -160,6 +160,32 @@ impl App {
             .is_some_and(|route| route.link_gen == self.astation_link_gen && !route.tx.is_closed())
     }
 
+    /// Whether relay only is about to drop the current link: no Astation
+    /// operation is handed this link (it waits for the next one).
+    pub(crate) fn relay_only_drop_pending(&self) -> bool {
+        self.astation_connected && self.drop_waits()
+    }
+
+    /// A local link that (re)authenticated while the stored record says
+    /// relay only (or can't be read): dropped like after a policy, by the
+    /// next pass (no ack: no policy message to answer).
+    pub(super) fn drop_local_link_if_relay_only(&mut self) {
+        if self.astation_client.via() != Some(&LinkVia::Local) || self.drop_waits() {
+            return;
+        }
+        let loaded = self
+            .astation_client
+            .profile()
+            .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing));
+        if !crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref)) {
+            self.relay_only_drop = Some(RelayOnlyDrop {
+                link_gen: self.astation_link_gen,
+                receipt: None,
+                due: None,
+            });
+        }
+    }
+
     /// Whether a drop of the current link is still waiting.
     fn drop_waits(&self) -> bool {
         self.relay_only_drop
