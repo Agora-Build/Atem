@@ -19,8 +19,9 @@ pub const NEARLY_FULL_PERCENT: u64 = 90;
 
 /// A product default, not a protocol rule: a signer doesn't widen or renew
 /// a service (a `set_roles` that grants anything new, e.g. a later
-/// `expires_at`) within 24 h of that service's last entry (`add` or
-/// `set_roles`), measured on the entries' `signed_at` (the signers' own
+/// `expires_at`) within 24 h of that service's last grant (its `add`, or a
+/// `set_roles` that granted something new; a narrowing doesn't restart the
+/// clock, so a mistaken narrowing can be undone at once), measured on the entries' `signed_at` (the signers' own
 /// clocks: display only for a verifier, so a host never applies it; the
 /// guard is advisory by design). Narrowing and removal are never
 /// rate-limited.
@@ -119,21 +120,33 @@ impl Membership {
     }
 }
 
+impl Membership {
+    /// Appends `entry` with no verification at all: filler for tests of
+    /// long logs (a debug build signs and verifies a thousand entries too
+    /// slowly). Never in a shipped build (feature `test-vectors`).
+    #[cfg(any(test, feature = "test-vectors"))]
+    #[doc(hidden)]
+    pub fn append_unchecked_for_tests(&mut self, entry: super::Entry, now: &super::HostNow) {
+        self.append(entry, now, &mut Vec::new());
+    }
+}
+
 /// Why a signer shouldn't draft a change now ([`check_change`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeRefusal {
     /// The log holds [`MAX_ENTRIES`]: no verifier takes another entry, a
     /// removal included; the account needs re-pairing.
     LogFull,
-    /// [`MAX_MEMBERS`] members: no `add` until one is removed.
+    /// [`MAX_MEMBERS`] members: no `add`, and no `recovery_add` either (a
+    /// Recovery Kit can't bring the account back), until one is removed.
     MembersFull,
     /// [`MAX_HOSTS`] current hosts: no `add_host` of a new host until one
     /// is removed (a current host's new key still fits).
     HostsFull,
-    /// The service had an entry signed at `last_signed_at`; a change that
-    /// grants anything new waits until `retry_at`
+    /// The service's last grant was signed at `last_signed_at`; a change
+    /// that grants anything new waits until `retry_at`
     /// ([`SERVICE_CHANGE_MIN_INTERVAL_MS`]).
-    TooSoon { last_signed_at: u64, retry_at: u64 },
+    ServiceChangeTooSoon { last_signed_at: u64, retry_at: u64 },
 }
 
 impl ChangeRefusal {
@@ -142,7 +155,7 @@ impl ChangeRefusal {
             ChangeRefusal::LogFull => "log_full",
             ChangeRefusal::MembersFull => "members_full",
             ChangeRefusal::HostsFull => "hosts_full",
-            ChangeRefusal::TooSoon { .. } => "service_change_too_soon",
+            ChangeRefusal::ServiceChangeTooSoon { .. } => "service_change_too_soon",
         }
     }
 }
@@ -166,9 +179,15 @@ impl std::error::Error for ChangeRefusal {}
 /// - a service's `set_roles` that grants anything new (a later
 ///   `expires_at`, a host, op, project or session it didn't have, or a
 ///   list it was restricted by dropped) within
-///   [`SERVICE_CHANGE_MIN_INTERVAL_MS`] of that service's last entry is
-///   refused; one that only narrows is never rate-limited, nor is `remove`.
-///   A last entry signed after `now_ms` counts as within the interval.
+///   [`SERVICE_CHANGE_MIN_INTERVAL_MS`] of that service's last grant (its
+///   `add` or a `set_roles` that granted something new) is refused; one
+///   that only narrows is never rate-limited, nor is `remove`. A last grant
+///   signed after `now_ms` counts as within the interval.
+///
+/// Scope lists are compared as the verifier holds them: canonical (sorted,
+/// unique), as every parsed entry and the bindings' `action_json` are. A
+/// Rust caller building an [`Action`] by hand must sort them too, or an
+/// identical re-grant reads as a narrowing and isn't paced.
 pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<(), ChangeRefusal> {
     let capacity = log.capacity();
     if capacity.entries_level() == CapacityLevel::Full {
@@ -207,15 +226,11 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
             {
                 return Ok(());
             }
-            let last = log.entries().iter().rev().find(|e| {
-                matches!(e.action, Action::Add { .. } | Action::SetRoles { .. })
-                    && e.subject() == Some(device_id.as_str())
-            });
-            match last {
-                Some(e) if now_ms < e.signed_at.saturating_add(SERVICE_CHANGE_MIN_INTERVAL_MS) => {
-                    Err(ChangeRefusal::TooSoon {
-                        last_signed_at: e.signed_at,
-                        retry_at: e.signed_at.saturating_add(SERVICE_CHANGE_MIN_INTERVAL_MS),
+            match last_grant(log, device_id) {
+                Some(at) if now_ms < at.saturating_add(SERVICE_CHANGE_MIN_INTERVAL_MS) => {
+                    Err(ChangeRefusal::ServiceChangeTooSoon {
+                        last_signed_at: at,
+                        retry_at: at.saturating_add(SERVICE_CHANGE_MIN_INTERVAL_MS),
                     })
                 }
                 _ => Ok(()),
@@ -223,6 +238,38 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
         }
         _ => Ok(()),
     }
+}
+
+/// `signed_at` of the service's last entry that granted something: its
+/// `add`, or a `set_roles` that didn't only narrow what it had then.
+fn last_grant(log: &Membership, device_id: &str) -> Option<u64> {
+    let mut held: Option<(&Scope, u64)> = None;
+    let mut last = None;
+    for entry in log.entries() {
+        if entry.subject() != Some(device_id) {
+            continue;
+        }
+        match &entry.action {
+            Action::Add { member } => {
+                if let MemberKind::Service { scope, expires_at } = &member.kind {
+                    held = Some((scope, *expires_at));
+                    last = Some(entry.signed_at);
+                }
+            }
+            Action::SetRoles {
+                change: RolesChange::Service { scope, expires_at },
+                ..
+            } => {
+                let narrowed = held.is_some_and(|(cur, exp)| narrows(cur, exp, scope, *expires_at));
+                if !narrowed {
+                    last = Some(entry.signed_at);
+                }
+                held = Some((scope, *expires_at));
+            }
+            _ => {}
+        }
+    }
+    last
 }
 
 /// The new scope and expiry grant nothing the current ones don't, and
@@ -573,7 +620,7 @@ mod tests {
         let mut log = Log::new();
         log.push(add_service("svc"), T0);
         let renewal = renew("svc", T0 + 40 * DAY);
-        let too_soon = Err(ChangeRefusal::TooSoon {
+        let too_soon = Err(ChangeRefusal::ServiceChangeTooSoon {
             last_signed_at: T0,
             retry_at: T0 + DAY,
         });
@@ -586,7 +633,7 @@ mod tests {
         let again = renew("svc", T0 + 50 * DAY);
         assert_eq!(
             check_change(&log.m, &again, T0 + DAY + 3_600_000),
-            Err(ChangeRefusal::TooSoon {
+            Err(ChangeRefusal::ServiceChangeTooSoon {
                 last_signed_at: T0 + DAY,
                 retry_at: T0 + 2 * DAY,
             })
@@ -596,6 +643,35 @@ mod tests {
         assert_eq!(check_change(&log.m, &again, T0 + 2 * DAY), Ok(()));
         // The same grant again only uses an entry: rate-limited too.
         assert!(check_change(&log.m, &renew("svc-2", T0 + 30 * DAY), T0 + DAY + 2).is_err());
+    }
+
+    #[test]
+    fn a_narrowing_doesnt_restart_the_clock() {
+        let mut log = Log::new();
+        log.push(add_service("svc"), T0);
+        // Narrowed by mistake two hours later...
+        let narrow = Action::SetRoles {
+            device_id: "svc".into(),
+            change: RolesChange::Service {
+                scope: scope(&["view"], None),
+                expires_at: T0 + 30 * DAY,
+            },
+        };
+        log.push(narrow, T0 + 2 * 3_600_000);
+        // ...restored within 24 h of the narrowing, a day after the add.
+        let restore = renew("svc", T0 + 30 * DAY);
+        assert_eq!(check_change(&log.m, &restore, T0 + DAY), Ok(()));
+        // Before a day since the add (the last grant), it waits for that.
+        assert_eq!(
+            check_change(&log.m, &restore, T0 + DAY - 1),
+            Err(ChangeRefusal::ServiceChangeTooSoon {
+                last_signed_at: T0,
+                retry_at: T0 + DAY,
+            })
+        );
+        // The restore is a grant: the clock runs from it.
+        log.push(restore, T0 + DAY);
+        assert!(check_change(&log.m, &renew("svc", T0 + 40 * DAY), T0 + DAY + 1).is_err());
     }
 
     #[test]
