@@ -1848,6 +1848,23 @@ a new member (or a new `add_host`).
 
 Log limits: ≤ 1024 entries, ≤ 256 members, ≤ 64 hosts. A full log is
 `membership_invalid` "device list full; re-pair to start a new one".
+
+*Capacity (non-normative, D23: no compaction).* Ids are never reused and
+every renewal or removal takes an entry, so signers pace themselves; the
+host accepts every valid entry regardless. The member limit counts
+members in effect and the subjects of pending `recovery_add`s (removed
+and cancelled ones free their place). A list is *nearly full* at ≥ 90 %
+of either limit (922 entries, 231 members). Signer guidance
+(`atem_client::membership::check_change`, `MembershipLog::check_change`
+in the bindings): draft nothing on a full log, no `add` with full
+members, and no service `set_roles` that grants anything new (a later
+`expires_at` included) within 24 h of that service's last `add` or
+`set_roles` by `signed_at` (a product default,
+`SERVICE_CHANGE_MIN_INTERVAL_MS`); narrowing and `remove` are never
+paced. Managing devices show a warning from nearly full
+(`MembershipLog::capacity`); `atem status` shows `N/1024 entries, M/256
+members` and the warning, and runtime.log gets one line when a commit
+moves a limit into nearly full or full.
 Vectors: `r9-vectors-membership-log` (E1–E6 and the alternatives used
 by the scenarios); `r9-vectors-pairing` (`verifyCommit` and its
 `host_trust_gen` cases).
