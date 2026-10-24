@@ -1403,3 +1403,69 @@ fn the_pin_seeds_the_revoked_grants_and_vouches_for_a_floor() {
     assert!(rig.journal.join("revoked_grants").exists());
     assert!(super::pin_wall_floor(&rig.pairing).unwrap() > 0);
 }
+
+// ── Capacity (D23) ──
+
+fn capacity(entries: u64, members: u64) -> atem_client::membership::Capacity {
+    atem_client::membership::Capacity::of(entries, members)
+}
+
+#[test]
+fn the_status_names_the_lists_use_of_its_limits_and_warns_from_90_percent() {
+    assert_eq!(
+        capacity_text(&capacity(6, 3)),
+        "6/1024 entries, 3/256 members"
+    );
+    assert_eq!(
+        capacity_text(&capacity(922, 3)),
+        "922/1024 entries, 3/256 members; nearly full: renewals use one entry each; a full list needs re-pairing"
+    );
+    assert!(capacity_text(&capacity(40, 231)).contains("; nearly full: "));
+    assert_eq!(
+        capacity_text(&capacity(1024, 3)),
+        "1024/1024 entries, 3/256 members; full: no device can be added, renewed or removed; a full list needs re-pairing"
+    );
+    assert!(
+        capacity_text(&capacity(300, 256))
+            .ends_with("; no room for another device: remove one before adding one")
+    );
+}
+
+#[test]
+fn runtime_log_gets_one_line_when_a_limit_crosses_into_nearly_full_or_full() {
+    let line =
+        |b: (u64, u64), a: (u64, u64)| capacity_crossing(&capacity(b.0, b.1), &capacity(a.0, a.1));
+    assert_eq!(line((900, 3), (921, 3)), None);
+    assert_eq!(
+        line((921, 3), (922, 3)).as_deref(),
+        Some(
+            "922/1024 entries, 3/256 members; nearly full: renewals use one entry each; a full list needs re-pairing"
+        )
+    );
+    // Not again on every commit while nearly full, nor when it empties.
+    assert_eq!(line((922, 3), (960, 3)), None);
+    assert_eq!(line((960, 231), (961, 230)), None);
+    assert!(line((1023, 3), (1024, 3)).unwrap().contains("; full: "));
+    // The other limit crossing while one is already nearly full.
+    assert!(line((950, 230), (951, 231)).is_some());
+    assert!(
+        line((950, 255), (951, 256))
+            .unwrap()
+            .contains("no room for another device")
+    );
+}
+
+#[test]
+fn the_runtime_status_line_carries_the_capacity() {
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (host, _) = opened(&rig, 1);
+    let status =
+        crate::runtime::host_bridge::device_list_status_of(Some(&host), None, 1, &t0()).unwrap();
+    // L: six entries; the mac, the phone and the service (the iPad was
+    // removed: its id stays used, its place is free).
+    assert_eq!(
+        status.text,
+        "pinned at seq 6 (1 remote client); 6/1024 entries, 3/256 members"
+    );
+}

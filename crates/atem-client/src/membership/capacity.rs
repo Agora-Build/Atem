@@ -70,6 +70,19 @@ pub struct Capacity {
 }
 
 impl Capacity {
+    /// `entries` and `members` against the verifier's limits.
+    pub fn of(entries: u64, members: u64) -> Capacity {
+        let mut capacity = Capacity {
+            entries,
+            max_entries: MAX_ENTRIES,
+            members,
+            max_members: MAX_MEMBERS as u64,
+            level: CapacityLevel::Ok,
+        };
+        capacity.level = capacity.entries_level().max(capacity.members_level());
+        capacity
+    }
+
     pub fn entries_level(&self) -> CapacityLevel {
         CapacityLevel::of(self.entries, self.max_entries)
     }
@@ -82,15 +95,7 @@ impl Capacity {
 impl Membership {
     /// How full this log is, by the verifier's own counts and limits.
     pub fn capacity(&self) -> Capacity {
-        let mut capacity = Capacity {
-            entries: self.head().seq,
-            max_entries: MAX_ENTRIES,
-            members: self.derived.current_member_count() as u64,
-            max_members: MAX_MEMBERS as u64,
-            level: CapacityLevel::Ok,
-        };
-        capacity.level = capacity.entries_level().max(capacity.members_level());
-        capacity
+        Capacity::of(self.head().seq, self.derived.current_member_count() as u64)
     }
 }
 

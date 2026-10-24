@@ -338,8 +338,13 @@ pub fn passive_device_list_line(
     pairing: &crate::paths::PairingPaths,
     datetime: impl Fn(u64) -> String,
 ) -> Option<Line> {
-    let (_, text, pending) = crate::session_protocol::membership::passive_status(pairing)?;
+    let (_, text, capacity, pending) =
+        crate::session_protocol::membership::passive_status(pairing)?;
     let mut text = format!("{text} (from disk; no runtime running)");
+    if let Some(c) = capacity {
+        text.push_str("; ");
+        text.push_str(&crate::session_protocol::membership::capacity_text(&c));
+    }
     for (subject, action, at) in pending {
         text.push_str(&format!(
             "; recovery pending: {subject} ({action}) takes effect at {} unless a managing device vetoes it",
@@ -823,7 +828,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
-        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        // Three entries; the mac and the pending dev-new count as members.
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members; recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
         // An unfinished write after a plain crash: replayed at the next
         // start, no managing device asked for (Astation's review of
         // 66ea556).

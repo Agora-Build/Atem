@@ -3905,6 +3905,11 @@ pub(crate) fn device_list_status_of(
             (!pending.is_empty()).then_some("Recovery pending"),
         )
     };
+    // How full the list is (D23), whatever its state.
+    let text = format!(
+        "{text}; {}",
+        crate::session_protocol::membership::capacity_text(&m.membership().capacity())
+    );
     Some(DeviceListStatus {
         state: state.into(),
         text,
