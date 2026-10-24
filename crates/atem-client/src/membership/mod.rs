@@ -49,12 +49,17 @@ use crate::error::Error;
 use crate::keys::PublicKey;
 use crate::signed::SignedObject;
 
+pub mod capacity;
 pub mod draft;
 pub mod entry;
 pub mod publish;
 pub mod stored;
 pub mod wait;
 
+pub use capacity::{
+    Capacity, CapacityLevel, ChangeRefusal, NEARLY_FULL_PERCENT, SERVICE_CHANGE_MIN_INTERVAL_MS,
+    check_change,
+};
 pub use draft::{draft_on, sign_entry, sign_entry_cosigned};
 pub use entry::{
     Action, Entry, HostRecord, KBackupRecord, KitMode, Member, MemberKind, RECOVERY_SIGNER, Role,
@@ -62,7 +67,7 @@ pub use entry::{
 };
 pub use wait::{HostNow, RECOVERY_WAIT_MS, WaitClock};
 
-/// Log limits (§R9.2).
+/// Log limits (§R9.2). [`Membership::capacity`] reports a log's use of them.
 pub const MAX_ENTRIES: u64 = 1024;
 pub const MAX_MEMBERS: usize = 256;
 pub const MAX_HOSTS: usize = 64;
