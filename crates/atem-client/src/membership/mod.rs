@@ -67,8 +67,9 @@ pub use entry::{
     RolesChange, Scope,
 };
 pub use service::{
-    ServiceChangeError, ServiceScope, service_add, service_grant, service_narrowing,
-    service_renewal, service_set_roles,
+    ServiceChangeError, ServiceScope, service_add, service_grant, service_key_fingerprint,
+    service_key_fingerprint_of, service_key_fingerprint_of_add, service_narrowing, service_renewal,
+    service_set_roles,
 };
 pub use wait::{HostNow, RECOVERY_WAIT_MS, WaitClock};
 

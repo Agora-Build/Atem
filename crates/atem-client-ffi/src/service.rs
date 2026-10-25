@@ -96,6 +96,17 @@ pub fn service_set_roles_action(
     action_json(&action)
 }
 
+/// `r9_svc` of a service's `auth_key`: lowercase hex SHA-256 of the raw
+/// public key bytes (P-256: 65-byte SEC1 uncompressed; Ed25519: 32 bytes),
+/// nothing else hashed. The key is checked first (`bad_key`, `weak_key`;
+/// X25519 is `wrong_alg`).
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn service_key_fingerprint(auth_key: PublicKeyData) -> Result<String> {
+    Ok(atem_client::membership::service_key_fingerprint(
+        &auth_key.to_key()?,
+    )?)
+}
+
 /// A launch project key from a repository's `origin` remote
 /// (`github.com/agora-build/atem`); `None` for a remote with no host and
 /// path.
@@ -163,6 +174,13 @@ impl MembershipLog {
                 expires_at,
             }
         })
+    }
+
+    /// `r9_svc` of the active service member `device_id` (its `add`
+    /// entry's `auth_key`), else `None`. Status only: expiry is the
+    /// caller's check.
+    pub fn service_key_fingerprint(&self, device_id: String) -> Option<String> {
+        atem_client::membership::service_key_fingerprint_of(&self.lock(), &device_id)
     }
 
     /// A renewal of the service `device_id`: its current scope with a

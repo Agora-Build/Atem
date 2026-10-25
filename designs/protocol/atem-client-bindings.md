@@ -411,6 +411,7 @@ for its shape, or its own refusal (`Membership` `bad_scope`,
 | `project_hash_from_mac(kid, mac)` | **the recommended path**: `h1.<kid>.<hex>` of the HMAC-SHA256 the platform computed with `K` itself (no derived subkey) for the generation `kid` over `project_hash_input(project_key)`; the key stays in the key store (WebCrypto: `crypto.subtle.sign("HMAC", key, input)`) |
 | `project_hash(account_key, project_key)` | the software form, only for an app that already holds `K` bytes in memory (the restore and K-backup flows, as `seal_k_backup` takes them); WASM: `software-keys` builds only |
 | `is_project_hash(text)` | the verifier's syntax check of a scope's project entry |
+| `service_key_fingerprint(auth_key)`, `MembershipLog::service_key_fingerprint(device_id)` | `r9_svc` (Atem #81): lowercase hex SHA-256 of the service `auth_key`'s raw public bytes as its `add` entry carries them (P-256: 65-byte SEC1 uncompressed; Ed25519: 32 bytes), nothing else hashed (no alg, no JSON); the key is checked first (`bad_key`, `weak_key`, X25519 `wrong_alg`). The log form: an active service member's, else `None` (status only). Vectors: `crates/atem-client/vectors/r9-svc-fingerprint.json` (Auth's station-token `r9Key`/`r9Svc` pairs and E5's svc-discord) |
 
 `projects` entries are hashes under one `K` generation each: a `K`
 rotation must re-issue the service's scope (`service_set_roles_action`
@@ -673,8 +674,9 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (the same 40 checks in each language, over
-  `designs/protocol/fixtures/r9-vectors-*.json`): `bindings/kotlin/Conformance.kt`
+- **Conformance** (the same 41 checks in each language, over
+  `designs/protocol/fixtures/r9-vectors-*.json` and atem-client's own
+  `crates/atem-client/vectors/r9-svc-fingerprint.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).

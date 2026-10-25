@@ -268,6 +268,19 @@ check("service builders: add, set_roles, renewal, narrowing (§R9.6)", () => {
   throwsCode(() => m.serviceSetRolesAction("svc-discord", { hosts: ["host-a"], ops: [] }, at + 90 * day + 1, at), "service_expiry");
   throwsCode(() => m.serviceAddAction("svc-x", "x25519", unhex(keys["dev-phone"].enc.pub_hex), { hosts: ["host-a"], ops: [] }, at, at), "wrong_alg");
 });
+// r9_svc vectors: atem-client's own file (crates/atem-client/vectors),
+// next to the shared fixtures' repository.
+const svcFp = JSON.parse(readFileSync(join(fixturesDir, "../../../crates/atem-client/vectors/r9-svc-fingerprint.json"), "utf8"));
+check("service key fingerprint r9_svc (atem-client vectors)", () => {
+  for (const c of svcFp.valid) {
+    eq(hex(b64u(c.auth_key.pub)), c.pub_hex, c.case);
+    eq(m.serviceKeyFingerprint(c.auth_key.alg, b64u(c.auth_key.pub)), c.fingerprint, c.case);
+  }
+  for (const c of svcFp.invalid) throwsCode(() => m.serviceKeyFingerprint(c.auth_key.alg, b64u(c.auth_key.pub)), c.code);
+  const discord = svcFp.valid.find((c) => c.case.includes("svc-discord"));
+  eq(logL().serviceKeyFingerprint("svc-discord"), discord.fingerprint);
+  eq(logL().serviceKeyFingerprint("dev-phone") ?? null, null);
+});
 // The host's own vector (src/memory/account_keys.rs H1_VECTOR): h1. of
 // "github.com/agora/atem" under K = [7; 32], kid 0123abcd.
 const H1_VECTOR = "h1.0123abcd.777eda018c9c9736a84728e10308571167773f209924bf052477a1283cfd7cb6";

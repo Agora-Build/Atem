@@ -1,0 +1,61 @@
+{
+  "note": "r9_svc: service_key_fingerprint(auth_key) = lowercase hex SHA-256 of the decoded auth_key.pub bytes of a service member's add entry (p256: the 65-byte SEC1 uncompressed point; ed25519: the 32 raw bytes); nothing else is hashed (no alg, no JSON). The key is checked by the verifier's own key parsing first. The p256 and ed25519 cases are Agora-Build/Auth's tests/fixtures/station-tokens/vectors.json (PR 9 at d7de441) r9Key/r9Svc values; svc-discord is r9-vectors-membership-log E5's member (designs/protocol/fixtures).",
+  "valid": [
+    {
+      "case": "p256 (Auth ok-integration-agent)",
+      "auth_key": {
+        "alg": "p256",
+        "pub": "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90"
+      },
+      "pub_hex": "04d6b408a97d742b9930483a58f3486996ad30684829e084957d8f73c140dc7daff087b36ede4696ad852af5cdce9c18c63691a71fdaaa75ee5d24e31b8910abdd",
+      "fingerprint": "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6"
+    },
+    {
+      "case": "ed25519 (Auth ok-integration-ed25519)",
+      "auth_key": {
+        "alg": "ed25519",
+        "pub": "ggpM_o3M3L3H4slbWlvWcIkSew9H-qMEWi49Py_wbkE"
+      },
+      "pub_hex": "820a4cfe8dccdcbdc7e2c95b5a5bd67089127b0f47faa3045a2e3d3f2ff06e41",
+      "fingerprint": "837e9176e9bcaffae6ca630d56ded10fb7d8d2b6cfe2d7d19499a483c3ba2cf4"
+    },
+    {
+      "case": "ed25519 svc-discord (E5)",
+      "auth_key": {
+        "alg": "ed25519",
+        "pub": "QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE"
+      },
+      "pub_hex": "40a3e522021710b7aab45e2e311d5673f3eac28d2588b458a24202abb23f68d1",
+      "fingerprint": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5"
+    }
+  ],
+  "invalid": [
+    {
+      "case": "x25519 is not a service auth_key",
+      "auth_key": {
+        "alg": "x25519",
+        "pub": "ggpM_o3M3L3H4slbWlvWcIkSew9H-qMEWi49Py_wbkE"
+      },
+      "pub_hex": "820a4cfe8dccdcbdc7e2c95b5a5bd67089127b0f47faa3045a2e3d3f2ff06e41",
+      "code": "wrong_alg"
+    },
+    {
+      "case": "p256 compressed (33 bytes)",
+      "auth_key": {
+        "alg": "p256",
+        "pub": "A9a0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v"
+      },
+      "pub_hex": "03d6b408a97d742b9930483a58f3486996ad30684829e084957d8f73c140dc7daf",
+      "code": "bad_key"
+    },
+    {
+      "case": "ed25519 of 31 bytes",
+      "auth_key": {
+        "alg": "ed25519",
+        "pub": "ggpM_o3M3L3H4slbWlvWcIkSew9H-qMEWi49Py_wbg"
+      },
+      "pub_hex": "820a4cfe8dccdcbdc7e2c95b5a5bd67089127b0f47faa3045a2e3d3f2ff06e",
+      "code": "bad_key"
+    }
+  ]
+}

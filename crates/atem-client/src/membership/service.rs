@@ -18,7 +18,8 @@
 use std::collections::BTreeSet;
 
 use crate::encoding::Hash32;
-use crate::keys::PublicKey;
+use crate::error::Error;
+use crate::keys::{Alg, PublicKey};
 
 use super::capacity::narrows;
 use super::draft::{check_body, draft_on};
@@ -293,6 +294,54 @@ pub fn service_narrowing(
     Ok(action)
 }
 
+/// `r9_svc` (Atem #81, the claim Agora.Build's Auth puts in a service's
+/// token): lowercase hex SHA-256 of the service's `auth_key.pub` bytes as
+/// its `add` entry carries them (P-256: the 65-byte SEC1 uncompressed
+/// point; Ed25519: the 32 raw bytes). Nothing else is hashed: no algorithm
+/// prefix, no JSON. The key went through the verifier's own key parsing
+/// ([`PublicKey::new`] / [`PublicKey::from_json`]: length, curve, weak
+/// keys); an X25519 key is no service `auth_key` (`WrongAlg`). Vectors:
+/// `crates/atem-client/vectors/r9-svc-fingerprint.json`.
+pub fn service_key_fingerprint(auth_key: &PublicKey) -> Result<String, Error> {
+    match auth_key.alg() {
+        Alg::P256 | Alg::Ed25519 => {
+            use sha2::Digest;
+            Ok(crate::encoding::hex(&sha2::Sha256::digest(
+                auth_key.as_bytes(),
+            )))
+        }
+        Alg::X25519 => Err(Error::WrongAlg),
+    }
+}
+
+impl Member {
+    /// A service member's `r9_svc` ([`service_key_fingerprint`]); `None`
+    /// for a native member.
+    pub fn service_key_fingerprint(&self) -> Option<String> {
+        match self.kind {
+            MemberKind::Service { .. } => service_key_fingerprint(&self.auth_key).ok(),
+            MemberKind::Native { .. } => None,
+        }
+    }
+}
+
+/// The `r9_svc` of the active service member `device_id` in `log` (the key
+/// of its `add` entry: `set_roles` never changes it); `None` for anything
+/// else. Status only, as [`service_grant`]: expiry is the caller's check.
+pub fn service_key_fingerprint_of(log: &Membership, device_id: &str) -> Option<String> {
+    service_grant(log, device_id)?;
+    log.member(device_id)?.member.service_key_fingerprint()
+}
+
+/// The `r9_svc` of a service `add` action (a builder's output); `None` for
+/// any other action.
+pub fn service_key_fingerprint_of_add(action: &Action) -> Option<String> {
+    match action {
+        Action::Add { member } => member.service_key_fingerprint(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +401,44 @@ mod tests {
             log.append(entry, &now, &mut Vec::new());
         };
         (log, append)
+    }
+
+    /// `r9_svc` against the committed vectors (Auth's r9Key/r9Svc pairs
+    /// and E5's svc-discord), through the verifier's key parse.
+    #[test]
+    fn service_key_fingerprints_match_the_vectors() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../vectors/r9-svc-fingerprint.json")).unwrap();
+        for c in v["valid"].as_array().unwrap() {
+            let key = PublicKey::from_json(&c["auth_key"]).unwrap();
+            assert_eq!(crate::encoding::hex(key.as_bytes()), c["pub_hex"]);
+            assert_eq!(
+                service_key_fingerprint(&key).unwrap(),
+                c["fingerprint"].as_str().unwrap(),
+                "{}",
+                c["case"]
+            );
+        }
+        for c in v["invalid"].as_array().unwrap() {
+            let code = match PublicKey::from_json(&c["auth_key"]) {
+                Ok(key) => service_key_fingerprint(&key).unwrap_err().code(),
+                Err(e) => e.code(),
+            };
+            assert_eq!(code, c["code"].as_str().unwrap(), "{}", c["case"]);
+        }
+        // The builder's output and a log carry the same value.
+        let key = PublicKey::from_json(&v["valid"][1]["auth_key"]).unwrap();
+        let want = v["valid"][1]["fingerprint"].as_str().unwrap();
+        let add = service_add("svc-x", key, &ServiceScope::new(["host-a"]), T0, T0).unwrap();
+        assert_eq!(service_key_fingerprint_of_add(&add).as_deref(), Some(want));
+        let (mut log, mut append) = signed_log();
+        append(&mut log, add, T0);
+        assert_eq!(
+            service_key_fingerprint_of(&log, "svc-x").as_deref(),
+            Some(want)
+        );
+        assert_eq!(service_key_fingerprint_of(&log, "mac"), None, "native");
+        assert_eq!(service_key_fingerprint_of(&log, "svc-none"), None);
     }
 
     #[test]

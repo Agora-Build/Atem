@@ -355,6 +355,23 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("service_expiry") { _ = try serviceSetRolesAction(deviceId: "svc-discord", scope: ServiceScopeInfo(hosts: ["host-a"], projects: nil, sessions: nil, ops: []), expiresAt: at + 90 * day + 1, signedAt: at) }
             try throwsCode("wrong_alg") { _ = try serviceAddAction(deviceId: "svc-x", authKey: PublicKeyData(alg: .x25519, raw: unhex(s(key("dev-phone", "enc")["pub_hex"]))), scope: ServiceScopeInfo(hosts: ["host-a"], projects: nil, sessions: nil, ops: []), expiresAt: at, signedAt: at) }
         }
+        // r9_svc vectors: atem-client's own file (crates/atem-client/vectors).
+        let svcFp = o(try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("../../../crates/atem-client/vectors/r9-svc-fingerprint.json"))))
+        check("service key fingerprint r9_svc (atem-client vectors)") {
+            func alg(_ name: String) -> KeyAlg { name == "p256" ? .p256 : (name == "ed25519" ? .ed25519 : .x25519) }
+            for c in a(svcFp["valid"]).map(o) {
+                let k = o(c["auth_key"])
+                try eq(hex(b64u(s(k["pub"]))), s(c["pub_hex"]), s(c["case"]))
+                try eq(try serviceKeyFingerprint(authKey: PublicKeyData(alg: alg(s(k["alg"])), raw: b64u(s(k["pub"])))), s(c["fingerprint"]), s(c["case"]))
+            }
+            for c in a(svcFp["invalid"]).map(o) {
+                let k = o(c["auth_key"])
+                try throwsCode(s(c["code"])) { _ = try serviceKeyFingerprint(authKey: PublicKeyData(alg: alg(s(k["alg"])), raw: b64u(s(k["pub"])))) }
+            }
+            let discord = a(svcFp["valid"]).map(o).first { s($0["case"]).contains("svc-discord") }!
+            try eq(try logL().serviceKeyFingerprint(deviceId: "svc-discord"), s(discord["fingerprint"]))
+            try eq(try logL().serviceKeyFingerprint(deviceId: "dev-phone"), nil)
+        }
         // The host's own vector (src/memory/account_keys.rs H1_VECTOR): h1. of
         // "github.com/agora/atem" under K = [7; 32], kid 0123abcd.
         let h1Vector = "h1.0123abcd.777eda018c9c9736a84728e10308571167773f209924bf052477a1283cfd7cb6"
@@ -577,6 +594,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 40)
+        XCTAssertEqual(passed, 41)
     }
 }

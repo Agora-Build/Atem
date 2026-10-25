@@ -460,6 +460,11 @@ impl MembershipLog {
     pub fn service_grant(&self, device_id: String) -> JsResult<JsValue> {
         to_js(&self.0.service_grant(device_id))
     }
+    /// `r9_svc` of the active service member, or `null`.
+    #[wasm_bindgen(js_name = serviceKeyFingerprint)]
+    pub fn service_key_fingerprint(&self, device_id: String) -> Option<String> {
+        self.0.service_key_fingerprint(device_id)
+    }
     /// A renewal's action JSON (current scope, later `expiresAt`).
     #[wasm_bindgen(js_name = serviceRenewalAction)]
     pub fn service_renewal_action(
@@ -546,6 +551,14 @@ pub fn service_set_roles_action(
         ms(expires_at)?,
         ms(signed_at)?,
     ))
+}
+
+/// `r9_svc` of a service `auth_key` (`alg` `p256` or `ed25519`, raw bytes).
+#[wasm_bindgen(js_name = serviceKeyFingerprint)]
+pub fn service_key_fingerprint(auth_alg: &str, auth_raw: Vec<u8>) -> JsResult<String> {
+    err(crate::service::service_key_fingerprint(key(
+        auth_alg, auth_raw,
+    )?))
 }
 
 #[wasm_bindgen(js_name = projectKeyOfRemote)]

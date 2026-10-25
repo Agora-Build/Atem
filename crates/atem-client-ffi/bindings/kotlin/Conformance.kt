@@ -319,6 +319,21 @@ fun main(args: Array<String>) {
         throwsCode("service_expiry") { serviceSetRolesAction("svc-discord", ServiceScopeInfo(listOf("host-a"), null, null, listOf()), at + 90uL * day + 1uL, at) }
         throwsCode("wrong_alg") { serviceAddAction("svc-x", PublicKeyData(KeyAlg.X25519, unhex(keys["dev-phone"]["enc"]["pub_hex"].s())), ServiceScopeInfo(listOf("host-a"), null, null, listOf()), at, at) }
     }
+    // r9_svc vectors: atem-client's own file (crates/atem-client/vectors).
+    val svcFp = Json.parse(File(dir, "../../../crates/atem-client/vectors/r9-svc-fingerprint.json").readText())
+    check("service key fingerprint r9_svc (atem-client vectors)") {
+        fun alg(name: String) = when (name) { "p256" -> KeyAlg.P256; "ed25519" -> KeyAlg.ED25519; else -> KeyAlg.X25519 }
+        for (c in svcFp["valid"].arr()) {
+            eq(hex(b64u(c["auth_key"]["pub"].s())), c["pub_hex"].s(), c["case"].s())
+            eq(serviceKeyFingerprint(PublicKeyData(alg(c["auth_key"]["alg"].s()), b64u(c["auth_key"]["pub"].s()))), c["fingerprint"].s(), c["case"].s())
+        }
+        for (c in svcFp["invalid"].arr()) {
+            throwsCode(c["code"].s()) { serviceKeyFingerprint(PublicKeyData(alg(c["auth_key"]["alg"].s()), b64u(c["auth_key"]["pub"].s()))) }
+        }
+        val discord = svcFp["valid"].arr().first { it["case"].s().contains("svc-discord") }
+        eq(logL().serviceKeyFingerprint("svc-discord"), discord["fingerprint"].s())
+        eq(logL().serviceKeyFingerprint("dev-phone"), null)
+    }
     // The host's own vector (src/memory/account_keys.rs H1_VECTOR): h1. of
     // "github.com/agora/atem" under K = [7; 32], kid 0123abcd.
     val h1Vector = "h1.0123abcd.777eda018c9c9736a84728e10308571167773f209924bf052477a1283cfd7cb6"
