@@ -53,7 +53,7 @@ jobs:
           set -o pipefail
           bins=(runtime_fixtures_binary runtime_build_binary membership_binary
                 r9_two_hosts_binary r9_revoked_binary r9_multi_device_binary
-                r9_push_binary)
+                r9_push_binary r9_services_binary)
           # Every binary with a debug-only ignore is in the list.
           for f in $(grep -rlzP 'cfg_attr\(\s*not\(debug_assertions\),\s*ignore' tests); do
             t=$(basename "$f" .rs)
