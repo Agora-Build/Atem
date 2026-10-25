@@ -4,7 +4,38 @@
 //! authenticated under (`PairingRecord::relay_only`), so `atem unpair` clears
 //! it, and the connect loop (`App::spawn_astation_connect`) reads it.
 use super::App;
-use crate::websocket_client::{AstationMessage, LinkVia};
+use crate::websocket_client::{AstationMessage, DeliveryReceipt, LinkVia};
+use std::time::{Duration, Instant};
+
+/// How long a drop waits for its ack to be written once no operation runs
+/// on the link.
+const ACK_FLUSH: Duration = Duration::from_secs(5);
+
+/// A local link drop relay only scheduled (`App::relay_only_drop`): after
+/// any Astation operation on that link and the ack's delivery.
+#[derive(Debug)]
+pub struct RelayOnlyDrop {
+    /// The link it applies to; a replaced link forgets it.
+    link_gen: u64,
+    /// The latest ack's delivery: the socket closes only once it was
+    /// written (or failed), so the ack reaches Astation before the close.
+    receipt: Option<DeliveryReceipt>,
+    /// Set once no operation runs on the link: the drop happens by then
+    /// even if the writer never wrote the ack.
+    due: Option<Instant>,
+}
+
+impl RelayOnlyDrop {
+    /// Whether the ack was written (or can no longer be): no wait.
+    fn delivered(&mut self) -> bool {
+        self.receipt.as_mut().is_none_or(|receipt| {
+            !matches!(
+                receipt.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )
+        })
+    }
+}
 
 /// The status after a local link was dropped for relay only.
 pub(super) const RELAY_ONLY_RECONNECT: &str =
@@ -33,12 +64,21 @@ impl NotStored {
     }
 }
 
+/// This profile's pairing record, read the one way every relay-only
+/// decision reads it (the connect loop and `drop_local_link_if_relay_only`):
+/// from the profile's pairing path, which doesn't depend on config.toml, so
+/// a broken config.toml is never taken for a damaged record.
+pub(super) fn stored_record() -> anyhow::Result<Option<crate::records::PairingRecord>> {
+    crate::records::PairingRecord::load(&crate::paths::ProfilePaths::default_paths().pairing)
+}
+
 impl App {
     /// Stores `relay_only` under the link's bound pairing and acknowledges
     /// the result (`stored`, else `stored: false` with a reason; another
     /// binding is never touched). A stored `true` on a local link drops it
-    /// after the ack, so the reconnect takes the relay; while an Astation
-    /// operation runs on that link the drop waits until it ends.
+    /// once the ack was written (at most 5 s), so the reconnect takes the
+    /// relay; while an Astation operation runs on that link the drop waits
+    /// until it ends. Never waits itself (`check_relay_only_drop` polls).
     pub(super) async fn transport_policy(&mut self, relay_only: bool) {
         let ack = match self.store_transport_policy(relay_only) {
             Ok(()) => AstationMessage::TransportPolicyAck {
@@ -66,16 +106,27 @@ impl App {
                 self.relay_only_drop = None;
             }
             let _ = self.astation_client.send_message(ack).await;
-        } else if !local || self.relay_only_drop == Some(self.astation_link_gen) {
-            // A relay link, or a repeat while the drop waits: nothing to do.
+        } else if !local {
+            // A relay link: nothing more to do.
             let _ = self.astation_client.send_message(ack).await;
-        } else if self.op_on_link() {
-            let _ = self.astation_client.send_message(ack).await;
-            self.relay_only_drop = Some(self.astation_link_gen);
         } else {
-            // Written before the socket closes (or given up after 5 s).
-            let _ = self.astation_client.send_message_flushed(ack).await;
-            self.drop_astation_link(RELAY_ONLY_RECONNECT.into());
+            // A local link: dropped by `check_relay_only_drop` (this pass,
+            // never waiting in it) once no operation runs on it and this
+            // ack was written, at most 5 s later. A repeat's ack is the
+            // later one (the writer keeps the order), so it is the barrier.
+            let receipt = self.astation_client.send_message_with_receipt(ack).ok();
+            match &mut self.relay_only_drop {
+                Some(pending) if pending.link_gen == self.astation_link_gen => {
+                    pending.receipt = receipt;
+                }
+                _ => {
+                    self.relay_only_drop = Some(RelayOnlyDrop {
+                        link_gen: self.astation_link_gen,
+                        receipt,
+                        due: None,
+                    });
+                }
+            }
         }
     }
 
@@ -117,15 +168,57 @@ impl App {
             .is_some_and(|route| route.link_gen == self.astation_link_gen && !route.tx.is_closed())
     }
 
-    /// The local link drop relay only deferred: done once the operation on
-    /// that link ended; forgotten when the link already went.
+    /// Whether relay only is about to drop the current link: no Astation
+    /// operation is handed this link (it waits for the next one).
+    pub(crate) fn relay_only_drop_pending(&self) -> bool {
+        self.astation_connected && self.drop_waits()
+    }
+
+    /// A local link that (re)authenticated while the stored record says
+    /// relay only (or can't be read): dropped like after a policy, by the
+    /// next pass (no ack: no policy message to answer).
+    pub(super) fn drop_local_link_if_relay_only(&mut self) {
+        if self.astation_client.via() != Some(&LinkVia::Local) || self.drop_waits() {
+            return;
+        }
+        let loaded = stored_record();
+        if !crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref)) {
+            self.relay_only_drop = Some(RelayOnlyDrop {
+                link_gen: self.astation_link_gen,
+                receipt: None,
+                due: None,
+            });
+        }
+    }
+
+    /// Whether a drop of the current link is still waiting.
+    fn drop_waits(&self) -> bool {
+        self.relay_only_drop
+            .as_ref()
+            .is_some_and(|pending| pending.link_gen == self.astation_link_gen)
+    }
+
+    /// The local link drop relay only scheduled: done once no operation runs
+    /// on that link and the ack was written (at most `ACK_FLUSH` after that,
+    /// never waiting in the pass); forgotten when the link already went.
     pub(super) fn check_relay_only_drop(&mut self) {
-        let Some(link_gen) = self.relay_only_drop else {
+        if self.relay_only_drop.is_none() {
+            return;
+        }
+        if !self.astation_connected || !self.drop_waits() {
+            self.relay_only_drop = None;
+            return;
+        }
+        if self.op_on_link() {
+            return;
+        }
+        let Some(pending) = self.relay_only_drop.as_mut() else {
             return;
         };
-        if !self.astation_connected || self.astation_link_gen != link_gen {
-            self.relay_only_drop = None;
-        } else if !self.op_on_link() {
+        let due = *pending
+            .due
+            .get_or_insert_with(|| Instant::now() + ACK_FLUSH);
+        if pending.delivered() || Instant::now() >= due {
             self.relay_only_drop = None;
             self.drop_astation_link(RELAY_ONLY_RECONNECT.into());
         }

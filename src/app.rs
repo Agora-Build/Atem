@@ -31,6 +31,9 @@ use crate::config::AtemConfig;
 use crate::runtime::protocol::SessionSummary;
 use crate::websocket_client::{AstationClient, AstationMessage};
 
+/// Why the connect loop tried nothing: the pairing record can't be read.
+pub const PAIRING_UNREADABLE: &str = "the pairing record can't be read; not connecting to Astation (neither locally nor through the relay). Restore it from a backup, or run `atem unpair`, then `atem pair`";
+
 /// A mark task whose file no live Claude session's directory has.
 pub const NO_PROJECT_SESSION: &str =
     "no Claude session for this project; run `atem agent launch claude` there";
@@ -115,9 +118,15 @@ pub struct App {
     /// Why the last background connect failed, when the saved session was
     /// the problem (shown to a pairing or unlock waiting for the link).
     pub astation_connect_error: Option<String>,
-    /// The local link (its `astation_link_gen`) relay only drops once the
-    /// Astation operation running on it ends (`app/transport_policy.rs`).
-    pub relay_only_drop: Option<u64>,
+    /// The local link relay only drops once the Astation operation running
+    /// on it ends and the ack was written (`app/transport_policy.rs`).
+    pub relay_only_drop: Option<transport_policy::RelayOnlyDrop>,
+    /// The unreadable pairing record error last logged by the connect loop
+    /// (logged again only when it changes).
+    pub pairing_unreadable: Option<String>,
+    /// How many times the connect loop logged it (tests).
+    #[cfg(test)]
+    pub pairing_unreadable_logged: usize,
 }
 
 impl App {
@@ -158,6 +167,9 @@ impl App {
             op_route: None,
             astation_connect_error: None,
             relay_only_drop: None,
+            pairing_unreadable: None,
+            #[cfg(test)]
+            pairing_unreadable_logged: 0,
         };
         app.rebuild_menu();
         app
@@ -454,15 +466,25 @@ impl App {
                 }
             };
 
-            // An unreadable record (or profile) reads as none: local may be
-            // tried, as before relay only (there is no relay room to use either).
-            let record = crate::profile::Sources::current()
-                .ok()
-                .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing).ok().flatten());
+            // An unreadable record is not "no pairing": it might say relay
+            // only, so local is never tried, and without its Astation id
+            // there is no relay room either. Fail closed: no attempt, the
+            // error (logged by `poll_astation_connect`), the 30 s retry.
+            // The record's place doesn't depend on config.toml.
+            let loaded = transport_policy::stored_record();
+            let local_allowed = crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref));
+            let record = match loaded {
+                Ok(record) => record,
+                Err(error) => {
+                    let text = format!("{PAIRING_UNREADABLE} ({error:#})");
+                    let _ = tx.send(Err(anyhow::Error::new(crate::runtime::ops::SessionAdvice(text))));
+                    return;
+                }
+            };
 
             // Local first: the pairing's saved session, else the loopback
             // bootstrap proof (never pairing).
-            if crate::records::PairingRecord::local_allowed(record.as_ref()) {
+            if local_allowed {
                 match client.connect_without_pairing(local_url).await {
                     Ok(()) => {
                         let _ = tx.send(Ok((client, Some("local".to_string()))));
@@ -507,9 +529,12 @@ impl App {
                     self.astation_connected = true;
                     self.astation_link_gen += 1;
                     self.astation_connect_error = None;
+                    self.pairing_unreadable = None;
                     self.pairing_code = code;
                     self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
+                    // The record may have said relay only meanwhile.
+                    self.drop_local_link_if_relay_only();
                 }
                 Ok(Err(error)) => {
                     self.astation_connect_error = error
@@ -521,9 +546,25 @@ impl App {
                     self.astation_connect_rx = None;
                     self.astation_reconnect_at =
                         Some(Instant::now() + std::time::Duration::from_secs(30));
-                    self.status_message = Some(
-                        "Astation offline — retrying…".to_string()
-                    );
+                    let unreadable = self
+                        .astation_connect_error
+                        .clone()
+                        .filter(|error| error.starts_with(PAIRING_UNREADABLE));
+                    if let Some(text) = unreadable {
+                        if self.note_pairing_unreadable(&text) {
+                            crate::diagnostics::warn(format!("atem runtime: {text}"));
+                            #[cfg(test)]
+                            {
+                                self.pairing_unreadable_logged += 1;
+                            }
+                        }
+                        self.status_message = Some(format!("Astation: {text}"));
+                    } else {
+                        self.pairing_unreadable = None;
+                        self.status_message = Some(
+                            "Astation offline — retrying…".to_string()
+                        );
+                    }
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     // Still pending
@@ -536,6 +577,16 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Remembers the connect loop's unreadable-record error: whether it is
+    /// new (the first failure, or another error), so it is logged once.
+    pub(crate) fn note_pairing_unreadable(&mut self, text: &str) -> bool {
+        if self.pairing_unreadable.as_deref() == Some(text) {
+            return false;
+        }
+        self.pairing_unreadable = Some(text.to_string());
+        true
     }
 
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
