@@ -88,6 +88,8 @@ pub struct StatusReport {
 pub struct Pairing {
     pub astation_id: String,
     pub session_expired: bool,
+    /// Astation's transport policy (`transportPolicy`): relay only.
+    pub relay_only: bool,
 }
 
 /// The pairing, if this profile has one (an unreadable record reads as
@@ -96,6 +98,7 @@ pub fn pairing(src: &Sources) -> Option<Pairing> {
     let record = PairingRecord::load(&src.paths.pairing).ok()??;
     Some(Pairing {
         session_expired: record.session_expired(),
+        relay_only: record.relay_only,
         astation_id: record.astation_id,
     })
 }
@@ -268,8 +271,15 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
         Verification::Revoked { by } => format!("revoked by {by}"),
         Verification::Unknown(error) => format!("unknown ({error})"),
     };
+    let relay_only = if pairing.relay_only {
+        "; relay only (set by Astation)"
+    } else {
+        ""
+    };
     (
-        Line::new(format!("paired ({astation_id}{trust}{expired})")),
+        Line::new(format!(
+            "paired ({astation_id}{trust}{expired}){relay_only}"
+        )),
         Line::new(verification),
     )
 }
@@ -293,6 +303,9 @@ fn trust_note(src: &Sources, astation_id: &str) -> String {
     }
 }
 
+/// After the block while relay only is set and Astation isn't connected.
+pub const RELAY_ONLY_NOTE: &str = "Astation's Station AI disabled the local connection: Atem reaches Astation only through the relay. It clears when Astation turns it off, or with `atem unpair`.";
+
 /// The status from `src`, with `agent` the already running cred agent (if
 /// any) and no runtime running.
 #[cfg(test)]
@@ -312,13 +325,18 @@ pub fn gather_full(
     let (pairing_line, verification_line) = pairing_lines(src, paired.as_ref());
     let runtime_differs = matches!(runtime, Look::Running { welcome, .. }
         if welcome.build != crate::memory::cred_agent::build_id());
-    let (credentials, notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
+    let (credentials, mut notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
     let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
     let device_list = match runtime {
         Look::Running { .. } => device_list_line(runtime, local_datetime),
         // No runtime: what the files say (read only).
         _ => passive_device_list_line(&src.paths.pairing, local_datetime),
     };
+    let connected =
+        matches!(runtime, Look::Running { status: Some(status), .. } if status.astation);
+    if paired.as_ref().is_some_and(|p| p.relay_only) && !connected {
+        notes.push(RELAY_ONLY_NOTE.into());
+    }
     StatusReport {
         account: account_line(src, crate::credentials::now_secs()),
         pairing: pairing_line,
@@ -910,6 +928,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn relay_only_set_by_astation_is_shown_on_the_pairing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        crate::pairing::tests::edit(dir.path(), |record| record.relay_only = true);
+        let report = report(dir.path());
+        assert_eq!(
+            report.pairing.value,
+            "paired (astation-1, trust gen 1); relay only (set by Astation)"
+        );
+        // No runtime, so Astation isn't connected: the hint says why.
+        assert!(report.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        // Connected (through the relay): no hint.
+        let src = Sources::in_dir(dir.path());
+        let online = gather_full(&src, None, &running(connected(Transport::Relay)));
+        assert!(!online.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        let offline = gather_full(&src, None, &running(RuntimeStatus::default()));
+        assert!(offline.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        // Astation turned it off: no hint.
+        crate::pairing::tests::edit(dir.path(), |record| record.relay_only = false);
+        let report = super::tests::report(dir.path());
+        assert!(!report.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        assert_eq!(report.pairing.value, "paired (astation-1, trust gen 1)");
+    }
+
+    #[test]
     fn paired_and_verified_shows_the_safety_code_and_lock_state() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
@@ -980,6 +1023,7 @@ pub(crate) mod tests {
             Some(Pairing {
                 astation_id: "astation-0".into(),
                 session_expired: false,
+                relay_only: false,
             })
         );
         // Not a pairing: `atem pair` proceeds and replaces it.

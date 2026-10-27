@@ -168,6 +168,9 @@ fn session_message_id(text: &str) -> Option<String> {
         .filter(|id| crate::session_protocol::wire::is_uuid_v4(id))
 }
 
+/// Resolves once the writer wrote a frame (`Ok`) or couldn't (`Err`).
+pub(crate) type DeliveryReceipt = tokio::sync::oneshot::Receiver<Result<(), String>>;
+
 struct OutboundMessage {
     message: AstationMessage,
     delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -346,6 +349,25 @@ pub enum AstationMessage {
     #[serde(rename = "pairSavePreference")]
     PairSavePreference {
         save_credentials: bool,
+    },
+
+    /// Astation → Atem, after every authentication and on change: while
+    /// `relay_only`, reach Astation only through its relay identity room
+    /// (never the local `astation_ws`). Kept in the pairing record.
+    #[serde(rename = "transportPolicy")]
+    TransportPolicy {
+        relay_only: bool,
+    },
+
+    /// Atem → Astation: the transport policy Atem stored (`stored`, then
+    /// `relay_only` is the stored value), or the requested one it couldn't
+    /// store, with `reason` (`not_paired`, `pairing_changed`, `save_failed`).
+    #[serde(rename = "transportPolicyAck")]
+    TransportPolicyAck {
+        relay_only: bool,
+        stored: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     /// Astation → Atem: the account's encryption mode, as a signed
@@ -855,6 +877,14 @@ impl AstationClient {
         self.guarded(apply)
     }
 
+    /// Whether the pairing state and saved session this connection's
+    /// authentication captured are still current (no lock held).
+    pub(crate) fn capture_current(&self) -> bool {
+        self.capture
+            .as_ref()
+            .is_some_and(|capture| capture.check().is_ok() && self.check_session(capture).is_ok())
+    }
+
     /// A saved session may answer `astation_id` only when the captured
     /// pairing binding is with it: after an `atem unpair` that stopped before
     /// removing the sessions (or one for another Astation), it is never used.
@@ -949,6 +979,28 @@ impl AstationClient {
             .unwrap()
             .map(|s| (s.session_id, s.token));
         self.capture = Some(capture);
+    }
+
+    /// Drops the injected profile: `profile()` then fails, as a runtime
+    /// client's does when config.toml can't be loaded.
+    #[cfg(test)]
+    pub(crate) fn forget_profile_for_test(&mut self) {
+        self.profile = None;
+    }
+
+    /// Holds back everything sent from now on until the returned handle's
+    /// `resume`, which hands it to the real writer in order.
+    #[cfg(test)]
+    pub(crate) fn pause_writer_for_test(&mut self) -> PausedWriter {
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        let writer = self.sender.replace(tx).expect("a connected client");
+        PausedWriter { rx, writer }
+    }
+
+    /// Pretend the link reached Astation `via`.
+    #[cfg(test)]
+    pub(crate) fn set_via_for_test(&mut self, via: LinkVia) {
+        self.via = Some(via);
     }
 
     /// Pretend the connect-time authentication pinned `astation_id`.
@@ -1896,13 +1948,21 @@ impl AstationClient {
         Ok(())
     }
 
-    /// Sends and waits (at most 5 s) until the writer has written the frame,
-    /// so a client dropped right after doesn't lose it.
-    pub(crate) async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+    /// Queues `message` and returns its delivery receipt, which resolves once
+    /// the writer has written the frame (or failed to); the caller polls it
+    /// instead of waiting (`send_message_flushed` waits).
+    pub(crate) fn send_message_with_receipt(&self, message: AstationMessage) -> Result<DeliveryReceipt> {
         let sender = self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?;
         let (delivered, receipt) = tokio::sync::oneshot::channel();
         sender.send(OutboundMessage { message, delivered: Some(delivered) })
             .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?;
+        Ok(receipt)
+    }
+
+    /// Sends and waits (at most 5 s) until the writer has written the frame,
+    /// so a client dropped right after doesn't lose it.
+    pub(crate) async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+        let receipt = self.send_message_with_receipt(message)?;
         tokio::time::timeout(Duration::from_secs(5), receipt).await
             .map_err(|_| anyhow!("WebSocket delivery timed out; retry this command"))?
             .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?
@@ -2349,6 +2409,25 @@ impl AstationClient {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
+    }
+}
+
+/// A writer `pause_writer_for_test` held back.
+#[cfg(test)]
+pub(crate) struct PausedWriter {
+    rx: mpsc::UnboundedReceiver<OutboundMessage>,
+    writer: mpsc::UnboundedSender<OutboundMessage>,
+}
+
+#[cfg(test)]
+impl PausedWriter {
+    /// Hands what was held back (and what comes later) to the real writer.
+    pub(crate) fn resume(mut self) {
+        tokio::spawn(async move {
+            while let Some(outbound) = self.rx.recv().await {
+                if self.writer.send(outbound).is_err() { break; }
+            }
+        });
     }
 }
 
@@ -4177,6 +4256,47 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // ── TransportPolicy ───────────────────────────────────
+
+    #[test]
+    fn transport_policy_roundtrip() {
+        for relay_only in [true, false] {
+            let wire = format!(r#"{{"type":"transportPolicy","data":{{"relay_only":{relay_only}}}}}"#);
+            let parsed: AstationMessage = serde_json::from_str(&wire).unwrap();
+            assert!(
+                matches!(parsed, AstationMessage::TransportPolicy { relay_only: r } if r == relay_only)
+            );
+            let json: serde_json::Value = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(json, serde_json::from_str::<serde_json::Value>(&wire).unwrap());
+        }
+    }
+
+    #[test]
+    fn transport_policy_ack_roundtrip() {
+        for relay_only in [true, false] {
+            let msg = AstationMessage::TransportPolicyAck { relay_only, stored: true, reason: None };
+            let json = serde_json::to_value(&msg).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"type": "transportPolicyAck", "data": {"relay_only": relay_only, "stored": true}})
+            );
+            let parsed: AstationMessage = serde_json::from_value(json).unwrap();
+            assert!(matches!(
+                parsed,
+                AstationMessage::TransportPolicyAck { relay_only: r, stored: true, reason: None } if r == relay_only
+            ));
+        }
+        let refused = AstationMessage::TransportPolicyAck {
+            relay_only: true,
+            stored: false,
+            reason: Some("pairing_changed".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            serde_json::json!({"type": "transportPolicyAck", "data": {"relay_only": true, "stored": false, "reason": "pairing_changed"}})
+        );
     }
 
     #[test]

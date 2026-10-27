@@ -1308,7 +1308,10 @@ impl Server {
             let _ = reply.send(Err(advice));
             return;
         }
+        // A link relay only is about to drop is no operation's: it waits
+        // for the next (relay) link.
         if self.app.astation_connected
+            && !self.app.relay_only_drop_pending()
             && let Some((encryption, credentials, reply)) = self.op_waiting.take()
             && let Some(view) = self.app.open_op_route(encryption, credentials)
             && reply.send(Ok(view)).is_err()

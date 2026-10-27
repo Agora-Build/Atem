@@ -314,9 +314,10 @@ impl AtemConfig {
                     .and_then(|login| login.subject.as_deref())
                     .unwrap_or("-");
                 let saved = if record.save_credentials { "yes" } else { "no" };
+                let relay_only = if record.relay_only { "  [relay only]" } else { "" };
                 lines.push(format!(
-                    "Paired:   {}  (login: {})  [save: {}]",
-                    record.astation_id, shared, saved
+                    "Paired:   {}  (login: {})  [save: {}]{}",
+                    record.astation_id, shared, saved, relay_only
                 ));
                 let trust = crate::memory::trust::TrustStore::load_from(&paths.cred.trust)
                     .unwrap_or_default();

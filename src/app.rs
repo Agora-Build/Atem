@@ -1,6 +1,7 @@
 pub mod hosted;
 pub mod op_route;
 mod reauth;
+mod transport_policy;
 #[cfg(test)]
 mod session_tests;
 
@@ -29,6 +30,9 @@ use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
 use crate::runtime::protocol::SessionSummary;
 use crate::websocket_client::{AstationClient, AstationMessage};
+
+/// Why the connect loop tried nothing: the pairing record can't be read.
+pub const PAIRING_UNREADABLE: &str = "the pairing record can't be read; not connecting to Astation (neither locally nor through the relay). Restore it from a backup, or run `atem unpair`, then `atem pair`";
 
 /// A mark task whose file no live Claude session's directory has.
 pub const NO_PROJECT_SESSION: &str =
@@ -133,6 +137,15 @@ pub struct App {
     /// Why the last background connect failed, when the saved session was
     /// the problem (shown to a pairing or unlock waiting for the link).
     pub astation_connect_error: Option<String>,
+    /// The local link relay only drops once the Astation operation running
+    /// on it ends and the ack was written (`app/transport_policy.rs`).
+    pub relay_only_drop: Option<transport_policy::RelayOnlyDrop>,
+    /// The unreadable pairing record error last logged by the connect loop
+    /// (logged again only when it changes).
+    pub pairing_unreadable: Option<String>,
+    /// How many times the connect loop logged it (tests).
+    #[cfg(test)]
+    pub pairing_unreadable_logged: usize,
 }
 
 impl App {
@@ -176,6 +189,10 @@ impl App {
             task_notices: Vec::new(),
             op_route: None,
             astation_connect_error: None,
+            relay_only_drop: None,
+            pairing_unreadable: None,
+            #[cfg(test)]
+            pairing_unreadable_logged: 0,
         };
         app.rebuild_menu();
         app
@@ -458,6 +475,7 @@ impl App {
             // Connection priority:
             // 1. Local URL (from config or default ws://127.0.0.1:8080/ws)
             //    - Works for: same machine, LAN IP, VPN IP (Netbird, Tailscale, etc.)
+            //    - Skipped while the pairing's Astation says relay only (`transportPolicy`)
             // 2. Relay (wss://station.agora.build) - remote connection
 
             let local_url = config.astation_ws();
@@ -472,23 +490,37 @@ impl App {
                 }
             };
 
-            // Local first: the pairing's saved session, else the loopback
-            // bootstrap proof (never pairing).
-            match client.connect_without_pairing(local_url).await {
-                Ok(()) => {
-                    let _ = tx.send(Ok((client, Some("local".to_string()))));
+            // An unreadable record is not "no pairing": it might say relay
+            // only, so local is never tried, and without its Astation id
+            // there is no relay room either. Fail closed: no attempt, the
+            // error (logged by `poll_astation_connect`), the 30 s retry.
+            // The record's place doesn't depend on config.toml.
+            let loaded = transport_policy::stored_record();
+            let local_allowed = crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref));
+            let record = match loaded {
+                Ok(record) => record,
+                Err(error) => {
+                    let text = format!("{PAIRING_UNREADABLE} ({error:#})");
+                    let _ = tx.send(Err(anyhow::Error::new(crate::runtime::ops::SessionAdvice(text))));
                     return;
                 }
-                Err(error) => note(error),
+            };
+
+            // Local first: the pairing's saved session, else the loopback
+            // bootstrap proof (never pairing).
+            if local_allowed {
+                match client.connect_without_pairing(local_url).await {
+                    Ok(()) => {
+                        let _ = tx.send(Ok((client, Some("local".to_string()))));
+                        return;
+                    }
+                    Err(error) => note(error),
+                }
             }
 
-            // Local unavailable: the paired Astation's identity room on the
-            // relay (no pairing, no relay connection).
-            let paired = crate::profile::Sources::current()
-                .ok()
-                .and_then(|src| crate::records::PairingRecord::load(&src.paths.pairing).ok().flatten())
-                .map(|record| record.astation_id);
-            if let Some(relay_code) = paired {
+            // Local unavailable or not allowed: the paired Astation's
+            // identity room on the relay (no pairing, no relay connection).
+            if let Some(relay_code) = record.map(|record| record.astation_id) {
                 let relay_url = config.astation_relay_url().to_string();
                 let mut relay_client = crate::websocket_client::AstationClient::new()
                     .with_host_route(host_route);
@@ -552,9 +584,12 @@ impl App {
                     self.astation_connected = true;
                     self.astation_link_gen += 1;
                     self.astation_connect_error = None;
+                    self.pairing_unreadable = None;
                     self.pairing_code = code;
                     self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
+                    // The record may have said relay only meanwhile.
+                    self.drop_local_link_if_relay_only();
                 }
                 Ok(Err(error)) => {
                     self.astation_connect_error = error
@@ -566,9 +601,25 @@ impl App {
                     self.astation_connect_rx = None;
                     self.astation_reconnect_at =
                         Some(Instant::now() + std::time::Duration::from_secs(30));
-                    self.status_message = Some(
-                        "Astation offline — retrying…".to_string()
-                    );
+                    let unreadable = self
+                        .astation_connect_error
+                        .clone()
+                        .filter(|error| error.starts_with(PAIRING_UNREADABLE));
+                    if let Some(text) = unreadable {
+                        if self.note_pairing_unreadable(&text) {
+                            crate::diagnostics::warn(format!("atem runtime: {text}"));
+                            #[cfg(test)]
+                            {
+                                self.pairing_unreadable_logged += 1;
+                            }
+                        }
+                        self.status_message = Some(format!("Astation: {text}"));
+                    } else {
+                        self.pairing_unreadable = None;
+                        self.status_message = Some(
+                            "Astation offline — retrying…".to_string()
+                        );
+                    }
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     // Still pending
@@ -581,6 +632,16 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Remembers the connect loop's unreadable-record error: whether it is
+    /// new (the first failure, or another error), so it is logged once.
+    pub(crate) fn note_pairing_unreadable(&mut self, text: &str) -> bool {
+        if self.pairing_unreadable.as_deref() == Some(text) {
+            return false;
+        }
+        self.pairing_unreadable = Some(text.to_string());
+        true
     }
 
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
@@ -732,6 +793,9 @@ impl App {
                     crate::session_protocol::wire::ErrorCode::UnsupportedVersion,
                     Some(hosted::REMOVED_OP),
                 );
+            }
+            AstationMessage::TransportPolicy { relay_only } => {
+                self.transport_policy(relay_only).await;
             }
             AstationMessage::CredentialSync {
                 access_token,
@@ -983,6 +1047,7 @@ impl App {
             message_count += 1;
         }
         self.check_astation_reauth_deadline();
+        self.check_relay_only_drop();
 
         // Detect WebSocket disconnect (channel closed after draining remaining messages)
         if self.astation_routed && self.astation_client.is_ws_closed() {

@@ -90,7 +90,7 @@ impl App {
         encryption: bool,
         credentials: bool,
     ) -> Option<AstationClient> {
-        if !self.astation_connected {
+        if !self.astation_connected || self.relay_only_drop_pending() {
             return None;
         }
         let (view, tx) = self.astation_client.op_view();
