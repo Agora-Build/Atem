@@ -44,7 +44,6 @@ pub fn write_pairing(config: &Path, astation_id: &str, trust_gen: u64) {
         shared: None,
         save_credentials: false,
         disconnected_at: None,
-        relay_only: false,
     };
     let plain = serde_json::to_vec(&record).unwrap();
     let sealed = machine_key::encrypt(machine_key::PAIRING, &plain).unwrap();

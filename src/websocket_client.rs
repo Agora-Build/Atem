@@ -122,17 +122,25 @@ pub(crate) const REMOVED_OPS: &[&str] = &[
     "agentListRequest",
 ];
 
-/// `text` is one of the `REMOVED_OPS`.
-pub(crate) fn is_removed_op(text: &str) -> bool {
+/// The plaintext relay-only messages (§R9.8a: the policy is set inside an
+/// r9 channel only; no compatibility, never a hint).
+pub(crate) const REMOVED_POLICY_OPS: &[&str] = &["transportPolicy", "transportPolicyAck"];
+
+/// The detail a removed op is refused with, when `text` is one.
+pub(crate) fn removed_op_detail(text: &str) -> Option<&'static str> {
     #[derive(Deserialize)]
     struct Peek {
         #[serde(rename = "type")]
         kind: Option<String>,
     }
-    serde_json::from_str::<Peek>(text)
-        .ok()
-        .and_then(|p| p.kind)
-        .is_some_and(|kind| REMOVED_OPS.contains(&kind.as_str()))
+    let kind = serde_json::from_str::<Peek>(text).ok()?.kind?;
+    if REMOVED_OPS.contains(&kind.as_str()) {
+        Some(crate::app::hosted::REMOVED_OP)
+    } else if REMOVED_POLICY_OPS.contains(&kind.as_str()) {
+        Some(crate::app::hosted::REMOVED_POLICY_OP)
+    } else {
+        None
+    }
 }
 
 /// The link's WebSocket limits: no message (or frame) larger than the
@@ -192,10 +200,11 @@ pub enum AstationMessage {
     #[serde(skip)]
     SessionOversize { id: Option<String>, family: String },
 
-    /// An op removed in atem-session r6 (`REMOVED_OPS`): answered with an
-    /// `error` `unsupported_version` and no effect.
+    /// An op removed in atem-session r6 (`REMOVED_OPS`) or the plaintext
+    /// relay-only messages (`REMOVED_POLICY_OPS`): answered with an `error`
+    /// `unsupported_version` (its `detail`, `removed_op_detail`) and no effect.
     #[serde(skip)]
-    RemovedOp,
+    RemovedOp { detail: String },
 
     /// An r9 channel envelope (`{"type":"channel",…}`, atem-session-v1.md
     /// §R9.7a) as its raw JSON text: demultiplexed before every other
@@ -349,25 +358,6 @@ pub enum AstationMessage {
     #[serde(rename = "pairSavePreference")]
     PairSavePreference {
         save_credentials: bool,
-    },
-
-    /// Astation → Atem, after every authentication and on change: while
-    /// `relay_only`, reach Astation only through its relay identity room
-    /// (never the local `astation_ws`). Kept in the pairing record.
-    #[serde(rename = "transportPolicy")]
-    TransportPolicy {
-        relay_only: bool,
-    },
-
-    /// Atem → Astation: the transport policy Atem stored (`stored`, then
-    /// `relay_only` is the stored value), or the requested one it couldn't
-    /// store, with `reason` (`not_paired`, `pairing_changed`, `save_failed`).
-    #[serde(rename = "transportPolicyAck")]
-    TransportPolicyAck {
-        relay_only: bool,
-        stored: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
     },
 
     /// Astation → Atem: the account's encryption mode, as a signed
@@ -877,14 +867,6 @@ impl AstationClient {
         self.guarded(apply)
     }
 
-    /// Whether the pairing state and saved session this connection's
-    /// authentication captured are still current (no lock held).
-    pub(crate) fn capture_current(&self) -> bool {
-        self.capture
-            .as_ref()
-            .is_some_and(|capture| capture.check().is_ok() && self.check_session(capture).is_ok())
-    }
-
     /// A saved session may answer `astation_id` only when the captured
     /// pairing binding is with it: after an `atem unpair` that stopped before
     /// removing the sessions (or one for another Astation), it is never used.
@@ -1209,7 +1191,9 @@ impl AstationClient {
                                 Some(AstationMessage::SessionOversize { id: session_message_id(&text), family: family.to_string() })
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
-                            None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),
+                            None if removed_op_detail(&text).is_some() => {
+                                removed_op_detail(&text).map(|detail| AstationMessage::RemovedOp { detail: detail.into() })
+                            }
                             // §R9.7b: answered here, once; never passed on.
                             None if crate::session_protocol::r9::route::is_host_challenge(&text) => {
                                 match route.as_mut() {
@@ -1917,6 +1901,26 @@ impl AstationClient {
     }
 
     pub fn try_send_channel(&self, text: String) -> bool {
+        self.try_send_channel_with(text, false).0
+    }
+
+    /// `try_send_channel`, with the write's delivery receipt when asked
+    /// (a committed relay-only result: the local link closes after it).
+    pub(crate) fn try_send_channel_with(&self, text: String, receipt: bool) -> (bool, Option<DeliveryReceipt>) {
+        let (delivered, rx) = if receipt {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        (self.try_send_channel_delivered(text, delivered), rx)
+    }
+
+    fn try_send_channel_delivered(
+        &self,
+        text: String,
+        delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> bool {
         use std::sync::atomic::Ordering;
         let Some(sender) = self.sender.as_ref() else { return false };
         let len = text.len();
@@ -1926,7 +1930,7 @@ impl AstationClient {
             return false;
         }
         self.channel_inflight.fetch_add(len, Ordering::Relaxed);
-        let outbound = OutboundMessage { message: AstationMessage::Channel(text), delivered: None };
+        let outbound = OutboundMessage { message: AstationMessage::Channel(text), delivered };
         if sender.send(outbound).is_err() {
             self.channel_inflight.fetch_sub(len, Ordering::Relaxed);
             return false;
@@ -4258,45 +4262,22 @@ mod tests {
         }
     }
 
-    // ── TransportPolicy ───────────────────────────────────
+    // ── Removed: the plaintext transport policy (§R9.8a) ──
 
     #[test]
-    fn transport_policy_roundtrip() {
-        for relay_only in [true, false] {
-            let wire = format!(r#"{{"type":"transportPolicy","data":{{"relay_only":{relay_only}}}}}"#);
-            let parsed: AstationMessage = serde_json::from_str(&wire).unwrap();
-            assert!(
-                matches!(parsed, AstationMessage::TransportPolicy { relay_only: r } if r == relay_only)
-            );
-            let json: serde_json::Value = serde_json::to_value(&parsed).unwrap();
-            assert_eq!(json, serde_json::from_str::<serde_json::Value>(&wire).unwrap());
+    fn the_plaintext_transport_policy_is_a_removed_op() {
+        for wire in [
+            r#"{"type":"transportPolicy","data":{"relay_only":true}}"#,
+            r#"{"type":"transportPolicyAck","data":{"relay_only":true,"stored":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<AstationMessage>(wire).is_err(), "{wire}");
+            assert_eq!(removed_op_detail(wire), Some(crate::app::hosted::REMOVED_POLICY_OP));
         }
-    }
-
-    #[test]
-    fn transport_policy_ack_roundtrip() {
-        for relay_only in [true, false] {
-            let msg = AstationMessage::TransportPolicyAck { relay_only, stored: true, reason: None };
-            let json = serde_json::to_value(&msg).unwrap();
-            assert_eq!(
-                json,
-                serde_json::json!({"type": "transportPolicyAck", "data": {"relay_only": relay_only, "stored": true}})
-            );
-            let parsed: AstationMessage = serde_json::from_value(json).unwrap();
-            assert!(matches!(
-                parsed,
-                AstationMessage::TransportPolicyAck { relay_only: r, stored: true, reason: None } if r == relay_only
-            ));
-        }
-        let refused = AstationMessage::TransportPolicyAck {
-            relay_only: true,
-            stored: false,
-            reason: Some("pairing_changed".into()),
-        };
         assert_eq!(
-            serde_json::to_value(&refused).unwrap(),
-            serde_json::json!({"type": "transportPolicyAck", "data": {"relay_only": true, "stored": false, "reason": "pairing_changed"}})
+            removed_op_detail(r#"{"type":"agentInput","data":{}}"#),
+            Some(crate::app::hosted::REMOVED_OP)
         );
+        assert_eq!(removed_op_detail(r#"{"type":"heartbeat","data":{}}"#), None);
     }
 
     #[test]

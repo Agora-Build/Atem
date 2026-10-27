@@ -443,8 +443,8 @@ mod tests {
         );
     }
 
-    /// A local link that re-authenticates while the stored record says
-    /// relay only is dropped (no ack: no policy message) and reconnects; one
+    /// A local link that re-authenticates while the host policy says relay
+    /// only is dropped and reconnects; one
     /// that may stay local stays, also with a config.toml that doesn't parse
     /// (never taken for a damaged record).
     #[tokio::test]
@@ -453,9 +453,10 @@ mod tests {
             let (mut app, mut peer) = connected_app().await;
             app.astation_client
                 .set_via_for_test(crate::websocket_client::LinkVia::Local);
-            crate::pairing::tests::edit(peer._state.path(), |record| {
-                record.relay_only = relay_only;
-            });
+            crate::session_protocol::r9::host_policy::write_for_test(
+                &crate::paths::ProfilePaths::in_dir(peer._state.path()).pairing,
+                relay_only,
+            );
             peer.send
                 .send(auth_required(ASTATION, &"c".repeat(64)))
                 .unwrap();
@@ -464,13 +465,7 @@ mod tests {
                 .send(status("authenticated", &[("method", "session_proof")]))
                 .unwrap();
             if relay_only {
-                let sent = until_closed(&mut app, &mut peer).await;
-                assert!(
-                    !sent
-                        .iter()
-                        .any(|m| matches!(m, AstationMessage::TransportPolicyAck { .. })),
-                    "no ack without a policy message"
-                );
+                until_closed(&mut app, &mut peer).await;
                 assert!(!app.astation_connected);
                 assert!(app.relay_only_drop.is_none());
                 assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");

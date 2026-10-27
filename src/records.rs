@@ -75,8 +75,4 @@ pub struct PairingRecord {
     /// When the link to this Astation last dropped (Unix seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<u64>,
-    /// Astation's transport policy (`transportPolicy`): reach it only
-    /// through the relay identity room, never the local `astation_ws`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub relay_only: bool,
 }

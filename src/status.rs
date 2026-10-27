@@ -88,7 +88,8 @@ pub struct StatusReport {
 pub struct Pairing {
     pub astation_id: String,
     pub session_expired: bool,
-    /// Astation's transport policy (`transportPolicy`): relay only.
+    /// The host policy keeps Atem off the local link (§R9.8a: relay only,
+    /// a write of it still uncertain, or a policy that can't be read).
     pub relay_only: bool,
 }
 
@@ -98,7 +99,7 @@ pub fn pairing(src: &Sources) -> Option<Pairing> {
     let record = PairingRecord::load(&src.paths.pairing).ok()??;
     Some(Pairing {
         session_expired: record.session_expired(),
-        relay_only: record.relay_only,
+        relay_only: !crate::session_protocol::r9::host_policy::local_allowed(&src.paths.pairing),
         astation_id: record.astation_id,
     })
 }
@@ -272,7 +273,7 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
         Verification::Unknown(error) => format!("unknown ({error})"),
     };
     let relay_only = if pairing.relay_only {
-        "; relay only (set by Astation)"
+        "; relay only (host policy)"
     } else {
         ""
     };
@@ -304,7 +305,7 @@ fn trust_note(src: &Sources, astation_id: &str) -> String {
 }
 
 /// After the block while relay only is set and Astation isn't connected.
-pub const RELAY_ONLY_NOTE: &str = "Astation's Station AI disabled the local connection: Atem reaches Astation only through the relay. It clears when Astation turns it off, or with `atem unpair`.";
+pub const RELAY_ONLY_NOTE: &str = "A manager set relay only (or the host policy can't be read): Atem reaches Astation only through the relay. It clears when a manager turns it off, or with `atem unpair`.";
 
 /// The status from `src`, with `agent` the already running cred agent (if
 /// any) and no runtime running.
@@ -928,14 +929,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn relay_only_set_by_astation_is_shown_on_the_pairing_line() {
+    fn relay_only_set_by_a_manager_is_shown_on_the_pairing_line() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
-        crate::pairing::tests::edit(dir.path(), |record| record.relay_only = true);
+        let paths = crate::paths::ProfilePaths::in_dir(dir.path()).pairing;
+        crate::session_protocol::r9::host_policy::write_for_test(&paths, true);
         let report = report(dir.path());
         assert_eq!(
             report.pairing.value,
-            "paired (astation-1, trust gen 1); relay only (set by Astation)"
+            "paired (astation-1, trust gen 1); relay only (host policy)"
         );
         // No runtime, so Astation isn't connected: the hint says why.
         assert!(report.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
@@ -945,8 +947,8 @@ pub(crate) mod tests {
         assert!(!online.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
         let offline = gather_full(&src, None, &running(RuntimeStatus::default()));
         assert!(offline.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
-        // Astation turned it off: no hint.
-        crate::pairing::tests::edit(dir.path(), |record| record.relay_only = false);
+        // A manager turned it off: no hint.
+        crate::session_protocol::r9::host_policy::write_for_test(&paths, false);
         let report = super::tests::report(dir.path());
         assert!(!report.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
         assert_eq!(report.pairing.value, "paired (astation-1, trust gen 1)");

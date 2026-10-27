@@ -1,7 +1,7 @@
 pub mod hosted;
 pub mod op_route;
 mod reauth;
-mod transport_policy;
+mod relay_only;
 #[cfg(test)]
 mod session_tests;
 
@@ -138,8 +138,8 @@ pub struct App {
     /// the problem (shown to a pairing or unlock waiting for the link).
     pub astation_connect_error: Option<String>,
     /// The local link relay only drops once the Astation operation running
-    /// on it ends and the ack was written (`app/transport_policy.rs`).
-    pub relay_only_drop: Option<transport_policy::RelayOnlyDrop>,
+    /// on it ends and the policy result was written (`app/relay_only.rs`).
+    pub relay_only_drop: Option<relay_only::RelayOnlyDrop>,
     /// The unreadable pairing record error last logged by the connect loop
     /// (logged again only when it changes).
     pub pairing_unreadable: Option<String>,
@@ -475,7 +475,7 @@ impl App {
             // Connection priority:
             // 1. Local URL (from config or default ws://127.0.0.1:8080/ws)
             //    - Works for: same machine, LAN IP, VPN IP (Netbird, Tailscale, etc.)
-            //    - Skipped while the pairing's Astation says relay only (`transportPolicy`)
+            //    - Skipped while the host policy says relay only (§R9.8a)
             // 2. Relay (wss://station.agora.build) - remote connection
 
             let local_url = config.astation_ws();
@@ -490,13 +490,15 @@ impl App {
                 }
             };
 
-            // An unreadable record is not "no pairing": it might say relay
-            // only, so local is never tried, and without its Astation id
-            // there is no relay room either. Fail closed: no attempt, the
-            // error (logged by `poll_astation_connect`), the 30 s retry.
-            // The record's place doesn't depend on config.toml.
-            let loaded = transport_policy::stored_record();
-            let local_allowed = crate::records::PairingRecord::local_allowed(loaded.as_ref().map(Option::as_ref));
+            // An unreadable record is not "no pairing": a damaged profile
+            // never gets a local link, and without its Astation id there is
+            // no relay room either. Fail closed: no attempt, the error
+            // (logged by `poll_astation_connect`), the 30 s retry. The
+            // record's place doesn't depend on config.toml. Local is also
+            // skipped while the host policy says relay only (or can't be
+            // read, or a write of it is uncertain).
+            let loaded = relay_only::stored_record();
+            let local_allowed = loaded.is_ok() && relay_only::local_allowed();
             let record = match loaded {
                 Ok(record) => record,
                 Err(error) => {
@@ -786,16 +788,13 @@ impl App {
             AstationMessage::SessionOversize { id, family } => {
                 self.session_oversize(id, &family);
             }
-            AstationMessage::RemovedOp => {
-                // r6 §0: refused, with no effect.
+            AstationMessage::RemovedOp { detail } => {
+                // r6 §0 and §R9.8a: refused, with no effect.
                 self.session_refusal(
                     None,
                     crate::session_protocol::wire::ErrorCode::UnsupportedVersion,
-                    Some(hosted::REMOVED_OP),
+                    Some(detail.as_str()),
                 );
-            }
-            AstationMessage::TransportPolicy { relay_only } => {
-                self.transport_policy(relay_only).await;
             }
             AstationMessage::CredentialSync {
                 access_token,

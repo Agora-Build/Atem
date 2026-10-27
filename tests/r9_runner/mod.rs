@@ -392,6 +392,16 @@ impl Rt {
         .unwrap();
         self.restarts += 1;
         self.sandbox.restarts = self.restarts;
+        // `setup.host.link: "relay"`: the fake Astation is reached as the
+        // relay identity room (no local endpoint), so a relay-only commit
+        // (§R9.8a) keeps the link.
+        let (local, relay) = if self.spec["link"] == "relay" {
+            let base = self.astation.url.replacen("ws://", "http://", 1);
+            let base = base.strip_suffix("/ws").unwrap_or(&base).to_owned();
+            ("ws://127.0.0.1:1/ws".to_owned(), base)
+        } else {
+            (self.astation.url.clone(), "http://127.0.0.1:1".to_owned())
+        };
         let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
         command
             .arg("runtime")
@@ -399,8 +409,8 @@ impl Rt {
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.sandbox.home)
             .env("XDG_RUNTIME_DIR", &self.sandbox.run)
-            .env("ASTATION_WS", &self.astation.url)
-            .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
+            .env("ASTATION_WS", local)
+            .env("ASTATION_RELAY_URL", relay)
             .env("ATEM_TEST_CLOCK_FILE", &self.sandbox.clock)
             .env("ATEM_TEST_PTY_FAULTS", &self.sandbox.faults)
             .env("ATEM_TEST_HOST_CLOCK", &self.host_clock)
@@ -1863,6 +1873,16 @@ impl Runner {
                 }
                 "evidence_count" => m["evidence"]["count"].clone(),
                 "evidence_reason" => m["evidence"]["reason"].clone(),
+                // §R9.8a: the stored host policy, as the files say
+                // (`pending`: a write whose durability is still unknown).
+                "host_policy" => {
+                    let text = std::fs::read_to_string(host.pairing().join("host_policy.json"))
+                        .unwrap_or_default();
+                    let doc = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+                    json!({"relay_only": doc["relay_only"].as_bool().unwrap_or(false),
+                           "revision": doc["revision"].as_u64().unwrap_or(0),
+                           "pending": file("host_policy.pending")})
+                }
                 "frozen_genesis" => {
                     let text = std::fs::read_to_string(host.pairing().join("frozen_genesis"))
                         .unwrap_or_default();
@@ -2211,13 +2231,20 @@ impl Runner {
                         "intent" => "membership.intent",
                         "freeze" => "membership.freeze",
                         "fault" => "membership.fault",
+                        "host_policy" => "host_policy.json",
+                        "host_policy_pending" => "host_policy.pending",
                         other => panic!("file {other}"),
                     };
                     let path = host.pairing().join(name);
                     let before = std::fs::read(&path).ok();
                     host.snapshot = Some((path, before));
                 }
-                std::fs::write(host.mfaults.join("fail_next"), format!("{file}:{at}")).unwrap();
+                let hook = if file.starts_with("host_policy") {
+                    "fail_next_policy"
+                } else {
+                    "fail_next"
+                };
+                std::fs::write(host.mfaults.join(hook), format!("{file}:{at}")).unwrap();
                 self.pass();
             }
             "crash_after_membership_commit" => {

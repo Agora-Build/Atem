@@ -181,6 +181,23 @@ fn event_info(event: Event) -> ClientEvent {
         },
         Event::GrantRevoked { re } => ClientEvent::GrantRevoked { re },
         Event::Seen { re } => ClientEvent::Seen { re },
+        Event::HostPolicy { result, observed } => ClientEvent::HostPolicy {
+            re: result.re.clone(),
+            request_id: result.request_id.clone(),
+            outcome: result.outcome.as_str().into(),
+            relay_only: result.policy.relay_only,
+            revision: result.policy.revision,
+            state: result.policy.state.as_str().into(),
+            observed: snake(&format!("{observed:?}")),
+            json: canonical_lossy(&result.to_json()),
+        },
+        Event::HostPolicyChanged { change, observed } => ClientEvent::HostPolicyChanged {
+            relay_only: change.policy.relay_only,
+            revision: change.policy.revision,
+            state: change.policy.state.as_str().into(),
+            observed: snake(&format!("{observed:?}")),
+            json: canonical_lossy(&change.to_json()),
+        },
         Event::Error(e) => error_event(&e, false),
         Event::Fenced(e) => error_event(&e, true),
     }
@@ -800,6 +817,56 @@ impl ClientConnection {
     /// `revoke_grant` (a browser grant's issuer, or a member with control).
     pub fn revoke_grant(&self, grant_id: String, now_ms: u64) -> Result<Outgoing> {
         self.request(|a| a.revoke_grant(&grant_id, now_ms))
+    }
+
+    /// `host_policy_set` (§R9.8a; a native member with `manage`): relay
+    /// only on or off. Keep `request_id` (a UUID v4) for retries of this
+    /// change; `expected_revision` is the newest revision this attachment
+    /// learned (0 before any result).
+    pub fn host_policy_set(
+        &self,
+        relay_only: bool,
+        request_id: String,
+        now_ms: u64,
+    ) -> Result<Outgoing> {
+        self.request(|a| a.host_policy_set(relay_only, &request_id, now_ms))
+    }
+
+    /// The same change again: the same `request_id`, `relay_only` and
+    /// `expected_revision` it was first sent with, under a fresh `id`.
+    pub fn host_policy_retry(
+        &self,
+        relay_only: bool,
+        request_id: String,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<Outgoing> {
+        self.request(|a| a.host_policy_retry(relay_only, &request_id, expected_revision, now_ms))
+    }
+
+    /// `host_policy_get`: the host's current policy; `desired` is the value
+    /// this attachment wants confirmed.
+    pub fn host_policy_get(&self, desired: bool, now_ms: u64) -> Result<Outgoing> {
+        self.request(|a| a.host_policy_get(desired, now_ms))
+    }
+
+    /// Whether relay only (the wanted value) is confirmed on this
+    /// attachment: a durable `committed`/`unchanged`/`current` result of
+    /// its own request, bound to this host and channel. A new attachment
+    /// starts unconfirmed.
+    pub fn host_policy_ready(&self) -> bool {
+        match &self.lock().phase {
+            Phase::Attached(a) => a.host_policy().ready(),
+            _ => false,
+        }
+    }
+
+    /// The newest policy revision a result of this attachment reported.
+    pub fn host_policy_revision(&self) -> Option<u64> {
+        match &self.lock().phase {
+            Phase::Attached(a) => a.host_policy().known().map(|p| p.revision),
+            _ => None,
+        }
     }
 
     /// `membership{entries}`: entries carried on the open channel (a new

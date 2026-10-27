@@ -153,6 +153,9 @@ impl HostRt {
         self.rt.apply(effects);
         self.route();
         self.engine.end_pass();
+        // No local link here (the runtime's pass keeps refusing opens only
+        // while a local link waits to close for relay only, §R9.8a).
+        self.engine.set_refuse_opens(false);
         out
     }
 
@@ -232,7 +235,7 @@ impl HostRt {
         self.route();
         self.call(|e, p| ((), e.reap(p)));
         let mut sent = Vec::new();
-        self.engine.flush(&mut |text| {
+        self.engine.flush(&mut |text, _| {
             sent.push(text);
             true
         });
@@ -569,13 +572,14 @@ impl Runner {
             assert!(fenced.is_empty());
             let effects = fences.effects;
             rt.apply(effects);
+            let engine = policy_engine(&rig.pairing, &rig.journal);
             let mut host = HostRt {
                 rig,
                 rt,
                 m: Some(m),
                 now,
                 epoch,
-                engine: R9Host::new(Limits::default(), None),
+                engine,
                 key: HostKey::new(&seed),
                 link: 1,
                 host_id,
@@ -1092,7 +1096,7 @@ impl Runner {
         host.rt.foreign.clear();
         host.m = Some(m);
         // A new runtime: a new engine on a new link; every channel ended.
-        host.engine = R9Host::new(Limits::default(), None);
+        host.engine = policy_engine(&host.rig.pairing, &host.rig.journal);
         host.chans.clear();
         host.link += 1;
         host.link_attached = false;
@@ -1267,6 +1271,19 @@ impl Runner {
                         .reason
                         .as_str()
                 )),
+                // §R9.8a: the stored host policy, as the files say.
+                "host_policy" => {
+                    let p = &host.rig.pairing;
+                    let doc = std::fs::read(&p.host_policy)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .unwrap_or(Value::Null);
+                    ok(
+                        json!({"relay_only": doc["relay_only"].as_bool().unwrap_or(false),
+                              "revision": doc["revision"].as_u64().unwrap_or(0),
+                              "pending": p.host_policy_pending.exists()}),
+                    )
+                }
                 "frozen_genesis" => {
                     let got: Vec<Value> = frozen_genesis(&host.rig.pairing)
                         .unwrap()
@@ -1531,7 +1548,14 @@ impl Runner {
                         }
                     }
                 };
-                self.host().m.as_mut().unwrap().store_mut().inject(injected);
+                if matches!(
+                    injected.file,
+                    DlFile::HostPolicy | DlFile::HostPolicyPending
+                ) {
+                    self.host().engine.inject_policy_fault(injected);
+                } else {
+                    self.host().m.as_mut().unwrap().store_mut().inject(injected);
+                }
                 self.pass();
             }
             "crash_after_membership_commit" => {
@@ -1949,4 +1973,12 @@ fn no_host_scenario_item_is_left_to_task_7_or_8() {
             "{name}: {pending:?}"
         );
     }
+}
+
+/// The engine of a host the fixtures run: the host policy stored in its
+/// pairing directory (§R9.8a), as the runtime's bridge sets it up.
+fn policy_engine(pairing: &crate::paths::PairingPaths, journal: &std::path::Path) -> R9Host {
+    let mut engine = R9Host::new(Limits::default(), None);
+    engine.set_policy_paths(pairing.clone(), journal.to_path_buf());
+    engine
 }

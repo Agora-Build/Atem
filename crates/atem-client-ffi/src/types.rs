@@ -683,6 +683,33 @@ data_enum! {
         MembershipHead { re: Option<String>, head: LogHead, pending_recovery: Vec<PendingRecoveryInfo> },
         GrantRevoked { re: String },
         Seen { re: String },
+        /// A `host_policy_result` (§R9.8a): the host's current policy and
+        /// what it did to this attachment's relay-only readiness
+        /// (`observed`: `ready`, `not_ready`, or `foreign` — not one of
+        /// this attachment's requests, or bound elsewhere: confirms
+        /// nothing). `outcome`: `committed`, `unchanged`, `superseded`,
+        /// `conflict`, `save_failed`, `uncertain`, `current`; `state`:
+        /// `durable` or `uncertain`.
+        HostPolicy {
+            re: String,
+            request_id: Option<String>,
+            outcome: String,
+            relay_only: bool,
+            revision: u64,
+            state: String,
+            observed: String,
+            json: String,
+        },
+        /// `host_policy_changed`: another manager's committed change (the
+        /// host's current policy). Never a confirmation; `observed`
+        /// `not_ready` when it contradicts the wanted value.
+        HostPolicyChanged {
+            relay_only: bool,
+            revision: u64,
+            state: String,
+            observed: String,
+            json: String,
+        },
         /// A session error.
         Error { code: String, re: Option<String>, detail: Option<String>, json: String },
         /// The attachment is over (`unauthorized`/`account_frozen` without

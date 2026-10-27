@@ -73,6 +73,12 @@ pub struct PairingPaths {
     pub revoked_floor: PathBuf,
     /// `host_channel_key`: the host's atem-ch1 key (deleted by `atem unpair`).
     pub host_channel_key: PathBuf,
+    /// `host_policy.json`: the relay-only policy a manager set (§R9.8a;
+    /// deleted by `atem unpair` and at a new pin).
+    pub host_policy: PathBuf,
+    /// `host_policy.pending`: the policy a write left uncertain (its bytes,
+    /// rolled forward at start); no local link while it exists.
+    pub host_policy_pending: PathBuf,
 }
 
 impl PairingPaths {
@@ -89,6 +95,8 @@ impl PairingPaths {
             frozen_genesis: dir.join("frozen_genesis"),
             revoked_floor: dir.join("revoked_floor"),
             host_channel_key: dir.join("host_channel_key"),
+            host_policy: dir.join("host_policy.json"),
+            host_policy_pending: dir.join("host_policy.pending"),
         }
     }
 

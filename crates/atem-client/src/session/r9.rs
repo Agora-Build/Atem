@@ -25,13 +25,14 @@ use crate::membership::Head;
 /// The revision an r9 `hello` must carry and `welcome` echoes.
 pub const REVISION: u64 = 9;
 
-/// The features an r9 host advertises: the nine of r8 plus r9's five.
+/// The features an r9 host advertises: the nine of r8 plus r9's six.
 pub const R9_FEATURES: &[&str] = &[
     "membership.carry",
     "push.sealed",
     "approval.seen",
     "grant.revoke",
     "recovery.wait",
+    crate::session::host_policy::FEATURE,
 ];
 
 /// The `hello`'s bytes (`jcs`): what the client seals as `finish` and the
@@ -593,6 +594,8 @@ pub enum Incoming {
     Seen {
         re: String,
     },
+    HostPolicyResult(Box<crate::session::host_policy::HostPolicyResult>),
+    HostPolicyChanged(Box<crate::session::host_policy::HostPolicyChanged>),
     /// Any other message (r8's session ops, terminal-v1, chat-v1).
     Other,
 }
@@ -629,6 +632,12 @@ impl Incoming {
             "seen" => Incoming::Seen {
                 re: re().ok_or("re")?,
             },
+            "host_policy_result" => Incoming::HostPolicyResult(Box::new(
+                crate::session::host_policy::HostPolicyResult::from_data(data)?,
+            )),
+            "host_policy_changed" => Incoming::HostPolicyChanged(Box::new(
+                crate::session::host_policy::HostPolicyChanged::from_data(data)?,
+            )),
             _ => Incoming::Other,
         })
     }

@@ -720,7 +720,14 @@ impl HostBridge {
         Ok(Self {
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
-            r9: R9Host::with_pairing(r9host::Limits::default(), Some(dir), vouch),
+            r9: {
+                let mut r9 = R9Host::with_pairing(r9host::Limits::default(), Some(dir), vouch);
+                if let Some(pairing) = &pairing {
+                    // §R9.8a: a pending policy write is rolled forward first.
+                    r9.set_policy_paths(pairing.clone(), dir.to_path_buf());
+                }
+                r9
+            },
             r9_link: None,
             r9_socket: 0,
             pairing,
@@ -1550,7 +1557,17 @@ impl HostBridge {
         let effects = self.r9_call(|r9, parts| r9.reap(parts));
         self.r9_exec(effects, &mut cx);
         let client = cx.client;
-        self.r9.flush(&mut |text| client.try_send_channel(text));
+        // §R9.8a: a committed relay-only result's write is what a local
+        // link waits for before it closes.
+        let mut receipt = None;
+        self.r9.flush(&mut |text, wants| {
+            let (sent, delivered) = client.try_send_channel_with(text, wants);
+            if delivered.is_some() {
+                receipt = delivered;
+            }
+            sent
+        });
+        let policy_changes = self.r9.take_policy_changes();
         if self.r9_link.is_some() {
             self.r9
                 .flush_relay(&mut |text| client.try_send_wire(text, false).is_ok());
@@ -1577,6 +1594,13 @@ impl HostBridge {
                 })
                 .collect();
         }
+        for relay_only in policy_changes {
+            app.host_policy_changed(relay_only);
+        }
+        if let Some(receipt) = receipt {
+            app.relay_only_receipt(receipt);
+        }
+        self.r9.set_refuse_opens(app.relay_only_drop_pending());
         if let Some(reason) = self.take_close() {
             app.drop_astation_link(reason.into());
         }

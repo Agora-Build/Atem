@@ -41,6 +41,9 @@ use crate::session::client::{
     ChatClient, LeaseClient, LeaseRequest, RegistryClient, RegistryOutcome, ReplyOutcome,
     RequestRefused,
 };
+use crate::session::host_policy::{
+    HostPolicyChanged, HostPolicyResult, HostPolicyTracker, Observed,
+};
 use crate::session::new_id;
 use crate::session::r9::{Incoming, PendingRecovery, REVISION, SessionError, Welcome, code};
 use crate::session::wire::{
@@ -428,6 +431,7 @@ impl AwaitWelcome {
         let lifetime = welcome.authorization_ms_left.min(NATIVE_LIFETIME_MS);
         self.channel.limit_lifetime(now_ms + lifetime);
         let mut attached = Attached {
+            host_policy: HostPolicyTracker::new(&welcome, false),
             channel: self.channel,
             authorization_deadline: now_ms + lifetime,
             head: welcome.head,
@@ -525,6 +529,19 @@ pub enum Event {
     Seen {
         re: String,
     },
+    /// A `host_policy_result` (§R9.8a) and what it did to this attachment's
+    /// tracker ([`Attached::host_policy`]); `Foreign` ones confirm nothing.
+    HostPolicy {
+        result: Box<HostPolicyResult>,
+        observed: Observed,
+    },
+    /// Another manager changed the policy (`host_policy_changed`): never a
+    /// confirmation; `observed` is `NotReady` when it contradicts the
+    /// wanted value.
+    HostPolicyChanged {
+        change: Box<HostPolicyChanged>,
+        observed: Observed,
+    },
     /// A session `error` (r9 fields included). With no `re` and code
     /// `unauthorized` or `account_frozen` it is a fence: the attachment is
     /// over and the channel closed (reconnect to learn more).
@@ -550,6 +567,7 @@ pub struct Attached {
     chat: ChatClient,
     leases: BTreeMap<String, LeaseClient>,
     outstanding: HashMap<String, Outstanding>,
+    host_policy: HostPolicyTracker,
 }
 
 impl Attached {
@@ -854,6 +872,66 @@ impl Attached {
         Ok((id, frame))
     }
 
+    /// The relay-only readiness of this attachment (§R9.8a): ready only
+    /// after a durable result of this channel confirmed the wanted value.
+    pub fn host_policy(&self) -> &HostPolicyTracker {
+        &self.host_policy
+    }
+
+    /// `host_policy_set` (a native member with `manage`): `request_id` is
+    /// the change's identity, kept by the app for retries
+    /// ([`Attached::host_policy_retry`]); `expected_revision` is the newest
+    /// revision this attachment learned (0 before any result).
+    pub fn host_policy_set(
+        &mut self,
+        relay_only: bool,
+        request_id: &str,
+        now_ms: u64,
+    ) -> Result<(String, Vec<u8>), ConnectError> {
+        self.host_policy.set_desired(relay_only);
+        let message = self.host_policy.set(request_id);
+        self.seal_policy(message, now_ms)
+    }
+
+    /// The same change again: same `request_id`, `relay_only` and
+    /// `expected_revision`, a fresh `id`.
+    pub fn host_policy_retry(
+        &mut self,
+        relay_only: bool,
+        request_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<(String, Vec<u8>), ConnectError> {
+        self.host_policy.set_desired(relay_only);
+        let message = self.host_policy.retry(request_id, expected_revision);
+        self.seal_policy(message, now_ms)
+    }
+
+    /// `host_policy_get`: the host's current policy (a new attachment asks
+    /// before it relies on relay only).
+    pub fn host_policy_get(
+        &mut self,
+        desired: bool,
+        now_ms: u64,
+    ) -> Result<(String, Vec<u8>), ConnectError> {
+        self.host_policy.set_desired(desired);
+        let message = self.host_policy.get();
+        self.seal_policy(message, now_ms)
+    }
+
+    fn seal_policy(
+        &mut self,
+        message: Value,
+        now_ms: u64,
+    ) -> Result<(String, Vec<u8>), ConnectError> {
+        let id = message["data"]["id"]
+            .as_str()
+            .expect("a request has an id")
+            .to_owned();
+        let frame = self.seal(&message, now_ms)?;
+        Ok((id, frame))
+    }
+
     /// `revoke_grant` (the issuer, or a native member with `control`).
     pub fn revoke_grant(
         &mut self,
@@ -900,6 +978,14 @@ impl Attached {
             }
             Incoming::GrantRevoked { re } => return Ok(vec![Event::GrantRevoked { re }]),
             Incoming::Seen { re } => return Ok(vec![Event::Seen { re }]),
+            Incoming::HostPolicyResult(result) => {
+                let observed = self.host_policy.observe(&result);
+                return Ok(vec![Event::HostPolicy { result, observed }]);
+            }
+            Incoming::HostPolicyChanged(change) => {
+                let observed = self.host_policy.observe_change(&change);
+                return Ok(vec![Event::HostPolicyChanged { change, observed }]);
+            }
             Incoming::Error(error) => {
                 // r8's machines see r8's errors (a lease request's refusal).
                 if let Ok(Envelope::Session(msg)) = wire::decode(&plain) {
