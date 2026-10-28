@@ -22,6 +22,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -57,6 +58,8 @@ fn recv(stream: &mut impl Read) -> Option<Vec<u8>> {
 struct Host {
     core: Arc<Mutex<HostCore>>,
     started: Instant,
+    /// Added to the host's wall clock (a test moves time forward).
+    skew: Arc<AtomicU64>,
 }
 
 impl Host {
@@ -93,13 +96,15 @@ impl Host {
         Host {
             core: Arc::new(Mutex::new(HostCore::new(log, clock.now, &seed, sessions))),
             started: Instant::now(),
+            skew: Arc::default(),
         }
     }
 
-    /// The host's clock now (real time since the start, from `WALL`).
-    fn sync(core: &mut HostCore, started: Instant) {
+    /// The host's clock now (real time since the start, from `WALL`, plus
+    /// the wall clock's skew).
+    fn sync(core: &mut HostCore, started: Instant, skew: &AtomicU64) {
         let elapsed = started.elapsed().as_millis() as u64;
-        core.now.wall_ms = WALL + elapsed;
+        core.now.wall_ms = WALL + elapsed + skew.load(Ordering::SeqCst);
         core.now.mono_ms = 1_000 + elapsed;
     }
 
@@ -108,17 +113,24 @@ impl Host {
     fn serve(&self, listener: TcpListener) {
         let core = self.core.clone();
         let started = self.started;
+        let skew = self.skew.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 let core = core.clone();
-                thread::spawn(move || serve_one(stream, core, started));
+                let skew = skew.clone();
+                thread::spawn(move || serve_one(stream, core, started, skew));
             }
         });
     }
 }
 
-fn serve_one(stream: TcpStream, core: Arc<Mutex<HostCore>>, started: Instant) {
+fn serve_one(
+    stream: TcpStream,
+    core: Arc<Mutex<HostCore>>,
+    started: Instant,
+    skew: Arc<AtomicU64>,
+) {
     let (tx, rx) = mpsc::channel();
     let mut reader = stream.try_clone().unwrap();
     thread::spawn(move || {
@@ -137,7 +149,7 @@ fn serve_one(stream: TcpStream, core: Arc<Mutex<HostCore>>, started: Instant) {
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         let mut core = core.lock().unwrap();
-        Host::sync(&mut core, started);
+        Host::sync(&mut core, started, &skew);
         let out = match frame {
             Some(f) => conn.on_frame(&mut core, &f),
             None => {
@@ -318,6 +330,10 @@ fn kotlin_phone_and_wasm_browser_use_the_host_over_tcp() {
         "renew interrupt approval rule_revoke stop terminal chat"
     );
     assert_eq!(next("phone", "RELEASED"), "lease_released");
+    assert_eq!(
+        next("phone", "POLICY"),
+        "committed committed current ready=true"
+    );
     let grant = next("phone", "GRANT");
     writeln!(browser_in, "GRANT {grant}").unwrap();
     browser_in.flush().unwrap();
@@ -337,6 +353,7 @@ fn kotlin_phone_and_wasm_browser_use_the_host_over_tcp() {
         next("browser", "REQUESTS"),
         "renew interrupt:forbidden release"
     );
+    assert_eq!(next("browser", "POLICY"), "get:forbidden");
     next("phone", "READY_FOR_PUSH");
     next("browser", "READY_FOR_PUSH");
 
@@ -353,7 +370,7 @@ fn kotlin_phone_and_wasm_browser_use_the_host_over_tcp() {
     // relay, which forwards the message to the phone and the browser.
     let message = {
         let mut core = host.core.lock().unwrap();
-        Host::sync(&mut core, host.started);
+        Host::sync(&mut core, host.started, &host.skew);
         core.open_approval(
             SES_A,
             APPROVAL,
@@ -404,4 +421,99 @@ fn kotlin_phone_and_wasm_browser_use_the_host_over_tcp() {
     assert_eq!(host.core.lock().unwrap().log.head().seq, 7);
     assert!(phone.0.wait().unwrap().success());
     assert!(browser.0.wait().unwrap().success());
+}
+
+/// A Node bot (the WASM build, its service key in a `SoftwareKeyStore`)
+/// as `svc-discord` (§R9.6: hosts `host-a`, projects ses-a's hash, ops
+/// `interrupt`, `prompt`, `view`; E5) against the host, over loopback TCP.
+///
+/// Proves, through the binding:
+/// - admission: welcomed as `service:svc-discord`, client kind `service`,
+///   control+view, revision 9, head 6, the scope's ops in the welcome, and
+///   `authorization_ms_left` bounded by the expiry;
+/// - the registry shows only ses-a (ses-b's project isn't in the scope);
+/// - inside the ops: a lease, a prompt and an interrupt complete;
+/// - outside them: an approval answer, a stop and a terminal input are
+///   `forbidden` at the host; ses-b, named with a hand-made binding, is
+///   `unknown_session`;
+/// - expiry: the host's clock passes `expires_at`, its timer fences the
+///   attachment (`unauthorized` "expired") and a new connection is refused
+///   with the same error and `next` = stop.
+///
+/// A host outside `scope.hosts` is a host-side check the runtime's tests
+/// cover (`tests/r9_services_binary.rs`): this host is `host-a`.
+#[test]
+#[ignore = "needs the built bindings: scripts/check-atem-client-bindings.sh e2e"]
+fn wasm_bot_is_admitted_as_a_service_within_its_scope_until_it_expires() {
+    let node = env("ATEM_E2E_NODE");
+    let wasm_pkg = env("ATEM_E2E_WASM_PKG");
+    let bot_js = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bindings/js/bot.mjs");
+
+    let host = Host::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    host.serve(listener);
+    let expires_at = host
+        .core
+        .lock()
+        .unwrap()
+        .log
+        .member("svc-discord")
+        .and_then(|m| match &m.member.kind {
+            atem_client::membership::MemberKind::Service { expires_at, .. } => Some(*expires_at),
+            _ => None,
+        })
+        .expect("svc-discord is a service");
+
+    let (tx, rx) = mpsc::channel::<(&'static str, String)>();
+    let mut bot = Kill(
+        Command::new(&node)
+            .arg(&bot_js)
+            .arg(&wasm_pkg)
+            .arg(fixtures())
+            .arg(host_port.to_string())
+            .arg(WALL.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("node"),
+    );
+    lines("bot", &mut bot.0, tx);
+    let mut bot_in = bot.0.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let next = |prefix: &str| -> String {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (_, line) = rx
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("timed out waiting for bot {prefix}"));
+            if line.starts_with("FAIL") || line == "<eof>" {
+                panic!("bot: {line} (waiting for {prefix})");
+            }
+            if let Some(rest) = line.strip_prefix(prefix) {
+                return rest.trim().to_owned();
+            }
+        }
+    };
+
+    assert_eq!(
+        next("WELCOME"),
+        "service:svc-discord service control,view 9 6 interrupt,prompt,view"
+    );
+    assert_eq!(next("SESSIONS"), SES_A);
+    assert_eq!(next("IN_SCOPE"), "prompt:completed interrupt:completed");
+    assert_eq!(
+        next("REFUSED "),
+        "approval:forbidden stop:forbidden terminal:forbidden out_of_scope:unknown_session"
+    );
+    next("READY_FOR_EXPIRY");
+    // The host's wall clock jumps past the expiry; its next tick fences.
+    let now = WALL + host.started.elapsed().as_millis() as u64;
+    host.skew.store(expires_at - now + 1_000, Ordering::SeqCst);
+    writeln!(bot_in, "EXPIRED").unwrap();
+    bot_in.flush().unwrap();
+    assert_eq!(next("FENCED"), "unauthorized expired");
+    assert_eq!(next("REFUSED_AGAIN"), "unauthorized expired");
+    next("DONE");
+    assert!(bot.0.wait().unwrap().success());
 }

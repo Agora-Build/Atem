@@ -338,6 +338,9 @@ pub fn refusal(re: Option<String>) -> String {
 /// The detail of the refusal of an op removed in atem-session r6.
 pub const REMOVED_OP: &str = "removed in atem-session r6";
 
+/// The detail of the refusal of a plaintext relay-only message (§R9.8a).
+pub const REMOVED_POLICY_OP: &str = "removed: relay only is set inside an r9 channel (host_policy_set)";
+
 /// A session `error{code}` answering `re`.
 pub fn error_text(re: Option<String>, code: ErrorCode) -> String {
     error_detail_text(re, code, None)

@@ -10,11 +10,8 @@ use crate::paths::PairingPaths;
 use atem_client::canonical::StrictValue;
 use atem_client::encoding::Hash32;
 use atem_client::keys::{Alg, PublicKey};
-use atem_client::membership::{Entry, HostNow, Membership};
+use atem_client::membership::{Entry, HostNow, MAX_ENTRIES, Membership};
 use serde_json::Value;
-
-/// Largest log a pairing carries (§R9.2 log limit).
-const MAX_ENTRIES: usize = 1024;
 
 /// What the ceremony learned about this host and the account.
 pub struct PairingInputs<'a> {
@@ -46,7 +43,7 @@ pub fn verify_pairing_log(
         .and_then(|m| m.get("entries"))
         .and_then(Value::as_array)
         .ok_or("Astation sent no device list (an r9 Astation is required)")?;
-    if entries.is_empty() || entries.len() > MAX_ENTRIES {
+    if entries.is_empty() || entries.len() as u64 > MAX_ENTRIES {
         return Err(format!(
             "the device list must hold 1 to {MAX_ENTRIES} entries"
         ));

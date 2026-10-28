@@ -24,6 +24,18 @@ use crate::memory::device_keys::decode32;
 pub const MISSING_KEY: &str =
     "this account requires encryption; connect to Astation to receive the encryption key";
 
+/// The agent's refusal of a kid it doesn't hold (neither current nor a
+/// retained previous generation): `"<NOT_RETAINED> <kid>"`. The runtime's
+/// project scopes drop every cached hash under that kid on it
+/// (`runtime::project_scope`), so the text is matched, never reworded
+/// apart from this constant.
+pub const NOT_RETAINED: &str = "no retained key";
+
+/// The refusal while the account's signed state has encryption off: no
+/// `e1.`/`h1.` operation runs. Project scopes drop their cached hashes on
+/// it (fail closed, as a fresh runtime would leave those sessions out).
+pub const ENCRYPTION_OFF: &str = "encryption is off for this account";
+
 #[derive(Clone)]
 pub struct AccountKey {
     pub kid: String,
@@ -49,7 +61,10 @@ pub type SignedModes = BTreeMap<String, Option<(EncryptionMode, Option<String>)>
 
 impl AccountKeys {
     pub fn migration_proof(&self, account: &str, kid: &str, input: &[u8]) -> Result<[u8; 32]> {
-        let ring = self.rings.get(account).filter(|ring| ring.current.kid == kid)
+        let ring = self
+            .rings
+            .get(account)
+            .filter(|ring| ring.current.kid == kid)
             .ok_or_else(|| anyhow!(MISSING_KEY))?;
         let mut derived = Zeroizing::new([0u8; 32]);
         hkdf::Hkdf::<Sha256>::new(None, &ring.current.key[..])
@@ -148,7 +163,7 @@ impl AccountKeys {
         ops: Vec<CryptOp>,
     ) -> Result<Vec<CryptOut>> {
         if mode == EncryptionMode::Off {
-            bail!("encryption is off for this account");
+            bail!(ENCRYPTION_OFF);
         }
         let ring = self
             .rings
@@ -189,7 +204,7 @@ impl AccountKeys {
                             .previous
                             .iter()
                             .find(|key| key.kid == kid)
-                            .ok_or_else(|| anyhow!("no retained key {kid}"))?,
+                            .ok_or_else(|| anyhow!("{NOT_RETAINED} {kid}"))?,
                     };
                     Ok(CryptOut::Hashed(keyed_hash(key, &value)))
                 }
@@ -624,11 +639,96 @@ mod tests {
         assert!(previous.starts_with(&format!("h1.{KID}.")), "{previous}");
         assert!(current.starts_with("h1.4567cdef."), "{current}");
         assert_eq!(hash(Some("4567cdef")).unwrap(), current);
-        assert!(hash(Some("89abcdef")).is_err());
+        // The texts the runtime's project scopes match (`NOT_RETAINED`,
+        // `ENCRYPTION_OFF`): built from the shared constants.
+        let refused = hash(Some("89abcdef")).unwrap_err().to_string();
+        assert_eq!(refused, format!("{NOT_RETAINED} 89abcdef"));
+        let off = keys
+            .crypt(
+                "acct",
+                EncryptionMode::Off,
+                Some("4567cdef"),
+                vec![CryptOp::keyed_hash(b"x")],
+            )
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(off, ENCRYPTION_OFF);
         // The wire form stays the old one without a kid.
         assert_eq!(
             serde_json::to_string(&CryptOp::keyed_hash_under(b"hi", KID)).unwrap(),
             format!(r#"{{"keyed_hash":{{"value":"aGk=","kid":"{KID}"}}}}"#)
+        );
+    }
+
+    /// The shared core's project-hash helper (`atem_client::project`, what
+    /// a manager uses to draft a service `projects` scope, §R9.6) makes
+    /// exactly the hash the cred agent compares: the session's launch
+    /// project key (`project_key_for`) HMAC'd under the named generation.
+    #[test]
+    fn the_shared_core_project_hash_is_the_agents() {
+        let mut keys = keys_with(KID, 7);
+        keys.install("acct", "4567cdef", Zeroizing::new([8; 32]));
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            )
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:Agora-Build/Atem.git",
+        ]);
+        let plain = tempfile::tempdir().unwrap();
+        let in_repo = crate::memory::project::project_key_for(repo.path());
+        let local = crate::memory::project::project_key_for(plain.path());
+        assert_eq!(in_repo, "github.com/agora-build/atem");
+        assert!(local.starts_with("local:"), "{local}");
+        for project_key in [in_repo.as_str(), local.as_str(), "github.com/agora/atem"] {
+            for (kid, byte) in [(KID, 7u8), ("4567cdef", 8)] {
+                let agent = keys
+                    .crypt(
+                        "acct",
+                        EncryptionMode::Enabling,
+                        Some("4567cdef"),
+                        vec![CryptOp::keyed_hash_under(project_key.as_bytes(), kid)],
+                    )
+                    .unwrap()
+                    .remove(0)
+                    .into_text()
+                    .unwrap();
+                let core = atem_client::project::project_hash(
+                    &atem_client::backup::BackupKey {
+                        kid: kid.into(),
+                        k: Zeroizing::new([byte; 32]),
+                    },
+                    project_key,
+                )
+                .unwrap();
+                assert_eq!(core, agent, "{project_key} under {kid}");
+                assert!(atem_client::project::is_project_hash(&core));
+            }
+        }
+        assert_eq!(
+            atem_client::project::project_hash(
+                &atem_client::backup::BackupKey {
+                    kid: KID.into(),
+                    k: Zeroizing::new([7; 32]),
+                },
+                "github.com/agora/atem"
+            )
+            .unwrap(),
+            H1_VECTOR
         );
     }
 

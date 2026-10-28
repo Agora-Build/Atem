@@ -20,6 +20,8 @@
 //!   session-v1 machines as one byte-in/byte-out object
 //!   ([`connection::ClientConnection`]); the app owns the socket and the
 //!   clock;
+//! - [`service`]: service member builders (`add`/`set_roles` action JSON,
+//!   renewal, narrowing) and the `projects` scope hash (§R9.6);
 //! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
@@ -44,6 +46,7 @@ pub mod log;
 pub mod provider;
 pub mod publish;
 pub mod push;
+pub mod service;
 pub mod types;
 #[cfg(feature = "wasm")]
 pub mod wasm;

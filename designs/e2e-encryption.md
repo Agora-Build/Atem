@@ -107,7 +107,7 @@ holding `K` never opens a credential.
 
 | Key | Type | Purpose | Held by |
 |---|---|---|---|
-| Account key `K` | 256-bit random, short id `kid` | Root of memory, skills and vault encryption; used only through HKDF subkeys | Astation Keychain; every verified device, sealed |
+| Account key `K` | 256-bit random, short id `kid` | Root of memory, skills and vault encryption: the AEAD key of `e1.` fields and the HMAC key of `h1.` hashes (directly, see below) | Astation Keychain; every verified device, sealed |
 | Scope key | 256-bit random, one per credential scope | Encrypts the credential values of one project (or global) | Astation Keychain; granted devices, sealed |
 | Index key | 256-bit random | HMACs credential names and project keys, so the relay can look up rows without learning names | Astation Keychain; every verified device, sealed |
 | Signing key | P-256, Secure Enclave, generation `sign_gen` | Signs every grant, mode change, device certificate, revocation list, credential row and manifest | Astation only; atems pin the public half |
@@ -118,15 +118,26 @@ holding `K` never opens a credential.
 | Storage key | 256-bit random, one per device, replaced at every unlock | Seals `device_keys.sealed` on disk | Astation Keychain only; agent memory while unlocked |
 | Recovery secret `R` | 256-bit random | Root of recovery. See "Recovery kit" | The recovery kit only |
 
-Subkeys, so no key is used for two jobs:
+How `K` is used (as built; the subkey separation an earlier draft of
+this design described was never implemented):
 
 ```
-K_enc     = HKDF-SHA256(K, info = "atem-k-enc-v1")       # AEAD for memory, skills, vault
-K_project = HKDF-SHA256(K, info = "atem-k-project-v1")   # HMAC of memory project keys
-K_dedupe  = HKDF-SHA256(K, info = "atem-k-dedupe-v1")    # HMAC content_hash
+e1. field = XChaCha20-Poly1305 under K itself            # memory, skills, vault
+h1. hash  = HMAC-SHA256 under K itself                   # memory/skill project keys, content_hash,
+                                                         #   service `projects` scopes (§R9.6)
+migration proof key = HKDF-SHA256(K, info = "atem-migration-proof-v1")
 I_name    = HKDF-SHA256(index_key, info = "atem-idx-name-v1")
 I_scope   = HKDF-SHA256(index_key, info = "atem-idx-scope-v1")
 ```
+
+`K` thus keys both an AEAD and an HMAC (different primitives, no known
+interaction; finding 13 below). Changing either to a derived subkey would
+change every stored `e1.` ciphertext and `h1.` hash (relay rows, project
+names, service scopes) and needs a migration. The one definition of the
+`h1.` project hash outside the cred agent is `atem_client::project`
+(`project_hash`, `project_hash_from_mac`; designs/protocol/atem-client-bindings.md
+"Service members"), checked equal to the agent's by
+`memory::account_keys::tests::the_shared_core_project_hash_is_the_agents`.
 
 ```mermaid
 flowchart TB
@@ -871,13 +882,13 @@ data becomes readable on the server again):
 | Data | Encrypted | Stays plain (the relay needs it) |
 |---|---|---|
 | Memory | `content` | id, scope, machine, confidence, source, timestamps, validity, seq |
-| Memory | | `project`: `HMAC(K_project, key)` |
-| Memory | | `content_hash` becomes `HMAC(K_dedupe, content)` |
+| Memory | | `project`: `h1.` = `HMAC-SHA256(K, key)` |
+| Memory | | `content_hash` becomes `h1.` = `HMAC-SHA256(K, content)` |
 | Skill | every file's bytes, and file paths | name, scope, project (HMAC), version, timestamps |
 | Vault | entry `content`, `summary` | vault id, entry number, version, writer, timestamps |
 
 - **Format.** `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305
-  under `K_enc` with a random 24-byte nonce. The associated data binds the
+  under `K` with a random 24-byte nonce. The associated data binds the
   record id, field name, scope, project HMAC, and the version or vault
   entry number, so the relay can't move a ciphertext to another record,
   field, project or entry.
@@ -890,7 +901,7 @@ data becomes readable on the server again):
   invalidated fact, and a revoked device can't write.
 - **No going back.** atem never replaces a record it holds with an older
   version or an earlier validity state.
-- **Project keys** would reveal repo names. `HMAC(K_project, key)` keeps
+- **Project keys** would reveal repo names. `HMAC-SHA256(K, key)` keeps
   per-project filtering working; atem keeps the hash → name mapping
   locally.
 - **`content_hash`** is what the relay dedupes on. A plain SHA-256 of a
@@ -1275,7 +1286,7 @@ project `…/a/bc` + name `d`).
 
 | Use | Format | Bound to |
 |---|---|---|
-| Memory / skill / vault field | `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 under `K_enc` | `enc("atem-mem-field-v1", record id, field, scope, project_hmac, version or entry number)` |
+| Memory / skill / vault field | `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 under `K` | `enc("atem-mem-field-v1", record id, field, scope, project_hmac, version or entry number)` |
 | Memory write signature | Ed25519, device signing key | `atem-mem-write-v1` |
 | Credential value | `c1.<scope_kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 | `enc("atem-cred-v1", account, scope_hmac, kid, name_hmac, version)` |
 | Credential display name | same, under the scope key | `enc("atem-cred-name-v1", account, scope_hmac, name_hmac)` |
@@ -1285,7 +1296,7 @@ project `…/a/bc` + name `d`).
 | `device_keys.sealed` | JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`; XChaCha20-Poly1305 under the 32-byte storage key; plaintext is the device key, the device signing key and (step 2b) `account_keys`, per account the current kid and key and the previous keys; the payload `version` is 2 when `account_keys` is present, else 1 (the unlock-auth key lives in its own 0600 file `unlock_auth_key`) | AAD `enc("atem-device-keys-v1", device_id, storage_kid)` |
 | Credential names | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
 | Credential scopes | `HMAC-SHA256(I_scope, project_key)` | — |
-| Memory projects | `HMAC-SHA256(K_project, project_key)` | — |
+| Memory projects (and service `projects` scopes) | `h1.<kid>.<hex HMAC-SHA256(K, project_key)>` | — |
 | Astation signatures | P-256 ECDSA (Secure Enclave), SHA-256, carried as fixed 64-byte `r ‖ s`; Astation converts from the Enclave's DER and normalizes to low-S; atem rejects high-S | the statement's encoding |
 | Device, unlock-auth and recovery signatures | Ed25519, 64 bytes | the statement's encoding |
 | Safety code | `base32(SHA-256(enc("atem-safety-code-v2", device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, genesis_hash, nonce_a, nonce_s)))[:12]` after commit-then-reveal; `astation_sign_pub` is the 65-byte uncompressed point | — |
@@ -1330,7 +1341,7 @@ and in the shipped #36 code; the design above includes every fix.
 | 10 | medium | Backup blob lacked pins and revocations and could be rolled back | Versioned blob with pins, revocations, baselines; atems report the highest version |
 | 11 | medium | Clone detected only at the real box's next reboot | Ticket rolls every 15 minutes, crash-safe ("Unlock policy") |
 | 12 | medium | Revocation left `K`, index key and pairing session | Revocation kills the session and rotates all three ("Revoking a device") |
-| 13 | low | Ambiguous concatenation, `K` reused for AEAD and HMAC, unauthenticated display names, unspecified signature encoding | Length-prefixed encoding, HKDF subkeys, bound display name, low-S `r ‖ s` ("Formats") |
+| 13 | low | Ambiguous concatenation, `K` reused for AEAD and HMAC, unauthenticated display names, unspecified signature encoding | Length-prefixed encoding, bound display name, low-S `r ‖ s` ("Formats"); HKDF subkeys for the index key and the migration proof only: `K` itself still keys both `e1.` and `h1.` (not changed: it would re-key every stored value) |
 | 14 | low | Pre-encryption plain text survives in old database backups | Stated in the threat model and "Moving existing data over" |
 
 Findings 1, 4 and 5 affect code already shipped in #36. No account is

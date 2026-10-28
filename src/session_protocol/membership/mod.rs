@@ -84,7 +84,8 @@ use atem_client::encoding::Hash32;
 use atem_client::membership::entry::{Action, Member, MemberKind, Role};
 use atem_client::membership::stored::{freeze_to_json, parse_freeze};
 use atem_client::membership::{
-    Admission, Effect as Change, Evaluation, Head, HostNow, Membership, RecoveryState,
+    Admission, Capacity, CapacityLevel, Effect as Change, Evaluation, Head, HostNow, Membership,
+    RecoveryState,
 };
 use serde_json::{Map, Value, json};
 use std::path::Path;
@@ -100,13 +101,15 @@ const EVIDENCE_PERSIST_MS: u64 = 60_000;
 const CHECKPOINT_MS: u64 = 60_000;
 /// r9 files that exist only with a device list (§R9.3): one of them
 /// without `membership.json` is a damaged or half-removed list.
-const LEFTOVERS: [DlFile; 7] = [
+const LEFTOVERS: [DlFile; 9] = [
     DlFile::Carriage,
     DlFile::Intent,
     DlFile::Freeze,
     DlFile::Fault,
     DlFile::FaultMirror,
     DlFile::HostChannelKey,
+    DlFile::HostPolicy,
+    DlFile::HostPolicyPending,
     DlFile::Applied,
 ];
 /// A device-list write fault is recorded: `membership.fault` or its mirror
@@ -431,6 +434,108 @@ fn log(line: &str) {
     eprintln!("atem runtime: device list: {line}");
 }
 
+/// The device list's use of its limits for `atem status` (D23): `N/1024
+/// entries, M/256 members, H/64 hosts`, then what each limit at nearly
+/// full or full means.
+pub fn capacity_text(c: &Capacity) -> String {
+    let mut text = format!(
+        "{}/{} entries, {}/{} members, {}/{} hosts",
+        c.entries, c.max_entries, c.members, c.max_members, c.hosts, c.max_hosts
+    );
+    for (_, _, warning) in limits(c) {
+        if let Some(warning) = warning {
+            text.push_str("; ");
+            text.push_str(warning);
+        }
+    }
+    text
+}
+
+/// Each limit: its name, level and what that level means (`None` below
+/// 90 %). Advisory: the host still accepts every valid entry. A full
+/// member list (and a full log) also refuses a Recovery Kit's
+/// `recovery_add`, so the texts ask for a free place for it.
+fn limits(c: &Capacity) -> [(&'static str, CapacityLevel, Option<&'static str>); 3] {
+    use CapacityLevel::{Full, NearlyFull, Ok};
+    let entries = c.entries_level();
+    let members = c.members_level();
+    let hosts = c.hosts_level();
+    [
+        (
+            "entries",
+            entries,
+            match entries {
+                Ok => None,
+                NearlyFull => Some(
+                    "entries nearly full: renewals use one entry each; a full list needs re-pairing",
+                ),
+                Full => Some(
+                    "entries full: no device can be added, renewed or removed and a Recovery Kit can't recover the account; a full list needs re-pairing",
+                ),
+            },
+        ),
+        (
+            "members",
+            members,
+            match members {
+                Ok => None,
+                NearlyFull => Some(
+                    "members nearly full: remove expired or unused services so a place stays free for a Recovery Kit",
+                ),
+                Full => Some(
+                    "members full: no device can be added and a Recovery Kit can't recover the account; remove expired or unused services",
+                ),
+            },
+        ),
+        (
+            "hosts",
+            hosts,
+            match hosts {
+                Ok => None,
+                NearlyFull => Some("hosts nearly full: remove hosts no longer used"),
+                Full => Some("hosts full: remove a host before adding one"),
+            },
+        ),
+    ]
+}
+
+/// `members nearly full, hosts full`: the limits `pick` names.
+fn limit_names(c: &Capacity, pick: impl Fn(usize, CapacityLevel) -> bool) -> Option<String> {
+    let names: Vec<String> = limits(c)
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, level, _))| pick(*i, *level))
+        .map(|(_, (name, level, _))| format!("{name} {}", level_words(*level)))
+        .collect();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
+fn level_words(level: CapacityLevel) -> &'static str {
+    match level {
+        CapacityLevel::Ok => "ok",
+        CapacityLevel::NearlyFull => "nearly full",
+        CapacityLevel::Full => "full",
+    }
+}
+
+/// The runtime.log line when a committed change moves a limit into nearly
+/// full or full (not on every commit, nor when it gets emptier), naming
+/// the limits that crossed.
+fn capacity_crossing(before: &Capacity, after: &Capacity) -> Option<String> {
+    let was = limits(before);
+    let crossed = limit_names(after, |i, level| {
+        level > was[i].1 && level != CapacityLevel::Ok
+    })?;
+    Some(format!("{crossed}: {}", capacity_text(after)))
+}
+
+/// The runtime.log line when a list opens (a start, or the reopen after a
+/// pin) already at nearly full or full.
+fn capacity_at_open(c: &Capacity) -> Option<String> {
+    let names = limit_names(c, |_, level| level != CapacityLevel::Ok)?;
+    Some(format!("opened with {names}: {}", capacity_text(c)))
+}
+
 /// What a failed step makes uncertain: which principals it would fence.
 struct Scope {
     /// These principals, each with its own reason and entry.
@@ -750,6 +855,9 @@ impl MembershipHost {
             log(&format!(
                 "held ({held:?}): remote access waits for a managing device"
             ));
+        }
+        if let Some(line) = capacity_at_open(&host.m.capacity()) {
+            log(&line);
         }
         Ok(Some((host, fenced)))
     }
@@ -1130,6 +1238,9 @@ impl MembershipHost {
             self.evidence_written_at = Some(now.mono_ms);
         }
         self.evidence_dirty = false;
+        if let Some(line) = capacity_crossing(&self.m.capacity(), &eval.next.capacity()) {
+            log(&line);
+        }
         self.m = eval.next.clone();
         if self.crash_now() {
             return CarriageResult {
@@ -2070,13 +2181,18 @@ pub fn peek_pin_genesis(pairing: &PairingPaths) -> Option<(String, HostPin, Stri
 
 /// The device list as the files say, read without writing anything (for
 /// `atem status` with no runtime running): `None` without any r9 file;
-/// else (state, what it means, pending recoveries as (subject, action,
-/// effective_at)). A held state is told by the files that hold it (the
-/// runtime decides at its start).
+/// else (state, what it means, its capacity when it could be read, pending
+/// recoveries as (subject, action, effective_at)). A held state is told by
+/// the files that hold it (the runtime decides at its start).
 #[allow(clippy::type_complexity)]
 pub fn passive_status(
     pairing: &PairingPaths,
-) -> Option<(&'static str, String, Vec<(String, String, u64)>)> {
+) -> Option<(
+    &'static str,
+    String,
+    Option<Capacity>,
+    Vec<(String, String, u64)>,
+)> {
     if !has_device_list_files(pairing) {
         return None;
     }
@@ -2085,6 +2201,7 @@ pub fn passive_status(
         return Some((
             "failed",
             format!("failed (device-list files without the list); {REPAIR}"),
+            None,
             Vec::new(),
         ));
     }
@@ -2100,9 +2217,11 @@ pub fn passive_status(
                 "failed ({} is damaged); {REPAIR}",
                 pairing.membership.display()
             ),
+            None,
             Vec::new(),
         ));
     };
+    let capacity = Some(m.capacity());
     let now = host_now();
     let pending = m
         .pending_recovery(&now)
@@ -2116,6 +2235,7 @@ pub fn passive_status(
         return Some((
             "frozen",
             format!("frozen (conflicting signed history); {REPAIR}"),
+            capacity,
             pending,
         ));
     }
@@ -2126,6 +2246,7 @@ pub fn passive_status(
         return Some((
             "held",
             "held (a device-list write fault is recorded); remote access waits until a managing device connects to reconcile".into(),
+            capacity,
             pending,
         ));
     }
@@ -2136,10 +2257,16 @@ pub fn passive_status(
                 "pinned at seq {}; an unfinished device-list write is replayed at the next start (only one that can't be reconciled then waits for a managing device)",
                 m.head().seq
             ),
+            capacity,
             pending,
         ));
     }
-    Some(("open", format!("pinned at seq {}", m.head().seq), pending))
+    Some((
+        "open",
+        format!("pinned at seq {}", m.head().seq),
+        capacity,
+        pending,
+    ))
 }
 
 /// The latest wall time a pinned device list vouches for (§R9.6): its

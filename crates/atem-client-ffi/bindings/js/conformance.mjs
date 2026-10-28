@@ -5,6 +5,7 @@
 // Swift (bindings/swift/Tests/…/ConformanceTests.swift).
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
 import { join, resolve } from "node:path";
 
 const [pkgDir, fixturesDir] = process.argv.slice(2).map((p) => resolve(p));
@@ -214,6 +215,88 @@ check("draft + publish reproduces E7 byte for byte (RFC 6979)", () => {
 });
 check("a draft the verifier would refuse is refused before signing", () => {
   throwsCode(() => logL().draftEntry("dev-phone", 1, str({ action: "remove" })), "membership_invalid");
+});
+
+check("capacity and the service change guard (D23)", () => {
+  const log = logL();
+  eq(log.capacity(), { entries: 6, maxEntries: 1024, members: 3, maxMembers: 256, hosts: 1, maxHosts: 64, level: "ok", entriesLevel: "ok", membersLevel: "ok", hostsLevel: "ok" });
+  const e5 = byLabel.E5.entry.body;
+  const svc = e5.member;
+  const at = e5.signed_at;
+  const day = 86400000;
+  const change = (ops, expiresAt) => str({ action: "set_roles", device_id: "svc-discord", roles: ["service"], scope: { ...svc.scope, ops }, expires_at: expiresAt });
+  const renew = change(svc.scope.ops, svc.expires_at + day);
+  eq(log.checkChange(renew, at + 3600000), { type: "service_change_too_soon", lastSignedAt: at, retryAt: at + day }, "a renewal within 24 h");
+  eq(log.checkChange(renew, at + day), null, "after 24 h");
+  eq(log.checkChange(change(["view"], svc.expires_at), at + 3600000), null, "narrowing");
+  eq(log.checkChange(str({ action: "remove", device_id: "svc-discord" }), at + 3600000), null, "removal");
+  const hostKey = byLabel.E2.entry.body.host.host_key;
+  eq(log.checkChange(str({ action: "add_host", host: { host_id: "host-b", host_trust_gen: 1, host_key: hostKey } }), at), null, "a host with room");
+  throwsCode(() => log.checkChange(str({ action: "remove" }), at), "membership_invalid");
+});
+
+check("service builders: add, set_roles, renewal, narrowing (§R9.6)", () => {
+  const log = logL();
+  const e5 = byLabel.E5.entry.body;
+  const svc = e5.member;
+  const at = e5.signed_at;
+  const day = 86400000;
+  const svcKey = unhex(keys["svc-discord"].auth.pub_hex);
+  // E5's member, rebuilt from its parts in another order: the vector's bytes.
+  const shuffled = { hosts: svc.scope.hosts, projects: [...svc.scope.projects].reverse(), ops: ["prompt", "interrupt"] };
+  eq(m.serviceAddAction("svc-discord", "ed25519", svcKey, shuffled, svc.expires_at, at), m.canonicalJson(str({ action: "add", member: svc })));
+  eq(log.serviceGrant("svc-discord"), { scope: { hosts: svc.scope.hosts, projects: svc.scope.projects, sessions: null, ops: svc.scope.ops }, expiresAt: svc.expires_at });
+  eq(log.serviceGrant("dev-phone") ?? null, null);
+  const newSvc = m.serviceAddAction("svc-new", "ed25519", svcKey, { hosts: ["host-a"], ops: ["prompt"], sessions: ["ses-bbbbbbbbbbbb", "ses-aaaaaaaaaaaa"] }, at + 3600000, at);
+  eq(JSON.parse(newSvc).member.scope, { hosts: ["host-a"], ops: ["prompt", "view"], sessions: ["ses-aaaaaaaaaaaa", "ses-bbbbbbbbbbbb"] });
+  log.draftEntry("dev-phone", at, newSvc);
+  eq(log.checkChange(newSvc, at), null, "an add with room");
+  const change = (ops, expiresAt) => m.canonicalJson(str({ action: "set_roles", device_id: "svc-discord", roles: ["service"], scope: { ...svc.scope, ops }, expires_at: expiresAt }));
+  const renew = log.serviceRenewalAction("svc-discord", svc.expires_at + day, at + day);
+  eq(renew, change(svc.scope.ops, svc.expires_at + day), "renewal");
+  eq(log.checkChange(renew, at + 3600000), { type: "service_change_too_soon", lastSignedAt: at, retryAt: at + day }, "a renewal is paced");
+  const narrow = log.serviceNarrowingAction("svc-discord", { ...svc.scope, ops: ["view"] }, null, at + 3600000);
+  eq(narrow, change(["view"], svc.expires_at), "narrowing");
+  eq(log.checkChange(narrow, at + 3600000), null, "a narrowing isn't paced");
+  eq(m.serviceSetRolesAction("svc-discord", { ...svc.scope, ops: ["view"] }, svc.expires_at, at), narrow);
+  throwsCode(() => log.serviceNarrowingAction("svc-discord", { ...svc.scope, ops: ["stop", "view"] }, null, at), "not_a_narrowing");
+  throwsCode(() => log.serviceNarrowingAction("svc-discord", svc.scope, null, at), "not_a_narrowing");
+  throwsCode(() => log.serviceRenewalAction("svc-discord", svc.expires_at, at), "not_a_renewal");
+  throwsCode(() => log.serviceRenewalAction("dev-phone", svc.expires_at + day, at), "not_a_service");
+  throwsCode(() => m.serviceSetRolesAction("svc-discord", { hosts: [], ops: ["view"] }, svc.expires_at, at), "bad_scope");
+  throwsCode(() => m.serviceSetRolesAction("svc-discord", { hosts: ["host-a"], ops: ["fly"] }, svc.expires_at, at), "bad_scope");
+  throwsCode(() => m.serviceSetRolesAction("svc-discord", { hosts: ["host-a"], ops: [] }, at + 90 * day + 1, at), "service_expiry");
+  throwsCode(() => m.serviceAddAction("svc-x", "x25519", unhex(keys["dev-phone"].enc.pub_hex), { hosts: ["host-a"], ops: [] }, at, at), "wrong_alg");
+});
+// r9_svc vectors: atem-client's own file (crates/atem-client/vectors),
+// next to the shared fixtures' repository.
+const svcFp = JSON.parse(readFileSync(join(fixturesDir, "../../../crates/atem-client/vectors/r9-svc-fingerprint.json"), "utf8"));
+check("service key fingerprint r9_svc (atem-client vectors)", () => {
+  for (const c of svcFp.valid) {
+    eq(hex(b64u(c.auth_key.pub)), c.pub_hex, c.case);
+    eq(m.serviceKeyFingerprint(c.auth_key.alg, b64u(c.auth_key.pub)), c.fingerprint, c.case);
+  }
+  for (const c of svcFp.invalid) throwsCode(() => m.serviceKeyFingerprint(c.auth_key.alg, b64u(c.auth_key.pub)), c.code);
+  const discord = svcFp.valid.find((c) => c.case.includes("svc-discord"));
+  eq(logL().serviceKeyFingerprint("svc-discord"), discord.fingerprint);
+  eq(logL().serviceKeyFingerprint("dev-phone") ?? null, null);
+});
+// The host's own vector (src/memory/account_keys.rs H1_VECTOR): h1. of
+// "github.com/agora/atem" under K = [7; 32], kid 0123abcd.
+const H1_VECTOR = "h1.0123abcd.777eda018c9c9736a84728e10308571167773f209924bf052477a1283cfd7cb6";
+check("project keys and hashes (§R9.6)", () => {
+  eq(m.projectKeyOfRemote("git@github.com:Agora-Build/Atem.git"), "github.com/agora-build/atem");
+  eq(m.projectKeyOfRemote("https://user:tok@github.com/Agora-Build/Atem.git/"), "github.com/agora-build/atem");
+  eq(m.projectKeyOfRemote("file:///srv/repo.git") ?? null, null);
+  eq(m.localProjectKey("Scratch"), "local:Scratch");
+  eq(hex(m.projectHashInput("github.com/agora/atem")), hex(utf8("github.com/agora/atem")));
+  eq(m.projectHash({ kid: "0123abcd", k: new Uint8Array(32).fill(7) }, "github.com/agora/atem"), H1_VECTOR);
+  const mac = createHmac("sha256", Buffer.alloc(32, 7)).update(m.projectHashInput("github.com/agora/atem")).digest();
+  eq(m.projectHashFromMac("0123abcd", new Uint8Array(mac)), H1_VECTOR);
+  throwsCode(() => m.projectHashFromMac("01.23", new Uint8Array(mac)), "malformed");
+  throwsCode(() => m.projectHashFromMac("0123abcd", new Uint8Array(31)), "malformed");
+  eq(m.isProjectHash(byLabel.E5.entry.body.member.scope.projects[0]), true);
+  eq(m.isProjectHash("h1.0123abcd.zz"), false);
 });
 
 // ---------------------------------------------------------------- recovery

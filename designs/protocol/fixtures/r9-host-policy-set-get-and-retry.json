@@ -1,0 +1,237 @@
+{
+  "name": "r9-host-policy-set-get-and-retry",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.8a: a native manager sets relay only inside its channel; the result answers the request's id with a fresh id, carries the request_id, the host's current policy (revision 1, durable) and the channel's binding (account, host, trust generation, head, channel, attachment). The other admitted manager hears host_policy_changed (never a confirmation) and its get reads it (current, no request_id); its reuse of the first manager's request_id is request_id_reused (a request is bound to its principal). The first manager reconnects on a new channel and retries: the same commit, re-wrapped for that channel; nothing is stored twice.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000,
+      "link": "relay"
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "mac2",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      }
+    ],
+    "connected": []
+  },
+  "steps": [
+    {
+      "connect": "mac",
+      "carry": []
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "welcome",
+        "revision": 9
+      },
+      "capture": {
+        "mac_channel": "channel_id",
+        "mac_att": "attachment_gen"
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": []
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9
+      },
+      "capture": {
+        "phone_channel": "channel_id",
+        "phone_att": "attachment_gen"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000901",
+          "request_id": "cccccccc-0000-4000-8000-000000000901",
+          "relay_only": true,
+          "expected_revision": 0
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000901",
+        "outcome": "committed",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "durable",
+        "channel_id": "${mac_channel}",
+        "attachment_gen": "${mac_att}",
+        "request_id": "cccccccc-0000-4000-8000-000000000901",
+        "account_id": "acct-test-1",
+        "atem_device_id": "host-a",
+        "host_trust_gen": 1,
+        "head.seq": 6,
+        "head.hash": "${hash:E6}"
+      }
+    },
+    {
+      "assert": {
+        "host_policy": {
+          "relay_only": true,
+          "revision": 1,
+          "pending": false
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "host_policy_changed",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "durable",
+        "channel_id": "${phone_channel}",
+        "attachment_gen": "${phone_att}"
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_get",
+          "id": "aaaaaaaa-0000-4000-8000-000000000902"
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000902",
+        "outcome": "current",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "durable",
+        "channel_id": "${phone_channel}",
+        "attachment_gen": "${phone_att}"
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000903",
+          "request_id": "cccccccc-0000-4000-8000-000000000901",
+          "relay_only": true,
+          "expected_revision": 0
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "error",
+        "re": "aaaaaaaa-0000-4000-8000-000000000903",
+        "code": "request_id_reused"
+      }
+    },
+    {
+      "connect": "mac2",
+      "carry": []
+    },
+    {
+      "expect": "mac2",
+      "match": {
+        "op": "welcome",
+        "revision": 9
+      },
+      "capture": {
+        "mac2_channel": "channel_id",
+        "mac2_att": "attachment_gen"
+      }
+    },
+    {
+      "send": "mac2",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000904",
+          "request_id": "cccccccc-0000-4000-8000-000000000901",
+          "relay_only": true,
+          "expected_revision": 0
+        }
+      }
+    },
+    {
+      "expect": "mac2",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000904",
+        "outcome": "committed",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "durable",
+        "channel_id": "${mac2_channel}",
+        "attachment_gen": "${mac2_att}",
+        "request_id": "cccccccc-0000-4000-8000-000000000901"
+      }
+    },
+    {
+      "assert": {
+        "host_policy": {
+          "relay_only": true,
+          "revision": 1,
+          "pending": false
+        }
+      }
+    }
+  ]
+}

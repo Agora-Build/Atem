@@ -294,7 +294,7 @@ impl EncryptionContext {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
-        let agent = self.agent.as_deref().ok_or_else(|| anyhow!("encryption is off for this account"))?;
+        let agent = self.agent.as_deref().ok_or_else(|| anyhow!(crate::memory::account_keys::ENCRYPTION_OFF))?;
         if let Some(op) = ops.iter().find(|op| op.wire_len() > CRYPT_OP_MAX_BYTES) {
             bail!("a field is too large to encrypt ({} bytes)", op.field_len());
         }

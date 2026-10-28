@@ -57,6 +57,11 @@ pub(super) struct Rig {
     pub projects: Option<crate::runtime::project_scope::ProjectScopes>,
     /// What Atem sent the relay (§R9.9), in order, not taken yet.
     pub relay: std::collections::VecDeque<Value>,
+    /// Frames the engine asked the link's write receipt for (§R9.8a).
+    pub receipts: usize,
+    /// A local link waits to close for relay only: as the runtime's pass,
+    /// the engine refuses new channels while it does (§R9.8a).
+    pub local_closing: bool,
     /// The relay takes nothing (its messages are lost).
     pub relay_down: bool,
 }
@@ -165,6 +170,8 @@ impl Rig {
             projects: None,
             relay: Default::default(),
             relay_down: false,
+            receipts: 0,
+            local_closing: false,
         }
     }
 
@@ -178,6 +185,7 @@ impl Rig {
         self.rt.apply(effects);
         self.route();
         self.engine.end_pass();
+        self.engine.set_refuse_opens(self.local_closing);
         out
     }
 
@@ -301,10 +309,13 @@ impl Rig {
             return;
         }
         let mut sent = Vec::new();
-        self.engine.flush(&mut |text| {
+        let mut receipts = 0;
+        self.engine.flush(&mut |text, receipt| {
+            receipts += usize::from(receipt);
             sent.push(text);
             true
         });
+        self.receipts += receipts;
         for text in sent {
             match envelope::parse(&text).expect("Atem sends valid envelopes") {
                 Event::Frame { channel, frame } => self.deliver_to_client(&channel, &frame),
@@ -377,7 +388,7 @@ impl Rig {
         self.send_frame(handle, frame);
     }
 
-    fn send_frame(&mut self, handle: &str, frame: &[u8]) {
+    pub fn send_frame(&mut self, handle: &str, frame: &[u8]) {
         let text = envelope::frame(handle, frame);
         self.run(|e, p| ((), e.on_envelope(&text, p)));
         self.pump();
@@ -1609,7 +1620,7 @@ fn a_backed_up_link_serves_the_channels_in_turn() {
     // them, not behind the busy one's twenty.
     let mut taken = Vec::new();
     let mut budget = 3;
-    rig.engine.flush(&mut |t| {
+    rig.engine.flush(&mut |t, _| {
         if budget == 0 {
             return false;
         }
@@ -1676,7 +1687,7 @@ fn backed_up_channels_share_the_link_equally() {
         let mut served: BTreeMap<String, usize> = BTreeMap::new();
         for _ in 0..(9 * channels / per_pass) {
             let mut budget = per_pass;
-            rig.engine.flush(&mut |t| {
+            rig.engine.flush(&mut |t, _| {
                 if budget == 0 {
                     return false;
                 }

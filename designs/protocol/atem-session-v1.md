@@ -1848,6 +1848,32 @@ a new member (or a new `add_host`).
 
 Log limits: ≤ 1024 entries, ≤ 256 members, ≤ 64 hosts. A full log is
 `membership_invalid` "device list full; re-pair to start a new one".
+
+*Capacity (non-normative, D23: no compaction).* Ids are never reused and
+every renewal or removal takes an entry, so signers pace themselves; the
+host accepts every valid entry regardless. The member limit counts
+members in effect and the subjects of pending `recovery_add`s (removed
+and cancelled ones free their place); the host limit counts current
+hosts. A list is *nearly full* at ≥ 90 % of any limit (922 entries, 231
+members, 58 hosts). A full member list (like a full log) also refuses a
+Recovery Kit's `recovery_add`, the account's way back after losing every
+managing device: keep expired or unused services removed so a place
+stays free. Signer guidance (`atem_client::membership::check_change`,
+`MembershipLog::check_change` in the bindings): draft nothing on a full
+log, no `add` or `recovery_add` with full members, no `add_host` of a
+new host with full hosts, and no service `set_roles` that grants
+anything new (a later `expires_at` included) within 24 h of that
+service's last grant (its `add`, or a `set_roles` that granted something
+new; a narrowing doesn't restart the clock) by `signed_at` (a product
+default, `SERVICE_CHANGE_MIN_INTERVAL_MS`); narrowing and `remove` are
+never paced. `signed_at` is the signers' own clock: the guard is
+advisory by design, never a verifier rule. Managing devices show a
+warning from nearly full (`MembershipLog::capacity`); `atem status`
+shows `N/1024 entries, M/256 members, H/64 hosts` and a warning per
+limit at nearly full or full; runtime.log gets one line naming the
+limits when a commit moves a limit into nearly full or full, and one
+when a list opens already there.
+
 Vectors: `r9-vectors-membership-log` (E1–E6 and the alternatives used
 by the scenarios); `r9-vectors-pairing` (`verifyCommit` and its
 `host_trust_gen` cases).
@@ -2582,7 +2608,7 @@ substitute chain `SUB1`–`SUB3`) and the kits in `r9-vectors-keys`
 
 | kind | proof | principal | permissions |
 |---|---|---|---|
-| `native` | member of kind `native` at Atem's head; `sig_c` by its `auth_key` | `member:<device_id>` | `view`; `control` if in its roles (`manage` gives the host nothing) |
+| `native` | member of kind `native` at Atem's head; `sig_c` by its `auth_key` | `member:<device_id>` | `view`; `control` if in its roles (`manage` gives the host nothing but the host policy, R9.8a) |
 | `service` | member of kind `service`, not expired, host in `scope.hosts`; `sig_c` by its `auth_key` | `service:<device_id>` | `view`; `control` if `scope.ops` has any of `prompt`, `interrupt`, `stop`, `terminal`, `approval`, `rule_revoke`; each op checked separately |
 | `browser` | grant (below) whose issuer is a native member with `control` at Atem's head; `sig_c` by the grant's `browser_key` | `browser:<grant_id>` (issuer recorded) | `view`; `control` if the grant's `ops` have a control op; never more than the issuer |
 | `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client) | — |
@@ -3155,15 +3181,204 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | `membership_head` | H→C | `head`, `pending_recovery` (event when Atem's head moves or a pending entry changes state; reply with `re`) |
 | `revoke_grant` | C→H | `grant_id` → `grant_revoked{re}` (issuer or a member with `control`) |
 | `approval_seen` | C→H | `binding` (read form: target + `attachment_gen`), `approval_id` → `seen{re}` (R9.9) |
+| `host_policy_set` | C→H | `request_id`, `relay_only`, `expected_revision` → `host_policy_result{re}` (R9.8a; native `manage`) |
+| `host_policy_get` | C→H | → `host_policy_result{re}` (R9.8a; native `manage`) |
+| `host_policy_result` | H→C | `re`, `request_id?`, `outcome`, `policy{relay_only, revision, state}`, `account_id`, `atem_device_id`, `host_trust_gen`, `head`, `channel_id`, `attachment_gen` (R9.8a) |
+| `host_policy_changed` | H→C | event: `policy`, `account_id`, `atem_device_id`, `host_trust_gen`, `head`, `channel_id`, `attachment_gen` (R9.8a; other manager attachments, after a commit) |
 
 - A `hello` without `revision: 9` gets `error{code:"unsupported_version",
   revision: 9}` and nothing else (as §A). Any session message outside a
   channel, or before `welcome`, is refused as before `welcome`.
 - `features`: the nine r8 features plus `membership.carry`,
-  `push.sealed`, `approval.seen`, `grant.revoke`, `recovery.wait`.
+  `push.sealed`, `approval.seen`, `grant.revoke`, `recovery.wait`,
+  `host.policy`.
 - One principal may have several attachments (a phone and its widget);
   each is fenced separately by `attachment_gen`, together by the
   principal's `control_gen`.
+
+### R9.8a Host policy: relay only (#99)
+
+A native member with `manage` can require this host to reach Astation only
+through its relay identity room, never a local/direct link (`relay_only`).
+The policy is set and read only inside an admitted `atem-ch1` channel, so
+neither a relay nor anything else outside the channel can read, forge or
+change it. There is **no plaintext form**: the outer messages
+`transportPolicy` / `transportPolicyAck` of earlier builds are removed.
+Atem answers them as removed ops (`unsupported_version`, no effect), and
+neither side treats them as a hint. A host without this feature has no
+relay-only policy, and a client treats it as not ready.
+
+Feature: `host.policy` in `welcome.features`.
+
+**Messages** (session family, `data.v: 1`, after `welcome`; they name the
+host, not a session; exact fields, nothing else):
+
+```json
+{"type":"session","data":{"v":1,"op":"host_policy_set","id":"<uuid v4>",
+ "request_id":"<uuid v4>","relay_only":true,"expected_revision":3}}
+{"type":"session","data":{"v":1,"op":"host_policy_get","id":"<uuid v4>"}}
+{"type":"session","data":{"v":1,"op":"host_policy_result","id":"<fresh uuid>","re":"<the request's id>",
+ "request_id":"<a set's>","outcome":"committed",
+ "policy":{"relay_only":true,"revision":4,"state":"durable"},
+ "account_id":"acct-test-1","atem_device_id":"host-a","host_trust_gen":1,
+ "head":{"seq":7,"hash":"<64 hex>"},"channel_id":"<the channel's>","attachment_gen":"<the attachment's>"}}
+```
+
+- `id` is fresh for every transmission. `re` is mandatory and equals the
+  id of the request this result answers, on this channel. A result is
+  built and sealed when it is sent, for the channel and attachment it is
+  sent on; saved reply bytes are never replayed.
+- `request_id` is the durable identity of a change; only a set carries it,
+  and a set's result echoes it (a `current` result has none).
+  `expected_revision` is the revision the client believes is current
+  (compare and set).
+- `policy` is always the host's **current** policy when the result is
+  built:
+  - `relay_only`;
+  - `revision`: 0 for a fresh pairing, plus 1 for every committed change,
+    never decreasing for a pinned list;
+  - `state`: `durable` or `uncertain` (below).
+
+  `account_id`, `atem_device_id`, `host_trust_gen`, `head` (`{seq, hash}`,
+  as in `welcome`), `channel_id` and `attachment_gen` bind the result to
+  the exact pairing, host, channel and attachment.
+
+**Authority** (the one exception to R9.6's "`manage` gives the host
+nothing"; it grants nothing else). Set and get both need a `native`
+principal that holds `manage` at the host's head **when the request is
+handled**:
+
+- it is checked again on every set, get and retry, after any carriage,
+  removal or `set_roles` the host applied, so a duplicate never passes
+  where a fresh request would fail;
+- services, browsers and natives without `manage` get `forbidden`,
+  whatever their `control`, ops or leases;
+- the policy never touches r8 leases, receipts or session control.
+
+**Set outcomes** (`outcome`; `policy` is always the current one):
+
+| outcome | when | effect |
+|---|---|---|
+| `committed` | a new `request_id` whose `expected_revision` equals the current revision, with a different value, written durably; or a retry of a recorded request whose revision is still the current one | the policy changed (once) |
+| `unchanged` | a new `request_id` whose `expected_revision` equals the current revision, with the same value | nothing written or recorded |
+| `superseded` | a retry of a recorded request whose revision is no longer the current one | nothing applied; the old request never re-applies |
+| `conflict` | a new `request_id` whose `expected_revision` isn't the current revision | nothing applied or recorded |
+| `save_failed` | the change provably did not commit (a failure before the pending file's rename, below) | the previous policy kept and reported; nothing recorded |
+| `uncertain` | the pending file was renamed into place, but the change isn't known durable yet | `policy.state: "uncertain"` with the new value; recorded; see below |
+
+- A retry is the same `request_id` from the same principal, with the same
+  `relay_only` and `expected_revision`. The same `request_id` with another
+  body, or from another principal, is `error{code:"request_id_reused"}`.
+  A retry never rewrites or re-applies the policy; its outcome says whether
+  its change is still the current one, and `policy` is the current
+  snapshot, so a receipt can't be taken for the current state.
+- An `unchanged` request isn't recorded: its retry is judged as a new
+  request.
+- Of several attachments or managers, whichever request the host handles
+  first wins. A `conflict` reports the current revision, and the client
+  decides again.
+
+**Get** answers `outcome: "current"`.
+
+**Change notification** (H→C event, no `re`): when a set commits
+(`committed` or `uncertain`), every other open attachment of a native
+member holding `manage` gets the current policy:
+
+```json
+{"type":"session","data":{"v":1,"op":"host_policy_changed","id":"<fresh uuid>",
+ "policy":{"relay_only":true,"revision":4,"state":"durable"},
+ "account_id":"acct-test-1","atem_device_id":"host-a","host_trust_gen":1,
+ "head":{"seq":7,"hash":"<64 hex>"},"channel_id":"<that channel's>","attachment_gen":"<that attachment's>"}}
+```
+
+It answers nothing and confirms nothing; a client reads it as the newest
+snapshot (it ends readiness when it contradicts the wanted value) and
+`get`s to confirm.
+
+**Errors** (session `error{re}`):
+- `invalid_request`: a field missing, mistyped or extra; ids not UUID v4.
+- `forbidden`: see Authority above.
+- `request_id_reused`: see above.
+- `busy`, with `detail`:
+  - `device list removed`: no pinned list;
+  - `device list not reconciled`: the host is held;
+  - `host policy unreadable`: see Storage.
+
+**Storage.**
+- `pairing/host_policy.json` (0600) holds
+  `{v:1, account_id, genesis_hash, revision, relay_only, requests[≤ 64]}`.
+  Each entry in `requests` is
+  `{request_id, principal, relay_only, expected_revision, revision}`: the newest
+  committed changes, kept in the same file so a request's identity and the
+  policy commit together. The retry of an evicted request meets the
+  `expected_revision` check (`conflict`) and never becomes a fresh change.
+- No file means `revision: 0, relay_only: false`.
+- A file for another account or genesis, or one that can't be read, fails
+  closed: no local/direct link, and set and get answer `busy` until it is
+  repaired or the host re-pairs.
+- Both policy files are device-list files: `atem unpair` and a new pin
+  remove them, and one of them without the list is a damaged list.
+
+**Writes and uncertainty.** A change is written in three steps, each one
+atomic (temp file, fsync, rename, directory fsync):
+
+1. `pairing/host_policy.pending` gets the whole new file.
+2. `host_policy.json` gets the same bytes.
+3. The pending file is removed.
+
+A failure before step 1's rename changed nothing (`save_failed`). From
+step 1's rename on, the change stands:
+- the pending file, while present, **is** the policy, with
+  `state: "uncertain"`;
+- no local/direct link is allowed while it exists, whatever its value;
+- it is rolled forward (steps 2 and 3 again) when Atem starts and every
+  5 s, after which the state is `durable`;
+- a crash never lets an older `false` stand in for an uncertain change.
+
+Residual: a crash that also loses step 1's rename (its directory fsync
+failed) leaves the previous policy. The client sees the old revision on
+its next `get` (not ready) and sets again.
+
+**Enforcement and migration.** While the policy keeps Atem off local (it
+is `relay_only: true`, or a write is pending, or the policy can't be read),
+Atem connects only through its relay identity room and drops any local
+link that authenticates. When a set commits `relay_only: true` while the
+link is local, Atem:
+
+1. accepts no new direct work at once: no new channel `open` on that link
+   (`close{reason:"closed"}`) and no Astation operation;
+2. writes the result with the link writer's delivery receipt for that
+   frame;
+3. closes the local link when that write completes or fails, or 5 s after
+   no operation runs on the link, whichever comes first;
+4. checks the policy again at the close, so an intervening `false`
+   cancels it (only for that link generation).
+
+A lost result never keeps direct access alive and never reverts the
+durable policy. The client reconciles with a fresh `get` on a new
+relay channel. There is no plaintext bootstrap and no direct fallback.
+
+**Client readiness** (shared core `HostPolicyTracker`, `Attached::host_policy`).
+Relay only is confirmed only by a result that:
+
+- answers an outstanding `id` of **this** admitted attachment (each id
+  answers once);
+- names the account, host, trust generation, channel and attachment of
+  the attachment's `welcome`;
+- has `outcome` `committed`, `unchanged` or `current`;
+- has `policy.state: "durable"` and `policy.relay_only` equal to the
+  wanted value.
+
+Other results never confirm:
+
+- A result of this attachment that reports an uncertain state, or a value
+  other than the wanted one, ends readiness.
+- A non-confirming outcome (`superseded`, `conflict`, `save_failed`) that
+  reports the wanted durable value leaves readiness as it was.
+- A `host_policy_changed` never confirms; one that contradicts the wanted
+  value ends readiness.
+- A result from another channel or attachment is ignored.
+- A new attachment starts not ready.
 
 ### R9.9 Push hints, seen, and the relay's schedule
 
@@ -3370,7 +3585,8 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
 | `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
-| `unsupported_version` | session | also: `hello` without `revision: 9` |
+| `unsupported_version` | session | also: `hello` without `revision: 9`; the removed outer `transportPolicy`/`transportPolicyAck` (R9.8a) |
+| `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a) |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 | relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused`) |
 
@@ -3424,7 +3640,17 @@ expiry, browser grant, push hints (sign and verify,
 (Mac and phone online, Mac off, takeover, approval while another holds
 the lease), and the channel envelope (R9.7a): `r9-envelope-vectors`,
 `r9-envelope-several-channels`, `r9-envelope-unknown-and-duplicate`,
-`r9-envelope-link-loss`, `r9-envelope-bounds`.
+`r9-envelope-link-loss`, `r9-envelope-bounds`, and the host policy
+(R9.8a): `r9-host-policy-set-get-and-retry`,
+`r9-host-policy-superseded-retry-never-reapplies`,
+`r9-host-policy-conflict-unchanged-and-field-errors`,
+`r9-host-policy-needs-a-native-manager`,
+`r9-host-policy-save-failed-changes-nothing`,
+`r9-host-policy-uncertain-write-rolls-forward`,
+`r9-host-policy-failed-true-to-false-stays-relay-only`,
+`r9-host-policy-restart-with-a-pending-write-rolls-forward` (their host runs with
+`setup.host.link: "relay"`: the fake Astation is reached as the relay
+identity room, so a relay-only commit keeps the link).
 
 ### R9.13 Open questions for Astation
 

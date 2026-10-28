@@ -176,6 +176,88 @@ fn an_idle_runtime_exits_by_itself() {
     );
 }
 
+/// Whether `listener` gets a connection within `secs`.
+fn accepted(listener: &std::net::TcpListener, secs: u64) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    within(secs, || listener.accept().is_ok())
+}
+
+/// An unreadable pairing record is not "no pairing": the runtime never
+/// tries the local Astation endpoint, logs why, and a restarted runtime
+/// does the same. A host-policy write left uncertain (§R9.8a) keeps it off
+/// the local endpoint too. Without either it does try it (first pairing).
+#[test]
+fn an_unreadable_pairing_record_never_tries_the_local_astation() {
+    for case in ["damaged", "policy_pending", "none"] {
+        let damaged = case == "damaged";
+        let dir = tempfile::Builder::new()
+            .prefix("atem-rb")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (home, run) = (dir.path().join("home"), dir.path().join("run"));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = home.join(".config").join("atem");
+        let pairing = config.join("pairing");
+        std::fs::create_dir_all(&pairing).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&pairing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if damaged {
+            std::fs::write(pairing.join("pairing.enc"), b"not a sealed record").unwrap();
+        }
+        if case == "policy_pending" {
+            std::fs::write(pairing.join("host_policy.pending"), b"{}").unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let log = dir.path().join("stderr.log");
+        for restart in 0..2 {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
+            command
+                .arg("runtime")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .env("XDG_RUNTIME_DIR", &run)
+                .env("ASTATION_WS", &url)
+                .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap());
+            let mut child = Running(command.spawn().unwrap());
+            let socket = run.join("atem").join("runtime.sock");
+            assert!(
+                within(10, || hello(&socket).is_some()),
+                "the runtime didn't start listening"
+            );
+            let tried = accepted(&listener, if case == "none" { 10 } else { 3 });
+            assert_eq!(tried, case == "none", "{case}, restart {restart}");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "the runtime keeps running"
+            );
+            unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) };
+            assert!(within(10, || child.0.try_wait().unwrap().is_some()));
+            if !damaged {
+                if case == "policy_pending" {
+                    assert!(pairing.join("host_policy.pending").exists(), "kept");
+                }
+                break;
+            }
+            let output = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                output.contains("the pairing record can't be read; not connecting to Astation"),
+                "{output}"
+            );
+            assert_eq!(
+                std::fs::read(pairing.join("pairing.enc")).unwrap(),
+                b"not a sealed record",
+                "left as it was"
+            );
+        }
+    }
+}
+
 /// `/proc/<pid>/stat` field 22, or `None` when the process is gone.
 #[cfg(target_os = "linux")]
 fn start_time(pid: u32) -> Option<u64> {

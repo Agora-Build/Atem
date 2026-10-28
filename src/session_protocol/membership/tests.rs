@@ -1403,3 +1403,115 @@ fn the_pin_seeds_the_revoked_grants_and_vouches_for_a_floor() {
     assert!(rig.journal.join("revoked_grants").exists());
     assert!(super::pin_wall_floor(&rig.pairing).unwrap() > 0);
 }
+
+// ── Capacity (D23) ──
+
+use atem_client::membership::Capacity;
+
+const ENTRIES_NEARLY: &str =
+    "entries nearly full: renewals use one entry each; a full list needs re-pairing";
+const MEMBERS_NEARLY: &str = "members nearly full: remove expired or unused services so a place stays free for a Recovery Kit";
+const MEMBERS_FULL: &str = "members full: no device can be added and a Recovery Kit can't recover the account; remove expired or unused services";
+
+#[test]
+fn the_status_names_the_lists_use_of_its_limits_and_warns_from_90_percent() {
+    assert_eq!(
+        capacity_text(&Capacity::of(6, 3, 1)),
+        "6/1024 entries, 3/256 members, 1/64 hosts"
+    );
+    assert_eq!(
+        capacity_text(&Capacity::of(922, 3, 1)),
+        format!("922/1024 entries, 3/256 members, 1/64 hosts; {ENTRIES_NEARLY}")
+    );
+    assert_eq!(
+        capacity_text(&Capacity::of(40, 231, 1)),
+        format!("40/1024 entries, 231/256 members, 1/64 hosts; {MEMBERS_NEARLY}")
+    );
+    assert_eq!(
+        capacity_text(&Capacity::of(1024, 3, 1)),
+        "1024/1024 entries, 3/256 members, 1/64 hosts; entries full: no device can be added, renewed or removed and a Recovery Kit can't recover the account; a full list needs re-pairing"
+    );
+    // Every limit at nearly full or full has its own warning, in order.
+    assert_eq!(
+        capacity_text(&Capacity::of(950, 256, 58)),
+        format!(
+            "950/1024 entries, 256/256 members, 58/64 hosts; {ENTRIES_NEARLY}; {MEMBERS_FULL}; hosts nearly full: remove hosts no longer used"
+        )
+    );
+    assert!(
+        capacity_text(&Capacity::of(10, 3, 64))
+            .ends_with("64/64 hosts; hosts full: remove a host before adding one")
+    );
+    assert_eq!(
+        capacity_text(&Capacity::of(10, 3, 57)),
+        "10/1024 entries, 3/256 members, 57/64 hosts"
+    );
+}
+
+#[test]
+fn runtime_log_gets_one_line_naming_the_limits_that_cross() {
+    let line = |b: (u64, u64, u64), a: (u64, u64, u64)| {
+        capacity_crossing(&Capacity::of(b.0, b.1, b.2), &Capacity::of(a.0, a.1, a.2))
+    };
+    assert_eq!(line((900, 3, 1), (921, 3, 1)), None);
+    assert_eq!(
+        line((921, 3, 1), (922, 3, 1)).as_deref(),
+        Some(
+            format!(
+                "entries nearly full: 922/1024 entries, 3/256 members, 1/64 hosts; {ENTRIES_NEARLY}"
+            )
+            .as_str()
+        )
+    );
+    // Not again on every commit while nearly full, nor when it empties.
+    assert_eq!(line((922, 3, 1), (960, 3, 1)), None);
+    assert_eq!(line((960, 231, 1), (961, 230, 1)), None);
+    assert!(
+        line((1023, 3, 1), (1024, 3, 1))
+            .unwrap()
+            .starts_with("entries full: ")
+    );
+    // Only the limit that crossed is named, whatever else is full.
+    assert!(
+        line((950, 256, 57), (951, 256, 58))
+            .unwrap()
+            .starts_with("hosts nearly full: 951/1024 entries")
+    );
+    assert!(
+        line((950, 230, 1), (951, 231, 1))
+            .unwrap()
+            .starts_with("members nearly full: ")
+    );
+    assert!(
+        line((10, 230, 57), (11, 231, 58))
+            .unwrap()
+            .starts_with("members nearly full, hosts nearly full: ")
+    );
+}
+
+#[test]
+fn a_list_opened_nearly_full_is_logged_once_at_the_open() {
+    assert_eq!(capacity_at_open(&Capacity::of(6, 3, 1)), None);
+    assert_eq!(
+        capacity_at_open(&Capacity::of(40, 256, 1)).as_deref(),
+        Some(
+            format!("opened with members full: 40/1024 entries, 256/256 members, 1/64 hosts; {MEMBERS_FULL}")
+                .as_str()
+        )
+    );
+}
+
+#[test]
+fn the_runtime_status_line_carries_the_capacity() {
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (host, _) = opened(&rig, 1);
+    let status =
+        crate::runtime::host_bridge::device_list_status_of(Some(&host), None, 1, &t0()).unwrap();
+    // L: six entries; the mac, the phone and the service (the iPad was
+    // removed: its id stays used, its place is free).
+    assert_eq!(
+        status.text,
+        "pinned at seq 6 (1 remote client); 6/1024 entries, 3/256 members, 1/64 hosts"
+    );
+}

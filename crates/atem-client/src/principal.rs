@@ -114,6 +114,11 @@ pub enum Need {
     /// (§R9.6, services included; a browser never revokes: it holds a
     /// grant, it isn't a member).
     RevokeGrant,
+    /// `host_policy_set`/`host_policy_get` (R9.8a): a `native` member; the
+    /// host also checks `manage` at its current head when it handles the
+    /// request (roles change under a live channel, and `manage` is no
+    /// permission here).
+    HostPolicy,
 }
 
 impl Need {
@@ -143,6 +148,7 @@ impl Need {
             }),
             ("session", "approval_seen") => Need::Seen,
             ("session", "revoke_grant") => Need::RevokeGrant,
+            ("session", "host_policy_set" | "host_policy_get") => Need::HostPolicy,
             ("session", "membership") => Need::Op(Op::View),
             ("terminal", "input" | "resize") => Need::Op(Op::Terminal),
             ("terminal", "stop") => Need::Op(Op::Stop),
@@ -731,6 +737,7 @@ impl Authority {
         match (&self.scope, need) {
             (_, Need::Control) => control,
             (_, Need::RevokeGrant) => self.client_kind != ClientKind::Browser && control,
+            (_, Need::HostPolicy) => self.client_kind == ClientKind::Native,
             (None, Need::Seen) => control,
             (Some(scope), Need::Seen) => control && scope.ops.contains(&Op::Approval),
             (None, Need::Op(Op::View)) => true,

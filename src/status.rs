@@ -88,6 +88,9 @@ pub struct StatusReport {
 pub struct Pairing {
     pub astation_id: String,
     pub session_expired: bool,
+    /// The host policy keeps Atem off the local link (§R9.8a: relay only,
+    /// a write of it still uncertain, or a policy that can't be read).
+    pub relay_only: bool,
 }
 
 /// The pairing, if this profile has one (an unreadable record reads as
@@ -96,6 +99,7 @@ pub fn pairing(src: &Sources) -> Option<Pairing> {
     let record = PairingRecord::load(&src.paths.pairing).ok()??;
     Some(Pairing {
         session_expired: record.session_expired(),
+        relay_only: !crate::session_protocol::r9::host_policy::local_allowed(&src.paths.pairing),
         astation_id: record.astation_id,
     })
 }
@@ -268,8 +272,15 @@ fn pairing_lines(src: &Sources, pairing: Option<&Pairing>) -> (Line, Line) {
         Verification::Revoked { by } => format!("revoked by {by}"),
         Verification::Unknown(error) => format!("unknown ({error})"),
     };
+    let relay_only = if pairing.relay_only {
+        "; relay only (host policy)"
+    } else {
+        ""
+    };
     (
-        Line::new(format!("paired ({astation_id}{trust}{expired})")),
+        Line::new(format!(
+            "paired ({astation_id}{trust}{expired}){relay_only}"
+        )),
         Line::new(verification),
     )
 }
@@ -293,6 +304,9 @@ fn trust_note(src: &Sources, astation_id: &str) -> String {
     }
 }
 
+/// After the block while relay only is set and Astation isn't connected.
+pub const RELAY_ONLY_NOTE: &str = "A manager set relay only (or the host policy can't be read): Atem reaches Astation only through the relay. It clears when a manager turns it off, or with `atem unpair`.";
+
 /// The status from `src`, with `agent` the already running cred agent (if
 /// any) and no runtime running.
 #[cfg(test)]
@@ -312,13 +326,18 @@ pub fn gather_full(
     let (pairing_line, verification_line) = pairing_lines(src, paired.as_ref());
     let runtime_differs = matches!(runtime, Look::Running { welcome, .. }
         if welcome.build != crate::memory::cred_agent::build_id());
-    let (credentials, notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
+    let (credentials, mut notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
     let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
     let device_list = match runtime {
         Look::Running { .. } => device_list_line(runtime, local_datetime),
         // No runtime: what the files say (read only).
         _ => passive_device_list_line(&src.paths.pairing, local_datetime),
     };
+    let connected =
+        matches!(runtime, Look::Running { status: Some(status), .. } if status.astation);
+    if paired.as_ref().is_some_and(|p| p.relay_only) && !connected {
+        notes.push(RELAY_ONLY_NOTE.into());
+    }
     StatusReport {
         account: account_line(src, crate::credentials::now_secs()),
         pairing: pairing_line,
@@ -338,8 +357,13 @@ pub fn passive_device_list_line(
     pairing: &crate::paths::PairingPaths,
     datetime: impl Fn(u64) -> String,
 ) -> Option<Line> {
-    let (_, text, pending) = crate::session_protocol::membership::passive_status(pairing)?;
+    let (_, text, capacity, pending) =
+        crate::session_protocol::membership::passive_status(pairing)?;
     let mut text = format!("{text} (from disk; no runtime running)");
+    if let Some(c) = capacity {
+        text.push_str("; ");
+        text.push_str(&crate::session_protocol::membership::capacity_text(&c));
+    }
     for (subject, action, at) in pending {
         text.push_str(&format!(
             "; recovery pending: {subject} ({action}) takes effect at {} unless a managing device vetoes it",
@@ -823,7 +847,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
-        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        // Three entries; the mac and the pending dev-new count as members.
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
         // An unfinished write after a plain crash: replayed at the next
         // start, no managing device asked for (Astation's review of
         // 66ea556).
@@ -904,6 +929,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn relay_only_set_by_a_manager_is_shown_on_the_pairing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        let paths = crate::paths::ProfilePaths::in_dir(dir.path()).pairing;
+        crate::session_protocol::r9::host_policy::write_for_test(&paths, true);
+        let report = report(dir.path());
+        assert_eq!(
+            report.pairing.value,
+            "paired (astation-1, trust gen 1); relay only (host policy)"
+        );
+        // No runtime, so Astation isn't connected: the hint says why.
+        assert!(report.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        // Connected (through the relay): no hint.
+        let src = Sources::in_dir(dir.path());
+        let online = gather_full(&src, None, &running(connected(Transport::Relay)));
+        assert!(!online.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        let offline = gather_full(&src, None, &running(RuntimeStatus::default()));
+        assert!(offline.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        // A manager turned it off: no hint.
+        crate::session_protocol::r9::host_policy::write_for_test(&paths, false);
+        let report = super::tests::report(dir.path());
+        assert!(!report.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
+        assert_eq!(report.pairing.value, "paired (astation-1, trust gen 1)");
+    }
+
+    #[test]
     fn paired_and_verified_shows_the_safety_code_and_lock_state() {
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
@@ -974,6 +1025,7 @@ pub(crate) mod tests {
             Some(Pairing {
                 astation_id: "astation-0".into(),
                 session_expired: false,
+                relay_only: false,
             })
         );
         // Not a pairing: `atem pair` proceeds and replaces it.

@@ -31,42 +31,17 @@ pub fn project_name(key: &str, repo: Option<&RepoInfo>) -> String {
 }
 
 /// `git@github.com:Agora-Build/Atem.git` and `https://github.com/Agora-Build/Atem`
-/// both become `github.com/agora-build/atem`.
+/// both become `github.com/agora-build/atem`. The one definition is
+/// `atem_client::project`, so a manager drafting a service `projects`
+/// scope (§R9.6) computes the key Atem records.
 pub fn normalize_remote(url: &str) -> Option<String> {
-    remote_label(url).map(|s| s.to_lowercase())
+    atem_client::project::project_key_of_remote(url)
 }
 
 /// The remote as `<host>/<path>` with its own capitalization
 /// (`github.com/Agora-Build/Atem`); credentials, port and `.git` dropped.
 pub fn remote_label(url: &str) -> Option<String> {
-    let u = url.trim();
-    if u.is_empty() {
-        return None;
-    }
-    let (host, path) = if let Some(idx) = u.find("://") {
-        let rest = &u[idx + 3..];
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i + 1..]),
-            None => (rest, ""),
-        };
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        let host = match host.rsplit_once(':') {
-            Some((h, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => h,
-            _ => host,
-        };
-        (host.to_string(), path.to_string())
-    } else if let Some((left, path)) = u.split_once(':') {
-        let host = left.rsplit('@').next().unwrap_or(left);
-        (host.to_string(), path.to_string())
-    } else {
-        return None;
-    };
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    if host.is_empty() || path.is_empty() {
-        return None;
-    }
-    Some(format!("{}/{}", host, path))
+    atem_client::project::remote_label(url)
 }
 
 /// Short name for display: the last path segment (`atem`, `scratch`).
@@ -91,7 +66,7 @@ pub fn detect_repo(cwd: &Path) -> Option<RepoInfo> {
     let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
     let label = git(&root, &["remote", "get-url", "origin"])
         .and_then(|u| remote_label(&u))
-        .unwrap_or_else(|| format!("local:{}", dir_name(&root)));
+        .unwrap_or_else(|| atem_client::project::local_project_key(&dir_name(&root)));
     // `local:` keys keep the folder name's case, as they always have.
     let key = if label.starts_with("local:") { label.clone() } else { label.to_lowercase() };
     Some(RepoInfo { root, key, label })
@@ -101,7 +76,9 @@ pub fn detect_repo(cwd: &Path) -> Option<RepoInfo> {
 /// remote), else `local:<folder>`. Also the launch project of an agent
 /// session (atem-session-v1.md §R9.6 service `projects` scopes).
 pub fn project_key_for(cwd: &Path) -> String {
-    detect_repo(cwd).map(|r| r.key).unwrap_or_else(|| format!("local:{}", dir_name(cwd)))
+    detect_repo(cwd)
+        .map(|r| r.key)
+        .unwrap_or_else(|| atem_client::project::local_project_key(&dir_name(cwd)))
 }
 
 #[cfg(test)]

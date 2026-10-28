@@ -436,10 +436,172 @@ impl MembershipLog {
     ) -> JsResult<String> {
         err(self.0.draft_entry(signer, ms(signed_at)?, action_json))
     }
+    /// How full the log is: `{entries, maxEntries, members, maxMembers,
+    /// hosts, maxHosts, level, entriesLevel, membersLevel, hostsLevel}`
+    /// (levels `ok`, `nearly_full`, `full`).
+    pub fn capacity(&self) -> JsResult<JsValue> {
+        to_js(&self.0.capacity())
+    }
+    /// `null` to go ahead, else `{type: "log_full" | "members_full" |
+    /// "hosts_full" | "service_change_too_soon", lastSignedAt?, retryAt?}` (advisory, for
+    /// signers).
+    #[wasm_bindgen(js_name = checkChange)]
+    pub fn check_change(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
+        ok(self.0.check_change(action_json, ms(now_ms)?))
+    }
     #[wasm_bindgen(js_name = checkMember)]
     pub fn check_member(&self, member_json: String) -> JsResult<String> {
         err(self.0.check_member(member_json))
     }
+    /// `{scope: {hosts, projects?, sessions?, ops}, expiresAt}` of the
+    /// active service member, or `null` (status only: an expired service is
+    /// still returned; compare `expiresAt` with the time yourself).
+    #[wasm_bindgen(js_name = serviceGrant)]
+    pub fn service_grant(&self, device_id: String) -> JsResult<JsValue> {
+        to_js(&self.0.service_grant(device_id))
+    }
+    /// `r9_svc` of the active service member, or `null`.
+    #[wasm_bindgen(js_name = serviceKeyFingerprint)]
+    pub fn service_key_fingerprint(&self, device_id: String) -> Option<String> {
+        self.0.service_key_fingerprint(device_id)
+    }
+    /// A renewal's action JSON (current scope, later `expiresAt`).
+    #[wasm_bindgen(js_name = serviceRenewalAction)]
+    pub fn service_renewal_action(
+        &self,
+        device_id: String,
+        expires_at: f64,
+        signed_at: f64,
+    ) -> JsResult<String> {
+        err(self
+            .0
+            .service_renewal_action(device_id, ms(expires_at)?, ms(signed_at)?))
+    }
+    /// A narrowing's action JSON (`expiresAt` `null`: unchanged).
+    #[wasm_bindgen(js_name = serviceNarrowingAction)]
+    pub fn service_narrowing_action(
+        &self,
+        device_id: String,
+        scope: JsValue,
+        expires_at: Option<f64>,
+        signed_at: f64,
+    ) -> JsResult<String> {
+        err(self.0.service_narrowing_action(
+            device_id,
+            service_scope(scope)?,
+            expires_at.map(ms).transpose()?,
+            ms(signed_at)?,
+        ))
+    }
+}
+
+// ------------------------------------------- service builders, projects
+
+/// `{hosts, projects?, sessions?, ops}` (any order; `view` is added).
+fn service_scope(v: JsValue) -> JsResult<crate::types::ServiceScopeInfo> {
+    #[derive(Deserialize)]
+    struct S {
+        hosts: Vec<String>,
+        #[serde(default)]
+        projects: Option<Vec<String>>,
+        #[serde(default)]
+        sessions: Option<Vec<String>>,
+        ops: Vec<String>,
+    }
+    let s: S = serde_wasm_bindgen::from_value(v)
+        .map_err(|_| bad("scope {hosts, projects?, sessions?, ops}"))?;
+    Ok(crate::types::ServiceScopeInfo {
+        hosts: s.hosts,
+        projects: s.projects,
+        sessions: s.sessions,
+        ops: s.ops,
+    })
+}
+
+/// The action JSON of a service `add` (for `draftEntry`/`checkChange`).
+#[wasm_bindgen(js_name = serviceAddAction)]
+pub fn service_add_action(
+    device_id: String,
+    auth_alg: &str,
+    auth_raw: Vec<u8>,
+    scope: JsValue,
+    expires_at: f64,
+    signed_at: f64,
+) -> JsResult<String> {
+    err(crate::service::service_add_action(
+        device_id,
+        key(auth_alg, auth_raw)?,
+        service_scope(scope)?,
+        ms(expires_at)?,
+        ms(signed_at)?,
+    ))
+}
+
+/// The action JSON of a service `set_roles`.
+#[wasm_bindgen(js_name = serviceSetRolesAction)]
+pub fn service_set_roles_action(
+    device_id: String,
+    scope: JsValue,
+    expires_at: f64,
+    signed_at: f64,
+) -> JsResult<String> {
+    err(crate::service::service_set_roles_action(
+        device_id,
+        service_scope(scope)?,
+        ms(expires_at)?,
+        ms(signed_at)?,
+    ))
+}
+
+/// `r9_svc` of a service `auth_key` (`alg` `p256` or `ed25519`, raw bytes).
+#[wasm_bindgen(js_name = serviceKeyFingerprint)]
+pub fn service_key_fingerprint(auth_alg: &str, auth_raw: Vec<u8>) -> JsResult<String> {
+    err(crate::service::service_key_fingerprint(key(
+        auth_alg, auth_raw,
+    )?))
+}
+
+#[wasm_bindgen(js_name = projectKeyOfRemote)]
+pub fn project_key_of_remote(url: String) -> Option<String> {
+    crate::service::project_key_of_remote(url)
+}
+
+#[wasm_bindgen(js_name = localProjectKey)]
+pub fn local_project_key(folder_name: String) -> String {
+    crate::service::local_project_key(folder_name)
+}
+
+/// The bytes to HMAC (WebCrypto: `crypto.subtle.sign("HMAC", key, …)`).
+#[wasm_bindgen(js_name = projectHashInput)]
+pub fn project_hash_input(project_key: String) -> Vec<u8> {
+    crate::service::project_hash_input(project_key)
+}
+
+#[wasm_bindgen(js_name = projectHashFromMac)]
+pub fn project_hash_from_mac(kid: String, mac: Vec<u8>) -> JsResult<String> {
+    err(crate::service::project_hash_from_mac(kid, mac))
+}
+
+#[wasm_bindgen(js_name = isProjectHash)]
+pub fn is_project_hash(text: String) -> bool {
+    crate::service::is_project_hash(text)
+}
+
+/// The software form over `{kid, k}` (bots and tests: `K` in JS memory).
+#[cfg(feature = "software-keys")]
+#[wasm_bindgen(js_name = projectHash)]
+pub fn project_hash(account_key: JsValue, project_key: String) -> JsResult<String> {
+    #[derive(Deserialize)]
+    struct K {
+        kid: String,
+        #[serde(with = "serde_bytes")]
+        k: Vec<u8>,
+    }
+    let k: K = serde_wasm_bindgen::from_value(account_key).map_err(|_| bad("key {kid, k}"))?;
+    err(crate::service::project_hash(
+        crate::types::AccountKey { kid: k.kid, k: k.k },
+        project_key,
+    ))
 }
 
 // ------------------------------------------------------- kit and backup
@@ -1030,6 +1192,35 @@ impl ClientConnection {
     #[wasm_bindgen(js_name = revokeGrant)]
     pub fn revoke_grant(&self, grant_id: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.revoke_grant(grant_id, ms(now_ms)?))
+    }
+    #[wasm_bindgen(js_name = hostPolicySet)]
+    pub fn host_policy_set(
+        &self,
+        relay_only: bool,
+        request_id: String,
+        now_ms: f64,
+    ) -> JsResult<JsValue> {
+        ok(self.0.host_policy_set(relay_only, request_id, ms(now_ms)?))
+    }
+    #[wasm_bindgen(js_name = hostPolicyRetry)]
+    pub fn host_policy_retry(
+        &self,
+        relay_only: bool,
+        request_id: String,
+        expected_revision: f64,
+        now_ms: f64,
+    ) -> JsResult<JsValue> {
+        ok(self
+            .0
+            .host_policy_retry(relay_only, request_id, ms(expected_revision)?, ms(now_ms)?))
+    }
+    #[wasm_bindgen(js_name = hostPolicyGet)]
+    pub fn host_policy_get(&self, desired: bool, now_ms: f64) -> JsResult<JsValue> {
+        ok(self.0.host_policy_get(desired, ms(now_ms)?))
+    }
+    #[wasm_bindgen(js_name = hostPolicyReady)]
+    pub fn host_policy_ready(&self) -> bool {
+        self.0.host_policy_ready()
     }
     #[wasm_bindgen(js_name = sendMembership)]
     pub fn send_membership(&self, entries: Vec<String>, now_ms: f64) -> JsResult<JsValue> {

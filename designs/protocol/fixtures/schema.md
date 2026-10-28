@@ -236,7 +236,9 @@ host, or for a restore or a backup writer the relay) or `relay` (the fixture pla
 implementation; the relay's own HTTP shapes are Astation's).
 
 `setup`: `host` (r8's host context plus `host_id`, `wall_clock_ms`,
-optional `cred_agent: "locked"`, `astation_desktop_connected`), or
+optional `cred_agent: "locked"`, `astation_desktop_connected`, `link:
+"relay"`: the link reaches Astation as the relay identity room, not the
+local endpoint), or
 `hosts` (several, each with a `name`); `pinned` (entry labels, genesis
 first: the host's durable chain at the start); `sessions` (r8's, plus
 `project`, the recorded launch project hash); `clients`
@@ -276,7 +278,8 @@ stand for the client's current read / lease binding. New:
 | `{"expect_relay": {path: value}}` / `{"expect_relay_none": true}` | host side: the next relay message Atem sends (`push_hint`, `push_seen`) / none |
 | `{"host_connect": {…}}` | relay side: a device then connects to a host pinned as given; client side (restore): the fixture's host answers an `init` with `accept_head` |
 | `{"expect_local_status": {"recovery_pending": bool}}` | host side: `atem status` and the agent terminal's status row show (or no longer show) that a recovery is pending; the text is the implementation's |
-| `{"fail_next_membership_write": {"at": "intent"\|"temp_write"\|"temp_fsync"\|"rename"\|"directory_fsync", "file"?: "carriage"\|"freeze"}}` | the next device-list write fails at that step (`true` = `temp_write`); by default `membership.json`, `file: "carriage"` the carriage record (the first write of a carriage, R9.3), `file: "freeze"` the freeze file |
+| `{"fail_next_membership_write": {"at": "intent"\|"temp_write"\|"temp_fsync"\|"rename"\|"directory_fsync", "file"?: "carriage"\|"freeze"\|"host_policy"\|"host_policy_pending"}}` | the next device-list write fails at that step (`true` = `temp_write`); by default `membership.json`, `file: "carriage"` the carriage record (the first write of a carriage, R9.3), `file: "freeze"` the freeze file, `file: "host_policy"`/`"host_policy_pending"` the host policy's file / its pending file (R9.8a) |
+| `{"assert": {"host_policy": {"relay_only": b, "revision": n, "pending": b}}}` | the stored host policy (R9.8a) as the files say (`pending`: `host_policy.pending` exists) |
 | `restart_runtime` with `"disk": "as_written"\|"rename_kept"\|"rename_lost"\|"write_lost"` | what survived of the failed write: everything written, the rename kept (never directory-fsynced), the rename lost, or nothing of it. `restart_runtime` is an orderly stop (it writes §H's clean close unless the run halted); `crash_runtime` (which also takes `disk`) and `crash_after_membership_commit` don't. Held at start depends only on a fault record or an unreconcilable carriage record (R9.3), never on how the run stopped |
 | `{"restore": …, "result": "withheld", "detail": "no_host_reachable"}` | client side: no host answered `init`; the restore waits (R9.5 step 3) |
 | `{"client_backup": {by, kids, kit}}` | client side: device `by` starts writing a K backup of that sequence sealed to that kit, on its verified log |

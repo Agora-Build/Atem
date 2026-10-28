@@ -74,6 +74,7 @@ pub mod keys;
 pub mod kit;
 pub mod membership;
 pub mod principal;
+pub mod project;
 pub mod provider;
 pub mod push;
 pub mod restore;

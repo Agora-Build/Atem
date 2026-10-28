@@ -97,7 +97,12 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 | `advance(now)` | ends waits that are over on this clock |
 | `draft_entry(signer, signed_at, action_json)` | the next entry's body, checked with the verifier's own schema; show it, then publish (below) |
 | `check_member(member_json)` | a member object for `add` / `recovery_add`, checked |
+| `capacity()` | `CapacityInfo{entries, max_entries, members, max_members, hosts, max_hosts, level, entries_level, members_level, hosts_level}`: the verifier's own counts against its limits (1024 entries; 256 members, counting members in effect and pending `recovery_add`s; 64 current hosts); `level` `ok` / `nearly_full` (≥ 90 % of any) / `full`. From `nearly_full` show a warning per limit (D23): entries, "renewals use one entry each; a full list needs re-pairing"; members, "remove expired or unused services so a place stays free for a Recovery Kit" (a full member list refuses the kit's `recovery_add` too); hosts, "remove hosts no longer used" |
+| `check_change(action_json, now_ms)` | before `draft_entry` (same `action_json`; `now_ms` the `signed_at` it would carry): `None` to go ahead, else `ChangeRefusalInfo` `LogFull` (no entry fits, a removal included), `MembersFull` (no `add`, and no `recovery_add`: a Recovery Kit can't bring the account back until a member is removed), `HostsFull` (no `add_host` of a host that isn't current), `ServiceChangeTooSoon{last_signed_at, retry_at}` (JS `service_change_too_soon`: a service `set_roles` that grants anything new, e.g. a renewal, within 24 h of that service's last grant; a narrowing doesn't restart the clock; narrowing and `remove` are never paced). Advisory for signers: hosts still accept any valid entry |
 | `admit_carrier(device_id, entries, more, now)` | host role, feature `host` only (never in an app build) |
+| `service_grant(device_id)` | `ServiceGrantInfo{scope, expires_at}` of an active service member (its scope in canonical order), else `None`: what a renewal or narrowing starts from. Status only: an expired service is still returned; compare `expires_at` with the time yourself |
+| `service_renewal_action(device_id, expires_at, signed_at)` | the action JSON of a renewal (the current scope, a later `expires_at` ≤ 90 days after `signed_at`); `Invalid` `not_a_service` / `not_a_renewal`. Run `check_change` on it first: a renewal is paced |
+| `service_narrowing_action(device_id, scope, expires_at?, signed_at)` | the action JSON of a narrowing (`expires_at` `None`: unchanged): nothing new granted and something changed, else `Invalid` `not_a_narrowing`; never paced |
 
 The log object is shared by reference: `extend`, `advance`, a publisher's
 or writer's reply change it in place. `snapshot()` copies.
@@ -388,6 +393,32 @@ control op gives the browser control within them). The browser connects
 with `ClientIdentity{kind: Browser, key_id, grant_json}`; any member with
 control revokes it with `revoke_grant`. `parse_browser_grant` reads one.
 
+### Service members (§R9.2, §R9.6)
+
+What a manager drafts to enroll, renew or narrow a bot (a Station agent
+module, a Discord bridge, a custom app). The builders make
+`atem-client`'s own action and run the verifier's structural parse over
+the drafted body, so they return only action JSON the verifier accepts
+for its shape, or its own refusal (`Membership` `bad_scope`,
+`service_expiry`, `wrong_alg`, …); there is no second wire form.
+
+| call | effect for the app |
+|---|---|
+| `service_add_action(device_id, auth_key, scope, expires_at, signed_at)` | the `add` of a service (`auth_key` P-256 or Ed25519, the bot's own key; `expires_at` ≤ 90 days after `signed_at`): `{"action":"add","member":{…}}`, for `check_change` then `draft_entry` (purpose `Enroll`) |
+| `service_set_roles_action(device_id, scope, expires_at, signed_at)` | a service `set_roles` (purpose `Roles`). Any `set_roles` fences the service's live channels at once (`unauthorized` "roles changed"); it reconnects under the new grant |
+| `ServiceScopeInfo{hosts, projects?, sessions?, ops}` | lists in any order: sorted by bytes, duplicates dropped, `view` added to `ops`; `projects`/`sessions` absent don't restrict (`hosts` 1–16, `projects` and `sessions` ≤ 64, ops from §R9.6) |
+| `project_key_of_remote(url)`, `local_project_key(folder_name)` | a session's launch project key, as Atem records it: the normalized `origin` remote (`github.com/agora-build/atem`, lowercase, credentials/port/`.git` dropped), else `local:<folder>` (case kept) |
+| `project_hash_from_mac(kid, mac)` | **the recommended path**: `h1.<kid>.<hex>` of the HMAC-SHA256 the platform computed with `K` itself (no derived subkey) for the generation `kid` over `project_hash_input(project_key)`; the key stays in the key store (WebCrypto: `crypto.subtle.sign("HMAC", key, input)`) |
+| `project_hash(account_key, project_key)` | the software form, only for an app that already holds `K` bytes in memory (the restore and K-backup flows, as `seal_k_backup` takes them); WASM: `software-keys` builds only |
+| `is_project_hash(text)` | the verifier's syntax check of a scope's project entry |
+| `service_key_fingerprint(auth_key)`, `MembershipLog::service_key_fingerprint(device_id)` | `r9_svc` (Atem #81): lowercase hex SHA-256 of the service `auth_key`'s raw public bytes as its `add` entry carries them (P-256: 65-byte SEC1 uncompressed; Ed25519: 32 bytes), nothing else hashed (no alg, no JSON); the key is checked first (`bad_key`, `weak_key`, X25519 `wrong_alg`). The log form: an active service member's, else `None` (status only). Vectors: `crates/atem-client/vectors/r9-svc-fingerprint.json` (Auth's station-token `r9Key`/`r9Svc` pairs and E5's svc-discord) |
+
+`projects` entries are hashes under one `K` generation each: a `K`
+rotation must re-issue the service's scope (`service_set_roles_action`
+with the new kid's hashes) before the old generation is dropped (§R9.13
+item 4). The host compares a session's hash under the kid each entry
+names, so both generations' hashes can be listed during the change.
+
 ### Encoding helpers
 
 `canonical_json`, `encode_fields`, `hash_fields` (SHA-256 of `enc`),
@@ -643,8 +674,9 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (the same 37 checks in each language, over
-  `designs/protocol/fixtures/r9-vectors-*.json`): `bindings/kotlin/Conformance.kt`
+- **Conformance** (the same 41 checks in each language, over
+  `designs/protocol/fixtures/r9-vectors-*.json` and atem-client's own
+  `crates/atem-client/vectors/r9-svc-fingerprint.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
@@ -666,7 +698,12 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   over loopback TCP: hello and welcome, list, lease, prompt and receipts,
   the other session requests, a browser grant, push hints (verified,
   opened, seen), a membership entry carried on the channel, the grant's
-  revocation and the browser's fence. The host is built from atem-client's
+  revocation and the browser's fence; and a Node/WASM service bot
+  (`bindings/js/bot.mjs`, `svc-discord`'s software key): admitted as a
+  service within its scope (only the in-scope session listed; lease,
+  prompt and interrupt complete), `forbidden` outside its ops (approval,
+  stop, terminal input), `unknown_session` for an out-of-scope session,
+  fenced at expiry and refused after it. The host is built from atem-client's
   responder role (`atem-client/tests/support/host.rs`). The real runtime
   host runs the shared r9 host fixtures in
   `src/session_protocol/membership/fixtures_tests.rs` (real engine, store

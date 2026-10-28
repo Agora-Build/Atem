@@ -2,6 +2,7 @@
 // through the Swift binding, the same checks as the Kotlin
 // (bindings/kotlin/Conformance.kt) and WASM (bindings/js/conformance.mjs)
 // runs. ATEM_FIXTURES names the fixtures directory.
+import CryptoKit
 import Foundation
 import XCTest
 @testable import AtemClient
@@ -110,6 +111,7 @@ final class ConformanceTests: XCTestCase {
         let mhead = o(mlog["head"])
         let mlogHead = LogHead(seq: u(mhead["seq"]), hash: s(mhead["hash"]))
         func hash(_ label: String) -> String { s(byLabel[label]!["entry_hash"]) }
+        func scopeOfE5() -> [String: Any] { o(o(o(o(byLabel["E5"]!["entry"])["body"])["member"])["scope"]) }
 
         // ------------------------------------------------------------ encoding
         let enc0 = o(a(enc["enc"])[0])
@@ -280,6 +282,113 @@ final class ConformanceTests: XCTestCase {
         }
         check("a draft the verifier would refuse is refused before signing") {
             try throwsCode("membership_invalid") { _ = try logL().draftEntry(signer: "dev-phone", signedAt: 1, actionJson: "{\"action\":\"remove\"}") }
+        }
+
+        check("capacity and the service change guard (D23)") {
+            let log = try logL()
+            try eq(log.capacity(), CapacityInfo(entries: 6, maxEntries: 1024, members: 3, maxMembers: 256, hosts: 1, maxHosts: 64, level: .ok, entriesLevel: .ok, membersLevel: .ok, hostsLevel: .ok))
+            let e5 = o(o(byLabel["E5"]!["entry"])["body"])
+            let svc = o(e5["member"])
+            let at = u(e5["signed_at"])
+            let day: UInt64 = 86_400_000
+            func change(_ ops: Any, _ expiresAt: UInt64) -> String {
+                var scope = o(svc["scope"])
+                scope["ops"] = ops
+                return js(["action": "set_roles", "device_id": "svc-discord", "roles": ["service"], "scope": scope, "expires_at": expiresAt] as [String: Any])
+            }
+            let renew = change(o(svc["scope"])["ops"]!, u(svc["expires_at"]) + day)
+            try eq(try log.checkChange(actionJson: renew, nowMs: at + 3_600_000), .serviceChangeTooSoon(lastSignedAt: at, retryAt: at + day), "a renewal within 24 h")
+            try eq(try log.checkChange(actionJson: renew, nowMs: at + day), nil, "after 24 h")
+            try eq(try log.checkChange(actionJson: change(["view"], u(svc["expires_at"])), nowMs: at + 3_600_000), nil, "narrowing")
+            try eq(try log.checkChange(actionJson: "{\"action\":\"remove\",\"device_id\":\"svc-discord\"}", nowMs: at + 3_600_000), nil, "removal")
+            let hostKey = o(o(o(o(byLabel["E2"]!["entry"])["body"])["host"])["host_key"])
+            let addHost = js(["action": "add_host", "host": ["host_id": "host-b", "host_trust_gen": 1, "host_key": hostKey] as [String: Any]] as [String: Any])
+            try eq(try log.checkChange(actionJson: addHost, nowMs: at), nil, "a host with room")
+            try throwsCode("membership_invalid") { _ = try log.checkChange(actionJson: "{\"action\":\"remove\"}", nowMs: at) }
+        }
+
+        check("service builders: add, set_roles, renewal, narrowing (§R9.6)") {
+            let log = try logL()
+            let e5 = o(o(byLabel["E5"]!["entry"])["body"])
+            let svc = o(e5["member"])
+            let scope = o(svc["scope"])
+            let at = u(e5["signed_at"])
+            let exp = u(svc["expires_at"])
+            let day: UInt64 = 86_400_000
+            let svcKey = PublicKeyData(alg: .ed25519, raw: unhex(s(key("svc-discord", "auth")["pub_hex"])))
+            let hosts = a(scope["hosts"]).map(s)
+            let projects = a(scope["projects"]).map(s)
+            let ops = a(scope["ops"]).map(s)
+            // E5's member, rebuilt from its parts in another order: the vector's bytes.
+            let shuffled = ServiceScopeInfo(hosts: hosts, projects: Array(projects.reversed()), sessions: nil, ops: ["prompt", "interrupt"])
+            try eq(try serviceAddAction(deviceId: "svc-discord", authKey: svcKey, scope: shuffled, expiresAt: exp, signedAt: at),
+                   try canonicalJson(json: js(["action": "add", "member": svc] as [String: Any])))
+            try eq(log.serviceGrant(deviceId: "svc-discord"), ServiceGrantInfo(scope: ServiceScopeInfo(hosts: hosts, projects: projects, sessions: nil, ops: ops), expiresAt: exp))
+            try eq(log.serviceGrant(deviceId: "dev-phone"), nil)
+            let newSvc = try serviceAddAction(deviceId: "svc-new", authKey: svcKey,
+                scope: ServiceScopeInfo(hosts: ["host-a"], projects: nil, sessions: ["ses-bbbbbbbbbbbb", "ses-aaaaaaaaaaaa"], ops: ["prompt"]),
+                expiresAt: at + 3_600_000, signedAt: at)
+            let newScope = o(o(o(try JSONSerialization.jsonObject(with: Data(newSvc.utf8)))["member"])["scope"])
+            try eq(a(newScope["ops"]).map(s), ["prompt", "view"])
+            try eq(a(newScope["sessions"]).map(s), ["ses-aaaaaaaaaaaa", "ses-bbbbbbbbbbbb"])
+            _ = try log.draftEntry(signer: "dev-phone", signedAt: at, actionJson: newSvc)
+            try eq(try log.checkChange(actionJson: newSvc, nowMs: at), nil, "an add with room")
+            func change(_ o2: [String], _ e: UInt64) throws -> String {
+                var sc = scope
+                sc["ops"] = o2
+                return try canonicalJson(json: js(["action": "set_roles", "device_id": "svc-discord", "roles": ["service"], "scope": sc, "expires_at": e] as [String: Any]))
+            }
+            let renew = try log.serviceRenewalAction(deviceId: "svc-discord", expiresAt: exp + day, signedAt: at + day)
+            try eq(renew, try change(ops, exp + day), "renewal")
+            try eq(try log.checkChange(actionJson: renew, nowMs: at + 3_600_000), .serviceChangeTooSoon(lastSignedAt: at, retryAt: at + day), "a renewal is paced")
+            let viewOnly = ServiceScopeInfo(hosts: hosts, projects: projects, sessions: nil, ops: ["view"])
+            let narrow = try log.serviceNarrowingAction(deviceId: "svc-discord", scope: viewOnly, expiresAt: nil, signedAt: at + 3_600_000)
+            try eq(narrow, try change(["view"], exp), "narrowing")
+            try eq(try log.checkChange(actionJson: narrow, nowMs: at + 3_600_000), nil, "a narrowing isn't paced")
+            try eq(try serviceSetRolesAction(deviceId: "svc-discord", scope: viewOnly, expiresAt: exp, signedAt: at), narrow)
+            try throwsCode("not_a_narrowing") { _ = try log.serviceNarrowingAction(deviceId: "svc-discord", scope: ServiceScopeInfo(hosts: hosts, projects: projects, sessions: nil, ops: ["stop", "view"]), expiresAt: nil, signedAt: at) }
+            try throwsCode("not_a_narrowing") { _ = try log.serviceNarrowingAction(deviceId: "svc-discord", scope: ServiceScopeInfo(hosts: hosts, projects: projects, sessions: nil, ops: ops), expiresAt: nil, signedAt: at) }
+            try throwsCode("not_a_renewal") { _ = try log.serviceRenewalAction(deviceId: "svc-discord", expiresAt: exp, signedAt: at) }
+            try throwsCode("not_a_service") { _ = try log.serviceRenewalAction(deviceId: "dev-phone", expiresAt: exp + day, signedAt: at) }
+            try throwsCode("bad_scope") { _ = try serviceSetRolesAction(deviceId: "svc-discord", scope: ServiceScopeInfo(hosts: [], projects: nil, sessions: nil, ops: ["view"]), expiresAt: exp, signedAt: at) }
+            try throwsCode("bad_scope") { _ = try serviceSetRolesAction(deviceId: "svc-discord", scope: ServiceScopeInfo(hosts: ["host-a"], projects: nil, sessions: nil, ops: ["fly"]), expiresAt: exp, signedAt: at) }
+            try throwsCode("service_expiry") { _ = try serviceSetRolesAction(deviceId: "svc-discord", scope: ServiceScopeInfo(hosts: ["host-a"], projects: nil, sessions: nil, ops: []), expiresAt: at + 90 * day + 1, signedAt: at) }
+            try throwsCode("wrong_alg") { _ = try serviceAddAction(deviceId: "svc-x", authKey: PublicKeyData(alg: .x25519, raw: unhex(s(key("dev-phone", "enc")["pub_hex"]))), scope: ServiceScopeInfo(hosts: ["host-a"], projects: nil, sessions: nil, ops: []), expiresAt: at, signedAt: at) }
+        }
+        // r9_svc vectors: atem-client's own file (crates/atem-client/vectors).
+        let svcFp = o(try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("../../../crates/atem-client/vectors/r9-svc-fingerprint.json"))))
+        check("service key fingerprint r9_svc (atem-client vectors)") {
+            func alg(_ name: String) -> KeyAlg { name == "p256" ? .p256 : (name == "ed25519" ? .ed25519 : .x25519) }
+            for c in a(svcFp["valid"]).map(o) {
+                let k = o(c["auth_key"])
+                try eq(hex(b64u(s(k["pub"]))), s(c["pub_hex"]), s(c["case"]))
+                try eq(try serviceKeyFingerprint(authKey: PublicKeyData(alg: alg(s(k["alg"])), raw: b64u(s(k["pub"])))), s(c["fingerprint"]), s(c["case"]))
+            }
+            for c in a(svcFp["invalid"]).map(o) {
+                let k = o(c["auth_key"])
+                try throwsCode(s(c["code"])) { _ = try serviceKeyFingerprint(authKey: PublicKeyData(alg: alg(s(k["alg"])), raw: b64u(s(k["pub"])))) }
+            }
+            let discord = a(svcFp["valid"]).map(o).first { s($0["case"]).contains("svc-discord") }!
+            try eq(try logL().serviceKeyFingerprint(deviceId: "svc-discord"), s(discord["fingerprint"]))
+            try eq(try logL().serviceKeyFingerprint(deviceId: "dev-phone"), nil)
+        }
+        // The host's own vector (src/memory/account_keys.rs H1_VECTOR): h1. of
+        // "github.com/agora/atem" under K = [7; 32], kid 0123abcd.
+        let h1Vector = "h1.0123abcd.777eda018c9c9736a84728e10308571167773f209924bf052477a1283cfd7cb6"
+        check("project keys and hashes (§R9.6)") {
+            try eq(projectKeyOfRemote(url: "git@github.com:Agora-Build/Atem.git"), "github.com/agora-build/atem")
+            try eq(projectKeyOfRemote(url: "https://user:tok@github.com/Agora-Build/Atem.git/"), "github.com/agora-build/atem")
+            try eq(projectKeyOfRemote(url: "file:///srv/repo.git"), nil)
+            try eq(localProjectKey(folderName: "Scratch"), "local:Scratch")
+            try eq(hex(projectHashInput(projectKey: "github.com/agora/atem")), hex(utf8("github.com/agora/atem")))
+            try eq(try projectHash(key: AccountKey(kid: "0123abcd", k: Data(repeating: 7, count: 32)), projectKey: "github.com/agora/atem"), h1Vector)
+            let mac = Data(HMAC<SHA256>.authenticationCode(for: projectHashInput(projectKey: "github.com/agora/atem"),
+                                                           using: SymmetricKey(data: Data(repeating: 7, count: 32))))
+            try eq(try projectHashFromMac(kid: "0123abcd", mac: mac), h1Vector)
+            try throwsCode("malformed") { _ = try projectHashFromMac(kid: "01.23", mac: mac) }
+            try throwsCode("malformed") { _ = try projectHashFromMac(kid: "0123abcd", mac: Data(count: 31)) }
+            try eq(isProjectHash(text: s(a(scopeOfE5()["projects"])[0])), true)
+            try eq(isProjectHash(text: "h1.0123abcd.zz"), false)
         }
 
         // ------------------------------------------------------------ recovery
@@ -485,6 +594,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 37)
+        XCTAssertEqual(passed, 41)
     }
 }

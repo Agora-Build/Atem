@@ -1,0 +1,186 @@
+{
+  "name": "r9-host-policy-restart-with-a-pending-write-rolls-forward",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.8a: the pending file is in place but host_policy.json wasn't replaced (its temp write failed): uncertain, the files still show the old policy plus the pending file (no local link); a restart rolls the pending change forward before anything is admitted, and a manager's get on the new runtime reads it durable (relay only, revision 1). A crash never lets the older false stand in.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000,
+      "link": "relay"
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      }
+    ],
+    "connected": []
+  },
+  "steps": [
+    {
+      "connect": "mac",
+      "carry": []
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "welcome",
+        "revision": 9
+      },
+      "capture": {
+        "mac_channel": "channel_id",
+        "mac_att": "attachment_gen"
+      }
+    },
+    {
+      "fail_next_membership_write": {
+        "file": "host_policy",
+        "at": "temp_write"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000901",
+          "request_id": "cccccccc-0000-4000-8000-000000000901",
+          "relay_only": true,
+          "expected_revision": 0
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000901",
+        "outcome": "uncertain",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "uncertain",
+        "channel_id": "${mac_channel}",
+        "attachment_gen": "${mac_att}",
+        "request_id": "cccccccc-0000-4000-8000-000000000901"
+      }
+    },
+    {
+      "assert": {
+        "host_policy": {
+          "relay_only": false,
+          "revision": 0,
+          "pending": true
+        }
+      }
+    },
+    {
+      "restart_runtime": {
+        "runtime_gen": "44444444-4444-4444-8444-444444444444",
+        "runtime_epoch": 2
+      }
+    },
+    {
+      "assert": {
+        "host_policy": {
+          "relay_only": true,
+          "revision": 1,
+          "pending": false
+        }
+      }
+    },
+    {
+      "connect": "mac",
+      "carry": []
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "welcome",
+        "revision": 9
+      },
+      "capture": {
+        "mac_channel": "channel_id",
+        "mac_att": "attachment_gen"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_get",
+          "id": "aaaaaaaa-0000-4000-8000-000000000902"
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000902",
+        "outcome": "current",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "durable",
+        "channel_id": "${mac_channel}",
+        "attachment_gen": "${mac_att}"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000903",
+          "request_id": "cccccccc-0000-4000-8000-000000000901",
+          "relay_only": true,
+          "expected_revision": 0
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000903",
+        "outcome": "committed",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "durable",
+        "channel_id": "${mac_channel}",
+        "attachment_gen": "${mac_att}",
+        "request_id": "cccccccc-0000-4000-8000-000000000901"
+      }
+    }
+  ]
+}

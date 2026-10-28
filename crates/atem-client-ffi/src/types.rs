@@ -201,6 +201,84 @@ record! {
     }
 }
 
+unit_enum! {
+    /// How close the log (or one of its limits) is to full (D23).
+    pub enum CapacityLevelKind {
+        Ok,
+        /// At or above 90 % of a limit: renewals use one entry each.
+        NearlyFull,
+        /// A limit reached: no entry at all (entries; the account needs
+        /// re-pairing), no `add` (members), or no `add_host` of a new host
+        /// (hosts).
+        Full,
+    }
+}
+
+record! {
+    /// The log's use of its limits (§R9.2), by the verifier's own counts.
+    /// `members` counts members in effect and the subjects of pending
+    /// `recovery_add`s (removed ones free their place; ids stay used),
+    /// `hosts` current hosts. `level` is the highest of the three limits'
+    /// levels.
+    pub struct CapacityInfo {
+        pub entries: u64,
+        pub max_entries: u64,
+        pub members: u64,
+        pub max_members: u64,
+        pub hosts: u64,
+        pub max_hosts: u64,
+        pub level: CapacityLevelKind,
+        pub entries_level: CapacityLevelKind,
+        pub members_level: CapacityLevelKind,
+        pub hosts_level: CapacityLevelKind,
+    }
+}
+
+data_enum! {
+    /// Why a signer shouldn't draft a change now
+    /// (`MembershipLog::check_change`; advisory, the verifier still accepts
+    /// any valid entry).
+    pub enum ChangeRefusalInfo {
+        /// 1024 entries: no verifier takes another, a removal included.
+        LogFull,
+        /// 256 members: no `add`, and no `recovery_add` either (a Recovery
+        /// Kit can't bring the account back), until one is removed: keep
+        /// expired or unused services removed so a place stays free.
+        MembersFull,
+        /// 64 current hosts: no `add_host` of a new host until one is
+        /// removed (a current host's new key still fits).
+        HostsFull,
+        /// A service change that grants anything new within 24 h of that
+        /// service's last grant (its add, or a change that granted
+        /// something new; signed at `last_signed_at`): retry at `retry_at`.
+        ServiceChangeTooSoon { last_signed_at: u64, retry_at: u64 },
+    }
+}
+
+record! {
+    /// A service scope (§R9.6) to build an `add` or `set_roles` from: the
+    /// lists in any order (the builder sorts them and drops duplicates);
+    /// `view` is added to `ops`; `projects`/`sessions` absent don't
+    /// restrict. Also what `MembershipLog::service_grant` returns
+    /// (canonical order).
+    pub struct ServiceScopeInfo {
+        pub hosts: Vec<String>,
+        /// `h1.<kid>.<64 hex>` launch project hashes (`project_hash`).
+        pub projects: Option<Vec<String>>,
+        /// `ses-…` session ids.
+        pub sessions: Option<Vec<String>>,
+        pub ops: Vec<String>,
+    }
+}
+
+record! {
+    /// A service member's grant in effect: its scope and expiry.
+    pub struct ServiceGrantInfo {
+        pub scope: ServiceScopeInfo,
+        pub expires_at: u64,
+    }
+}
+
 data_enum! {
     /// A state change the verifier committed (or would commit).
     pub enum MembershipEffect {
@@ -605,6 +683,33 @@ data_enum! {
         MembershipHead { re: Option<String>, head: LogHead, pending_recovery: Vec<PendingRecoveryInfo> },
         GrantRevoked { re: String },
         Seen { re: String },
+        /// A `host_policy_result` (§R9.8a): the host's current policy and
+        /// what it did to this attachment's relay-only readiness
+        /// (`observed`: `ready`, `not_ready`, or `foreign` — not one of
+        /// this attachment's requests, or bound elsewhere: confirms
+        /// nothing). `outcome`: `committed`, `unchanged`, `superseded`,
+        /// `conflict`, `save_failed`, `uncertain`, `current`; `state`:
+        /// `durable` or `uncertain`.
+        HostPolicy {
+            re: String,
+            request_id: Option<String>,
+            outcome: String,
+            relay_only: bool,
+            revision: u64,
+            state: String,
+            observed: String,
+            json: String,
+        },
+        /// `host_policy_changed`: another manager's committed change (the
+        /// host's current policy). Never a confirmation; `observed`
+        /// `not_ready` when it contradicts the wanted value.
+        HostPolicyChanged {
+            relay_only: bool,
+            revision: u64,
+            state: String,
+            observed: String,
+            json: String,
+        },
         /// A session error.
         Error { code: String, re: Option<String>, detail: Option<String>, json: String },
         /// The attachment is over (`unauthorized`/`account_frozen` without

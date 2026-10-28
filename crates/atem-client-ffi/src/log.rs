@@ -13,17 +13,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use atem_client::SignedObject;
 use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::channel::HeadRelation;
-use atem_client::encoding::{Hash32, b64u};
+use atem_client::encoding::Hash32;
 use atem_client::membership::{
-    Action, Conflict, Effect, Entry, Evaluation, Head, HostNow, Invalid, Member, MemberKind,
-    MemberStatus, Membership, Stop,
+    Action, CapacityLevel, ChangeRefusal, Conflict, Effect, Entry, Evaluation, Head, HostNow,
+    Invalid, Member, MemberKind, MemberStatus, Membership, Stop,
 };
 
 use crate::encoding::{MAX_SAFE, canonical, canonical_lossy, hash_of, safe_int, signed, strict};
 use crate::error::{AtemError, Result};
 use crate::types::{
-    CarriageResult, CarriageStop, FreezeInfo, HeadRelationKind, HostClock, HostInfo, KBackupInfo,
-    LogHead, MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo,
+    CapacityInfo, CapacityLevelKind, CarriageResult, CarriageStop, ChangeRefusalInfo, FreezeInfo,
+    HeadRelationKind, HostClock, HostInfo, KBackupInfo, LogHead, MemberInfo, MemberStatusKind,
+    MembershipEffect, PendingRecoveryInfo,
 };
 
 /// Largest durable snapshot `MembershipLog::from_stored` reads: the host's
@@ -141,6 +142,14 @@ fn member_info(member: &Member, status: MemberStatus) -> MemberInfo {
     }
 }
 
+fn level_kind(level: CapacityLevel) -> CapacityLevelKind {
+    match level {
+        CapacityLevel::Ok => CapacityLevelKind::Ok,
+        CapacityLevel::NearlyFull => CapacityLevelKind::NearlyFull,
+        CapacityLevel::Full => CapacityLevelKind::Full,
+    }
+}
+
 pub(crate) fn effect_info(effect: &Effect) -> MembershipEffect {
     match effect {
         Effect::Appended(h) => MembershipEffect::Appended { head: (*h).into() },
@@ -219,20 +228,11 @@ fn carriage_result(eval: &Evaluation, committed: bool) -> CarriageResult {
 }
 
 /// A structural check of an unsigned body with the verifier's own parser
-/// (the signature is checked against the chain later): so the owner is
-/// only asked to confirm a body the verifier would accept.
+/// (`atem_client::membership::check_body`; the signature is checked
+/// against the chain later): so the owner is only asked to confirm a body
+/// the verifier would accept.
 pub(crate) fn structural_entry(body: &serde_json::Value) -> std::result::Result<Entry, Invalid> {
-    let zero = b64u(&[0u8; 64]);
-    let mut object = serde_json::json!({"body": body, "sig": zero});
-    if body["action"] == "set_recovery_key" && body["kit"] == "current" {
-        object["kit_sig"] = serde_json::json!(zero);
-    }
-    let object = SignedObject::parse(
-        canonical(&object)
-            .map_err(|_| Invalid::Malformed("outside the canonical domain"))?
-            .as_bytes(),
-    )?;
-    Entry::parse(object)
+    atem_client::membership::check_body(body)
 }
 
 /// A verified membership log.
@@ -605,6 +605,64 @@ impl MembershipLog {
         canonical(&body)
     }
 
+    /// How full the log is (D23): entries, members and hosts against the
+    /// verifier's limits (1024, 256, 64), nearly full from 90 %. Show a warning
+    /// from `nearly_full`: renewals use one entry each, and a full log
+    /// needs re-pairing.
+    pub fn capacity(&self) -> CapacityInfo {
+        let c = self.lock().capacity();
+        CapacityInfo {
+            entries: c.entries,
+            max_entries: c.max_entries,
+            members: c.members,
+            max_members: c.max_members,
+            hosts: c.hosts,
+            max_hosts: c.max_hosts,
+            level: level_kind(c.level),
+            entries_level: level_kind(c.entries_level()),
+            members_level: level_kind(c.members_level()),
+            hosts_level: level_kind(c.hosts_level()),
+        }
+    }
+
+    /// Whether to draft `action_json` (as `draft_entry` takes it) as the
+    /// next entry at `now_ms` (the time it would be signed): `None` to go
+    /// ahead, else why not (`LogFull`, `MembersFull`, `HostsFull`, or `ServiceChangeTooSoon` for a
+    /// service change that grants anything new, e.g. a renewal, within
+    /// 24 h of that service's last grant; narrowing and `remove` are never
+    /// paced and never restart the 24 h). Advisory, for signers only: hosts accept any valid entry.
+    /// A malformed action is `Invalid`/`Membership` as in `draft_entry`.
+    pub fn check_change(
+        &self,
+        action_json: String,
+        now_ms: u64,
+    ) -> Result<Option<ChangeRefusalInfo>> {
+        let action = strict(&action_json)?;
+        // A placeholder signer: who signs isn't judged here.
+        let signer = match action["action"].as_str() {
+            Some("recovery_add") => atem_client::membership::RECOVERY_SIGNER,
+            _ => "change-check",
+        };
+        let body = self.draft_value(signer, safe_int(now_ms, "now_ms")?, &action)?;
+        let entry = structural_entry(&body)?;
+        let log = self.lock();
+        Ok(
+            match atem_client::membership::check_change(&log, &entry.action, now_ms) {
+                Ok(()) => None,
+                Err(ChangeRefusal::LogFull) => Some(ChangeRefusalInfo::LogFull),
+                Err(ChangeRefusal::MembersFull) => Some(ChangeRefusalInfo::MembersFull),
+                Err(ChangeRefusal::HostsFull) => Some(ChangeRefusalInfo::HostsFull),
+                Err(ChangeRefusal::ServiceChangeTooSoon {
+                    last_signed_at,
+                    retry_at,
+                }) => Some(ChangeRefusalInfo::ServiceChangeTooSoon {
+                    last_signed_at,
+                    retry_at,
+                }),
+            },
+        )
+    }
+
     /// Checks a member object (`add`/`recovery_add`'s `member`) with the
     /// verifier's schema; returns it in canonical JSON.
     pub fn check_member(&self, member_json: String) -> Result<String> {
@@ -664,5 +722,88 @@ impl MembershipLog {
                 device_id: state.member.device_id,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ChangeRefusalInfo;
+    use atem_client::membership::{Role, RolesChange};
+
+    /// The shared log L (six entries).
+    fn log_l() -> (Arc<MembershipLog>, HostClock) {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../designs/protocol/fixtures/r9-vectors-membership-log.json"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let entries = v["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["entry"].to_string())
+            .collect();
+        let now = HostClock {
+            wall_ms: 1_793_264_001_000,
+            mono_ms: 1000,
+            boot_id: "boot-1".into(),
+        };
+        let log = MembershipLog::verify(
+            v["account_id"].as_str().unwrap().into(),
+            v["genesis_hash"].as_str().unwrap().into(),
+            entries,
+            now.clone(),
+        )
+        .unwrap();
+        (log, now)
+    }
+
+    /// A full log is `LogFull` from `check_change`, never a
+    /// `membership_invalid` of the draft at seq 1025.
+    #[test]
+    fn a_full_log_is_log_full_not_an_invalid_draft() {
+        let (log, now) = log_l();
+        {
+            let mut m = log.lock();
+            let host_now = now.host_now().unwrap();
+            let mut i = 0u64;
+            while m.head().seq < atem_client::membership::MAX_ENTRIES {
+                let roles = if i % 2 == 0 {
+                    [Role::Control, Role::View].into()
+                } else {
+                    [Role::Control, Role::Manage, Role::View].into()
+                };
+                let body = m.draft(
+                    "dev-mac",
+                    1,
+                    &Action::SetRoles {
+                        device_id: "dev-phone".into(),
+                        change: RolesChange::Native(roles),
+                    },
+                );
+                let wire = serde_json::json!({"body": body, "sig": atem_client::encoding::b64u(&[0u8; 64])});
+                let entry = Entry::parse_bytes(wire.to_string().as_bytes()).unwrap();
+                m.append_unchecked_for_tests(entry, &host_now);
+                i += 1;
+            }
+        }
+        assert_eq!(log.capacity().entries, 1024);
+        for action in [
+            r#"{"action":"remove","device_id":"svc-discord"}"#,
+            r#"{"action":"remove_host","host_id":"host-a"}"#,
+        ] {
+            assert_eq!(
+                log.check_change(action.into(), 1_793_264_001_000).unwrap(),
+                Some(ChangeRefusalInfo::LogFull),
+                "{action}"
+            );
+        }
+        // A malformed action is still refused as `draft_entry` refuses it.
+        assert!(matches!(
+            log.check_change(r#"{"action":"remove"}"#.into(), 1),
+            Err(AtemError::Membership { .. })
+        ));
     }
 }
