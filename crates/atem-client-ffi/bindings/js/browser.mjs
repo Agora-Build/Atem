@@ -124,6 +124,12 @@ async function main() {
     expect(e.kind === "request" && e.detail === "unknown session", `local refusal (${e.kind} ${e.detail})`);
   }
   console.log("REQUESTS renew interrupt:forbidden release");
+  // §R9.8a: a browser holds a grant, not membership: the host policy is
+  // forbidden, and the binding never reports it ready.
+  const policy = await exchange(conn.hostPolicyGet(true, mono()), (ev) => ev.some((e) => e.type === "error" || e.type === "host_policy"));
+  expect(policy.some((e) => e.type === "error" && e.code === "forbidden"), `host policy forbidden: ${JSON.stringify(policy)}`);
+  expect(conn.hostPolicyReady() === false, "never ready");
+  console.log("POLICY get:forbidden");
 
   const relay = new Wire(relayPort);
   relay.send(Buffer.from(JSON.stringify({ device_id: "browser" })));

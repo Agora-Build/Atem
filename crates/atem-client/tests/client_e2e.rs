@@ -1450,3 +1450,88 @@ fn junk_revocations_cannot_reenable_a_revoked_grant() {
     world.advance(3_900_001);
     assert!(world.core.lock().unwrap().revoked.is_empty());
 }
+
+/// §R9.8a through the shared client core against the test host: a native
+/// manager sets relay only and is ready; another manager hears the change
+/// (never a confirmation) and confirms with a get; a retry after a later
+/// change is superseded with the current policy; a service is forbidden.
+#[test]
+fn the_host_policy_is_set_and_confirmed_in_the_channel() {
+    use atem_client::session::host_policy::{Observed, Outcome};
+    let world = World::new(&L);
+    let log = world.log(&L);
+    let now = || world.mono();
+    let policy = |events: &[Event]| {
+        events.iter().find_map(|e| match e {
+            Event::HostPolicy { result, observed } => Some((result.clone(), *observed)),
+            _ => None,
+        })
+    };
+    let changed = |events: &[Event]| {
+        events.iter().find_map(|e| match e {
+            Event::HostPolicyChanged { change, observed } => Some((change.clone(), *observed)),
+            _ => None,
+        })
+    };
+    let mut pw = world.tcp();
+    let mut p = Device::native(&world, "dev-phone", log.clone())
+        .connect(&mut pw)
+        .unwrap();
+    let mut mw = world.tcp();
+    let mut m = Device::native(&world, "dev-mac", log.clone())
+        .connect(&mut mw)
+        .unwrap();
+    assert!(p.welcome().features.iter().any(|f| f == "host.policy"));
+    assert!(!p.host_policy().ready());
+
+    const R1: &str = "cccccccc-0000-4000-8000-000000000001";
+    const R2: &str = "cccccccc-0000-4000-8000-000000000002";
+    let (id, frame) = p.host_policy_set(true, R1, now()).unwrap();
+    let ev = exchange(&mut p, &mut pw, &frame, now(), |e| policy(e).is_some());
+    let (r, observed) = policy(&ev).unwrap();
+    assert_eq!(
+        (r.re.as_str(), r.outcome),
+        (id.as_str(), Outcome::Committed)
+    );
+    assert_eq!((r.policy.relay_only, r.policy.revision), (true, 1));
+    assert_eq!(r.channel_id, p.channel_id());
+    assert_eq!(observed, Observed::Ready);
+    assert!(p.host_policy().ready());
+
+    // The Mac hears it with its next exchange, then confirms with a get.
+    let (_, frame) = m.host_policy_get(true, now()).unwrap();
+    let ev = exchange(&mut m, &mut mw, &frame, now(), |e| policy(e).is_some());
+    let (c, observed) = changed(&ev).expect("host_policy_changed");
+    assert_eq!(observed, Observed::NotReady, "never a confirmation");
+    assert_eq!(
+        (c.policy.relay_only, c.channel_id.as_str()),
+        (true, m.channel_id())
+    );
+    assert_eq!(policy(&ev).unwrap().0.outcome, Outcome::Current);
+    assert!(m.host_policy().ready());
+
+    // The Mac turns it off; the phone's retry of R1 is superseded.
+    let (_, frame) = m.host_policy_set(false, R2, now()).unwrap();
+    let ev = exchange(&mut m, &mut mw, &frame, now(), |e| policy(e).is_some());
+    assert_eq!(policy(&ev).unwrap().0.outcome, Outcome::Committed);
+    let (_, frame) = p.host_policy_retry(true, R1, 0, now()).unwrap();
+    let ev = exchange(&mut p, &mut pw, &frame, now(), |e| policy(e).is_some());
+    let (r, observed) = policy(&ev).unwrap();
+    assert_eq!(r.outcome, Outcome::Superseded);
+    assert_eq!((r.policy.relay_only, r.policy.revision), (false, 2));
+    assert_eq!(observed, Observed::NotReady);
+    assert!(!p.host_policy().ready());
+    // The Mac's request id from the phone: reused.
+    let (_, frame) = p.host_policy_retry(false, R2, 1, now()).unwrap();
+    let ev = exchange(&mut p, &mut pw, &frame, now(), |e| error_code(e).is_some());
+    assert_eq!(error_code(&ev).as_deref(), Some("request_id_reused"));
+
+    // A service is never a manager.
+    let mut bw = world.tcp();
+    let mut b = Device::service(&world, "svc-discord", log.clone())
+        .connect(&mut bw)
+        .unwrap();
+    let (_, frame) = b.host_policy_get(true, now()).unwrap();
+    let ev = exchange(&mut b, &mut bw, &frame, now(), |e| error_code(e).is_some());
+    assert_eq!(error_code(&ev).as_deref(), Some("forbidden"));
+}
