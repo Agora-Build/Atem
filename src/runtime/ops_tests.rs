@@ -1144,20 +1144,9 @@ fn first_pairing(leftover: Option<&str>) {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         });
-        let (question, kind, text) = op.ask().await;
-        assert_eq!(kind, AskKind::YesNo);
-        assert!(text.contains("Save credentials"), "{text}");
-        op.answer(question, AnswerValue::Yes).await;
-        let preference = peer.next("pairSavePreference").await;
-        assert_eq!(preference["data"]["save_credentials"], true);
-        peer.send(&AstationMessage::CredentialSync {
-            access_token: "access".into(),
-            refresh_token: "refresh".into(),
-            expires_at: crate::credentials::now_secs() + 3600,
-            login_id: Some("me".into()),
-            astation_id: ASTATION.into(),
-            save_credentials: true,
-        });
+        // Local pairing: the authenticated loopback challenge named
+        // Astation, so no bootstrap hello and no credentials (the
+        // token-free design); the verification below establishes trust.
         // Verification on the same connection, now the runtime's link.
         let verifier = Verifier::keys(&mut peer, "acct-new").await;
         let certificate = verifier
@@ -1173,17 +1162,20 @@ fn first_pairing(leftover: Option<&str>) {
             pending_kid: None,
         });
         op.done().await.unwrap();
+        assert!(op.printed.iter().any(|l| l == "Paired with Astation."));
         assert!(
-            op.printed
-                .iter()
-                .any(|l| l.contains("Paired with Astation. (SSO: me)"))
+            !peer.seen.iter().any(|m| m["type"] == "pairing"),
+            "no bootstrap on a local link"
         );
+        assert!(!op.printed.iter().any(|l| l.contains("SSO")));
 
         let src = crate::profile::Sources::in_dir(&rt.profile);
         let binding = crate::pairing::load(&src).unwrap().binding.unwrap();
         assert_eq!(binding.astation_id, ASTATION);
-        assert!(fresh_shared(&rt.profile).is_some());
-        assert!(record(&rt.profile).save_credentials);
+        // No Login fabricated, nothing to save without `--save`.
+        assert!(fresh_shared(&rt.profile).is_none());
+        assert!(record(&rt.profile).shared.is_none());
+        assert!(!record(&rt.profile).save_credentials);
         assert_eq!(record(&rt.profile).astation_id, ASTATION);
         assert_eq!(
             record(&rt.profile).session.unwrap().session_id,
@@ -2170,6 +2162,47 @@ fn a_verify_keys_without_a_genesis_is_refused() {
         let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
         assert!(!pending(&rt.keys()), "no pending pin");
+        rt.shutdown().await;
+    });
+}
+
+/// Every `atem pair verify` ceremony runs in the next host trust
+/// generation (durable before `verifyCommit`): a retry after an aborted
+/// ceremony reveals a fresh `host_channel_key`, which Astation can only add
+/// at a higher generation than an `add_host` it may already have signed.
+/// The pairing (Astation, session) is kept and the link stays current.
+#[test]
+fn each_verification_runs_in_the_next_trust_generation_and_keeps_the_pairing() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let start = trust_gen(&rt.profile);
+        let session = record(&rt.profile).session.unwrap().session_id;
+        for attempt in 1..=2u64 {
+            let mut op =
+                Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+            let commit = peer.next("verifyCommit").await;
+            assert_eq!(
+                commit["data"]["host_trust_gen"],
+                start + attempt,
+                "attempt {attempt}: {commit}"
+            );
+            assert_eq!(trust_gen(&rt.profile), start + attempt, "durable first");
+            // Astation cancels this attempt (as an aborted ceremony).
+            peer.send(&AstationMessage::VerifyAbort {
+                reason: "cancelled".into(),
+            });
+            assert!(op.done().await.is_err());
+            assert_eq!(record(&rt.profile).astation_id, ASTATION);
+            assert_eq!(
+                record(&rt.profile).session.unwrap().session_id,
+                session,
+                "the pairing and its session stay"
+            );
+        }
         rt.shutdown().await;
     });
 }

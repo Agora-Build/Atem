@@ -353,12 +353,25 @@ pub enum AstationMessage {
         save_credentials: bool,
     },
 
-    /// Atem → Astation: user's preference for whether paired credentials should persist
-    /// after Astation disconnect. Sent during `atem pair`.
-    #[serde(rename = "pairSavePreference")]
-    PairSavePreference {
-        save_credentials: bool,
+    /// The token-free pairing bootstrap v1 (Astation's
+    /// `designs/protocol/pairing-and-service-authorization.md`): Atem sends
+    /// `hello{id}` on its pairing connection (the same `id` for every
+    /// retransmission of one attempt); Astation answers
+    /// `introduction{id, astation_id}` or `error{id, code}`. It carries no
+    /// account, token, credential or key: `astation_id` is only a routing
+    /// hint, and trust comes from the authenticated identity connection and
+    /// the device verification after it.
+    #[serde(rename = "pairing")]
+    Pairing {
+        v: u64,
+        op: String,
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        astation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
+
 
     /// Astation → Atem: the account's encryption mode, as a signed
     /// `atem-account-state-v1` statement. Messages without one are ignored.
@@ -543,6 +556,10 @@ pub struct AstationClient {
     /// Shows the pairing code and its outcome (`authenticate_with_pairing`);
     /// `None` prints them. The runtime sends them to the CLI that pairs.
     pairing_notice: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// The pairing attempt this identity link continues (`atem pair`): the
+    /// room's code and the bootstrap hello's id, sent as `pairing_code` and
+    /// `pairing_attempt_id` instead of a new code (`with_pairing_attempt`).
+    pairing_attempt: Option<(String, String)>,
     /// The cred agent encryption messages and reports use (`with_agent`);
     /// `None` is this user's agent.
     agent: Option<std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>>,
@@ -692,6 +709,7 @@ impl AstationClient {
             profile: None,
             capture: None,
             pairing_notice: None,
+            pairing_attempt: None,
             agent: None,
             is_op_view: false,
             via: None,
@@ -752,6 +770,15 @@ impl AstationClient {
         notice: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
     ) -> Self {
         self.pairing_notice = Some(notice);
+        self
+    }
+
+    /// The identity link of an explicit `atem pair` continues that attempt:
+    /// its pairing-code authentication sends the room's `code` and the
+    /// bootstrap hello's `attempt_id` (Astation matches both, and the same
+    /// `atem_id`, before it prompts the owner), never a second code.
+    pub(crate) fn with_pairing_attempt(mut self, code: &str, attempt_id: &str) -> Self {
+        self.pairing_attempt = Some((code.to_string(), attempt_id.to_string()));
         self
     }
 
@@ -1576,17 +1603,27 @@ impl AstationClient {
 
     /// Authenticate using pairing code (fallback when session invalid/missing)
     async fn authenticate_with_pairing(&mut self, astation_id: &str, atem_id: &str) -> Result<()> {
-        // Generate pairing code
-        let pairing_code = crate::auth::generate_otp();
+        // The attempt `atem pair` started (its room code and hello id), else
+        // a new code.
+        let attempt = self.pairing_attempt.clone();
+        let pairing_code = match &attempt {
+            Some((code, _)) => code.clone(),
+            None => crate::auth::generate_otp(),
+        };
         let hostname = crate::auth::get_hostname();
 
-        self.pairing_line("🔐 Pairing with Astation...");
-        self.pairing_line(&format!("   Code: {}", pairing_code));
+        if attempt.is_none() {
+            self.pairing_line("🔐 Pairing with Astation...");
+            self.pairing_line(&format!("   Code: {}", pairing_code));
+        }
         self.pairing_line("   Waiting for approval...");
 
         // Send pairing auth
         let mut auth_data = std::collections::HashMap::new();
         auth_data.insert("pairing_code".to_string(), pairing_code.clone());
+        if let Some((_, attempt_id)) = &attempt {
+            auth_data.insert("pairing_attempt_id".to_string(), attempt_id.clone());
+        }
         auth_data.insert("hostname".to_string(), hostname.clone());
         auth_data.insert("atem_id".to_string(), atem_id.to_string());
 
@@ -2286,7 +2323,13 @@ impl AstationClient {
         } else {
             station_url.replace("http://", "ws://")
         };
-        let ws_url = format!("{}/ws?role=atem&code={}", ws_scheme, code);
+        // The same stable atem_id as the identity link that follows: Astation
+        // pins the room's host and matches it (token-free pairing v1).
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let atem_id = self.resolved_atem_id(&hostname);
+        let ws_url = relay_ws_url(&ws_scheme, &code, &atem_id);
         self.connect_raw(&ws_url).await?;
         // A pairing room: its code is a secret until the pairing ends.
         self.via = Some(LinkVia::Relay {
@@ -4237,32 +4280,6 @@ mod tests {
             _ => panic!("expected CredentialSync"),
         }
     }
-
-    // ── PairSavePreference ────────────────────────────────
-
-    #[test]
-    fn pair_save_preference_roundtrip_true() {
-        let msg = AstationMessage::PairSavePreference { save_credentials: true };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"pairSavePreference""#));
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        matches!(parsed, AstationMessage::PairSavePreference { save_credentials: true });
-    }
-
-    #[test]
-    fn pair_save_preference_roundtrip_false() {
-        let msg = AstationMessage::PairSavePreference { save_credentials: false };
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AstationMessage = serde_json::from_str(&json).unwrap();
-        match parsed {
-            AstationMessage::PairSavePreference { save_credentials } => {
-                assert!(!save_credentials);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── Removed: the plaintext transport policy (§R9.8a) ──
 
     #[test]
     fn the_plaintext_transport_policy_is_a_removed_op() {

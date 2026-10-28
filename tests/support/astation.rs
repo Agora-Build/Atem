@@ -173,6 +173,14 @@ fn is_auth(value: &Value) -> bool {
     value["type"] == "statusUpdate" && value["data"]["status"] == "auth"
 }
 
+/// Every relay host connection's query (`code`, `atem_id`, …) in this test
+/// process.
+pub static QUERIES: Mutex<Vec<Vec<(String, String)>>> = Mutex::new(Vec::new());
+
+/// Every `auth` data any fake received in this test process (tests check
+/// fields of their own attempt, e.g. `pairing_attempt_id`).
+pub static AUTHS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
 /// Answers Atem's `auth` (`value`) as `auth` says: `Event::Authenticated`
 /// when accepted, else the `auth` as a message. `false`: the socket failed.
 async fn answer_auth(
@@ -182,6 +190,7 @@ async fn answer_auth(
     auth: &Arc<Mutex<AuthReply>>,
     value: Value,
 ) -> bool {
+    AUTHS.lock().unwrap().push(value["data"]["data"].clone());
     let answer = auth.lock().unwrap().clone();
     let (reply, accepted) = match answer {
         AuthReply::Authenticated => (
@@ -247,7 +256,7 @@ pub enum Reply {
     OkThenClose { host_id: String, head: Value },
     /// No verdict and no proof expected: after the challenge the link
     /// carries what the test sends (a pairing-code room's link, which
-    /// answers no challenge, gets `credentialSync` from the test).
+    /// answers no challenge, gets the pairing introduction from the test).
     Serve,
     /// The room's owner is in the room (carrier A): `host_challenge`, then
     /// Astation's `auth_required` at once (before any verdict). Atem's
@@ -418,6 +427,7 @@ async fn relay_link(
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+    QUERIES.lock().unwrap().push(query.clone());
     if let Reply::Unsolicited { host_id, head } = &reply {
         let _ = socket.send(Message::Text(ok_message(host_id, head))).await;
     }
