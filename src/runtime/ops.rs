@@ -13,6 +13,7 @@ use super::protocol::{AnswerValue, AskKind, OpKind, OpOptions, PrintLevel, Runti
 use crate::memory::cred_agent::{CredAgentApi, LOCKED, blocking, default_agent};
 use crate::memory::unlock::{AstationLink, shown};
 use crate::pair_verify::{CodeAnswer, VerifyFailure};
+use crate::pairing_wire::{PAIRING_V, valid_astation_id};
 use crate::paths::CredPaths;
 use crate::profile::Sources;
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -906,9 +907,6 @@ async fn pair<U: OpUi>(
     verified
 }
 
-/// The `pairing` bootstrap's version.
-const PAIRING_V: u64 = 1;
-
 /// How long a first pairing waits for Astation's introduction (the relay's
 /// pairing room lives 600 s).
 const PAIR_INTRODUCTION_WAIT: Duration = Duration::from_secs(600);
@@ -946,7 +944,9 @@ fn pairing_reply(
         ));
     }
     match (op, astation_id) {
-        ("introduction", Some(a)) if valid_astation_id(a) => PairingReply::Introduction(a.into()),
+        ("introduction", Some(a)) if code.is_none() && valid_astation_id(a) => {
+            PairingReply::Introduction(a.into())
+        }
         ("introduction", _) => PairingReply::Refused("Astation sent an invalid introduction.".into()),
         ("error", _) => PairingReply::Refused(match code.unwrap_or_default() {
             "not_signed_in" => {
@@ -961,15 +961,6 @@ fn pairing_reply(
         }),
         _ => PairingReply::Refused("Astation sent an unknown pairing message. Update atem.".into()),
     }
-}
-
-/// A routing id worth connecting to: 1–128 of `[A-Za-z0-9._:-]`.
-fn valid_astation_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 /// The token-free pairing bootstrap v1 on the pairing connection: sends
@@ -1043,6 +1034,10 @@ async fn introduction_from<U: OpUi>(
                 PairingReply::Introduction(astation_id) => return Ok((astation_id, hello_id)),
                 PairingReply::Refused(why) => bail!(why),
             },
+            AstationMessage::PairingInvalid { reason } => bail!(
+                "Astation sent an invalid pairing message ({}). Update atem or Astation, then run `atem pair` again.",
+                shown(&reason)
+            ),
             AstationMessage::CredentialSync { .. } => bail!(
                 "This Astation uses the old credential-based pairing. Update Astation, then run `atem pair` again."
             ),
@@ -1238,6 +1233,13 @@ mod pairing_bootstrap_tests {
             r(1, "introduction", ID, Some(""), None),
             r(1, "error", ID, None, Some("pairing_cancelled")),
             r(1, "error", ID, None, Some("weird")),
+            r(
+                1,
+                "introduction",
+                ID,
+                Some("astation-x"),
+                Some("pairing_cancelled"),
+            ),
             r(1, "hello", ID, None, None),
         ] {
             assert!(matches!(refused, PairingReply::Refused(_)), "{refused:?}");

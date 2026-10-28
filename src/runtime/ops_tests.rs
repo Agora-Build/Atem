@@ -1085,6 +1085,63 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
     first_pairing(None);
 }
 
+/// The pairing bootstrap's receive path: what the link's reader makes of
+/// raw frames (the contract's 4096-byte bound including, exact shapes, no
+/// unknown or duplicate fields, UUID ids, v1), before `atem pair` sees them.
+#[test]
+fn pairing_frames_are_read_strictly_on_the_receive_path() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (url, peer) = Peer::listen().await;
+        let mut client = link_to(&profile, &url, relay()).await;
+        const ID: &str = "1dc7bd24-391c-4d16-8b6e-1121e75a2af8";
+        let intro = format!(
+            r#"{{"type":"pairing","data":{{"v":1,"op":"introduction","id":"{ID}","astation_id":"{ASTATION}"}}}}"#
+        );
+        let padded = |len: usize| format!("{intro}{}", " ".repeat(len - intro.len()));
+        let cases: Vec<(String, bool)> = vec![
+            (intro.clone(), true),
+            (intro.clone(), true), // a retransmitted reply reads the same
+            (padded(4096), true),
+            (padded(4097), false),
+            (intro.replace(r#""v":1"#, r#""v":2"#), false),
+            (intro.replace(ID, "not-a-uuid"), false),
+            (
+                intro.replace(r#"}}"#, r#","code":"pairing_cancelled"}}"#),
+                false,
+            ),
+            (intro.replace(r#"}}"#, r#","extra":1}}"#), false),
+            (
+                intro.replace(
+                    r#""astation_id""#,
+                    r#""astation_id":"astation-x","astation_id""#,
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"type":"pairing","data":{{"v":1,"op":"error","id":"{ID}","code":"not_signed_in"}}}}"#
+                ),
+                true,
+            ),
+        ];
+        for (frame, valid) in &cases {
+            peer.to_atem.send(frame.clone()).unwrap();
+            let message = tokio::time::timeout(WAIT, client.recv_message_async())
+                .await
+                .expect("a message")
+                .expect("the link is open");
+            match message {
+                AstationMessage::Pairing { .. } => assert!(valid, "accepted: {frame}"),
+                AstationMessage::PairingInvalid { .. } => assert!(!valid, "refused: {frame}"),
+                other => panic!("{other:?} for {frame}"),
+            }
+        }
+    });
+}
+
 /// A record without a binding (left by v0.7.2's background reconnect) is
 /// not a pairing: `atem pair` proceeds and replaces it.
 #[test]
@@ -2205,6 +2262,85 @@ fn each_verification_runs_in_the_next_trust_generation_and_keeps_the_pairing() {
         }
         rt.shutdown().await;
     });
+}
+
+/// The rebind persists across a runtime restart: after an aborted
+/// ceremony the runtime stops; a new runtime's `pair verify` goes one
+/// generation higher again.
+#[test]
+fn the_next_generation_survives_a_runtime_restart() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir.clone(), Some(&url), Arc::new(test_agent(&keys))).await;
+        let start = trust_gen(&rt.profile);
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        assert_eq!(
+            peer.next("verifyCommit").await["data"]["host_trust_gen"],
+            start + 1
+        );
+        peer.send(&AstationMessage::VerifyAbort {
+            reason: "cancelled".into(),
+        });
+        assert!(op.done().await.is_err());
+        rt.shutdown().await;
+        // The old runtime's socket file (a real restart replaces it too).
+        let _ = std::fs::remove_file(dir.path().join("rt.sock"));
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        assert_eq!(
+            trust_gen(&rt.profile),
+            start + 1,
+            "durable across the restart"
+        );
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        assert_eq!(
+            peer.next("verifyCommit").await["data"]["host_trust_gen"],
+            start + 2
+        );
+        peer.send(&AstationMessage::VerifyAbort {
+            reason: "cancelled".into(),
+        });
+        assert!(op.done().await.is_err());
+        rt.shutdown().await;
+    });
+}
+
+/// A save error during the rebind (before or after the rename) ends the
+/// operation before `verifyCommit`: nothing is sent, nothing is lowered.
+#[test]
+fn a_failed_rebind_sends_no_verify_commit() {
+    for after_rename in [false, true] {
+        local(async {
+            let dir = Rc::new(short_dir());
+            paired(&dir.path().join("profile"));
+            let (url, mut peer) = Peer::listen().await;
+            let keys = CredPaths::in_dir(&dir.path().join("profile"));
+            let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+            let start = trust_gen(&rt.profile);
+            let record = crate::paths::ProfilePaths::in_dir(&rt.profile)
+                .pairing
+                .record;
+            let (_before, _after);
+            if after_rename {
+                _after = Some(crate::memory::crypto::fail_after_rename(&record));
+            } else {
+                _before = Some(crate::memory::crypto::fail_writes_to(&record));
+            }
+            let mut op =
+                Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+            assert!(op.done().await.is_err(), "after_rename {after_rename}");
+            peer.drain(Duration::from_millis(300)).await;
+            assert!(
+                !peer.seen.iter().any(|m| m["type"] == "verifyCommit"),
+                "after_rename {after_rename}: no verifyCommit"
+            );
+            assert!(trust_gen(&rt.profile) >= start, "never lower");
+            rt.shutdown().await;
+        });
+    }
 }
 
 /// r9: a device list whose `add_host` names another key than the one this

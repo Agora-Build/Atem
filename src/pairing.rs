@@ -836,6 +836,42 @@ pub(crate) mod tests {
         Captured::now(&src).unwrap()
     }
 
+    /// A write that renamed its bytes into place and then failed (its
+    /// directory fsync, an uncertain outcome): the rebind reports the error
+    /// (so no `verifyCommit` follows), what is on disk is consistent at the
+    /// higher generation and still paired, and the next rebind goes higher.
+    #[test]
+    fn a_rebind_failing_after_a_rename_is_consistent_and_never_lower() {
+        for failing in ["record", "floor", "trust_gen"] {
+            let dir = tempfile::tempdir().unwrap();
+            let captured = bound_profile(dir.path(), "astation-1");
+            let src = captured.sources().clone();
+            let before = captured.state.clone();
+            let path = match failing {
+                "record" => src.paths.pairing.record.clone(),
+                "floor" => src.paths.cred.trust_gen_floor.clone(),
+                _ => src.paths.pairing.trust_gen.clone(),
+            };
+            {
+                let _failing = crate::memory::crypto::fail_after_rename(&path);
+                assert!(
+                    rebind_for_verification(&src, &before, "astation-1").is_err(),
+                    "{failing}"
+                );
+            }
+            let now = load(&src).unwrap();
+            assert_eq!(now.host_trust_gen, before.host_trust_gen + 1, "{failing}");
+            assert_eq!(
+                now.binding.as_ref().map(|b| b.astation_id.as_str()),
+                Some("astation-1"),
+                "{failing}: still paired"
+            );
+            let next =
+                rebind_for_verification(&src, &capture(&src).unwrap(), "astation-1").unwrap();
+            assert_eq!(next.host_trust_gen, before.host_trust_gen + 2, "{failing}");
+        }
+    }
+
     /// `atem pair verify`'s rebind: the next generation, durable, the
     /// pairing and its session kept; refused (nothing written) when the
     /// pairing moved meanwhile, for another Astation or with no record.

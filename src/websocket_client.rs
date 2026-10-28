@@ -361,6 +361,8 @@ pub enum AstationMessage {
     /// account, token, credential or key: `astation_id` is only a routing
     /// hint, and trust comes from the authenticated identity connection and
     /// the device verification after it.
+    /// Outbound only through serde: a received `pairing` frame is read by
+    /// `pairing_wire::parse` (strict) instead.
     #[serde(rename = "pairing")]
     Pairing {
         v: u64,
@@ -372,6 +374,11 @@ pub enum AstationMessage {
         code: Option<String>,
     },
 
+
+    /// A received `pairing` frame that `pairing_wire::parse` refused
+    /// (over 4096 bytes, not strict JSON, or not an exact v1 shape).
+    #[serde(skip)]
+    PairingInvalid { reason: String },
 
     /// Astation → Atem: the account's encryption mode, as a signed
     /// `atem-account-state-v1` statement. Messages without one are ignored.
@@ -1245,6 +1252,12 @@ impl AstationClient {
                                 Some((None, true)) => None,
                                 _ => Some(AstationMessage::Relay(text)),
                             },
+                            // The pairing bootstrap: read strictly (bound,
+                            // exact shapes), never through the generic decoder.
+                            None if crate::pairing_wire::is_pairing(&text) => Some(match crate::pairing_wire::parse(&text) {
+                                Ok(message) => message,
+                                Err(reason) => AstationMessage::PairingInvalid { reason: reason.to_string() },
+                            }),
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };
                         if let Some(astation_msg) = astation_msg
