@@ -189,6 +189,8 @@ impl App {
         }
         self.rebuild_menu();
         self.status_message = Some("Astation reconnected".to_string());
+        // A local link stays local only while the record allows it.
+        self.drop_local_link_if_relay_only();
     }
 }
 
@@ -439,6 +441,40 @@ mod tests {
             crate::pairing::tests::session_id(&dir).as_deref(),
             Some(SESSION_ID)
         );
+    }
+
+    /// A local link that re-authenticates while the host policy says relay
+    /// only is dropped and reconnects; one
+    /// that may stay local stays, also with a config.toml that doesn't parse
+    /// (never taken for a damaged record).
+    #[tokio::test]
+    async fn a_local_link_re_authenticated_under_relay_only_is_dropped() {
+        for relay_only in [true, false] {
+            let (mut app, mut peer) = connected_app().await;
+            app.astation_client
+                .set_via_for_test(crate::websocket_client::LinkVia::Local);
+            crate::session_protocol::r9::host_policy::write_for_test(
+                &crate::paths::ProfilePaths::in_dir(peer._state.path()).pairing,
+                relay_only,
+            );
+            peer.send
+                .send(auth_required(ASTATION, &"c".repeat(64)))
+                .unwrap();
+            next_auth(&mut app, &mut peer).await;
+            peer.send
+                .send(status("authenticated", &[("method", "session_proof")]))
+                .unwrap();
+            if relay_only {
+                until_closed(&mut app, &mut peer).await;
+                assert!(!app.astation_connected);
+                assert!(app.relay_only_drop.is_none());
+                assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
+            } else {
+                pump(&mut app, &mut peer).await;
+                assert!(app.astation_connected, "local allowed: kept");
+                assert!(app.relay_only_drop.is_none());
+            }
+        }
     }
 
     async fn assert_fails_closed(app: &mut App, peer: &mut Peer, notice: &str) {

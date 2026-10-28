@@ -13,11 +13,14 @@
 //! - [`r9`]: the r9 `hello` (built by the crate around `sig_c`, parsed by the
 //!   host), `welcome`, the r9 session errors and the new session ops of
 //!   §R9.8 (`membership`, `membership_head`, `revoke_grant`,
-//!   `grant_revoked`, `approval_seen`, `seen`).
+//!   `grant_revoked`, `approval_seen`, `seen`);
+//! - [`host_policy`]: §R9.8a's relay-only policy (`host_policy_set`,
+//!   `host_policy_get`, `host_policy_result`) and the client's tracker.
 use rand_core::{OsRng, RngCore};
 
 pub mod chat;
 pub mod client;
+pub mod host_policy;
 pub mod r9;
 pub mod revision;
 pub mod terminal;

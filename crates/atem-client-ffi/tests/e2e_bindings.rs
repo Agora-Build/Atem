@@ -330,6 +330,10 @@ fn kotlin_phone_and_wasm_browser_use_the_host_over_tcp() {
         "renew interrupt approval rule_revoke stop terminal chat"
     );
     assert_eq!(next("phone", "RELEASED"), "lease_released");
+    assert_eq!(
+        next("phone", "POLICY"),
+        "committed committed current ready=true"
+    );
     let grant = next("phone", "GRANT");
     writeln!(browser_in, "GRANT {grant}").unwrap();
     browser_in.flush().unwrap();
@@ -349,6 +353,7 @@ fn kotlin_phone_and_wasm_browser_use_the_host_over_tcp() {
         next("browser", "REQUESTS"),
         "renew interrupt:forbidden release"
     );
+    assert_eq!(next("browser", "POLICY"), "get:forbidden");
     next("phone", "READY_FOR_PUSH");
     next("browser", "READY_FOR_PUSH");
 

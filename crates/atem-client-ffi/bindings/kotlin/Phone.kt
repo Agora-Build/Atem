@@ -138,6 +138,21 @@ private fun run(args: Array<String>) {
     println("RELEASED $releasedOp")
     expect(!conn.lease(ses, mono())!!.controls, "released")
 
+    // §R9.8a: relay only, set and confirmed inside the channel (dev-phone
+    // holds manage). Ready only on a durable result of its own request.
+    expect(!conn.hostPolicyReady(), "a new attachment starts not ready")
+    val policyId = UUID.randomUUID().toString()
+    val set = exchange(conn.hostPolicySet(true, policyId, mono())) { ev -> ev.any { it is ClientEvent.HostPolicy || it is ClientEvent.Error } }
+    val setResult = set.filterIsInstance<ClientEvent.HostPolicy>().single()
+    expect(setResult.requestId == policyId && setResult.relayOnly && setResult.revision == 1uL && setResult.state == "durable", "policy committed")
+    expect(setResult.observed == "ready" && conn.hostPolicyReady(), "ready after the commit")
+    val retried = exchange(conn.hostPolicyRetry(true, policyId, 0uL, mono())) { ev -> ev.any { it is ClientEvent.HostPolicy } }
+    val retryResult = retried.filterIsInstance<ClientEvent.HostPolicy>().single()
+    val got = exchange(conn.hostPolicyGet(true, mono())) { ev -> ev.any { it is ClientEvent.HostPolicy } }
+    val getResult = got.filterIsInstance<ClientEvent.HostPolicy>().single()
+    expect(getResult.requestId == null && conn.hostPolicyRevision() == 1uL, "get reads the current policy")
+    println("POLICY ${setResult.outcome} ${retryResult.outcome} ${getResult.outcome} ready=${conn.hostPolicyReady()}")
+
     // A browser grant (the QR) for the browser's WebCrypto key: prompt + view
     // on ses-a…, one hour at most; a fresh owner confirmation.
     val issued = wall()

@@ -235,6 +235,16 @@ pub fn membership_fault() -> Option<String> {
     None
 }
 
+/// The next host-policy write fault (§R9.8a; `file:step`, the files
+/// `host_policy`/`host_policy_pending`): its own hook, so a device-list
+/// write never takes it.
+pub fn policy_fault() -> Option<String> {
+    #[cfg(debug_assertions)]
+    return imp::take_membership("fail_next_policy");
+    #[cfg(not(debug_assertions))]
+    None
+}
+
 /// The runtime kills itself right after the next durable `membership.json`.
 #[cfg_attr(test, allow(dead_code))]
 pub fn crash_after_membership_commit() -> bool {

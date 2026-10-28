@@ -57,6 +57,10 @@ pub enum DlFile {
     FrozenGenesisMirror,
     /// `host_channel_key`.
     HostChannelKey,
+    /// `host_policy.json` (§R9.8a).
+    HostPolicy,
+    /// `host_policy.pending`: an uncertain policy write's bytes.
+    HostPolicyPending,
 }
 
 impl DlFile {
@@ -72,6 +76,8 @@ impl DlFile {
             DlFile::FrozenGenesis => "frozen_genesis",
             DlFile::FrozenGenesisMirror => "journal frozen_genesis",
             DlFile::HostChannelKey => "host_channel_key",
+            DlFile::HostPolicy => "host_policy.json",
+            DlFile::HostPolicyPending => "host_policy.pending",
         }
     }
 
@@ -84,6 +90,8 @@ impl DlFile {
             "freeze" => DlFile::Freeze,
             "fault" => DlFile::Fault,
             "applied" => DlFile::Applied,
+            "host_policy" => DlFile::HostPolicy,
+            "host_policy_pending" => DlFile::HostPolicyPending,
             _ => return None,
         })
     }
@@ -304,6 +312,8 @@ impl Store {
             DlFile::FrozenGenesis => self.pairing.frozen_genesis.clone(),
             DlFile::FrozenGenesisMirror => self.journal_dir.join("frozen_genesis"),
             DlFile::HostChannelKey => self.pairing.host_channel_key.clone(),
+            DlFile::HostPolicy => self.pairing.host_policy.clone(),
+            DlFile::HostPolicyPending => self.pairing.host_policy_pending.clone(),
         }
     }
 
@@ -330,10 +340,16 @@ impl Store {
 
     /// Whether the step fails now (an injected fault, else the debug hook).
     fn fails(&mut self, file: DlFile, step: Step) -> bool {
-        if self.injected.is_none()
-            && let Some(marker) = crate::runtime::test_hooks::membership_fault()
-        {
-            self.injected = Injected::parse(&marker);
+        let policy = matches!(file, DlFile::HostPolicy | DlFile::HostPolicyPending);
+        if self.injected.is_none() {
+            let marker = if policy {
+                crate::runtime::test_hooks::policy_fault()
+            } else {
+                crate::runtime::test_hooks::membership_fault()
+            };
+            if let Some(marker) = marker {
+                self.injected = Injected::parse(&marker);
+            }
         }
         if self.injected == Some(Injected { file, step }) {
             self.injected = None;

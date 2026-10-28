@@ -1193,6 +1193,35 @@ impl ClientConnection {
     pub fn revoke_grant(&self, grant_id: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.revoke_grant(grant_id, ms(now_ms)?))
     }
+    #[wasm_bindgen(js_name = hostPolicySet)]
+    pub fn host_policy_set(
+        &self,
+        relay_only: bool,
+        request_id: String,
+        now_ms: f64,
+    ) -> JsResult<JsValue> {
+        ok(self.0.host_policy_set(relay_only, request_id, ms(now_ms)?))
+    }
+    #[wasm_bindgen(js_name = hostPolicyRetry)]
+    pub fn host_policy_retry(
+        &self,
+        relay_only: bool,
+        request_id: String,
+        expected_revision: f64,
+        now_ms: f64,
+    ) -> JsResult<JsValue> {
+        ok(self
+            .0
+            .host_policy_retry(relay_only, request_id, ms(expected_revision)?, ms(now_ms)?))
+    }
+    #[wasm_bindgen(js_name = hostPolicyGet)]
+    pub fn host_policy_get(&self, desired: bool, now_ms: f64) -> JsResult<JsValue> {
+        ok(self.0.host_policy_get(desired, ms(now_ms)?))
+    }
+    #[wasm_bindgen(js_name = hostPolicyReady)]
+    pub fn host_policy_ready(&self) -> bool {
+        self.0.host_policy_ready()
+    }
     #[wasm_bindgen(js_name = sendMembership)]
     pub fn send_membership(&self, entries: Vec<String>, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.send_membership(entries, ms(now_ms)?))

@@ -29,6 +29,9 @@
 pub mod envelope;
 #[cfg(test)]
 mod fixtures_tests;
+pub mod host_policy;
+#[cfg(test)]
+mod host_policy_host_tests;
 pub mod push;
 #[cfg(test)]
 mod push_tests;
@@ -39,16 +42,18 @@ mod tests;
 
 use super::host::{Attach, Effect, SessionHost};
 use super::journal::Journal;
+use super::membership::store::{self, Store};
 use super::membership::{
     self, CarriageResult, Carried, DETAIL_NOT_RECONCILED, DETAIL_NOT_RECORDED, Fence, FenceReason,
     Hello as MHello, HostFences, Init as MInit, MembershipHost,
 };
 use super::wire::{self as r8, Envelope as R8Envelope, Op as R8Op};
+use crate::paths::PairingPaths;
 use atem_client::canonical::StrictValue;
 use atem_client::channel::responder::{AwaitFinish, HostContext, InitLimiter, Responder};
 use atem_client::channel::wire::{self as chwire, Frame};
 use atem_client::channel::{Channel, ClearCode, Principal};
-use atem_client::membership::{Admission, HostNow};
+use atem_client::membership::{Admission, HostNow, MemberStatus};
 use atem_client::principal::{
     Authority, BrowserGrant, ClientKind, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS,
     Need, Op, Permission, Refusal, RevokedGrants, SessionRef, admission_error,
@@ -262,6 +267,9 @@ struct Chan {
     queued: usize,
     /// Atem's `close` reason, sent once the queue drained.
     close: Option<&'static str>,
+    /// A queued frame whose write the link reports (a committed relay-only
+    /// result: the local link closes once it was written, §R9.8a).
+    receipt_for: Option<String>,
 }
 
 impl Chan {
@@ -342,14 +350,44 @@ pub struct R9Host {
     input_log: LineLimit,
     /// The latest monotonic time seen (for lines without a clock at hand).
     last_mono: u64,
+    /// Where the host policy lives (§R9.8a): the pairing paths and the
+    /// journal directory (the device-list store's two directories).
+    policy_paths: Option<(PairingPaths, PathBuf)>,
+    /// Relay-only values committed since the runtime last took them.
+    policy_changes: Vec<bool>,
+    /// Monotonic time of the next roll-forward of a pending policy write.
+    policy_roll_at: u64,
+    /// The local link is about to close for relay only: new channels are
+    /// refused (`close{closed}`), never admitted on it.
+    refuse_opens: bool,
     /// Tests: the next revoked-grants write "crashes" after this step.
     #[cfg(test)]
     pub(super) revoked_crash: Option<revoked::Step>,
+    /// Tests (in-process fixtures): the next host-policy write fails here.
+    #[cfg(test)]
+    policy_fault: Option<store::Injected>,
 }
 
 fn log(line: &str) {
     eprintln!("atem runtime: r9: {line}");
 }
+
+/// A native member holding `manage` at the head, with the key it was
+/// admitted with (§R9.8a: checked when each request is handled).
+fn holds_manage(m: &MembershipHost, authority: &Authority) -> bool {
+    authority
+        .name()
+        .strip_prefix("member:")
+        .and_then(|device| m.membership().member(device))
+        .is_some_and(|state| {
+            state.status == MemberStatus::Active
+                && state.member.is_manager()
+                && state.member.auth_key == authority.key
+        })
+}
+
+/// A pending host-policy write is rolled forward at most this often.
+const POLICY_ROLL_MS: u64 = 5_000;
 
 /// At most this many input-driven lines per window (as `refusal_log`).
 const INPUT_LOG_LINES: u32 = 20;
@@ -487,11 +525,46 @@ impl R9Host {
             push: push::HostPush::default(),
             input_log: LineLimit::default(),
             last_mono: 0,
+            policy_paths: None,
+            policy_changes: Vec::new(),
+            policy_roll_at: 0,
+            refuse_opens: false,
             #[cfg(test)]
             revoked_crash: None,
+            #[cfg(test)]
+            policy_fault: None,
         };
         host.load_revoked(pairing.and_then(|p| p.pin_floor));
         host
+    }
+
+    /// Where the host policy is stored (§R9.8a); a pending write is rolled
+    /// forward now, before any link is allowed.
+    pub fn set_policy_paths(&mut self, pairing: PairingPaths, journal_dir: PathBuf) {
+        let mut store = Store::new(&pairing, &journal_dir);
+        if let Err(e) = host_policy::roll_forward(&mut store, &pairing) {
+            log(&format!(
+                "host policy: a pending write is still uncertain ({e})"
+            ));
+        }
+        self.policy_paths = Some((pairing, journal_dir));
+    }
+
+    /// Tests: the next host-policy write fails at `fault`.
+    #[cfg(test)]
+    pub fn inject_policy_fault(&mut self, fault: store::Injected) {
+        self.policy_fault = Some(fault);
+    }
+
+    /// The relay-only values committed since the last call, in order.
+    pub fn take_policy_changes(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.policy_changes)
+    }
+
+    /// While the local link waits to close for relay only, new channels are
+    /// refused.
+    pub fn set_refuse_opens(&mut self, refuse: bool) {
+        self.refuse_opens = refuse;
     }
 
     /// Input-driven runtime.log lines written so far (tests: the rate
@@ -665,6 +738,10 @@ impl R9Host {
             });
             return;
         }
+        if self.refuse_opens {
+            self.refuse_outside(&handle, reason::CLOSED, parts.now.host.mono_ms);
+            return;
+        }
         let handshakes = self.chans.values().filter(|c| c.handshaking()).count();
         // A restart's pending `close{closed}` still holds its channel's
         // slot (§R9.7a "Overload"): opens wait for the link to take it.
@@ -687,6 +764,7 @@ impl R9Host {
                 queue: VecDeque::new(),
                 queued: 0,
                 close: None,
+                receipt_for: None,
             },
         );
     }
@@ -1478,10 +1556,187 @@ impl R9Host {
                     self.approval_seen(att, authority, &data, re.as_deref(), parts);
                     return Vec::new();
                 }
+                Some("host_policy_set" | "host_policy_get") => {
+                    self.host_policy_op(att, authority, &data, re.as_deref(), parts);
+                    return Vec::new();
+                }
                 _ => {}
             }
         }
         parts.host.receive(att, plain, parts.now.mono)
+    }
+
+    /// `host_policy_set`/`host_policy_get` → `host_policy_result{re}`
+    /// (§R9.8a). A native member holding `manage` at the current head, checked
+    /// here on every request and retry (roles change under a live channel).
+    fn host_policy_op<J: Journal>(
+        &mut self,
+        att: &str,
+        authority: &Authority,
+        data: &Value,
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) {
+        use atem_client::session::host_policy::{
+            HostPolicyChanged, HostPolicyResult, Outcome, Request,
+        };
+        let mono = parts.now.host.mono_ms;
+        let refuse = |me: &mut Self, code: &str, detail: Option<&str>| {
+            me.seal_to(att, &error(code, re, detail).to_bytes(), mono);
+        };
+        let request = match Request::from_data(data) {
+            Ok(request) => request,
+            Err(_) => return refuse(self, code::INVALID_REQUEST, None),
+        };
+        let DeviceList::Open { m, .. } = &parts.list else {
+            return refuse(self, code::BUSY, Some(DETAIL_UNPAIRED));
+        };
+        if m.held().is_some() {
+            return refuse(self, code::BUSY, Some(DETAIL_NOT_RECONCILED));
+        }
+        if !holds_manage(m, authority) {
+            return refuse(self, code::FORBIDDEN, None);
+        }
+        let Some((pairing, journal)) = self.policy_paths.clone() else {
+            return refuse(self, code::BUSY, Some(host_policy::DETAIL_UNREADABLE));
+        };
+        let account = m.membership().account_id().to_owned();
+        let genesis = m.membership().genesis_hash().to_hex();
+        let head = m.head();
+        let (request_id, answer) = match &request {
+            Request::Get { .. } => (
+                None,
+                host_policy::current(&pairing, &account, &genesis)
+                    .map(|c| (Outcome::Current, c.policy()))
+                    .map_err(host_policy::Refused::Unreadable),
+            ),
+            Request::Set {
+                request_id,
+                relay_only,
+                expected_revision,
+                ..
+            } => {
+                let mut store = Store::new(&pairing, &journal);
+                #[cfg(test)]
+                if let Some(fault) = self.policy_fault.take() {
+                    store.inject(fault);
+                }
+                (
+                    Some(request_id.clone()),
+                    host_policy::set(
+                        &mut store,
+                        &pairing,
+                        &account,
+                        &genesis,
+                        &host_policy::Change {
+                            principal: &authority.name(),
+                            request_id,
+                            relay_only: *relay_only,
+                            expected_revision: *expected_revision,
+                        },
+                    )
+                    .map(|r| (r.outcome, r.policy)),
+                )
+            }
+        };
+        let (outcome, policy) = match answer {
+            Ok(answer) => answer,
+            Err(host_policy::Refused::Reused) => {
+                return refuse(
+                    self,
+                    &super::host::code_name(r8::ErrorCode::RequestIdReused),
+                    None,
+                );
+            }
+            Err(host_policy::Refused::Unreadable(why)) => {
+                log(&format!("host policy: {why}"));
+                return refuse(self, code::BUSY, Some(host_policy::DETAIL_UNREADABLE));
+            }
+        };
+        let Some(handle) = self.by_attachment.get(att).cloned() else {
+            return;
+        };
+        let Some(channel_id) = self.chans.get(&handle).and_then(|c| match &c.phase {
+            Phase::Open(a) => Some(a.channel.channel_id().to_owned()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let ctx = parts.host.context();
+        let result = HostPolicyResult {
+            id: new_id(),
+            re: request.id().to_owned(),
+            request_id,
+            outcome,
+            policy,
+            account_id: ctx.account_id.clone(),
+            atem_device_id: ctx.atem_device_id.clone(),
+            host_trust_gen: ctx.host_trust_gen,
+            head,
+            channel_id,
+            attachment_gen: att.to_owned(),
+        };
+        self.seal_to(att, &result.to_bytes(), mono);
+        if matches!(outcome, Outcome::Committed | Outcome::Uncertain) {
+            // Every other manager attachment hears the current policy.
+            let others: Vec<(String, String)> = self
+                .chans
+                .values()
+                .filter_map(|c| match &c.phase {
+                    Phase::Open(a) if a.attachment != att && holds_manage(m, &a.authority) => {
+                        Some((a.attachment.clone(), a.channel.channel_id().to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (other, channel_id) in others {
+                let change = HostPolicyChanged {
+                    id: new_id(),
+                    policy,
+                    account_id: result.account_id.clone(),
+                    atem_device_id: result.atem_device_id.clone(),
+                    host_trust_gen: result.host_trust_gen,
+                    head,
+                    channel_id,
+                    attachment_gen: other.clone(),
+                };
+                self.seal_to(&other, &change.to_bytes(), mono);
+            }
+            log(&format!(
+                "relay only {} (revision {}, {})",
+                if policy.relay_only { "on" } else { "off" },
+                policy.revision,
+                outcome.as_str()
+            ));
+            self.policy_changes.push(policy.relay_only);
+            // No channel opens for the rest of this pass; the runtime's
+            // pass then keeps refusing them only while a local link waits
+            // to close (`set_refuse_opens`).
+            self.refuse_opens |= policy.relay_only;
+            // The result's write is what the local link waits for.
+            if let Some(chan) = self.chans.get_mut(&handle) {
+                chan.receipt_for = chan.queue.back().cloned();
+            }
+        }
+    }
+
+    /// A pending policy write is retried every 5 s until it is durable.
+    fn roll_policy_forward(&mut self, mono: u64) {
+        if mono < self.policy_roll_at {
+            return;
+        }
+        self.policy_roll_at = mono + POLICY_ROLL_MS;
+        if let Some((pairing, journal)) = &self.policy_paths
+            && store::present(&pairing.host_policy_pending)
+        {
+            let mut store = Store::new(pairing, journal);
+            match host_policy::roll_forward(&mut store, pairing) {
+                Ok(_) => log("host policy: the pending write is durable"),
+                Err(e) => self
+                    .input_log
+                    .log(mono, || format!("host policy: still uncertain ({e})")),
+            }
+        }
     }
 
     /// `membership{entries}` → `membership_head{re}` (§R9.8): the entries
@@ -2019,8 +2274,9 @@ impl R9Host {
     /// each channel's queue in turn, and each closing channel's `close`
     /// once its queue drained. `send` refuses when the link is full; the
     /// rest waits.
-    pub fn flush(&mut self, send: &mut dyn FnMut(String) -> bool) {
-        if !self.flush_closes(send) {
+    /// `send`'s flag asks for the write's receipt (see `Chan::receipt_for`).
+    pub fn flush(&mut self, send: &mut dyn FnMut(String, bool) -> bool) {
+        if !self.flush_closes(&mut |text| send(text, false)) {
             return;
         }
         // Fair service: one message per channel per round, the rounds
@@ -2040,15 +2296,19 @@ impl R9Host {
                 };
                 if let Some(text) = chan.queue.pop_front() {
                     let len = text.len();
-                    if !send(text.clone()) {
+                    let receipt = chan.receipt_for.as_ref() == Some(&text);
+                    if !send(text.clone(), receipt) {
                         chan.queue.push_front(text);
                         self.flush_cursor = Some(handle.clone());
                         return;
                     }
+                    if receipt {
+                        chan.receipt_for = None;
+                    }
                     chan.queued = chan.queued.saturating_sub(len);
                     progressed = true;
                 } else if let Some(why) = chan.close {
-                    if !send(envelope::close(handle, Some(why))) {
+                    if !send(envelope::close(handle, Some(why)), false) {
                         self.flush_cursor = Some(handle.clone());
                         return;
                     }
@@ -2072,6 +2332,7 @@ impl R9Host {
         let wall = parts.now.host.wall_ms;
         self.last_mono = mono;
         self.browsers_refused(wall, mono);
+        self.roll_policy_forward(mono);
         let mut effects = self.reap(parts);
         let mut timeouts = Vec::new();
         let mut ended = Vec::new();

@@ -1,0 +1,174 @@
+{
+  "name": "r9-host-policy-superseded-retry-never-reapplies",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.8a (Astation's counterexample): A sets true, B sets false, A's retry arrives: superseded, with the current policy (false, revision 2); the old request never re-applies and the stored policy stays false.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000,
+      "link": "relay"
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ],
+    "connected": []
+  },
+  "steps": [
+    {
+      "connect": "mac",
+      "carry": []
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "welcome",
+        "revision": 9
+      },
+      "capture": {
+        "mac_channel": "channel_id",
+        "mac_att": "attachment_gen"
+      }
+    },
+    {
+      "connect": "phone",
+      "carry": []
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9
+      },
+      "capture": {
+        "phone_channel": "channel_id",
+        "phone_att": "attachment_gen"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000901",
+          "request_id": "cccccccc-0000-4000-8000-000000000901",
+          "relay_only": true,
+          "expected_revision": 0
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000901",
+        "outcome": "committed",
+        "policy.relay_only": true,
+        "policy.revision": 1,
+        "policy.state": "durable",
+        "channel_id": "${mac_channel}",
+        "attachment_gen": "${mac_att}",
+        "request_id": "cccccccc-0000-4000-8000-000000000901"
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000902",
+          "request_id": "cccccccc-0000-4000-8000-000000000902",
+          "relay_only": false,
+          "expected_revision": 1
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000902",
+        "outcome": "committed",
+        "policy.relay_only": false,
+        "policy.revision": 2,
+        "policy.state": "durable",
+        "channel_id": "${phone_channel}",
+        "attachment_gen": "${phone_att}",
+        "request_id": "cccccccc-0000-4000-8000-000000000902"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "host_policy_set",
+          "id": "aaaaaaaa-0000-4000-8000-000000000903",
+          "request_id": "cccccccc-0000-4000-8000-000000000901",
+          "relay_only": true,
+          "expected_revision": 0
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "host_policy_result",
+        "re": "aaaaaaaa-0000-4000-8000-000000000903",
+        "outcome": "superseded",
+        "policy.relay_only": false,
+        "policy.revision": 2,
+        "policy.state": "durable",
+        "channel_id": "${mac_channel}",
+        "attachment_gen": "${mac_att}",
+        "request_id": "cccccccc-0000-4000-8000-000000000901"
+      }
+    },
+    {
+      "assert": {
+        "host_policy": {
+          "relay_only": false,
+          "revision": 2,
+          "pending": false
+        }
+      }
+    }
+  ]
+}

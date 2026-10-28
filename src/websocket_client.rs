@@ -122,17 +122,25 @@ pub(crate) const REMOVED_OPS: &[&str] = &[
     "agentListRequest",
 ];
 
-/// `text` is one of the `REMOVED_OPS`.
-pub(crate) fn is_removed_op(text: &str) -> bool {
+/// The plaintext relay-only messages (§R9.8a: the policy is set inside an
+/// r9 channel only; no compatibility, never a hint).
+pub(crate) const REMOVED_POLICY_OPS: &[&str] = &["transportPolicy", "transportPolicyAck"];
+
+/// The detail a removed op is refused with, when `text` is one.
+pub(crate) fn removed_op_detail(text: &str) -> Option<&'static str> {
     #[derive(Deserialize)]
     struct Peek {
         #[serde(rename = "type")]
         kind: Option<String>,
     }
-    serde_json::from_str::<Peek>(text)
-        .ok()
-        .and_then(|p| p.kind)
-        .is_some_and(|kind| REMOVED_OPS.contains(&kind.as_str()))
+    let kind = serde_json::from_str::<Peek>(text).ok()?.kind?;
+    if REMOVED_OPS.contains(&kind.as_str()) {
+        Some(crate::app::hosted::REMOVED_OP)
+    } else if REMOVED_POLICY_OPS.contains(&kind.as_str()) {
+        Some(crate::app::hosted::REMOVED_POLICY_OP)
+    } else {
+        None
+    }
 }
 
 /// The link's WebSocket limits: no message (or frame) larger than the
@@ -168,6 +176,9 @@ fn session_message_id(text: &str) -> Option<String> {
         .filter(|id| crate::session_protocol::wire::is_uuid_v4(id))
 }
 
+/// Resolves once the writer wrote a frame (`Ok`) or couldn't (`Err`).
+pub(crate) type DeliveryReceipt = tokio::sync::oneshot::Receiver<Result<(), String>>;
+
 struct OutboundMessage {
     message: AstationMessage,
     delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -189,10 +200,11 @@ pub enum AstationMessage {
     #[serde(skip)]
     SessionOversize { id: Option<String>, family: String },
 
-    /// An op removed in atem-session r6 (`REMOVED_OPS`): answered with an
-    /// `error` `unsupported_version` and no effect.
+    /// An op removed in atem-session r6 (`REMOVED_OPS`) or the plaintext
+    /// relay-only messages (`REMOVED_POLICY_OPS`): answered with an `error`
+    /// `unsupported_version` (its `detail`, `removed_op_detail`) and no effect.
     #[serde(skip)]
-    RemovedOp,
+    RemovedOp { detail: String },
 
     /// An r9 channel envelope (`{"type":"channel",…}`, atem-session-v1.md
     /// §R9.7a) as its raw JSON text: demultiplexed before every other
@@ -951,6 +963,28 @@ impl AstationClient {
         self.capture = Some(capture);
     }
 
+    /// Drops the injected profile: `profile()` then fails, as a runtime
+    /// client's does when config.toml can't be loaded.
+    #[cfg(test)]
+    pub(crate) fn forget_profile_for_test(&mut self) {
+        self.profile = None;
+    }
+
+    /// Holds back everything sent from now on until the returned handle's
+    /// `resume`, which hands it to the real writer in order.
+    #[cfg(test)]
+    pub(crate) fn pause_writer_for_test(&mut self) -> PausedWriter {
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        let writer = self.sender.replace(tx).expect("a connected client");
+        PausedWriter { rx, writer }
+    }
+
+    /// Pretend the link reached Astation `via`.
+    #[cfg(test)]
+    pub(crate) fn set_via_for_test(&mut self, via: LinkVia) {
+        self.via = Some(via);
+    }
+
     /// Pretend the connect-time authentication pinned `astation_id`.
     #[cfg(test)]
     /// Also captures the profile's pairing and saved session, as the
@@ -1157,7 +1191,9 @@ impl AstationClient {
                                 Some(AstationMessage::SessionOversize { id: session_message_id(&text), family: family.to_string() })
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
-                            None if is_removed_op(&text) => Some(AstationMessage::RemovedOp),
+                            None if removed_op_detail(&text).is_some() => {
+                                removed_op_detail(&text).map(|detail| AstationMessage::RemovedOp { detail: detail.into() })
+                            }
                             // §R9.7b: answered here, once; never passed on.
                             None if crate::session_protocol::r9::route::is_host_challenge(&text) => {
                                 match route.as_mut() {
@@ -1865,6 +1901,26 @@ impl AstationClient {
     }
 
     pub fn try_send_channel(&self, text: String) -> bool {
+        self.try_send_channel_with(text, false).0
+    }
+
+    /// `try_send_channel`, with the write's delivery receipt when asked
+    /// (a committed relay-only result: the local link closes after it).
+    pub(crate) fn try_send_channel_with(&self, text: String, receipt: bool) -> (bool, Option<DeliveryReceipt>) {
+        let (delivered, rx) = if receipt {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        (self.try_send_channel_delivered(text, delivered), rx)
+    }
+
+    fn try_send_channel_delivered(
+        &self,
+        text: String,
+        delivered: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> bool {
         use std::sync::atomic::Ordering;
         let Some(sender) = self.sender.as_ref() else { return false };
         let len = text.len();
@@ -1874,7 +1930,7 @@ impl AstationClient {
             return false;
         }
         self.channel_inflight.fetch_add(len, Ordering::Relaxed);
-        let outbound = OutboundMessage { message: AstationMessage::Channel(text), delivered: None };
+        let outbound = OutboundMessage { message: AstationMessage::Channel(text), delivered };
         if sender.send(outbound).is_err() {
             self.channel_inflight.fetch_sub(len, Ordering::Relaxed);
             return false;
@@ -1896,13 +1952,21 @@ impl AstationClient {
         Ok(())
     }
 
-    /// Sends and waits (at most 5 s) until the writer has written the frame,
-    /// so a client dropped right after doesn't lose it.
-    pub(crate) async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+    /// Queues `message` and returns its delivery receipt, which resolves once
+    /// the writer has written the frame (or failed to); the caller polls it
+    /// instead of waiting (`send_message_flushed` waits).
+    pub(crate) fn send_message_with_receipt(&self, message: AstationMessage) -> Result<DeliveryReceipt> {
         let sender = self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?;
         let (delivered, receipt) = tokio::sync::oneshot::channel();
         sender.send(OutboundMessage { message, delivered: Some(delivered) })
             .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?;
+        Ok(receipt)
+    }
+
+    /// Sends and waits (at most 5 s) until the writer has written the frame,
+    /// so a client dropped right after doesn't lose it.
+    pub(crate) async fn send_message_flushed(&self, message: AstationMessage) -> Result<()> {
+        let receipt = self.send_message_with_receipt(message)?;
         tokio::time::timeout(Duration::from_secs(5), receipt).await
             .map_err(|_| anyhow!("WebSocket delivery timed out; retry this command"))?
             .map_err(|_| anyhow!("WebSocket writer closed before delivery"))?
@@ -2349,6 +2413,25 @@ impl AstationClient {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
+    }
+}
+
+/// A writer `pause_writer_for_test` held back.
+#[cfg(test)]
+pub(crate) struct PausedWriter {
+    rx: mpsc::UnboundedReceiver<OutboundMessage>,
+    writer: mpsc::UnboundedSender<OutboundMessage>,
+}
+
+#[cfg(test)]
+impl PausedWriter {
+    /// Hands what was held back (and what comes later) to the real writer.
+    pub(crate) fn resume(mut self) {
+        tokio::spawn(async move {
+            while let Some(outbound) = self.rx.recv().await {
+                if self.writer.send(outbound).is_err() { break; }
+            }
+        });
     }
 }
 
@@ -4177,6 +4260,24 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // ── Removed: the plaintext transport policy (§R9.8a) ──
+
+    #[test]
+    fn the_plaintext_transport_policy_is_a_removed_op() {
+        for wire in [
+            r#"{"type":"transportPolicy","data":{"relay_only":true}}"#,
+            r#"{"type":"transportPolicyAck","data":{"relay_only":true,"stored":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<AstationMessage>(wire).is_err(), "{wire}");
+            assert_eq!(removed_op_detail(wire), Some(crate::app::hosted::REMOVED_POLICY_OP));
+        }
+        assert_eq!(
+            removed_op_detail(r#"{"type":"agentInput","data":{}}"#),
+            Some(crate::app::hosted::REMOVED_OP)
+        );
+        assert_eq!(removed_op_detail(r#"{"type":"heartbeat","data":{}}"#), None);
     }
 
     #[test]

@@ -50,6 +50,7 @@ struct Attachment {
     authority: Authority,
     attachment_gen: String,
     controller_session: String,
+    channel_id: String,
     /// Plaintexts queued for this connection by other connections/timers.
     queue: Vec<Vec<u8>>,
     /// Close after sending the queue.
@@ -89,6 +90,11 @@ pub struct HostCore {
     pub refusals: Vec<SessionError>,
     /// A misbehaving host for client tests: rewrites the welcome it sends.
     pub welcome_override: Option<fn(&mut Welcome)>,
+    /// The host policy (§R9.8a), in memory: (relay_only, revision) and the
+    /// recorded changes (request_id, principal, relay_only, expected
+    /// revision, committed revision).
+    pub policy: (bool, u64),
+    policy_requests: Vec<(String, String, bool, u64, u64)>,
 }
 
 fn uuid(n: u64) -> String {
@@ -125,6 +131,8 @@ impl HostCore {
             next_conn: 0,
             refusals: Vec::new(),
             welcome_override: None,
+            policy: (false, 0),
+            policy_requests: Vec::new(),
         }
     }
 
@@ -187,6 +195,125 @@ impl HostCore {
         for id in ids {
             self.fence(id, detail);
         }
+    }
+
+    /// A native member holding `manage` at the head (§R9.8a).
+    fn holds_manage(&self, authority: &Authority) -> bool {
+        authority
+            .name()
+            .strip_prefix("member:")
+            .and_then(|d| self.log.member(d))
+            .is_some_and(|m| {
+                m.status == atem_client::membership::MemberStatus::Active
+                    && m.member.is_manager()
+                    && m.member.auth_key == authority.key
+            })
+    }
+
+    /// `host_policy_set`/`host_policy_get` (§R9.8a) from attachment `conn`,
+    /// as the runtime host answers them (no storage faults here): the
+    /// reply, and `host_policy_changed` queued for the other managers.
+    fn host_policy(&mut self, conn: u64, data: &Value) -> Vec<u8> {
+        use atem_client::session::host_policy::{
+            HostPolicyChanged, HostPolicyResult, Outcome, Policy, PolicyState, Request,
+        };
+        let authority = self.attachments[&conn].authority.clone();
+        let re = data["id"].as_str().map(str::to_owned);
+        let error = |code: &str| {
+            SessionError {
+                re: re.clone(),
+                ..SessionError::new(code)
+            }
+            .to_bytes()
+        };
+        let Ok(request) = Request::from_data(data) else {
+            return error(code::INVALID_REQUEST);
+        };
+        if !self.holds_manage(&authority) {
+            return error(code::FORBIDDEN);
+        }
+        let principal = authority.name();
+        let mut changed = false;
+        let (request_id, outcome) = match &request {
+            Request::Get { .. } => (None, Outcome::Current),
+            Request::Set {
+                request_id,
+                relay_only,
+                expected_revision,
+                ..
+            } => {
+                let (value, revision) = self.policy;
+                let outcome = match self.policy_requests.iter().find(|r| r.0 == *request_id) {
+                    Some(r)
+                        if r.1 != principal || r.2 != *relay_only || r.3 != *expected_revision =>
+                    {
+                        return error("request_id_reused");
+                    }
+                    Some(r) if r.4 == revision => Outcome::Committed,
+                    Some(_) => Outcome::Superseded,
+                    None if *expected_revision != revision => Outcome::Conflict,
+                    None if *relay_only == value => Outcome::Unchanged,
+                    None => {
+                        self.policy = (*relay_only, revision + 1);
+                        self.policy_requests.push((
+                            request_id.clone(),
+                            principal.clone(),
+                            *relay_only,
+                            *expected_revision,
+                            revision + 1,
+                        ));
+                        if self.policy_requests.len() > 64 {
+                            self.policy_requests.remove(0);
+                        }
+                        changed = true;
+                        Outcome::Committed
+                    }
+                };
+                (Some(request_id.clone()), outcome)
+            }
+        };
+        let policy = Policy {
+            relay_only: self.policy.0,
+            revision: self.policy.1,
+            state: PolicyState::Durable,
+        };
+        let a = &self.attachments[&conn];
+        let result = HostPolicyResult {
+            id: uuid(0x9100 + policy.revision),
+            re: request.id().to_owned(),
+            request_id,
+            outcome,
+            policy,
+            account_id: self.log.account_id().to_owned(),
+            atem_device_id: self.host_id.clone(),
+            host_trust_gen: self.trust_gen,
+            head: self.log.head(),
+            channel_id: a.channel_id.clone(),
+            attachment_gen: a.attachment_gen.clone(),
+        };
+        if changed {
+            let others: Vec<u64> = self
+                .attachments
+                .iter()
+                .filter(|(id, a)| **id != conn && !a.fenced && self.holds_manage(&a.authority))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in others {
+                let a = self.attachments.get_mut(&id).unwrap();
+                let change = HostPolicyChanged {
+                    id: uuid(0x9200 + policy.revision),
+                    policy,
+                    account_id: result.account_id.clone(),
+                    atem_device_id: result.atem_device_id.clone(),
+                    host_trust_gen: result.host_trust_gen,
+                    head: result.head,
+                    channel_id: a.channel_id.clone(),
+                    attachment_gen: a.attachment_gen.clone(),
+                };
+                a.queue.push(change.to_bytes());
+            }
+        }
+        result.to_bytes()
     }
 
     fn in_scope(&self, authority: &Authority, session: &HostSession) -> bool {
@@ -524,6 +651,7 @@ impl HostConn {
                 authority,
                 attachment_gen,
                 controller_session,
+                channel_id: channel.channel_id().to_owned(),
                 queue: Vec::new(),
                 fenced: false,
             },
@@ -590,6 +718,9 @@ impl HostConn {
         // r9's own ops.
         if value["type"] == "session" {
             match data["op"].as_str() {
+                Some("host_policy_set" | "host_policy_get") => {
+                    return vec![core.host_policy(self.id, data)];
+                }
                 Some("revoke_grant") => {
                     let grant_id = data["grant_id"].as_str().unwrap_or_default().to_owned();
                     if core.revoke(&grant_id).is_err() {

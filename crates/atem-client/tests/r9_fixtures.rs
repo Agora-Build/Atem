@@ -402,6 +402,8 @@ fn event_json(event: &Event) -> Option<Value> {
         Event::MembershipHead { re, head, .. } => Some(
             json!({"type": "session", "data": {"op": "membership_head", "re": re, "head": head.to_json()}}),
         ),
+        Event::HostPolicy { result, .. } => Some(result.to_json()),
+        Event::HostPolicyChanged { change, .. } => Some(change.to_json()),
         Event::Registry(_) | Event::Lease { .. } | Event::Outgoing(_) => None,
     }
 }

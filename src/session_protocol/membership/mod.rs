@@ -101,13 +101,15 @@ const EVIDENCE_PERSIST_MS: u64 = 60_000;
 const CHECKPOINT_MS: u64 = 60_000;
 /// r9 files that exist only with a device list (§R9.3): one of them
 /// without `membership.json` is a damaged or half-removed list.
-const LEFTOVERS: [DlFile; 7] = [
+const LEFTOVERS: [DlFile; 9] = [
     DlFile::Carriage,
     DlFile::Intent,
     DlFile::Freeze,
     DlFile::Fault,
     DlFile::FaultMirror,
     DlFile::HostChannelKey,
+    DlFile::HostPolicy,
+    DlFile::HostPolicyPending,
     DlFile::Applied,
 ];
 /// A device-list write fault is recorded: `membership.fault` or its mirror
