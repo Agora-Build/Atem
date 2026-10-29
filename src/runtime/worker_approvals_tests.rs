@@ -564,6 +564,73 @@ fn a_result_matching_two_waiting_requests_closes_neither() {
     assert_eq!(printed(second), "");
 }
 
+fn post_of(call: &str) -> String {
+    let mut v: Value = serde_json::from_str(&post_body()).unwrap();
+    v["tool_use_id"] = call.into();
+    v.to_string()
+}
+
+#[test]
+fn a_bound_request_closes_only_on_its_own_calls_result() {
+    // Bound to call "a": another call's result ("b", same command) leaves
+    // it; its own closes it.
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Claude);
+    let hook = s.hook("claude", 30, SECRET_BASH);
+    let id = request_id(&events(&mut a, true)[0]);
+    a.bind(&id, vec!["a".into()]);
+    s.post(&post_of("b"));
+    for _ in 0..5 {
+        assert!(a.poll(true, Vec::new()).is_empty());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    s.post(&post_of("a"));
+    assert_eq!(
+        events(&mut a, true),
+        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
+    );
+    assert_eq!(printed(hook), "");
+}
+
+#[test]
+fn a_request_that_can_be_two_calls_closes_once_both_ran() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Claude);
+    let hook = s.hook("claude", 30, SECRET_BASH);
+    let id = request_id(&events(&mut a, true)[0]);
+    a.bind(&id, vec!["a".into(), "c".into()]);
+    s.post(&post_of("c"));
+    for _ in 0..5 {
+        assert!(a.poll(true, Vec::new()).is_empty());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    s.post(&post_of("a"));
+    assert_eq!(
+        events(&mut a, true),
+        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
+    );
+    assert_eq!(printed(hook), "");
+}
+
+#[test]
+fn a_request_bound_to_no_call_is_closed_by_no_result() {
+    // Its call unknown (a lost PreToolUse): no result can close it.
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Claude);
+    let hook = s.hook("claude", 30, SECRET_BASH);
+    let id = request_id(&events(&mut a, true)[0]);
+    a.bind(&id, Vec::new());
+    s.post(&post_of("a"));
+    s.post(&post_body());
+    for _ in 0..5 {
+        assert!(a.poll(true, Vec::new()).is_empty());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(a.waiting(), 1);
+    a.process_ended();
+    assert_eq!(printed(hook), "");
+}
+
 #[test]
 fn a_transcript_rejection_closes_the_matching_request() {
     let s = Session::new();

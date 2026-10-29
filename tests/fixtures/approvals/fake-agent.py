@@ -194,6 +194,13 @@ while True:
                      "message": {"id": "msg-t-%d" % n, "role": "assistant", "content": [
                          {"type": "tool_use", "id": "toolu-%d" % n, "name": request["tool_name"],
                           "input": request["tool_input"]}], "stop_reason": "tool_use"}})
+            # As Claude Code does (with FAKE_PRETOOLUSE=1; the shared
+            # fixtures model an agent that sends none): the call's
+            # PreToolUse (synchronous, with its tool_use_id) runs to its end
+            # before PermissionRequest.
+            if settings and os.environ.get("FAKE_PRETOOLUSE") == "1":
+                fire("PreToolUse", dict(tool_name=request["tool_name"], tool_input=request["tool_input"],
+                                        tool_use_id="toolu-%d" % n))
             payload = dict(request, hook_event_name="PermissionRequest", session_id=session)
             proc = subprocess.Popen(["sh", "-c", permission], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -210,7 +217,7 @@ while True:
                 continue
             os.remove(path)
             if what == "terminal-yes":
-                fire("PostToolUse", dict(tool, tool_response={"stdout": "ok"}))
+                fire("PostToolUse", dict(tool, tool_response={"stdout": "ok"}, tool_use_id="toolu-%d" % n))
                 tool_result(n, "ok", False)
                 events.write("ran %d\n" % n)
             elif what == "terminal-no":

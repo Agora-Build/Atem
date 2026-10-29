@@ -2263,6 +2263,18 @@ impl Runtime {
         provider: &str,
         fake: &Path,
     ) -> SessionSummary {
+        self.launch_approval_agent_with(client, provider, fake, &[])
+            .await
+    }
+
+    /// `launch_approval_agent` with more of the agent's environment.
+    async fn launch_approval_agent_with(
+        &self,
+        client: &mut RuntimeClient,
+        provider: &str,
+        fake: &Path,
+        extra: &[(&str, &str)],
+    ) -> SessionSummary {
         let var = if provider == "claude" {
             "CLAUDE_CLI_BIN"
         } else {
@@ -2274,12 +2286,17 @@ impl Runtime {
                 provider: provider.into(),
                 args: vec![],
                 cwd: self.dir.path().to_path_buf(),
-                env: LaunchEnv(vec![
-                    ("PATH".into(), "/usr/bin:/bin".into()),
-                    (var.into(), approval_agent().display().to_string()),
-                    ("FAKE_DIR".into(), fake.display().to_string()),
-                    ("FAKE_CODEX_HOOK".into(), hook),
-                ]),
+                env: LaunchEnv(
+                    [
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        (var.into(), approval_agent().display().to_string()),
+                        ("FAKE_DIR".into(), fake.display().to_string()),
+                        ("FAKE_CODEX_HOOK".into(), hook),
+                    ]
+                    .into_iter()
+                    .chain(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+                    .collect(),
+                ),
                 rows: 24,
                 cols: 80,
             })
@@ -2696,6 +2713,62 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
     );
     assert!(bridge.open_approvals().is_empty());
     let _ = session.stop();
+}
+
+/// Claude with its tool hooks (PreToolUse with `tool_use_id`, as Claude
+/// Code sends them): a request denied remotely, then the same command
+/// asked again and answered in Claude's own dialog. The retry's card closes
+/// `answered_terminal` on its own call's result: the denied call (which
+/// never ends with a PostToolUse) is never taken for it.
+#[test]
+fn a_retry_of_a_denied_command_closes_on_its_own_call() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt
+            .launch_approval_agent_with(&mut client, "claude", &fake, &[("FAKE_PRETOOLUSE", "1")])
+            .await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        ask(&fake, 1, npm_test());
+        let at = peer
+            .wait_from(0, |v| is_session(v, "approval_request"))
+            .await;
+        let first = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Denied remotely (lease-free, r8 §G): the call never runs.
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval", "payload": {"approval_id": first, "decision": "deny"}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+        agent_event(&fake, "answer 1 deny Denied from Astation").await;
+        // The same command again, answered in Claude's own dialog.
+        ask(&fake, 2, npm_test());
+        let from = peer.seen.len();
+        let at = peer
+            .wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        let second = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
+        let a = second.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "answered_terminal");
+        rt.shutdown().await;
+    });
 }
 
 #[test]

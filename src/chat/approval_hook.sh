@@ -20,7 +20,7 @@
 #   sh approval-hook.sh post
 #       Claude PostToolUse: tells Atem a tool ran while a request waits
 #       (post-<id>.json), so a prompt answered in the terminal closes.
-#   sh approval-hook.sh event [<Event>]
+#   sh approval-hook.sh event [<Event> [sync]]
 #       Codex lifecycle hooks (SessionStart, UserPromptSubmit, Stop, ...):
 #       writes "$$ $PPID" (one line, so Atem can tell its own agent's hook
 #       from a nested codex's) and then the hook's stdin to
@@ -42,7 +42,8 @@
 #       releases only a lock naming its own pid. PermissionRequest is never
 #       written here (its own mode).
 #       Synchronous events (Codex waits for them: PreToolUse, PostToolUse,
-#       UserPromptSubmit, Interrupt) are never dropped by this script: each
+#       UserPromptSubmit, Interrupt; any event with `sync`: Claude Code
+#       waits for all its hooks) are never dropped by this script: each
 #       first leaves start-<Event>.<pid> (a builtin redirection, before
 #       anything that could fail), waits longer for the lock (~6 s; ~2 s for
 #       Interrupt, which Codex clamps to 3 s), and removes the marker only
@@ -95,11 +96,14 @@ if [ "$1" = event ]; then
         w=
     }
     # Synchronous events: the lock wait (seconds) and the start marker.
+    # `event <Event> sync` (Claude: Claude Code waits for every hook) makes
+    # any event one.
     case $named in
         PreToolUse | PostToolUse | UserPromptSubmit) sync=6 ;;
         Interrupt) sync=2 ;;
         *) sync= ;;
     esac
+    [ "${3:-}" = sync ] && [ -z "$sync" ] && sync=6
     m=
     # Not published: a PreToolUse blocks its tool (exit 2: no call, so no
     # marker); any other event keeps its marker for Atem to find.
@@ -116,7 +120,9 @@ if [ "$1" = event ]; then
     }
     if [ -n "$sync" ]; then
         m=$e/start-$named.$$
-        : > "$m" 2>/dev/null || { m=; fail; }
+        # `printf`, not `:`: a failed redirection on a special builtin
+        # would exit the script (status 2) instead of reaching `fail`.
+        printf '' 2>/dev/null > "$m" || { m=; fail; }
     fi
     t=$(mktemp "$e/tmp.XXXXXXXX" 2>/dev/null) || { t=; fail; }
     # A signal (Codex's timeout among them) lets the tool through: the

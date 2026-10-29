@@ -181,14 +181,17 @@ keep running; Claude merges `--settings` with them.
 ### Hook events: one file each
 
 Claude runs a hook as a shell command and passes the event JSON on stdin. Each
-hook command writes that JSON to its own file, atomically:
+hook runs Atem's one hook script in its synchronous event mode:
 
 ```sh
-{ f=$(mktemp "<chat dir>/events/ev.XXXXXXXX") && cat > "$f" && mv "$f" "$f.json"; } 2>/dev/null; exit 0
+ATEM_APPROVAL_DIR='<chat dir>' exec /bin/sh '<chat dir>/approval-hook.sh' event <Event> sync
 ```
 
-(`mktemp` gives a unique name on both Linux and macOS; `date +%N` would not
-work on macOS.)
+It writes `events/ev-<seq>-<Event>.json` (the hook's `$$ $PPID` line, then
+the JSON) under the session's counter lock, in sequence order, never
+dropping one; a start marker (`start-<Event>.<pid>`) stays until the event
+is published, so a hook that died is a lost event Atem detects. (It was a
+one-line `mktemp`/`mv` writer read by file time until 2026-10-29.)
 
 - One file per event, written then renamed, because hooks can run at the same
   time (parallel tool calls) and an event can be large (a `Write` event holds
@@ -648,11 +651,21 @@ and a failure is a session notice (Codex starts anyway).
   writer while any of its approvals is open or Claude's dialog is on the
   screen (a prompt the broker admits while the status still says `ready`,
   before Claude's Notification, is `rejected` with nothing written; the
-  status itself is unchanged, as the shared fixtures expect), and a tool
-  result closes a request only when it matches exactly one waiting
-  request. Its events
-  need no sequence counter: Claude's hooks are synchronous and Atem's
-  Claude writer never drops one.
+  status itself is unchanged, as the shared fixtures expect). Claude's
+  hooks run the one hook script (`event <Event> sync`): every event is
+  published under its lock in sequence order, never dropped, with a start
+  marker until published, so a lost event (Claude lets a failed or killed
+  hook through) is detected and fails closed: the status shows working
+  until the turn ends, and requests are no longer bound to calls. Each
+  request is bound to the calls it can be by event sequence (its
+  PreToolUse published by the request's `evseq`, unfinished then, not
+  claimed by an earlier request); since Claude asks one call at a time
+  that is exactly its own, which it claims (a denied call never ends with
+  a PostToolUse, so a retry of the same command is never mistaken for
+  it). It closes on results only once each of its calls ran
+  (`tool_use_id`), never on another call's. Claude's file dialogs ("Do you
+  want to create …?", "Do you want to make this edit to …?") were checked
+  live for the screen backstop.
   A refusal in Codex's dialog leaves no evidence Atem can read:
   the session stays `waiting` until a prompt typed in the terminal or an
   interrupt (fail closed). Found live on 2026-10-29: a remote prompt pasted into the

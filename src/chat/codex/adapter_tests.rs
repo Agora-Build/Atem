@@ -4,9 +4,11 @@
 
 use super::*;
 use crate::chat::adapter::{Outcome, Part};
+use crate::chat::hook_events::MAX_EVENT;
 use crate::chat::session::{ChatSession, Origin, Out, State};
 use std::fs;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 const FX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/designs/fixtures/codex-hooks");
 const GEN: &str = "gen-1";

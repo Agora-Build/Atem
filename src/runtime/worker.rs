@@ -1198,6 +1198,42 @@ impl Worker {
             }
     }
 
+    /// Claude: binds each request not bound yet to the calls it can be,
+    /// once every event published when it asked (`evseq`) has been read
+    /// (Claude Code ran its PreToolUse to its end before asking): its
+    /// result then closes it exactly, never another call's. Without an
+    /// `evseq` it is bound to none (no result closes it).
+    fn bind_claude_calls(&mut self) {
+        let (Some(ChatAdapter::Claude(claude)), Some(approvals)) =
+            (self.adapter.as_mut(), self.approvals.as_mut())
+        else {
+            return;
+        };
+        // Oldest first: Claude asks one call at a time, so each request's
+        // own call is the one left when the earlier ones claimed theirs.
+        let mut unbound = approvals.unbound();
+        unbound.sort_by_key(|(_, _, _, evseq)| *evseq);
+        for (id, tool, input, evseq) in unbound {
+            match evseq {
+                None => approvals.bind(&id, Vec::new()),
+                Some(evseq) if claude.last_seq() >= evseq => {
+                    let calls = claude.call_for(&tool, &input, evseq);
+                    match &calls[..] {
+                        // No PreToolUse sent for it, and none lost: matched
+                        // by tool and input instead.
+                        [] if !claude.calls_incomplete() => approvals.leave_unbound(&id),
+                        [call] => {
+                            claude.claim(call);
+                            approvals.bind(&id, calls);
+                        }
+                        _ => approvals.bind(&id, calls),
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
     /// Every waiting hook gets "no decision"; the ones released now.
     fn release_approvals(&mut self) -> Vec<String> {
         match self.approvals.as_mut() {
@@ -1247,6 +1283,7 @@ impl Worker {
         if super::test_hooks::approvals_held() {
             return;
         }
+        self.bind_claude_calls();
         let connected = self.conn.as_ref().is_some_and(|c| !c.tx.is_closed());
         let Some(a) = self.approvals.as_mut() else {
             return;

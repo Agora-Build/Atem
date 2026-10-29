@@ -140,6 +140,8 @@ pub enum Evidence {
         tool_name: String,
         input: Value,
         at_ms: i64,
+        /// Its call (`tool_use_id`), when the agent names it.
+        call: Option<String>,
     },
     /// A new prompt or the turn's end; `interrupted`: the user stopped it.
     /// `at_ms`: when the agent reported it (unix ms); it answers only a
@@ -178,6 +180,12 @@ struct Waiting {
     /// Codex: the hook events published when it asked (`evseq-<id>`, the
     /// events counter): its call is among the calls started by then.
     evseq: Option<u64>,
+    /// Claude: the calls this request can be (`bind`; `None`: not bound,
+    /// so results are matched by tool and input), those of them that ran,
+    /// and whether binding was decided (`unbound` asks no more).
+    calls: Option<Vec<String>>,
+    ran: Vec<String>,
+    settled: bool,
     /// Sent to the broker.
     reported: bool,
     /// This session's agent started its hook (Codex; Claude: always).
@@ -760,6 +768,10 @@ impl Approvals {
                     tool_name: tool_name.to_string(),
                     input: ran.get("tool_input").cloned().unwrap_or(Value::Null),
                     at_ms,
+                    call: ran
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 });
             }
         }
@@ -825,6 +837,9 @@ impl Approvals {
                 opened: Instant::now(),
                 opened_ms,
                 evseq,
+                calls: None,
+                ran: Vec::new(),
+                settled: false,
                 reported: false,
                 ours,
                 pending_rule: None,
@@ -897,17 +912,103 @@ impl Approvals {
         }
     }
 
+    /// Claude: the call `call` ran. A request bound to calls (`bind`) is
+    /// answered once every call it can be has finished: its own, exactly,
+    /// when it can be only one. One bound to no call (a lost PreToolUse)
+    /// isn't closed by results at all. A request not bound yet falls back
+    /// to `target` among the unbound ones.
+    fn call_ran(&mut self, call: &str, ev: &Evidence, out: &mut Vec<Event>) {
+        let mut answered = Vec::new();
+        let mut bound_to_it = false;
+        for (id, w) in self.waiting.iter_mut() {
+            if w.state == State::Released {
+                continue;
+            }
+            if let Some(calls) = &w.calls
+                && calls.iter().any(|c| c == call)
+            {
+                bound_to_it = true;
+                if !w.ran.iter().any(|c| c == call) {
+                    w.ran.push(call.to_string());
+                }
+                if calls.iter().all(|c| w.ran.contains(c)) {
+                    answered.push(id.clone());
+                }
+            }
+        }
+        for id in answered {
+            self.resolve(&id, ev, out);
+        }
+        if bound_to_it {
+            return;
+        }
+        if let Evidence::Ran {
+            tool_name,
+            input,
+            at_ms,
+            ..
+        } = ev
+            && let Some(id) = self.target(tool_name, input, *at_ms, true)
+        {
+            self.resolve(&id, ev, out);
+        }
+    }
+
+    /// Claude's requests not bound to calls yet: id, tool, input and
+    /// `evseq` (the events published when it asked).
+    pub fn unbound(&self) -> Vec<(String, String, Value, Option<u64>)> {
+        self.waiting
+            .iter()
+            .filter(|(_, w)| !w.settled && w.state != State::Released)
+            .filter_map(|(id, w)| {
+                let r = w.request.as_ref()?;
+                Some((
+                    id.clone(),
+                    r.tool_name.clone(),
+                    r.tool_input.clone(),
+                    w.evseq,
+                ))
+            })
+            .collect()
+    }
+
+    /// Binds request `id` to the calls it can be (`ClaudeAdapter::call_for`;
+    /// empty: none known, so no result closes it).
+    pub fn bind(&mut self, id: &str, calls: Vec<String>) {
+        if let Some(w) = self.waiting.get_mut(id) {
+            w.calls = Some(calls);
+            w.settled = true;
+        }
+    }
+
+    /// Request `id` stays unbound: the agent sent no PreToolUse for it and
+    /// none was lost (an agent, or a test agent, without tool hooks), so
+    /// results are matched by tool and input, uniquely.
+    pub fn leave_unbound(&mut self, id: &str) {
+        if let Some(w) = self.waiting.get_mut(id) {
+            w.settled = true;
+        }
+    }
+
     /// The request `ev` is about: the only waiting one with the same tool
-    /// and input (opened by the evidence's time). Two such (identical calls,
-    /// say a background agent's and the main one's) can't be told apart:
-    /// the evidence closes neither, which their hooks' own ends or a later,
+    /// and input (opened by the evidence's time; with `unbound_only`, among
+    /// those not bound to calls). Two such (identical calls, say a
+    /// background agent's and the main one's) can't be told apart: the
+    /// evidence closes neither, which their hooks' own ends or a later,
     /// unambiguous result do.
-    fn target(&self, tool_name: &str, input: &Value, at_ms: i64) -> Option<String> {
+    fn target(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        at_ms: i64,
+        unbound_only: bool,
+    ) -> Option<String> {
         let candidates: Vec<&String> = self
             .waiting
             .iter()
             .filter(|(_, w)| {
                 w.state != State::Released
+                    && (!unbound_only || w.calls.is_none())
                     && w.opened_ms <= at_ms + RESULT_SLACK_MS
                     && w.request
                         .as_ref()
@@ -941,18 +1042,31 @@ impl Approvals {
                     self.resolve(&id, &ev, out);
                 }
             }
+            Evidence::Ran {
+                call: Some(call), ..
+            } => {
+                let call = call.clone();
+                self.call_ran(&call, &ev, out);
+            }
+            // A result naming no call can't be a bound request's.
+            Evidence::Ran {
+                tool_name,
+                input,
+                at_ms,
+                call: None,
+            } => {
+                if let Some(id) = self.target(tool_name, input, *at_ms, true) {
+                    self.resolve(&id, &ev, out);
+                }
+            }
+            // A refusal in the transcript (the user said no in the terminal).
             Evidence::Tool {
                 tool_name,
                 input,
                 at_ms,
                 ..
-            }
-            | Evidence::Ran {
-                tool_name,
-                input,
-                at_ms,
             } => {
-                if let Some(id) = self.target(tool_name, input, *at_ms) {
+                if let Some(id) = self.target(tool_name, input, *at_ms, false) {
                     self.resolve(&id, &ev, out);
                 }
             }

@@ -139,12 +139,17 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The hook command: one event file per event, silent, always exit 0.
-pub fn hook_command(dir: &Path) -> String {
-    let template = format!("{}/events/ev.XXXXXXXX", dir.display());
+/// The hook command for `event`: the hook script's synchronous event mode
+/// (`event <Event> sync`): published under its lock in sequence order,
+/// never dropped, a start marker until published (a hook that died is a
+/// lost event the adapter detects); a PreToolUse it can't record exits 2,
+/// which makes Claude block the tool. Silent otherwise, exit 0.
+pub fn event_command(dir: &Path, event: &str) -> String {
+    use crate::chat::approvals::{ENV, SCRIPT_NAME};
     format!(
-        "{{ f=$(mktemp {}) && cat > \"$f\" && mv \"$f\" \"$f.json\"; }} 2>/dev/null; exit 0",
-        shell_quote(&template)
+        "{ENV}={} exec /bin/sh {} event {event} sync",
+        shell_quote(&dir.to_string_lossy()),
+        shell_quote(&dir.join(SCRIPT_NAME).to_string_lossy())
     )
 }
 
@@ -155,16 +160,15 @@ pub fn hook_command(dir: &Path) -> String {
 /// (`[claude] approvals_hook = false`) Claude's prompts stay in its terminal.
 pub fn write_settings(dir: &Path, approvals: bool) -> anyhow::Result<PathBuf> {
     use crate::chat::approvals;
-    if approvals {
-        approvals::install_script(&dir.join(approvals::SCRIPT_NAME))?;
-    }
-    let cmd = hook_command(dir);
+    // The one script: chat events and, with `approvals`, the approval hook.
+    approvals::install_script(&dir.join(approvals::SCRIPT_NAME))?;
     let mut hooks = serde_json::Map::new();
     for ev in HOOK_EVENTS {
         let mut entry = serde_json::Map::new();
         if ev == "PreToolUse" || ev == "PostToolUse" {
             entry.insert("matcher".into(), "".into());
         }
+        let cmd = event_command(dir, ev);
         let mut commands = vec![serde_json::json!({ "type": "command", "command": cmd })];
         if approvals && ev == "PostToolUse" {
             commands.push(serde_json::json!({
@@ -194,77 +198,20 @@ pub fn write_settings(dir: &Path, approvals: bool) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-pub struct EventReader {
-    dir: PathBuf,
-}
-
-impl EventReader {
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
-    }
-
-    /// Read events/*.json ordered by (mtime ns, name), delete each, map to AgentEvent.
-    /// Skips names without .json; removes non-.json leftovers older than 60 s.
-    pub fn poll(&mut self) -> Vec<AgentEvent> {
-        let Ok(rd) = std::fs::read_dir(self.dir.join("events")) else {
-            return Vec::new();
-        };
-        let now = std::time::SystemTime::now();
-        let mut files = Vec::new();
-        for e in rd.flatten() {
-            let path = e.path();
-            let Ok(meta) = e.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            if path.extension().is_some_and(|x| x == "json") {
-                files.push((mtime, e.file_name(), path));
-            } else if now
-                .duration_since(mtime)
-                .is_ok_and(|age| age > std::time::Duration::from_secs(60))
-            {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-        files.sort();
-        let mut out = Vec::new();
-        for (mtime, _, path) in files {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    let _ = std::fs::remove_file(&path);
-                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                        let at = mtime
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_millis() as i64);
-                        out.extend(map_hook(&v).map(|e| match e {
-                            AgentEvent::PromptSubmitted { text, turn_id, .. } => {
-                                AgentEvent::PromptSubmitted {
-                                    text,
-                                    turn_id,
-                                    at_ms: Some(at),
-                                }
-                            }
-                            AgentEvent::TurnEnded { .. } => {
-                                AgentEvent::TurnEnded { at_ms: Some(at) }
-                            }
-                            e => e,
-                        }));
-                    }
-                }
-                Err(_) => {
-                    // Unreadable: keep it for now, drop it once it is stale.
-                    if now
-                        .duration_since(mtime)
-                        .is_ok_and(|age| age > std::time::Duration::from_secs(60))
-                    {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-            }
-        }
-        out
-    }
+/// A hook script event (`chat::hook_events`) as an agent event; a prompt
+/// and a turn end carry the event file's time.
+pub fn read_hook(raw: &crate::chat::hook_events::RawEvent) -> Option<AgentEvent> {
+    map_hook(&raw.json).map(|e| match e {
+        AgentEvent::PromptSubmitted { text, turn_id, .. } => AgentEvent::PromptSubmitted {
+            text,
+            turn_id,
+            at_ms: Some(raw.at_ms),
+        },
+        AgentEvent::TurnEnded { .. } => AgentEvent::TurnEnded {
+            at_ms: Some(raw.at_ms),
+        },
+        e => e,
+    })
 }
 
 pub fn map_hook(json: &Value) -> Option<AgentEvent> {
@@ -320,11 +267,11 @@ mod tests {
     }
 
     #[test]
-    fn hook_command_matches_the_spec_and_quotes_the_dir() {
-        let cmd = hook_command(Path::new("/tmp/a b/it's"));
+    fn event_command_runs_the_script_synchronously_and_quotes_the_dir() {
+        let cmd = event_command(Path::new("/tmp/a b/it's"), "Stop");
         assert_eq!(
             cmd,
-            "{ f=$(mktemp '/tmp/a b/it'\\''s/events/ev.XXXXXXXX') && cat > \"$f\" && mv \"$f\" \"$f.json\"; } 2>/dev/null; exit 0"
+            "ATEM_APPROVAL_DIR='/tmp/a b/it'\\''s' exec /bin/sh '/tmp/a b/it'\\''s/approval-hook.sh' event Stop sync"
         );
     }
 
@@ -335,11 +282,14 @@ mod tests {
         let path = write_settings(&dir, true).unwrap();
         assert_eq!(path, dir.join("settings.json"));
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let cmd = hook_command(&dir);
         for ev in HOOK_EVENTS {
             let entry = &v["hooks"][ev][0];
             assert_eq!(entry["hooks"][0]["type"], "command", "{ev}");
-            assert_eq!(entry["hooks"][0]["command"], cmd.as_str(), "{ev}");
+            assert_eq!(
+                entry["hooks"][0]["command"],
+                event_command(&dir, ev).as_str(),
+                "{ev}"
+            );
             if ev == "PreToolUse" || ev == "PostToolUse" {
                 assert_eq!(entry["matcher"], "", "{ev}");
             } else {
@@ -458,15 +408,19 @@ mod tests {
         let dir = create_session_dir(root.path()).unwrap();
         let path = write_settings(&dir, false).unwrap();
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let cmd = hook_command(&dir);
         assert_eq!(v["hooks"].as_object().unwrap().len(), 6);
         assert!(v["hooks"].get("PermissionRequest").is_none());
         for ev in HOOK_EVENTS {
             let hooks = v["hooks"][ev][0]["hooks"].as_array().unwrap();
             assert_eq!(hooks.len(), 1, "{ev}");
-            assert_eq!(hooks[0]["command"], cmd.as_str(), "{ev}");
+            assert_eq!(
+                hooks[0]["command"],
+                event_command(&dir, ev).as_str(),
+                "{ev}"
+            );
         }
-        assert!(!dir.join("approval-hook.sh").exists());
+        // The script records the chat events either way.
+        assert!(dir.join("approval-hook.sh").exists());
     }
 
     #[test]
@@ -506,159 +460,52 @@ mod tests {
     }
 
     #[test]
-    fn hook_command_really_writes_one_event_file() {
+    fn claudes_events_are_published_in_order_and_read_as_events() {
         let root = tempfile::tempdir().unwrap();
         let dir = create_session_dir(root.path()).unwrap();
-        let cmd = hook_command(&dir);
-        let handles: Vec<_> = (0..2)
-            .map(|i| {
-                let cmd = cmd.clone();
-                std::thread::spawn(move || run_hook(&cmd, &format!("{{\"n\":{i}}}")))
+        write_settings(&dir, false).unwrap();
+        // Two at once: both published (the script's lock), never dropped.
+        let handles: Vec<_> = ["UserPromptSubmit", "PreToolUse"]
+            .into_iter()
+            .map(|ev| {
+                let cmd = event_command(&dir, ev);
+                let body =
+                    format!(r#"{{"hook_event_name":"{ev}","prompt":"hi","tool_use_id":"t1"}}"#);
+                std::thread::spawn(move || run_hook(&cmd, &body))
             })
             .collect();
         for h in handles {
             let out = h.join().unwrap();
-            assert!(out.status.success());
+            assert!(out.status.success(), "{out:?}");
             assert!(out.stdout.is_empty() && out.stderr.is_empty());
         }
-        let files: Vec<_> = fs::read_dir(dir.join("events")).unwrap().collect();
-        assert_eq!(files.len(), 2);
-        for f in files {
-            let p = f.unwrap().path();
-            assert_eq!(p.extension().unwrap(), "json");
-            let _: Value = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
-        }
-        // Unwritable events dir: still exit 0 and silent.
-        fs::set_permissions(dir.join("events"), fs::Permissions::from_mode(0o500)).unwrap();
-        let out = run_hook(&cmd, "{}");
-        fs::set_permissions(dir.join("events"), fs::Permissions::from_mode(0o700)).unwrap();
+        let out = run_hook(
+            &event_command(&dir, "Stop"),
+            r#"{"hook_event_name":"Stop"}"#,
+        );
         assert!(out.status.success());
-        assert!(out.stdout.is_empty() && out.stderr.is_empty());
-    }
-
-    fn put(dir: &Path, name: &str, body: &str, age_secs: u64) {
-        let p = dir.join("events").join(name);
-        fs::write(&p, body).unwrap();
-        let t = SystemTime::now() - Duration::from_secs(age_secs);
-        fs::File::options()
-            .write(true)
-            .open(&p)
-            .unwrap()
-            .set_modified(t)
-            .unwrap();
-    }
-
-    #[test]
-    fn events_are_read_in_order_and_deleted() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_session_dir(root.path()).unwrap();
-        let stop = r#"{"hook_event_name":"Stop"}"#;
-        let tool = r#"{"hook_event_name":"PreToolUse"}"#;
-        let prompt = r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
-        put(&dir, "ev.a.json", stop, 1);
-        put(&dir, "ev.b.json", prompt, 3);
-        put(&dir, "ev.c.json", tool, 2);
-        let mut r = EventReader::new(dir.clone());
-        let now_ms = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let events = r.poll();
-        // The prompt carries its file's time (written 3 s ago).
-        let Some(AgentEvent::PromptSubmitted {
-            at_ms: Some(at), ..
-        }) = events.first()
-        else {
-            panic!("{events:?}")
-        };
-        assert!(
-            (now_ms - 4000..=now_ms - 2000).contains(at),
-            "{at} {now_ms}"
-        );
-        // Stop's file was written 1 s ago.
-        let Some(AgentEvent::TurnEnded { at_ms: Some(stop) }) = events.last() else {
-            panic!("{events:?}")
-        };
-        assert!((now_ms - 2000..=now_ms).contains(stop), "{stop} {now_ms}");
-        assert_eq!(
-            events,
-            vec![
-                AgentEvent::PromptSubmitted {
-                    text: "hi".into(),
-                    turn_id: None,
-                    at_ms: Some(*at),
-                },
-                AgentEvent::ToolStarted,
-                AgentEvent::TurnEnded { at_ms: Some(*stop) }
-            ]
-        );
-        assert_eq!(fs::read_dir(dir.join("events")).unwrap().count(), 0);
-        assert!(r.poll().is_empty());
-    }
-
-    #[test]
-    fn same_mtime_orders_by_name_and_bad_json_is_dropped() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_session_dir(root.path()).unwrap();
-        let t = SystemTime::now() - Duration::from_secs(5);
-        for (n, body) in [
-            ("ev.2.json", r#"{"hook_event_name":"Stop"}"#),
-            ("ev.1.json", r#"{"hook_event_name":"PreToolUse"}"#),
-            ("ev.0.json", "not json"),
-        ] {
-            let p = dir.join("events").join(n);
-            fs::write(&p, body).unwrap();
-            fs::File::options()
-                .write(true)
-                .open(&p)
-                .unwrap()
-                .set_modified(t)
-                .unwrap();
+        let mut r = crate::chat::hook_events::EventReader::new(dir.clone());
+        let raws: Vec<_> = r.poll().into_iter().flatten().collect();
+        let seqs: Vec<u64> = raws.iter().map(|raw| raw.seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
+        let events: Vec<AgentEvent> = raws.iter().filter_map(read_hook).collect();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[2],
+            AgentEvent::TurnEnded { at_ms: Some(_) }
+        ));
+        assert!(r.take_lost().is_empty());
+        // Unwritable events dir: a PreToolUse blocks its tool (exit 2), any
+        // other event exits 0, silently.
+        fs::set_permissions(dir.join("events"), fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::write(dir.join("events").join("probe"), "").is_err() {
+            let pre = run_hook(&event_command(&dir, "PreToolUse"), "{}");
+            let stop = run_hook(&event_command(&dir, "Stop"), "{}");
+            assert_eq!(pre.status.code(), Some(2));
+            assert_eq!(stop.status.code(), Some(0));
+            assert!(stop.stdout.is_empty() && stop.stderr.is_empty());
         }
-        let mut r = EventReader::new(dir.clone());
-        let at = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-        assert_eq!(
-            r.poll(),
-            vec![
-                AgentEvent::ToolStarted,
-                AgentEvent::TurnEnded { at_ms: Some(at) }
-            ]
-        );
-        assert_eq!(fs::read_dir(dir.join("events")).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn unreadable_event_files_stay_until_stale() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_session_dir(root.path()).unwrap();
-        put(&dir, "ev.young.json", "{}", 1);
-        put(&dir, "ev.old.json", "{}", 120);
-        for n in ["ev.young.json", "ev.old.json"] {
-            fs::set_permissions(
-                dir.join("events").join(n),
-                fs::Permissions::from_mode(0o000),
-            )
-            .unwrap();
-        }
-        if fs::read_to_string(dir.join("events/ev.young.json")).is_ok() {
-            return; // running as root: cannot make a file unreadable
-        }
-        let mut r = EventReader::new(dir.clone());
-        assert!(r.poll().is_empty());
-        assert!(dir.join("events/ev.young.json").exists());
-        assert!(!dir.join("events/ev.old.json").exists());
-    }
-
-    #[test]
-    fn tmp_files_are_skipped_then_cleaned() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = create_session_dir(root.path()).unwrap();
-        put(&dir, "ev.young", "{", 1);
-        put(&dir, "ev.old", "{", 120);
-        let mut r = EventReader::new(dir.clone());
-        assert!(r.poll().is_empty());
-        assert!(dir.join("events/ev.young").exists());
-        assert!(!dir.join("events/ev.old").exists());
+        fs::set_permissions(dir.join("events"), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

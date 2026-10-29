@@ -7,11 +7,13 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use crate::chat::adapter::{
     AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_REASONING,
     UNAVAILABLE_STREAMING,
 };
-use hooks::EventReader;
+use crate::chat::hook_events::EventReader;
 use transcript::TranscriptReader;
 
 /// What Claude chat can't provide: no partial text (transcript blocks
@@ -37,9 +39,117 @@ pub struct ClaudeAdapter {
     withdrawn: Option<String>,
     /// The launch registers the approval hook (`[claude] approvals_hook`).
     approvals: bool,
+    /// Calls seen at their PreToolUse, by event sequence (at most
+    /// `MAX_CALLS`): what an approval request is bound to (`call_for`).
+    calls: Vec<Call>,
+    /// A PreToolUse was lost (its hook died, or its event couldn't be read;
+    /// Claude went on), or an unfinished call forgotten: no request is
+    /// bound to a call any more (only its hook's end closes it).
+    calls_incomplete: bool,
+    /// The newest event sequence read.
+    last_seq: u64,
 }
 
+/// A call, from its PreToolUse (`tool_use_id`, tool and input).
+#[derive(Debug)]
+struct Call {
+    id: String,
+    tool_name: String,
+    input: Value,
+    started_seq: u64,
+    finished_seq: Option<u64>,
+    /// Bound alone to an approval request (`claim`): it is that request's,
+    /// never another's (a denied call never ends with a PostToolUse).
+    claimed: bool,
+}
+
+/// Calls remembered for binding requests.
+const MAX_CALLS: usize = 256;
+
 impl ClaudeAdapter {
+    /// The newest event sequence read.
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
+    }
+
+    /// Records a PreToolUse's call, and a PostToolUse's end.
+    fn record_call(&mut self, raw: &crate::chat::hook_events::RawEvent) {
+        let s = |k: &str| raw.json.get(k).and_then(Value::as_str);
+        let Some(id) = s("tool_use_id") else { return };
+        match s("hook_event_name") {
+            Some("PreToolUse") => {
+                if self.calls.iter().any(|c| c.id == id) {
+                    return;
+                }
+                if self.calls.len() >= MAX_CALLS {
+                    match self
+                        .calls
+                        .iter()
+                        .position(|c| c.finished_seq.is_some() || c.claimed)
+                    {
+                        Some(i) => {
+                            self.calls.remove(i);
+                        }
+                        None => {
+                            self.calls.remove(0);
+                            self.calls_incomplete = true;
+                        }
+                    }
+                }
+                self.calls.push(Call {
+                    id: id.to_string(),
+                    tool_name: s("tool_name").unwrap_or_default().to_string(),
+                    input: raw.json.get("tool_input").cloned().unwrap_or(Value::Null),
+                    started_seq: raw.seq,
+                    finished_seq: None,
+                    claimed: false,
+                });
+            }
+            Some("PostToolUse") => {
+                if let Some(c) = self.calls.iter_mut().find(|c| c.id == id) {
+                    c.finished_seq = Some(raw.seq);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The calls an approval request (`tool_name`, `input`, asked after
+    /// event `evseq`) can be: those with its tool and input whose PreToolUse
+    /// was published by then (Claude Code runs it to its end first) and that
+    /// hadn't finished. Usually one (Claude asks one call at a time); an
+    /// identical call already running makes two. Empty when the calls are
+    /// incomplete (a lost PreToolUse): no result can close the request.
+    /// Calls another request claimed are not candidates.
+    pub fn call_for(&self, tool_name: &str, input: &Value, evseq: u64) -> Vec<String> {
+        if self.calls_incomplete {
+            return Vec::new();
+        }
+        self.calls
+            .iter()
+            .filter(|c| {
+                !c.claimed
+                    && c.tool_name == tool_name
+                    && &c.input == input
+                    && c.started_seq <= evseq
+                    && c.finished_seq.is_none_or(|f| f > evseq)
+            })
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    /// A PreToolUse was lost (or an unfinished call forgotten).
+    pub fn calls_incomplete(&self) -> bool {
+        self.calls_incomplete
+    }
+
+    /// Call `id` is a request's own (bound to it alone): no other request's.
+    pub fn claim(&mut self, id: &str) {
+        if let Some(c) = self.calls.iter_mut().find(|c| c.id == id) {
+            c.claimed = true;
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             dir: None,
@@ -52,6 +162,9 @@ impl ClaudeAdapter {
             session_started: false,
             withdrawn: None,
             approvals: true,
+            calls: Vec::new(),
+            calls_incomplete: false,
+            last_seq: 0,
         }
     }
 
@@ -156,7 +269,32 @@ impl AgentAdapter for ClaudeAdapter {
             return Vec::new();
         };
         let mut incoming = std::mem::take(&mut self.held);
-        incoming.extend(reader.poll());
+        let read = reader.poll();
+        let lost = reader.take_lost();
+        for raw in read.into_iter().flatten() {
+            self.last_seq = self.last_seq.max(raw.seq);
+            self.record_call(&raw);
+            incoming.extend(hooks::read_hook(&raw));
+        }
+        if !lost.is_empty() {
+            for event in &lost {
+                eprintln!("atem worker: a Claude {event} hook event was lost");
+            }
+            if lost.iter().any(|e| e == "PreToolUse") {
+                self.calls_incomplete = true;
+            }
+            // Something happened that wasn't seen (a prompt, a tool, a turn's
+            // end): the agent counts as working, so no chat prompt goes in,
+            // until the next turn end says otherwise.
+            self.queued.push(LogItem::Problem {
+                detail: format!(
+                    "a Claude hook event was lost ({}): the status shows working until the turn ends",
+                    lost.join(", ")
+                ),
+                fatal: false,
+            });
+            incoming.push_back(AgentEvent::ToolStarted);
+        }
         let mut out = Vec::new();
         while let Some(mut event) = incoming.pop_front() {
             if let AgentEvent::SessionStarted {
@@ -263,6 +401,110 @@ mod tests {
         (root, a, plan)
     }
 
+    fn tool(dir: &Path, n: u64, hook: &str, id: &str, command: &str) {
+        event(
+            dir,
+            &format!("ev.{n}.json"),
+            &format!(
+                r#"{{"hook_event_name":"{hook}","tool_use_id":"{id}","tool_name":"Bash","tool_input":{{"command":"{command}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn a_request_is_bound_to_the_calls_it_can_be() {
+        let (_r, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let input = serde_json::json!({"command": "touch x"});
+        // B (same command) already ran and finished; A started, then asked
+        // (its request saw events up to 3).
+        tool(&dir, 1, "PreToolUse", "b", "touch x");
+        tool(&dir, 2, "PostToolUse", "b", "touch x");
+        tool(&dir, 3, "PreToolUse", "a", "touch x");
+        a.poll_events();
+        assert_eq!(a.last_seq(), 3);
+        assert_eq!(a.call_for("Bash", &input, 3), ["a"], "exactly A");
+        // C, identical, starts later: not A's request's call
+        tool(&dir, 4, "PreToolUse", "c", "touch x");
+        a.poll_events();
+        assert_eq!(a.call_for("Bash", &input, 3), ["a"]);
+        // An identical call still running when A asked: either can be it
+        assert_eq!(a.call_for("Bash", &input, 4), ["a", "c"]);
+        assert!(
+            a.call_for("Bash", &serde_json::json!({"command": "rm x"}), 4)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_denied_call_is_its_requests_and_never_a_retrys() {
+        // A asks, is denied (no PostToolUse ever comes); the same command
+        // is tried again (B): B's request is bound to B alone.
+        let (_r, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let input = serde_json::json!({"command": "touch x"});
+        tool(&dir, 1, "PreToolUse", "a", "touch x");
+        a.poll_events();
+        assert_eq!(a.call_for("Bash", &input, 1), ["a"]);
+        a.claim("a");
+        tool(&dir, 2, "PreToolUse", "b", "touch x");
+        a.poll_events();
+        assert_eq!(a.call_for("Bash", &input, 2), ["b"]);
+    }
+
+    #[test]
+    fn a_lost_event_fails_closed() {
+        // A synchronous hook that died before publishing (Claude went on):
+        // the session counts as working (no prompt goes in) until the turn
+        // ends, and no request is bound to a call any more.
+        use crate::chat::session::{ChatSession, State};
+        let (_r, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let mut chat = ChatSession::new("g".into(), 0);
+        chat.on_event(
+            AgentEvent::SessionStarted {
+                session_id: "s".into(),
+                log_path: "/x/s.jsonl".into(),
+                source: "startup".into(),
+                same_log: false,
+            },
+            1,
+            0,
+        );
+        tool(&dir, 1, "PreToolUse", "a", "touch x");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        fs::write(
+            dir.join("events").join(format!("start-PreToolUse.{dead}")),
+            "",
+        )
+        .unwrap();
+        for e in a.poll_events() {
+            chat.on_event(e, 2, 0);
+        }
+        assert_eq!(chat.status().state, State::Working);
+        assert!(chat.submit("r1", "g", "next", 0, false).is_err());
+        assert!(
+            a.poll_log()
+                .iter()
+                .any(|i| matches!(i, LogItem::Problem { detail, fatal: false } if detail.contains("was lost")))
+        );
+        assert!(
+            a.call_for("Bash", &serde_json::json!({"command": "touch x"}), 1)
+                .is_empty()
+        );
+        // the turn's end: ready again
+        event(&dir, "ev.2.json", r#"{"hook_event_name":"Stop"}"#);
+        for e in a.poll_events() {
+            chat.on_event(e, 3, 0);
+        }
+        assert_eq!(chat.status().state, State::Ready);
+    }
+
     #[test]
     fn claudes_dialog_on_screen_is_recognized() {
         let pane = fs::read_to_string(concat!(
@@ -271,6 +513,16 @@ mod tests {
         ))
         .unwrap();
         assert!(dialog_on_screen(&pane));
+        // Claude Code 2.1.302's file dialogs (captured live): create, edit.
+        for name in ["pane-write.txt", "pane-edit.txt"] {
+            let pane = fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("designs/fixtures/permission-hook")
+                    .join(name),
+            )
+            .unwrap();
+            assert!(dialog_on_screen(&pane), "{name}");
+        }
         assert!(!dialog_on_screen("● Done.\n❯ \n? for shortcuts"));
         assert!(!dialog_on_screen("Do you want to continue? I can go on."));
     }
@@ -339,8 +591,22 @@ mod tests {
         assert_eq!(c.reason.as_deref(), Some("format changed"));
     }
 
+    /// An event as the hook script publishes it: `ev.<n>.json` names its
+    /// sequence `<n>`.
     fn event(dir: &Path, name: &str, body: &str) {
-        fs::write(dir.join("events").join(name), body).unwrap();
+        let n: u64 = name
+            .trim_start_matches("ev.")
+            .trim_end_matches(".json")
+            .parse()
+            .unwrap();
+        let v: Value = serde_json::from_str(body).unwrap();
+        let ev = v["hook_event_name"].as_str().unwrap();
+        let me = std::process::id();
+        fs::write(
+            dir.join("events").join(format!("ev-{n:010}-{ev}.json")),
+            format!("{me} {me}\n{body}"),
+        )
+        .unwrap();
     }
 
     #[test]
