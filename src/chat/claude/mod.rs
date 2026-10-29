@@ -64,6 +64,15 @@ impl ClaudeAdapter {
 /// A new chat directory under `root` and the arguments Claude needs for it
 /// (put before the launch arguments `args`), with the approval hook when
 /// `approvals`. On failure nothing is left behind.
+/// The screen shows Claude Code's own permission dialog (2.1.30x: "Do you
+/// want to proceed?" for a command, "Do you want to make this edit to …?"
+/// and the like for files, above "Esc to cancel"): a chat prompt's Enter
+/// would answer it ("1. Yes"), so prompts are held. A backstop beside the
+/// worker's open approvals; it only ever adds a hold.
+pub fn dialog_on_screen(text: &str) -> bool {
+    text.contains("Esc to cancel") && text.contains("Do you want to")
+}
+
 pub fn prepare_chat(
     root: &Path,
     args: &[String],
@@ -252,6 +261,18 @@ mod tests {
         let mut a = ClaudeAdapter::new();
         let plan = a.prepare_launch(&s(args), &dir).unwrap();
         (root, a, plan)
+    }
+
+    #[test]
+    fn claudes_dialog_on_screen_is_recognized() {
+        let pane = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/designs/fixtures/permission-hook/pane-none.txt"
+        ))
+        .unwrap();
+        assert!(dialog_on_screen(&pane));
+        assert!(!dialog_on_screen("● Done.\n❯ \n? for shortcuts"));
+        assert!(!dialog_on_screen("Do you want to continue? I can go on."));
     }
 
     #[test]

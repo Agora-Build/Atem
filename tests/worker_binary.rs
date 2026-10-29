@@ -109,7 +109,7 @@ impl Env {
 
     /// Writes the spawn spec the broker would and starts `atem worker`.
     fn start_worker(&self, sid: &str, process_gen: &str) -> (Child, PathBuf) {
-        self.start_worker_with(sid, process_gen, &[])
+        self.start_worker_with(sid, process_gen, "codex", &[])
     }
 
     /// `start_worker` with more environment for the worker itself.
@@ -117,6 +117,7 @@ impl Env {
         &self,
         sid: &str,
         process_gen: &str,
+        provider: &str,
         extra: &[(&str, &Path)],
     ) -> (Child, PathBuf) {
         let socket = self
@@ -127,7 +128,7 @@ impl Env {
         let spec = json!({
             "session_id": sid,
             "process_gen": process_gen,
-            "provider": "codex",
+            "provider": provider,
             "args": [],
             "cwd": self.home,
             "rows": 24,
@@ -492,12 +493,34 @@ printf '  Would you like to run the following command?\n  $ touch made.txt\n  Pr
 while read l; do echo "got:$l"; done
 "#;
 
+/// Claude's: the approval hook as Claude's `--settings` registers it (the
+/// worker passes `--settings <session dir>/settings.json` first).
+const CLAUDE_APPROVING: &str = r#"#!/bin/sh
+dir=$(dirname "$2")
+echo ready
+while [ ! -e "$GO" ]; do sleep 0.02; done
+printf '%s' "$REQ" | ATEM_APPROVAL_DIR="$dir" /bin/sh "$dir/approval-hook.sh" claude 600
+echo hook-done
+while read l; do echo "got:$l"; done
+"#;
+
+/// Claude Code's own permission dialog (2.1.30x), with no hook involved.
+const CLAUDE_DIALOG_ON_SCREEN: &str = r#"#!/bin/sh
+echo ready
+printf ' Bash command\n $ touch made.txt\n Do you want to proceed?\n > 1. Yes\n   4. No\n Esc to cancel · Tab to amend\n'
+while read l; do echo "got:$l"; done
+"#;
+
 impl Approving {
     fn start(sid: &str) -> Self {
         Self::start_with(sid, APPROVING)
     }
 
     fn start_with(sid: &str, agent: &str) -> Self {
+        Self::start_as(sid, agent, "codex")
+    }
+
+    fn start_as(sid: &str, agent: &str, provider: &str) -> Self {
         let env = Env::new();
         let config = env.home.join(".config").join("atem");
         std::fs::create_dir_all(&config).unwrap();
@@ -511,6 +534,7 @@ impl Approving {
         let (worker, socket) = env.start_worker_with(
             sid,
             "3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+            provider,
             &[("ATEM_TEST_PTY_FAULTS", &faults)],
         );
         cleanup.children.push(worker);
@@ -519,6 +543,7 @@ impl Approving {
         let agent_env = json!([
             ["PATH", "/usr/bin:/bin"],
             ["CODEX_CLI_BIN", env.agent.to_str().unwrap()],
+            ["CLAUDE_CLI_BIN", env.agent.to_str().unwrap()],
             ["CODEX_HOME", codex_home.to_str().unwrap()],
             ["GO", go.to_str().unwrap()],
             ["REQ", TOUCH_REQ],
@@ -557,6 +582,20 @@ impl Approving {
 
     fn paste(&mut self, seq: u64, text: &str) {
         self.broker.send(json!({"op": "paste", "seq": seq, "text": text, "input_epoch": 0, "release_approvals": true}));
+    }
+
+    /// Waits until the agent's output shows `text` (it may have come with
+    /// what was read already).
+    fn screen_shows(&mut self, text: &str) {
+        if !self.broker.output.contains(text) {
+            self.broker.until(|_, out| out.contains(text));
+        }
+    }
+
+    /// A paste as the broker sends Claude's (it releases nothing).
+    fn paste_claude(&mut self, seq: u64, text: &str) {
+        self.broker
+            .send(json!({"op": "paste", "seq": seq, "text": text, "input_epoch": 0}));
     }
 
     /// The paste's result: consumed with `APPROVAL_IN_DIALOG`, nothing written.
@@ -632,8 +671,7 @@ fn a_prompt_is_held_while_codexs_dialog_is_on_the_screen() {
     // No hook said anything (one Codex never started, say): the dialog on
     // the canonical screen alone holds chat prompts; terminal input goes.
     let mut t = Approving::start_with("ses-ffffffff6666", DIALOG_ON_SCREEN);
-    t.broker
-        .until(|_, out| out.contains("Press enter to confirm"));
+    t.screen_shows("Press enter to confirm");
     t.paste(1, "pasted-at-the-dialog");
     t.assert_held(1, "pasted-at-the-dialog");
 }
@@ -655,4 +693,23 @@ fn a_dialog_and_its_prompt_hold_outlive_a_broker_restart() {
     t.broker = broker;
     t.paste(2, "pasted-after-restart");
     t.assert_held(2, "pasted-after-restart");
+}
+
+#[test]
+fn a_prompt_is_held_while_a_claude_approval_is_open() {
+    // Claude shows its own dialog while our hook waits (a background agent
+    // may ask after the turn ended): a chat prompt's Enter would pick
+    // "1. Yes". Held while the approval is open.
+    let mut t = Approving::start_as("ses-hhhhhhhh2222", CLAUDE_APPROVING, "claude");
+    t.ask();
+    t.paste_claude(1, "pasted-into-claudes-dialog");
+    t.assert_held(1, "pasted-into-claudes-dialog");
+}
+
+#[test]
+fn a_prompt_is_held_while_claudes_dialog_is_on_the_screen() {
+    let mut t = Approving::start_as("ses-jjjjjjjj3333", CLAUDE_DIALOG_ON_SCREEN, "claude");
+    t.screen_shows("Esc to cancel");
+    t.paste_claude(1, "pasted-at-claudes-dialog");
+    t.assert_held(1, "pasted-at-claudes-dialog");
 }

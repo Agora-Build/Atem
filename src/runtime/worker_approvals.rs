@@ -897,11 +897,13 @@ impl Approvals {
         }
     }
 
-    /// The request `ev` is about: the oldest open one with the same tool and
-    /// input (opened by the evidence's time), else the oldest with our
-    /// decision out.
+    /// The request `ev` is about: the only waiting one with the same tool
+    /// and input (opened by the evidence's time). Two such (identical calls,
+    /// say a background agent's and the main one's) can't be told apart:
+    /// the evidence closes neither, which their hooks' own ends or a later,
+    /// unambiguous result do.
     fn target(&self, tool_name: &str, input: &Value, at_ms: i64) -> Option<String> {
-        let mut candidates: Vec<(&String, &Waiting)> = self
+        let candidates: Vec<&String> = self
             .waiting
             .iter()
             .filter(|(_, w)| {
@@ -911,9 +913,12 @@ impl Approvals {
                         .as_ref()
                         .is_some_and(|r| same_tool(r, tool_name, input))
             })
+            .map(|(id, _)| id)
             .collect();
-        candidates.sort_by_key(|(_, w)| (w.state != State::Open, w.opened));
-        candidates.first().map(|(id, _)| (*id).clone())
+        match candidates[..] {
+            [id] => Some(id.clone()),
+            _ => None,
+        }
     }
 
     fn weigh(&mut self, ev: Evidence, out: &mut Vec<Event>) {

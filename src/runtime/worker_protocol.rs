@@ -31,10 +31,11 @@ pub const MAX_PASTE: usize = 256 * 1024;
 /// Why a consumed write (`consumed`) wasn't written: the remote `written`
 /// ack's error.
 pub const APPROVAL_HANDED: &str = "the approval was handed to the terminal; not written";
-/// Why a chat prompt (`paste`) was consumed: Codex's own approval dialog is
-/// open, and the paste's Enter would answer it.
+/// Why a chat prompt (`paste`) was consumed: the agent's own approval
+/// dialog is open (or an approval waits), and the paste's Enter would
+/// answer it.
 pub const APPROVAL_IN_DIALOG: &str =
-    "Codex's approval dialog is open in the terminal; answer it there; not written";
+    "the agent's approval dialog is open in the terminal; answer it there; not written";
 /// The local frontend's notice for consumed input.
 pub const APPROVAL_HANDED_NOTICE: &str =
     "Codex's approval was handed to the terminal; answer its dialog";

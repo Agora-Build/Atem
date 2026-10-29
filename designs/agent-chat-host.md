@@ -639,6 +639,20 @@ and a failure is a session notice (Codex starts anyway).
   for what hooks can't report (a hook Codex never started, for
   PermissionRequest too), chat prompts are also held while Codex's own
   approval dialog is on the canonical screen.
+  Claude (spike on Claude Code 2.1.302): its own dialog shows while our
+  hook waits, typed text plus Enter answers it ("1. Yes"), a background
+  agent can ask after its parent turn's Stop (Notification ~6 s later),
+  PreToolUse exit 1 is let through, PermissionRequest names no call, and
+  parallel calls ask one after another (never two dialogs of one agent at
+  once). So for Claude: chat prompts are held at paste and at the PTY
+  writer while any of its approvals is open or Claude's dialog is on the
+  screen (a prompt the broker admits while the status still says `ready`,
+  before Claude's Notification, is `rejected` with nothing written; the
+  status itself is unchanged, as the shared fixtures expect), and a tool
+  result closes a request only when it matches exactly one waiting
+  request. Its events
+  need no sequence counter: Claude's hooks are synchronous and Atem's
+  Claude writer never drops one.
   A refusal in Codex's dialog leaves no evidence Atem can read:
   the session stays `waiting` until a prompt typed in the terminal or an
   interrupt (fail closed). Found live on 2026-10-29: a remote prompt pasted into the

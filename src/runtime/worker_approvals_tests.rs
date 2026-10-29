@@ -542,6 +542,29 @@ fn claude_answered_in_the_terminal_closes_the_request() {
 }
 
 #[test]
+fn a_result_matching_two_waiting_requests_closes_neither() {
+    // Two identical calls ask (a background agent's and the main one's):
+    // a result can't say which ran, so neither card closes on it.
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Claude);
+    let first = s.hook("claude", 30, SECRET_BASH);
+    let id1 = request_id(&events(&mut a, true)[0]);
+    let second = s.hook("claude", 30, SECRET_BASH);
+    let id2 = request_id(&events(&mut a, true)[0]);
+    assert_ne!(id1, id2);
+    s.post(&post_body());
+    for _ in 0..5 {
+        assert!(a.poll(true, Vec::new()).is_empty());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(a.waiting(), 2);
+    let ended = a.process_ended();
+    assert_eq!(ended.len(), 2, "{ended:?}");
+    assert_eq!(printed(first), "");
+    assert_eq!(printed(second), "");
+}
+
+#[test]
 fn a_transcript_rejection_closes_the_matching_request() {
     let s = Session::new();
     let mut a = watcher(&s, Agent::Claude);

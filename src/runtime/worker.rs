@@ -515,8 +515,9 @@ struct Worker {
     handle: PtyHandle,
     events: Option<mpsc::Receiver<PtyEvent>>,
     parser: vt100::Parser,
-    /// Codex: its own approval dialog is on the canonical screen
-    /// (`chat::codex::dialog_on_screen`): chat prompts are held.
+    /// The agent's own approval dialog is on the canonical screen
+    /// (`chat::codex::dialog_on_screen`, `chat::claude::dialog_on_screen`):
+    /// chat prompts are held.
     dialog_on_screen: bool,
     share: SharedTerminal,
     /// The agent's output for the session log.
@@ -892,9 +893,13 @@ impl Worker {
                 let start = self.offset;
                 let text = self.share.process(&mut self.parser, &self.input, &bytes);
                 self.log.append(&text);
-                if matches!(self.adapter, Some(ChatAdapter::Codex(_))) {
-                    self.dialog_on_screen =
-                        crate::chat::codex::dialog_on_screen(&self.parser.screen().contents());
+                let on_screen: Option<fn(&str) -> bool> = match &self.adapter {
+                    Some(ChatAdapter::Codex(_)) => Some(crate::chat::codex::dialog_on_screen),
+                    Some(ChatAdapter::Claude(_)) => Some(crate::chat::claude::dialog_on_screen),
+                    None => None,
+                };
+                if let Some(on_screen) = on_screen {
+                    self.dialog_on_screen = on_screen(&self.parser.screen().contents());
                     self.hold_prompts();
                 }
                 self.offset += bytes.len() as u64;
@@ -999,8 +1004,7 @@ impl Worker {
         // on is latched first).
         self.latch_dialogs();
         if let BrokerMsg::Paste { seq, .. } = &message
-            && matches!(&self.adapter, Some(ChatAdapter::Codex(c))
-                if c.dialog_open() || self.dialog_on_screen)
+            && self.prompts_held()
         {
             self.send(&consumed(*seq, APPROVAL_IN_DIALOG));
             return false;
@@ -1155,11 +1159,11 @@ impl Worker {
         false
     }
 
-    /// Codex: hands the adapter the approvals that just got "no decision"
-    /// (its own dialog asks about them now) and holds chat prompts at the
-    /// PTY write boundary while it waits. Called right after every change,
-    /// not at the next pass: a prompt already queued, or arriving before
-    /// that pass, never reaches the dialog.
+    /// Codex: hands the adapter the open approvals and those that just got
+    /// "no decision" (its own dialog asks about them now); then, for any
+    /// agent, holds chat prompts at the PTY write boundary while it waits. Called
+    /// right after every change, not at the next pass: a prompt already
+    /// queued, or arriving before that pass, never reaches the dialog.
     fn latch_dialogs(&mut self) {
         let released = self
             .approvals
@@ -1172,14 +1176,26 @@ impl Worker {
         self.hold_prompts();
     }
 
-    /// Chat prompts are held at the PTY write boundary while Codex waits
-    /// for an approval (a remote answer or its own dialog), or while its
-    /// approval dialog is on the screen.
+    /// Chat prompts are held at the PTY write boundary while the agent
+    /// waits for an approval, or while its approval dialog is on the screen.
     fn hold_prompts(&self) {
-        if let Some(ChatAdapter::Codex(codex)) = &self.adapter {
-            self.input
-                .hold_prompts(codex.waiting() || self.dialog_on_screen);
-        }
+        self.input.hold_prompts(self.prompts_held());
+    }
+
+    /// A chat prompt must not be written now: the agent waits for an
+    /// approval (Codex: a remote answer or its own dialog; Claude: one of
+    /// the worker's open approvals, whose dialog Claude shows the whole
+    /// time, also a background agent's after its parent's turn ended), or
+    /// its dialog is on the screen. The session's status is the agent's own
+    /// (for Claude, its Notification ~6 s later): a prompt the broker
+    /// admits meanwhile is refused here, with nothing written.
+    fn prompts_held(&self) -> bool {
+        self.dialog_on_screen
+            || match &self.adapter {
+                Some(ChatAdapter::Codex(codex)) => codex.waiting(),
+                Some(ChatAdapter::Claude(_)) => !self.open_approvals.is_empty(),
+                None => false,
+            }
     }
 
     /// Every waiting hook gets "no decision"; the ones released now.
