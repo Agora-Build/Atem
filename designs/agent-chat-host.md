@@ -599,11 +599,14 @@ and a failure is a session notice (Codex starts anyway).
   is consumed, never written, so it can't answer the dialog the user hadn't
   seen; a remote prompt or interrupt that released one is `rejected` — no
   broker, an adopting broker that doesn't know it, a prompt or interrupted
-  turn end closing it, its hook ending without one) — that one until
-  evidence from after it went there that the dialog was answered: its
-  PostToolUse, Interrupt or UserPromptSubmit hook, or the rollout's next
-  user message, command or `turn_aborted`; never a Stop or a plain
-  `task_complete` — `ready` at `task_complete` / `turn_aborted` otherwise.
+  turn end closing it, its hook ending without one) — each such approval
+  (its call: tool and `tool_input.command`) until evidence from after it
+  went there: the PostToolUse of that same call, or the dialog dismissed or
+  gone (Interrupt or UserPromptSubmit hook, the rollout's next user message
+  or `turn_aborted`); never a Stop, a plain `task_complete`, a reply or
+  another call's result (Codex's rollout names no call for a command, so a
+  command item proves nothing) — `ready` at `task_complete` /
+  `turn_aborted` otherwise.
   Codex's waits outlast the turn: Codex (0.163, its exec cell) may end the
   turn while the approval still waits, or with its dialog still open, so a
   plain turn end neither closes an open approval nor makes the session
@@ -613,8 +616,14 @@ and a failure is a session notice (Codex starts anyway).
   dialog the worker consumes a chat prompt's paste ("Codex's approval
   dialog is open in the terminal; answer it there; not written", the
   prompt `rejected`): its Enter would pick the dialog's default, an allow
-  no one gave. Terminal input is still written (whoever types sees the
-  dialog). Found live on 2026-10-29: a remote prompt pasted into the
+  no one gave. The worker latches a "no decision" at once (not at its next
+  approvals pass), and while Codex waits (an approval open or a dialog) it
+  holds chat prompts at the PTY write boundary too, so a prompt queued
+  before is never written (`FencedOutcome::Held`, reported like a consumed
+  paste). Terminal input is still written (whoever types sees the
+  dialog). A refusal in Codex's dialog leaves no evidence Atem can read:
+  the session stays `waiting` until a prompt typed in the terminal or an
+  interrupt (fail closed). Found live on 2026-10-29: a remote prompt pasted into the
   dialog approved a command.
 - **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
   UserPromptSubmit and the rollout's UserMessage both name it, with the same

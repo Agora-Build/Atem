@@ -1418,7 +1418,7 @@ fn waiting_for_an_approval(f: &Fx) -> (CodexAdapter, ChatSession) {
     rollout_upto(&f.a, A, 19);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
-    a.set_approvals(1, None);
+    a.set_approvals(1, Vec::new(), 0);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     (a, chat)
@@ -1429,7 +1429,7 @@ fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
     // input to Codex: released ("no decision"), Codex shows its own dialog
-    a.set_approvals(0, Some(BEFORE_TURN_TWO));
+    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
     for _ in 0..3 {
         assert!(tick(&mut a, &mut chat).events.is_empty());
         assert_eq!(chat.status().state, State::Waiting);
@@ -1443,18 +1443,70 @@ fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
     assert_eq!(chat.status().state, State::Working);
 }
 
+/// The call turn 2 of session A asks about (06-PermissionRequest.json).
+fn touch_made() -> DialogCall {
+    DialogCall {
+        tool_name: "Bash".into(),
+        command: Some("touch made.txt".into()),
+    }
+}
+
 #[test]
-fn codexs_own_dialog_ends_with_the_turns_next_item() {
+fn the_rollouts_next_command_or_reply_leaves_codexs_dialog() {
+    // A command item or a reply may be another call's: only that call's
+    // PostToolUse, a prompt or an interrupt ends the dialog.
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
-    a.set_approvals(0, Some(BEFORE_TURN_TWO));
+    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
     assert!(tick(&mut a, &mut chat).events.is_empty());
-    // the command ran (no PostToolUse read yet)
-    rollout_upto(&f.a, A, 22);
+    rollout_upto(&f.a, A, 26);
     let t = tick(&mut a, &mut chat);
     assert!(!message_ids(&t.outs).is_empty());
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert!(a.dialog_open());
+    assert_eq!(chat.status().state, State::Waiting);
+}
+
+#[test]
+fn another_calls_result_leaves_codexs_dialog() {
+    // Approval A (touch made.txt) sits in Codex's dialog; call B (cat
+    // notes.txt) finishes afterwards: A still waits, and so do prompts.
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    f.fire(&a, "14-PostToolUse.json");
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+    }
+    assert!(a.dialog_open());
+    assert_eq!(chat.status().state, State::Waiting);
+    assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
+    // A's own PostToolUse: answered there, ready (the turn is over)
+    f.fire(&a, "07-PostToolUse-after-approval.json");
     assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
-    assert_eq!(chat.status().state, State::Working);
+    assert!(!a.dialog_open());
+    assert_eq!(chat.status().state, State::Ready);
+}
+
+#[test]
+fn each_dialog_waits_for_its_own_call() {
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    let cat = DialogCall {
+        tool_name: "Bash".into(),
+        command: Some("cat notes.txt".into()),
+    };
+    a.set_approvals(0, vec![touch_made(), cat], BEFORE_TURN_TWO);
+    tick(&mut a, &mut chat);
+    f.fire(&a, "07-PostToolUse-after-approval.json");
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert!(a.dialog_open(), "the other one still waits");
+    f.fire(&a, "14-PostToolUse.json");
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert!(!a.dialog_open());
 }
 
 #[test]
@@ -1468,7 +1520,7 @@ fn released_with_no_remote_wait_before_is_waiting_until_an_interrupt() {
     rollout_upto(&f.a, A, 67);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
-    a.set_approvals(0, Some(BEFORE_TURN_TWO));
+    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
     let t = tick(&mut a, &mut chat);
     assert!(
         matches!(&t.events[..], [AgentEvent::WaitingForPermission { .. }]),
@@ -1539,7 +1591,7 @@ fn codex_ending_the_turn_leaves_its_dialog_waiting() {
     // answer that dialog (its Enter picks the default: allow once).
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
-    a.set_approvals(0, Some(BEFORE_TURN_TWO));
+    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
     assert!(a.dialog_open());
     turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
     let mut outs = Vec::new();
@@ -1550,7 +1602,7 @@ fn codex_ending_the_turn_leaves_its_dialog_waiting() {
     assert_eq!(completes(&outs), [("<turn-2>".into(), None, Outcome::Done)]);
     assert_eq!(chat.status().state, State::Waiting);
     assert!(a.dialog_open());
-    assert!(chat.submit("r-1", GEN, "go on", 0, true).is_err());
+    assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
     // a Stop hook doesn't end it either
     f.fire(&a, "08-Stop-empty-last-message.json");
     tick(&mut a, &mut chat);
@@ -1573,7 +1625,7 @@ fn a_remote_wait_outlasts_the_turns_end_too() {
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     // answered remotely, the tool ran: ready (the turn is over)
-    a.set_approvals(0, None);
+    a.set_approvals(0, Vec::new(), 0);
     assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
     assert_eq!(chat.status().state, State::Ready);
 }
@@ -1588,7 +1640,7 @@ fn evidence_from_before_the_dialog_doesnt_end_it() {
         .unwrap()
         .as_millis() as i64
         + 3_600_000;
-    a.set_approvals(0, Some(later));
+    a.set_approvals(0, vec![touch_made()], later);
     rollout_upto(&f.a, A, 29);
     f.fire(&a, "07-PostToolUse-after-approval.json");
     for _ in 0..3 {

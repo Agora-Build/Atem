@@ -914,6 +914,9 @@ impl Worker {
                         self.dropped += 1;
                         dropped(sequence)
                     }
+                    // A chat prompt reached the writer while Codex waited
+                    // for an approval: nothing written.
+                    FencedOutcome::Held => consumed(sequence, APPROVAL_IN_DIALOG),
                     FencedOutcome::Failed(error) => WorkerMsg::WriteResult {
                         seq: sequence,
                         ok: false,
@@ -983,7 +986,9 @@ impl Worker {
             return false;
         }
         // A chat prompt never reaches Codex's own approval dialog: its
-        // Enter would answer it.
+        // Enter would answer it (a release or a hook's end not yet passed
+        // on is latched first).
+        self.latch_dialogs();
         if let BrokerMsg::Paste { seq, .. } = &message
             && matches!(&self.adapter, Some(ChatAdapter::Codex(c)) if c.dialog_open())
         {
@@ -1140,6 +1145,31 @@ impl Worker {
         false
     }
 
+    /// Codex: hands the adapter the approvals that just got "no decision"
+    /// (its own dialog asks about them now) and holds chat prompts at the
+    /// PTY write boundary while it waits. Called right after every change,
+    /// not at the next pass: a prompt already queued, or arriving before
+    /// that pass, never reaches the dialog.
+    fn latch_dialogs(&mut self) {
+        let released = self
+            .approvals
+            .as_mut()
+            .map(|a| a.take_released())
+            .unwrap_or_default();
+        if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+            codex.set_approvals(self.open_approvals.len(), released, now_ms());
+        }
+        self.hold_prompts();
+    }
+
+    /// Chat prompts are held at the PTY write boundary while Codex waits
+    /// for an approval (a remote answer or its own dialog).
+    fn hold_prompts(&self) {
+        if let Some(ChatAdapter::Codex(codex)) = &self.adapter {
+            self.input.hold_prompts(codex.waiting());
+        }
+    }
+
     /// Every waiting hook gets "no decision"; the ones released now.
     fn release_approvals(&mut self) -> Vec<String> {
         match self.approvals.as_mut() {
@@ -1153,6 +1183,7 @@ impl Worker {
     /// the released hooks still run (`consuming`).
     fn release_for_input(&mut self) -> bool {
         let released = self.release_approvals();
+        self.latch_dialogs();
         if released.is_empty() {
             return false;
         }
@@ -1214,10 +1245,7 @@ impl Worker {
                 | ApprovalEvent::RuleNotKept { .. } => {}
             }
         }
-        let released = self.approvals.as_mut().is_some_and(|a| a.take_released());
-        if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
-            codex.set_approvals(self.open_approvals.len(), released.then(now_ms));
-        }
+        self.latch_dialogs();
         for event in events {
             let message = match event {
                 ApprovalEvent::Request { request_id, info } => WorkerMsg::ApprovalRequest {
@@ -1391,6 +1419,8 @@ impl Worker {
             (Activity::Unknown, None)
         };
         self.set_activity(state, detail);
+        // A dialog answered now lets prompts through again.
+        self.hold_prompts();
     }
 
     /// What the adapter's chat can't provide (`Capabilities::unavailable`).

@@ -72,7 +72,7 @@ use serde_json::Value;
 
 use super::rollout::RolloutReader;
 use crate::chat::adapter::{
-    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, Outcome, Part,
+    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, Outcome,
     UNAVAILABLE_ERROR_DETAILS, UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
 };
 use crate::chat::approvals::{Ancestry, HookAgent};
@@ -90,6 +90,23 @@ pub const UNAVAILABLE: &[&str] = &[
 ];
 /// The status detail while an approval waits (`ChatSession` shows its own).
 const APPROVAL_DETAIL: &str = "approve in the terminal";
+
+/// The call an approval was for, as its PermissionRequest named it: its
+/// PostToolUse names the same tool and command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogCall {
+    pub tool_name: String,
+    /// `tool_input.command` (a shell command); `None` for other tools,
+    /// whose dialog only a prompt or an interrupt ends.
+    pub command: Option<String>,
+}
+
+/// An approval in Codex's own dialog since `since` (unix ms).
+#[derive(Debug)]
+struct Dialog {
+    call: DialogCall,
+    since: i64,
+}
 
 /// Codex's permission wait: it outlasts the turn's end (an approval belongs
 /// to a tool call that can outlive the turn, and Codex's own dialog stays
@@ -139,14 +156,16 @@ pub struct CodexAdapter {
     /// Approvals open for this session (the worker's count: waiting for a
     /// remote answer).
     approvals: usize,
-    /// Since when (unix ms) an approval sits in Codex's own dialog: one got
-    /// "no decision" (released, closed at a turn end, its hook ended). The
-    /// status stays waiting until evidence from after that time that the
-    /// dialog was answered: its PostToolUse, Interrupt or UserPromptSubmit
-    /// hook, or the rollout's next user message, command or interrupted
-    /// turn end. Never a turn's plain end: Codex may end the turn with the
-    /// dialog still open (its exec cell runs on).
-    dialog_since: Option<i64>,
+    /// Approvals that sit in Codex's own dialog: each got "no decision"
+    /// (released, closed by a prompt or turn end, its hook ended). Each
+    /// holds the status waiting until evidence from after it went there
+    /// that it was answered: the PostToolUse of that call (same tool and
+    /// command), or the dialog dismissed (Interrupt hook, `turn_aborted`)
+    /// or gone (a prompt went in: UserPromptSubmit, the rollout's user
+    /// message). Never a Stop, a turn's plain end, a reply or another
+    /// call's result: Codex may end the turn with the dialog still open
+    /// (its exec cell runs on), and other calls may finish meanwhile.
+    dialogs: Vec<Dialog>,
     /// The pinned session was pinned by a hook other than its SessionStart
     /// (async hooks publish in either order): that SessionStart, read
     /// later on the same rollout, is no restart.
@@ -177,7 +196,7 @@ impl CodexAdapter {
             announced: false,
             turn_open: false,
             approvals: 0,
-            dialog_since: None,
+            dialogs: Vec::new(),
             start_unseen: false,
             session_started: false,
             withdrawn: None,
@@ -206,42 +225,58 @@ impl CodexAdapter {
     /// [`Self::set_approvals`] with nothing released.
     #[cfg(test)]
     pub fn set_open_approvals(&mut self, n: usize) {
-        self.set_approvals(n, None);
+        self.set_approvals(n, Vec::new(), 0);
     }
 
-    /// The worker's report after a pass: `open` approvals wait for a remote
-    /// answer, and `released_at_ms` says some of this session's were given
-    /// back to Codex's own dialog then ("no decision": input to Codex, no
-    /// broker, a broker that doesn't know them, a turn end or its hook
-    /// ending while it waited). Waiting while either holds.
-    pub fn set_approvals(&mut self, open: usize, released_at_ms: Option<i64>) {
+    /// The worker's report: `open` approvals wait for a remote answer, and
+    /// `released` were given back to Codex's own dialog at `at_ms` ("no
+    /// decision": input to Codex, no broker, a broker that doesn't know
+    /// them, a prompt or turn end closing them, their hook ending while it
+    /// waited). Waiting while either holds.
+    pub fn set_approvals(&mut self, open: usize, released: Vec<DialogCall>, at_ms: i64) {
         let before = self.waiting();
         self.approvals = open;
-        if let Some(at) = released_at_ms {
-            self.dialog_since.get_or_insert(at);
-        }
+        self.dialogs.extend(
+            released
+                .into_iter()
+                .map(|call| Dialog { call, since: at_ms }),
+        );
         self.status_change(before);
     }
 
     /// An approval sits in Codex's own dialog: input typed now answers it,
     /// so a chat prompt must not be pasted (the worker consumes it).
     pub fn dialog_open(&self) -> bool {
-        self.dialog_since.is_some()
+        !self.dialogs.is_empty()
     }
 
-    /// Waiting for an approval: a remote answer or Codex's own dialog.
-    fn waiting(&self) -> bool {
+    /// Waiting for an approval: a remote answer or Codex's own dialog. A
+    /// chat prompt is never written meanwhile (the worker holds prompts).
+    pub fn waiting(&self) -> bool {
         self.approvals > 0 || self.dialog_open()
     }
 
-    /// Evidence from `at_ms` that Codex's own dialog was answered: only
-    /// evidence from after the approval went there counts.
-    fn dialog_answered(&mut self, at_ms: i64) {
-        if self.dialog_since.is_some_and(|since| at_ms > since) {
+    /// The call `tool_name` `command` ran at `at_ms` (its PostToolUse): its
+    /// dialog, if one waits from before, was answered.
+    fn dialog_ran(&mut self, tool_name: &str, command: Option<&str>, at_ms: i64) {
+        let Some(command) = command else { return };
+        if let Some(i) = self.dialogs.iter().position(|d| {
+            d.since < at_ms
+                && d.call.tool_name == tool_name
+                && d.call.command.as_deref() == Some(command)
+        }) {
             let before = self.waiting();
-            self.dialog_since = None;
+            self.dialogs.remove(i);
             self.status_change(before);
         }
+    }
+
+    /// At `at_ms` no dialog of Codex's took the keys (dismissed with Esc, or
+    /// a prompt went in): every dialog from before is gone.
+    fn dialogs_gone(&mut self, at_ms: i64) {
+        let before = self.waiting();
+        self.dialogs.retain(|d| d.since >= at_ms);
+        self.status_change(before);
     }
 
     fn status_change(&mut self, before: bool) {
@@ -360,7 +395,7 @@ impl CodexAdapter {
         match hook.event.as_str() {
             "UserPromptSubmit" => {
                 // A prompt went in: no dialog was taking the keys.
-                self.dialog_answered(hook.at_ms);
+                self.dialogs_gone(hook.at_ms);
                 if let Some(text) = hook.prompt {
                     self.turn_open = true;
                     out.push(AgentEvent::PromptSubmitted {
@@ -378,7 +413,11 @@ impl CodexAdapter {
                 // of the wait is its `ToolFinished`). While an approval
                 // still waits, the status stays waiting.
                 let before = self.waiting();
-                self.dialog_answered(hook.at_ms);
+                self.dialog_ran(
+                    hook.tool_name.as_deref().unwrap_or_default(),
+                    hook.command.as_deref(),
+                    hook.at_ms,
+                );
                 if !before {
                     out.push(AgentEvent::ToolFinished);
                 }
@@ -390,7 +429,7 @@ impl CodexAdapter {
             "Stop" => self.turn_open = false,
             "Interrupt" => {
                 self.turn_open = false;
-                self.dialog_answered(hook.at_ms);
+                self.dialogs_gone(hook.at_ms);
             }
             _ => {}
         }
@@ -551,7 +590,7 @@ impl AgentAdapter for CodexAdapter {
             // a dialog of the old session is gone, and approvals still open
             // (the worker's count) wait again.
             self.extra.clear();
-            self.dialog_since = None;
+            self.dialogs.clear();
             if self.approvals > 0 {
                 self.extra.push(waiting_event());
             }
@@ -594,18 +633,13 @@ impl AgentAdapter for CodexAdapter {
                 _ => {}
             }
         }
-        // A dialog Codex showed was answered: a prompt went in, a command
-        // ran, or the turn was interrupted. A reply or a plain turn end
-        // says nothing about it.
-        let answered = items
+        // Codex's dialogs are gone once a prompt went in or the turn was
+        // interrupted. A reply, a command (maybe another call's) or a plain
+        // turn end says nothing about them.
+        let gone = items
             .iter()
             .filter_map(|i| match i {
-                LogItem::UserMessage { created_at_ms, .. }
-                | LogItem::AssistantPart {
-                    part: Part::Tool { .. },
-                    created_at_ms,
-                    ..
-                } => Some(*created_at_ms),
+                LogItem::UserMessage { created_at_ms, .. } => Some(*created_at_ms),
                 LogItem::TurnEnded {
                     outcome: Outcome::Interrupted,
                     at_ms,
@@ -614,8 +648,8 @@ impl AgentAdapter for CodexAdapter {
                 _ => None,
             })
             .max();
-        if let Some(at_ms) = answered {
-            self.dialog_answered(at_ms);
+        if let Some(at_ms) = gone {
+            self.dialogs_gone(at_ms);
         }
         items
     }
@@ -656,6 +690,9 @@ pub struct Hook {
     pub prompt: Option<String>,
     /// The turn of a turn-scoped hook.
     pub turn_id: Option<String>,
+    /// A tool hook's `tool_name` and `tool_input.command`.
+    pub tool_name: Option<String>,
+    pub command: Option<String>,
 }
 
 impl Hook {
@@ -671,6 +708,11 @@ impl Hook {
             source: s("source").unwrap_or_default().to_string(),
             prompt: s("prompt").map(str::to_string),
             turn_id: s("turn_id").map(str::to_string),
+            tool_name: s("tool_name").map(str::to_string),
+            command: json
+                .pointer("/tool_input/command")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 }

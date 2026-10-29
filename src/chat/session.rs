@@ -1457,6 +1457,53 @@ mod tests {
         // A new prompt is accepted at once (ready, no draft).
         assert!(restored.submit("r1", "g2", "next", 1, false).is_ok());
     }
+    #[test]
+    fn a_wait_held_past_its_turn_survives_a_snapshot() {
+        // Codex's approval outlasted the turn; a new broker restores the
+        // session from the worker's snapshot: still waiting, no prompt.
+        let mut s = ready();
+        s.on_log(
+            LogItem::TurnStarted {
+                turn_id: "t1".into(),
+            },
+            2,
+            0,
+        );
+        s.on_event(
+            AgentEvent::WaitingForPermission {
+                detail: "approve in the terminal".into(),
+                outlasts_turn: true,
+            },
+            3,
+            0,
+        );
+        s.on_log(
+            LogItem::TurnEnded {
+                turn_id: "t1".into(),
+                outcome: Outcome::Done,
+                at_ms: 4,
+            },
+            4,
+            0,
+        );
+        assert_eq!(s.status().state, State::Waiting);
+        let wire: ChatSnapshot =
+            serde_json::from_str(&serde_json::to_string(&s.snapshot(50, 1 << 20)).unwrap())
+                .unwrap();
+        let mut restored = ChatSession::restore("g2".into(), wire);
+        assert_eq!(restored.status().state, State::Waiting);
+        let r = restored.submit("r1", "g2", "next", 0, false);
+        assert!(
+            matches!(&r, Err(outs) if outs.iter().any(|o| matches!(o, Out::Error { .. }))),
+            "{r:?}"
+        );
+        // the wait ends: ready (its turn is over)
+        restored.on_event(AgentEvent::ToolFinished, 5, 0);
+        assert_eq!(restored.status().state, State::Ready);
+        let r = restored.submit("r2", "g2", "next", 0, false);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     use std::path::PathBuf;
 
     fn started() -> AgentEvent {

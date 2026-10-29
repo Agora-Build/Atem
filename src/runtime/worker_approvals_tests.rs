@@ -392,8 +392,8 @@ fn without_a_broker_the_hook_is_released_at_once() {
     let hook = s.hook("codex", 30, SECRET_BASH);
     known(&mut a, 1, false);
     // Codex shows its own dialog for it: still waiting there.
-    assert!(a.take_released());
-    assert!(!a.take_released(), "reported once");
+    assert!(!a.take_released().is_empty());
+    assert!(a.take_released().is_empty(), "reported once");
     assert_eq!(printed(hook), "");
     assert!(drained(&mut a).is_empty());
     assert!(s.files().is_empty());
@@ -407,10 +407,10 @@ fn adoption_releases_what_the_new_broker_does_not_know() {
     let one = request_id(&events(&mut a, true)[0]);
     let second = s.hook("codex", 30, SECRET_BASH);
     let two = request_id(&events(&mut a, true)[0]);
-    assert!(!a.take_released());
+    assert!(a.take_released().is_empty());
     a.keep_only(std::slice::from_ref(&two));
     // the released one waits in Codex's own dialog
-    assert!(a.take_released());
+    assert!(!a.take_released().is_empty());
     assert_eq!(printed(first), "");
     a.decide(&two, ApprovalDecision::AllowOnce, None, None, None);
     assert!(printed(second).contains(r#""behavior":"allow""#));
@@ -437,7 +437,7 @@ fn release_approvals_answers_every_waiting_hook_with_no_decision() {
         })
         .collect();
     a.release_all();
-    assert!(a.take_released());
+    assert!(!a.take_released().is_empty());
     for h in hooks {
         assert_eq!(printed(h), "");
     }
@@ -481,7 +481,7 @@ fn a_hook_at_its_timeout_is_timed_out() {
         vec![closed(&id, ApprovalCloseReason::TimedOut)]
     );
     // no decision: Codex shows its own dialog for it
-    assert!(a.take_released());
+    assert!(!a.take_released().is_empty());
 }
 
 #[test]
@@ -491,7 +491,7 @@ fn a_codex_hook_closed_by_a_prompt_or_turn_end_goes_to_codexs_dialog() {
     for interrupted in [false, true] {
         let hook = s.hook("codex", 30, SECRET_BASH);
         let id = request_id(&events(&mut a, true)[0]);
-        assert!(!a.take_released());
+        assert!(a.take_released().is_empty());
         let reason = if interrupted {
             ApprovalCloseReason::Interrupted
         } else {
@@ -508,7 +508,15 @@ fn a_codex_hook_closed_by_a_prompt_or_turn_end_goes_to_codexs_dialog() {
             vec![closed(&id, reason)]
         );
         assert_eq!(printed(hook), "");
-        assert!(a.take_released(), "no decision: Codex's dialog");
+        let calls = a.take_released();
+        assert_eq!(calls.len(), 1, "no decision: Codex's dialog");
+        assert_eq!(calls[0].tool_name, "Bash");
+        assert!(
+            calls[0]
+                .command
+                .as_deref()
+                .is_some_and(|c| c.starts_with("curl "))
+        );
         drained(&mut a);
     }
 }
@@ -615,10 +623,10 @@ fn a_nested_codex_is_released_without_a_report() {
         &format!("/bin/sh -c \"/bin/sh {script} codex 30; true\"; true"),
         SECRET_BASH,
     );
-    assert!(a.take_released(), "the session's own");
+    assert!(!a.take_released().is_empty(), "the session's own");
     known(&mut a, 1, true);
     assert!(
-        !a.take_released(),
+        a.take_released().is_empty(),
         "a nested codex's dialog is not this session's"
     );
     assert_eq!(printed(nested), "");
@@ -1204,7 +1212,7 @@ fn revoking_withdraws_an_allow_the_hook_has_not_taken() {
         "",
         "no decision: Codex's own dialog asks"
     );
-    assert!(a.take_released());
+    assert!(!a.take_released().is_empty());
     let _ = sleeper.kill();
     let _ = sleeper.wait();
     drained(&mut a);

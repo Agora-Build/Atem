@@ -68,6 +68,7 @@
 
 use crate::chat::adapter::ToolResultKind;
 use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request, SessionRule};
+use crate::chat::codex::adapter::DialogCall;
 use crate::runtime::worker_protocol::{ApplyOutcome, HeldRule, RuleGrant};
 use crate::session_protocol::host::ApprovalInfo;
 use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision, MAX_SESSION_RULES};
@@ -200,10 +201,11 @@ pub struct Approvals {
     codex_session: Option<String>,
     /// Events produced outside `poll`, sent with its next result.
     queued: Vec<Event>,
-    /// Codex: one of this session's requests got "no decision" since the
+    /// Codex: this session's requests that got "no decision" since the
     /// last `take_released` (released, closed by a prompt or an interrupt,
-    /// or its hook ended without one), so Codex shows its own dialog for it.
-    released: bool,
+    /// or their hook ended without one): Codex shows its own dialog for
+    /// each.
+    released: Vec<DialogCall>,
     /// Codex: the Atem session rules of this agent process, oldest first.
     rules: Vec<Kept>,
 }
@@ -278,7 +280,7 @@ impl Approvals {
             waiting: BTreeMap::new(),
             codex_session: None,
             queued: Vec::new(),
-            released: false,
+            released: Vec::new(),
             rules: Vec::new(),
         }
     }
@@ -348,7 +350,8 @@ impl Approvals {
             }
             if self.withdraw(&id) {
                 self.write_decision(&id, "");
-                self.released = true;
+                let call = self.waiting.get(&id).and_then(|w| self.dialog_call(w));
+                self.released.extend(call);
             }
         }
     }
@@ -460,10 +463,10 @@ impl Approvals {
             return;
         };
         let reported = w.reported;
-        let to_dialog = self.agent == Agent::Codex && w.ours;
+        let to_dialog = self.dialog_call(w);
         match w.state.clone() {
             State::Open => {
-                self.released |= to_dialog;
+                self.released.extend(to_dialog.clone());
                 self.write_decision(id, "");
                 self.set(id, State::Released);
                 if reported {
@@ -475,7 +478,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
-                    self.released |= to_dialog;
+                    self.released.extend(to_dialog.clone());
                     self.write_decision(id, "");
                     self.set(id, State::Released);
                     self.queued.push(Event::Applied {
@@ -490,10 +493,28 @@ impl Approvals {
         }
     }
 
-    /// Codex: some of this session's requests got "no decision" (its own
+    /// Codex: this session's requests that got "no decision" (its own
     /// dialog shows them) since the last call.
-    pub fn take_released(&mut self) -> bool {
+    pub fn take_released(&mut self) -> Vec<DialogCall> {
         std::mem::take(&mut self.released)
+    }
+
+    /// The call Codex's own dialog asks about once `w` gets no decision:
+    /// only for this session's own Codex hooks.
+    fn dialog_call(&self, w: &Waiting) -> Option<DialogCall> {
+        (self.agent == Agent::Codex && w.ours).then(|| DialogCall {
+            tool_name: w
+                .request
+                .as_ref()
+                .map(|r| r.tool_name.clone())
+                .unwrap_or_default(),
+            command: w
+                .request
+                .as_ref()
+                .and_then(|r| r.tool_input.get("command"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
     }
 
     /// The broker's `release_approval` (the host closed it): "no decision".
@@ -941,12 +962,13 @@ impl Approvals {
         };
         // "No decision" after a prompt or a turn end (not a tool that ran):
         // Codex may show its own dialog for it.
-        let to_dialog =
-            self.agent == Agent::Codex && w.ours && matches!(ev, Evidence::TurnEnded { .. });
+        let to_dialog = self
+            .dialog_call(w)
+            .filter(|_| matches!(ev, Evidence::TurnEnded { .. }));
         match w.state.clone() {
             State::Released => {}
             State::Open => {
-                self.released |= to_dialog;
+                self.released.extend(to_dialog.clone());
                 if reported {
                     out.push(Event::Closed {
                         request_id: id.into(),
@@ -958,7 +980,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
-                    self.released |= to_dialog;
+                    self.released.extend(to_dialog.clone());
                     out.push(Event::Closed {
                         request_id: id.into(),
                         reason,
@@ -1007,10 +1029,10 @@ impl Approvals {
             };
             // A Codex hook that ended without a decision: Codex shows its
             // own dialog.
-            let to_dialog = self.agent == Agent::Codex && w.ours;
+            let to_dialog = self.dialog_call(w);
             match w.state.clone() {
                 State::Open if !alive => {
-                    self.released |= to_dialog;
+                    self.released.extend(to_dialog.clone());
                     if w.reported {
                         out.push(Event::Closed {
                             request_id: id.clone(),
@@ -1023,7 +1045,7 @@ impl Approvals {
                 // timeout).
                 State::Decided { allow, deny } if !alive => {
                     if self.withdraw(&id) {
-                        self.released |= to_dialog;
+                        self.released.extend(to_dialog.clone());
                         out.push(Event::Closed {
                             request_id: id.clone(),
                             reason: gone,
