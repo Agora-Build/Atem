@@ -292,6 +292,7 @@ pub fn map_hook(json: &Value) -> Option<AgentEvent> {
             };
             permission.then(|| AgentEvent::WaitingForPermission {
                 detail: message.to_string(),
+                outlasts_turn: false,
             })
         }
         "Stop" => Some(AgentEvent::TurnEnded { at_ms: None }),
@@ -692,7 +693,8 @@ mod tests {
         assert_eq!(
             map_hook(&fixture("08-notification.json")),
             Some(AgentEvent::WaitingForPermission {
-                detail: "Claude needs your permission".into()
+                detail: "Claude needs your permission".into(),
+                outlasts_turn: false,
             })
         );
         let clear = map_hook(&fixture("12-session-start.json"));
@@ -722,7 +724,8 @@ mod tests {
                 r#"{"hook_event_name":"Notification","message":"Claude needs your permission"}"#
             )),
             Some(AgentEvent::WaitingForPermission {
-                detail: "Claude needs your permission".into()
+                detail: "Claude needs your permission".into(),
+                outlasts_turn: false,
             })
         );
         assert_eq!(

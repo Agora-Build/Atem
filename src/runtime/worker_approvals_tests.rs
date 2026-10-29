@@ -480,6 +480,37 @@ fn a_hook_at_its_timeout_is_timed_out() {
         events(&mut a, true),
         vec![closed(&id, ApprovalCloseReason::TimedOut)]
     );
+    // no decision: Codex shows its own dialog for it
+    assert!(a.take_released());
+}
+
+#[test]
+fn a_codex_hook_closed_by_a_prompt_or_turn_end_goes_to_codexs_dialog() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    for interrupted in [false, true] {
+        let hook = s.hook("codex", 30, SECRET_BASH);
+        let id = request_id(&events(&mut a, true)[0]);
+        assert!(!a.take_released());
+        let reason = if interrupted {
+            ApprovalCloseReason::Interrupted
+        } else {
+            ApprovalCloseReason::AnsweredTerminal
+        };
+        assert_eq!(
+            a.poll(
+                true,
+                vec![Evidence::TurnEnded {
+                    interrupted,
+                    at_ms: Some(now_ms())
+                }]
+            ),
+            vec![closed(&id, reason)]
+        );
+        assert_eq!(printed(hook), "");
+        assert!(a.take_released(), "no decision: Codex's dialog");
+        drained(&mut a);
+    }
 }
 
 #[test]

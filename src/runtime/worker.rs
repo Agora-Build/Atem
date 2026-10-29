@@ -24,8 +24,8 @@
 use super::adopt::process_start_time;
 use super::worker_approvals::{Approvals, Event as ApprovalEvent};
 use super::worker_protocol::{
-    Activity, BrokerMsg, MAX_LINE, MAX_OUTPUT, WorkerMsg, WorkerRecord, WorkerSpec, b64,
-    decode_broker, encode_worker, write_bytes,
+    APPROVAL_HANDED, APPROVAL_IN_DIALOG, Activity, BrokerMsg, MAX_LINE, MAX_OUTPUT, WorkerMsg,
+    WorkerRecord, WorkerSpec, b64, decode_broker, encode_worker, write_bytes,
 };
 use crate::chat::adapter::{AgentAdapter, AgentEvent, Capabilities, LogItem};
 use crate::chat::approvals::Agent;
@@ -979,7 +979,15 @@ impl Worker {
         } = &message
             && ((*release_approvals && self.release_for_input()) || self.consuming())
         {
-            self.send(&consumed(*seq));
+            self.send(&consumed(*seq, APPROVAL_HANDED));
+            return false;
+        }
+        // A chat prompt never reaches Codex's own approval dialog: its
+        // Enter would answer it.
+        if let BrokerMsg::Paste { seq, .. } = &message
+            && matches!(&self.adapter, Some(ChatAdapter::Codex(c)) if c.dialog_open())
+        {
+            self.send(&consumed(*seq, APPROVAL_IN_DIALOG));
             return false;
         }
         match message {
@@ -1208,7 +1216,7 @@ impl Worker {
         }
         let released = self.approvals.as_mut().is_some_and(|a| a.take_released());
         if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
-            codex.set_approvals(self.open_approvals.len(), released);
+            codex.set_approvals(self.open_approvals.len(), released.then(now_ms));
         }
         for event in events {
             let message = match event {
@@ -1285,6 +1293,7 @@ impl Worker {
     /// ends), keeps the activity from it and forwards what it read.
     fn poll_chat(&mut self) {
         let evidence = self.approvals.is_some();
+        let codex = matches!(self.adapter, Some(ChatAdapter::Codex(_)));
         let Some(adapter) = self.adapter.as_mut().map(ChatAdapter::get) else {
             return;
         };
@@ -1298,21 +1307,25 @@ impl Worker {
         // the terminal — each stamped with when the agent reported it, so
         // it answers only a prompt opened before (one read in the same pass
         // as a newer request doesn't). Tool results are the worker's only:
-        // never forwarded.
+        // never forwarded. Codex may end a turn while its exec cell still
+        // waits for an approval: only an interrupted turn end answers one.
         if evidence {
             use super::worker_approvals::Evidence;
             for e in &events {
-                if let AgentEvent::PromptSubmitted { at_ms, .. } | AgentEvent::TurnEnded { at_ms } =
-                    e
-                {
-                    self.approval_evidence.push(Evidence::TurnEnded {
-                        interrupted: false,
-                        at_ms: *at_ms,
-                    });
-                }
+                let at_ms = match e {
+                    AgentEvent::PromptSubmitted { at_ms, .. } => at_ms,
+                    AgentEvent::TurnEnded { at_ms } if !codex => at_ms,
+                    _ => continue,
+                };
+                self.approval_evidence.push(Evidence::TurnEnded {
+                    interrupted: false,
+                    at_ms: *at_ms,
+                });
             }
             for item in &log {
                 match item {
+                    LogItem::TurnEnded { outcome, .. }
+                        if codex && *outcome != crate::chat::adapter::Outcome::Interrupted => {}
                     LogItem::TurnEnded { outcome, at_ms, .. } => {
                         self.approval_evidence.push(Evidence::TurnEnded {
                             interrupted: *outcome == crate::chat::adapter::Outcome::Interrupted,
@@ -1490,9 +1503,9 @@ struct Consume {
     ids: Vec<String>,
 }
 
-/// Input consumed because it handed a waiting approval to the agent's own
-/// dialog (nothing written).
-fn consumed(seq: u64) -> WorkerMsg {
+/// Input consumed (nothing written) because it handed a waiting approval to
+/// the agent's own dialog, or would have answered that dialog: `why`.
+fn consumed(seq: u64, why: &str) -> WorkerMsg {
     WorkerMsg::WriteResult {
         seq,
         ok: false,
@@ -1500,7 +1513,7 @@ fn consumed(seq: u64) -> WorkerMsg {
         dropped: false,
         no_effect: true,
         consumed: true,
-        error: Some(super::worker_protocol::APPROVAL_HANDED.into()),
+        error: Some(why.into()),
     }
 }
 

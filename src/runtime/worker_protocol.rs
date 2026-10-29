@@ -31,6 +31,10 @@ pub const MAX_PASTE: usize = 256 * 1024;
 /// Why a consumed write (`consumed`) wasn't written: the remote `written`
 /// ack's error.
 pub const APPROVAL_HANDED: &str = "the approval was handed to the terminal; not written";
+/// Why a chat prompt (`paste`) was consumed: Codex's own approval dialog is
+/// open, and the paste's Enter would answer it.
+pub const APPROVAL_IN_DIALOG: &str =
+    "Codex's approval dialog is open in the terminal; answer it there; not written";
 /// The local frontend's notice for consumed input.
 pub const APPROVAL_HANDED_NOTICE: &str =
     "Codex's approval was handed to the terminal; answer its dialog";
@@ -110,7 +114,9 @@ pub enum BrokerMsg {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         release_approvals: bool,
     },
-    /// A bracketed paste plus Enter, under the same rules → `write_result`.
+    /// A chat prompt: a bracketed paste plus Enter, under the same rules →
+    /// `write_result`. Codex: consumed (never written) while an approval
+    /// sits in Codex's own dialog (`APPROVAL_IN_DIALOG`).
     Paste {
         seq: u64,
         text: String,

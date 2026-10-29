@@ -44,16 +44,23 @@
 //! - Waiting: PermissionRequest never reaches `events/` (it is the
 //!   approvals' own protocol, `runtime/worker_approvals.rs`), so the worker
 //!   reports how many approvals of this session wait for a remote answer
-//!   and whether it gave some back to Codex's own dialog ("no decision":
-//!   input to Codex, no broker, a broker that doesn't know them)
+//!   and when it gave some back to Codex's own dialog ("no decision":
+//!   input to Codex, no broker, a broker that doesn't know them, a turn
+//!   end or the hook ending while it waited)
 //!   ([`CodexAdapter::set_approvals`]; its set is the only source of the
 //!   first). Waiting while either holds: not waiting → waiting is
-//!   `WaitingForPermission`, back `ToolFinished` (working), returned after
-//!   that poll's hook events. Codex's own dialog counts until its
-//!   PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
-//!   rollout item (a re-pin drops it); after a re-pin with approvals
-//!   open, `WaitingForPermission` again. A PreToolUse read while waiting is
-//!   dropped (Codex holds the tool while the hook or its dialog waits).
+//!   `WaitingForPermission` with `outlasts_turn` (Codex may end the turn
+//!   while its exec cell still waits for the approval, or with its dialog
+//!   open: the status stays waiting past the turn's end), back
+//!   `ToolFinished`, returned after that poll's hook events. Codex's own
+//!   dialog counts until evidence from after the approval went there: its
+//!   PostToolUse, Interrupt or UserPromptSubmit hook, or the rollout's next
+//!   user message, command or interrupted turn end; never a Stop or a
+//!   plain turn end (a re-pin drops it). While it is open a chat prompt is
+//!   never pasted ([`CodexAdapter::dialog_open`]: the worker consumes it).
+//!   After a re-pin with approvals open, `WaitingForPermission` again. A
+//!   PreToolUse read while waiting is dropped (Codex holds the tool while
+//!   the hook or its dialog waits).
 //! - A format change in the rollout withdraws chat, as for Claude.
 //!   Messages arrive whole, never streamed; [`UNAVAILABLE`] says so.
 
@@ -65,8 +72,8 @@ use serde_json::Value;
 
 use super::rollout::RolloutReader;
 use crate::chat::adapter::{
-    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_ERROR_DETAILS,
-    UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
+    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, Outcome, Part,
+    UNAVAILABLE_ERROR_DETAILS, UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
 };
 use crate::chat::approvals::{Ancestry, HookAgent};
 
@@ -83,6 +90,16 @@ pub const UNAVAILABLE: &[&str] = &[
 ];
 /// The status detail while an approval waits (`ChatSession` shows its own).
 const APPROVAL_DETAIL: &str = "approve in the terminal";
+
+/// Codex's permission wait: it outlasts the turn's end (an approval belongs
+/// to a tool call that can outlive the turn, and Codex's own dialog stays
+/// open after it).
+fn waiting_event() -> AgentEvent {
+    AgentEvent::WaitingForPermission {
+        detail: APPROVAL_DETAIL.into(),
+        outlasts_turn: true,
+    }
+}
 /// Event files read per poll; the rest wait for the next.
 const EVENTS_PER_POLL: usize = 256;
 /// Largest event file read; a bigger one is dropped.
@@ -122,10 +139,14 @@ pub struct CodexAdapter {
     /// Approvals open for this session (the worker's count: waiting for a
     /// remote answer).
     approvals: usize,
-    /// An approval was released ("no decision"): Codex shows its own
-    /// dialog, so the status stays waiting until its PostToolUse or
-    /// Interrupt hook, a turn end, or the turn's next rollout item.
-    terminal_wait: bool,
+    /// Since when (unix ms) an approval sits in Codex's own dialog: one got
+    /// "no decision" (released, closed at a turn end, its hook ended). The
+    /// status stays waiting until evidence from after that time that the
+    /// dialog was answered: its PostToolUse, Interrupt or UserPromptSubmit
+    /// hook, or the rollout's next user message, command or interrupted
+    /// turn end. Never a turn's plain end: Codex may end the turn with the
+    /// dialog still open (its exec cell runs on).
+    dialog_since: Option<i64>,
     /// The pinned session was pinned by a hook other than its SessionStart
     /// (async hooks publish in either order): that SessionStart, read
     /// later on the same rollout, is no restart.
@@ -156,7 +177,7 @@ impl CodexAdapter {
             announced: false,
             turn_open: false,
             approvals: 0,
-            terminal_wait: false,
+            dialog_since: None,
             start_unseen: false,
             session_started: false,
             withdrawn: None,
@@ -185,39 +206,47 @@ impl CodexAdapter {
     /// [`Self::set_approvals`] with nothing released.
     #[cfg(test)]
     pub fn set_open_approvals(&mut self, n: usize) {
-        self.set_approvals(n, false);
+        self.set_approvals(n, None);
     }
 
     /// The worker's report after a pass: `open` approvals wait for a remote
-    /// answer, and `released` says some of this session's were given back
-    /// to Codex's own dialog ("no decision": input to Codex, no broker, a
-    /// broker that doesn't know them). Waiting while either holds.
-    pub fn set_approvals(&mut self, open: usize, released: bool) {
+    /// answer, and `released_at_ms` says some of this session's were given
+    /// back to Codex's own dialog then ("no decision": input to Codex, no
+    /// broker, a broker that doesn't know them, a turn end or its hook
+    /// ending while it waited). Waiting while either holds.
+    pub fn set_approvals(&mut self, open: usize, released_at_ms: Option<i64>) {
         let before = self.waiting();
         self.approvals = open;
-        self.terminal_wait |= released;
+        if let Some(at) = released_at_ms {
+            self.dialog_since.get_or_insert(at);
+        }
         self.status_change(before);
+    }
+
+    /// An approval sits in Codex's own dialog: input typed now answers it,
+    /// so a chat prompt must not be pasted (the worker consumes it).
+    pub fn dialog_open(&self) -> bool {
+        self.dialog_since.is_some()
     }
 
     /// Waiting for an approval: a remote answer or Codex's own dialog.
     fn waiting(&self) -> bool {
-        self.approvals > 0 || self.terminal_wait
+        self.approvals > 0 || self.dialog_open()
     }
 
-    /// Codex's own dialog was answered (or the turn went on, or ended).
-    fn end_terminal_wait(&mut self) {
-        if self.terminal_wait {
+    /// Evidence from `at_ms` that Codex's own dialog was answered: only
+    /// evidence from after the approval went there counts.
+    fn dialog_answered(&mut self, at_ms: i64) {
+        if self.dialog_since.is_some_and(|since| at_ms > since) {
             let before = self.waiting();
-            self.terminal_wait = false;
+            self.dialog_since = None;
             self.status_change(before);
         }
     }
 
     fn status_change(&mut self, before: bool) {
         match (before, self.waiting()) {
-            (false, true) => self.extra.push(AgentEvent::WaitingForPermission {
-                detail: APPROVAL_DETAIL.into(),
-            }),
+            (false, true) => self.extra.push(waiting_event()),
             (true, false) => self.extra.push(AgentEvent::ToolFinished),
             _ => {}
         }
@@ -330,6 +359,8 @@ impl CodexAdapter {
     fn map(&mut self, hook: Hook, out: &mut Vec<AgentEvent>) {
         match hook.event.as_str() {
             "UserPromptSubmit" => {
+                // A prompt went in: no dialog was taking the keys.
+                self.dialog_answered(hook.at_ms);
                 if let Some(text) = hook.prompt {
                     self.turn_open = true;
                     out.push(AgentEvent::PromptSubmitted {
@@ -343,17 +374,23 @@ impl CodexAdapter {
             // read now came before it.
             "PreToolUse" if !self.waiting() => out.push(AgentEvent::ToolStarted),
             "PostToolUse" => {
-                // The tool ran: a dialog Codex showed was answered (its
-                // `ToolFinished` is this one).
-                self.terminal_wait = false;
-                out.push(AgentEvent::ToolFinished);
+                // The tool ran: a dialog Codex showed was answered (the end
+                // of the wait is its `ToolFinished`). While an approval
+                // still waits, the status stays waiting.
+                let before = self.waiting();
+                self.dialog_answered(hook.at_ms);
+                if !before {
+                    out.push(AgentEvent::ToolFinished);
+                }
             }
             // Only wake-ups for the reader (the rollout's end record is the
-            // turn's end), but the turn is over: a deferred start may go,
-            // and a dialog Codex showed is gone.
-            "Stop" | "Interrupt" => {
+            // turn's end), but the turn is over: a deferred start may go.
+            // Stop leaves a dialog Codex showed open (Codex may end the turn
+            // before it is answered); Interrupt (Esc) dismissed it.
+            "Stop" => self.turn_open = false,
+            "Interrupt" => {
                 self.turn_open = false;
-                self.end_terminal_wait();
+                self.dialog_answered(hook.at_ms);
             }
             _ => {}
         }
@@ -514,11 +551,9 @@ impl AgentAdapter for CodexAdapter {
             // a dialog of the old session is gone, and approvals still open
             // (the worker's count) wait again.
             self.extra.clear();
-            self.terminal_wait = false;
+            self.dialog_since = None;
             if self.approvals > 0 {
-                self.extra.push(AgentEvent::WaitingForPermission {
-                    detail: APPROVAL_DETAIL.into(),
-                });
+                self.extra.push(waiting_event());
             }
             self.deferred = None;
             self.session_started = true;
@@ -559,15 +594,28 @@ impl AgentAdapter for CodexAdapter {
                 _ => {}
             }
         }
-        // The turn went on (or ended): a dialog Codex showed was answered.
-        let went_on = items.iter().any(|i| {
-            !matches!(
-                i,
-                LogItem::Problem { .. } | LogItem::Backfill(_) | LogItem::TurnStarted { .. }
-            )
-        });
-        if went_on {
-            self.end_terminal_wait();
+        // A dialog Codex showed was answered: a prompt went in, a command
+        // ran, or the turn was interrupted. A reply or a plain turn end
+        // says nothing about it.
+        let answered = items
+            .iter()
+            .filter_map(|i| match i {
+                LogItem::UserMessage { created_at_ms, .. }
+                | LogItem::AssistantPart {
+                    part: Part::Tool { .. },
+                    created_at_ms,
+                    ..
+                } => Some(*created_at_ms),
+                LogItem::TurnEnded {
+                    outcome: Outcome::Interrupted,
+                    at_ms,
+                    ..
+                } => Some(*at_ms),
+                _ => None,
+            })
+            .max();
+        if let Some(at_ms) = answered {
+            self.dialog_answered(at_ms);
         }
         items
     }

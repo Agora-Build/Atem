@@ -598,9 +598,24 @@ and a failure is a session notice (Codex starts anyway).
   released one to Codex's own dialog ("no decision": input to Codex — which
   is consumed, never written, so it can't answer the dialog the user hadn't
   seen; a remote prompt or interrupt that released one is `rejected` — no
-  broker, an adopting broker that doesn't know it) — that one until its
-  PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
-  rollout item — `ready` at `task_complete` / `turn_aborted`.
+  broker, an adopting broker that doesn't know it, a prompt or interrupted
+  turn end closing it, its hook ending without one) — that one until
+  evidence from after it went there that the dialog was answered: its
+  PostToolUse, Interrupt or UserPromptSubmit hook, or the rollout's next
+  user message, command or `turn_aborted`; never a Stop or a plain
+  `task_complete` — `ready` at `task_complete` / `turn_aborted` otherwise.
+  Codex's waits outlast the turn: Codex (0.163, its exec cell) may end the
+  turn while the approval still waits, or with its dialog still open, so a
+  plain turn end neither closes an open approval nor makes the session
+  `ready` (`WaitingForPermission.outlasts_turn`: the turn completes, the
+  status stays `waiting`, and the wait's end makes it `ready`); an
+  interrupted turn end does both. While an approval sits in Codex's own
+  dialog the worker consumes a chat prompt's paste ("Codex's approval
+  dialog is open in the terminal; answer it there; not written", the
+  prompt `rejected`): its Enter would pick the dialog's default, an allow
+  no one gave. Terminal input is still written (whoever types sees the
+  dialog). Found live on 2026-10-29: a remote prompt pasted into the
+  dialog approved a command.
 - **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
   UserPromptSubmit and the rollout's UserMessage both name it, with the same
   `turn_id`; completed at that turn's end (interrupted at `turn_aborted`).
@@ -614,7 +629,8 @@ and a failure is a session notice (Codex starts anyway).
 - **Approvals and chat evidence.** A new prompt or a turn end (stamped with
   its hook file's or log entry's time) answers only a permission prompt
   opened before it, for both agents: one read in the same pass as a newer
-  request leaves it open.
+  request leaves it open. For Codex only a prompt or an interrupted turn
+  end counts (a plain turn end leaves its approval waiting, see Status).
 - **Pairing a remote prompt.** Only a hook (its event file's time) and a log
   entry (its timestamp) from after the paste can be the remote prompt's, and
   only the first of each whose turn isn't known to be another: a local

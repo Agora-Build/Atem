@@ -201,7 +201,8 @@ pub struct Approvals {
     /// Events produced outside `poll`, sent with its next result.
     queued: Vec<Event>,
     /// Codex: one of this session's requests got "no decision" since the
-    /// last `take_released`, so Codex shows its own dialog for it.
+    /// last `take_released` (released, closed by a prompt or an interrupt,
+    /// or its hook ended without one), so Codex shows its own dialog for it.
     released: bool,
     /// Codex: the Atem session rules of this agent process, oldest first.
     rules: Vec<Kept>,
@@ -938,9 +939,14 @@ impl Approvals {
             } => ApprovalCloseReason::Interrupted,
             _ => ApprovalCloseReason::AnsweredTerminal,
         };
+        // "No decision" after a prompt or a turn end (not a tool that ran):
+        // Codex may show its own dialog for it.
+        let to_dialog =
+            self.agent == Agent::Codex && w.ours && matches!(ev, Evidence::TurnEnded { .. });
         match w.state.clone() {
             State::Released => {}
             State::Open => {
+                self.released |= to_dialog;
                 if reported {
                     out.push(Event::Closed {
                         request_id: id.into(),
@@ -952,6 +958,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
+                    self.released |= to_dialog;
                     out.push(Event::Closed {
                         request_id: id.into(),
                         reason,
@@ -998,8 +1005,12 @@ impl Approvals {
             } else {
                 ApprovalCloseReason::Interrupted
             };
+            // A Codex hook that ended without a decision: Codex shows its
+            // own dialog.
+            let to_dialog = self.agent == Agent::Codex && w.ours;
             match w.state.clone() {
                 State::Open if !alive => {
+                    self.released |= to_dialog;
                     if w.reported {
                         out.push(Event::Closed {
                             request_id: id.clone(),
@@ -1012,6 +1023,7 @@ impl Approvals {
                 // timeout).
                 State::Decided { allow, deny } if !alive => {
                     if self.withdraw(&id) {
+                        self.released |= to_dialog;
                         out.push(Event::Closed {
                             request_id: id.clone(),
                             reason: gone,

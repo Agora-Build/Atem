@@ -2722,10 +2722,14 @@ impl HostBridge {
                 );
             }
             Pending::Prompt(request_id) => {
-                // It only handed a waiting Codex approval to Codex's dialog.
+                // It only handed a waiting Codex approval to Codex's dialog,
+                // or Codex's dialog was open (the worker says which).
                 let failure = if result.consumed {
                     Some(DispatchReport::Refused {
-                        detail: super::worker_protocol::APPROVAL_HANDED.into(),
+                        detail: result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| super::worker_protocol::APPROVAL_HANDED.into()),
                     })
                 } else {
                     failure

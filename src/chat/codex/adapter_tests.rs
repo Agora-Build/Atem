@@ -695,7 +695,8 @@ fn approvals_are_counted() {
     assert_eq!(
         a.poll_events(),
         [AgentEvent::WaitingForPermission {
-            detail: APPROVAL_DETAIL.into()
+            detail: APPROVAL_DETAIL.into(),
+            outlasts_turn: true,
         }]
     );
     a.set_open_approvals(1);
@@ -941,7 +942,8 @@ fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
     assert!(tick(&mut a, &mut chat).events.is_empty());
     assert_eq!(chat.status().state, State::Waiting);
     // the worker's reports follow the pass's hooks: a PostToolUse read with
-    // a new approval leaves it waiting
+    // a new approval leaves it waiting (the PostToolUse, read while one
+    // waits, finishes nothing of its own)
     a.set_open_approvals(0);
     a.set_open_approvals(1);
     f.fire(&a, "07-PostToolUse-after-approval.json");
@@ -950,7 +952,6 @@ fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
         matches!(
             &t.events[..],
             [
-                AgentEvent::ToolFinished,
                 AgentEvent::ToolFinished,
                 AgentEvent::WaitingForPermission { .. },
             ]
@@ -1417,7 +1418,7 @@ fn waiting_for_an_approval(f: &Fx) -> (CodexAdapter, ChatSession) {
     rollout_upto(&f.a, A, 19);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
-    a.set_approvals(1, false);
+    a.set_approvals(1, None);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     (a, chat)
@@ -1428,7 +1429,7 @@ fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
     // input to Codex: released ("no decision"), Codex shows its own dialog
-    a.set_approvals(0, true);
+    a.set_approvals(0, Some(BEFORE_TURN_TWO));
     for _ in 0..3 {
         assert!(tick(&mut a, &mut chat).events.is_empty());
         assert_eq!(chat.status().state, State::Waiting);
@@ -1446,7 +1447,7 @@ fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
 fn codexs_own_dialog_ends_with_the_turns_next_item() {
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
-    a.set_approvals(0, true);
+    a.set_approvals(0, Some(BEFORE_TURN_TWO));
     assert!(tick(&mut a, &mut chat).events.is_empty());
     // the command ran (no PostToolUse read yet)
     rollout_upto(&f.a, A, 22);
@@ -1467,7 +1468,7 @@ fn released_with_no_remote_wait_before_is_waiting_until_an_interrupt() {
     rollout_upto(&f.a, A, 67);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
-    a.set_approvals(0, true);
+    a.set_approvals(0, Some(BEFORE_TURN_TWO));
     let t = tick(&mut a, &mut chat);
     assert!(
         matches!(&t.events[..], [AgentEvent::WaitingForPermission { .. }]),
@@ -1483,6 +1484,118 @@ fn released_with_no_remote_wait_before_is_waiting_until_an_interrupt() {
     f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
     assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
     assert_ne!(chat.status().state, State::Waiting);
+}
+
+/// Unix ms before turn 2's prompt in `rollout-session-A.jsonl`: evidence
+/// from the fixtures (and every hook fired now) is newer.
+const BEFORE_TURN_TWO: i64 = 1_792_215_201_000;
+
+/// Appends rollout records to `dst`: turn 2 of session A, from `at_ms`.
+fn append_turn_two(dst: &Path, at_ms: i64, records: &[(&str, Value)]) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().append(true).open(dst).unwrap();
+    for (n, (kind, payload)) in records.iter().enumerate() {
+        // the record's time: its `completed_at_ms` wins over `timestamp`
+        let mut payload = payload.clone();
+        payload["completed_at_ms"] = Value::from(at_ms + n as i64);
+        let line = serde_json::json!({
+            "timestamp": "2026-10-17T06:00:00.000Z",
+            "ordinal": 1000 + n,
+            "type": kind,
+            "payload": payload,
+        });
+        writeln!(file, "{line}").unwrap();
+    }
+}
+
+/// Codex 0.163 ends the turn while its exec cell still waits for the
+/// approval (the model's `wait` calls gave up): the reply and the turn's
+/// end, as in the incident.
+fn turn_two_ends_awaiting_approval(f: &Fx, at_ms: i64) {
+    append_turn_two(
+        &f.a,
+        at_ms,
+        &[
+            (
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "thread_id": "<session-A>",
+                    "turn_id": "<turn-2>", "item": {"type": "AgentMessage", "id": "<msg-await>",
+                    "content": [{"type": "Text", "text": "Awaiting approval to run the command."}],
+                    "phase": "final_answer"}}),
+            ),
+            (
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "root_turn_id": "<turn-2>",
+                    "turn_id": "<turn-2>", "last_agent_message": "Awaiting approval to run the command."}),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn codex_ending_the_turn_leaves_its_dialog_waiting() {
+    // The incident: the turn ended while the approval waited; it got no
+    // decision and Codex showed its own dialog. A prompt pasted now would
+    // answer that dialog (its Enter picks the default: allow once).
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    a.set_approvals(0, Some(BEFORE_TURN_TWO));
+    assert!(a.dialog_open());
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    let mut outs = Vec::new();
+    for _ in 0..3 {
+        outs.extend(tick(&mut a, &mut chat).outs);
+    }
+    // the turn completes, the session stays waiting, no prompt goes in
+    assert_eq!(completes(&outs), [("<turn-2>".into(), None, Outcome::Done)]);
+    assert_eq!(chat.status().state, State::Waiting);
+    assert!(a.dialog_open());
+    assert!(chat.submit("r-1", GEN, "go on", 0, true).is_err());
+    // a Stop hook doesn't end it either
+    f.fire(&a, "08-Stop-empty-last-message.json");
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    // Esc at Codex's dialog: answered, and with the turn over it is ready
+    f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert!(!a.dialog_open());
+    assert_eq!(chat.status().state, State::Ready);
+}
+
+#[test]
+fn a_remote_wait_outlasts_the_turns_end_too() {
+    // The turn ended while the hook still waits for a remote answer: the
+    // approval stays open (the worker no longer closes it at a plain turn
+    // end), and so does the waiting status.
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    // answered remotely, the tool ran: ready (the turn is over)
+    a.set_approvals(0, None);
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Ready);
+}
+
+#[test]
+fn evidence_from_before_the_dialog_doesnt_end_it() {
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    // released after everything the rollout and the hooks hold now
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 3_600_000;
+    a.set_approvals(0, Some(later));
+    rollout_upto(&f.a, A, 29);
+    f.fire(&a, "07-PostToolUse-after-approval.json");
+    for _ in 0..3 {
+        tick(&mut a, &mut chat);
+    }
+    assert!(a.dialog_open());
+    assert_eq!(chat.status().state, State::Waiting);
 }
 
 /// Session A with turn 1 over.
