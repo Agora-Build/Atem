@@ -1248,6 +1248,13 @@ impl Server {
                 }
                 self.op_tick();
             }
+            OpCall::Rebind { astation_id, reply } => {
+                let _ = reply.send(
+                    self.app
+                        .rebind_for_verification(&astation_id)
+                        .map_err(|error| format!("{error:#}")),
+                );
+            }
             OpCall::Install { client, reply } => {
                 self.app.install_astation_link(*client);
                 let _ = reply.send(());

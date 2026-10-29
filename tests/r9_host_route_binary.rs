@@ -938,9 +938,10 @@ fn a_local_link_never_reconnects_for_a_pin() {
 }
 
 /// Fix round 1 (H1): the first enrollment through the real `atem pair`
-/// over the relay. Its pairing-code room (connection 1) delivers
-/// `credentialSync`; the operation's own relay identity link (connection
-/// 2, Astation in the room: carrier A, no proof) is installed as the
+/// over the relay. Its pairing-code room (connection 1) answers the
+/// pairing hello with an introduction (the token-free bootstrap); the
+/// operation's own relay identity link (connection 2, Astation in the
+/// room: carrier A, no proof) is installed as the
 /// runtime's link and verification starts on it (`verifyCommit`). The pin
 /// the ceremony would apply at `deviceVerified` is written here (the fake
 /// can't sign Astation's ceremony), and the operation ends (its CLI goes
@@ -974,17 +975,20 @@ fn the_link_atem_pair_installed_reconnects_once_after_the_pin() {
     let pair_log =
         || std::fs::read_to_string(rig.sandbox.dir.path().join("pair.log")).unwrap_or_default();
     let mut verifying = false;
+    let mut hello_id: Option<String> = None;
     let deadline = Instant::now() + Duration::from_secs(30);
     while !verifying {
         let left = deadline.saturating_duration_since(Instant::now());
         match rig.relay.events.recv_timeout(left) {
-            Ok(Event::Message(1, v)) if v["type"] == "pairSavePreference" => rig.relay.send(
-                1,
-                json!({"type": "credentialSync", "data": {"access_token": "AT",
-                    "refresh_token": "RT", "expires_at": 4_000_000_000u64, "login_id": "u",
-                    "astation_id": ASTATION, "save_credentials": true}})
-                .to_string(),
-            ),
+            Ok(Event::Message(1, v)) if v["type"] == "pairing" && v["data"]["op"] == "hello" => {
+                hello_id = v["data"]["id"].as_str().map(str::to_owned);
+                rig.relay.send(
+                    1,
+                    json!({"type": "pairing", "data": {"v": 1, "op": "introduction",
+                        "id": v["data"]["id"], "astation_id": ASTATION}})
+                    .to_string(),
+                )
+            }
             Ok(Event::Message(2, v)) if v["type"] == "verifyCommit" => verifying = true,
             Ok(_) => {}
             Err(_) => panic!(
@@ -994,6 +998,43 @@ fn the_link_atem_pair_installed_reconnects_once_after_the_pin() {
             ),
         }
     }
+    // The identity link continued the same attempt: the room's code and
+    // the hello's id, never a second code.
+    let attempt = support::astation::AUTHS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|a| a["pairing_attempt_id"].as_str() == hello_id.as_deref())
+        .cloned()
+        .expect("the identity link's auth carries the attempt id");
+    assert_eq!(
+        attempt["pairing_attempt_id"].as_str(),
+        hello_id.as_deref(),
+        "{attempt}"
+    );
+    let code = attempt["pairing_code"].as_str().unwrap();
+    // The pairing room was joined under the same stable atem_id the identity
+    // link authenticated with (Astation pins and matches the host).
+    let room_atem_id = support::astation::QUERIES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|q| q.iter().any(|(k, v)| k == "code" && v == code))
+        .and_then(|q| {
+            q.iter()
+                .find(|(k, _)| k == "atem_id")
+                .map(|(_, v)| v.clone())
+        });
+    assert_eq!(
+        room_atem_id.as_deref(),
+        attempt["atem_id"].as_str(),
+        "the pairing room's atem_id: {attempt}"
+    );
+    assert!(
+        pair_log().contains(&format!("Pairing code: {code}")),
+        "the room's code, not a new one: {attempt}\n{}",
+        pair_log()
+    );
     // The operation's link is a carrier (A) link: no proof on it.
     assert!(!rig.runtime_log().contains("host_challenge answered"));
     rig.pin();

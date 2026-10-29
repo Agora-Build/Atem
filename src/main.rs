@@ -26,6 +26,7 @@ mod vault_client;
 mod memory;
 mod pair_verify;
 mod pairing;
+mod pairing_wire;
 mod machine_key;
 mod paths;
 mod profile;

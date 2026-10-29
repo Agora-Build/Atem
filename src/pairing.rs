@@ -166,6 +166,18 @@ impl PairingRecord {
         Ok(())
     }
 
+    /// Records that a later `credentialSync` from `astation_id` should be
+    /// kept for offline use (`atem pair --save`). Never creates a pairing.
+    /// Callers hold the lock (`Captured::apply`).
+    pub fn set_save_credentials(paths: &PairingPaths, astation_id: &str) -> Result<()> {
+        if !Self::update_locked(paths, astation_id, |record| record.save_credentials = true)? {
+            bail!(
+                "the pairing with Astation {astation_id} was removed meanwhile; nothing was saved"
+            );
+        }
+        Ok(())
+    }
+
     /// The valid session for `astation_id`.
     pub fn session_for(&self, astation_id: &str) -> Option<&SavedSession> {
         self.session
@@ -553,6 +565,57 @@ pub fn bind_new(src: &Sources, expected: &TrustState, astation_id: &str) -> Resu
     })
 }
 
+/// `atem pair verify`: every verification ceremony reveals a fresh
+/// `host_channel_key`, so it runs under a new binding in the next trust
+/// generation (a host binding change, §R9.2): an `add_host` a previous,
+/// aborted ceremony may have had signed names a key this host never kept,
+/// and Astation can only add the new key at a higher generation. The
+/// pairing (its Astation, session and shared login) is kept; unlike
+/// `bind_new` this never creates one. Durable before `verifyCommit`.
+pub fn rebind_for_verification(
+    src: &Sources,
+    expected: &TrustState,
+    astation_id: &str,
+) -> Result<TrustState> {
+    let _lock = lock(src)?;
+    let paths = &src.paths.pairing;
+    let generations = Generations::read(src)?;
+    let host_trust_gen = generations.effective() + 1;
+    let current = expected
+        .binding
+        .as_ref()
+        .is_some_and(|binding| binding.astation_id == astation_id);
+    if !current || !generations.state().same(expected) {
+        bail!(CHANGED);
+    }
+    let Some(mut record) = PairingRecord::load(paths)?.filter(|r| r.astation_id == astation_id)
+    else {
+        bail!(CHANGED);
+    };
+    let binding = BindingRecord {
+        binding_id: uuid::Uuid::new_v4().to_string(),
+        host_trust_gen,
+        created_at: now_secs(),
+    };
+    record.binding = Some(binding.clone());
+    // The record first: its binding alone already makes `host_trust_gen`
+    // the effective generation (the highest of the files and the binding),
+    // so a failure here changes nothing, and one in the generation files
+    // after it leaves a consistent, higher generation (raised again at the
+    // next capture). Never a lower generation, never a lost pairing.
+    record.save(paths)?;
+    commit_generation(src, host_trust_gen)?;
+    Ok(TrustState {
+        host_trust_gen,
+        binding: Some(Binding {
+            binding_id: binding.binding_id,
+            astation_id: astation_id.to_string(),
+            host_trust_gen,
+            created_at: binding.created_at,
+        }),
+    })
+}
+
 /// What asynchronous work started under: the state and the session its
 /// authentication used (`(session_id, token)`; `None` for the local proof or
 /// a pairing in progress).
@@ -771,6 +834,107 @@ pub(crate) mod tests {
         paired_record(astation_id).save(&src.paths.pairing).unwrap();
         bind_new(&src, &before, astation_id).unwrap();
         Captured::now(&src).unwrap()
+    }
+
+    /// A write that renamed its bytes into place and then failed (its
+    /// directory fsync, an uncertain outcome): the rebind reports the error
+    /// (so no `verifyCommit` follows), what is on disk is consistent at the
+    /// higher generation and still paired, and the next rebind goes higher.
+    #[test]
+    fn a_rebind_failing_after_a_rename_is_consistent_and_never_lower() {
+        for failing in ["record", "floor", "trust_gen"] {
+            let dir = tempfile::tempdir().unwrap();
+            let captured = bound_profile(dir.path(), "astation-1");
+            let src = captured.sources().clone();
+            let before = captured.state.clone();
+            let path = match failing {
+                "record" => src.paths.pairing.record.clone(),
+                "floor" => src.paths.cred.trust_gen_floor.clone(),
+                _ => src.paths.pairing.trust_gen.clone(),
+            };
+            {
+                let _failing = crate::memory::crypto::fail_after_rename(&path);
+                assert!(
+                    rebind_for_verification(&src, &before, "astation-1").is_err(),
+                    "{failing}"
+                );
+            }
+            let now = load(&src).unwrap();
+            assert_eq!(now.host_trust_gen, before.host_trust_gen + 1, "{failing}");
+            assert_eq!(
+                now.binding.as_ref().map(|b| b.astation_id.as_str()),
+                Some("astation-1"),
+                "{failing}: still paired"
+            );
+            let next =
+                rebind_for_verification(&src, &capture(&src).unwrap(), "astation-1").unwrap();
+            assert_eq!(next.host_trust_gen, before.host_trust_gen + 2, "{failing}");
+        }
+    }
+
+    /// `atem pair verify`'s rebind: the next generation, durable, the
+    /// pairing and its session kept; refused (nothing written) when the
+    /// pairing moved meanwhile, for another Astation or with no record.
+    #[test]
+    fn a_verification_rebind_raises_the_generation_and_keeps_the_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let src = captured.sources().clone();
+        let before = captured.state.clone();
+        let session = PairingRecord::load(&src.paths.pairing)
+            .unwrap()
+            .unwrap()
+            .session;
+        let after = rebind_for_verification(&src, &before, "astation-1").unwrap();
+        assert_eq!(after.host_trust_gen, before.host_trust_gen + 1);
+        let loaded = load(&src).unwrap();
+        assert!(loaded.same(&after), "durable: {loaded:?}");
+        let record = PairingRecord::load(&src.paths.pairing).unwrap().unwrap();
+        assert_eq!(record.astation_id, "astation-1");
+        assert_eq!(record.session, session, "the session stays");
+        // The old capture is stale now: another rebind from it is refused.
+        assert!(rebind_for_verification(&src, &before, "astation-1").is_err());
+        assert!(load(&src).unwrap().same(&after), "nothing written");
+        // Another Astation, or no pairing at all: refused.
+        assert!(rebind_for_verification(&src, &after, "astation-2").is_err());
+        unpair(&src).unwrap();
+        let unpaired = load(&src).unwrap();
+        assert!(rebind_for_verification(&src, &unpaired, "astation-1").is_err());
+        assert!(!src.paths.pairing.record.exists(), "never creates one");
+    }
+
+    /// A failed write before `verifyCommit`: the record's write failing
+    /// changes nothing; the generation files failing after it leave the
+    /// record's higher binding in effect. The pairing is never lost and
+    /// the generation never goes down.
+    #[test]
+    fn a_failed_verification_rebind_never_lowers_or_loses_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let src = captured.sources().clone();
+        let before = captured.state.clone();
+        {
+            let _failing = crate::memory::crypto::fail_writes_to(&src.paths.pairing.record);
+            assert!(rebind_for_verification(&src, &before, "astation-1").is_err());
+        }
+        assert!(
+            load(&src).unwrap().same(&before),
+            "the record's failure changed nothing"
+        );
+        let raised = {
+            let _failing = crate::memory::crypto::fail_writes_to(&src.paths.cred.trust_gen_floor);
+            assert!(rebind_for_verification(&src, &before, "astation-1").is_err());
+            load(&src).unwrap()
+        };
+        assert_eq!(raised.host_trust_gen, before.host_trust_gen + 1);
+        assert_eq!(
+            raised.binding.as_ref().map(|b| b.astation_id.as_str()),
+            Some("astation-1"),
+            "still paired, at the higher generation"
+        );
+        // The next capture raises the files; the next rebind goes higher.
+        let next = rebind_for_verification(&src, &capture(&src).unwrap(), "astation-1").unwrap();
+        assert_eq!(next.host_trust_gen, before.host_trust_gen + 2);
     }
 
     #[test]
