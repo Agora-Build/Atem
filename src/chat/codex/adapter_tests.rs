@@ -1663,6 +1663,168 @@ fn a_pretooluse_published_after_its_request_is_no_candidate() {
     assert!(a.dialog_open());
 }
 
+/// An event as the hook script publishes it, by hand: seq `n` and the
+/// counter raised to it.
+fn publish(f: &Fx, a: &CodexAdapter, n: u64, body: &Value) {
+    let event = body["hook_event_name"].as_str().unwrap();
+    f.put(a, n, event, &body.to_string());
+    let seq = a.dir().unwrap().join("events").join("seq");
+    let now: u64 = fs::read_to_string(&seq)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0);
+    fs::write(seq, format!("{}\n", now.max(n))).unwrap();
+}
+
+fn call_body(f: &Fx, event: &str, id: &str, command: &str) -> Value {
+    let mut body: Value =
+        serde_json::from_str(&f.hook("07-PostToolUse-after-approval.json")).unwrap();
+    body["hook_event_name"] = event.into();
+    body["tool_use_id"] = id.into();
+    body["tool_input"]["command"] = command.into();
+    body
+}
+
+/// Finding 2 (#81 6506654658): A's PreToolUse died (its marker left), B
+/// (same command) is the only call seen, and B's result comes in the first
+/// batch of more than 256 waiting events. Nothing is judged while a backlog
+/// waits; once drained, the loss is known: A keeps waiting (and its hold)
+/// before and after, until dismissed.
+#[test]
+fn a_backlog_never_lets_a_result_answer_a_dialog() {
+    let f = fx();
+    let (mut a, mut chat) = asking_without_its_pretooluse(&f);
+    let base = f.evseq(&a);
+    publish(
+        &f,
+        &a,
+        base + 1,
+        &call_body(&f, "PreToolUse", "c-b", "touch made.txt"),
+    );
+    tick(&mut a, &mut chat);
+    // A asks (its PreToolUse died: the marker, judged only later)
+    a.set_approvals(0, vec![touch_made(&f, &a)], now_ms());
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    tick(&mut a, &mut chat);
+    lost(&a, "PreToolUse");
+    publish(
+        &f,
+        &a,
+        base + 2,
+        &call_body(&f, "PostToolUse", "c-b", "touch made.txt"),
+    );
+    let filler: Value = serde_json::from_str(&f.hook("25-PreCompact-manual.json")).unwrap();
+    for n in base + 3..base + 303 {
+        publish(&f, &a, n, &filler);
+    }
+    // the first batch: B's result is in it, the marker can't be judged yet
+    let t = tick(&mut a, &mut chat);
+    assert!(
+        !t.events.contains(&AgentEvent::ToolFinished),
+        "{:?}",
+        t.events
+    );
+    assert!(
+        a.dialog_open() && a.waiting(),
+        "held while the backlog waits"
+    );
+    // drained: the loss is known, still held
+    for _ in 0..3 {
+        let t = tick(&mut a, &mut chat);
+        assert!(
+            !t.events.contains(&AgentEvent::ToolFinished),
+            "{:?}",
+            t.events
+        );
+    }
+    assert!(a.dialog_open() && a.waiting(), "held after draining");
+    assert_eq!(chat.status().state, State::Waiting);
+    assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
+}
+
+/// Turn 2 of session A, its call's PreToolUse never seen (B, the same
+/// command, will be the only call seen).
+fn asking_without_its_pretooluse(f: &Fx) -> (CodexAdapter, ChatSession) {
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "04-UserPromptSubmit-approval-turn.json");
+    rollout_upto(&f.a, A, 19);
+    tick(&mut a, &mut chat);
+    a.set_approvals(1, Vec::new(), 0);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    (a, chat)
+}
+
+/// Finding 1 at the adapter: a number the counter took without its event
+/// (A's PreToolUse failed or died between the two) before the request: the
+/// history isn't complete, so B's result can't answer A.
+#[test]
+fn a_gap_before_the_request_means_no_result_answers_a_dialog() {
+    let f = fx();
+    let (mut a, mut chat) = asking_without_its_pretooluse(&f);
+    let base = f.evseq(&a);
+    publish(
+        &f,
+        &a,
+        base + 1,
+        &call_body(&f, "PreToolUse", "c-b", "touch made.txt"),
+    );
+    fs::write(
+        a.dir().unwrap().join("events").join("seq"),
+        format!("{}\n", base + 2),
+    )
+    .unwrap();
+    tick(&mut a, &mut chat);
+    a.set_approvals(0, vec![touch_made(&f, &a)], now_ms());
+    tick(&mut a, &mut chat);
+    publish(
+        &f,
+        &a,
+        base + 3,
+        &call_body(&f, "PostToolUse", "c-b", "touch made.txt"),
+    );
+    for _ in 0..3 {
+        assert!(
+            !tick(&mut a, &mut chat)
+                .events
+                .contains(&AgentEvent::ToolFinished)
+        );
+    }
+    assert!(a.dialog_open() && a.waiting());
+}
+
+/// The control for the two above: with A's own PreToolUse lost but no
+/// marker, gap or backlog to tell, B would be the sole candidate. Here A's
+/// PreToolUse is simply absent from a complete history: B's result alone
+/// answers (what the guards above prevent when completeness is unknown).
+#[test]
+fn without_a_guard_a_sole_same_command_candidate_would_answer() {
+    let f = fx();
+    let (mut a, mut chat) = asking_without_its_pretooluse(&f);
+    let base = f.evseq(&a);
+    publish(
+        &f,
+        &a,
+        base + 1,
+        &call_body(&f, "PreToolUse", "c-b", "touch made.txt"),
+    );
+    tick(&mut a, &mut chat);
+    a.set_approvals(0, vec![touch_made(&f, &a)], now_ms());
+    tick(&mut a, &mut chat);
+    publish(
+        &f,
+        &a,
+        base + 2,
+        &call_body(&f, "PostToolUse", "c-b", "touch made.txt"),
+    );
+    assert!(
+        tick(&mut a, &mut chat)
+            .events
+            .contains(&AgentEvent::ToolFinished)
+    );
+}
+
 #[test]
 fn an_unreadable_pretooluse_means_no_result_answers_a_dialog() {
     let f = fx();

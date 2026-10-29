@@ -637,7 +637,14 @@ and a failure is a session notice (Codex starts anyway).
   hook first leaves a start marker and removes it once published: a
   marker of a dead hook, or an unreadable PreToolUse event, makes the
   calls incomplete, and until the next re-pin no result answers any
-  dialog (with a notice and a worker log line, so losses are counted). A
+  dialog (with a notice and a worker log line, so losses are counted). The
+  script advances the counter before publishing under it, either step
+  failing the hook (never a partial success): an event never exists above
+  the counter, and a number without its event is a gap the reader reports
+  as a lost event. Results are judged only on a complete history: no
+  backlog unread, every event through the request's `evseq` read, and that
+  poll's losses known; a result read meanwhile is recorded and judged later.
+  A
   PreToolUse that can't publish exits 2 (its tool blocked). As a backstop
   for what hooks can't report (a hook Codex never started, for
   PermissionRequest too), chat prompts are also held while Codex's own
@@ -663,7 +670,14 @@ and a failure is a session notice (Codex starts anyway).
   that is exactly its own, which it claims (a denied call never ends with
   a PostToolUse, so a retry of the same command is never mistaken for
   it). It closes on results only once each of its calls ran
-  (`tool_use_id`), never on another call's. Claude's file dialogs ("Do you
+  (`tool_use_id`, from its PostToolUse note or the transcript's failed or
+  refused result), never on another call's or on a result naming none. A
+  request is bound in the same approvals pass that reads it, before any
+  result is weighed; until its binding can be decided (every event through
+  its `evseq` read, no backlog) a result it could be about is held back,
+  never matched by tool and input. Invariant, both agents: an approval
+  wait is cleared by a tool result only when that result is proven to be
+  the exact call's. Claude's file dialogs ("Do you
   want to create …?", "Do you want to make this edit to …?") were checked
   live for the screen backstop.
   A refusal in Codex's dialog leaves no evidence Atem can read:

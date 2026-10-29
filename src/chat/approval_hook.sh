@@ -32,11 +32,11 @@
 #       (ev-0000000001-SessionStart.json): one more than events/seq, taken
 #       under the lock events/seq.lock, a symlink whose target is the
 #       holder's pid (made atomically by `ln -s`, so it always names a
-#       live or dead holder, never nobody). The stdin goes to a temp file
-#       first (mode 0600, umask 077) and is published with `ln`, which never
-#       replaces an existing file: a name already taken moves to the next
-#       seq, so no event overwrites another even if two hooks ever held the
-#       lock. A lock whose pid is gone (a killed hook) is taken over after
+#       live or dead holder, never nobody). The counter is advanced first,
+#       then the stdin (in a temp file, mode 0600, umask 077) is published
+#       with `ln`, which never replaces an existing file; either failing
+#       fails the hook, and a number left without its event is a gap the
+#       reader counts as lost. A lock whose pid is gone (a killed hook) is taken over after
 #       ~2 s (wall time); a live holder that long means an async event is
 #       dropped. A hook
 #       releases only a lock naming its own pid. PermissionRequest is never
@@ -176,27 +176,23 @@ if [ "$1" = event ]; then
     held=1
     # Under the lock, as few forks as can be (each one is slow on a loaded
     # machine, and every hook waiting for the lock waits for them): the
-    # counter is read and the name padded by builtins; `ln` publishes, `mv`
-    # replaces the counter, `rm` releases.
+    # counter is read and the name padded by builtins. The counter is
+    # advanced first (`mv`, atomic), then the event published under that
+    # number (`ln`, onto a free name only): an event never exists above
+    # the counter (a request's `evseq` always covers what was published
+    # before it), and a number without its event is a gap the reader
+    # detects as a lost event. Either step failing fails the hook: never a
+    # partial success.
     {
         s=
         read -r s < "$e/seq"
         case $s in '' | *[!0-9]*) s=0 ;; esac
-        k=0
-        while [ "$k" -lt 100 ]; do
-            s=$((s + 1))
-            z=0000000000$s
-            f=$e/ev-${z#"${z%??????????}"}-$ev.json
-            if ln "$t" "$f"; then break; fi
-            # No hard links here: a rename, only onto a free name.
-            if [ ! -e "$f" ] && mv "$t" "$f"; then break; fi
-            k=$((k + 1))
-        done
-        if [ "$k" -lt 100 ]; then
-            printf '%s\n' "$s" > "$e/seq.$$" && mv "$e/seq.$$" "$e/seq" || rm -f "$e/seq.$$"
-        fi
-    } 2>/dev/null
-    [ "$k" -lt 100 ] || fail
+        s=$((s + 1))
+        z=0000000000$s
+        f=$e/ev-${z#"${z%??????????}"}-$ev.json
+        printf '%s\n' "$s" > "$e/seq.$$" && mv "$e/seq.$$" "$e/seq"
+    } 2>/dev/null || { rm -f "$e/seq.$$" 2>/dev/null; fail; }
+    ln "$t" "$f" 2>/dev/null || fail
     release
     rm -f "$t" 2>/dev/null
     # Published: no longer a lost event.

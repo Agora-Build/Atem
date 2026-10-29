@@ -300,6 +300,7 @@ fn a_remote_deny_confirmed_by_its_tool_result_is_applied() {
         kind: ToolResultKind::Failed,
         text: "Error: use staging".into(),
         at_ms: now_ms() + 50,
+        call: None,
     };
     assert_eq!(
         a.poll(true, vec![result]),
@@ -631,6 +632,130 @@ fn a_request_bound_to_no_call_is_closed_by_no_result() {
     assert_eq!(printed(hook), "");
 }
 
+/// Finding 3 (#81 6510022266): A's request and same-command B's result
+/// read in the same pass. A is bound before any result is weighed; while
+/// its binding can't be decided yet, B's result is held back, never matched
+/// by tool and input; once bound to A, B's result leaves it.
+#[test]
+fn a_new_request_is_bound_before_a_result_read_with_it_is_weighed() {
+    for decided_at_once in [true, false] {
+        let s = Session::new();
+        let mut a = watcher(&s, Agent::Claude);
+        let hook = s.hook("claude", 30, SECRET_BASH);
+        // wait until the request file exists, without polling it
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !s.files().iter().any(|f| f.starts_with("req-")) {
+            assert!(std::time::Instant::now() < deadline, "no request");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s.post(&post_of("b"));
+        let ready = decided_at_once;
+        let mut binder = |_: &str, _: &Value, _: Option<u64>| {
+            if ready {
+                Binding::Calls(vec!["a".into()])
+            } else {
+                Binding::NotYet
+            }
+        };
+        // one pass reads A's request and B's result together
+        let first = a.poll_binding(true, Vec::new(), &mut binder);
+        assert!(
+            first.iter().all(|e| !matches!(e, Event::Closed { .. })),
+            "{first:?}"
+        );
+        let id = request_id(&first[0]);
+        let mut binder = |_: &str, _: &Value, _: Option<u64>| Binding::Calls(vec!["a".into()]);
+        for _ in 0..3 {
+            assert!(a.poll_binding(true, Vec::new(), &mut binder).is_empty());
+        }
+        assert_eq!(a.waiting(), 1, "B's result never closes A");
+        s.post(&post_of("a"));
+        let mut out = Vec::new();
+        for _ in 0..50 {
+            out.extend(a.poll_binding(true, Vec::new(), &mut binder));
+            if !out.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            out,
+            vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
+        );
+        assert_eq!(printed(hook), "");
+    }
+}
+
+/// A's own result read in the same pass as its request, before its binding
+/// can be decided: held back, not dropped and not matched by tool and
+/// input; once A is bound, it closes A.
+#[test]
+fn a_result_read_before_its_request_is_bound_waits_for_the_binding() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Claude);
+    let hook = s.hook("claude", 30, SECRET_BASH);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !s.files().iter().any(|f| f.starts_with("req-")) {
+        assert!(std::time::Instant::now() < deadline, "no request");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s.post(&post_of("a"));
+    let first = a.poll_binding(true, Vec::new(), &mut |_, _, _| Binding::NotYet);
+    let id = request_id(&first[0]);
+    assert!(
+        first.iter().all(|e| !matches!(e, Event::Closed { .. })),
+        "{first:?}"
+    );
+    assert!(
+        a.poll_binding(true, Vec::new(), &mut |_, _, _| Binding::NotYet)
+            .is_empty()
+    );
+    assert_eq!(
+        a.poll_binding(true, Vec::new(), &mut |_, _, _| Binding::Calls(vec![
+            "a".into()
+        ])),
+        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
+    );
+    assert_eq!(printed(hook), "");
+}
+
+/// Finding 4 (#81 6510022266): a transcript result (failed or refused) of
+/// another call, or naming none, never closes a request bound to its call;
+/// its own does.
+#[test]
+fn a_transcript_result_closes_only_the_request_bound_to_its_call() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Claude);
+    let hook = s.hook("claude", 30, SECRET_BASH);
+    let id = request_id(&events(&mut a, true)[0]);
+    a.bind(&id, vec!["a".into()]);
+    let result = |call: Option<&str>, kind| Evidence::Tool {
+        tool_name: "Bash".into(),
+        input: tool_input(),
+        kind,
+        text: "Error".into(),
+        at_ms: now_ms() + 50,
+        call: call.map(str::to_string),
+    };
+    for (call, kind) in [
+        (Some("b"), ToolResultKind::Failed),
+        (Some("b"), ToolResultKind::Rejected),
+        (None, ToolResultKind::Failed),
+        (None, ToolResultKind::Rejected),
+    ] {
+        assert!(
+            a.poll(true, vec![result(call, kind)]).is_empty(),
+            "{call:?} {kind:?}"
+        );
+    }
+    assert_eq!(a.waiting(), 1);
+    assert_eq!(
+        a.poll(true, vec![result(Some("a"), ToolResultKind::Rejected)]),
+        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
+    );
+    assert_eq!(printed(hook), "");
+}
+
 #[test]
 fn a_transcript_rejection_closes_the_matching_request() {
     let s = Session::new();
@@ -643,6 +768,7 @@ fn a_transcript_rejection_closes_the_matching_request() {
         kind: ToolResultKind::Rejected,
         text: "The user doesn't want to proceed with this tool use.".into(),
         at_ms,
+        call: None,
     };
     // Another input, or a rejection long before the request: no match.
     let other = serde_json::json!({"command": "ls"});

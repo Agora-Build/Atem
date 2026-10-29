@@ -713,3 +713,42 @@ fn a_prompt_is_held_while_claudes_dialog_is_on_the_screen() {
     t.paste_claude(1, "pasted-at-claudes-dialog");
     t.assert_held(1, "pasted-at-claudes-dialog");
 }
+
+/// Claude, through the real hook script: call A's PreToolUse, A's request,
+/// then same-command B's PostToolUse note, all while the approvals pass is
+/// held; it draws no dialog (the screen backstop can't help).
+const CLAUDE_BIND_RACE: &str = r#"#!/bin/sh
+dir=$(dirname "$2")
+hook() { ATEM_APPROVAL_DIR="$dir" /bin/sh "$dir/approval-hook.sh" "$@"; }
+echo ready
+while [ ! -e "$GO" ]; do sleep 0.02; done
+printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch x"},"tool_use_id":"a"}' | hook event PreToolUse sync
+printf '%s' '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"touch x"}}' | hook claude 600 &
+while ! ls "$dir"/approvals/req-*.json >/dev/null 2>&1; do sleep 0.02; done
+printf '%s' '{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"touch x"},"tool_use_id":"b"}' | hook post
+echo posted
+while read l; do echo "got:$l"; done
+"#;
+
+/// Finding 3 at the worker (#81 6510022266): A's new request and B's
+/// result read in one pass. A is bound to its own call before B's result
+/// is weighed, so it stays open, and a chat prompt writes nothing.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only test seams (ATEM_TEST_PTY_FAULTS)"
+)]
+fn a_new_claude_request_and_another_calls_result_in_one_pass_keep_the_hold() {
+    let mut t = Approving::start_as("ses-kkkkkkkk4444", CLAUDE_BIND_RACE, "claude");
+    t.marker("hold_approvals", true);
+    std::fs::write(&t.go, "").unwrap();
+    t.screen_shows("posted");
+    t.marker("hold_approvals", false);
+    let seen = t.broker.until(|m, _| m["op"] == "approval_request");
+    assert!(
+        !seen.iter().any(|m| m["op"] == "approval_closed"),
+        "B's result closed A: {seen:?}"
+    );
+    t.paste_claude(1, "pasted-into-claudes-dialog");
+    t.assert_held(1, "pasted-into-claudes-dialog");
+}

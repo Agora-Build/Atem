@@ -68,8 +68,19 @@ const MAX_CALLS: usize = 256;
 
 impl ClaudeAdapter {
     /// The newest event sequence read.
+    #[cfg(test)]
     pub fn last_seq(&self) -> u64 {
         self.last_seq
+    }
+
+    /// Every event through this sequence was read (or reported lost) and
+    /// nothing waits unread: binding a request that asked at or below it
+    /// may be decided. `None` while a backlog waits.
+    pub fn read_through(&self) -> Option<u64> {
+        self.events
+            .as_ref()
+            .filter(|r| r.caught_up())
+            .map(|r| r.through())
     }
 
     /// Records a PreToolUse's call, and a PostToolUse's end.
@@ -280,7 +291,10 @@ impl AgentAdapter for ClaudeAdapter {
             for event in &lost {
                 eprintln!("atem worker: a Claude {event} hook event was lost");
             }
-            if lost.iter().any(|e| e == "PreToolUse") {
+            if lost
+                .iter()
+                .any(|e| e == "PreToolUse" || e == crate::chat::hook_events::UNKNOWN)
+            {
                 self.calls_incomplete = true;
             }
             // Something happened that wasn't seen (a prompt, a tool, a turn's

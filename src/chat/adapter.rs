@@ -164,6 +164,9 @@ pub enum LogItem {
         kind: ToolResultKind,
         text: String,
         at_ms: i64,
+        /// Its call (`tool_use_id`): matched to an approval bound to it only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<String>,
     },
 }
 

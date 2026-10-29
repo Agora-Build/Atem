@@ -341,46 +341,60 @@ impl CodexAdapter {
         }
     }
 
-    /// A call finished (its PostToolUse). It answers a dialog only when it
-    /// is the one call that dialog can be about. Codex's PermissionRequest
-    /// names no call; its candidates are the calls with its tool and
-    /// command whose PreToolUse was published by its request (`evseq`:
-    /// Codex waits for the synchronous PreToolUse, so the asking call is
-    /// among them) and that hadn't finished by then. Another candidate (a
-    /// same-command call), an unreadable `evseq` or incomplete calls make
-    /// it ambiguous: the dialog stays until it is dismissed.
+    /// A call finished (its PostToolUse): recorded; whether that answers a
+    /// dialog is judged by `evaluate_dialogs`, once the history is known
+    /// complete.
     fn call_finished(&mut self, hook: &Hook) {
         let Some(id) = hook.tool_use_id.as_deref() else {
             return;
         };
-        let Some(at) = self.calls.iter().position(|c| c.id == id) else {
+        if let Some(c) = self.calls.iter_mut().find(|c| c.id == id) {
+            c.finished_seq = Some(hook.seq);
+        }
+    }
+
+    /// Clears each dialog whose call is proven to have ended. Codex's
+    /// PermissionRequest names no call; a dialog's candidates are the calls
+    /// with its tool and command whose PreToolUse was published by its
+    /// request (`evseq`: Codex waits for the synchronous PreToolUse, so the
+    /// asking call is among them) and that hadn't finished by then. It is
+    /// answered only when it has exactly one candidate and that call
+    /// finished after the dialog opened, and only while the history is
+    /// complete: no backlog unread, every event through its `evseq` read
+    /// (none skipped), and no lost or unreadable PreToolUse (or lost event
+    /// of unknown kind) this session. Anything less keeps it, and its
+    /// hold, until it is dismissed.
+    fn evaluate_dialogs(&mut self) {
+        let Some(reader) = self.events.as_ref() else {
             return;
         };
-        self.calls[at].finished_seq = Some(hook.seq);
-        if self.calls_incomplete.is_some() {
+        if self.calls_incomplete.is_some() || !reader.caught_up() || self.dialogs.is_empty() {
             return;
         }
+        let through = reader.through();
         let calls = &self.calls;
-        let answered = self.dialogs.iter().position(|d| {
-            let Some(evseq) = d.call.evseq else {
-                return false;
+        let before = self.waiting();
+        self.dialogs.retain(|d| {
+            let Some(evseq) = d.call.evseq.filter(|e| *e <= through) else {
+                return true;
             };
-            let candidate = |c: &Call| {
-                d.call.command.is_some()
-                    && c.tool_name == d.call.tool_name
-                    && c.command == d.call.command
-                    && c.started_seq <= evseq
-                    && c.finished_seq.is_none_or(|f| f > evseq)
-            };
-            hook.seq > d.since_seq
-                && candidate(&calls[at])
-                && calls.iter().filter(|c| candidate(c)).count() == 1
+            let candidates: Vec<&Call> = calls
+                .iter()
+                .filter(|c| {
+                    d.call.command.is_some()
+                        && c.tool_name == d.call.tool_name
+                        && c.command == d.call.command
+                        && c.started_seq <= evseq
+                        && c.finished_seq.is_none_or(|f| f > evseq)
+                })
+                .collect();
+            let answered = matches!(
+                &candidates[..],
+                [only] if only.finished_seq.is_some_and(|f| f > d.since_seq)
+            );
+            !answered
         });
-        if let Some(i) = answered {
-            let before = self.waiting();
-            self.dialogs.remove(i);
-            self.status_change(before);
-        }
+        self.status_change(before);
         if self.dialogs.is_empty() {
             self.calls.retain(|c| c.finished_seq.is_none());
         }
@@ -603,8 +617,13 @@ impl AgentAdapter for CodexAdapter {
         for event in &lost {
             eprintln!("atem worker: a Codex {event} hook event was lost");
         }
-        if lost.iter().any(|e| e == "PreToolUse") {
-            self.calls_lost("its PreToolUse hook didn't finish or couldn't be read");
+        if lost
+            .iter()
+            .any(|e| e == "PreToolUse" || e == crate::chat::hook_events::UNKNOWN)
+        {
+            self.calls_lost(
+                "its PreToolUse hook didn't finish, couldn't be read, or an event went missing",
+            );
         }
         while let Some(hook) = incoming.pop_front() {
             let start = hook.event == "SessionStart";
@@ -741,6 +760,8 @@ impl AgentAdapter for CodexAdapter {
                 self.map(hook, &mut out);
             }
         }
+        // After this poll's losses are known (`take_lost` above).
+        self.evaluate_dialogs();
         out.append(&mut self.extra);
         out
     }

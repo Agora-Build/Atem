@@ -1198,42 +1198,6 @@ impl Worker {
             }
     }
 
-    /// Claude: binds each request not bound yet to the calls it can be,
-    /// once every event published when it asked (`evseq`) has been read
-    /// (Claude Code ran its PreToolUse to its end before asking): its
-    /// result then closes it exactly, never another call's. Without an
-    /// `evseq` it is bound to none (no result closes it).
-    fn bind_claude_calls(&mut self) {
-        let (Some(ChatAdapter::Claude(claude)), Some(approvals)) =
-            (self.adapter.as_mut(), self.approvals.as_mut())
-        else {
-            return;
-        };
-        // Oldest first: Claude asks one call at a time, so each request's
-        // own call is the one left when the earlier ones claimed theirs.
-        let mut unbound = approvals.unbound();
-        unbound.sort_by_key(|(_, _, _, evseq)| *evseq);
-        for (id, tool, input, evseq) in unbound {
-            match evseq {
-                None => approvals.bind(&id, Vec::new()),
-                Some(evseq) if claude.last_seq() >= evseq => {
-                    let calls = claude.call_for(&tool, &input, evseq);
-                    match &calls[..] {
-                        // No PreToolUse sent for it, and none lost: matched
-                        // by tool and input instead.
-                        [] if !claude.calls_incomplete() => approvals.leave_unbound(&id),
-                        [call] => {
-                            claude.claim(call);
-                            approvals.bind(&id, calls);
-                        }
-                        _ => approvals.bind(&id, calls),
-                    }
-                }
-                Some(_) => {}
-            }
-        }
-    }
-
     /// Every waiting hook gets "no decision"; the ones released now.
     fn release_approvals(&mut self) -> Vec<String> {
         match self.approvals.as_mut() {
@@ -1283,13 +1247,18 @@ impl Worker {
         if super::test_hooks::approvals_held() {
             return;
         }
-        self.bind_claude_calls();
         let connected = self.conn.as_ref().is_some_and(|c| !c.tx.is_closed());
         let Some(a) = self.approvals.as_mut() else {
             return;
         };
         let evidence = std::mem::take(&mut self.approval_evidence);
-        let events = a.poll(connected, evidence);
+        let mut claude = match self.adapter.as_mut() {
+            Some(ChatAdapter::Claude(claude)) => Some(claude.as_mut()),
+            _ => None,
+        };
+        let events = a.poll_binding(connected, evidence, &mut |tool, input, evseq| {
+            bind_claude_request(claude.as_deref_mut(), tool, input, evseq)
+        });
         self.send_approval_events(events);
     }
 
@@ -1434,6 +1403,7 @@ impl Worker {
                         kind,
                         text,
                         at_ms,
+                        call,
                     } => {
                         if let Ok(input) = serde_json::from_str(input) {
                             self.approval_evidence.push(Evidence::Tool {
@@ -1442,6 +1412,7 @@ impl Worker {
                                 kind: *kind,
                                 text: text.clone(),
                                 at_ms: *at_ms,
+                                call: call.clone(),
                             });
                         }
                     }
@@ -1599,6 +1570,43 @@ struct Consume {
     until: Instant,
     /// The released hooks.
     ids: Vec<String>,
+}
+
+/// How a Claude approval request is bound to its call, before any result
+/// is weighed: to the calls whose PreToolUse was published by its request
+/// (`evseq`) and unfinished, not claimed by an earlier request
+/// (`ClaudeAdapter::call_for`). Claude asks one call at a time, so that is
+/// exactly its own, which it then claims. Not decidable until every event
+/// through `evseq` was read with no backlog; no `evseq`, or a lost
+/// PreToolUse: bound to no call (no result closes it). No PreToolUse sent
+/// and none lost: results are matched by tool and input. Other agents
+/// name no calls here (Codex's dialogs are its adapter's).
+fn bind_claude_request(
+    claude: Option<&mut crate::chat::claude::ClaudeAdapter>,
+    tool: &str,
+    input: &serde_json::Value,
+    evseq: Option<u64>,
+) -> super::worker_approvals::Binding {
+    use super::worker_approvals::Binding;
+    let Some(claude) = claude else {
+        return Binding::NoCalls;
+    };
+    let Some(evseq) = evseq else {
+        return Binding::Calls(Vec::new());
+    };
+    match claude.read_through() {
+        Some(through) if through >= evseq => {}
+        _ => return Binding::NotYet,
+    }
+    let calls = claude.call_for(tool, input, evseq);
+    match &calls[..] {
+        [] if !claude.calls_incomplete() => Binding::NoCalls,
+        [call] => {
+            claude.claim(call);
+            Binding::Calls(calls)
+        }
+        _ => Binding::Calls(calls),
+    }
 }
 
 /// Input consumed (nothing written) because it handed a waiting approval to

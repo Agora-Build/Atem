@@ -69,6 +69,9 @@ pub struct EventReader {
     published: VecDeque<u32>,
     /// More events were waiting than one poll reads.
     backlog: bool,
+    /// Every event up to this sequence was read (or reported lost): the
+    /// history is complete through it.
+    through: u64,
 }
 
 /// The seq of an `ev-<digits>-<Letters>.json` name.
@@ -120,6 +123,10 @@ fn event_name(name: &str) -> Option<&str> {
         .map(|(_, e)| e)
 }
 
+/// A lost event of unknown kind (a gap in the sequence): it may have been
+/// any, a PreToolUse included.
+pub const UNKNOWN: &str = "unknown";
+
 /// Pids remembered as published (`EventReader::published`).
 const PUBLISHED_PIDS: usize = 4096;
 /// A start marker this old is lost whatever its pid says (a reused pid):
@@ -133,7 +140,36 @@ impl EventReader {
             unusable: Vec::new(),
             published: VecDeque::new(),
             backlog: false,
+            through: 0,
         }
+    }
+
+    /// Every event up to this sequence was read or reported lost
+    /// (`take_lost`): a request that asked at `evseq` may be judged only
+    /// once this reached it.
+    pub fn through(&self) -> u64 {
+        self.through
+    }
+
+    /// Nothing published waits unread (no backlog): what was read, with
+    /// what `take_lost` reports, is the whole history so far.
+    pub fn caught_up(&self) -> bool {
+        !self.backlog
+    }
+
+    /// A lock on the counter held by a live hook (it may be between
+    /// advancing the counter and publishing).
+    fn locked(&self) -> bool {
+        let lock = self.dir.join("events").join("seq.lock");
+        std::fs::read_link(&lock)
+            .ok()
+            .and_then(|p| p.to_str().and_then(|p| p.parse::<i32>().ok()))
+            // SAFETY: signal 0 only checks that the pid exists.
+            .is_some_and(|pid| {
+                pid > 0
+                    && (unsafe { libc::kill(pid, 0) } == 0
+                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+            })
     }
 
     /// The events lost since the last call (their `<Event>` names): read
@@ -145,6 +181,20 @@ impl EventReader {
         let mut lost = std::mem::take(&mut self.unusable);
         if self.backlog {
             return lost;
+        }
+        // Numbers the counter took with no event left (a hook that failed
+        // or died between advancing it and publishing): lost, of unknown
+        // kind. Not while a live hook holds the lock (it may be between
+        // the two steps).
+        if !self.locked() {
+            let counter = std::fs::read_to_string(self.dir.join("events").join("seq"))
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if counter > self.through {
+                lost.extend((self.through..counter).map(|_| UNKNOWN.to_string()));
+                self.through = counter;
+            }
         }
         let Ok(rd) = std::fs::read_dir(self.dir.join("events")) else {
             return lost;
@@ -204,6 +254,13 @@ impl EventReader {
         let mut out = Vec::new();
         for (seq, name, path) in files {
             let event = event_name(&name).unwrap_or_default().to_string();
+            // A number skipped: its event was lost (published in order
+            // under the lock, so a later one can't come first).
+            if seq > self.through + 1 {
+                self.unusable
+                    .extend((self.through + 1..seq).map(|_| UNKNOWN.to_string()));
+            }
+            self.through = self.through.max(seq);
             match read_event(&path) {
                 Ok(text) => {
                     let _ = std::fs::remove_file(&path);
