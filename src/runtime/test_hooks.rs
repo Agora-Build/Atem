@@ -11,6 +11,8 @@
 //! - `ATEM_TEST_PTY_FAULTS=<dir>`, read by workers at the PTY write boundary:
 //!   - `<dir>/hold` exists: fenced writes wait, before their input-epoch
 //!     check, until it is removed;
+//!   - `<dir>/hold_approvals` exists: the worker's approvals pass (reading
+//!     requests, hooks that ended) is skipped until it is removed;
 //!   - `<dir>/fail_next_enqueue`: the next paste (a dispatched prompt) is
 //!     refused before anything is queued;
 //!   - `<dir>/fail_next_partial`: the next paste writes the first half of
@@ -92,6 +94,10 @@ mod imp {
                 .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(0),
         )
+    }
+
+    pub fn approvals_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_approvals").exists())
     }
 
     pub fn hold_writes() {
@@ -203,6 +209,14 @@ pub fn build() -> Option<String> {
     return imp::build();
     #[cfg(not(debug_assertions))]
     None
+}
+
+/// The worker's approvals pass is held.
+pub fn approvals_held() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::approvals_held();
+    #[cfg(not(debug_assertions))]
+    false
 }
 
 /// Waits while fenced PTY writes are held.

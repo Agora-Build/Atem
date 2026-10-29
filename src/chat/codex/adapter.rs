@@ -91,15 +91,34 @@ pub const UNAVAILABLE: &[&str] = &[
 /// The status detail while an approval waits (`ChatSession` shows its own).
 const APPROVAL_DETAIL: &str = "approve in the terminal";
 
-/// The call an approval was for, as its PermissionRequest named it: its
-/// PostToolUse names the same tool and command.
+/// The call an approval was for, as its PermissionRequest named it (tool
+/// and command, no call id), and when that request was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogCall {
     pub tool_name: String,
     /// `tool_input.command` (a shell command); `None` for other tools,
     /// whose dialog only a prompt or an interrupt ends.
     pub command: Option<String>,
+    /// The request file's time (unix ms).
+    pub opened_ms: i64,
 }
+
+/// A call of the pinned session, from its PreToolUse (`tool_use_id`).
+#[derive(Debug)]
+struct Call {
+    id: String,
+    tool_name: String,
+    command: Option<String>,
+    started_ms: i64,
+    finished_ms: Option<i64>,
+}
+
+/// Calls remembered for matching dialogs.
+const MAX_CALLS: usize = 256;
+/// A call's PreToolUse (async, ≤ 3 s) may be stamped after its
+/// PermissionRequest: a call started this long after a request is still
+/// one of its candidates (so a same-command call then is ambiguous).
+const CALL_SLACK_MS: i64 = 3_000;
 
 /// An approval in Codex's own dialog since `since` (unix ms).
 #[derive(Debug)]
@@ -159,13 +178,19 @@ pub struct CodexAdapter {
     /// Approvals that sit in Codex's own dialog: each got "no decision"
     /// (released, closed by a prompt or turn end, its hook ended). Each
     /// holds the status waiting until evidence from after it went there
-    /// that it was answered: the PostToolUse of that call (same tool and
-    /// command), or the dialog dismissed (Interrupt hook, `turn_aborted`)
+    /// that it was answered: the PostToolUse of the one call it can be
+    /// about (`call_finished`), or the dialog dismissed (Interrupt hook, `turn_aborted`)
     /// or gone (a prompt went in: UserPromptSubmit, the rollout's user
     /// message). Never a Stop, a turn's plain end, a reply or another
     /// call's result: Codex may end the turn with the dialog still open
     /// (its exec cell runs on), and other calls may finish meanwhile.
     dialogs: Vec<Dialog>,
+    /// Calls of the pinned session seen at their PreToolUse (at most
+    /// `MAX_CALLS`): what a dialog's PostToolUse is matched by.
+    calls: Vec<Call>,
+    /// An unfinished call had to be forgotten: no PostToolUse answers a
+    /// dialog until the next re-pin (only a dismissal does).
+    calls_forgotten: bool,
     /// The pinned session was pinned by a hook other than its SessionStart
     /// (async hooks publish in either order): that SessionStart, read
     /// later on the same rollout, is no restart.
@@ -197,6 +222,8 @@ impl CodexAdapter {
             turn_open: false,
             approvals: 0,
             dialogs: Vec::new(),
+            calls: Vec::new(),
+            calls_forgotten: false,
             start_unseen: false,
             session_started: false,
             withdrawn: None,
@@ -256,18 +283,76 @@ impl CodexAdapter {
         self.approvals > 0 || self.dialog_open()
     }
 
-    /// The call `tool_name` `command` ran at `at_ms` (its PostToolUse): its
-    /// dialog, if one waits from before, was answered.
-    fn dialog_ran(&mut self, tool_name: &str, command: Option<&str>, at_ms: i64) {
-        let Some(command) = command else { return };
-        if let Some(i) = self.dialogs.iter().position(|d| {
-            d.since < at_ms
-                && d.call.tool_name == tool_name
-                && d.call.command.as_deref() == Some(command)
-        }) {
+    /// A call started (its PreToolUse, with its `tool_use_id`).
+    fn call_started(&mut self, hook: &Hook) {
+        let Some(id) = hook.tool_use_id.clone() else {
+            return;
+        };
+        if self.calls.iter().any(|c| c.id == id) {
+            return;
+        }
+        if self.calls.len() >= MAX_CALLS {
+            // Forget a finished call first; forgetting an unfinished one
+            // could make a dialog's match look unique: no PostToolUse
+            // answers a dialog any more (only its dismissal does).
+            match self.calls.iter().position(|c| c.finished_ms.is_some()) {
+                Some(i) => {
+                    self.calls.remove(i);
+                }
+                None => {
+                    self.calls.remove(0);
+                    self.calls_forgotten = true;
+                }
+            }
+        }
+        self.calls.push(Call {
+            id,
+            tool_name: hook.tool_name.clone().unwrap_or_default(),
+            command: hook.command.clone(),
+            started_ms: hook.at_ms,
+            finished_ms: None,
+        });
+    }
+
+    /// A call finished (its PostToolUse). It answers a dialog only when it
+    /// is the one call that dialog can be about: Codex's PermissionRequest
+    /// names no call, so the dialog's candidates are the calls with its
+    /// tool and command that started by its request (`CALL_SLACK_MS`: the
+    /// PreToolUse hook is async) and hadn't finished when the dialog
+    /// opened. Another call with the same command among them makes it
+    /// ambiguous: the dialog stays until it is dismissed.
+    fn call_finished(&mut self, hook: &Hook) {
+        let Some(id) = hook.tool_use_id.as_deref() else {
+            return;
+        };
+        let Some(at) = self.calls.iter().position(|c| c.id == id) else {
+            return;
+        };
+        self.calls[at].finished_ms = Some(hook.at_ms);
+        if self.calls_forgotten {
+            return;
+        }
+        let call = &self.calls[at];
+        let calls = &self.calls;
+        let answered = self.dialogs.iter().position(|d| {
+            let candidate = |c: &Call| {
+                d.call.command.is_some()
+                    && c.tool_name == d.call.tool_name
+                    && c.command == d.call.command
+                    && c.started_ms <= d.call.opened_ms + CALL_SLACK_MS
+                    && c.finished_ms.is_none_or(|f| f > d.since)
+            };
+            d.since < hook.at_ms
+                && candidate(call)
+                && calls.iter().filter(|c| candidate(c)).count() == 1
+        });
+        if let Some(i) = answered {
             let before = self.waiting();
             self.dialogs.remove(i);
             self.status_change(before);
+        }
+        if self.dialogs.is_empty() {
+            self.calls.retain(|c| c.finished_ms.is_none());
         }
     }
 
@@ -406,18 +491,20 @@ impl CodexAdapter {
                 }
             }
             // While an approval waits Codex holds the tool: a PreToolUse
-            // read now came before it.
-            "PreToolUse" if !self.waiting() => out.push(AgentEvent::ToolStarted),
+            // read now came before it. Every one is recorded: the call
+            // identity a dialog's PostToolUse is matched by.
+            "PreToolUse" => {
+                self.call_started(&hook);
+                if !self.waiting() {
+                    out.push(AgentEvent::ToolStarted);
+                }
+            }
             "PostToolUse" => {
-                // The tool ran: a dialog Codex showed was answered (the end
-                // of the wait is its `ToolFinished`). While an approval
-                // still waits, the status stays waiting.
+                // The tool ran: the dialog of that call, if any, was
+                // answered (the end of the wait is its `ToolFinished`).
+                // While an approval still waits, the status stays waiting.
                 let before = self.waiting();
-                self.dialog_ran(
-                    hook.tool_name.as_deref().unwrap_or_default(),
-                    hook.command.as_deref(),
-                    hook.at_ms,
-                );
+                self.call_finished(&hook);
                 if !before {
                     out.push(AgentEvent::ToolFinished);
                 }
@@ -591,6 +678,8 @@ impl AgentAdapter for CodexAdapter {
             // (the worker's count) wait again.
             self.extra.clear();
             self.dialogs.clear();
+            self.calls.clear();
+            self.calls_forgotten = false;
             if self.approvals > 0 {
                 self.extra.push(waiting_event());
             }
@@ -690,9 +779,10 @@ pub struct Hook {
     pub prompt: Option<String>,
     /// The turn of a turn-scoped hook.
     pub turn_id: Option<String>,
-    /// A tool hook's `tool_name` and `tool_input.command`.
+    /// A tool hook's `tool_name`, `tool_input.command` and `tool_use_id`.
     pub tool_name: Option<String>,
     pub command: Option<String>,
+    pub tool_use_id: Option<String>,
 }
 
 impl Hook {
@@ -709,6 +799,7 @@ impl Hook {
             prompt: s("prompt").map(str::to_string),
             turn_id: s("turn_id").map(str::to_string),
             tool_name: s("tool_name").map(str::to_string),
+            tool_use_id: s("tool_use_id").map(str::to_string),
             command: json
                 .pointer("/tool_input/command")
                 .and_then(Value::as_str)

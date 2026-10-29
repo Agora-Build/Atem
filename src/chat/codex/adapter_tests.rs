@@ -99,6 +99,40 @@ impl Fx {
         self.put_from(a, n, event, body, me);
     }
 
+    /// A Bash PreToolUse/PostToolUse of call `id` running `command` in
+    /// session A's turn 2, written directly (seq `n`), its file time moved
+    /// by `offset_ms` (negative: the past).
+    fn call_hook(
+        &self,
+        a: &CodexAdapter,
+        n: u64,
+        event: &str,
+        id: &str,
+        command: &str,
+        offset_ms: i64,
+    ) {
+        let mut body: Value =
+            serde_json::from_str(&self.hook("07-PostToolUse-after-approval.json")).unwrap();
+        body["hook_event_name"] = event.into();
+        body["tool_use_id"] = id.into();
+        body["tool_input"]["command"] = command.into();
+        self.put(a, n, event, &body.to_string());
+        let p = a
+            .dir()
+            .unwrap()
+            .join("events")
+            .join(format!("ev-{n:010}-{event}.json"));
+        fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis((now_ms() + offset_ms) as u64),
+            )
+            .unwrap();
+    }
+
     /// Writes an event file whose hook's parent was `parent`.
     fn put_from(&self, a: &CodexAdapter, n: u64, event: &str, body: &str, parent: u32) {
         let p = a
@@ -1418,6 +1452,9 @@ fn waiting_for_an_approval(f: &Fx) -> (CodexAdapter, ChatSession) {
     rollout_upto(&f.a, A, 19);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
+    // its call starts (PreToolUse, `<exec-1>`), then asks
+    f.fire(&a, "05-PreToolUse-before-approval.json");
+    tick(&mut a, &mut chat);
     a.set_approvals(1, Vec::new(), 0);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
@@ -1429,7 +1466,7 @@ fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
     // input to Codex: released ("no decision"), Codex shows its own dialog
-    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
+    a.set_approvals(0, vec![touch_made()], now_ms());
     for _ in 0..3 {
         assert!(tick(&mut a, &mut chat).events.is_empty());
         assert_eq!(chat.status().state, State::Waiting);
@@ -1443,12 +1480,21 @@ fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
     assert_eq!(chat.status().state, State::Working);
 }
 
-/// The call turn 2 of session A asks about (06-PermissionRequest.json).
+/// The call turn 2 of session A asks about (06-PermissionRequest.json),
+/// requested now.
 fn touch_made() -> DialogCall {
     DialogCall {
         tool_name: "Bash".into(),
         command: Some("touch made.txt".into()),
+        opened_ms: now_ms(),
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 #[test]
@@ -1457,7 +1503,7 @@ fn the_rollouts_next_command_or_reply_leaves_codexs_dialog() {
     // PostToolUse, a prompt or an interrupt ends the dialog.
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
-    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
+    a.set_approvals(0, vec![touch_made()], now_ms());
     assert!(tick(&mut a, &mut chat).events.is_empty());
     rollout_upto(&f.a, A, 26);
     let t = tick(&mut a, &mut chat);
@@ -1473,7 +1519,7 @@ fn another_calls_result_leaves_codexs_dialog() {
     // notes.txt) finishes afterwards: A still waits, and so do prompts.
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
-    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
+    a.set_approvals(0, vec![touch_made()], now_ms());
     turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
@@ -1492,19 +1538,71 @@ fn another_calls_result_leaves_codexs_dialog() {
 }
 
 #[test]
+fn a_same_command_call_never_answers_another_calls_dialog() {
+    // Approval A (`touch made.txt`, call `<exec-1>`) outlives its turn in
+    // Codex's dialog. Call B runs the same command and finishes: the
+    // dialog can't tell them apart, so neither result answers it; the
+    // session stays waiting and prompts are held until it is dismissed.
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    a.set_approvals(0, vec![touch_made()], now_ms());
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    f.call_hook(&a, 9001, "PreToolUse", "c-b", "touch made.txt", 0);
+    f.call_hook(&a, 9002, "PostToolUse", "c-b", "touch made.txt", 0);
+    for _ in 0..3 {
+        assert!(tick(&mut a, &mut chat).events.is_empty());
+    }
+    assert!(a.dialog_open() && a.waiting());
+    assert_eq!(chat.status().state, State::Waiting);
+    assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
+    // even A's own result is ambiguous now (B was a candidate too)
+    f.fire(&a, "07-PostToolUse-after-approval.json");
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert!(a.dialog_open());
+    // dismissed: ready (the turn is over)
+    f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Ready);
+}
+
+#[test]
+fn a_same_command_call_started_after_the_request_is_no_candidate() {
+    // B starts well after A's request (beyond the async hook's slack): it
+    // can't be A's call, so A's own PostToolUse still answers A.
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    a.set_approvals(0, vec![touch_made()], now_ms());
+    tick(&mut a, &mut chat);
+    f.call_hook(&a, 9001, "PreToolUse", "c-b", "touch made.txt", 10_000);
+    f.call_hook(&a, 9002, "PostToolUse", "c-b", "touch made.txt", 11_000);
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert!(a.dialog_open(), "B is not A's call");
+    f.fire(&a, "07-PostToolUse-after-approval.json");
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert!(!a.dialog_open());
+}
+
+#[test]
 fn each_dialog_waits_for_its_own_call() {
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
+    f.call_hook(&a, 9001, "PreToolUse", "c-cat", "cat notes.txt", 0);
+    tick(&mut a, &mut chat);
     let cat = DialogCall {
         tool_name: "Bash".into(),
         command: Some("cat notes.txt".into()),
+        opened_ms: now_ms(),
     };
-    a.set_approvals(0, vec![touch_made(), cat], BEFORE_TURN_TWO);
+    a.set_approvals(0, vec![touch_made(), cat], now_ms());
     tick(&mut a, &mut chat);
+    std::thread::sleep(std::time::Duration::from_millis(5));
     f.fire(&a, "07-PostToolUse-after-approval.json");
     assert!(tick(&mut a, &mut chat).events.is_empty());
     assert!(a.dialog_open(), "the other one still waits");
-    f.fire(&a, "14-PostToolUse.json");
+    f.call_hook(&a, 9002, "PostToolUse", "c-cat", "cat notes.txt", 0);
     assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
     assert!(!a.dialog_open());
 }
@@ -1520,7 +1618,7 @@ fn released_with_no_remote_wait_before_is_waiting_until_an_interrupt() {
     rollout_upto(&f.a, A, 67);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
-    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
+    a.set_approvals(0, vec![touch_made()], now_ms());
     let t = tick(&mut a, &mut chat);
     assert!(
         matches!(&t.events[..], [AgentEvent::WaitingForPermission { .. }]),
@@ -1591,7 +1689,7 @@ fn codex_ending_the_turn_leaves_its_dialog_waiting() {
     // answer that dialog (its Enter picks the default: allow once).
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
-    a.set_approvals(0, vec![touch_made()], BEFORE_TURN_TWO);
+    a.set_approvals(0, vec![touch_made()], now_ms());
     assert!(a.dialog_open());
     turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
     let mut outs = Vec::new();

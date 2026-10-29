@@ -109,6 +109,16 @@ impl Env {
 
     /// Writes the spawn spec the broker would and starts `atem worker`.
     fn start_worker(&self, sid: &str, process_gen: &str) -> (Child, PathBuf) {
+        self.start_worker_with(sid, process_gen, &[])
+    }
+
+    /// `start_worker` with more environment for the worker itself.
+    fn start_worker_with(
+        &self,
+        sid: &str,
+        process_gen: &str,
+        extra: &[(&str, &Path)],
+    ) -> (Child, PathBuf) {
         let socket = self
             .run
             .join("atem")
@@ -139,11 +149,11 @@ impl Env {
             .write_all(spec.to_string().as_bytes())
             .unwrap();
         let state = self.state.to_str().unwrap().to_string();
-        let child = self
-            .command(&["worker", "--state", &state, "--session", sid])
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut command = self.command(&["worker", "--state", &state, "--session", sid]);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        let child = command.stderr(Stdio::null()).spawn().unwrap();
         (child, socket)
     }
 
@@ -447,4 +457,150 @@ fn a_crashed_worker_and_agent_are_reported_interrupted_and_the_record_kept() {
         std::fs::read_to_string(&log).unwrap_or_default()
     );
     assert!(env.workers().join(format!("{sid}.json")).exists());
+}
+
+/// A Codex worker with Atem's hooks on (`[codex] hooks = true`) whose fake
+/// agent asks for one approval through the real hook script once `go`
+/// exists, and the PTY-fault directory the worker reads
+/// (`ATEM_TEST_PTY_FAULTS`: `hold` pauses the PTY writer, `hold_approvals`
+/// the approvals pass). Process-isolated: the markers reach only it.
+struct Approving {
+    /// Kept for the test's life: its temp dirs, and what it started.
+    _env: Env,
+    faults: PathBuf,
+    go: PathBuf,
+    _cleanup: Cleanup,
+    broker: Broker,
+}
+
+const APPROVING: &str = r#"#!/bin/sh
+echo ready
+while [ ! -e "$GO" ]; do sleep 0.02; done
+printf '%s' "$REQ" | /bin/sh "$SCRIPT" codex 300
+echo hook-done
+while read l; do echo "got:$l"; done
+"#;
+
+const TOUCH_REQ: &str = r#"{"hook_event_name":"PermissionRequest","turn_id":"t","tool_name":"Bash","tool_input":{"command":"touch probe.txt"}}"#;
+
+impl Approving {
+    fn start(sid: &str) -> Self {
+        let env = Env::new();
+        let config = env.home.join(".config").join("atem");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[codex]\nhooks = true\n").unwrap();
+        let root = env.home.parent().unwrap().to_path_buf();
+        let (faults, go, codex_home) = (root.join("faults"), root.join("go"), root.join("codex"));
+        std::fs::create_dir_all(&faults).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(&env.agent, APPROVING).unwrap();
+        let mut cleanup = Cleanup::default();
+        let (worker, socket) = env.start_worker_with(
+            sid,
+            "3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+            &[("ATEM_TEST_PTY_FAULTS", &faults)],
+        );
+        cleanup.children.push(worker);
+        let mut broker = Broker::connect(&socket);
+        let script = config.join("hooks").join("approval-hook.sh");
+        let agent_env = json!([
+            ["PATH", "/usr/bin:/bin"],
+            ["CODEX_CLI_BIN", env.agent.to_str().unwrap()],
+            ["CODEX_HOME", codex_home.to_str().unwrap()],
+            ["GO", go.to_str().unwrap()],
+            ["REQ", TOUCH_REQ],
+            ["SCRIPT", script.to_str().unwrap()]
+        ]);
+        broker.send(json!({"op": "start", "env": agent_env}));
+        let hello = broker.recv();
+        assert_eq!(hello["op"], "hello", "{hello}");
+        let agent_pid = hello["agent_pid"].as_u64().unwrap() as u32;
+        cleanup.agent = Some((agent_pid, start_time(agent_pid).unwrap()));
+        broker.until(|_, out| out.contains("ready"));
+        Self {
+            _env: env,
+            faults,
+            go,
+            _cleanup: cleanup,
+            broker,
+        }
+    }
+
+    /// The agent asks; the worker reports the approval open.
+    fn ask(&mut self) {
+        std::fs::write(&self.go, "").unwrap();
+        self.broker.until(|m, _| m["op"] == "approval_request");
+    }
+
+    fn marker(&self, name: &str, on: bool) {
+        let path = self.faults.join(name);
+        if on {
+            std::fs::write(path, "").unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    fn paste(&mut self, seq: u64, text: &str) {
+        self.broker.send(json!({"op": "paste", "seq": seq, "text": text, "input_epoch": 0, "release_approvals": true}));
+    }
+
+    /// The paste's result: consumed with `APPROVAL_IN_DIALOG`, nothing written.
+    fn assert_held(&mut self, seq: u64, text: &str) {
+        let result = self.broker.result(seq);
+        assert_eq!(result["consumed"], true, "{result}");
+        assert_eq!(result["bytes_written"], 0, "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("approval dialog is open")),
+            "{result}"
+        );
+        // Whatever comes next on the screen, the prompt's bytes never do.
+        self.broker.send(json!({"op": "write", "seq": seq + 100, "bytes": STANDARD.encode(b"\r"), "input_epoch": 0}));
+        self.broker.result(seq + 100);
+        assert!(
+            !self.broker.output.contains(text),
+            "{:?}",
+            self.broker.output
+        );
+    }
+}
+
+impl Drop for Approving {
+    fn drop(&mut self) {
+        // Ends the agent's process group (the hook with it).
+        self.broker.send(json!({"op": "stop"}));
+    }
+}
+
+#[test]
+fn a_prompt_right_after_a_released_hook_ends_is_consumed_with_the_approvals_pass_held() {
+    let mut t = Approving::start("ses-dddddddd4444");
+    t.ask();
+    // From here the worker reads no approvals file and notices no ended
+    // hook: only what input handling latches counts.
+    t.marker("hold_approvals", true);
+    // Input to Codex gives the waiting hook "no decision" (consumed): Codex
+    // shows its own dialog.
+    t.broker.send(json!({"op": "write", "seq": 1, "bytes": STANDARD.encode(b"x"), "input_epoch": 0, "release_approvals": true}));
+    assert_eq!(t.broker.result(1)["consumed"], true);
+    t.broker.until(|_, out| out.contains("hook-done"));
+    // The hook is gone, the pass still held: a chat prompt now writes nothing.
+    t.paste(2, "pasted-into-dialog");
+    t.assert_held(2, "pasted-into-dialog");
+    t.marker("hold_approvals", false);
+}
+
+#[test]
+fn a_prompt_paused_in_the_writer_when_an_approval_opens_writes_nothing() {
+    let mut t = Approving::start("ses-eeeeeeee5555");
+    // The PTY writer pauses at its write boundary (before every check).
+    t.marker("hold", true);
+    // Nothing waits yet: the prompt is admitted and queued to the writer.
+    t.paste(1, "queued-before-approval");
+    // Meanwhile the agent asks for an approval and the worker sees it.
+    t.ask();
+    t.marker("hold", false);
+    t.assert_held(1, "queued-before-approval");
 }

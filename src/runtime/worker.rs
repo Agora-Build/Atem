@@ -1216,6 +1216,9 @@ impl Worker {
     /// Reads the approvals directory (a request with no broker connected is
     /// released at once) and reports what happened.
     fn poll_approvals(&mut self) {
+        if super::test_hooks::approvals_held() {
+            return;
+        }
         let connected = self.conn.as_ref().is_some_and(|c| !c.tx.is_closed());
         let Some(a) = self.approvals.as_mut() else {
             return;

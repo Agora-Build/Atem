@@ -503,6 +503,7 @@ impl Approvals {
     /// only for this session's own Codex hooks.
     fn dialog_call(&self, w: &Waiting) -> Option<DialogCall> {
         (self.agent == Agent::Codex && w.ours).then(|| DialogCall {
+            opened_ms: w.opened_ms,
             tool_name: w
                 .request
                 .as_ref()

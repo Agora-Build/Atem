@@ -600,9 +600,8 @@ and a failure is a session notice (Codex starts anyway).
   seen; a remote prompt or interrupt that released one is `rejected` — no
   broker, an adopting broker that doesn't know it, a prompt or interrupted
   turn end closing it, its hook ending without one) — each such approval
-  (its call: tool and `tool_input.command`) until evidence from after it
-  went there: the PostToolUse of that same call, or the dialog dismissed or
-  gone (Interrupt or UserPromptSubmit hook, the rollout's next user message
+  until evidence from after it went there: the PostToolUse of the one call
+  it can be about, or the dialog dismissed or gone (Interrupt or UserPromptSubmit hook, the rollout's next user message
   or `turn_aborted`); never a Stop, a plain `task_complete`, a reply or
   another call's result (Codex's rollout names no call for a command, so a
   command item proves nothing) — `ready` at `task_complete` /
@@ -621,7 +620,14 @@ and a failure is a session notice (Codex starts anyway).
   holds chat prompts at the PTY write boundary too, so a prompt queued
   before is never written (`FencedOutcome::Held`, reported like a consumed
   paste). Terminal input is still written (whoever types sees the
-  dialog). A refusal in Codex's dialog leaves no evidence Atem can read:
+  dialog). Codex's PermissionRequest names no call (no `tool_use_id`),
+  so a dialog's candidates are the calls whose PreToolUse has its tool and
+  command, stamped no later than its request + 3 s (the async hook's
+  budget) and unfinished when the dialog opened; only the PostToolUse of
+  a sole candidate answers it. A same-command call among them makes it
+  ambiguous: neither result answers it, only a dismissal does (and with
+  more than 256 calls remembered unfinished, no result answers any).
+  A refusal in Codex's dialog leaves no evidence Atem can read:
   the session stays `waiting` until a prompt typed in the terminal or an
   interrupt (fail closed). Found live on 2026-10-29: a remote prompt pasted into the
   dialog approved a command.
