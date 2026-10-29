@@ -69,6 +69,34 @@ pub const EVENTS: [&str; 10] = [
 /// event lock.
 pub const EVENT_TIMEOUT: u64 = 3;
 
+/// Events Codex must wait for (`async` off), so none is lost or late:
+/// PreToolUse and PostToolUse (a call's identity, matched against an
+/// approval in Codex's own dialog), UserPromptSubmit and Interrupt (what
+/// ends such a dialog). The script waits longer for its lock for them and
+/// a PreToolUse it can't record blocks its tool (exit 2).
+pub const SYNC_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Interrupt"];
+
+/// Their timeout (seconds), above the script's ~6 s lock wait; Interrupt
+/// keeps `EVENT_TIMEOUT` (Codex clamps it to 3 s; the script waits ~2 s).
+pub const SYNC_EVENT_TIMEOUT: u64 = 10;
+
+/// Lines Codex's own approval dialog shows (codex-cli 0.162–0.163;
+/// `designs/fixtures/codex-hooks/screen-approval-dialog.txt`).
+const DIALOG_ON_SCREEN: [&str; 3] = [
+    "Press enter to confirm or esc to cancel",
+    "Would you like to run the following command?",
+    "Would you like to make the following edits?",
+];
+
+/// The screen shows Codex's own approval dialog: whatever Atem's hooks
+/// say, a chat prompt's Enter would answer it, so prompts are held. A
+/// backstop for what hooks can't report (a hook Codex never started);
+/// it only ever adds a hold, so a Codex version that words it otherwise
+/// leaves the hooks' guard as it is.
+pub fn dialog_on_screen(text: &str) -> bool {
+    DIALOG_ON_SCREEN.iter().any(|line| text.contains(line))
+}
+
 /// `$CODEX_HOME`, else `~/.codex`.
 pub fn codex_home() -> PathBuf {
     #[cfg(test)]
@@ -127,12 +155,18 @@ pub fn entry_for(script: &Path, event: &str) -> Value {
     if event == "PermissionRequest" {
         return hook_entry(script);
     }
+    let sync = SYNC_EVENTS.contains(&event);
+    let timeout = if sync && event != "Interrupt" {
+        SYNC_EVENT_TIMEOUT
+    } else {
+        EVENT_TIMEOUT
+    };
     let mut hook = serde_json::json!({
         "type": "command",
         "command": event_command(script, event),
-        "timeout": EVENT_TIMEOUT,
+        "timeout": timeout,
     });
-    if event != "SessionEnd" {
+    if !sync && event != "SessionEnd" {
         hook["async"] = Value::Bool(true);
     }
     serde_json::json!({ "hooks": [hook] })

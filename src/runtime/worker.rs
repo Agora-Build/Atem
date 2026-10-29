@@ -515,6 +515,9 @@ struct Worker {
     handle: PtyHandle,
     events: Option<mpsc::Receiver<PtyEvent>>,
     parser: vt100::Parser,
+    /// Codex: its own approval dialog is on the canonical screen
+    /// (`chat::codex::dialog_on_screen`): chat prompts are held.
+    dialog_on_screen: bool,
     share: SharedTerminal,
     /// The agent's output for the session log.
     log: super::session_log::SessionLog,
@@ -665,6 +668,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         handle: pty.resize_handle,
         events: Some(pty.receiver),
         parser: vt100::Parser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS),
+        dialog_on_screen: false,
         offset: 0,
         dropped: 0,
         has_chat: adapter.is_some(),
@@ -888,6 +892,11 @@ impl Worker {
                 let start = self.offset;
                 let text = self.share.process(&mut self.parser, &self.input, &bytes);
                 self.log.append(&text);
+                if matches!(self.adapter, Some(ChatAdapter::Codex(_))) {
+                    self.dialog_on_screen =
+                        crate::chat::codex::dialog_on_screen(&self.parser.screen().contents());
+                    self.hold_prompts();
+                }
                 self.offset += bytes.len() as u64;
                 if let Some(conn) = &mut self.conn {
                     if conn.resync || conn.backlog() > OUTPUT_BACKLOG {
@@ -990,7 +999,8 @@ impl Worker {
         // on is latched first).
         self.latch_dialogs();
         if let BrokerMsg::Paste { seq, .. } = &message
-            && matches!(&self.adapter, Some(ChatAdapter::Codex(c)) if c.dialog_open())
+            && matches!(&self.adapter, Some(ChatAdapter::Codex(c))
+                if c.dialog_open() || self.dialog_on_screen)
         {
             self.send(&consumed(*seq, APPROVAL_IN_DIALOG));
             return false;
@@ -1163,10 +1173,12 @@ impl Worker {
     }
 
     /// Chat prompts are held at the PTY write boundary while Codex waits
-    /// for an approval (a remote answer or its own dialog).
+    /// for an approval (a remote answer or its own dialog), or while its
+    /// approval dialog is on the screen.
     fn hold_prompts(&self) {
         if let Some(ChatAdapter::Codex(codex)) = &self.adapter {
-            self.input.hold_prompts(codex.waiting());
+            self.input
+                .hold_prompts(codex.waiting() || self.dialog_on_screen);
         }
     }
 

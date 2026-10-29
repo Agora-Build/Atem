@@ -469,6 +469,7 @@ struct Approving {
     _env: Env,
     faults: PathBuf,
     go: PathBuf,
+    socket: PathBuf,
     _cleanup: Cleanup,
     broker: Broker,
 }
@@ -483,8 +484,20 @@ while read l; do echo "got:$l"; done
 
 const TOUCH_REQ: &str = r#"{"hook_event_name":"PermissionRequest","turn_id":"t","tool_name":"Bash","tool_input":{"command":"touch probe.txt"}}"#;
 
+/// A fake agent showing Codex's own approval dialog (as Codex 0.163 draws
+/// it), with no hook involved.
+const DIALOG_ON_SCREEN: &str = r#"#!/bin/sh
+echo ready
+printf '  Would you like to run the following command?\n  $ touch made.txt\n  Press enter to confirm or esc to cancel\n'
+while read l; do echo "got:$l"; done
+"#;
+
 impl Approving {
     fn start(sid: &str) -> Self {
+        Self::start_with(sid, APPROVING)
+    }
+
+    fn start_with(sid: &str, agent: &str) -> Self {
         let env = Env::new();
         let config = env.home.join(".config").join("atem");
         std::fs::create_dir_all(&config).unwrap();
@@ -493,7 +506,7 @@ impl Approving {
         let (faults, go, codex_home) = (root.join("faults"), root.join("go"), root.join("codex"));
         std::fs::create_dir_all(&faults).unwrap();
         std::fs::create_dir_all(&codex_home).unwrap();
-        std::fs::write(&env.agent, APPROVING).unwrap();
+        std::fs::write(&env.agent, agent).unwrap();
         let mut cleanup = Cleanup::default();
         let (worker, socket) = env.start_worker_with(
             sid,
@@ -521,6 +534,7 @@ impl Approving {
             _env: env,
             faults,
             go,
+            socket,
             _cleanup: cleanup,
             broker,
         }
@@ -575,6 +589,10 @@ impl Drop for Approving {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only test seams (ATEM_TEST_PTY_FAULTS)"
+)]
 fn a_prompt_right_after_a_released_hook_ends_is_consumed_with_the_approvals_pass_held() {
     let mut t = Approving::start("ses-dddddddd4444");
     t.ask();
@@ -593,6 +611,10 @@ fn a_prompt_right_after_a_released_hook_ends_is_consumed_with_the_approvals_pass
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only test seams (ATEM_TEST_PTY_FAULTS)"
+)]
 fn a_prompt_paused_in_the_writer_when_an_approval_opens_writes_nothing() {
     let mut t = Approving::start("ses-eeeeeeee5555");
     // The PTY writer pauses at its write boundary (before every check).
@@ -603,4 +625,34 @@ fn a_prompt_paused_in_the_writer_when_an_approval_opens_writes_nothing() {
     t.ask();
     t.marker("hold", false);
     t.assert_held(1, "queued-before-approval");
+}
+
+#[test]
+fn a_prompt_is_held_while_codexs_dialog_is_on_the_screen() {
+    // No hook said anything (one Codex never started, say): the dialog on
+    // the canonical screen alone holds chat prompts; terminal input goes.
+    let mut t = Approving::start_with("ses-ffffffff6666", DIALOG_ON_SCREEN);
+    t.broker
+        .until(|_, out| out.contains("Press enter to confirm"));
+    t.paste(1, "pasted-at-the-dialog");
+    t.assert_held(1, "pasted-at-the-dialog");
+}
+
+#[test]
+fn a_dialog_and_its_prompt_hold_outlive_a_broker_restart() {
+    // The approval goes to Codex's own dialog; the broker goes away and a
+    // new one adopts the worker: a chat prompt is still never written.
+    let mut t = Approving::start("ses-gggggggg7777");
+    t.ask();
+    t.broker.send(json!({"op": "write", "seq": 1, "bytes": STANDARD.encode(b"x"), "input_epoch": 0, "release_approvals": true}));
+    assert_eq!(t.broker.result(1)["consumed"], true);
+    t.broker.until(|_, out| out.contains("hook-done"));
+    // The broker goes away.
+    t.broker.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    let socket = t.socket.clone();
+    let (broker, hello) = Broker::adopt(&socket);
+    assert_eq!(hello["op"], "hello", "{hello}");
+    t.broker = broker;
+    t.paste(2, "pasted-after-restart");
+    t.assert_held(2, "pasted-after-restart");
 }

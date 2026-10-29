@@ -620,13 +620,25 @@ and a failure is a session notice (Codex starts anyway).
   holds chat prompts at the PTY write boundary too, so a prompt queued
   before is never written (`FencedOutcome::Held`, reported like a consumed
   paste). Terminal input is still written (whoever types sees the
-  dialog). Codex's PermissionRequest names no call (no `tool_use_id`),
-  so a dialog's candidates are the calls whose PreToolUse has its tool and
-  command, stamped no later than its request + 3 s (the async hook's
-  budget) and unfinished when the dialog opened; only the PostToolUse of
-  a sole candidate answers it. A same-command call among them makes it
-  ambiguous: neither result answers it, only a dismissal does (and with
-  more than 256 calls remembered unfinished, no result answers any).
+  dialog). Codex's PermissionRequest names no call (no `tool_use_id`, and
+  no call identity in the hook's environment), so a dialog's candidates
+  are the calls whose PreToolUse has its tool and command, published by
+  its request and unfinished then, by event sequence, never by time: the
+  PermissionRequest hook records the events counter (`evseq-<id>`), and
+  PreToolUse is synchronous, so Codex ran it to its end before asking
+  (verified on codex-cli 0.163.0, also for `apply_patch` and for parallel
+  calls). Only the PostToolUse of a sole candidate answers it. Concurrent
+  identical calls are ambiguous (nothing tells them apart): neither result
+  answers the dialog, only a dismissal does. Codex lets a failed, timed
+  out or killed hook through (only exit 2 blocks), so every synchronous
+  hook first leaves a start marker and removes it once published: a
+  marker of a dead hook, or an unreadable PreToolUse event, makes the
+  calls incomplete, and until the next re-pin no result answers any
+  dialog (with a notice and a worker log line, so losses are counted). A
+  PreToolUse that can't publish exits 2 (its tool blocked). As a backstop
+  for what hooks can't report (a hook Codex never started, for
+  PermissionRequest too), chat prompts are also held while Codex's own
+  approval dialog is on the canonical screen.
   A refusal in Codex's dialog leaves no evidence Atem can read:
   the session stays `waiting` until a prompt typed in the terminal or an
   interrupt (fail closed). Found live on 2026-10-29: a remote prompt pasted into the

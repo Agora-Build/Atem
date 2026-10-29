@@ -7,9 +7,14 @@
 //! Costs real API calls, so it never runs in a normal `cargo test`:
 //!
 //! ```sh
-//! set -a; source ~/.config/.env; set +a
+//! # Only the variables the agents need, never a whole credentials file:
+//! export OSS_API_KEY=… ANTHROPIC_AUTH_TOKEN=… # (and ANTHROPIC_BASE_URL)
 //! ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Each agent's process gets a cleared environment plus only its own
+//! variables (Claude: the `ANTHROPIC_*` ones; Codex: `CODEX_HOME`, `PATH`
+//! and its provider's key), so neither sees the other's credentials.
 //!
 //! Claude needs `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`) and
 //! optionally `ANTHROPIC_BASE_URL`; Codex runs `--profile oss` with the

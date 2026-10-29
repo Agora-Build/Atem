@@ -53,10 +53,14 @@
 //!   while its exec cell still waits for the approval, or with its dialog
 //!   open: the status stays waiting past the turn's end), back
 //!   `ToolFinished`, returned after that poll's hook events. Codex's own
-//!   dialog counts until evidence from after the approval went there: its
-//!   PostToolUse, Interrupt or UserPromptSubmit hook, or the rollout's next
-//!   user message, command or interrupted turn end; never a Stop or a
-//!   plain turn end (a re-pin drops it). While it is open a chat prompt is
+//!   dialog counts until evidence from after the approval went there: the
+//!   PostToolUse of the one call it can be about (by event sequence:
+//!   `call_finished`), its dismissal (Interrupt or UserPromptSubmit hook,
+//!   the rollout's next user message or interrupted turn end); never a
+//!   Stop, a plain turn end, a reply or another call's result (a re-pin
+//!   drops it). Lost events (`EventReader::take_lost`: a synchronous
+//!   hook's start marker left by a dead hook, an unreadable event) make a
+//!   lost PreToolUse's calls incomplete: then only a dismissal ends one. While it is open a chat prompt is
 //!   never pasted ([`CodexAdapter::dialog_open`]: the worker consumes it).
 //!   After a re-pin with approvals open, `WaitingForPermission` again. A
 //!   PreToolUse read while waiting is dropped (Codex holds the tool while
@@ -92,39 +96,41 @@ pub const UNAVAILABLE: &[&str] = &[
 const APPROVAL_DETAIL: &str = "approve in the terminal";
 
 /// The call an approval was for, as its PermissionRequest named it (tool
-/// and command, no call id), and when that request was made.
+/// and command: no call id), and the hook events published when it asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogCall {
     pub tool_name: String,
-    /// `tool_input.command` (a shell command); `None` for other tools,
-    /// whose dialog only a prompt or an interrupt ends.
+    /// `tool_input.command` (a shell command or a patch); `None` for other
+    /// tools, whose dialog only a dismissal ends.
     pub command: Option<String>,
-    /// The request file's time (unix ms).
-    pub opened_ms: i64,
+    /// The events counter when it asked (`evseq-<id>`): Codex ran the
+    /// call's synchronous PreToolUse to its end first, so the call is among
+    /// the calls started by then. `None` (unreadable): no call is ever
+    /// matched to it.
+    pub evseq: Option<u64>,
 }
 
-/// A call of the pinned session, from its PreToolUse (`tool_use_id`).
+/// A call of the pinned session, from its PreToolUse (`tool_use_id`), by
+/// event sequence (the script's counter: publication order).
 #[derive(Debug)]
 struct Call {
     id: String,
     tool_name: String,
     command: Option<String>,
-    started_ms: i64,
-    finished_ms: Option<i64>,
+    started_seq: u64,
+    finished_seq: Option<u64>,
 }
 
 /// Calls remembered for matching dialogs.
 const MAX_CALLS: usize = 256;
-/// A call's PreToolUse (async, ≤ 3 s) may be stamped after its
-/// PermissionRequest: a call started this long after a request is still
-/// one of its candidates (so a same-command call then is ambiguous).
-const CALL_SLACK_MS: i64 = 3_000;
 
-/// An approval in Codex's own dialog since `since` (unix ms).
+/// An approval in Codex's own dialog: since `since` (unix ms) and after
+/// event `since_seq` (the newest read then).
 #[derive(Debug)]
 struct Dialog {
     call: DialogCall,
     since: i64,
+    since_seq: u64,
 }
 
 /// Codex's permission wait: it outlasts the turn's end (an approval belongs
@@ -188,9 +194,13 @@ pub struct CodexAdapter {
     /// Calls of the pinned session seen at their PreToolUse (at most
     /// `MAX_CALLS`): what a dialog's PostToolUse is matched by.
     calls: Vec<Call>,
-    /// An unfinished call had to be forgotten: no PostToolUse answers a
-    /// dialog until the next re-pin (only a dismissal does).
-    calls_forgotten: bool,
+    /// Why the calls can't be trusted to be complete (a PreToolUse lost:
+    /// its hook died, timed out or failed, Codex ran the tool anyway; or an
+    /// unfinished call forgotten): until the next re-pin no PostToolUse
+    /// answers a dialog, only a dismissal does.
+    calls_incomplete: Option<&'static str>,
+    /// The newest event sequence read.
+    last_seq: u64,
     /// The pinned session was pinned by a hook other than its SessionStart
     /// (async hooks publish in either order): that SessionStart, read
     /// later on the same rollout, is no restart.
@@ -223,7 +233,8 @@ impl CodexAdapter {
             approvals: 0,
             dialogs: Vec::new(),
             calls: Vec::new(),
-            calls_forgotten: false,
+            calls_incomplete: None,
+            last_seq: 0,
             start_unseen: false,
             session_started: false,
             withdrawn: None,
@@ -263,12 +274,25 @@ impl CodexAdapter {
     pub fn set_approvals(&mut self, open: usize, released: Vec<DialogCall>, at_ms: i64) {
         let before = self.waiting();
         self.approvals = open;
-        self.dialogs.extend(
-            released
-                .into_iter()
-                .map(|call| Dialog { call, since: at_ms }),
-        );
+        // Every event published by now (the script's counter, read or not
+        // yet): a later one was published after the dialog opened.
+        let since_seq = self.last_seq.max(self.published_seq());
+        self.dialogs.extend(released.into_iter().map(|call| Dialog {
+            call,
+            since: at_ms,
+            since_seq,
+        }));
         self.status_change(before);
+    }
+
+    /// The script's events counter (`events/seq`): the newest event
+    /// published, read or not; 0 without one.
+    fn published_seq(&self) -> u64 {
+        self.dir
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join("events").join("seq")).ok())
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     /// An approval sits in Codex's own dialog: input typed now answers it,
@@ -293,15 +317,14 @@ impl CodexAdapter {
         }
         if self.calls.len() >= MAX_CALLS {
             // Forget a finished call first; forgetting an unfinished one
-            // could make a dialog's match look unique: no PostToolUse
-            // answers a dialog any more (only its dismissal does).
-            match self.calls.iter().position(|c| c.finished_ms.is_some()) {
+            // could make a dialog's match look unique.
+            match self.calls.iter().position(|c| c.finished_seq.is_some()) {
                 Some(i) => {
                     self.calls.remove(i);
                 }
                 None => {
                     self.calls.remove(0);
-                    self.calls_forgotten = true;
+                    self.calls_lost("more unfinished calls than Atem keeps");
                 }
             }
         }
@@ -309,18 +332,30 @@ impl CodexAdapter {
             id,
             tool_name: hook.tool_name.clone().unwrap_or_default(),
             command: hook.command.clone(),
-            started_ms: hook.at_ms,
-            finished_ms: None,
+            started_seq: hook.seq,
+            finished_seq: None,
         });
     }
 
+    /// The calls are no longer known to be complete: no tool result answers
+    /// a dialog until the next re-pin (only a dismissal does). Said once.
+    fn calls_lost(&mut self, why: &'static str) {
+        if self.calls_incomplete.is_none() {
+            self.calls_incomplete = Some(why);
+            self.notice(&format!(
+                "a Codex tool call went unrecorded ({why}); an approval left in Codex's own dialog now ends only when it is dismissed (Esc) or a prompt is typed in the terminal"
+            ));
+        }
+    }
+
     /// A call finished (its PostToolUse). It answers a dialog only when it
-    /// is the one call that dialog can be about: Codex's PermissionRequest
-    /// names no call, so the dialog's candidates are the calls with its
-    /// tool and command that started by its request (`CALL_SLACK_MS`: the
-    /// PreToolUse hook is async) and hadn't finished when the dialog
-    /// opened. Another call with the same command among them makes it
-    /// ambiguous: the dialog stays until it is dismissed.
+    /// is the one call that dialog can be about. Codex's PermissionRequest
+    /// names no call; its candidates are the calls with its tool and
+    /// command whose PreToolUse was published by its request (`evseq`:
+    /// Codex waits for the synchronous PreToolUse, so the asking call is
+    /// among them) and that hadn't finished by then. Another candidate (a
+    /// same-command call), an unreadable `evseq` or incomplete calls make
+    /// it ambiguous: the dialog stays until it is dismissed.
     fn call_finished(&mut self, hook: &Hook) {
         let Some(id) = hook.tool_use_id.as_deref() else {
             return;
@@ -328,22 +363,24 @@ impl CodexAdapter {
         let Some(at) = self.calls.iter().position(|c| c.id == id) else {
             return;
         };
-        self.calls[at].finished_ms = Some(hook.at_ms);
-        if self.calls_forgotten {
+        self.calls[at].finished_seq = Some(hook.seq);
+        if self.calls_incomplete.is_some() {
             return;
         }
-        let call = &self.calls[at];
         let calls = &self.calls;
         let answered = self.dialogs.iter().position(|d| {
+            let Some(evseq) = d.call.evseq else {
+                return false;
+            };
             let candidate = |c: &Call| {
                 d.call.command.is_some()
                     && c.tool_name == d.call.tool_name
                     && c.command == d.call.command
-                    && c.started_ms <= d.call.opened_ms + CALL_SLACK_MS
-                    && c.finished_ms.is_none_or(|f| f > d.since)
+                    && c.started_seq <= evseq
+                    && c.finished_seq.is_none_or(|f| f > evseq)
             };
-            d.since < hook.at_ms
-                && candidate(call)
+            hook.seq > d.since_seq
+                && candidate(&calls[at])
                 && calls.iter().filter(|c| candidate(c)).count() == 1
         });
         if let Some(i) = answered {
@@ -352,15 +389,21 @@ impl CodexAdapter {
             self.status_change(before);
         }
         if self.dialogs.is_empty() {
-            self.calls.retain(|c| c.finished_ms.is_none());
+            self.calls.retain(|c| c.finished_seq.is_none());
         }
     }
 
-    /// At `at_ms` no dialog of Codex's took the keys (dismissed with Esc, or
-    /// a prompt went in): every dialog from before is gone.
-    fn dialogs_gone(&mut self, at_ms: i64) {
+    /// No dialog of Codex's took the keys (dismissed with Esc, or a prompt
+    /// went in): every dialog opened before is gone. A hook event is
+    /// ordered by its sequence (published after the dialog opened), never
+    /// by its file time (filesystem clocks are coarse); a rollout record
+    /// has no sequence and is ordered by its own time, Codex's.
+    fn dialogs_gone(&mut self, at_ms: i64, seq: Option<u64>) {
         let before = self.waiting();
-        self.dialogs.retain(|d| d.since >= at_ms);
+        self.dialogs.retain(|d| match seq {
+            Some(seq) => seq <= d.since_seq,
+            None => d.since >= at_ms,
+        });
         self.status_change(before);
     }
 
@@ -480,7 +523,7 @@ impl CodexAdapter {
         match hook.event.as_str() {
             "UserPromptSubmit" => {
                 // A prompt went in: no dialog was taking the keys.
-                self.dialogs_gone(hook.at_ms);
+                self.dialogs_gone(hook.at_ms, Some(hook.seq));
                 if let Some(text) = hook.prompt {
                     self.turn_open = true;
                     out.push(AgentEvent::PromptSubmitted {
@@ -516,7 +559,7 @@ impl CodexAdapter {
             "Stop" => self.turn_open = false,
             "Interrupt" => {
                 self.turn_open = false;
-                self.dialogs_gone(hook.at_ms);
+                self.dialogs_gone(hook.at_ms, Some(hook.seq));
             }
             _ => {}
         }
@@ -549,9 +592,13 @@ impl AgentAdapter for CodexAdapter {
             return out;
         };
         let read = reader.poll();
+        let lost = reader.take_lost();
         let mut incoming = std::mem::take(&mut self.held);
         let mut bad = 0;
         for raw in read {
+            if let Some(raw) = &raw {
+                self.last_seq = self.last_seq.max(raw.seq);
+            }
             match raw.as_ref().and_then(Hook::from_raw) {
                 Some(hook) => incoming.push_back(hook),
                 None => bad += 1,
@@ -559,6 +606,12 @@ impl AgentAdapter for CodexAdapter {
         }
         if bad > 0 {
             self.notice("ignored a Codex hook event that could not be read");
+        }
+        for event in &lost {
+            eprintln!("atem worker: a Codex {event} hook event was lost");
+        }
+        if lost.iter().any(|e| e == "PreToolUse") {
+            self.calls_lost("its PreToolUse hook didn't finish or couldn't be read");
         }
         while let Some(hook) = incoming.pop_front() {
             let start = hook.event == "SessionStart";
@@ -679,7 +732,7 @@ impl AgentAdapter for CodexAdapter {
             self.extra.clear();
             self.dialogs.clear();
             self.calls.clear();
-            self.calls_forgotten = false;
+            self.calls_incomplete = None;
             if self.approvals > 0 {
                 self.extra.push(waiting_event());
             }
@@ -738,7 +791,7 @@ impl AgentAdapter for CodexAdapter {
             })
             .max();
         if let Some(at_ms) = gone {
-            self.dialogs_gone(at_ms);
+            self.dialogs_gone(at_ms, None);
         }
         items
     }
@@ -779,6 +832,8 @@ pub struct Hook {
     pub prompt: Option<String>,
     /// The turn of a turn-scoped hook.
     pub turn_id: Option<String>,
+    /// The event's sequence (`RawEvent::seq`).
+    pub seq: u64,
     /// A tool hook's `tool_name`, `tool_input.command` and `tool_use_id`.
     pub tool_name: Option<String>,
     pub command: Option<String>,
@@ -792,6 +847,7 @@ impl Hook {
         Some(Hook {
             parent: raw.parent,
             at_ms: raw.at_ms,
+            seq: raw.seq,
             event: s("hook_event_name")?.to_string(),
             session_id: s("session_id")?.to_string(),
             transcript_path: PathBuf::from(s("transcript_path")?),
@@ -817,11 +873,14 @@ pub struct RawEvent {
     pub parent: u32,
     /// The file's time (unix ms): when the hook wrote it.
     pub at_ms: i64,
+    /// Its sequence (the name's `<seq>`): the script's counter, taken
+    /// under its lock, so publication order.
+    pub seq: u64,
     pub json: Value,
 }
 
 /// `"<pid> <ppid>\n<json>"` as written by the hook script.
-fn parse_event(text: &str, at_ms: i64) -> Option<RawEvent> {
+fn parse_event(text: &str, at_ms: i64, seq: u64) -> Option<RawEvent> {
     let (head, body) = text.split_once('\n')?;
     let mut ids = head.split(' ');
     let pid = ids.next()?.parse().ok()?;
@@ -834,6 +893,7 @@ fn parse_event(text: &str, at_ms: i64) -> Option<RawEvent> {
         pid,
         parent,
         at_ms,
+        seq,
         json,
     })
 }
@@ -844,6 +904,14 @@ fn parse_event(text: &str, at_ms: i64) -> Option<RawEvent> {
 /// `seq.<pid>`, `seq.lock` (the script's).
 pub struct EventReader {
     dir: PathBuf,
+    /// Events read but unusable since the last `take_lost` (their names'
+    /// `<Event>`): unreadable, too big, or not a hook's.
+    unusable: Vec<String>,
+    /// Pids of the hooks whose events were read lately: a start marker of
+    /// one of them was published, not lost.
+    published: VecDeque<u32>,
+    /// More events were waiting than one poll reads.
+    backlog: bool,
 }
 
 /// The seq of an `ev-<digits>-<Letters>.json` name.
@@ -887,9 +955,70 @@ fn read_event(path: &Path) -> std::io::Result<Option<(String, i64)>> {
     Ok((text.len() as u64 <= MAX_EVENT).then_some((text, at_ms)))
 }
 
+/// The `<Event>` of an `ev-<seq>-<Event>.json` name.
+fn event_name(name: &str) -> Option<&str> {
+    name.strip_prefix("ev-")?
+        .strip_suffix(".json")?
+        .split_once('-')
+        .map(|(_, e)| e)
+}
+
+/// Pids remembered as published (`EventReader::published`).
+const PUBLISHED_PIDS: usize = 4096;
+/// A start marker this old is lost whatever its pid says (a reused pid):
+/// beyond every synchronous hook's timeout.
+const MARKER_LOST_AFTER: Duration = Duration::from_secs(30);
+
 impl EventReader {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            unusable: Vec::new(),
+            published: VecDeque::new(),
+            backlog: false,
+        }
+    }
+
+    /// The events lost since the last call (their `<Event>` names): read
+    /// but unusable, and synchronous hooks that left their start marker
+    /// (`start-<Event>.<pid>`) and died without publishing (killed, timed
+    /// out, failed: Codex then went on as if they had run). Markers are
+    /// judged only once every event published is read.
+    pub fn take_lost(&mut self) -> Vec<String> {
+        let mut lost = std::mem::take(&mut self.unusable);
+        if self.backlog {
+            return lost;
+        }
+        let Ok(rd) = std::fs::read_dir(self.dir.join("events")) else {
+            return lost;
+        };
+        let now = SystemTime::now();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some((event, pid)) = name
+                .strip_prefix("start-")
+                .and_then(|r| r.split_once('.'))
+                .and_then(|(ev, pid)| Some((ev.to_string(), pid.parse::<u32>().ok()?)))
+            else {
+                continue;
+            };
+            let old = std::fs::symlink_metadata(e.path())
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age > MARKER_LOST_AFTER);
+            // SAFETY: signal 0 only checks that the pid exists.
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if alive && !old {
+                continue;
+            }
+            let _ = std::fs::remove_file(e.path());
+            if !self.published.contains(&pid) {
+                lost.push(event);
+            }
+        }
+        lost
     }
 
     /// The events in order; `None` for one that was too big, had no
@@ -913,16 +1042,30 @@ impl EventReader {
             }
         }
         files.sort();
+        self.backlog = files.len() > EVENTS_PER_POLL;
         files.truncate(EVENTS_PER_POLL);
         let mut out = Vec::new();
-        for (_, _, path) in files {
+        for (seq, name, path) in files {
+            let event = event_name(&name).unwrap_or_default().to_string();
             match read_event(&path) {
                 Ok(text) => {
                     let _ = std::fs::remove_file(&path);
-                    out.push(text.and_then(|(t, at_ms)| parse_event(&t, at_ms)));
+                    let raw = text.and_then(|(t, at_ms)| parse_event(&t, at_ms, seq));
+                    match &raw {
+                        Some(raw) => {
+                            if self.published.len() >= PUBLISHED_PIDS {
+                                self.published.pop_front();
+                            }
+                            self.published.push_back(raw.pid);
+                        }
+                        None => self.unusable.push(event),
+                    }
+                    out.push(raw);
                 }
                 Err(_) => {
-                    // Unreadable: kept for now, dropped once stale.
+                    // Unreadable: kept for now, dropped once stale; lost
+                    // either way (a later event may depend on it).
+                    self.unusable.push(event);
                     if std::fs::symlink_metadata(&path).is_ok_and(|m| stale(&m, now)) {
                         let _ = std::fs::remove_file(&path);
                     }

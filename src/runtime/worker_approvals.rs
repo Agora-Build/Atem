@@ -175,6 +175,9 @@ struct Waiting {
     opened: Instant,
     /// The request file's time.
     opened_ms: i64,
+    /// Codex: the hook events published when it asked (`evseq-<id>`, the
+    /// events counter): its call is among the calls started by then.
+    evseq: Option<u64>,
     /// Sent to the broker.
     reported: bool,
     /// This session's agent started its hook (Codex; Claude: always).
@@ -503,7 +506,7 @@ impl Approvals {
     /// only for this session's own Codex hooks.
     fn dialog_call(&self, w: &Waiting) -> Option<DialogCall> {
         (self.agent == Agent::Codex && w.ours).then(|| DialogCall {
-            opened_ms: w.opened_ms,
+            evseq: w.evseq,
             tool_name: w
                 .request
                 .as_ref()
@@ -788,6 +791,8 @@ impl Approvals {
             .copied()
             .filter(|p| *p > 0)
             .map(|p| (p, super::adopt::process_start_time(p)));
+        let evseq =
+            read_capped(&self.path("evseq", id, "")).and_then(|t| t.trim().parse::<u64>().ok());
         let ours = match self.agent {
             Agent::Claude => true,
             Agent::Codex => self.codex_owns(ids.get(1).copied(), value.as_ref()),
@@ -819,6 +824,7 @@ impl Approvals {
                 pid,
                 opened: Instant::now(),
                 opened_ms,
+                evseq,
                 reported: false,
                 ours,
                 pending_rule: None,
@@ -1076,6 +1082,7 @@ impl Approvals {
             for (prefix, suffix) in [
                 ("req", ".json"),
                 ("pid", ""),
+                ("evseq", ""),
                 ("dec", ".json"),
                 ("taken", ".json"),
                 ("claimed", ""),
