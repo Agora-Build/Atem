@@ -630,8 +630,15 @@ pub(crate) enum RoutedAuth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkVia {
     Local,
-    /// The relay's host and this Atem's id in the room.
-    Relay { label: String },
+    /// The relay's host and this Atem's id in the room (`label`), and the
+    /// Station URL it was reached at (`url`, compared with the configured
+    /// one at `atem runtime reload`).
+    Relay { label: String, url: String },
+}
+
+/// Two Station URLs name the same Station (a trailing `/` aside).
+pub(crate) fn same_station(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 /// `<relay host> as <atem_id>`: what `atem status` shows for a relay link.
@@ -980,7 +987,10 @@ impl AstationClient {
     /// operation's link, §R9.7b).
     #[cfg(test)]
     pub(crate) fn relay_link_for_test(&mut self) {
-        self.via = Some(LinkVia::Relay { label: "relay.test as atem-x".into() });
+        self.via = Some(LinkVia::Relay {
+            label: "relay.test as atem-x".into(),
+            url: "https://relay.test".into(),
+        });
     }
 
     /// Pretend the relay routed this link (§R9.7b) for `room` and its proof
@@ -2347,6 +2357,7 @@ impl AstationClient {
         // A pairing room: its code is a secret until the pairing ends.
         self.via = Some(LinkVia::Relay {
             label: relay_label(&station_url, ""),
+            url: station_url.clone(),
         });
 
         // Return the code — caller is responsible for any UI (println!, open_browser, etc.)
@@ -2431,6 +2442,7 @@ impl AstationClient {
         } else {
             self.via = Some(LinkVia::Relay {
                 label: relay_label(relay_url, &atem_id),
+                url: relay_url.to_string(),
             });
         }
         result

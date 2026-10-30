@@ -1086,6 +1086,11 @@ impl Server {
                     self.app.drop_astation_link(
                         "The Astation pairing changed; the link was dropped".into(),
                     );
+                } else if let Some(reason) = self.app.station_changed() {
+                    // Another Station is configured: nothing of the old
+                    // one's context (attachments, channels, leases) stays.
+                    eprintln!("atem runtime: {reason}");
+                    self.app.drop_astation_link(reason);
                 }
                 if !self.app.astation_connected && !self.app.astation_routed {
                     // Credentials or pairing may have changed: try again now.
@@ -1117,7 +1122,7 @@ impl Server {
         let routed = app.astation_routed && !connected && !app.astation_client.is_ws_closed();
         let (transport, relay) = match app.astation_client.via().filter(|_| connected || routed) {
             Some(LinkVia::Local) => (Some(Transport::Local), None),
-            Some(LinkVia::Relay { label }) => (Some(Transport::Relay), Some(label.clone())),
+            Some(LinkVia::Relay { label, .. }) => (Some(Transport::Relay), Some(label.clone())),
             None => (None, None),
         };
         let link = self.bridge.as_ref().map(HostBridge::link_status);
