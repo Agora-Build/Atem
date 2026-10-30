@@ -1016,6 +1016,23 @@ impl Server {
                 self.adjust_size(&sid, rows, cols);
                 self.restore(&sid);
             }
+            ClientMsg::ApprovalsAnswered { session_id } => {
+                let Some(sid) = self.attached_by(id, &session_id) else {
+                    return self.error(id, "Attach to the session first", "approvals_answered");
+                };
+                let Some(session) = self.sessions.get(&sid).filter(|s| s.is_live()) else {
+                    return self.send(
+                        id,
+                        &RuntimeMsg::Notice {
+                            text: "The session has ended".into(),
+                        },
+                    );
+                };
+                if let Err(error) = session.approvals_answered() {
+                    return self.error(id, error.to_string(), "approvals_answered");
+                }
+                eprintln!("atem runtime: {sid}: approvals marked answered at a local frontend");
+            }
             ClientMsg::List => {
                 let sessions = self.order.iter().map(|sid| self.summary(sid)).collect();
                 self.send(id, &RuntimeMsg::Sessions { sessions });

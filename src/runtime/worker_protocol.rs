@@ -31,6 +31,15 @@ pub const MAX_PASTE: usize = 256 * 1024;
 /// Why a consumed write (`consumed`) wasn't written: the remote `written`
 /// ack's error.
 pub const APPROVAL_HANDED: &str = "the approval was handed to the terminal; not written";
+/// Why a chat prompt (`paste`) was consumed: the agent's own approval
+/// dialog is open (or an approval waits), and the paste's Enter would
+/// answer it.
+pub const APPROVAL_IN_DIALOG: &str =
+    "the agent's approval dialog is open in the terminal; answer it there; not written";
+/// The local frontend's notice when a tool like a waiting approval's call
+/// ran: it may have been answered in the agent's own dialog, which only the
+/// person there can say. The frontend puts its prefix for `{prefix}`.
+pub const ANSWER_HINT: &str = "A tool ran while an approval waits: if you answered the agent's dialog here, press {prefix} then a";
 /// The local frontend's notice for consumed input.
 pub const APPROVAL_HANDED_NOTICE: &str =
     "Codex's approval was handed to the terminal; answer its dialog";
@@ -110,7 +119,9 @@ pub enum BrokerMsg {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         release_approvals: bool,
     },
-    /// A bracketed paste plus Enter, under the same rules → `write_result`.
+    /// A chat prompt: a bracketed paste plus Enter, under the same rules →
+    /// `write_result`. Codex: consumed (never written) while an approval
+    /// sits in Codex's own dialog (`APPROVAL_IN_DIALOG`).
     Paste {
         seq: u64,
         text: String,
@@ -152,6 +163,10 @@ pub enum BrokerMsg {
     ReleaseApproval {
         request_id: String,
     },
+    /// The person at a local frontend says the agent's own approval dialog
+    /// was answered there: every waiting hook gets "no decision" and closes
+    /// `answered_terminal`; Codex's dialog waits end.
+    ApprovalsAnswered,
     /// After adoption: the approvals this broker knows; every other waiting
     /// hook gets "no decision".
     KnownApprovals {
@@ -249,6 +264,7 @@ impl std::fmt::Debug for BrokerMsg {
                 message.as_ref().map_or(0, String::len)
             ),
             BrokerMsg::ReleaseApproval { request_id } => write!(f, "ReleaseApproval({request_id})"),
+            BrokerMsg::ApprovalsAnswered => f.write_str("ApprovalsAnswered"),
             BrokerMsg::KnownApprovals { request_ids } => {
                 write!(f, "KnownApprovals({} ids)", request_ids.len())
             }
@@ -645,6 +661,7 @@ mod tests {
             BrokerMsg::ReleaseApproval {
                 request_id: "a1".into(),
             },
+            BrokerMsg::ApprovalsAnswered,
             BrokerMsg::KnownApprovals {
                 request_ids: vec!["a1".into()],
             },

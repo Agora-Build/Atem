@@ -4,7 +4,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -35,6 +35,9 @@ pub enum FencedOutcome {
     /// Its input epoch was older than the current one when its turn came:
     /// nothing was written.
     Dropped,
+    /// A chat prompt while prompts were held (`PtyInput::hold_prompts`: an
+    /// approval waits, or sits in the agent's own dialog): nothing written.
+    Held,
     Failed(String),
 }
 
@@ -52,6 +55,9 @@ struct WriteRequest {
     /// A remote write: dropped at the write boundary once `monotonic_ns()`
     /// reached it (its lease's deadline). Local writes have none.
     not_after: Option<u64>,
+    /// A chat prompt (`paste_fenced`): held back at the write boundary while
+    /// prompts are held.
+    prompt: bool,
     /// Write half of it, then fail (`runtime::test_hooks`, debug builds).
     partial: bool,
 }
@@ -83,15 +89,18 @@ fn write_request(writer: &mut impl Write, request: &WriteRequest) -> Result<(), 
 }
 
 /// A fenced write at the write boundary: dropped when `fence` is older than
-/// the current input epoch, or when its `not_after` has passed.
+/// the current input epoch, or when its `not_after` has passed; a chat
+/// prompt is held back while `prompts_held`.
 fn write_fenced_request(
     writer: &mut impl Write,
     current: &AtomicU64,
-    fence: u64,
-    not_after: Option<u64>,
-    data: &[u8],
-    partial: bool,
+    prompts_held: &AtomicBool,
+    request: &WriteRequest,
 ) -> FencedOutcome {
+    let Some(fence) = request.fence else {
+        return FencedOutcome::Failed("not a fenced write".into());
+    };
+    let (data, not_after) = (&request.data[..], request.not_after);
     crate::runtime::test_hooks::hold_writes();
     if fence < current.load(Ordering::SeqCst) {
         return FencedOutcome::Dropped;
@@ -99,7 +108,10 @@ fn write_fenced_request(
     if not_after.is_some_and(|deadline| monotonic_ns() >= deadline) {
         return FencedOutcome::Dropped;
     }
-    if partial {
+    if request.prompt && prompts_held.load(Ordering::SeqCst) {
+        return FencedOutcome::Held;
+    }
+    if request.partial {
         let _ = writer
             .write_all(&data[..data.len() / 2])
             .and_then(|()| writer.flush());
@@ -118,6 +130,8 @@ pub struct PtyInput {
     inputs: Arc<AtomicU64>,
     /// The current input epoch for fenced writes; only ever rises.
     input_epoch: Arc<AtomicU64>,
+    /// Chat prompts are held back at the write boundary (`hold_prompts`).
+    prompts_held: Arc<AtomicBool>,
 }
 
 impl PtyInput {
@@ -143,6 +157,14 @@ impl PtyInput {
         self.input_epoch.load(Ordering::SeqCst)
     }
 
+    /// While `held`, a chat prompt (`paste_fenced`) reaching the write
+    /// boundary is not written (`FencedOutcome::Held`), however long it was
+    /// queued: an approval waits, or sits in the agent's own dialog, where
+    /// the paste's Enter would answer it.
+    pub fn hold_prompts(&self, held: bool) {
+        self.prompts_held.store(held, Ordering::SeqCst);
+    }
+
     /// Terminal input (counted) written only if `epoch` is still current
     /// (and `not_after`, a remote write's lease deadline, not reached) at
     /// the write boundary; the outcome comes back as `PtyEvent::Fenced`.
@@ -153,7 +175,7 @@ impl PtyInput {
         sequence: u64,
         not_after: Option<u64>,
     ) -> Result<()> {
-        self.enqueue_fenced_request(data, epoch, sequence, not_after, false)?;
+        self.enqueue_fenced_request(data, epoch, sequence, not_after, false, false)?;
         self.inputs.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -183,7 +205,7 @@ impl PtyInput {
             bail!("Terminal input was not queued (test fault)");
         }
         let partial = crate::runtime::test_hooks::fail_next_partial();
-        self.enqueue_fenced_request(bytes, epoch, sequence, not_after, partial)
+        self.enqueue_fenced_request(bytes, epoch, sequence, not_after, partial, true)
     }
 
     fn enqueue_fenced_request(
@@ -193,6 +215,7 @@ impl PtyInput {
         sequence: u64,
         not_after: Option<u64>,
         partial: bool,
+        prompt: bool,
     ) -> Result<()> {
         if data.is_empty() || data.len() > MAX_FENCED {
             bail!("Input must contain 1..={MAX_FENCED} bytes");
@@ -203,6 +226,7 @@ impl PtyInput {
                 sequence: Some(sequence),
                 fence: Some(epoch),
                 not_after,
+                prompt,
                 partial,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
@@ -218,6 +242,7 @@ impl PtyInput {
                 sequence: None,
                 fence: None,
                 not_after: None,
+                prompt: false,
                 partial: false,
             })
             .map_err(|_| anyhow!("Terminal input queue full or closed; input was not queued"))
@@ -231,6 +256,7 @@ impl PtyInput {
                 tx,
                 inputs: Arc::default(),
                 input_epoch: Arc::default(),
+                prompts_held: Arc::default(),
             },
             TestInputReader(requests),
         )
@@ -452,17 +478,13 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
     let writer_output = output.clone();
     let input_epoch = Arc::new(AtomicU64::new(0));
     let writer_epoch = input_epoch.clone();
+    let prompts_held = Arc::new(AtomicBool::new(false));
+    let writer_held = prompts_held.clone();
     std::thread::spawn(move || {
         while let Some(request) = input.blocking_recv() {
-            if let (Some(fence), Some(sequence)) = (request.fence, request.sequence) {
-                let outcome = write_fenced_request(
-                    &mut writer,
-                    &writer_epoch,
-                    fence,
-                    request.not_after,
-                    &request.data,
-                    request.partial,
-                );
+            if let (Some(_), Some(sequence)) = (request.fence, request.sequence) {
+                let outcome =
+                    write_fenced_request(&mut writer, &writer_epoch, &writer_held, &request);
                 if writer_output
                     .blocking_send(PtyEvent::Fenced { sequence, outcome })
                     .is_err()
@@ -512,6 +534,7 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
             tx,
             inputs: Arc::default(),
             input_epoch,
+            prompts_held,
         },
         receiver,
         resize_handle: handle,
@@ -553,10 +576,8 @@ mod tests {
             outcomes.push(write_fenced_request(
                 &mut destination,
                 &input.input_epoch,
-                request.fence.unwrap(),
-                request.not_after,
-                &request.data,
-                request.partial,
+                &input.prompts_held,
+                &request,
             ));
         }
         assert_eq!(
@@ -579,6 +600,42 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_queued_before_prompts_are_held_is_held_at_the_writer() {
+        // Queued while nothing waited; an approval went to the agent's own
+        // dialog before its turn at the writer came: none of its bytes.
+        let (input, mut queued) = PtyInput::test_channel();
+        input.paste_fenced("go on", 0, 1, None).unwrap();
+        input.write_fenced(b"y".to_vec(), 0, 2, None).unwrap();
+        input.hold_prompts(true);
+        let mut destination = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Ok(request) = queued.0.try_recv() {
+            outcomes.push(write_fenced_request(
+                &mut destination,
+                &input.input_epoch,
+                &input.prompts_held,
+                &request,
+            ));
+        }
+        // terminal input still goes (whoever types sees the dialog)
+        assert_eq!(outcomes, [FencedOutcome::Held, FencedOutcome::Written(1)]);
+        assert_eq!(destination, b"y");
+        // released again: a prompt is written
+        input.hold_prompts(false);
+        input.paste_fenced("go on", 0, 3, None).unwrap();
+        let request = queued.0.try_recv().unwrap();
+        assert_eq!(
+            write_fenced_request(
+                &mut destination,
+                &input.input_epoch,
+                &input.prompts_held,
+                &request
+            ),
+            FencedOutcome::Written(18)
+        );
+    }
+
+    #[test]
     fn a_remote_write_past_its_deadline_is_dropped_at_the_writer() {
         let (input, mut queued) = PtyInput::test_channel();
         let now = monotonic_ns();
@@ -597,10 +654,8 @@ mod tests {
             outcomes.push(write_fenced_request(
                 &mut destination,
                 &input.input_epoch,
-                request.fence.unwrap(),
-                request.not_after,
-                &request.data,
-                request.partial,
+                &input.prompts_held,
+                &request,
             ));
         }
         assert_eq!(

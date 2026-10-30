@@ -213,6 +213,18 @@ impl Rig {
         (sid, fake)
     }
 
+    /// The person at the terminal answered the agent's own dialog and says
+    /// so (prefix, then `a`): no tool result ends a wait by itself.
+    fn answered_here(&self, sid: &str) {
+        let mut frontend = self
+            .sandbox
+            .spawn(&["agent", "attach", sid], &self.sandbox.home, &[]);
+        frontend.shows("?:help");
+        frontend.send(b"\x1da");
+        frontend.shows("Marked the waiting approvals as answered here");
+        frontend.detach();
+    }
+
     /// Hints verified as a device does now (the host's own clock).
     fn hints(&self, message: &Value) -> Vec<Hint> {
         assert_eq!(message["type"], "relay", "{message}");
@@ -483,6 +495,7 @@ fn an_approval_reaches_the_relay_sealed_for_the_phone_and_the_mac() {
     assert!(hs[0].open(keys, &enc("dev-phone"), "dev-phone").is_err());
     // The answer closes it: a resolved hint follows (and no r8 push).
     std::fs::write(fake.join("terminal-yes-1"), "").unwrap();
+    rig.answered_here(&sid);
     let resolved = expect_relay(&mut router, WAIT);
     let r = rig.hints(&resolved);
     assert!(matches!(
@@ -687,6 +700,7 @@ fn a_late_approval_within_15_s_of_expiry_is_suppressed() {
         rig.runtime_log()
     );
     std::fs::write(fake.join("terminal-yes-1"), "").unwrap();
+    rig.answered_here(&sid);
     let resolved = expect_relay(&mut router, WAIT);
     assert!(matches!(
         rig.hints(&resolved)[0].state(),
@@ -769,6 +783,7 @@ fn a_device_removed_mid_approval_gets_no_more_hints() {
         rig.runtime_log()
     );
     std::fs::write(fake.join("terminal-yes-1"), "").unwrap();
+    rig.answered_here(&sid);
     let resolved = expect_relay(&mut router, WAIT);
     assert!(matches!(
         rig.hints(&resolved)[0].state(),

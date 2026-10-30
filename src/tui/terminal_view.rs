@@ -55,6 +55,8 @@ pub enum Action {
     Cancel,
     Hide,
     Take,
+    /// The person here says the agent's approval dialog was answered here.
+    Answered,
     Stop,
     Redraw,
     Help,
@@ -221,6 +223,7 @@ impl State {
                 KeyCode::Esc => Action::Cancel,
                 KeyCode::Char('h' | 'm') if key.modifiers.is_empty() => Action::Hide,
                 KeyCode::Char('g') if key.modifiers.is_empty() => Action::Take,
+                KeyCode::Char('a') if key.modifiers.is_empty() => Action::Answered,
                 KeyCode::Char('x') if key.modifiers.is_empty() => Action::Stop,
                 KeyCode::Char('r') if key.modifiers.is_empty() => Action::Redraw,
                 KeyCode::Char('?') => Action::Help,
