@@ -11,7 +11,7 @@ use crate::chat::adapter::{
     AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_REASONING,
     UNAVAILABLE_STREAMING,
 };
-use hooks::EventReader;
+use crate::chat::hook_events::EventReader;
 use transcript::TranscriptReader;
 
 /// What Claude chat can't provide: no partial text (transcript blocks
@@ -64,6 +64,15 @@ impl ClaudeAdapter {
 /// A new chat directory under `root` and the arguments Claude needs for it
 /// (put before the launch arguments `args`), with the approval hook when
 /// `approvals`. On failure nothing is left behind.
+/// The screen shows Claude Code's own permission dialog (2.1.30x: "Do you
+/// want to proceed?" for a command, "Do you want to make this edit to …?"
+/// and the like for files, above "Esc to cancel"): a chat prompt's Enter
+/// would answer it ("1. Yes"), so prompts are held. A backstop beside the
+/// worker's open approvals; it only ever adds a hold.
+pub fn dialog_on_screen(text: &str) -> bool {
+    text.contains("Esc to cancel") && text.contains("Do you want to")
+}
+
 pub fn prepare_chat(
     root: &Path,
     args: &[String],
@@ -147,7 +156,27 @@ impl AgentAdapter for ClaudeAdapter {
             return Vec::new();
         };
         let mut incoming = std::mem::take(&mut self.held);
-        incoming.extend(reader.poll());
+        let read = reader.poll();
+        let lost = reader.take_lost();
+        for raw in read.into_iter().flatten() {
+            incoming.extend(hooks::read_hook(&raw));
+        }
+        if !lost.is_empty() {
+            for event in &lost {
+                eprintln!("atem worker: a Claude {event} hook event was lost");
+            }
+            // Something happened that wasn't seen (a prompt, a tool, a turn's
+            // end): the agent counts as working, so no chat prompt goes in,
+            // until the next turn end says otherwise.
+            self.queued.push(LogItem::Problem {
+                detail: format!(
+                    "a Claude hook event was lost ({}): the status shows working until the turn ends",
+                    lost.join(", ")
+                ),
+                fatal: false,
+            });
+            incoming.push_back(AgentEvent::ToolStarted);
+        }
         let mut out = Vec::new();
         while let Some(mut event) = incoming.pop_front() {
             if let AgentEvent::SessionStarted {
@@ -240,6 +269,7 @@ impl Drop for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::fs;
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -252,6 +282,81 @@ mod tests {
         let mut a = ClaudeAdapter::new();
         let plan = a.prepare_launch(&s(args), &dir).unwrap();
         (root, a, plan)
+    }
+
+    #[test]
+    fn a_lost_event_fails_closed() {
+        // A synchronous hook that died before publishing (Claude went on):
+        // the session counts as working (no prompt goes in) until the turn
+        // ends.
+        use crate::chat::session::{ChatSession, State};
+        let (_r, mut a, _plan) = launch(&[]);
+        let dir = a.dir().unwrap().to_path_buf();
+        let mut chat = ChatSession::new("g".into(), 0);
+        chat.on_event(
+            AgentEvent::SessionStarted {
+                session_id: "s".into(),
+                log_path: "/x/s.jsonl".into(),
+                source: "startup".into(),
+                same_log: false,
+            },
+            1,
+            0,
+        );
+        event(
+            &dir,
+            "ev.1.json",
+            r#"{"hook_event_name":"PreToolUse","tool_use_id":"a","tool_name":"Bash","tool_input":{"command":"touch x"}}"#,
+        );
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        fs::write(
+            dir.join("events").join(format!("start-PreToolUse.{dead}")),
+            "",
+        )
+        .unwrap();
+        for e in a.poll_events() {
+            chat.on_event(e, 2, 0);
+        }
+        assert_eq!(chat.status().state, State::Working);
+        assert!(chat.submit("r1", "g", "next", 0, false).is_err());
+        assert!(
+            a.poll_log()
+                .iter()
+                .any(|i| matches!(i, LogItem::Problem { detail, fatal: false } if detail.contains("was lost")))
+        );
+        // the turn's end: ready again
+        event(&dir, "ev.2.json", r#"{"hook_event_name":"Stop"}"#);
+        for e in a.poll_events() {
+            chat.on_event(e, 3, 0);
+        }
+        assert_eq!(chat.status().state, State::Ready);
+    }
+
+    #[test]
+    fn claudes_dialog_on_screen_is_recognized() {
+        let pane = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/designs/fixtures/permission-hook/pane-none.txt"
+        ))
+        .unwrap();
+        assert!(dialog_on_screen(&pane));
+        // Claude Code 2.1.302's file dialogs (captured live): create, edit.
+        for name in ["pane-write.txt", "pane-edit.txt"] {
+            let pane = fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("designs/fixtures/permission-hook")
+                    .join(name),
+            )
+            .unwrap();
+            assert!(dialog_on_screen(&pane), "{name}");
+        }
+        assert!(!dialog_on_screen("● Done.\n❯ \n? for shortcuts"));
+        assert!(!dialog_on_screen("Do you want to continue? I can go on."));
     }
 
     #[test]
@@ -318,8 +423,22 @@ mod tests {
         assert_eq!(c.reason.as_deref(), Some("format changed"));
     }
 
+    /// An event as the hook script publishes it: `ev.<n>.json` names its
+    /// sequence `<n>`.
     fn event(dir: &Path, name: &str, body: &str) {
-        fs::write(dir.join("events").join(name), body).unwrap();
+        let n: u64 = name
+            .trim_start_matches("ev.")
+            .trim_end_matches(".json")
+            .parse()
+            .unwrap();
+        let v: Value = serde_json::from_str(body).unwrap();
+        let ev = v["hook_event_name"].as_str().unwrap();
+        let me = std::process::id();
+        fs::write(
+            dir.join("events").join(format!("ev-{n:010}-{ev}.json")),
+            format!("{me} {me}\n{body}"),
+        )
+        .unwrap();
     }
 
     #[test]

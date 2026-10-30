@@ -756,6 +756,34 @@ fn queued_remote_bytes_are_dropped_at_the_worker_when_local_input_takes_over() {
     });
 }
 
+/// The person at the local frontend answered in the agent's own dialog and
+/// says so (the prefix `a`): attached first, as a frontend is.
+async fn answered_here(client: &mut RuntimeClient, sid: &str) {
+    attach(client, sid).await;
+    client
+        .send(&ClientMsg::ApprovalsAnswered {
+            session_id: sid.to_string(),
+        })
+        .await
+        .unwrap();
+}
+
+/// A local frontend attaches to `sid`.
+async fn attach(client: &mut RuntimeClient, sid: &str) {
+    client
+        .send(&ClientMsg::Attach {
+            session_id: sid.to_string(),
+            rows: 24,
+            cols: 80,
+        })
+        .await
+        .unwrap();
+    expect(client, |m| {
+        matches!(m, RuntimeMsg::Attached { .. }).then_some(())
+    })
+    .await;
+}
+
 /// Opens `conversation` once chat is available; returns `opened`.
 async fn open_chat(peer: &mut Peer, conversation: &str, sid: &str, pg: &str) -> Value {
     tokio::time::timeout(WAIT, async {
@@ -2263,6 +2291,18 @@ impl Runtime {
         provider: &str,
         fake: &Path,
     ) -> SessionSummary {
+        self.launch_approval_agent_with(client, provider, fake, &[])
+            .await
+    }
+
+    /// `launch_approval_agent` with more of the agent's environment.
+    async fn launch_approval_agent_with(
+        &self,
+        client: &mut RuntimeClient,
+        provider: &str,
+        fake: &Path,
+        extra: &[(&str, &str)],
+    ) -> SessionSummary {
         let var = if provider == "claude" {
             "CLAUDE_CLI_BIN"
         } else {
@@ -2274,12 +2314,17 @@ impl Runtime {
                 provider: provider.into(),
                 args: vec![],
                 cwd: self.dir.path().to_path_buf(),
-                env: LaunchEnv(vec![
-                    ("PATH".into(), "/usr/bin:/bin".into()),
-                    (var.into(), approval_agent().display().to_string()),
-                    ("FAKE_DIR".into(), fake.display().to_string()),
-                    ("FAKE_CODEX_HOOK".into(), hook),
-                ]),
+                env: LaunchEnv(
+                    [
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        (var.into(), approval_agent().display().to_string()),
+                        ("FAKE_DIR".into(), fake.display().to_string()),
+                        ("FAKE_CODEX_HOOK".into(), hook),
+                    ]
+                    .into_iter()
+                    .chain(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+                    .collect(),
+                ),
                 rows: 24,
                 cols: 80,
             })
@@ -2453,7 +2498,21 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
             .as_str()
             .unwrap()
             .to_string();
+        attach(&mut client, &sid).await;
         std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
+        // The tool ran: that ends nothing, but the attached frontend is told
+        // how to say the dialog was answered.
+        expect(&mut client, |m| {
+            matches!(m, RuntimeMsg::Notice { text } if text == crate::runtime::worker_protocol::ANSWER_HINT)
+                .then_some(())
+        })
+        .await;
+        client
+            .send(&ClientMsg::ApprovalsAnswered {
+                session_id: sid.to_string(),
+            })
+            .await
+            .unwrap();
         let a = aid.clone();
         let closed = peer
             .wait(move |v| {
@@ -2696,6 +2755,63 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
     );
     assert!(bridge.open_approvals().is_empty());
     let _ = session.stop();
+}
+
+/// Claude with its tool hooks (PreToolUse with `tool_use_id`, as Claude
+/// Code sends them): a request denied remotely, then the same command
+/// asked again and answered in Claude's own dialog. The tool's result
+/// closes nothing by itself; the person saying so (the prefix `a`) closes
+/// the retry's card `answered_terminal`.
+#[test]
+fn a_retry_answered_in_the_terminal_closes_when_the_person_says_so() {
+    local(async {
+        let mut rt = Runtime::start(true).await;
+        let mut client = rt.client().await;
+        let fake = rt.dir.path().join("fake");
+        let session = rt
+            .launch_approval_agent_with(&mut client, "claude", &fake, &[("FAKE_PRETOOLUSE", "1")])
+            .await;
+        let (sid, pg) = (session.id.clone(), session.generation.clone());
+        let peer = &mut rt.peer;
+        peer.hello().await;
+        listed(peer, &sid).await;
+        ask(&fake, 1, npm_test());
+        let at = peer
+            .wait_from(0, |v| is_session(v, "approval_request"))
+            .await;
+        let first = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Denied remotely (lease-free, r8 §G): the call never runs.
+        let id = peer.request(
+            "submit",
+            json!({"binding": peer.binding(&sid, &pg, None), "request_id": uuid::Uuid::new_v4().to_string(),
+                   "kind": "approval", "payload": {"approval_id": first, "decision": "deny"}}),
+        );
+        assert_eq!(peer.reply(&id).await["state"], "accepted");
+        agent_event(&fake, "answer 1 deny Denied from Astation").await;
+        // The same command again, answered in Claude's own dialog.
+        ask(&fake, 2, npm_test());
+        let from = peer.seen.len();
+        let at = peer
+            .wait_from(from, |v| is_session(v, "approval_request"))
+            .await;
+        let second = peer.seen[at]["data"]["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
+        answered_here(&mut client, &sid).await;
+        let a = second.clone();
+        let closed = peer
+            .wait(move |v| {
+                is_session(v, "approval_closed") && v["data"]["approval_id"] == a.as_str()
+            })
+            .await;
+        assert_eq!(closed["data"]["reason"], "answered_terminal");
+        rt.shutdown().await;
+    });
 }
 
 #[test]
@@ -3121,9 +3237,20 @@ fn codex_stays_waiting_at_its_own_dialog_after_a_release() {
         let peer = &mut rt.peer;
         peer.drain(Duration::from_millis(500)).await;
         assert_eq!(listed(peer, &sid).await["activity"], "waiting");
-        // allowed there: the tool runs (PostToolUse), working again
+        // allowed there: the tool runs (PostToolUse), which ends nothing by
+        // itself (no result is proven to be the asking call's)
         client.send(&ClientMsg::input(&sid, b"y")).await.unwrap();
         agent_event(&fake, "dialog 1 allow").await;
+        let peer = &mut rt.peer;
+        peer.drain(Duration::from_millis(500)).await;
+        assert_eq!(listed(peer, &sid).await["activity"], "waiting");
+        // the person at the terminal says it was answered: working again
+        client
+            .send(&ClientMsg::ApprovalsAnswered {
+                session_id: sid.clone(),
+            })
+            .await
+            .unwrap();
         activity_until(&mut rt.peer, &sid, "working").await;
         rt.shutdown().await;
     });

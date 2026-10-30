@@ -69,7 +69,7 @@ fn the_permission_request_entry_is_unchanged_from_before_chat() {
 }
 
 #[test]
-fn one_marked_entry_per_event_async_but_permission_request_and_session_end() {
+fn one_marked_entry_per_event_async_but_the_synchronous_ones() {
     let all = entries();
     assert_eq!(
         all.iter().map(|(e, _)| *e).collect::<Vec<_>>(),
@@ -90,6 +90,17 @@ fn one_marked_entry_per_event_async_but_permission_request_and_session_end() {
                 assert!(cmd.ends_with(" event SessionEnd"));
                 assert!(hooks[0].get("async").is_none(), "SessionEnd is always sync");
                 assert_eq!(hooks[0]["timeout"], EVENT_TIMEOUT);
+            }
+            // Codex waits for these: none is lost or late.
+            "PreToolUse" | "PostToolUse" | "UserPromptSubmit" => {
+                assert!(cmd.ends_with(&format!(" event {event}")), "{cmd}");
+                assert!(hooks[0].get("async").is_none(), "{event} is sync");
+                assert_eq!(hooks[0]["timeout"], SYNC_EVENT_TIMEOUT, "{event}");
+                assert!(group.get("matcher").is_none());
+            }
+            "Interrupt" => {
+                assert!(hooks[0].get("async").is_none(), "Interrupt is sync");
+                assert_eq!(hooks[0]["timeout"], EVENT_TIMEOUT, "clamped to 3 s");
             }
             other => {
                 assert!(cmd.ends_with(&format!(" event {other}")), "{cmd}");
@@ -1099,27 +1110,32 @@ mod script {
     /// never overwritten: the event takes the next seq.
     #[test]
     fn a_taken_name_is_never_overwritten() {
+        // The number the counter gives is taken (never by Atem's own hooks:
+        // published in order under the lock): nothing is overwritten, the
+        // hook fails (an async one silently; a PreToolUse exits 2), and the
+        // number it took is left without its event, a gap the reader
+        // reports as lost.
         let (s, script) = session();
         let events = s.path().join("events");
         fs::write(events.join("seq"), "4\n").unwrap();
         fs::write(events.join("ev-0000000005-Stop.json"), "theirs").unwrap();
-        fs::write(events.join("ev-0000000006-Stop.json"), "theirs too").unwrap();
         let (ok, stdout, _) = stop(s.path(), &script);
         assert!(ok && stdout.is_empty());
-        assert_eq!(
-            event_files(s.path()),
-            vec![
-                "ev-0000000005-Stop.json",
-                "ev-0000000006-Stop.json",
-                "ev-0000000007-Stop.json"
-            ]
-        );
+        assert_eq!(event_files(s.path()), vec!["ev-0000000005-Stop.json"]);
         assert_eq!(
             fs::read_to_string(events.join("ev-0000000005-Stop.json")).unwrap(),
             "theirs"
         );
-        assert_eq!(fs::read_to_string(events.join("seq")).unwrap(), "7\n");
-        assert!(leftovers(s.path()).is_empty());
+        assert_eq!(fs::read_to_string(events.join("seq")).unwrap(), "5\n");
+        assert!(leftovers(s.path()).iter().all(|n| n == "seq.lock") || leftovers(s.path()).is_empty());
+        fs::write(events.join("ev-0000000006-PreToolUse.json"), "theirs too").unwrap();
+        fs::write(events.join("seq"), "5\n").unwrap();
+        let (code, _) = run_code(
+            &event_command(&script, "PreToolUse"),
+            s.path(),
+            &hook_fixture("05-PreToolUse-before-approval.json"),
+        );
+        assert_eq!(code, Some(2), "a PreToolUse it can't publish blocks its tool");
     }
 
     /// Two SessionEnd hooks at once (Codex quitting after /new), many
@@ -1159,4 +1175,294 @@ mod script {
             assert_eq!(got, want);
         }
     }
+
+    /// Runs `command` as Codex does; its exit code (`None`: a signal).
+    fn run_code(command: &str, dir: &Path, stdin: &str) -> (Option<i32>, String) {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env(ENV, dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (out.status.code(), String::from_utf8(out.stderr).unwrap())
+    }
+
+    fn markers(dir: &Path) -> Vec<String> {
+        leftovers(dir)
+            .into_iter()
+            .filter(|n| n.starts_with("start-"))
+            .collect()
+    }
+
+    /// A synchronous event is published and leaves no marker.
+    #[test]
+    fn a_synchronous_event_is_published_and_its_marker_removed() {
+        let (s, script) = session();
+        for (event, fixture) in [
+            ("PreToolUse", "05-PreToolUse-before-approval.json"),
+            ("PostToolUse", "07-PostToolUse-after-approval.json"),
+            ("UserPromptSubmit", "04-UserPromptSubmit-approval-turn.json"),
+            ("Interrupt", "21-Interrupt-esc-at-approval-dialog.json"),
+        ] {
+            let (code, _) = run_code(
+                &event_command(&script, event),
+                s.path(),
+                &hook_fixture(fixture),
+            );
+            assert_eq!(code, Some(0), "{event}");
+        }
+        assert_eq!(event_files(s.path()).len(), 4);
+        assert!(markers(s.path()).is_empty(), "{:?}", markers(s.path()));
+    }
+
+    /// A synchronous event waits longer for a live holder than an async
+    /// one; a PreToolUse it can't publish blocks its tool (exit 2, nothing
+    /// left behind: no call), any other keeps its marker (a lost event
+    /// Atem detects). Never dropped silently.
+    #[test]
+    fn a_synchronous_event_that_cant_publish_blocks_or_leaves_its_marker() {
+        for (event, fixture, code, marker) in [
+            ("PreToolUse", "05-PreToolUse-before-approval.json", 2, false),
+            ("PostToolUse", "07-PostToolUse-after-approval.json", 0, true),
+        ] {
+            let (s, script) = session();
+            let lock = s.path().join("events/seq.lock");
+            std::os::unix::fs::symlink(std::process::id().to_string(), &lock).unwrap();
+            let started = Instant::now();
+            let (got, stderr) = run_code(
+                &event_command(&script, event),
+                s.path(),
+                &hook_fixture(fixture),
+            );
+            let took = started.elapsed();
+            assert_eq!(got, Some(code), "{event}: {stderr}");
+            assert!(took >= Duration::from_secs(5), "{event} waited: {took:?}");
+            assert!(
+                took < Duration::from_secs(9),
+                "{event}: within its 10 s: {took:?}"
+            );
+            assert!(event_files(s.path()).is_empty(), "{event}");
+            assert_eq!(!markers(s.path()).is_empty(), marker, "{event}");
+            if code == 2 {
+                assert!(stderr.contains("blocked"), "{stderr}");
+            }
+        }
+    }
+
+    /// Killed while it waits (Codex's timeout, any signal): Codex lets the
+    /// tool through, so the marker must stay for Atem to see the loss.
+    #[test]
+    fn a_synchronous_event_killed_while_it_waits_leaves_its_marker() {
+        let (s, script) = session();
+        let lock = s.path().join("events/seq.lock");
+        std::os::unix::fs::symlink(std::process::id().to_string(), &lock).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(event_command(&script, "PreToolUse"))
+            .env(ENV, s.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(hook_fixture("05-PreToolUse-before-approval.json").as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while markers(s.path()).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        // `exec /bin/sh script`: the child is the script itself.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        child.wait().unwrap();
+        assert!(event_files(s.path()).is_empty());
+        assert_eq!(markers(s.path()).len(), 1, "{:?}", leftovers(s.path()));
+    }
+
+    /// No marker can be written (the events directory read-only): a
+    /// PreToolUse blocks its tool.
+    #[test]
+    fn a_pretooluse_that_cant_even_start_blocks_its_tool() {
+        use std::os::unix::fs::PermissionsExt;
+        let (s, script) = session();
+        let events = s.path().join("events");
+        fs::set_permissions(&events, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::write(events.join("probe"), "").is_ok() {
+            return; // running as root: the directory stays writable
+        }
+        let (code, stderr) = run_code(
+            &event_command(&script, "PreToolUse"),
+            s.path(),
+            &hook_fixture("05-PreToolUse-before-approval.json"),
+        );
+        fs::set_permissions(&events, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(code, Some(2), "{stderr}");
+    }
+
+    /// Codex's PermissionRequest hook records the events published so far
+    /// (`evseq-<id>`) before its request appears.
+    #[test]
+    fn a_permission_request_records_the_events_published_before_it() {
+        let (s, script) = session();
+        fs::write(s.path().join("events/seq"), "17\n").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(hook_command(&script))
+            .env(ENV, s.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(hook_fixture("06-PermissionRequest.json").as_bytes())
+            .unwrap();
+        let approvals = s.path().join("approvals");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let req = loop {
+            let found = fs::read_dir(&approvals)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n.starts_with("req-"));
+            if let Some(req) = found {
+                break req;
+            }
+            assert!(Instant::now() < deadline, "no request");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let id = req
+            .strip_prefix("req-")
+            .unwrap()
+            .strip_suffix(".json")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(approvals.join(format!("evseq-{id}"))).unwrap(),
+            "17\n"
+        );
+        // No decision: the hook gives up when its request goes.
+        fs::remove_file(approvals.join(&req)).unwrap();
+        child.wait().unwrap();
+    }
+
+    /// A directory of shims standing in for `mv`/`ln` (Astation's fault
+    /// injection: only the hook's own calls run through PATH).
+    fn shims(dir: &Path, mv: &str, ln: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("shims");
+        fs::create_dir_all(&bin).unwrap();
+        for (name, body) in [("mv", mv), ("ln", ln)] {
+            let p = bin.join(name);
+            fs::write(&p, format!("#!/bin/sh\n{body}\nexec /bin/{name} \"$@\"\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    /// Runs `command` with `bin` first in PATH; its exit code.
+    fn run_faulty(command: &str, dir: &Path, stdin: &str, bin: &Path) -> Option<i32> {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env(ENV, dir)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait().unwrap().code()
+    }
+
+    fn counter(dir: &Path) -> Option<String> {
+        fs::read_to_string(dir.join("events/seq")).ok()
+    }
+
+    /// Finding 1 (#81 6508023019): the counter can't be advanced (its rename
+    /// fails). Nothing is published, so no event exists above the counter
+    /// for a request's `evseq` to miss: a PreToolUse blocks its tool (exit
+    /// 2), any other event fails with its marker left (a detected loss).
+    #[test]
+    fn a_counter_that_cant_advance_publishes_nothing() {
+        let fail_seq = r#"case "$2" in */seq) exit 1 ;; esac"#;
+        for (event, fixture, code, marker) in [
+            ("PreToolUse", "05-PreToolUse-before-approval.json", Some(2), false),
+            ("PostToolUse", "07-PostToolUse-after-approval.json", Some(0), true),
+        ] {
+            let (s, script) = session();
+            fs::write(s.path().join("events/seq"), "1\n").unwrap();
+            let bin = shims(s.path(), fail_seq, "");
+            let got = run_faulty(
+                &event_command(&script, event),
+                s.path(),
+                &hook_fixture(fixture),
+                &bin,
+            );
+            assert_eq!(got, code, "{event}");
+            assert!(event_files(s.path()).is_empty(), "{event}: nothing published");
+            assert_eq!(counter(s.path()).as_deref(), Some("1\n"), "{event}");
+            assert_eq!(!markers(s.path()).is_empty(), marker, "{event}");
+            let mut r = crate::chat::hook_events::EventReader::new(s.path().to_path_buf());
+            r.poll();
+            let lost = r.take_lost();
+            assert_eq!(lost.contains(&event.to_string()), marker, "{event}: {lost:?}");
+        }
+    }
+
+    /// Finding 1: the counter advanced but the event can't be published
+    /// (`ln` fails), or the hook dies right between the two. Its number is
+    /// left without an event: a gap the reader reports as lost (unknown
+    /// kind), so no request can be matched while it stands.
+    #[test]
+    fn a_number_without_its_event_is_a_reported_gap() {
+        for (what, ln) in [
+            ("ln fails", r#"case "$2" in */ev-*) exit 1 ;; esac"#),
+            ("killed between", r#"case "$2" in */ev-*) kill -9 $PPID; exit 1 ;; esac"#),
+        ] {
+            let (s, script) = session();
+            let bin = shims(s.path(), "", ln);
+            let code = run_faulty(
+                &event_command(&script, "PostToolUse"),
+                s.path(),
+                &hook_fixture("07-PostToolUse-after-approval.json"),
+                &bin,
+            );
+            assert_ne!(code, Some(2), "{what}: a PostToolUse never blocks");
+            assert!(event_files(s.path()).is_empty(), "{what}");
+            assert_eq!(counter(s.path()).as_deref(), Some("1\n"), "{what}");
+            // the live lock of a killed hook goes once its pid is gone
+            let mut r = crate::chat::hook_events::EventReader::new(s.path().to_path_buf());
+            r.poll();
+            let lost = r.take_lost();
+            assert!(
+                lost.iter().any(|e| e == crate::chat::hook_events::UNKNOWN),
+                "{what}: {lost:?}"
+            );
+            assert_eq!(r.through(), 1, "{what}");
+        }
+    }
 }
+

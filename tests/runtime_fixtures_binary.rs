@@ -1206,12 +1206,27 @@ impl Host {
             }
             "close_approval" => {
                 let ask = self.ask(arg.as_str().unwrap_or_default())?;
+                let terminal = step["reason"] == "answered_terminal";
                 let what = match step["reason"].as_str() {
                     Some("answered_terminal") => "terminal-yes",
                     Some("interrupted") => "kill",
                     other => return Err(format!("close_approval {other:?} is not supported")),
                 };
-                std::fs::write(ask.dir.join(format!("{what}-{}", ask.n)), "").unwrap();
+                let (dir, n) = (ask.dir.clone(), ask.n);
+                std::fs::write(dir.join(format!("{what}-{n}")), "").unwrap();
+                if terminal {
+                    // The person answered in the agent's own dialog, then says
+                    // so (the prefix `a`): no tool result ends a wait by itself.
+                    let real_id = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.dir == dir)
+                        .map(|s| s.real_id.clone())
+                        .ok_or("the approval's session")?;
+                    self.pump(SETTLE);
+                    self.frontend
+                        .send(json!({"op": "approvals_answered", "session_id": real_id}));
+                }
             }
             // The agent acts on the decision its hook got by itself.
             "approval_applied" if step["ok"] == true => {

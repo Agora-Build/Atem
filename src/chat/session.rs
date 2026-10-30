@@ -29,6 +29,8 @@ pub const MAX_PARTS: usize = MAX_MESSAGE_BYTES / PART_OVERHEAD;
 const MAX_PROMPT_BYTES: usize = 32_768;
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const TRUNCATED: &str = "… (truncated)";
+/// The detail of a permission wait.
+const WAITING_DETAIL: &str = "approve in the terminal";
 /// Reserved part id; adapters never produce ids with this prefix.
 const TRUNCATED_ID: &str = "atem:truncated";
 
@@ -226,6 +228,12 @@ pub struct ChatSnapshot {
     /// partial).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_evicted_turn: Option<String>,
+    /// A permission wait that outlasts the turn's end holds (Codex).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_held: bool,
+    /// The turn ended while it held.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_past_turn: bool,
 }
 
 pub struct ChatSession {
@@ -259,6 +267,13 @@ pub struct ChatSession {
     current_turn: Option<(String, Option<String>)>,
     last_completed: Option<String>,
     last_outcome: Option<Outcome>,
+    /// A permission wait that outlasts the turn's end holds
+    /// (`WaitingForPermission::outlasts_turn`, Codex): a turn end leaves
+    /// the status waiting, and its `ToolFinished` makes it ready
+    /// (`held_past_turn`) or working.
+    wait_held: bool,
+    /// The turn ended while `wait_held`.
+    held_past_turn: bool,
 }
 
 /// Redact credential values (names are kept). See `memory::secrets::redact_secrets`.
@@ -404,6 +419,8 @@ impl ChatSession {
             current_turn: None,
             last_completed: None,
             last_outcome: None,
+            wait_held: false,
+            held_past_turn: false,
         }
     }
 
@@ -427,6 +444,8 @@ impl ChatSession {
             history: self.history(None, max_messages, max_bytes),
             truncated: self.truncated,
             last_evicted_turn: self.last_evicted_turn.clone(),
+            wait_held: self.wait_held,
+            held_past_turn: self.held_past_turn,
         }
     }
 
@@ -444,6 +463,8 @@ impl ChatSession {
         session.current_turn = snapshot.current_turn.map(|t| (t, None));
         session.last_completed = snapshot.last_completed;
         session.last_outcome = snapshot.last_outcome;
+        session.wait_held = snapshot.wait_held;
+        session.held_past_turn = snapshot.held_past_turn;
         for message in snapshot.history {
             session.push_message(message);
         }
@@ -663,6 +684,8 @@ impl ChatSession {
             _ => {}
         }
         self.input_mark = snapshot.input_mark;
+        self.wait_held = snapshot.wait_held;
+        self.held_past_turn = snapshot.held_past_turn;
         self.set_status(
             snapshot.state,
             snapshot.detail.as_deref(),
@@ -800,6 +823,8 @@ impl ChatSession {
                 }
                 self.started = true;
                 self.input_mark = input_count;
+                self.wait_held = false;
+                self.held_past_turn = false;
                 self.set_status(State::Ready, None, now_ms, &mut out);
             }
             AgentEvent::PromptSubmitted {
@@ -807,6 +832,8 @@ impl ChatSession {
                 turn_id,
                 at_ms,
             } => {
+                // A new turn: a held wait goes on into it.
+                self.held_past_turn = false;
                 // The first hook from after the paste whose turn isn't
                 // known to be another decides.
                 if let Some(p) = &mut self.pending
@@ -836,9 +863,17 @@ impl ChatSession {
             }
             // A finished tool ends a permission wait (the user approved); otherwise
             // hooks may arrive out of order and it says nothing about the turn.
+            // A wait that outlasted its turn ends ready.
             AgentEvent::ToolFinished => {
+                let past_turn = std::mem::take(&mut self.held_past_turn);
+                self.wait_held = false;
                 if self.live() && self.status.state == State::Waiting {
-                    self.set_status(State::Working, None, now_ms, &mut out);
+                    if past_turn {
+                        self.input_mark = input_count;
+                        self.set_status(State::Ready, None, now_ms, &mut out);
+                    } else {
+                        self.set_status(State::Working, None, now_ms, &mut out);
+                    }
                 }
             }
             AgentEvent::NotReady { detail } => {
@@ -846,14 +881,10 @@ impl ChatSession {
                     self.set_status(State::Unknown, Some(&detail), now_ms, &mut out);
                 }
             }
-            AgentEvent::WaitingForPermission { .. } => {
+            AgentEvent::WaitingForPermission { outlasts_turn, .. } => {
                 if self.live() {
-                    self.set_status(
-                        State::Waiting,
-                        Some("approve in the terminal"),
-                        now_ms,
-                        &mut out,
-                    );
+                    self.wait_held |= outlasts_turn;
+                    self.set_status(State::Waiting, Some(WAITING_DETAIL), now_ms, &mut out);
                 }
             }
             AgentEvent::TurnEnded { .. } if !self.started => {}
@@ -866,10 +897,22 @@ impl ChatSession {
                     self.complete(turn, Outcome::Done, &mut out);
                 }
                 self.input_mark = input_count;
-                self.set_status(State::Ready, None, now_ms, &mut out);
+                self.after_turn(now_ms, &mut out);
             }
         }
         out
+    }
+
+    /// The turn ended: ready, unless a permission wait that outlasts it
+    /// holds (Codex: its dialog or a remote answer still pending), which
+    /// stays waiting until its `ToolFinished`.
+    fn after_turn(&mut self, now_ms: i64, out: &mut Vec<Out>) {
+        if self.wait_held {
+            self.held_past_turn = true;
+            self.set_status(State::Waiting, Some(WAITING_DETAIL), now_ms, out);
+        } else {
+            self.set_status(State::Ready, None, now_ms, out);
+        }
     }
 
     fn check_accepted(&mut self, out: &mut Vec<Out>) {
@@ -981,6 +1024,7 @@ impl ChatSession {
                 self.assistant_part(message_id, part, turn_id, created_at_ms, &mut out);
             }
             LogItem::TurnStarted { .. } => {
+                self.held_past_turn = false;
                 if self.live() {
                     self.set_status(State::Working, None, now_ms, &mut out);
                 }
@@ -990,11 +1034,16 @@ impl ChatSession {
                 turn_id, outcome, ..
             } => {
                 self.expired = None;
+                // Interrupted: nothing of the turn waits on (its tool call
+                // was cancelled, a dialog dismissed).
+                if outcome == Outcome::Interrupted {
+                    self.wait_held = false;
+                }
                 if self.last_completed.as_deref() != Some(turn_id.as_str()) {
                     self.complete(turn_id, outcome, &mut out);
                 }
                 self.input_mark = input_count;
-                self.set_status(State::Ready, None, now_ms, &mut out);
+                self.after_turn(now_ms, &mut out);
             }
             LogItem::Backfill(item) => self.on_backfill(*item),
             // The App handles problems (withdrawing chat when fatal); tool
@@ -1408,6 +1457,53 @@ mod tests {
         // A new prompt is accepted at once (ready, no draft).
         assert!(restored.submit("r1", "g2", "next", 1, false).is_ok());
     }
+    #[test]
+    fn a_wait_held_past_its_turn_survives_a_snapshot() {
+        // Codex's approval outlasted the turn; a new broker restores the
+        // session from the worker's snapshot: still waiting, no prompt.
+        let mut s = ready();
+        s.on_log(
+            LogItem::TurnStarted {
+                turn_id: "t1".into(),
+            },
+            2,
+            0,
+        );
+        s.on_event(
+            AgentEvent::WaitingForPermission {
+                detail: "approve in the terminal".into(),
+                outlasts_turn: true,
+            },
+            3,
+            0,
+        );
+        s.on_log(
+            LogItem::TurnEnded {
+                turn_id: "t1".into(),
+                outcome: Outcome::Done,
+                at_ms: 4,
+            },
+            4,
+            0,
+        );
+        assert_eq!(s.status().state, State::Waiting);
+        let wire: ChatSnapshot =
+            serde_json::from_str(&serde_json::to_string(&s.snapshot(50, 1 << 20)).unwrap())
+                .unwrap();
+        let mut restored = ChatSession::restore("g2".into(), wire);
+        assert_eq!(restored.status().state, State::Waiting);
+        let r = restored.submit("r1", "g2", "next", 0, false);
+        assert!(
+            matches!(&r, Err(outs) if outs.iter().any(|o| matches!(o, Out::Error { .. }))),
+            "{r:?}"
+        );
+        // the wait ends: ready (its turn is over)
+        restored.on_event(AgentEvent::ToolFinished, 5, 0);
+        assert_eq!(restored.status().state, State::Ready);
+        let r = restored.submit("r2", "g2", "next", 0, false);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     use std::path::PathBuf;
 
     fn started() -> AgentEvent {
@@ -1730,6 +1826,7 @@ mod tests {
         let o = s.on_event(
             AgentEvent::WaitingForPermission {
                 detail: "raw secret text".into(),
+                outlasts_turn: false,
             },
             30,
             0,

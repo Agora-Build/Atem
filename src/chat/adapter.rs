@@ -104,6 +104,12 @@ pub enum AgentEvent {
     ToolFinished,
     WaitingForPermission {
         detail: String,
+        /// The wait outlasts the turn's end (Codex: an approval belongs to
+        /// a tool call that can outlive the turn, and its own dialog stays
+        /// open after it): a turn end leaves the status waiting, and the
+        /// wait's `ToolFinished` then makes it ready.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        outlasts_turn: bool,
     },
     TurnEnded {
         /// When the agent reported it (its event file's time, unix ms): it

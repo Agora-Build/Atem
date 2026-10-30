@@ -818,6 +818,79 @@ async fn input_that_releases_a_waiting_hook_is_consumed() {
 }
 
 #[tokio::test]
+async fn a_chat_prompt_never_reaches_codexs_own_dialog() {
+    let (running, mut handle) = start_approving().await;
+    approval_request(&mut handle, 1).await;
+    // Input released the hook: no decision, Codex shows its own dialog.
+    handle.write_until(2, b"zap\r", 0, None, true).unwrap();
+    until(&mut handle, has_output("hook-done")).await;
+    // At once, before the worker's next approvals pass (the release latched
+    // the dialog): a chat prompt would answer it, so it is consumed.
+    handle.paste_until(3, "pasted", 0, None, true).unwrap();
+    let seen = until(&mut handle, |m| {
+        matches!(m, WorkerMsg::WriteResult { seq: 3, .. })
+    })
+    .await;
+    assert_eq!(
+        seen.last(),
+        Some(&WorkerMsg::WriteResult {
+            seq: 3,
+            ok: false,
+            bytes_written: 0,
+            dropped: false,
+            no_effect: true,
+            consumed: true,
+            error: Some(super::super::worker_protocol::APPROVAL_IN_DIALOG.into()),
+        })
+    );
+    // Terminal input is written: whoever types sees the dialog.
+    handle.write_until(4, b"typed\r", 0, None, true).unwrap();
+    let seen = until(&mut handle, |m| {
+        matches!(m, WorkerMsg::ApprovalRequest { .. })
+    })
+    .await;
+    assert!(seen.iter().any(|m| matches!(
+        m,
+        WorkerMsg::WriteResult {
+            seq: 4,
+            ok: true,
+            consumed: false,
+            ..
+        }
+    )));
+    let all = output_text(&seen);
+    assert!(all.contains("typed") && !all.contains("pasted"), "{all}");
+    stop(running, handle).await;
+}
+
+#[tokio::test]
+async fn a_prompt_reaching_the_writer_while_an_approval_waits_is_held() {
+    let (running, mut handle) = start_approving().await;
+    approval_request(&mut handle, 1).await;
+    // A paste that releases nothing (as one queued before the approval
+    // opened): it reaches the PTY writer, which holds it back.
+    handle.paste_until(2, "pasted", 0, None, false).unwrap();
+    let seen = until(&mut handle, |m| {
+        matches!(m, WorkerMsg::WriteResult { seq: 2, .. })
+    })
+    .await;
+    assert_eq!(
+        seen.last(),
+        Some(&WorkerMsg::WriteResult {
+            seq: 2,
+            ok: false,
+            bytes_written: 0,
+            dropped: false,
+            no_effect: true,
+            consumed: true,
+            error: Some(super::super::worker_protocol::APPROVAL_IN_DIALOG.into()),
+        })
+    );
+    assert!(!output_text(&seen).contains("pasted"));
+    stop(running, handle).await;
+}
+
+#[tokio::test]
 async fn a_broker_that_goes_away_releases_the_waiting_hook() {
     let (running, mut handle) = start_approving().await;
     approval_request(&mut handle, 1).await;

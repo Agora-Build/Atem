@@ -27,3 +27,8 @@ approval). Never rely on the hook to hide the dialog.
 
 Side effects: Claude added a trust entry for the temp project in ~/.claude.json (projects["/tmp/phprobe.*/proj"]);
 the temp project dir under ~/.claude/projects was removed.
+
+pane-write.txt, pane-edit.txt: Claude Code 2.1.302's own dialogs for the Write tool ("Do you want to create
+note.txt?") and the Edit tool ("Do you want to make this edit to note.txt?"), captured live (default permission
+mode, no hooks; paths anonymized). Like the Bash dialog they end with "Esc to cancel · Tab to amend": what
+`chat::claude::dialog_on_screen` recognizes.

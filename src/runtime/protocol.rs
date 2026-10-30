@@ -105,6 +105,13 @@ pub enum ClientMsg {
     Reclaim {
         session_id: String,
     },
+    /// The person at this frontend says the agent's own approval dialog was
+    /// answered here (the prefix `a`): the session's waiting approvals end
+    /// (`answered_terminal`). Atem can't tell from the agent which call a
+    /// result belongs to, so nothing else ends such a wait.
+    ApprovalsAnswered {
+        session_id: String,
+    },
     /// → `sessions`
     List,
     Stop {
@@ -216,6 +223,7 @@ impl ClientMsg {
             ClientMsg::Paste { .. } => "paste",
             ClientMsg::Resize { .. } => "resize",
             ClientMsg::Reclaim { .. } => "reclaim",
+            ClientMsg::ApprovalsAnswered { .. } => "approvals_answered",
             ClientMsg::List => "list",
             ClientMsg::Stop { .. } => "stop",
             ClientMsg::Reload => "reload",
@@ -699,6 +707,9 @@ mod tests {
                 cols: 100,
             },
             ClientMsg::Reclaim {
+                session_id: "s".into(),
+            },
+            ClientMsg::ApprovalsAnswered {
                 session_id: "s".into(),
             },
             ClientMsg::List,

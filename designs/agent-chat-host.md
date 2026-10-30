@@ -181,14 +181,17 @@ keep running; Claude merges `--settings` with them.
 ### Hook events: one file each
 
 Claude runs a hook as a shell command and passes the event JSON on stdin. Each
-hook command writes that JSON to its own file, atomically:
+hook runs Atem's one hook script in its synchronous event mode:
 
 ```sh
-{ f=$(mktemp "<chat dir>/events/ev.XXXXXXXX") && cat > "$f" && mv "$f" "$f.json"; } 2>/dev/null; exit 0
+ATEM_APPROVAL_DIR='<chat dir>' exec /bin/sh '<chat dir>/approval-hook.sh' event <Event> sync
 ```
 
-(`mktemp` gives a unique name on both Linux and macOS; `date +%N` would not
-work on macOS.)
+It writes `events/ev-<seq>-<Event>.json` (the hook's `$$ $PPID` line, then
+the JSON) under the session's counter lock, in sequence order, never
+dropping one; a start marker (`start-<Event>.<pid>`) stays until the event
+is published, so a hook that died is a lost event Atem detects. (It was a
+one-line `mktemp`/`mv` writer read by file time until 2026-10-29.)
 
 - One file per event, written then renamed, because hooks can run at the same
   time (parallel tool calls) and an event can be large (a `Write` event holds
@@ -598,9 +601,76 @@ and a failure is a session notice (Codex starts anyway).
   released one to Codex's own dialog ("no decision": input to Codex — which
   is consumed, never written, so it can't answer the dialog the user hadn't
   seen; a remote prompt or interrupt that released one is `rejected` — no
-  broker, an adopting broker that doesn't know it) — that one until its
-  PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
-  rollout item — `ready` at `task_complete` / `turn_aborted`.
+  broker, an adopting broker that doesn't know it, a prompt or interrupted
+  turn end closing it, its hook ending without one) — each such approval
+  until the dialog is dismissed or gone (Interrupt or UserPromptSubmit
+  hook, the rollout's next user message or `turn_aborted`, all after it
+  went there), or the person at the terminal says it was answered (the
+  prefix, then `a`: "approval answered"); never a Stop, a plain
+  `task_complete`, a reply or a tool result — `ready` at `task_complete` /
+  `turn_aborted` otherwise.
+  Codex's waits outlast the turn: Codex (0.163, its exec cell) may end the
+  turn while the approval still waits, or with its dialog still open, so a
+  plain turn end neither closes an open approval nor makes the session
+  `ready` (`WaitingForPermission.outlasts_turn`: the turn completes, the
+  status stays `waiting`, and the wait's end makes it `ready`); an
+  interrupted turn end does both. While an approval sits in Codex's own
+  dialog the worker consumes a chat prompt's paste ("Codex's approval
+  dialog is open in the terminal; answer it there; not written", the
+  prompt `rejected`): its Enter would pick the dialog's default, an allow
+  no one gave. The worker latches a "no decision" at once (not at its next
+  approvals pass), and while Codex waits (an approval open or a dialog) it
+  holds chat prompts at the PTY write boundary too, so a prompt queued
+  before is never written (`FencedOutcome::Held`, reported like a consumed
+  paste). Terminal input is still written (whoever types sees the
+  dialog). As a backstop for what hooks can't report (a hook the agent
+  never started), chat prompts are also held while the agent's own
+  approval dialog is on the canonical screen, for both agents.
+  **Invariant, both agents: a tool result never ends an approval wait.**
+  Neither agent's PermissionRequest names its call (no `tool_use_id`, and
+  no call identity in the hook's environment; verified on codex-cli
+  0.163.0 and Claude Code 2.1.302), so no result can be proven to be the
+  exact call's: Codex lets a failed, timed out or killed hook through (only
+  exit 2 blocks), and a PreToolUse hook it never started leaves nothing to
+  count, so even a sole candidate is an inference (Astation's review,
+  #81). A wait ends only on evidence that names the dialog itself: a
+  dismissal after it (above), the request's hook ending (timeout, kill,
+  process exit), a remote answer, or the local key `a`. Event collection
+  is still lossless and sequenced (the script advances the counter before
+  publishing under it, either step failing the hook; a start marker until
+  published; a gap or an unreadable event is reported as lost, with a
+  notice and a worker log line), so status and chat never act on a partial
+  history.
+  Claude (spike on Claude Code 2.1.302): its own dialog shows while our
+  hook waits, typed text plus Enter answers it ("1. Yes"), a background
+  agent can ask after its parent turn's Stop (Notification ~6 s later),
+  PreToolUse exit 1 is let through, and parallel calls ask one after
+  another (never two dialogs of one agent at once). So for Claude: chat
+  prompts are held at paste and at the PTY writer while any of its
+  approvals is open or Claude's dialog is on the screen (a prompt the
+  broker admits while the status still says `ready`, before Claude's
+  Notification, is `rejected` with nothing written; the status itself is
+  unchanged, as the shared fixtures expect). Claude's hooks run the one
+  hook script (`event <Event> sync`), every event published in sequence; a
+  lost event makes the status working until the turn ends. A request
+  answered in Claude's own dialog stays open (its card pending, prompts
+  held) until its hook ends (600 s) or the person at the terminal presses
+  the prefix, then `a`, which closes it `answered_terminal` (an allow
+  written for it and not yet taken is withdrawn first). So the key is
+  found when it matters, a result with a waiting request's tool and input
+  (Claude), or a PostToolUse after a dialog went to the terminal (Codex),
+  sends the attached frontend a notice once per request or dialog: "A tool
+  ran while an approval waits: if you answered the agent's dialog here,
+  press <prefix> then a" (the worker writes `{prefix}`, the frontend puts
+  its own). The result still ends nothing. Claude's file
+  dialogs ("Do you want to create …?", "Do you want to make this edit to
+  …?") were checked live for the screen backstop.
+  A refusal in Codex's dialog leaves no evidence Atem can read either:
+  the session stays `waiting` until a prompt typed in the terminal, an
+  interrupt or the key `a` (fail closed). Found live on 2026-10-29: a
+  remote prompt pasted into the dialog approved a command. Upstream asks:
+  a call id in PermissionRequest (Codex and Claude) would let a result end
+  a wait.
 - **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
   UserPromptSubmit and the rollout's UserMessage both name it, with the same
   `turn_id`; completed at that turn's end (interrupted at `turn_aborted`).
@@ -614,7 +684,8 @@ and a failure is a session notice (Codex starts anyway).
 - **Approvals and chat evidence.** A new prompt or a turn end (stamped with
   its hook file's or log entry's time) answers only a permission prompt
   opened before it, for both agents: one read in the same pass as a newer
-  request leaves it open.
+  request leaves it open. For Codex only a prompt or an interrupted turn
+  end counts (a plain turn end leaves its approval waiting, see Status).
 - **Pairing a remote prompt.** Only a hook (its event file's time) and a log
   entry (its timestamp) from after the paste can be the remote prompt's, and
   only the first of each whose turn isn't known to be another: a local

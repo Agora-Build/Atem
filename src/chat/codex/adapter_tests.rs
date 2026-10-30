@@ -4,9 +4,11 @@
 
 use super::*;
 use crate::chat::adapter::{Outcome, Part};
+use crate::chat::hook_events::MAX_EVENT;
 use crate::chat::session::{ChatSession, Origin, Out, State};
 use std::fs;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 const FX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/designs/fixtures/codex-hooks");
 const GEN: &str = "gen-1";
@@ -68,9 +70,15 @@ impl Fx {
     /// Runs the real hook script as Codex's event entry does, with the
     /// fixture as its stdin.
     fn fire(&self, a: &CodexAdapter, name: &str) {
-        use std::io::Write;
         let body = self.hook(name);
-        let v: Value = serde_json::from_str(&body).unwrap();
+        self.fire_body(a, &body, name);
+    }
+
+    /// Runs the real hook script as Codex's event entry does, with `body`
+    /// as its stdin (its event from `hook_event_name`).
+    fn fire_body(&self, a: &CodexAdapter, body: &str, name: &str) {
+        use std::io::Write;
+        let v: Value = serde_json::from_str(body).unwrap();
         let event = v["hook_event_name"].as_str().unwrap();
         let mut child = Command::new("/bin/sh")
             .arg(&self.script)
@@ -89,7 +97,11 @@ impl Fx {
             .write_all(body.as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
-        assert!(out.status.success() && out.stdout.is_empty(), "{name}");
+        assert!(
+            out.status.success() && out.stdout.is_empty(),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Writes an event file directly (seq `n`), as a hook this process
@@ -97,6 +109,15 @@ impl Fx {
     fn put(&self, a: &CodexAdapter, n: u64, event: &str, body: &str) {
         let me = std::process::id();
         self.put_from(a, n, event, body, me);
+    }
+
+    /// The events counter now (`events/seq`): what Codex's PermissionRequest
+    /// hook records as its request's `evseq`.
+    fn evseq(&self, a: &CodexAdapter) -> u64 {
+        fs::read_to_string(a.dir().unwrap().join("events").join("seq"))
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     /// Writes an event file whose hook's parent was `parent`.
@@ -130,6 +151,7 @@ fn raw(json: Value) -> RawEvent {
         pid: 2,
         parent: 1,
         at_ms: 0,
+        seq: 1,
         json,
     }
 }
@@ -695,7 +717,8 @@ fn approvals_are_counted() {
     assert_eq!(
         a.poll_events(),
         [AgentEvent::WaitingForPermission {
-            detail: APPROVAL_DETAIL.into()
+            detail: APPROVAL_DETAIL.into(),
+            outlasts_turn: true,
         }]
     );
     a.set_open_approvals(1);
@@ -941,7 +964,8 @@ fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
     assert!(tick(&mut a, &mut chat).events.is_empty());
     assert_eq!(chat.status().state, State::Waiting);
     // the worker's reports follow the pass's hooks: a PostToolUse read with
-    // a new approval leaves it waiting
+    // a new approval leaves it waiting (the PostToolUse, read while one
+    // waits, finishes nothing of its own)
     a.set_open_approvals(0);
     a.set_open_approvals(1);
     f.fire(&a, "07-PostToolUse-after-approval.json");
@@ -950,7 +974,6 @@ fn a_pretooluse_in_the_same_pass_as_an_approval_keeps_it_waiting() {
         matches!(
             &t.events[..],
             [
-                AgentEvent::ToolFinished,
                 AgentEvent::ToolFinished,
                 AgentEvent::WaitingForPermission { .. },
             ]
@@ -1417,18 +1440,21 @@ fn waiting_for_an_approval(f: &Fx) -> (CodexAdapter, ChatSession) {
     rollout_upto(&f.a, A, 19);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
-    a.set_approvals(1, false);
+    // its call starts (PreToolUse, `<exec-1>`), then asks
+    f.fire(&a, "05-PreToolUse-before-approval.json");
+    tick(&mut a, &mut chat);
+    a.set_approvals(1, 0, 0);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Waiting);
     (a, chat)
 }
 
 #[test]
-fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
+fn a_released_approval_waits_in_codexs_dialog_until_it_is_dismissed() {
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
     // input to Codex: released ("no decision"), Codex shows its own dialog
-    a.set_approvals(0, true);
+    a.set_approvals(0, 1, now_ms());
     for _ in 0..3 {
         assert!(tick(&mut a, &mut chat).events.is_empty());
         assert_eq!(chat.status().state, State::Waiting);
@@ -1436,24 +1462,140 @@ fn a_released_approval_waits_in_codexs_dialog_until_its_posttooluse() {
     // a PreToolUse read meanwhile came before it
     f.fire(&a, "05-PreToolUse-before-approval.json");
     assert!(tick(&mut a, &mut chat).events.is_empty());
-    // answered there: the tool ran
+    // a PostToolUse (even this call's): nothing ties a result to the
+    // approval, so it ends nothing
     f.fire(&a, "07-PostToolUse-after-approval.json");
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert!(a.dialog_open());
+    // Esc at Codex's dialog
+    f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
     assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
-    assert_eq!(chat.status().state, State::Working);
+    assert!(!a.dialog_open());
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 #[test]
-fn codexs_own_dialog_ends_with_the_turns_next_item() {
+fn the_rollouts_next_command_or_reply_leaves_codexs_dialog() {
     let f = fx();
     let (mut a, mut chat) = waiting_for_an_approval(&f);
-    a.set_approvals(0, true);
+    a.set_approvals(0, 1, now_ms());
     assert!(tick(&mut a, &mut chat).events.is_empty());
-    // the command ran (no PostToolUse read yet)
-    rollout_upto(&f.a, A, 22);
+    rollout_upto(&f.a, A, 26);
     let t = tick(&mut a, &mut chat);
     assert!(!message_ids(&t.outs).is_empty());
+    assert!(tick(&mut a, &mut chat).events.is_empty());
+    assert!(a.dialog_open());
+    assert_eq!(chat.status().state, State::Waiting);
+}
+
+/// An event as the hook script publishes it, by hand: seq `n` and the
+/// counter raised to it.
+fn publish(f: &Fx, a: &CodexAdapter, n: u64, body: &Value) {
+    let event = body["hook_event_name"].as_str().unwrap();
+    f.put(a, n, event, &body.to_string());
+    let seq = a.dir().unwrap().join("events").join("seq");
+    let now: u64 = fs::read_to_string(&seq)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0);
+    fs::write(seq, format!("{}\n", now.max(n))).unwrap();
+}
+
+fn call_body(f: &Fx, event: &str, id: &str, command: &str) -> Value {
+    let mut body: Value =
+        serde_json::from_str(&f.hook("07-PostToolUse-after-approval.json")).unwrap();
+    body["hook_event_name"] = event.into();
+    body["tool_use_id"] = id.into();
+    body["tool_input"]["command"] = command.into();
+    body
+}
+
+/// Turn 2 of session A, its call's PreToolUse never seen (a hook Codex
+/// never started leaves no trace).
+fn asking_without_its_pretooluse(f: &Fx) -> (CodexAdapter, ChatSession) {
+    let mut a = f.adapter();
+    let mut chat = ChatSession::new(GEN.into(), 0);
+    f.fire(&a, "04-UserPromptSubmit-approval-turn.json");
+    rollout_upto(&f.a, A, 19);
+    tick(&mut a, &mut chat);
+    a.set_approvals(1, 0, 0);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    (a, chat)
+}
+
+/// Astation's counterexample (#81 6511290452): A's hook absent with nothing
+/// to show it (no marker, no gap, a complete history), same-command B the
+/// only call seen, B's result first, then a result naming A's call too. No
+/// tool result is proven to be the asking call's, so none ends the wait:
+/// held throughout (no prompt goes in), until a dismissal.
+#[test]
+fn no_tool_result_ends_codexs_dialog() {
+    let f = fx();
+    let (mut a, mut chat) = asking_without_its_pretooluse(&f);
+    let base = f.evseq(&a);
+    publish(
+        &f,
+        &a,
+        base + 1,
+        &call_body(&f, "PreToolUse", "c-b", "touch made.txt"),
+    );
+    tick(&mut a, &mut chat);
+    a.set_approvals(0, 1, now_ms());
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    tick(&mut a, &mut chat);
+    assert!(!a.take_answer_hint(), "no tool ended since the dialog");
+    publish(
+        &f,
+        &a,
+        base + 2,
+        &call_body(&f, "PostToolUse", "c-b", "touch made.txt"),
+    );
+    publish(
+        &f,
+        &a,
+        base + 3,
+        &call_body(&f, "PostToolUse", "<exec-1>", "touch made.txt"),
+    );
+    for _ in 0..3 {
+        let t = tick(&mut a, &mut chat);
+        assert!(
+            !t.events.contains(&AgentEvent::ToolFinished),
+            "{:?}",
+            t.events
+        );
+    }
+    assert!(a.dialog_open() && a.waiting());
+    // A tool's end only tells the terminal how to end the wait, once.
+    assert!(a.take_answer_hint());
+    assert!(!a.take_answer_hint());
+    assert_eq!(chat.status().state, State::Waiting);
+    assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
+    f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
     assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
-    assert_eq!(chat.status().state, State::Working);
+    assert_eq!(chat.status().state, State::Ready);
+}
+
+/// The person at the terminal says the approval was answered there (the
+/// prefix `a`): the wait ends, ready (its turn is over).
+#[test]
+fn the_person_at_the_terminal_ends_codexs_dialog_wait() {
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    a.set_approvals(0, 1, now_ms());
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    a.answered_here();
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert!(!a.dialog_open());
+    assert_eq!(chat.status().state, State::Ready);
 }
 
 #[test]
@@ -1467,7 +1609,7 @@ fn released_with_no_remote_wait_before_is_waiting_until_an_interrupt() {
     rollout_upto(&f.a, A, 67);
     tick(&mut a, &mut chat);
     assert_eq!(chat.status().state, State::Working);
-    a.set_approvals(0, true);
+    a.set_approvals(0, 1, now_ms());
     let t = tick(&mut a, &mut chat);
     assert!(
         matches!(&t.events[..], [AgentEvent::WaitingForPermission { .. }]),
@@ -1483,6 +1625,114 @@ fn released_with_no_remote_wait_before_is_waiting_until_an_interrupt() {
     f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
     assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
     assert_ne!(chat.status().state, State::Waiting);
+}
+
+/// Unix ms before turn 2's prompt in `rollout-session-A.jsonl`: evidence
+/// from the fixtures (and every hook fired now) is newer.
+const BEFORE_TURN_TWO: i64 = 1_792_215_201_000;
+
+/// Appends rollout records to `dst`: turn 2 of session A, from `at_ms`.
+fn append_turn_two(dst: &Path, at_ms: i64, records: &[(&str, Value)]) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().append(true).open(dst).unwrap();
+    for (n, (kind, payload)) in records.iter().enumerate() {
+        // the record's time: its `completed_at_ms` wins over `timestamp`
+        let mut payload = payload.clone();
+        payload["completed_at_ms"] = Value::from(at_ms + n as i64);
+        let line = serde_json::json!({
+            "timestamp": "2026-10-17T06:00:00.000Z",
+            "ordinal": 1000 + n,
+            "type": kind,
+            "payload": payload,
+        });
+        writeln!(file, "{line}").unwrap();
+    }
+}
+
+/// Codex 0.163 ends the turn while its exec cell still waits for the
+/// approval (the model's `wait` calls gave up): the reply and the turn's
+/// end, as in the incident.
+fn turn_two_ends_awaiting_approval(f: &Fx, at_ms: i64) {
+    append_turn_two(
+        &f.a,
+        at_ms,
+        &[
+            (
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "thread_id": "<session-A>",
+                    "turn_id": "<turn-2>", "item": {"type": "AgentMessage", "id": "<msg-await>",
+                    "content": [{"type": "Text", "text": "Awaiting approval to run the command."}],
+                    "phase": "final_answer"}}),
+            ),
+            (
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "root_turn_id": "<turn-2>",
+                    "turn_id": "<turn-2>", "last_agent_message": "Awaiting approval to run the command."}),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn codex_ending_the_turn_leaves_its_dialog_waiting() {
+    // The incident: the turn ended while the approval waited; it got no
+    // decision and Codex showed its own dialog. A prompt pasted now would
+    // answer that dialog (its Enter picks the default: allow once).
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    a.set_approvals(0, 1, now_ms());
+    assert!(a.dialog_open());
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    let mut outs = Vec::new();
+    for _ in 0..3 {
+        outs.extend(tick(&mut a, &mut chat).outs);
+    }
+    // the turn completes, the session stays waiting, no prompt goes in
+    assert_eq!(completes(&outs), [("<turn-2>".into(), None, Outcome::Done)]);
+    assert_eq!(chat.status().state, State::Waiting);
+    assert!(a.dialog_open());
+    assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
+    // a Stop hook doesn't end it either
+    f.fire(&a, "08-Stop-empty-last-message.json");
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    // Esc at Codex's dialog: answered, and with the turn over it is ready
+    f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert!(!a.dialog_open());
+    assert_eq!(chat.status().state, State::Ready);
+}
+
+#[test]
+fn a_remote_wait_outlasts_the_turns_end_too() {
+    // The turn ended while the hook still waits for a remote answer: the
+    // approval stays open (the worker no longer closes it at a plain turn
+    // end), and so does the waiting status.
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
+    tick(&mut a, &mut chat);
+    assert_eq!(chat.status().state, State::Waiting);
+    // answered remotely, the tool ran: ready (the turn is over)
+    a.set_approvals(0, 0, 0);
+    assert_eq!(tick(&mut a, &mut chat).events, [AgentEvent::ToolFinished]);
+    assert_eq!(chat.status().state, State::Ready);
+}
+
+#[test]
+fn a_dismissal_from_before_the_dialog_doesnt_end_it() {
+    // An Interrupt published before the dialog opened but read only after
+    // it: the dialog records every event published by then (the script's
+    // counter), so it is from before and ends nothing.
+    let f = fx();
+    let (mut a, mut chat) = waiting_for_an_approval(&f);
+    f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");
+    a.set_approvals(0, 1, now_ms());
+    for _ in 0..3 {
+        tick(&mut a, &mut chat);
+    }
+    assert!(a.dialog_open());
+    assert_eq!(chat.status().state, State::Waiting);
 }
 
 /// Session A with turn 1 over.

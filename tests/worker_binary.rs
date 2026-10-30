@@ -109,6 +109,17 @@ impl Env {
 
     /// Writes the spawn spec the broker would and starts `atem worker`.
     fn start_worker(&self, sid: &str, process_gen: &str) -> (Child, PathBuf) {
+        self.start_worker_with(sid, process_gen, "codex", &[])
+    }
+
+    /// `start_worker` with more environment for the worker itself.
+    fn start_worker_with(
+        &self,
+        sid: &str,
+        process_gen: &str,
+        provider: &str,
+        extra: &[(&str, &Path)],
+    ) -> (Child, PathBuf) {
         let socket = self
             .run
             .join("atem")
@@ -117,7 +128,7 @@ impl Env {
         let spec = json!({
             "session_id": sid,
             "process_gen": process_gen,
-            "provider": "codex",
+            "provider": provider,
             "args": [],
             "cwd": self.home,
             "rows": 24,
@@ -139,11 +150,11 @@ impl Env {
             .write_all(spec.to_string().as_bytes())
             .unwrap();
         let state = self.state.to_str().unwrap().to_string();
-        let child = self
-            .command(&["worker", "--state", &state, "--session", sid])
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut command = self.command(&["worker", "--state", &state, "--session", sid]);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        let child = command.stderr(Stdio::null()).spawn().unwrap();
         (child, socket)
     }
 
@@ -447,4 +458,297 @@ fn a_crashed_worker_and_agent_are_reported_interrupted_and_the_record_kept() {
         std::fs::read_to_string(&log).unwrap_or_default()
     );
     assert!(env.workers().join(format!("{sid}.json")).exists());
+}
+
+/// A Codex worker with Atem's hooks on (`[codex] hooks = true`) whose fake
+/// agent asks for one approval through the real hook script once `go`
+/// exists, and the PTY-fault directory the worker reads
+/// (`ATEM_TEST_PTY_FAULTS`: `hold` pauses the PTY writer, `hold_approvals`
+/// the approvals pass). Process-isolated: the markers reach only it.
+struct Approving {
+    /// Kept for the test's life: its temp dirs, and what it started.
+    _env: Env,
+    faults: PathBuf,
+    go: PathBuf,
+    socket: PathBuf,
+    _cleanup: Cleanup,
+    broker: Broker,
+}
+
+const APPROVING: &str = r#"#!/bin/sh
+echo ready
+while [ ! -e "$GO" ]; do sleep 0.02; done
+printf '%s' "$REQ" | /bin/sh "$SCRIPT" codex 300
+echo hook-done
+while read l; do echo "got:$l"; done
+"#;
+
+const TOUCH_REQ: &str = r#"{"hook_event_name":"PermissionRequest","turn_id":"t","tool_name":"Bash","tool_input":{"command":"touch probe.txt"}}"#;
+
+/// A fake agent showing Codex's own approval dialog (as Codex 0.163 draws
+/// it), with no hook involved.
+const DIALOG_ON_SCREEN: &str = r#"#!/bin/sh
+echo ready
+printf '  Would you like to run the following command?\n  $ touch made.txt\n  Press enter to confirm or esc to cancel\n'
+while read l; do echo "got:$l"; done
+"#;
+
+/// Claude's: the approval hook as Claude's `--settings` registers it (the
+/// worker passes `--settings <session dir>/settings.json` first).
+const CLAUDE_APPROVING: &str = r#"#!/bin/sh
+dir=$(dirname "$2")
+echo ready
+while [ ! -e "$GO" ]; do sleep 0.02; done
+printf '%s' "$REQ" | ATEM_APPROVAL_DIR="$dir" /bin/sh "$dir/approval-hook.sh" claude 600
+echo hook-done
+while read l; do echo "got:$l"; done
+"#;
+
+/// Claude Code's own permission dialog (2.1.30x), with no hook involved.
+const CLAUDE_DIALOG_ON_SCREEN: &str = r#"#!/bin/sh
+echo ready
+printf ' Bash command\n $ touch made.txt\n Do you want to proceed?\n > 1. Yes\n   4. No\n Esc to cancel · Tab to amend\n'
+while read l; do echo "got:$l"; done
+"#;
+
+impl Approving {
+    fn start(sid: &str) -> Self {
+        Self::start_with(sid, APPROVING)
+    }
+
+    fn start_with(sid: &str, agent: &str) -> Self {
+        Self::start_as(sid, agent, "codex")
+    }
+
+    fn start_as(sid: &str, agent: &str, provider: &str) -> Self {
+        let env = Env::new();
+        let config = env.home.join(".config").join("atem");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[codex]\nhooks = true\n").unwrap();
+        let root = env.home.parent().unwrap().to_path_buf();
+        let (faults, go, codex_home) = (root.join("faults"), root.join("go"), root.join("codex"));
+        std::fs::create_dir_all(&faults).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(&env.agent, agent).unwrap();
+        let mut cleanup = Cleanup::default();
+        let (worker, socket) = env.start_worker_with(
+            sid,
+            "3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+            provider,
+            &[("ATEM_TEST_PTY_FAULTS", &faults)],
+        );
+        cleanup.children.push(worker);
+        let mut broker = Broker::connect(&socket);
+        let script = config.join("hooks").join("approval-hook.sh");
+        let agent_env = json!([
+            ["PATH", "/usr/bin:/bin"],
+            ["CODEX_CLI_BIN", env.agent.to_str().unwrap()],
+            ["CLAUDE_CLI_BIN", env.agent.to_str().unwrap()],
+            ["CODEX_HOME", codex_home.to_str().unwrap()],
+            ["GO", go.to_str().unwrap()],
+            ["REQ", TOUCH_REQ],
+            ["SCRIPT", script.to_str().unwrap()]
+        ]);
+        broker.send(json!({"op": "start", "env": agent_env}));
+        let hello = broker.recv();
+        assert_eq!(hello["op"], "hello", "{hello}");
+        let agent_pid = hello["agent_pid"].as_u64().unwrap() as u32;
+        cleanup.agent = Some((agent_pid, start_time(agent_pid).unwrap()));
+        broker.until(|_, out| out.contains("ready"));
+        Self {
+            _env: env,
+            faults,
+            go,
+            socket,
+            _cleanup: cleanup,
+            broker,
+        }
+    }
+
+    /// The agent asks; the worker reports the approval open.
+    fn ask(&mut self) {
+        std::fs::write(&self.go, "").unwrap();
+        self.broker.until(|m, _| m["op"] == "approval_request");
+    }
+
+    fn marker(&self, name: &str, on: bool) {
+        let path = self.faults.join(name);
+        if on {
+            std::fs::write(path, "").unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    fn paste(&mut self, seq: u64, text: &str) {
+        self.broker.send(json!({"op": "paste", "seq": seq, "text": text, "input_epoch": 0, "release_approvals": true}));
+    }
+
+    /// Waits until the agent's output shows `text` (it may have come with
+    /// what was read already).
+    fn screen_shows(&mut self, text: &str) {
+        if !self.broker.output.contains(text) {
+            self.broker.until(|_, out| out.contains(text));
+        }
+    }
+
+    /// A paste as the broker sends Claude's (it releases nothing).
+    fn paste_claude(&mut self, seq: u64, text: &str) {
+        self.broker
+            .send(json!({"op": "paste", "seq": seq, "text": text, "input_epoch": 0}));
+    }
+
+    /// The paste's result: consumed with `APPROVAL_IN_DIALOG`, nothing written.
+    fn assert_held(&mut self, seq: u64, text: &str) {
+        let result = self.broker.result(seq);
+        assert_eq!(result["consumed"], true, "{result}");
+        assert_eq!(result["bytes_written"], 0, "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("approval dialog is open")),
+            "{result}"
+        );
+        // Whatever comes next on the screen, the prompt's bytes never do.
+        self.broker.send(json!({"op": "write", "seq": seq + 100, "bytes": STANDARD.encode(b"\r"), "input_epoch": 0}));
+        self.broker.result(seq + 100);
+        assert!(
+            !self.broker.output.contains(text),
+            "{:?}",
+            self.broker.output
+        );
+    }
+}
+
+impl Drop for Approving {
+    fn drop(&mut self) {
+        // Ends the agent's process group (the hook with it).
+        self.broker.send(json!({"op": "stop"}));
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only test seams (ATEM_TEST_PTY_FAULTS)"
+)]
+fn a_prompt_right_after_a_released_hook_ends_is_consumed_with_the_approvals_pass_held() {
+    let mut t = Approving::start("ses-dddddddd4444");
+    t.ask();
+    // From here the worker reads no approvals file and notices no ended
+    // hook: only what input handling latches counts.
+    t.marker("hold_approvals", true);
+    // Input to Codex gives the waiting hook "no decision" (consumed): Codex
+    // shows its own dialog.
+    t.broker.send(json!({"op": "write", "seq": 1, "bytes": STANDARD.encode(b"x"), "input_epoch": 0, "release_approvals": true}));
+    assert_eq!(t.broker.result(1)["consumed"], true);
+    t.broker.until(|_, out| out.contains("hook-done"));
+    // The hook is gone, the pass still held: a chat prompt now writes nothing.
+    t.paste(2, "pasted-into-dialog");
+    t.assert_held(2, "pasted-into-dialog");
+    t.marker("hold_approvals", false);
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only test seams (ATEM_TEST_PTY_FAULTS)"
+)]
+fn a_prompt_paused_in_the_writer_when_an_approval_opens_writes_nothing() {
+    let mut t = Approving::start("ses-eeeeeeee5555");
+    // The PTY writer pauses at its write boundary (before every check).
+    t.marker("hold", true);
+    // Nothing waits yet: the prompt is admitted and queued to the writer.
+    t.paste(1, "queued-before-approval");
+    // Meanwhile the agent asks for an approval and the worker sees it.
+    t.ask();
+    t.marker("hold", false);
+    t.assert_held(1, "queued-before-approval");
+}
+
+#[test]
+fn a_prompt_is_held_while_codexs_dialog_is_on_the_screen() {
+    // No hook said anything (one Codex never started, say): the dialog on
+    // the canonical screen alone holds chat prompts; terminal input goes.
+    let mut t = Approving::start_with("ses-ffffffff6666", DIALOG_ON_SCREEN);
+    t.screen_shows("Press enter to confirm");
+    t.paste(1, "pasted-at-the-dialog");
+    t.assert_held(1, "pasted-at-the-dialog");
+}
+
+#[test]
+fn a_dialog_and_its_prompt_hold_outlive_a_broker_restart() {
+    // The approval goes to Codex's own dialog; the broker goes away and a
+    // new one adopts the worker: a chat prompt is still never written.
+    let mut t = Approving::start("ses-gggggggg7777");
+    t.ask();
+    t.broker.send(json!({"op": "write", "seq": 1, "bytes": STANDARD.encode(b"x"), "input_epoch": 0, "release_approvals": true}));
+    assert_eq!(t.broker.result(1)["consumed"], true);
+    t.broker.until(|_, out| out.contains("hook-done"));
+    // The broker goes away.
+    t.broker.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    let socket = t.socket.clone();
+    let (broker, hello) = Broker::adopt(&socket);
+    assert_eq!(hello["op"], "hello", "{hello}");
+    t.broker = broker;
+    t.paste(2, "pasted-after-restart");
+    t.assert_held(2, "pasted-after-restart");
+}
+
+#[test]
+fn a_prompt_is_held_while_a_claude_approval_is_open() {
+    // Claude shows its own dialog while our hook waits (a background agent
+    // may ask after the turn ended): a chat prompt's Enter would pick
+    // "1. Yes". Held while the approval is open.
+    let mut t = Approving::start_as("ses-hhhhhhhh2222", CLAUDE_APPROVING, "claude");
+    t.ask();
+    t.paste_claude(1, "pasted-into-claudes-dialog");
+    t.assert_held(1, "pasted-into-claudes-dialog");
+}
+
+#[test]
+fn a_prompt_is_held_while_claudes_dialog_is_on_the_screen() {
+    let mut t = Approving::start_as("ses-jjjjjjjj3333", CLAUDE_DIALOG_ON_SCREEN, "claude");
+    t.screen_shows("Esc to cancel");
+    t.paste_claude(1, "pasted-at-claudes-dialog");
+    t.assert_held(1, "pasted-at-claudes-dialog");
+}
+
+/// Claude, through the real hook script: call A's PreToolUse, A's request,
+/// then same-command B's PostToolUse note, all while the approvals pass is
+/// held; it draws no dialog (the screen backstop can't help).
+const CLAUDE_BIND_RACE: &str = r#"#!/bin/sh
+dir=$(dirname "$2")
+hook() { ATEM_APPROVAL_DIR="$dir" /bin/sh "$dir/approval-hook.sh" "$@"; }
+echo ready
+while [ ! -e "$GO" ]; do sleep 0.02; done
+printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch x"},"tool_use_id":"a"}' | hook event PreToolUse sync
+printf '%s' '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"touch x"}}' | hook claude 600 &
+while ! ls "$dir"/approvals/req-*.json >/dev/null 2>&1; do sleep 0.02; done
+printf '%s' '{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"touch x"},"tool_use_id":"b"}' | hook post
+echo posted
+while read l; do echo "got:$l"; done
+"#;
+
+/// Finding 3 at the worker (#81 6510022266): A's new request and B's
+/// result read in one pass. A is bound to its own call before B's result
+/// is weighed, so it stays open, and a chat prompt writes nothing.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only test seams (ATEM_TEST_PTY_FAULTS)"
+)]
+fn a_new_claude_request_and_another_calls_result_in_one_pass_keep_the_hold() {
+    let mut t = Approving::start_as("ses-kkkkkkkk4444", CLAUDE_BIND_RACE, "claude");
+    t.marker("hold_approvals", true);
+    std::fs::write(&t.go, "").unwrap();
+    t.screen_shows("posted");
+    t.marker("hold_approvals", false);
+    let seen = t.broker.until(|m, _| m["op"] == "approval_request");
+    assert!(
+        !seen.iter().any(|m| m["op"] == "approval_closed"),
+        "B's result closed A: {seen:?}"
+    );
+    t.paste_claude(1, "pasted-into-claudes-dialog");
+    t.assert_held(1, "pasted-into-claudes-dialog");
 }
