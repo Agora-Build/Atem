@@ -1055,7 +1055,10 @@ mod script {
         let started = Instant::now();
         let (ok, stdout, _) = stop(s.path(), &script);
         assert!(ok && stdout.is_empty());
-        assert!(started.elapsed() < Duration::from_secs(3));
+        // At once, not after the ~2 s wait for a live holder (which, with a
+        // loaded machine's forks, ran into Codex's 3 s).
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(1500), "{took:?}");
         assert_eq!(event_files(s.path()), vec!["ev-0000000042-Stop.json"]);
         assert!(fs::symlink_metadata(&lock).is_err(), "released");
     }
