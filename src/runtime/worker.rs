@@ -1104,6 +1104,17 @@ impl Worker {
                     a.release(&request_id);
                 }
             }
+            BrokerMsg::ApprovalsAnswered => {
+                let events = self
+                    .approvals
+                    .as_mut()
+                    .map(|a| a.answered_here())
+                    .unwrap_or_default();
+                if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+                    codex.answered_here();
+                }
+                self.send_approval_events(events);
+            }
             BrokerMsg::KnownApprovals { request_ids } => {
                 if let Some(a) = self.approvals.as_mut() {
                     a.keep_only(&request_ids);
@@ -1252,13 +1263,7 @@ impl Worker {
             return;
         };
         let evidence = std::mem::take(&mut self.approval_evidence);
-        let mut claude = match self.adapter.as_mut() {
-            Some(ChatAdapter::Claude(claude)) => Some(claude.as_mut()),
-            _ => None,
-        };
-        let events = a.poll_binding(connected, evidence, &mut |tool, input, evseq| {
-            bind_claude_request(claude.as_deref_mut(), tool, input, evseq)
-        });
+        let events = a.poll(connected, evidence);
         self.send_approval_events(events);
     }
 
@@ -1376,21 +1381,23 @@ impl Worker {
         // waits for an approval: only an interrupted turn end answers one.
         if evidence {
             use super::worker_approvals::Evidence;
-            for e in &events {
-                let at_ms = match e {
-                    AgentEvent::PromptSubmitted { at_ms, .. } => at_ms,
-                    AgentEvent::TurnEnded { at_ms } if !codex => at_ms,
-                    _ => continue,
-                };
-                self.approval_evidence.push(Evidence::TurnEnded {
-                    interrupted: false,
-                    at_ms: *at_ms,
-                });
+            // Codex: a new prompt or an interrupted turn end gives its
+            // waiting hooks no decision (to its own dialog: the wait goes
+            // on there). Claude: neither ends anything (a background agent
+            // may ask while its parent's turn ends); its waits end with the
+            // hook, a remote answer or the person at the terminal.
+            for e in events.iter().filter(|_| codex) {
+                if let AgentEvent::PromptSubmitted { at_ms, .. } = e {
+                    self.approval_evidence.push(Evidence::TurnEnded {
+                        interrupted: false,
+                        at_ms: *at_ms,
+                    });
+                }
             }
             for item in &log {
                 match item {
                     LogItem::TurnEnded { outcome, .. }
-                        if codex && *outcome != crate::chat::adapter::Outcome::Interrupted => {}
+                        if !codex || *outcome != crate::chat::adapter::Outcome::Interrupted => {}
                     LogItem::TurnEnded { outcome, at_ms, .. } => {
                         self.approval_evidence.push(Evidence::TurnEnded {
                             interrupted: *outcome == crate::chat::adapter::Outcome::Interrupted,
@@ -1403,7 +1410,6 @@ impl Worker {
                         kind,
                         text,
                         at_ms,
-                        call,
                     } => {
                         if let Ok(input) = serde_json::from_str(input) {
                             self.approval_evidence.push(Evidence::Tool {
@@ -1412,7 +1418,6 @@ impl Worker {
                                 kind: *kind,
                                 text: text.clone(),
                                 at_ms: *at_ms,
-                                call: call.clone(),
                             });
                         }
                     }
@@ -1570,43 +1575,6 @@ struct Consume {
     until: Instant,
     /// The released hooks.
     ids: Vec<String>,
-}
-
-/// How a Claude approval request is bound to its call, before any result
-/// is weighed: to the calls whose PreToolUse was published by its request
-/// (`evseq`) and unfinished, not claimed by an earlier request
-/// (`ClaudeAdapter::call_for`). Claude asks one call at a time, so that is
-/// exactly its own, which it then claims. Not decidable until every event
-/// through `evseq` was read with no backlog; no `evseq`, or a lost
-/// PreToolUse: bound to no call (no result closes it). No PreToolUse sent
-/// and none lost: results are matched by tool and input. Other agents
-/// name no calls here (Codex's dialogs are its adapter's).
-fn bind_claude_request(
-    claude: Option<&mut crate::chat::claude::ClaudeAdapter>,
-    tool: &str,
-    input: &serde_json::Value,
-    evseq: Option<u64>,
-) -> super::worker_approvals::Binding {
-    use super::worker_approvals::Binding;
-    let Some(claude) = claude else {
-        return Binding::NoCalls;
-    };
-    let Some(evseq) = evseq else {
-        return Binding::Calls(Vec::new());
-    };
-    match claude.read_through() {
-        Some(through) if through >= evseq => {}
-        _ => return Binding::NotYet,
-    }
-    let calls = claude.call_for(tool, input, evseq);
-    match &calls[..] {
-        [] if !claude.calls_incomplete() => Binding::NoCalls,
-        [call] => {
-            claude.claim(call);
-            Binding::Calls(calls)
-        }
-        _ => Binding::Calls(calls),
-    }
 }
 
 /// Input consumed (nothing written) because it handed a waiting approval to

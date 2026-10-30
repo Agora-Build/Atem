@@ -317,7 +317,6 @@ impl TranscriptReader {
                 kind,
                 text: truncate(&text, RESULT_TEXT_CAP),
                 at_ms: ts,
-                call: Some(id.to_string()),
             });
         }
     }

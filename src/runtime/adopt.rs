@@ -302,6 +302,12 @@ impl WorkerHandle {
         })
     }
 
+    /// The person at a local frontend says the approvals were answered in
+    /// the agent's own dialog.
+    pub fn approvals_answered(&self) -> Result<()> {
+        self.send(&BrokerMsg::ApprovalsAnswered)
+    }
+
     /// "No decision" for one waiting approval.
     pub fn release_approval(&self, request_id: &str) -> Result<()> {
         self.send(&BrokerMsg::ReleaseApproval {

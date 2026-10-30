@@ -68,7 +68,6 @@
 
 use crate::chat::adapter::ToolResultKind;
 use crate::chat::approvals::{self, Agent, Ancestry, HookAgent, Request, SessionRule};
-use crate::chat::codex::adapter::DialogCall;
 use crate::runtime::worker_protocol::{ApplyOutcome, HeldRule, RuleGrant};
 use crate::session_protocol::host::ApprovalInfo;
 use crate::session_protocol::wire::{ApprovalCloseReason, ApprovalDecision, MAX_SESSION_RULES};
@@ -134,16 +133,12 @@ pub enum Evidence {
         kind: ToolResultKind,
         text: String,
         at_ms: i64,
-        /// Its call (`tool_use_id`), when the agent names it.
-        call: Option<String>,
     },
     /// A tool ran (Claude's PostToolUse, via `post-<id>.json`).
     Ran {
         tool_name: String,
         input: Value,
         at_ms: i64,
-        /// Its call (`tool_use_id`), when the agent names it.
-        call: Option<String>,
     },
     /// A new prompt or the turn's end; `interrupted`: the user stopped it.
     /// `at_ms`: when the agent reported it (unix ms); it answers only a
@@ -153,28 +148,6 @@ pub enum Evidence {
         at_ms: Option<i64>,
     },
 }
-
-/// How a newly read request is bound to the call it asks about (the
-/// binder `Approvals::poll_binding` asks, before any result is weighed).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Binding {
-    /// The calls it can be: closed only by results naming them, once each
-    /// of them ended (empty: none known, so no result closes it).
-    Calls(Vec<String>),
-    /// The agent names no calls (no tool hooks, or Codex, whose dialogs
-    /// its adapter matches): results are matched by tool and input,
-    /// uniquely.
-    NoCalls,
-    /// Not decidable yet (the events it depends on aren't all read): no
-    /// result may close it meanwhile; asked again at the next poll.
-    NotYet,
-}
-
-/// A result that could be a not-yet-bound request's waits this long for
-/// its binding, then is dropped (the request stays for its hook's end).
-const DEFER_FOR: Duration = Duration::from_secs(60);
-/// Results held back at most.
-const MAX_DEFERRED: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 enum State {
@@ -201,15 +174,6 @@ struct Waiting {
     opened: Instant,
     /// The request file's time.
     opened_ms: i64,
-    /// Codex: the hook events published when it asked (`evseq-<id>`, the
-    /// events counter): its call is among the calls started by then.
-    evseq: Option<u64>,
-    /// Claude: the calls this request can be (`bind`; `None`: not bound,
-    /// so results are matched by tool and input), those of them that ran,
-    /// and whether binding was decided (`unbound` asks no more).
-    calls: Option<Vec<String>>,
-    ran: Vec<String>,
-    settled: bool,
     /// Sent to the broker.
     reported: bool,
     /// This session's agent started its hook (Codex; Claude: always).
@@ -240,12 +204,9 @@ pub struct Approvals {
     /// last `take_released` (released, closed by a prompt or an interrupt,
     /// or their hook ended without one): Codex shows its own dialog for
     /// each.
-    released: Vec<DialogCall>,
+    released: usize,
     /// Codex: the Atem session rules of this agent process, oldest first.
     rules: Vec<Kept>,
-    /// Results held back until the request they could be about is bound
-    /// (`weigh_at`), with when each was first read.
-    deferred: Vec<(Instant, Evidence)>,
 }
 
 /// A session rule the worker keeps.
@@ -301,26 +262,6 @@ fn hook_alive(pid: u32, start: Option<u64>) -> bool {
 }
 
 /// Equal tool inputs (serde_json's maps compare regardless of key order).
-/// A tool result's tool, input, time and call.
-fn result_parts(ev: &Evidence) -> Option<(&str, &Value, i64, Option<&String>)> {
-    match ev {
-        Evidence::Tool {
-            tool_name,
-            input,
-            at_ms,
-            call,
-            ..
-        }
-        | Evidence::Ran {
-            tool_name,
-            input,
-            at_ms,
-            call,
-        } => Some((tool_name, input, *at_ms, call.as_ref())),
-        Evidence::TurnEnded { .. } => None,
-    }
-}
-
 fn same_tool(r: &Request, tool_name: &str, input: &Value) -> bool {
     r.tool_name == tool_name && &r.tool_input == input
 }
@@ -338,9 +279,8 @@ impl Approvals {
             waiting: BTreeMap::new(),
             codex_session: None,
             queued: Vec::new(),
-            released: Vec::new(),
+            released: 0,
             rules: Vec::new(),
-            deferred: Vec::new(),
         }
     }
 
@@ -409,8 +349,8 @@ impl Approvals {
             }
             if self.withdraw(&id) {
                 self.write_decision(&id, "");
-                let call = self.waiting.get(&id).and_then(|w| self.dialog_call(w));
-                self.released.extend(call);
+                let to_dialog = self.waiting.get(&id).is_some_and(|w| self.to_dialog(w));
+                self.released += usize::from(to_dialog);
             }
         }
     }
@@ -522,10 +462,10 @@ impl Approvals {
             return;
         };
         let reported = w.reported;
-        let to_dialog = self.dialog_call(w);
+        let to_dialog = self.to_dialog(w);
         match w.state.clone() {
             State::Open => {
-                self.released.extend(to_dialog.clone());
+                self.released += usize::from(to_dialog);
                 self.write_decision(id, "");
                 self.set(id, State::Released);
                 if reported {
@@ -537,7 +477,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
-                    self.released.extend(to_dialog.clone());
+                    self.released += usize::from(to_dialog);
                     self.write_decision(id, "");
                     self.set(id, State::Released);
                     self.queued.push(Event::Applied {
@@ -554,27 +494,46 @@ impl Approvals {
 
     /// Codex: this session's requests that got "no decision" (its own
     /// dialog shows them) since the last call.
-    pub fn take_released(&mut self) -> Vec<DialogCall> {
+    pub fn take_released(&mut self) -> usize {
         std::mem::take(&mut self.released)
     }
 
-    /// The call Codex's own dialog asks about once `w` gets no decision:
-    /// only for this session's own Codex hooks.
-    fn dialog_call(&self, w: &Waiting) -> Option<DialogCall> {
-        (self.agent == Agent::Codex && w.ours).then(|| DialogCall {
-            evseq: w.evseq,
-            tool_name: w
-                .request
-                .as_ref()
-                .map(|r| r.tool_name.clone())
-                .unwrap_or_default(),
-            command: w
-                .request
-                .as_ref()
-                .and_then(|r| r.tool_input.get("command"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        })
+    /// Codex shows its own dialog once `w` gets no decision: only for this
+    /// session's own Codex hooks.
+    fn to_dialog(&self, w: &Waiting) -> bool {
+        self.agent == Agent::Codex && w.ours
+    }
+
+    /// The person at the terminal says the approvals waiting were answered
+    /// there, in the agent's own dialog (the prefix `a`): each hook gets "no
+    /// decision" (our decision not taken yet is withdrawn) and a reported
+    /// one closes `answered_terminal`. An explicit human assertion: nothing
+    /// else ends a wait on the strength of the terminal.
+    pub fn answered_here(&mut self) -> Vec<Event> {
+        let ids: Vec<String> = self.waiting.keys().cloned().collect();
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(w) = self.waiting.get(&id) else {
+                continue;
+            };
+            let reported = w.reported;
+            let answered = match w.state.clone() {
+                State::Open => true,
+                State::Decided { .. } => self.withdraw(&id),
+                State::Claimed { .. } | State::Released => false,
+            };
+            if answered {
+                self.write_decision(&id, "");
+                self.set(&id, State::Released);
+                if reported {
+                    out.push(Event::Closed {
+                        request_id: id.clone(),
+                        reason: ApprovalCloseReason::AnsweredTerminal,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// The broker's `release_approval` (the host closed it): "no decision".
@@ -751,22 +710,7 @@ impl Approvals {
     /// released at once), decisions the hooks took, Claude's tool-ran notes
     /// — applies `evidence` (from the chat adapter), and finds hooks that
     /// ended.
-    /// `poll_binding` with every request left unbound (tests).
-    #[cfg(test)]
     pub fn poll(&mut self, connected: bool, evidence: Vec<Evidence>) -> Vec<Event> {
-        self.poll_binding(connected, evidence, &mut |_, _, _| Binding::NoCalls)
-    }
-
-    /// Reads the approvals directory, binds every request not bound yet
-    /// (`binder`: tool, input, `evseq`) before any result is weighed, then
-    /// weighs the results: held-back ones first, then the hooks' notes,
-    /// then `evidence`.
-    pub fn poll_binding(
-        &mut self,
-        connected: bool,
-        evidence: Vec<Evidence>,
-        binder: &mut dyn FnMut(&str, &Value, Option<u64>) -> Binding,
-    ) -> Vec<Event> {
         let mut out = std::mem::take(&mut self.queued);
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return out;
@@ -831,32 +775,12 @@ impl Approvals {
                     tool_name: tool_name.to_string(),
                     input: ran.get("tool_input").cloned().unwrap_or(Value::Null),
                     at_ms,
-                    call: ran
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
                 });
             }
         }
         all.extend(evidence);
-        // Every request read now is bound first: a result read in the same
-        // pass never closes a request whose call isn't known yet.
-        for (id, tool, input, evseq) in self.unbound() {
-            match binder(&tool, &input, evseq) {
-                Binding::Calls(calls) => self.bind(&id, calls),
-                Binding::NoCalls => self.leave_unbound(&id),
-                Binding::NotYet => {}
-            }
-        }
-        let held = std::mem::take(&mut self.deferred);
-        let fresh = Instant::now();
-        for (since, ev) in held {
-            if since.elapsed() < DEFER_FOR {
-                self.weigh_at(ev, since, &mut out);
-            }
-        }
         for ev in all {
-            self.weigh_at(ev, fresh, &mut out);
+            self.weigh(ev, &mut out);
         }
         out.append(&mut self.queued);
         out.extend(self.ended());
@@ -882,8 +806,6 @@ impl Approvals {
             .copied()
             .filter(|p| *p > 0)
             .map(|p| (p, super::adopt::process_start_time(p)));
-        let evseq =
-            read_capped(&self.path("evseq", id, "")).and_then(|t| t.trim().parse::<u64>().ok());
         let ours = match self.agent {
             Agent::Claude => true,
             Agent::Codex => self.codex_owns(ids.get(1).copied(), value.as_ref()),
@@ -915,10 +837,6 @@ impl Approvals {
                 pid,
                 opened: Instant::now(),
                 opened_ms,
-                evseq,
-                calls: None,
-                ran: Vec::new(),
-                settled: false,
                 reported: false,
                 ours,
                 pending_rule: None,
@@ -991,97 +909,17 @@ impl Approvals {
         }
     }
 
-    /// A tool result naming its call (`tool_use_id`): it can end only the
-    /// requests bound to that call, each once every call it can be ended
-    /// (its own, exactly, when it can be only one). A request bound to
-    /// other calls is never its; only an unbound one (its agent names no
-    /// calls) is matched by tool and input.
-    fn call_ended(&mut self, call: &str, ev: &Evidence, out: &mut Vec<Event>) {
-        let mut answered = Vec::new();
-        let mut bound_to_it = false;
-        for (id, w) in self.waiting.iter_mut() {
-            if w.state == State::Released {
-                continue;
-            }
-            if let Some(calls) = &w.calls
-                && calls.iter().any(|c| c == call)
-            {
-                bound_to_it = true;
-                if !w.ran.iter().any(|c| c == call) {
-                    w.ran.push(call.to_string());
-                }
-                if calls.iter().all(|c| w.ran.contains(c)) {
-                    answered.push(id.clone());
-                }
-            }
-        }
-        for id in answered {
-            self.resolve(&id, ev, out);
-        }
-        if !bound_to_it {
-            self.resolve_unbound(ev, out);
-        }
-    }
-
-    /// A result closes an unbound request (its agent names no calls) only
-    /// when it matches exactly one by tool and input.
-    fn resolve_unbound(&mut self, ev: &Evidence, out: &mut Vec<Event>) {
-        if let Some((tool_name, input, at_ms, _)) = result_parts(ev)
-            && let Some(id) = self.target(tool_name, input, at_ms)
-        {
-            self.resolve(&id, ev, out);
-        }
-    }
-
-    /// Claude's requests not bound to calls yet: id, tool, input and
-    /// `evseq` (the events published when it asked).
-    pub fn unbound(&self) -> Vec<(String, String, Value, Option<u64>)> {
-        self.waiting
-            .iter()
-            .filter(|(_, w)| !w.settled && w.state != State::Released)
-            .filter_map(|(id, w)| {
-                let r = w.request.as_ref()?;
-                Some((
-                    id.clone(),
-                    r.tool_name.clone(),
-                    r.tool_input.clone(),
-                    w.evseq,
-                ))
-            })
-            .collect()
-    }
-
-    /// Binds request `id` to the calls it can be (`ClaudeAdapter::call_for`;
-    /// empty: none known, so no result closes it).
-    pub fn bind(&mut self, id: &str, calls: Vec<String>) {
-        if let Some(w) = self.waiting.get_mut(id) {
-            w.calls = Some(calls);
-            w.settled = true;
-        }
-    }
-
-    /// Request `id` stays unbound: the agent sent no PreToolUse for it and
-    /// none was lost (an agent, or a test agent, without tool hooks), so
-    /// results are matched by tool and input, uniquely.
-    pub fn leave_unbound(&mut self, id: &str) {
-        if let Some(w) = self.waiting.get_mut(id) {
-            w.settled = true;
-        }
-    }
-
-    /// The unbound request (settled, its agent naming no calls) a result
-    /// is about: the only one with the same tool and input (opened by the
-    /// evidence's time). Two such can't be told apart: the result closes
-    /// neither, which their hooks' own ends or a later, unambiguous result
-    /// do. A bound request is never matched this way.
+    /// The request whose decision a tool result can judge: the only one
+    /// with the same tool and input whose hook took Atem's decision
+    /// (`Claimed`), opened by the result's time. A result never ends a wait
+    /// (open, or our decision not taken yet): the agents' PermissionRequest
+    /// names no call, so no result can be proven to be the asking call's.
     fn target(&self, tool_name: &str, input: &Value, at_ms: i64) -> Option<String> {
         let candidates: Vec<&String> = self
             .waiting
             .iter()
             .filter(|(_, w)| {
-                w.state != State::Released
-                    && w.settled
-                    && w.calls.is_none()
+                matches!(w.state, State::Claimed { .. })
                     && w.opened_ms <= at_ms + RESULT_SLACK_MS
                     && w.request
                         .as_ref()
@@ -1093,33 +931,6 @@ impl Approvals {
             [id] => Some(id.clone()),
             _ => None,
         }
-    }
-
-    /// Weighs `ev` (first read at `since`). A result that a request not yet
-    /// bound could be about is held back (`deferred`) until that request is
-    /// bound: it never falls back to tool-and-input matching meanwhile.
-    fn weigh_at(&mut self, ev: Evidence, since: Instant, out: &mut Vec<Event>) {
-        if let Some((tool_name, input, at_ms, _)) = result_parts(&ev)
-            && self.unsettled_could_be(tool_name, input, at_ms)
-        {
-            if self.deferred.len() < MAX_DEFERRED {
-                self.deferred.push((since, ev));
-            }
-            return;
-        }
-        self.weigh(ev, out);
-    }
-
-    /// A request not bound yet has this tool and input (opened by then).
-    fn unsettled_could_be(&self, tool_name: &str, input: &Value, at_ms: i64) -> bool {
-        self.waiting.values().any(|w| {
-            !w.settled
-                && w.state != State::Released
-                && w.opened_ms <= at_ms + RESULT_SLACK_MS
-                && w.request
-                    .as_ref()
-                    .is_some_and(|r| same_tool(r, tool_name, input))
-        })
     }
 
     fn weigh(&mut self, ev: Evidence, out: &mut Vec<Event>) {
@@ -1142,13 +953,19 @@ impl Approvals {
                     self.resolve(&id, &ev, out);
                 }
             }
-            // A tool result (it ran, or the transcript says it failed or
-            // was refused): by its call when it names one; a result naming
-            // none can't be a bound request's.
-            Evidence::Ran { .. } | Evidence::Tool { .. } => {
-                match result_parts(&ev).and_then(|(_, _, _, call)| call.cloned()) {
-                    Some(call) => self.call_ended(&call, &ev, out),
-                    None => self.resolve_unbound(&ev, out),
+            Evidence::Tool {
+                tool_name,
+                input,
+                at_ms,
+                ..
+            }
+            | Evidence::Ran {
+                tool_name,
+                input,
+                at_ms,
+            } => {
+                if let Some(id) = self.target(tool_name, input, *at_ms) {
+                    self.resolve(&id, &ev, out);
                 }
             }
         }
@@ -1169,13 +986,11 @@ impl Approvals {
         };
         // "No decision" after a prompt or a turn end (not a tool that ran):
         // Codex may show its own dialog for it.
-        let to_dialog = self
-            .dialog_call(w)
-            .filter(|_| matches!(ev, Evidence::TurnEnded { .. }));
+        let to_dialog = self.to_dialog(w) && matches!(ev, Evidence::TurnEnded { .. });
         match w.state.clone() {
             State::Released => {}
             State::Open => {
-                self.released.extend(to_dialog.clone());
+                self.released += usize::from(to_dialog);
                 if reported {
                     out.push(Event::Closed {
                         request_id: id.into(),
@@ -1187,7 +1002,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
-                    self.released.extend(to_dialog.clone());
+                    self.released += usize::from(to_dialog);
                     out.push(Event::Closed {
                         request_id: id.into(),
                         reason,
@@ -1236,10 +1051,10 @@ impl Approvals {
             };
             // A Codex hook that ended without a decision: Codex shows its
             // own dialog.
-            let to_dialog = self.dialog_call(w);
+            let to_dialog = self.to_dialog(w);
             match w.state.clone() {
                 State::Open if !alive => {
-                    self.released.extend(to_dialog.clone());
+                    self.released += usize::from(to_dialog);
                     if w.reported {
                         out.push(Event::Closed {
                             request_id: id.clone(),
@@ -1252,7 +1067,7 @@ impl Approvals {
                 // timeout).
                 State::Decided { allow, deny } if !alive => {
                     if self.withdraw(&id) {
-                        self.released.extend(to_dialog.clone());
+                        self.released += usize::from(to_dialog);
                         out.push(Event::Closed {
                             request_id: id.clone(),
                             reason: gone,

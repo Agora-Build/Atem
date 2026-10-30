@@ -834,6 +834,18 @@ fn claude_approvals_end_to_end() {
         t.contains("Do you want to proceed")
     });
     fe.send(b"\r");
+    // The tool runs; its result alone ends no wait (no call id ties it to
+    // the approval): the person at the terminal says it was answered (the
+    // prefix, then `a`).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !work.join("terminal.txt").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the terminal's Yes never ran the tool"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    fe.send(b"\x1da");
     assert_eq!(
         rig.closed(&aid, Duration::from_secs(30)),
         "answered_terminal"
@@ -864,7 +876,7 @@ fn claude_approvals_end_to_end() {
         work.join("terminal.txt").exists(),
         "terminal.txt was not created"
     );
-    report.push("4 terminal first: closed answered_terminal; push_resolved answered_terminal; card answered_terminal; late allow_once → error stale_target, no receipt; file created by the terminal's Yes".into());
+    report.push("4 terminal first: the terminal's Yes ran the tool, the prefix `a` closed it answered_terminal; push_resolved answered_terminal; card answered_terminal; late allow_once → error stale_target, no receipt".into());
 
     // 3. allow_always with an offered rule.
     ask_claude(&mut fe, "touch always.txt");
@@ -1227,9 +1239,11 @@ fn codex_approvals_end_to_end() {
     within_secs("codex-local.txt", 60, || {
         work.join("codex-local.txt").exists()
     });
+    // Its result ends no wait: the person at the terminal says so.
+    fe.send(b"\x1da");
     screen_until(&fe, "Codex idle", TURN, codex_idle);
     report.push(format!(
-        "8 local key while the hook waits: dialog visible before: {dialog_before}; closed {reason}; push_resolved {}; first 'y' consumed: {consumed}; 'y' at Codex's own dialog created the file",
+        "8 local key while the hook waits: dialog visible before: {dialog_before}; closed {reason}; push_resolved {}; first 'y' consumed: {consumed}; 'y' at Codex's own dialog created the file, the prefix `a` ended the wait",
         resolved["reason"]
     ));
     assert_eq!(reason, "released");

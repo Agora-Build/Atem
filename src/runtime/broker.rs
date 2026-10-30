@@ -497,6 +497,15 @@ impl BrokerSession {
         }
     }
 
+    /// The person at a local frontend says the agent's approvals were
+    /// answered in its own dialog.
+    pub fn approvals_answered(&self) -> anyhow::Result<()> {
+        match &self.worker {
+            Some(worker) => worker.approvals_answered(),
+            None => Ok(()),
+        }
+    }
+
     /// "No decision" for one waiting hook.
     pub fn release_approval(&self, request_id: &str) -> anyhow::Result<()> {
         match &self.worker {

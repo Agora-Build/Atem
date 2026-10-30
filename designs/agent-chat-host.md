@@ -603,11 +603,11 @@ and a failure is a session notice (Codex starts anyway).
   seen; a remote prompt or interrupt that released one is `rejected` — no
   broker, an adopting broker that doesn't know it, a prompt or interrupted
   turn end closing it, its hook ending without one) — each such approval
-  until evidence from after it went there: the PostToolUse of the one call
-  it can be about, or the dialog dismissed or gone (Interrupt or UserPromptSubmit hook, the rollout's next user message
-  or `turn_aborted`); never a Stop, a plain `task_complete`, a reply or
-  another call's result (Codex's rollout names no call for a command, so a
-  command item proves nothing) — `ready` at `task_complete` /
+  until the dialog is dismissed or gone (Interrupt or UserPromptSubmit
+  hook, the rollout's next user message or `turn_aborted`, all after it
+  went there), or the person at the terminal says it was answered (the
+  prefix, then `a`: "approval answered"); never a Stop, a plain
+  `task_complete`, a reply or a tool result — `ready` at `task_complete` /
   `turn_aborted` otherwise.
   Codex's waits outlast the turn: Codex (0.163, its exec cell) may end the
   turn while the approval still waits, or with its dialog still open, so a
@@ -623,67 +623,48 @@ and a failure is a session notice (Codex starts anyway).
   holds chat prompts at the PTY write boundary too, so a prompt queued
   before is never written (`FencedOutcome::Held`, reported like a consumed
   paste). Terminal input is still written (whoever types sees the
-  dialog). Codex's PermissionRequest names no call (no `tool_use_id`, and
-  no call identity in the hook's environment), so a dialog's candidates
-  are the calls whose PreToolUse has its tool and command, published by
-  its request and unfinished then, by event sequence, never by time: the
-  PermissionRequest hook records the events counter (`evseq-<id>`), and
-  PreToolUse is synchronous, so Codex ran it to its end before asking
-  (verified on codex-cli 0.163.0, also for `apply_patch` and for parallel
-  calls). Only the PostToolUse of a sole candidate answers it. Concurrent
-  identical calls are ambiguous (nothing tells them apart): neither result
-  answers the dialog, only a dismissal does. Codex lets a failed, timed
-  out or killed hook through (only exit 2 blocks), so every synchronous
-  hook first leaves a start marker and removes it once published: a
-  marker of a dead hook, or an unreadable PreToolUse event, makes the
-  calls incomplete, and until the next re-pin no result answers any
-  dialog (with a notice and a worker log line, so losses are counted). The
-  script advances the counter before publishing under it, either step
-  failing the hook (never a partial success): an event never exists above
-  the counter, and a number without its event is a gap the reader reports
-  as a lost event. Results are judged only on a complete history: no
-  backlog unread, every event through the request's `evseq` read, and that
-  poll's losses known; a result read meanwhile is recorded and judged later.
-  A
-  PreToolUse that can't publish exits 2 (its tool blocked). As a backstop
-  for what hooks can't report (a hook Codex never started, for
-  PermissionRequest too), chat prompts are also held while Codex's own
-  approval dialog is on the canonical screen.
+  dialog). As a backstop for what hooks can't report (a hook the agent
+  never started), chat prompts are also held while the agent's own
+  approval dialog is on the canonical screen, for both agents.
+  **Invariant, both agents: a tool result never ends an approval wait.**
+  Neither agent's PermissionRequest names its call (no `tool_use_id`, and
+  no call identity in the hook's environment; verified on codex-cli
+  0.163.0 and Claude Code 2.1.302), so no result can be proven to be the
+  exact call's: Codex lets a failed, timed out or killed hook through (only
+  exit 2 blocks), and a PreToolUse hook it never started leaves nothing to
+  count, so even a sole candidate is an inference (Astation's review,
+  #81). A wait ends only on evidence that names the dialog itself: a
+  dismissal after it (above), the request's hook ending (timeout, kill,
+  process exit), a remote answer, or the local key `a`. Event collection
+  is still lossless and sequenced (the script advances the counter before
+  publishing under it, either step failing the hook; a start marker until
+  published; a gap or an unreadable event is reported as lost, with a
+  notice and a worker log line), so status and chat never act on a partial
+  history.
   Claude (spike on Claude Code 2.1.302): its own dialog shows while our
   hook waits, typed text plus Enter answers it ("1. Yes"), a background
   agent can ask after its parent turn's Stop (Notification ~6 s later),
-  PreToolUse exit 1 is let through, PermissionRequest names no call, and
-  parallel calls ask one after another (never two dialogs of one agent at
-  once). So for Claude: chat prompts are held at paste and at the PTY
-  writer while any of its approvals is open or Claude's dialog is on the
-  screen (a prompt the broker admits while the status still says `ready`,
-  before Claude's Notification, is `rejected` with nothing written; the
-  status itself is unchanged, as the shared fixtures expect). Claude's
-  hooks run the one hook script (`event <Event> sync`): every event is
-  published under its lock in sequence order, never dropped, with a start
-  marker until published, so a lost event (Claude lets a failed or killed
-  hook through) is detected and fails closed: the status shows working
-  until the turn ends, and requests are no longer bound to calls. Each
-  request is bound to the calls it can be by event sequence (its
-  PreToolUse published by the request's `evseq`, unfinished then, not
-  claimed by an earlier request); since Claude asks one call at a time
-  that is exactly its own, which it claims (a denied call never ends with
-  a PostToolUse, so a retry of the same command is never mistaken for
-  it). It closes on results only once each of its calls ran
-  (`tool_use_id`, from its PostToolUse note or the transcript's failed or
-  refused result), never on another call's or on a result naming none. A
-  request is bound in the same approvals pass that reads it, before any
-  result is weighed; until its binding can be decided (every event through
-  its `evseq` read, no backlog) a result it could be about is held back,
-  never matched by tool and input. Invariant, both agents: an approval
-  wait is cleared by a tool result only when that result is proven to be
-  the exact call's. Claude's file dialogs ("Do you
-  want to create …?", "Do you want to make this edit to …?") were checked
-  live for the screen backstop.
-  A refusal in Codex's dialog leaves no evidence Atem can read:
-  the session stays `waiting` until a prompt typed in the terminal or an
-  interrupt (fail closed). Found live on 2026-10-29: a remote prompt pasted into the
-  dialog approved a command.
+  PreToolUse exit 1 is let through, and parallel calls ask one after
+  another (never two dialogs of one agent at once). So for Claude: chat
+  prompts are held at paste and at the PTY writer while any of its
+  approvals is open or Claude's dialog is on the screen (a prompt the
+  broker admits while the status still says `ready`, before Claude's
+  Notification, is `rejected` with nothing written; the status itself is
+  unchanged, as the shared fixtures expect). Claude's hooks run the one
+  hook script (`event <Event> sync`), every event published in sequence; a
+  lost event makes the status working until the turn ends. A request
+  answered in Claude's own dialog stays open (its card pending, prompts
+  held) until its hook ends (600 s) or the person at the terminal presses
+  the prefix, then `a`, which closes it `answered_terminal` (an allow
+  written for it and not yet taken is withdrawn first). Claude's file
+  dialogs ("Do you want to create …?", "Do you want to make this edit to
+  …?") were checked live for the screen backstop.
+  A refusal in Codex's dialog leaves no evidence Atem can read either:
+  the session stays `waiting` until a prompt typed in the terminal, an
+  interrupt or the key `a` (fail closed). Found live on 2026-10-29: a
+  remote prompt pasted into the dialog approved a command. Upstream asks:
+  a call id in PermissionRequest (Codex and Claude) would let a result end
+  a wait.
 - **Prompts.** Pasted bracketed plus Enter through the worker; accepted when
   UserPromptSubmit and the rollout's UserMessage both name it, with the same
   `turn_id`; completed at that turn's end (interrupted at `turn_aborted`).

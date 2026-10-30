@@ -756,6 +756,29 @@ fn queued_remote_bytes_are_dropped_at_the_worker_when_local_input_takes_over() {
     });
 }
 
+/// The person at the local frontend answered in the agent's own dialog and
+/// says so (the prefix `a`): attached first, as a frontend is.
+async fn answered_here(client: &mut RuntimeClient, sid: &str) {
+    client
+        .send(&ClientMsg::Attach {
+            session_id: sid.to_string(),
+            rows: 24,
+            cols: 80,
+        })
+        .await
+        .unwrap();
+    expect(client, |m| {
+        matches!(m, RuntimeMsg::Attached { .. }).then_some(())
+    })
+    .await;
+    client
+        .send(&ClientMsg::ApprovalsAnswered {
+            session_id: sid.to_string(),
+        })
+        .await
+        .unwrap();
+}
+
 /// Opens `conversation` once chat is available; returns `opened`.
 async fn open_chat(peer: &mut Peer, conversation: &str, sid: &str, pg: &str) -> Value {
     tokio::time::timeout(WAIT, async {
@@ -2471,6 +2494,7 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
             .unwrap()
             .to_string();
         std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
+        answered_here(&mut client, &sid).await;
         let a = aid.clone();
         let closed = peer
             .wait(move |v| {
@@ -2717,11 +2741,11 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
 
 /// Claude with its tool hooks (PreToolUse with `tool_use_id`, as Claude
 /// Code sends them): a request denied remotely, then the same command
-/// asked again and answered in Claude's own dialog. The retry's card closes
-/// `answered_terminal` on its own call's result: the denied call (which
-/// never ends with a PostToolUse) is never taken for it.
+/// asked again and answered in Claude's own dialog. The tool's result
+/// closes nothing by itself; the person saying so (the prefix `a`) closes
+/// the retry's card `answered_terminal`.
 #[test]
-fn a_retry_of_a_denied_command_closes_on_its_own_call() {
+fn a_retry_answered_in_the_terminal_closes_when_the_person_says_so() {
     local(async {
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
@@ -2760,6 +2784,7 @@ fn a_retry_of_a_denied_command_closes_on_its_own_call() {
             .unwrap()
             .to_string();
         std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
+        answered_here(&mut client, &sid).await;
         let a = second.clone();
         let closed = peer
             .wait(move |v| {
@@ -3194,9 +3219,20 @@ fn codex_stays_waiting_at_its_own_dialog_after_a_release() {
         let peer = &mut rt.peer;
         peer.drain(Duration::from_millis(500)).await;
         assert_eq!(listed(peer, &sid).await["activity"], "waiting");
-        // allowed there: the tool runs (PostToolUse), working again
+        // allowed there: the tool runs (PostToolUse), which ends nothing by
+        // itself (no result is proven to be the asking call's)
         client.send(&ClientMsg::input(&sid, b"y")).await.unwrap();
         agent_event(&fake, "dialog 1 allow").await;
+        let peer = &mut rt.peer;
+        peer.drain(Duration::from_millis(500)).await;
+        assert_eq!(listed(peer, &sid).await["activity"], "waiting");
+        // the person at the terminal says it was answered: working again
+        client
+            .send(&ClientMsg::ApprovalsAnswered {
+                session_id: sid.clone(),
+            })
+            .await
+            .unwrap();
         activity_until(&mut rt.peer, &sid, "working").await;
         rt.shutdown().await;
     });

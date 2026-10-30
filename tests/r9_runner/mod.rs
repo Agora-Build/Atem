@@ -2343,7 +2343,19 @@ impl Runner {
                     .iter()
                     .find(|a| a.approval_id == id)
                     .unwrap_or_else(|| panic!("unknown approval {id}"));
-                std::fs::write(ask.dir.join(format!("terminal-yes-{}", ask.n)), "").unwrap();
+                let (dir, n) = (ask.dir.clone(), ask.n);
+                std::fs::write(dir.join(format!("terminal-yes-{n}")), "").unwrap();
+                // The person answered in the agent's own dialog, then says so
+                // (the prefix `a`): no tool result ends a wait by itself.
+                host.pump(SETTLE);
+                let real_id = host
+                    .sessions
+                    .iter()
+                    .find(|s| s.dir == dir)
+                    .map(|s| s.real_id.clone())
+                    .expect("the approval's session");
+                host.frontend()
+                    .send(json!({"op": "approvals_answered", "session_id": real_id}));
                 host.pump(SETTLE);
                 self.drain();
                 self.pass();

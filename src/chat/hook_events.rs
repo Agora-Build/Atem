@@ -147,14 +147,9 @@ impl EventReader {
     /// Every event up to this sequence was read or reported lost
     /// (`take_lost`): a request that asked at `evseq` may be judged only
     /// once this reached it.
+    #[cfg(test)]
     pub fn through(&self) -> u64 {
         self.through
-    }
-
-    /// Nothing published waits unread (no backlog): what was read, with
-    /// what `take_lost` reports, is the whole history so far.
-    pub fn caught_up(&self) -> bool {
-        !self.backlog
     }
 
     /// A lock on the counter held by a live hook (it may be between

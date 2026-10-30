@@ -159,6 +159,10 @@ pub enum BrokerMsg {
     ReleaseApproval {
         request_id: String,
     },
+    /// The person at a local frontend says the agent's own approval dialog
+    /// was answered there: every waiting hook gets "no decision" and closes
+    /// `answered_terminal`; Codex's dialog waits end.
+    ApprovalsAnswered,
     /// After adoption: the approvals this broker knows; every other waiting
     /// hook gets "no decision".
     KnownApprovals {
@@ -256,6 +260,7 @@ impl std::fmt::Debug for BrokerMsg {
                 message.as_ref().map_or(0, String::len)
             ),
             BrokerMsg::ReleaseApproval { request_id } => write!(f, "ReleaseApproval({request_id})"),
+            BrokerMsg::ApprovalsAnswered => f.write_str("ApprovalsAnswered"),
             BrokerMsg::KnownApprovals { request_ids } => {
                 write!(f, "KnownApprovals({} ids)", request_ids.len())
             }
@@ -652,6 +657,7 @@ mod tests {
             BrokerMsg::ReleaseApproval {
                 request_id: "a1".into(),
             },
+            BrokerMsg::ApprovalsAnswered,
             BrokerMsg::KnownApprovals {
                 request_ids: vec!["a1".into()],
             },

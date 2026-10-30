@@ -192,7 +192,9 @@ impl View {
             return "Atem | Esc: close help | Up/Down: scroll details".to_string();
         }
         if self.ui.pending {
-            return format!("{prefix} | h:detach g:take x:stop r:redraw [:history c:copy ?:help");
+            return format!(
+                "{prefix} | h:detach g:take a:answered x:stop r:redraw [:history c:copy ?:help"
+            );
         }
         if let Some(browse) = &self.ui.browse {
             return format!(
@@ -320,7 +322,7 @@ fn pieces(bytes: &[u8]) -> Vec<Vec<u8>> {
 fn help_text(ui: &terminal_view::State) -> String {
     let prefix = ui.prefix.label();
     let mut text = format!(
-        "{prefix}, then:\n\nh / m  Detach; the session keeps running (atem agent attach reopens it)\ng      Take control back from a remote viewer\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nterminal_prefix in ~/.config/atem/config.toml or ATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
+        "{prefix}, then:\n\nh / m  Detach; the session keeps running (atem agent attach reopens it)\ng      Take control back from a remote viewer\na      An approval was answered here, in the agent's own dialog: end its wait\n       (Atem can't tell from the agent; chat prompts are held until then)\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nterminal_prefix in ~/.config/atem/config.toml or ATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
     );
     for message in ui.messages.iter().rev() {
         text.push('\n');
@@ -574,6 +576,16 @@ async fn handle_key(
                     session_id: view.sid.clone(),
                 })
                 .await?;
+        }
+        Action::Answered => {
+            if view.exited.is_none() {
+                writer
+                    .send(&ClientMsg::ApprovalsAnswered {
+                        session_id: view.sid.clone(),
+                    })
+                    .await?;
+                view.notice("Marked the waiting approvals as answered here".into());
+            }
         }
         Action::Stop => {
             if view.exited.is_none() {

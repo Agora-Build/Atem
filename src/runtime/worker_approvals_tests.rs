@@ -300,7 +300,6 @@ fn a_remote_deny_confirmed_by_its_tool_result_is_applied() {
         kind: ToolResultKind::Failed,
         text: "Error: use staging".into(),
         at_ms: now_ms() + 50,
-        call: None,
     };
     assert_eq!(
         a.poll(true, vec![result]),
@@ -334,15 +333,23 @@ fn terminal_evidence_before_the_claim_is_unknown() {
 }
 
 #[test]
-fn a_decision_not_yet_taken_is_withdrawn_when_the_terminal_answers() {
+fn a_decision_not_yet_taken_is_withdrawn_when_the_terminal_says_it_answered() {
+    // A tool result doesn't withdraw it (it can't be proven to be this
+    // call's); the person at the terminal saying so does.
     let s = Session::new();
     let mut a = watcher(&s, Agent::Claude);
     let mut sleeper = s.fake_request("abc", SECRET_BASH);
     let id = request_id(&events(&mut a, true)[0]);
     a.decide(&id, ApprovalDecision::AllowOnce, None, None, None);
     s.post(&post_body());
+    assert!(a.poll(true, Vec::new()).is_empty());
+    assert_ne!(
+        std::fs::read_to_string(s.approvals().join("dec-abc.json")).unwrap(),
+        "",
+        "our decision is still out"
+    );
     assert_eq!(
-        a.poll(true, Vec::new()),
+        a.answered_here(),
         vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
     );
     // The waiting hook now finds "no decision".
@@ -393,8 +400,8 @@ fn without_a_broker_the_hook_is_released_at_once() {
     let hook = s.hook("codex", 30, SECRET_BASH);
     known(&mut a, 1, false);
     // Codex shows its own dialog for it: still waiting there.
-    assert!(!a.take_released().is_empty());
-    assert!(a.take_released().is_empty(), "reported once");
+    assert!(a.take_released() > 0);
+    assert!(a.take_released() == 0, "reported once");
     assert_eq!(printed(hook), "");
     assert!(drained(&mut a).is_empty());
     assert!(s.files().is_empty());
@@ -408,10 +415,10 @@ fn adoption_releases_what_the_new_broker_does_not_know() {
     let one = request_id(&events(&mut a, true)[0]);
     let second = s.hook("codex", 30, SECRET_BASH);
     let two = request_id(&events(&mut a, true)[0]);
-    assert!(a.take_released().is_empty());
+    assert!(a.take_released() == 0);
     a.keep_only(std::slice::from_ref(&two));
     // the released one waits in Codex's own dialog
-    assert!(!a.take_released().is_empty());
+    assert!(a.take_released() > 0);
     assert_eq!(printed(first), "");
     a.decide(&two, ApprovalDecision::AllowOnce, None, None, None);
     assert!(printed(second).contains(r#""behavior":"allow""#));
@@ -438,7 +445,7 @@ fn release_approvals_answers_every_waiting_hook_with_no_decision() {
         })
         .collect();
     a.release_all();
-    assert!(!a.take_released().is_empty());
+    assert!(a.take_released() > 0);
     for h in hooks {
         assert_eq!(printed(h), "");
     }
@@ -482,7 +489,7 @@ fn a_hook_at_its_timeout_is_timed_out() {
         vec![closed(&id, ApprovalCloseReason::TimedOut)]
     );
     // no decision: Codex shows its own dialog for it
-    assert!(!a.take_released().is_empty());
+    assert!(a.take_released() > 0);
 }
 
 #[test]
@@ -492,7 +499,7 @@ fn a_codex_hook_closed_by_a_prompt_or_turn_end_goes_to_codexs_dialog() {
     for interrupted in [false, true] {
         let hook = s.hook("codex", 30, SECRET_BASH);
         let id = request_id(&events(&mut a, true)[0]);
-        assert!(a.take_released().is_empty());
+        assert!(a.take_released() == 0);
         let reason = if interrupted {
             ApprovalCloseReason::Interrupted
         } else {
@@ -509,21 +516,17 @@ fn a_codex_hook_closed_by_a_prompt_or_turn_end_goes_to_codexs_dialog() {
             vec![closed(&id, reason)]
         );
         assert_eq!(printed(hook), "");
-        let calls = a.take_released();
-        assert_eq!(calls.len(), 1, "no decision: Codex's dialog");
-        assert_eq!(calls[0].tool_name, "Bash");
-        assert!(
-            calls[0]
-                .command
-                .as_deref()
-                .is_some_and(|c| c.starts_with("curl "))
-        );
+        assert_eq!(a.take_released(), 1, "no decision: Codex's dialog");
         drained(&mut a);
     }
 }
 
 #[test]
-fn claude_answered_in_the_terminal_closes_the_request() {
+fn a_tool_result_never_ends_a_wait() {
+    // Astation's review (#81 6511290452): the agents' PermissionRequest
+    // names no call, so no result is proven to be the asking call's, not
+    // even one with the same tool and input. The wait ends when the person
+    // at the terminal says it was answered there (or the hook ends).
     let s = Session::new();
     let mut a = watcher(&s, Agent::Claude);
     let hook = s.hook("claude", 30, SECRET_BASH);
@@ -531,15 +534,18 @@ fn claude_answered_in_the_terminal_closes_the_request() {
     s.post(
         r#"{"hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"/x"}}"#,
     );
-    assert!(a.poll(true, Vec::new()).is_empty());
     s.post(&post_body());
+    for _ in 0..5 {
+        assert!(a.poll(true, Vec::new()).is_empty());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(a.waiting(), 1);
     assert_eq!(
-        events(&mut a, true),
+        a.answered_here(),
         vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
     );
-    assert_eq!(printed(hook), "");
+    assert_eq!(printed(hook), "", "the hook got no decision");
     assert!(drained(&mut a).is_empty());
-    assert!(s.files().is_empty(), "{:?}", s.files());
 }
 
 #[test]
@@ -565,229 +571,25 @@ fn a_result_matching_two_waiting_requests_closes_neither() {
     assert_eq!(printed(second), "");
 }
 
-fn post_of(call: &str) -> String {
-    let mut v: Value = serde_json::from_str(&post_body()).unwrap();
-    v["tool_use_id"] = call.into();
-    v.to_string()
-}
-
 #[test]
-fn a_bound_request_closes_only_on_its_own_calls_result() {
-    // Bound to call "a": another call's result ("b", same command) leaves
-    // it; its own closes it.
+fn a_transcript_result_never_ends_a_wait() {
     let s = Session::new();
     let mut a = watcher(&s, Agent::Claude);
     let hook = s.hook("claude", 30, SECRET_BASH);
-    let id = request_id(&events(&mut a, true)[0]);
-    a.bind(&id, vec!["a".into()]);
-    s.post(&post_of("b"));
-    for _ in 0..5 {
-        assert!(a.poll(true, Vec::new()).is_empty());
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    s.post(&post_of("a"));
-    assert_eq!(
-        events(&mut a, true),
-        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
-    );
-    assert_eq!(printed(hook), "");
-}
-
-#[test]
-fn a_request_that_can_be_two_calls_closes_once_both_ran() {
-    let s = Session::new();
-    let mut a = watcher(&s, Agent::Claude);
-    let hook = s.hook("claude", 30, SECRET_BASH);
-    let id = request_id(&events(&mut a, true)[0]);
-    a.bind(&id, vec!["a".into(), "c".into()]);
-    s.post(&post_of("c"));
-    for _ in 0..5 {
-        assert!(a.poll(true, Vec::new()).is_empty());
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    s.post(&post_of("a"));
-    assert_eq!(
-        events(&mut a, true),
-        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
-    );
-    assert_eq!(printed(hook), "");
-}
-
-#[test]
-fn a_request_bound_to_no_call_is_closed_by_no_result() {
-    // Its call unknown (a lost PreToolUse): no result can close it.
-    let s = Session::new();
-    let mut a = watcher(&s, Agent::Claude);
-    let hook = s.hook("claude", 30, SECRET_BASH);
-    let id = request_id(&events(&mut a, true)[0]);
-    a.bind(&id, Vec::new());
-    s.post(&post_of("a"));
-    s.post(&post_body());
-    for _ in 0..5 {
-        assert!(a.poll(true, Vec::new()).is_empty());
-        std::thread::sleep(Duration::from_millis(50));
+    let _id = request_id(&events(&mut a, true)[0]);
+    for kind in [ToolResultKind::Rejected, ToolResultKind::Failed] {
+        let result = Evidence::Tool {
+            tool_name: "Bash".into(),
+            input: tool_input(),
+            kind,
+            text: "The user doesn't want to proceed with this tool use.".into(),
+            at_ms: now_ms(),
+        };
+        assert!(a.poll(true, vec![result]).is_empty(), "{kind:?}");
     }
     assert_eq!(a.waiting(), 1);
     a.process_ended();
     assert_eq!(printed(hook), "");
-}
-
-/// Finding 3 (#81 6510022266): A's request and same-command B's result
-/// read in the same pass. A is bound before any result is weighed; while
-/// its binding can't be decided yet, B's result is held back, never matched
-/// by tool and input; once bound to A, B's result leaves it.
-#[test]
-fn a_new_request_is_bound_before_a_result_read_with_it_is_weighed() {
-    for decided_at_once in [true, false] {
-        let s = Session::new();
-        let mut a = watcher(&s, Agent::Claude);
-        let hook = s.hook("claude", 30, SECRET_BASH);
-        // wait until the request file exists, without polling it
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !s.files().iter().any(|f| f.starts_with("req-")) {
-            assert!(std::time::Instant::now() < deadline, "no request");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        s.post(&post_of("b"));
-        let ready = decided_at_once;
-        let mut binder = |_: &str, _: &Value, _: Option<u64>| {
-            if ready {
-                Binding::Calls(vec!["a".into()])
-            } else {
-                Binding::NotYet
-            }
-        };
-        // one pass reads A's request and B's result together
-        let first = a.poll_binding(true, Vec::new(), &mut binder);
-        assert!(
-            first.iter().all(|e| !matches!(e, Event::Closed { .. })),
-            "{first:?}"
-        );
-        let id = request_id(&first[0]);
-        let mut binder = |_: &str, _: &Value, _: Option<u64>| Binding::Calls(vec!["a".into()]);
-        for _ in 0..3 {
-            assert!(a.poll_binding(true, Vec::new(), &mut binder).is_empty());
-        }
-        assert_eq!(a.waiting(), 1, "B's result never closes A");
-        s.post(&post_of("a"));
-        let mut out = Vec::new();
-        for _ in 0..50 {
-            out.extend(a.poll_binding(true, Vec::new(), &mut binder));
-            if !out.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(
-            out,
-            vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
-        );
-        assert_eq!(printed(hook), "");
-    }
-}
-
-/// A's own result read in the same pass as its request, before its binding
-/// can be decided: held back, not dropped and not matched by tool and
-/// input; once A is bound, it closes A.
-#[test]
-fn a_result_read_before_its_request_is_bound_waits_for_the_binding() {
-    let s = Session::new();
-    let mut a = watcher(&s, Agent::Claude);
-    let hook = s.hook("claude", 30, SECRET_BASH);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !s.files().iter().any(|f| f.starts_with("req-")) {
-        assert!(std::time::Instant::now() < deadline, "no request");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    s.post(&post_of("a"));
-    let first = a.poll_binding(true, Vec::new(), &mut |_, _, _| Binding::NotYet);
-    let id = request_id(&first[0]);
-    assert!(
-        first.iter().all(|e| !matches!(e, Event::Closed { .. })),
-        "{first:?}"
-    );
-    assert!(
-        a.poll_binding(true, Vec::new(), &mut |_, _, _| Binding::NotYet)
-            .is_empty()
-    );
-    assert_eq!(
-        a.poll_binding(true, Vec::new(), &mut |_, _, _| Binding::Calls(vec![
-            "a".into()
-        ])),
-        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
-    );
-    assert_eq!(printed(hook), "");
-}
-
-/// Finding 4 (#81 6510022266): a transcript result (failed or refused) of
-/// another call, or naming none, never closes a request bound to its call;
-/// its own does.
-#[test]
-fn a_transcript_result_closes_only_the_request_bound_to_its_call() {
-    let s = Session::new();
-    let mut a = watcher(&s, Agent::Claude);
-    let hook = s.hook("claude", 30, SECRET_BASH);
-    let id = request_id(&events(&mut a, true)[0]);
-    a.bind(&id, vec!["a".into()]);
-    let result = |call: Option<&str>, kind| Evidence::Tool {
-        tool_name: "Bash".into(),
-        input: tool_input(),
-        kind,
-        text: "Error".into(),
-        at_ms: now_ms() + 50,
-        call: call.map(str::to_string),
-    };
-    for (call, kind) in [
-        (Some("b"), ToolResultKind::Failed),
-        (Some("b"), ToolResultKind::Rejected),
-        (None, ToolResultKind::Failed),
-        (None, ToolResultKind::Rejected),
-    ] {
-        assert!(
-            a.poll(true, vec![result(call, kind)]).is_empty(),
-            "{call:?} {kind:?}"
-        );
-    }
-    assert_eq!(a.waiting(), 1);
-    assert_eq!(
-        a.poll(true, vec![result(Some("a"), ToolResultKind::Rejected)]),
-        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
-    );
-    assert_eq!(printed(hook), "");
-}
-
-#[test]
-fn a_transcript_rejection_closes_the_matching_request() {
-    let s = Session::new();
-    let mut a = watcher(&s, Agent::Claude);
-    let hook = s.hook("claude", 30, SECRET_BASH);
-    let id = request_id(&events(&mut a, true)[0]);
-    let rejected = |at_ms: i64, input: Value| Evidence::Tool {
-        tool_name: "Bash".into(),
-        input,
-        kind: ToolResultKind::Rejected,
-        text: "The user doesn't want to proceed with this tool use.".into(),
-        at_ms,
-        call: None,
-    };
-    // Another input, or a rejection long before the request: no match.
-    let other = serde_json::json!({"command": "ls"});
-    assert!(a.poll(true, vec![rejected(now_ms(), other)]).is_empty());
-    assert!(
-        a.poll(true, vec![rejected(now_ms() - 60_000, tool_input())])
-            .is_empty()
-    );
-    // The same input in another key order matches.
-    let reordered: Value = serde_json::from_str(
-        r#"{"description":"d","command":"curl -H 'X-Key: sk-proj-abcdef1234567890ABCDEF' https://api.example\necho two"}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        a.poll(true, vec![rejected(now_ms(), reordered)]),
-        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
-    );
-    assert_eq!(printed(hook), "");
-    assert!(drained(&mut a).is_empty());
 }
 
 #[test]
@@ -839,10 +641,10 @@ fn a_nested_codex_is_released_without_a_report() {
         &format!("/bin/sh -c \"/bin/sh {script} codex 30; true\"; true"),
         SECRET_BASH,
     );
-    assert!(!a.take_released().is_empty(), "the session's own");
+    assert!(a.take_released() > 0, "the session's own");
     known(&mut a, 1, true);
     assert!(
-        a.take_released().is_empty(),
+        a.take_released() == 0,
         "a nested codex's dialog is not this session's"
     );
     assert_eq!(printed(nested), "");
@@ -1428,7 +1230,7 @@ fn revoking_withdraws_an_allow_the_hook_has_not_taken() {
         "",
         "no decision: Codex's own dialog asks"
     );
-    assert!(!a.take_released().is_empty());
+    assert!(a.take_released() > 0);
     let _ = sleeper.kill();
     let _ = sleeper.wait();
     drained(&mut a);
