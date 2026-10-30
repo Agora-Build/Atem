@@ -100,6 +100,9 @@ const APPROVAL_DETAIL: &str = "approve in the terminal";
 struct Dialog {
     since: i64,
     since_seq: u64,
+    /// A tool ended after it went there: the terminal was told how to say
+    /// it was answered (once).
+    hinted: bool,
 }
 
 /// Codex's permission wait: it outlasts the turn's end (an approval belongs
@@ -152,6 +155,8 @@ pub struct CodexAdapter {
     /// result (no call id ties one to the approval), a Stop or a turn's
     /// plain end (Codex may end the turn with the dialog still open).
     dialogs: Vec<Dialog>,
+    /// A tool ended after a dialog opened (`take_answer_hint`).
+    answer_hint: bool,
     /// The newest event sequence read.
     last_seq: u64,
     /// The pinned session was pinned by a hook other than its SessionStart
@@ -185,6 +190,7 @@ impl CodexAdapter {
             turn_open: false,
             approvals: 0,
             dialogs: Vec::new(),
+            answer_hint: false,
 
             last_seq: 0,
             start_unseen: false,
@@ -232,6 +238,7 @@ impl CodexAdapter {
         self.dialogs.extend((0..released).map(|_| Dialog {
             since: at_ms,
             since_seq,
+            hinted: false,
         }));
         self.status_change(before);
     }
@@ -242,6 +249,13 @@ impl CodexAdapter {
         let before = self.waiting();
         self.dialogs.clear();
         self.status_change(before);
+    }
+
+    /// A tool ended after an approval went to Codex's own dialog, since the
+    /// last call: it may have been answered there, which only the person at
+    /// the terminal can say (the prefix `a`).
+    pub fn take_answer_hint(&mut self) -> bool {
+        std::mem::take(&mut self.answer_hint)
     }
 
     /// The script's events counter (`events/seq`): the newest event
@@ -411,6 +425,16 @@ impl CodexAdapter {
             // it was can't be told from the approval's.
             "PreToolUse" if !self.waiting() => out.push(AgentEvent::ToolStarted),
             "PostToolUse" if !self.waiting() => out.push(AgentEvent::ToolFinished),
+            // A tool's end while a dialog waits ends nothing, but the
+            // terminal is told once per dialog how to end it.
+            "PostToolUse" => {
+                for d in self.dialogs.iter_mut() {
+                    if !d.hinted && hook.seq > d.since_seq {
+                        d.hinted = true;
+                        self.answer_hint = true;
+                    }
+                }
+            }
             // Only wake-ups for the reader (the rollout's end record is the
             // turn's end), but the turn is over: a deferred start may go.
             // Stop leaves a dialog Codex showed open (Codex may end the turn

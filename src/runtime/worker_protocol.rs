@@ -36,6 +36,10 @@ pub const APPROVAL_HANDED: &str = "the approval was handed to the terminal; not 
 /// answer it.
 pub const APPROVAL_IN_DIALOG: &str =
     "the agent's approval dialog is open in the terminal; answer it there; not written";
+/// The local frontend's notice when a tool like a waiting approval's call
+/// ran: it may have been answered in the agent's own dialog, which only the
+/// person there can say. The frontend puts its prefix for `{prefix}`.
+pub const ANSWER_HINT: &str = "A tool ran while an approval waits: if you answered the agent's dialog here, press {prefix} then a";
 /// The local frontend's notice for consumed input.
 pub const APPROVAL_HANDED_NOTICE: &str =
     "Codex's approval was handed to the terminal; answer its dialog";

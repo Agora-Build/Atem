@@ -534,12 +534,25 @@ fn a_tool_result_never_ends_a_wait() {
     s.post(
         r#"{"hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"/x"}}"#,
     );
+    for _ in 0..3 {
+        assert!(a.poll(true, Vec::new()).is_empty());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!a.take_answer_hint(), "another tool's result: no hint");
     s.post(&post_body());
     for _ in 0..5 {
         assert!(a.poll(true, Vec::new()).is_empty());
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(a.waiting(), 1);
+    // A result like its call's only tells the terminal how to end it, once.
+    assert!(a.take_answer_hint());
+    s.post(&post_body());
+    for _ in 0..3 {
+        assert!(a.poll(true, Vec::new()).is_empty());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!a.take_answer_hint(), "hinted once per request");
     assert_eq!(
         a.answered_here(),
         vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]

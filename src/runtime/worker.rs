@@ -1264,7 +1264,19 @@ impl Worker {
         };
         let evidence = std::mem::take(&mut self.approval_evidence);
         let events = a.poll(connected, evidence);
+        let hint = a.take_answer_hint();
         self.send_approval_events(events);
+        if hint {
+            self.answer_hint();
+        }
+    }
+
+    /// A tool like a waiting approval's call ran: the terminal is told how
+    /// to say it was answered there (nothing ends the wait by itself).
+    fn answer_hint(&mut self) {
+        self.send(&WorkerMsg::Notice {
+            text: super::worker_protocol::ANSWER_HINT.into(),
+        });
     }
 
     fn send_approval_events(&mut self, events: Vec<ApprovalEvent>) {
@@ -1372,6 +1384,13 @@ impl Worker {
         let events = adapter.poll_events();
         let mut log = adapter.poll_log();
         let capabilities = adapter.capabilities();
+        let hint = match self.adapter.as_mut() {
+            Some(ChatAdapter::Codex(codex)) => codex.take_answer_hint(),
+            _ => false,
+        };
+        if hint {
+            self.answer_hint();
+        }
         // What may end a waiting permission prompt (applied with the next
         // approvals poll): a new prompt or the turn's end, a tool refused in
         // the terminal — each stamped with when the agent reported it, so

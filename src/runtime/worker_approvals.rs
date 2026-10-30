@@ -184,6 +184,9 @@ struct Waiting {
     /// The session rule whose allow the worker wrote for it (auto-allowed);
     /// revoking the rule withdraws that allow while the hook hasn't taken it.
     auto_rule: Option<String>,
+    /// A result like its call's came while it waited: the person at the
+    /// terminal was told how to say it was answered (once).
+    hinted: bool,
     state: State,
 }
 
@@ -207,6 +210,8 @@ pub struct Approvals {
     released: usize,
     /// Codex: the Atem session rules of this agent process, oldest first.
     rules: Vec<Kept>,
+    /// A result like a waiting request's call came (`take_answer_hint`).
+    answer_hint: bool,
 }
 
 /// A session rule the worker keeps.
@@ -281,6 +286,7 @@ impl Approvals {
             queued: Vec::new(),
             released: 0,
             rules: Vec::new(),
+            answer_hint: false,
         }
     }
 
@@ -494,6 +500,32 @@ impl Approvals {
 
     /// Codex: this session's requests that got "no decision" (its own
     /// dialog shows them) since the last call.
+    /// A tool like a waiting request's call ran since the last call: the
+    /// request may have been answered in the agent's own dialog, which only
+    /// the person at the terminal can say (the prefix `a`).
+    pub fn take_answer_hint(&mut self) -> bool {
+        std::mem::take(&mut self.answer_hint)
+    }
+
+    /// A result with a waiting request's tool and input (still open, or
+    /// our decision not taken): it ends nothing (no call id ties it to the
+    /// request), but the terminal is told once per request how to end it.
+    fn hint(&mut self, tool_name: &str, input: &Value, at_ms: i64) {
+        for w in self.waiting.values_mut() {
+            if !w.hinted
+                && w.reported
+                && matches!(w.state, State::Open | State::Decided { .. })
+                && w.opened_ms <= at_ms + RESULT_SLACK_MS
+                && w.request
+                    .as_ref()
+                    .is_some_and(|r| same_tool(r, tool_name, input))
+            {
+                w.hinted = true;
+                self.answer_hint = true;
+            }
+        }
+    }
+
     pub fn take_released(&mut self) -> usize {
         std::mem::take(&mut self.released)
     }
@@ -841,6 +873,7 @@ impl Approvals {
                 ours,
                 pending_rule: None,
                 auto_rule: None,
+                hinted: false,
                 state: State::Open,
             },
         );
@@ -967,6 +1000,7 @@ impl Approvals {
                 if let Some(id) = self.target(tool_name, input, *at_ms) {
                     self.resolve(&id, &ev, out);
                 }
+                self.hint(tool_name, input, *at_ms);
             }
         }
     }

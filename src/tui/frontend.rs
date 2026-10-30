@@ -168,7 +168,12 @@ impl View {
                 }
                 self.device_list = status;
             }
-            RuntimeMsg::Notice { text } => self.notice(text),
+            // A worker's notice names the key as `{prefix}` (only the
+            // frontend knows its prefix).
+            RuntimeMsg::Notice { text } => {
+                let text = text.replace("{prefix}", &self.ui.prefix.label());
+                self.notice(text)
+            }
             RuntimeMsg::Error { text, op } if op.as_deref() == Some("attach") => {
                 return Applied::Failed(text);
             }
@@ -696,6 +701,17 @@ mod tests {
             bytes: b64(text.as_bytes()),
             offset,
         });
+    }
+
+    #[test]
+    fn a_workers_notice_names_this_frontends_prefix() {
+        let mut view = View::new(SID, false, Some("ctrl-a"));
+        view.apply(RuntimeMsg::Notice {
+            text: crate::runtime::worker_protocol::ANSWER_HINT.into(),
+        });
+        let (text, _) = view.ui.feedback.clone().unwrap();
+        assert!(text.ends_with("press Ctrl+a then a"), "{text}");
+        assert!(!text.contains("{prefix}"), "{text}");
     }
 
     #[test]

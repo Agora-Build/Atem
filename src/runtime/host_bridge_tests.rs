@@ -759,6 +759,17 @@ fn queued_remote_bytes_are_dropped_at_the_worker_when_local_input_takes_over() {
 /// The person at the local frontend answered in the agent's own dialog and
 /// says so (the prefix `a`): attached first, as a frontend is.
 async fn answered_here(client: &mut RuntimeClient, sid: &str) {
+    attach(client, sid).await;
+    client
+        .send(&ClientMsg::ApprovalsAnswered {
+            session_id: sid.to_string(),
+        })
+        .await
+        .unwrap();
+}
+
+/// A local frontend attaches to `sid`.
+async fn attach(client: &mut RuntimeClient, sid: &str) {
     client
         .send(&ClientMsg::Attach {
             session_id: sid.to_string(),
@@ -771,12 +782,6 @@ async fn answered_here(client: &mut RuntimeClient, sid: &str) {
         matches!(m, RuntimeMsg::Attached { .. }).then_some(())
     })
     .await;
-    client
-        .send(&ClientMsg::ApprovalsAnswered {
-            session_id: sid.to_string(),
-        })
-        .await
-        .unwrap();
 }
 
 /// Opens `conversation` once chat is available; returns `opened`.
@@ -2493,8 +2498,21 @@ fn a_denial_carries_the_message_and_a_terminal_answer_resolves_the_push() {
             .as_str()
             .unwrap()
             .to_string();
+        attach(&mut client, &sid).await;
         std::fs::write(fake.join("terminal-yes-2"), "").unwrap();
-        answered_here(&mut client, &sid).await;
+        // The tool ran: that ends nothing, but the attached frontend is told
+        // how to say the dialog was answered.
+        expect(&mut client, |m| {
+            matches!(m, RuntimeMsg::Notice { text } if text == crate::runtime::worker_protocol::ANSWER_HINT)
+                .then_some(())
+        })
+        .await;
+        client
+            .send(&ClientMsg::ApprovalsAnswered {
+                session_id: sid.to_string(),
+            })
+            .await
+            .unwrap();
         let a = aid.clone();
         let closed = peer
             .wait(move |v| {

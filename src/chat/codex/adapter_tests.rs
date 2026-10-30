@@ -1550,6 +1550,7 @@ fn no_tool_result_ends_codexs_dialog() {
     a.set_approvals(0, 1, now_ms());
     turn_two_ends_awaiting_approval(&f, BEFORE_TURN_TWO + 60_000);
     tick(&mut a, &mut chat);
+    assert!(!a.take_answer_hint(), "no tool ended since the dialog");
     publish(
         &f,
         &a,
@@ -1571,6 +1572,9 @@ fn no_tool_result_ends_codexs_dialog() {
         );
     }
     assert!(a.dialog_open() && a.waiting());
+    // A tool's end only tells the terminal how to end the wait, once.
+    assert!(a.take_answer_hint());
+    assert!(!a.take_answer_hint());
     assert_eq!(chat.status().state, State::Waiting);
     assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
     f.fire(&a, "21-Interrupt-esc-at-approval-dialog.json");

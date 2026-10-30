@@ -656,7 +656,13 @@ and a failure is a session notice (Codex starts anyway).
   answered in Claude's own dialog stays open (its card pending, prompts
   held) until its hook ends (600 s) or the person at the terminal presses
   the prefix, then `a`, which closes it `answered_terminal` (an allow
-  written for it and not yet taken is withdrawn first). Claude's file
+  written for it and not yet taken is withdrawn first). So the key is
+  found when it matters, a result with a waiting request's tool and input
+  (Claude), or a PostToolUse after a dialog went to the terminal (Codex),
+  sends the attached frontend a notice once per request or dialog: "A tool
+  ran while an approval waits: if you answered the agent's dialog here,
+  press <prefix> then a" (the worker writes `{prefix}`, the frontend puts
+  its own). The result still ends nothing. Claude's file
   dialogs ("Do you want to create …?", "Do you want to make this edit to
   …?") were checked live for the screen backstop.
   A refusal in Codex's dialog leaves no evidence Atem can read either:
