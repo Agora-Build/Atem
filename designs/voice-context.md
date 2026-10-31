@@ -1,6 +1,6 @@
-# Huddle: get the whole project clear by talking
+# Parley: get the whole project clear by talking
 
-Talking is the fastest way to get a whole project clear. Huddle is a voice
+Talking is the fastest way to get a whole project clear. Parley is a voice
 conversation that brings you, the project's knowledge and its coding agents
 together: grounded in the project's own context, with tool calls that ask
 the coding agents in Atem for more information or hand them work. It replaces the earlier voice-coding
