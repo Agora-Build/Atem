@@ -296,6 +296,26 @@ impl App {
         true
     }
 
+    /// The relay link was reached at another Station than the configured
+    /// one (`astation_relay_url` changed, then `atem runtime reload`): why
+    /// it must be dropped, so the reconnect reaches the configured Station
+    /// at once. A local link, or none, is never another Station's.
+    pub fn station_changed(&self) -> Option<String> {
+        use crate::websocket_client::{LinkVia, same_station};
+        if !self.astation_connected && !self.astation_routed {
+            return None;
+        }
+        let Some(LinkVia::Relay { url, .. }) = self.astation_client.via() else {
+            return None;
+        };
+        let now = self.config.astation_relay_url();
+        (!same_station(url, now)).then(|| {
+            format!(
+                "The Station changed ({url} → {now}); the link was dropped and reconnects there"
+            )
+        })
+    }
+
     /// Drops the Astation link (closing its socket) and schedules the
     /// normal reconnect, which authenticates it again.
     pub fn drop_astation_link(&mut self, reason: String) {
@@ -339,7 +359,8 @@ pub fn refusal(re: Option<String>) -> String {
 pub const REMOVED_OP: &str = "removed in atem-session r6";
 
 /// The detail of the refusal of a plaintext relay-only message (§R9.8a).
-pub const REMOVED_POLICY_OP: &str = "removed: relay only is set inside an r9 channel (host_policy_set)";
+pub const REMOVED_POLICY_OP: &str =
+    "removed: relay only is set inside an r9 channel (host_policy_set)";
 
 /// A session `error{code}` answering `re`.
 pub fn error_text(re: Option<String>, code: ErrorCode) -> String {

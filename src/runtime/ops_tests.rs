@@ -1612,6 +1612,7 @@ async fn link_to(
 fn relay() -> crate::websocket_client::LinkVia {
     crate::websocket_client::LinkVia::Relay {
         label: "relay".into(),
+        url: "https://relay.test".into(),
     }
 }
 
@@ -1646,6 +1647,41 @@ fn commit(app: &mut App, profile: &Path, relay_only: bool, written: bool) {
 /// The channel frames the peer got (the policy results in these tests).
 fn results(peer: &Peer) -> usize {
     peer.seen.iter().filter(|m| m["type"] == "channel").count()
+}
+
+/// `atem runtime reload` after `astation_relay_url` changed: a relay link
+/// reached at the old Station is dropped (its attachments and channels go
+/// with it) and the reconnect goes to the configured Station at once; the
+/// same Station (a trailing `/` aside) or a local link stays.
+#[test]
+fn a_reload_to_another_station_drops_the_relay_link() {
+    local(async {
+        let profile = crate::config::AtemConfig::config_dir();
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        app.config.astation_relay_url = Some("https://relay.test/".into());
+        assert_eq!(app.station_changed(), None, "the same Station");
+        app.config.astation_relay_url = Some("https://station-dev.agora.build".into());
+        let reason = app.station_changed().expect("another Station");
+        assert_eq!(
+            reason,
+            "The Station changed (https://relay.test → https://station-dev.agora.build); the link was dropped and reconnects there"
+        );
+        app.drop_astation_link(reason);
+        assert!(peer.drain(WAIT).await, "the old Station's link was dropped");
+        assert!(!app.astation_connected && !app.astation_routed);
+        assert!(
+            app.astation_reconnect_at
+                .is_some_and(|at| at <= Instant::now()),
+            "reconnects at once"
+        );
+        assert_eq!(app.station_changed(), None, "no link: nothing to drop");
+        // A local link is no Station's.
+        let (mut local_app, mut local_peer) = linked_app(&profile, local_via()).await;
+        local_app.config.astation_relay_url = Some("https://station-dev.agora.build".into());
+        assert_eq!(local_app.station_changed(), None);
+        assert!(!local_peer.drain(Duration::from_millis(100)).await);
+    });
 }
 
 /// A relay link stays on any commit; `false` on a local link keeps it.

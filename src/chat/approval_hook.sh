@@ -135,35 +135,45 @@ if [ "$1" = event ]; then
     esac
     case $ev in '' | *[!A-Za-z]*) ev=unknown ;; esac
     [ "$ev" = PermissionRequest ] && { rm -f "$t" "$m"; exit 0; }
+    # The lock is free unless a live hook holds it: one whose holder is
+    # gone (or that names no pid: no hook makes one) is removed, only if it
+    # still names that holder. Fails (1) while a live hook holds it.
+    free_stale() {
+        if [ -h "$l" ]; then
+            p=$(readlink "$l" 2>/dev/null)
+            case $p in
+                '' | *[!0-9]*) ;;
+                *) kill -0 "$p" 2>/dev/null && return 1 ;;
+            esac
+            [ "$(readlink "$l" 2>/dev/null)" = "$p" ] && rm -f "$l" 2>/dev/null
+        elif [ -e "$l" ]; then
+            rm -f "$l" 2>/dev/null # not a lock any hook makes
+        fi
+        return 0
+    }
     # A directory there isn't a lock any hook makes (and `ln -s` would
     # put the link inside it): out of the way.
     if [ -d "$l" ] && [ ! -h "$l" ]; then rm -rf "$l" 2>/dev/null; fi
-    # The wait for a held lock is ~2 s of wall time, not a count of polls:
-    # each poll forks (`ln`, `sleep`), which a loaded machine makes slow,
-    # and Codex stops waiting at 3 s. A background `sleep 2` (no stdio, so
-    # Codex never waits for its output) is the timer; the builtin `kill -0`
-    # checks it. The poll count (the old bound) is only a backstop.
+    # A lock whose holder is gone (a killed hook's) is taken over at once:
+    # waiting for it would only run into Codex's 3 s. A live holder is
+    # waited for, ~2 s of wall time, not a count of polls: each poll forks
+    # (`ln`, `sleep`), which a loaded machine makes slow. A background
+    # `sleep 2` (no stdio, so Codex never waits for its output) is the
+    # timer; the builtin `kill -0` checks it. The poll count (the old
+    # bound) is only a backstop.
     n=0
     until ln -s "$$" "$l" 2>/dev/null; do
+        if [ "$n" -eq 0 ] && free_stale; then
+            n=1
+            continue
+        fi
         if [ -z "$w" ]; then
             sleep "${sync:-2}" </dev/null >/dev/null 2>&1 &
             w=$!
         fi
         if [ "$n" -ge $((${sync:-2} * 10)) ] || ! kill -0 "$w" 2>/dev/null; then
             untime
-            if [ -h "$l" ]; then
-                p=$(readlink "$l" 2>/dev/null)
-                case $p in
-                    '' | *[!0-9]*) ;; # not a pid: no live hook made it
-                    *) if kill -0 "$p" 2>/dev/null; then
-                        fail
-                    fi ;;
-                esac
-                # Gone: removed only if it still names that holder.
-                [ "$(readlink "$l" 2>/dev/null)" = "$p" ] && rm -f "$l" 2>/dev/null
-            elif [ -e "$l" ]; then
-                rm -f "$l" 2>/dev/null # not a lock any hook makes
-            fi
+            free_stale || fail
             ln -s "$$" "$l" 2>/dev/null && break
             fail
         fi
