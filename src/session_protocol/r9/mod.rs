@@ -1,0 +1,2797 @@
+//! r9 admission on the host (atem-session-v1.md Appendix r9: §R9.6–§R9.8,
+//! §R9.7a): the `atem-ch1` responder for every client channel the router
+//! opens on Atem's link, carry before admission (§R9.3), principals with
+//! scope and expiry (§R9.6, the `atem_client::principal` helpers), the
+//! r9 `welcome`, `membership`/`membership_head`, `revoke_grant`,
+//! `approval_seen`, and the fences: each attachment is fenced on its own
+//! (its `attachment_gen`), a principal's attachments together (its §H
+//! `control_gen`).
+//!
+//! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
+//! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
+//! received envelope through [`R9Host::on_envelope`], and what Atem sends
+//! drained with [`R9Host::flush`] (a `try_send` of envelope text that may
+//! refuse when the link is full). What the transport must provide:
+//!
+//! - one ordered, reliable stream of JSON text messages per link
+//!   generation, in both directions (Atem's existing outbound WebSocket);
+//! - the router's `open` before a channel's first frame, and its `close`
+//!   when the client goes away;
+//! - a new link generation on every (re)authentication, and the drop of
+//!   the old one (every channel on it closes);
+//! - a bounded `try_send` (Atem queues per channel, bounded, and closes a
+//!   channel that falls behind rather than dropping records).
+//!
+//! The session host (`SessionHost`) serves each admitted channel as an
+//! attachment like any other: the runtime runs its effects, and hands the
+//! messages for an r9 attachment back here ([`R9Host::deliver`]) to be
+//! filtered by scope, sealed and queued.
+pub mod envelope;
+#[cfg(test)]
+mod fixtures_tests;
+pub mod host_policy;
+#[cfg(test)]
+mod host_policy_host_tests;
+pub mod push;
+#[cfg(test)]
+mod push_tests;
+mod revoked;
+pub mod route;
+#[cfg(test)]
+mod tests;
+
+use super::host::{Attach, Effect, SessionHost};
+use super::journal::Journal;
+use super::membership::store::{self, Store};
+use super::membership::{
+    self, CarriageResult, Carried, DETAIL_NOT_RECONCILED, DETAIL_NOT_RECORDED, Fence, FenceReason,
+    Hello as MHello, HostFences, Init as MInit, MembershipHost,
+};
+use super::wire::{self as r8, Envelope as R8Envelope, Op as R8Op};
+use crate::paths::PairingPaths;
+use atem_client::canonical::StrictValue;
+use atem_client::channel::responder::{AwaitFinish, HostContext, InitLimiter, Responder};
+use atem_client::channel::wire::{self as chwire, Frame};
+use atem_client::channel::{Channel, ClearCode, Principal};
+use atem_client::membership::{Admission, HostNow, MemberStatus};
+use atem_client::principal::{
+    Authority, BrowserGrant, ClientKind, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS,
+    Need, Op, Permission, Refusal, RevokedGrants, SessionRef, admission_error,
+};
+use atem_client::session::r9::{
+    self, Hello, PendingRecovery, R9_FEATURES, REVISION, SessionError, Welcome, code,
+};
+use atem_client::{KeyId, SoftwareKeys};
+use envelope::{Event, Transport, reason};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+
+/// §R9.7a "Bounds".
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub open_channels: usize,
+    pub handshakes: usize,
+    pub queued_bytes: usize,
+    pub unknown_handles: usize,
+    /// `close`s refusing an `open` or a frame for an unknown handle, a
+    /// second (together).
+    pub unknown_closes_per_second: u32,
+    /// `close`s queued outside any channel, at most.
+    pub global_closes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            open_channels: 64,
+            handshakes: 16,
+            queued_bytes: 4 << 20,
+            unknown_handles: 1024,
+            unknown_closes_per_second: 16,
+            global_closes: 1024,
+        }
+    }
+}
+
+/// The largest legal inner frame (a `finish`; a `rec` is 3 bytes shorter)
+/// and `ct` (1 MiB + the 16-byte tag, base64url), §R9.7a.
+pub const MAX_INNER_FRAME: usize = 1_398_162;
+pub const MAX_CT_CHARS: usize = 1_398_123;
+/// Approval ids remembered with their session (scope checks of
+/// `approval_closed`).
+const MAX_APPROVAL_SESSIONS: usize = 1024;
+
+/// An opened channel waits this long for its `init` (as `accept` → `finish`).
+const INIT_WAIT_MS: u64 = atem_client::channel::HANDSHAKE_STEP_MS;
+/// `busy` detail when the device list was removed while the runtime ran.
+const DETAIL_UNPAIRED: &str = "device list removed";
+/// `busy` detail when the journal halted (r8 §I).
+const DETAIL_JOURNAL_HALTED: &str = "journal halted; restart Atem";
+/// `busy` when the session host runs under another identity than the list.
+const DETAIL_IDENTITY: &str = "host identity differs from the device list";
+/// The revoked grants journal (§R9.6), in the session journal's directory.
+pub const REVOKED_GRANTS_FILE: &str = "revoked_grants";
+/// `busy` for a browser while the revoked grants couldn't be read.
+const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
+/// `busy` for a browser while the host's wall clock is below the revoked
+/// grants' bound, `max(until, high_water)` (the clock went back).
+const DETAIL_CLOCK_BACK: &str = "host clock went back";
+
+/// What the pairing directory vouches for, for the revoked grants (§R9.6).
+pub struct PairingVouch {
+    /// `pairing/revoked_floor`: a copy of the revoked grants' bound
+    /// (`{"v":1,"until","high_water"}`, only ever raised), written before
+    /// the journal's sidecar at every write that raises it.
+    pub copy: PathBuf,
+    /// With a pinned device list, the latest wall time the list vouches
+    /// for (its clean checkpoint, the newest write in `pairing/`); `None`
+    /// without one.
+    pub pin_floor: Option<u64>,
+}
+
+/// Seeds the revoked-grants files when a device list is pinned (§R9.6):
+/// the pairing's copy of the bound (`copy`), raised to the max of itself,
+/// the journal's sidecar and `wall`, then the sidecar raised to the same
+/// floor (or seeded with it), then an empty `revoked_grants` if the journal
+/// has none, each durable. A pinned host then always has them, so their
+/// loss is never read as a fresh host, and a re-pin over an existing
+/// journal leaves the sidecar level with the copy. Damaged or lost journal
+/// files (a host paired before) are kept as they are.
+pub fn seed_revoked_journal(journal_dir: &Path, copy: &Path, wall: u64) -> std::io::Result<()> {
+    let main = journal_dir.join(REVOKED_GRANTS_FILE);
+    let sidecar = journal_dir.join(revoked::SIDECAR_FILE);
+    let mut floor = revoked::Bound {
+        until: 0,
+        high_water: wall,
+    };
+    for path in [copy, sidecar.as_path()] {
+        if let revoked::SidecarLoaded::Read(b) = revoked::load_sidecar(path) {
+            floor = floor.max(b);
+        }
+    }
+    if revoked::load_sidecar(copy) != revoked::SidecarLoaded::Read(floor) {
+        revoked::write_atomic(copy, &revoked::encode_sidecar(floor), None)?;
+    }
+    // Then the journal's sidecar, to the same floor (never below the copy,
+    // so a re-pin isn't read as a journal rolled back). A damaged or lost
+    // one is left as it is (it fails closed at the next start).
+    match revoked::load_sidecar(&sidecar) {
+        revoked::SidecarLoaded::Read(b) => {
+            if b != floor {
+                revoked::write_atomic(&sidecar, &revoked::encode_sidecar(floor), None)?;
+            }
+            return Ok(());
+        }
+        revoked::SidecarLoaded::Unreadable => return Ok(()),
+        revoked::SidecarLoaded::Missing => {}
+    }
+    if main.symlink_metadata().is_ok() || revoked::damaged_asides(journal_dir) {
+        return Ok(());
+    }
+    revoked::write_atomic(&sidecar, &revoked::encode_sidecar(floor), None)?;
+    revoked::write_atomic(&main, &revoked::encode(&BTreeMap::new(), None), None)
+}
+
+/// The host's `host_channel_key` behind a provider (plain, §R9.3).
+pub struct HostKey {
+    keys: SoftwareKeys,
+    id: KeyId,
+}
+
+impl HostKey {
+    pub fn new(seed: &[u8; 32]) -> Self {
+        let mut keys = SoftwareKeys::new();
+        let id = KeyId::new("host_channel_key");
+        keys.insert_ed25519(id.clone(), seed);
+        HostKey { keys, id }
+    }
+}
+
+impl std::fmt::Debug for HostKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostKey")
+    }
+}
+
+/// The runtime's device list, as admission sees it.
+pub enum DeviceList<'a> {
+    /// Not paired for r9: r9 is refused (`stale_target` at `init`).
+    None,
+    /// It exists but can't serve (damaged, unsynced, no host key): r9 is
+    /// refused (`busy`), with why.
+    Failed(&'a str),
+    Open {
+        m: &'a mut MembershipHost,
+        key: &'a HostKey,
+    },
+}
+
+/// The clocks: the session host's monotonic ms, and the host clock of
+/// §R9.5 (wall time for expiry; its monotonic ms for channel timers).
+#[derive(Debug, Clone)]
+pub struct Now {
+    pub mono: u64,
+    pub host: HostNow,
+}
+
+/// How a session's recorded launch project matches a service scope's
+/// `projects` entry (`h1.<kid>.<hash>`, §R9.6). `None` while it can't be
+/// told (no project recorded, a locked cred agent): the session is then
+/// out of scope (fail closed).
+pub trait ProjectScope {
+    fn matches(&self, session_id: &str, entry: &str) -> Option<bool>;
+}
+
+/// No launch project is recorded: every `projects` scope leaves sessions
+/// out (pending), never in. Tests (the runtime has its `ProjectScopes`).
+#[cfg(test)]
+pub struct NoProjects;
+
+#[cfg(test)]
+impl ProjectScope for NoProjects {
+    fn matches(&self, _: &str, _: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// What one call works on.
+pub struct Parts<'a, J: Journal> {
+    pub host: &'a mut SessionHost<J>,
+    pub list: DeviceList<'a>,
+    pub now: Now,
+    pub projects: &'a dyn ProjectScope,
+}
+
+struct Attached {
+    channel: Channel,
+    attachment: String,
+    authority: Authority,
+}
+
+enum Phase {
+    /// Opened; waiting for `init` until `deadline`.
+    AwaitInit {
+        deadline: u64,
+    },
+    AwaitFinish(AwaitFinish),
+    Open(Box<Attached>),
+    /// Atem closed it: what is queued goes, then the `close`.
+    Closing,
+}
+
+struct Chan {
+    transport: Transport,
+    phase: Phase,
+    queue: VecDeque<String>,
+    queued: usize,
+    /// Atem's `close` reason, sent once the queue drained.
+    close: Option<&'static str>,
+    /// A queued frame whose write the link reports (a committed relay-only
+    /// result: the local link closes once it was written, §R9.8a).
+    receipt_for: Option<String>,
+}
+
+impl Chan {
+    fn handshaking(&self) -> bool {
+        matches!(self.phase, Phase::AwaitInit { .. } | Phase::AwaitFinish(_))
+    }
+}
+
+/// What `atem status` shows of r9 admission.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct R9Status {
+    pub link: bool,
+    pub channels: usize,
+    pub attachments: usize,
+}
+
+/// The r9 admission engine for one runtime (see the module docs).
+pub struct R9Host {
+    limits: Limits,
+    /// The live link generation.
+    link: Option<u64>,
+    chans: BTreeMap<String, Chan>,
+    by_attachment: HashMap<String, String>,
+    /// One `init` a second per link (§R9.7a: "per transport" is the link).
+    limiter: InitLimiter,
+    unknown: HashSet<String>,
+    unknown_order: VecDeque<String>,
+    /// (second, closes sent in it) for `unknown_channel`.
+    unknown_rate: (u64, u32),
+    unknown_dropped: u64,
+    /// approval id → its session, from the requests delivered (in order).
+    approval_sessions: HashMap<String, String>,
+    approval_order: VecDeque<String>,
+    /// `close`s queued outside any channel, in order: refusals (bounded by
+    /// `global_closes` and the rate) and the `close{closed}`s of a restart
+    /// (lifecycle closes, counted in `lifecycle`).
+    global: VecDeque<(String, bool)>,
+    /// Lifecycle closes in `global` (flagged `true` there): each holds its channel's slot until it
+    /// is sent, so open channels plus these never pass `open_channels`.
+    lifecycle: usize,
+    revoked: RevokedGrants,
+    revoked_until: BTreeMap<String, u64>,
+    revoked_path: Option<PathBuf>,
+    /// The bound's copy in `pairing/` (`revoked_floor`), outside the
+    /// journal directory: it survives the loss of `runtime/`.
+    pairing_copy: Option<PathBuf>,
+    /// What that copy durably holds (only ever raised).
+    copy_bound: revoked::Bound,
+    /// The revoked-grants file couldn't be read (at this start, or at an
+    /// earlier one whose record the file carries): browser grants are
+    /// refused until it ends (`revoked::Quarantine::ended`). Fail closed.
+    quarantine: Option<revoked::Quarantine>,
+    /// The quarantine's record is durable in the file.
+    quarantine_recorded: bool,
+    /// A damaged file still at `revoked_path`, not kept aside yet.
+    revoked_damaged: revoked::Damaged,
+    /// A damaged sidecar (`revoked_quarantine`), not kept aside yet.
+    sidecar_damaged: revoked::Damaged,
+    /// The conservative bound durable in the sidecar (raised in memory
+    /// only by a prune, written at the next write).
+    bound: revoked::Bound,
+    /// The clock-went-back refusal was logged (until it ends).
+    clock_back_logged: bool,
+    /// Monotonic time before which a failed record write isn't retried.
+    quarantine_retry_at: u64,
+    /// (approval id, device) pairs whose first `approval_seen` was taken.
+    seen: HashSet<(String, String)>,
+    /// The error a fenced principal's attachments get before their close.
+    fence_errors: HashMap<String, SessionError>,
+    /// Attachments whose channel Atem closed (overflow), for the session
+    /// host to forget.
+    dead: Vec<String>,
+    /// The channel the link last refused (the next round starts after it).
+    flush_cursor: Option<String>,
+    /// Sealed push hints and seen for the relay (§R9.9).
+    push: push::HostPush,
+    /// Lines driven by the router's or the relay's input, rate-limited.
+    input_log: LineLimit,
+    /// The latest monotonic time seen (for lines without a clock at hand).
+    last_mono: u64,
+    /// Where the host policy lives (§R9.8a): the pairing paths and the
+    /// journal directory (the device-list store's two directories).
+    policy_paths: Option<(PairingPaths, PathBuf)>,
+    /// Relay-only values committed since the runtime last took them.
+    policy_changes: Vec<bool>,
+    /// Monotonic time of the next roll-forward of a pending policy write.
+    policy_roll_at: u64,
+    /// The local link is about to close for relay only: new channels are
+    /// refused (`close{closed}`), never admitted on it.
+    refuse_opens: bool,
+    /// Tests: the next revoked-grants write "crashes" after this step.
+    #[cfg(test)]
+    pub(super) revoked_crash: Option<revoked::Step>,
+    /// Tests (in-process fixtures): the next host-policy write fails here.
+    #[cfg(test)]
+    policy_fault: Option<store::Injected>,
+}
+
+fn log(line: &str) {
+    eprintln!("atem runtime: r9: {line}");
+}
+
+/// A native member holding `manage` at the head, with the key it was
+/// admitted with (§R9.8a: checked when each request is handled).
+fn holds_manage(m: &MembershipHost, authority: &Authority) -> bool {
+    authority
+        .name()
+        .strip_prefix("member:")
+        .and_then(|device| m.membership().member(device))
+        .is_some_and(|state| {
+            state.status == MemberStatus::Active
+                && state.member.is_manager()
+                && state.member.auth_key == authority.key
+        })
+}
+
+/// A pending host-policy write is rolled forward at most this often.
+const POLICY_ROLL_MS: u64 = 5_000;
+
+/// At most this many input-driven lines per window (as `refusal_log`).
+const INPUT_LOG_LINES: u32 = 20;
+const INPUT_LOG_WINDOW_MS: u64 = 10_000;
+
+/// A runtime.log rate limit for lines whose number the router or the relay
+/// decides (refused envelopes, duplicate opens, closed channels, unmatched
+/// acknowledgments): at most `INPUT_LOG_LINES` per `INPUT_LOG_WINDOW_MS`,
+/// then one "… N more … suppressed" line when the next window starts.
+#[derive(Debug, Default)]
+struct LineLimit {
+    window: u64,
+    lines: u32,
+    suppressed: u64,
+    /// Lines written (tests: the bound holds).
+    written: u64,
+}
+
+impl LineLimit {
+    fn log(&mut self, now_ms: u64, line: impl FnOnce() -> String) {
+        if now_ms >= self.window.saturating_add(INPUT_LOG_WINDOW_MS) || now_ms < self.window {
+            if self.suppressed > 0 {
+                log(&format!(
+                    "… {} more input-driven line(s) suppressed",
+                    self.suppressed
+                ));
+                self.written += 1;
+            }
+            self.window = now_ms;
+            self.lines = 0;
+            self.suppressed = 0;
+        }
+        if self.lines < INPUT_LOG_LINES {
+            self.lines += 1;
+            self.written += 1;
+            log(&line());
+        } else {
+            self.suppressed += 1;
+        }
+    }
+}
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn error(code: &str, re: Option<&str>, detail: Option<&str>) -> SessionError {
+    SessionError {
+        re: re.map(str::to_owned),
+        detail: detail.map(str::to_owned),
+        ..SessionError::new(code)
+    }
+}
+
+/// The session `error` a fence reason gives the fenced principal's
+/// attachments (sent without `re`: the client closes, §R9.8).
+fn fence_error(reason: FenceReason) -> SessionError {
+    match reason {
+        FenceReason::Removed => error(code::UNAUTHORIZED, None, Some("removed")),
+        FenceReason::Revoked => error(code::UNAUTHORIZED, None, Some("roles changed")),
+        FenceReason::HostRemoved => error(code::UNAUTHORIZED, None, Some("host removed")),
+        FenceReason::Frozen => error(code::ACCOUNT_FROZEN, None, None),
+        FenceReason::NotRecorded => error(code::BUSY, None, Some(DETAIL_NOT_RECORDED)),
+    }
+}
+
+/// The family error of a terminal-v1 or chat-v1 request (their r8 shapes).
+fn family_error(family: &str, data: &Value, code: &str) -> Vec<u8> {
+    let body = if family == "agentChat" {
+        serde_json::json!({"v": 1, "op": "error", "conversationId": data.get("conversationId"),
+               "agentId": data.get("agentId"), "code": code, "text": code})
+    } else {
+        serde_json::json!({"v": 1, "op": "error", "terminal_id": data.get("terminal_id"),
+               "code": code, "message": code})
+    };
+    serde_json::json!({"type": family, "data": body})
+        .to_string()
+        .into_bytes()
+}
+
+impl Default for R9Host {
+    fn default() -> Self {
+        Self::new(Limits::default(), None)
+    }
+}
+
+impl R9Host {
+    /// An engine with these bounds; revoked grants are journaled in
+    /// `journal_dir/revoked_grants` (none: memory only, tests).
+    pub fn new(limits: Limits, journal_dir: Option<&Path>) -> Self {
+        Self::with_pairing(limits, journal_dir, None)
+    }
+
+    /// [`R9Host::new`] on a host with a pairing directory: the revoked
+    /// grants' bound is also kept in `pairing.copy` (see [`PairingVouch`]),
+    /// and with a pinned list, finding none of the revoked-grants files
+    /// means they were lost (the journal directory removed), never a fresh
+    /// host: browsers are quarantined from the pairing's floor.
+    pub fn with_pairing(
+        limits: Limits,
+        journal_dir: Option<&Path>,
+        pairing: Option<PairingVouch>,
+    ) -> Self {
+        let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
+        let mut host = R9Host {
+            limits,
+            link: None,
+            chans: BTreeMap::new(),
+            by_attachment: HashMap::new(),
+            limiter: InitLimiter::new(),
+            unknown: HashSet::new(),
+            unknown_order: VecDeque::new(),
+            unknown_rate: (0, 0),
+            unknown_dropped: 0,
+            approval_sessions: HashMap::new(),
+            approval_order: VecDeque::new(),
+            global: VecDeque::new(),
+            lifecycle: 0,
+            revoked: RevokedGrants::new(),
+            revoked_until: BTreeMap::new(),
+            revoked_path,
+            quarantine: None,
+            quarantine_recorded: false,
+            revoked_damaged: revoked::Damaged::default(),
+            sidecar_damaged: revoked::Damaged::default(),
+            bound: revoked::Bound::default(),
+            pairing_copy: pairing.as_ref().map(|p| p.copy.clone()),
+            copy_bound: revoked::Bound::default(),
+            clock_back_logged: false,
+            quarantine_retry_at: 0,
+            seen: HashSet::new(),
+            fence_errors: HashMap::new(),
+            dead: Vec::new(),
+            flush_cursor: None,
+            push: push::HostPush::default(),
+            input_log: LineLimit::default(),
+            last_mono: 0,
+            policy_paths: None,
+            policy_changes: Vec::new(),
+            policy_roll_at: 0,
+            refuse_opens: false,
+            #[cfg(test)]
+            revoked_crash: None,
+            #[cfg(test)]
+            policy_fault: None,
+        };
+        host.load_revoked(pairing.and_then(|p| p.pin_floor));
+        host
+    }
+
+    /// Where the host policy is stored (§R9.8a); a pending write is rolled
+    /// forward now, before any link is allowed.
+    pub fn set_policy_paths(&mut self, pairing: PairingPaths, journal_dir: PathBuf) {
+        let mut store = Store::new(&pairing, &journal_dir);
+        if let Err(e) = host_policy::roll_forward(&mut store, &pairing) {
+            log(&format!(
+                "host policy: a pending write is still uncertain ({e})"
+            ));
+        }
+        self.policy_paths = Some((pairing, journal_dir));
+    }
+
+    /// Tests: the next host-policy write fails at `fault`.
+    #[cfg(test)]
+    pub fn inject_policy_fault(&mut self, fault: store::Injected) {
+        self.policy_fault = Some(fault);
+    }
+
+    /// The relay-only values committed since the last call, in order.
+    pub fn take_policy_changes(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.policy_changes)
+    }
+
+    /// While the local link waits to close for relay only, new channels are
+    /// refused.
+    pub fn set_refuse_opens(&mut self, refuse: bool) {
+        self.refuse_opens = refuse;
+    }
+
+    /// Input-driven runtime.log lines written so far (tests: the rate
+    /// limit holds).
+    #[cfg(test)]
+    pub fn input_lines_written(&self) -> u64 {
+        self.input_log.written
+    }
+
+    pub fn status(&self) -> R9Status {
+        R9Status {
+            link: self.link.is_some(),
+            channels: self.chans.len(),
+            attachments: self.by_attachment.len(),
+        }
+    }
+
+    /// The r9 attachments (debug builds: the fixture state dump).
+    #[cfg(any(test, debug_assertions))]
+    pub fn attachment_ids(&self) -> Vec<String> {
+        self.by_attachment.keys().cloned().collect()
+    }
+
+    /// A channel is mid-admission (its handshake runs): the broker doesn't
+    /// reconnect the link under it to prove its route (§R9.7b).
+    pub fn admitting(&self) -> bool {
+        self.chans.values().any(Chan::handshaking)
+    }
+
+    /// Whether `att` is an r9 attachment (its messages go back here).
+    pub fn owns(&self, att: &str) -> bool {
+        self.by_attachment.contains_key(att)
+    }
+
+    /// The r9 attachments, with their principals.
+    pub fn attachments(&self) -> Vec<(String, String)> {
+        self.chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a) => Some((a.attachment.clone(), a.authority.name())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ── The link ──
+
+    /// Atem's link authenticated (generation `link_gen`): channels may
+    /// open. Anything of an earlier link is gone already
+    /// ([`R9Host::link_down`]).
+    pub fn link_up<J: Journal>(&mut self, link_gen: u64, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if self.link.is_some_and(|g| g != link_gen) {
+            effects = self.link_down(parts);
+        }
+        if self.link.is_none() {
+            self.link = Some(link_gen);
+            self.limiter = InitLimiter::new();
+            self.unknown.clear();
+            self.unknown_order.clear();
+            // §R9.9: everything unacknowledged goes again at a reconnect
+            // (to the recipients at the head).
+            self.push_recipients(parts);
+            self.push
+                .link_up(push_suppressed(parts), parts.now.host.wall_ms);
+        }
+        effects
+    }
+
+    /// Atem's link dropped: every channel on it closes and its attachment
+    /// is fenced (no lease is carried; §R9.7a 6). Nothing is sent.
+    pub fn link_down<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let had_link = self.link.is_some();
+        let effects = self.end_channels(parts);
+        self.global.clear();
+        self.lifecycle = 0;
+        if had_link {
+            log("the link dropped; every channel on it closed");
+        }
+        effects
+    }
+
+    /// Every channel ends and its attachment is fenced; the link is no
+    /// longer up. What is queued outside a channel is the caller's.
+    fn end_channels<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for (_, chan) in std::mem::take(&mut self.chans) {
+            if let Phase::Open(a) = chan.phase {
+                effects.extend(parts.host.disconnect(&a.attachment));
+            }
+        }
+        self.by_attachment.clear();
+        self.unknown.clear();
+        self.unknown_order.clear();
+        self.link = None;
+        self.push.link_down();
+        effects
+    }
+
+    /// The link generation ends while the socket stays up (a
+    /// re-authentication, or a link no longer authenticated): every
+    /// channel ends as in [`R9Host::restart`], and its closes (with those
+    /// already queued) are handed to `send` now, before anything of a new
+    /// generation. Whatever the socket doesn't take now is dropped and
+    /// counted: a handle is scoped to its generation (§R9.7a "Scope of a
+    /// handle"), so a late close could end a new channel that reused it.
+    /// The caller brings the new generation up ([`R9Host::link_up`]).
+    pub fn end_generation<J: Journal>(
+        &mut self,
+        parts: &mut Parts<'_, J>,
+        send: &mut dyn FnMut(String) -> bool,
+    ) -> Vec<Effect> {
+        let effects = self.restart(parts);
+        self.flush_closes(send);
+        let left = std::mem::take(&mut self.global).len();
+        self.lifecycle = 0;
+        if left > 0 {
+            self.unknown_dropped += left as u64;
+            log(&format!(
+                "{left} close(s) of an ended link generation dropped (the link was backed up)"
+            ));
+        }
+        effects
+    }
+
+    // ── Envelopes in ──
+
+    /// One envelope from the router (§R9.7a).
+    pub fn on_envelope<J: Journal>(&mut self, text: &str, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        if self.link.is_none() {
+            return Vec::new();
+        }
+        let mono = parts.now.host.mono_ms;
+        self.last_mono = mono;
+        let event = match envelope::parse(text) {
+            Ok(event) => event,
+            Err(refused) => {
+                self.input_log.log(mono, || {
+                    format!("refused an envelope ({})", refused.reason())
+                });
+                if let Some(handle) = refused.channel().map(str::to_owned) {
+                    return self.fail(&handle, refused.reason(), parts);
+                }
+                return Vec::new();
+            }
+        };
+        match event {
+            Event::Open { channel, transport } => {
+                self.open(channel, transport, parts);
+                Vec::new()
+            }
+            Event::Close { channel, .. } => self.router_closed(&channel, parts),
+            Event::Frame { channel, frame } => {
+                if !self.chans.contains_key(&channel) {
+                    self.unknown_frame(&channel, parts.now.host.mono_ms);
+                    return Vec::new();
+                }
+                self.on_frame(&channel, &frame, parts)
+            }
+        }
+    }
+
+    fn open<J: Journal>(&mut self, handle: String, transport: Transport, parts: &Parts<'_, J>) {
+        if self.chans.contains_key(&handle) {
+            // Never replaces a live handshake, keys or attachment.
+            self.input_log.log(parts.now.host.mono_ms, || {
+                format!(
+                    "ignored a duplicate open of a live channel ({})",
+                    transport.as_str()
+                )
+            });
+            return;
+        }
+        if self.refuse_opens {
+            self.refuse_outside(&handle, reason::CLOSED, parts.now.host.mono_ms);
+            return;
+        }
+        let handshakes = self.chans.values().filter(|c| c.handshaking()).count();
+        // A restart's pending `close{closed}` still holds its channel's
+        // slot (§R9.7a "Overload"): opens wait for the link to take it.
+        if self.chans.len() + self.lifecycle >= self.limits.open_channels
+            || handshakes >= self.limits.handshakes
+        {
+            self.refuse_outside(&handle, reason::BUSY, parts.now.host.mono_ms);
+            return;
+        }
+        if self.unknown.remove(&handle) {
+            self.unknown_order.retain(|h| *h != handle);
+        }
+        self.chans.insert(
+            handle,
+            Chan {
+                transport,
+                phase: Phase::AwaitInit {
+                    deadline: parts.now.host.mono_ms + INIT_WAIT_MS,
+                },
+                queue: VecDeque::new(),
+                queued: 0,
+                close: None,
+                receipt_for: None,
+            },
+        );
+    }
+
+    /// The router closed `handle`: that channel ends (its attachment is
+    /// fenced); nothing answers a close.
+    fn router_closed<J: Journal>(&mut self, handle: &str, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let Some(chan) = self.chans.remove(handle) else {
+            return Vec::new();
+        };
+        match chan.phase {
+            Phase::Open(a) => {
+                self.by_attachment.remove(&a.attachment);
+                parts.host.disconnect(&a.attachment)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A frame for a handle Atem doesn't hold: one `unknown_channel` close
+    /// per handle per link, at most 16 a second (§R9.7a 3).
+    fn unknown_frame(&mut self, handle: &str, now_mono: u64) {
+        if self.unknown.contains(handle) {
+            return;
+        }
+        if self.unknown_order.len() >= self.limits.unknown_handles {
+            // Remembers no more: dropped, never a second close (§R9.7a 3).
+            self.dropped("frames for unknown channels");
+            return;
+        }
+        if self.refuse_outside(handle, reason::UNKNOWN_CHANNEL, now_mono) {
+            self.unknown.insert(handle.to_string());
+            self.unknown_order.push_back(handle.to_string());
+        }
+    }
+
+    /// A `close` outside any channel (a refused `open`, an unknown handle):
+    /// at most 16 a second and 1024 queued (§R9.7a "Bounds"); beyond either
+    /// dropped and counted. Whether it was queued.
+    fn refuse_outside(&mut self, handle: &str, why: &'static str, now_mono: u64) -> bool {
+        let second = now_mono / 1000;
+        if self.unknown_rate.0 != second {
+            self.unknown_rate = (second, 0);
+        }
+        if self.unknown_rate.1 >= self.limits.unknown_closes_per_second
+            || self.global.len() - self.lifecycle >= self.limits.global_closes
+        {
+            self.dropped("refusals outside a channel");
+            return false;
+        }
+        self.unknown_rate.1 += 1;
+        self.global
+            .push_back((envelope::close(handle, Some(why)), false));
+        true
+    }
+
+    fn dropped(&mut self, what: &str) {
+        self.unknown_dropped += 1;
+        if self.unknown_dropped.is_power_of_two() {
+            log(&format!("{} {what} dropped so far", self.unknown_dropped));
+        }
+    }
+
+    /// Tests: the fixture runners connect clients back to back; the
+    /// per-link `init` rate is checked by the engine tests and the envelope
+    /// fixtures. Debug builds: the real runtime's fixture hook
+    /// (`ATEM_TEST_NO_INIT_LIMIT`).
+    #[cfg(any(test, debug_assertions))]
+    pub fn reset_init_limiter(&mut self) {
+        self.limiter = InitLimiter::new();
+    }
+
+    /// `close`s queued outside any channel (tests: the bound holds).
+    #[cfg(test)]
+    pub fn queued_closes(&self) -> usize {
+        self.global.len()
+    }
+
+    /// Bytes of the `close`s queued outside any channel (tests: the bound
+    /// holds).
+    #[cfg(test)]
+    pub fn queued_close_bytes(&self) -> usize {
+        self.global.iter().map(|(t, _)| t.len()).sum()
+    }
+
+    /// Restart closes not yet taken by the link (tests).
+    #[cfg(test)]
+    pub fn pending_lifecycle_closes(&self) -> usize {
+        self.lifecycle
+    }
+
+    /// Hands the closes queued outside a channel to `send`, in order;
+    /// false when it refused one (the rest waits).
+    fn flush_closes(&mut self, send: &mut dyn FnMut(String) -> bool) -> bool {
+        while let Some((text, lifecycle)) = self.global.pop_front() {
+            if !send(text.clone()) {
+                self.global.push_front((text, lifecycle));
+                return false;
+            }
+            if lifecycle {
+                self.lifecycle -= 1;
+            }
+        }
+        true
+    }
+
+    /// Ends every channel while the socket stays up (a re-pin, an unpair, a
+    /// re-authentication): as [`R9Host::link_down`], but the closes already
+    /// queued stay and a `close{closed}` is queued for each live handle
+    /// (past the outside-channel bounds: they end channels the router holds
+    /// open), all sent on the same socket (§R9.7a 6). Each such close holds
+    /// its channel's slot until the link takes it, so across any number of
+    /// restarts at most 64 are pending (opens are refused `busy` while the
+    /// slots are taken). The caller brings the link up again.
+    pub fn restart<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let live: Vec<String> = self.chans.keys().cloned().collect();
+        let effects = self.end_channels(parts);
+        if !live.is_empty() {
+            log(&format!(
+                "every channel ended ({}); the link stays up",
+                live.len()
+            ));
+        }
+        // Each holds its channel's slot until sent (see `open`): at most
+        // `open_channels` are ever pending, however many restarts come.
+        self.lifecycle += live.len();
+        self.global.extend(
+            live.iter()
+                .map(|h| (envelope::close(h, Some(reason::CLOSED)), true)),
+        );
+        effects
+    }
+
+    /// Closes `handle` now with `reason` (no record first); its attachment,
+    /// if any, is fenced.
+    fn fail<J: Journal>(
+        &mut self,
+        handle: &str,
+        why: &'static str,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let Some(chan) = self.chans.get_mut(handle) else {
+            return Vec::new();
+        };
+        let phase = std::mem::replace(&mut chan.phase, Phase::Closing);
+        chan.queue.clear();
+        chan.queued = 0;
+        chan.close.get_or_insert(why);
+        match phase {
+            Phase::Open(mut a) => {
+                a.channel.close();
+                self.by_attachment.remove(&a.attachment);
+                parts.host.disconnect(&a.attachment)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// An envelope of `handle` was refused unread (the broker's inbox was
+    /// full: `busy`; over its bound: `too_large`): that channel closes,
+    /// never short of a frame.
+    pub fn refuse_unread<J: Journal>(
+        &mut self,
+        handle: &str,
+        why: &'static str,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        if self.chans.contains_key(handle) {
+            return self.fail(handle, why, parts);
+        }
+        self.refuse_outside(handle, why, parts.now.host.mono_ms);
+        Vec::new()
+    }
+
+    /// Sends `frame` (an `atem-ch1` frame's bytes) on `handle`, then closes
+    /// it with `why`.
+    fn reply_and_close(&mut self, handle: &str, frame: Option<Vec<u8>>, why: &'static str) {
+        if let Some(chan) = self.chans.get_mut(handle) {
+            chan.phase = Phase::Closing;
+            if let Some(frame) = frame {
+                let text = envelope::frame(handle, &frame);
+                chan.queued += text.len();
+                chan.queue.push_back(text);
+            }
+            chan.close.get_or_insert(why);
+        }
+    }
+
+    fn on_frame<J: Journal>(
+        &mut self,
+        handle: &str,
+        frame: &[u8],
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        if inner_too_large(frame) {
+            self.input_log.log(parts.now.host.mono_ms, || {
+                "a channel's frame is over the inner-frame bound; closed (too_large)".into()
+            });
+            return self.fail(handle, reason::TOO_LARGE, parts);
+        }
+        let chan = self.chans.get_mut(handle).expect("checked");
+        let phase = std::mem::replace(&mut chan.phase, Phase::Closing);
+        match phase {
+            Phase::Closing => {
+                // Atem is closing it: anything more is dropped.
+                chan.phase = Phase::Closing;
+                Vec::new()
+            }
+            Phase::AwaitInit { .. } => {
+                self.on_init(handle, frame, parts);
+                Vec::new()
+            }
+            Phase::AwaitFinish(await_finish) => self.on_finish(handle, await_finish, frame, parts),
+            Phase::Open(mut a) => {
+                let plain = match a.channel.open(frame, parts.now.host.mono_ms) {
+                    Ok(plain) => plain,
+                    Err(e) => {
+                        // A gap, replay, failed tag or wrong direction: that
+                        // channel closes without a reply (§R9.7 "Records").
+                        let mono = parts.now.host.mono_ms;
+                        self.input_log
+                            .log(mono, || format!("a channel closed: {}", e.code()));
+                        let chan = self.chans.get_mut(handle).expect("checked");
+                        chan.phase = Phase::Open(a);
+                        return self.fail(handle, reason::CLOSED, parts);
+                    }
+                };
+                let attachment = a.attachment.clone();
+                let authority = a.authority.clone();
+                self.chans.get_mut(handle).expect("checked").phase = Phase::Open(a);
+                self.on_record(&attachment, &authority, &plain, parts)
+            }
+        }
+    }
+
+    // ── The handshake ──
+
+    fn on_init<J: Journal>(&mut self, handle: &str, frame: &[u8], parts: &mut Parts<'_, J>) {
+        let clear = |code: ClearCode| Some(chwire::clear_error(code));
+        let init = match chwire::parse_frame(frame) {
+            Ok(Frame::Init(init)) => init,
+            Ok(Frame::Error { .. }) => {
+                // The client gave up (advisory): close quietly.
+                self.reply_and_close(handle, None, reason::CLOSED);
+                return;
+            }
+            _ => {
+                self.reply_and_close(
+                    handle,
+                    clear(ClearCode::HandshakeFailed),
+                    reason::HANDSHAKE_FAILED,
+                );
+                return;
+            }
+        };
+        if !self.limiter.admit(parts.now.host.mono_ms) {
+            self.reply_and_close(handle, InitLimiter::busy().reply, reason::BUSY);
+            return;
+        }
+        let ctx = parts.host.context().clone();
+        let (m, key) = match &mut parts.list {
+            DeviceList::None => {
+                // No device list: nothing of this host is pinned.
+                self.reply_and_close(handle, clear(ClearCode::StaleTarget), reason::CLOSED);
+                return;
+            }
+            DeviceList::Failed(why) => {
+                log(&format!(
+                    "refused an init: the device list failed to open ({why})"
+                ));
+                self.reply_and_close(handle, clear(ClearCode::Busy), reason::BUSY);
+                return;
+            }
+            DeviceList::Open { m, key } => (m, key),
+        };
+        let pin = m.pin_of().clone();
+        // §R9.7 step 2: the target first (stale_target), then frozen.
+        if init.genesis_hash != m.membership().genesis_hash()
+            || init.host_id != pin.host_id
+            || init.host_trust_gen != pin.host_trust_gen
+        {
+            self.reply_and_close(handle, clear(ClearCode::StaleTarget), reason::CLOSED);
+            return;
+        }
+        match m.init() {
+            MInit::Frozen => {
+                self.reply_and_close(handle, clear(ClearCode::AccountFrozen), reason::CLOSED);
+                return;
+            }
+            MInit::Busy => {
+                self.reply_and_close(handle, clear(ClearCode::Busy), reason::BUSY);
+                return;
+            }
+            MInit::Accept => {}
+        }
+        if ctx.account_id != m.membership().account_id()
+            || ctx.atem_device_id != pin.host_id
+            || ctx.host_trust_gen != pin.host_trust_gen
+        {
+            log(DETAIL_IDENTITY);
+            self.reply_and_close(handle, clear(ClearCode::Busy), reason::BUSY);
+            return;
+        }
+        let hctx = HostContext {
+            log: m.membership(),
+            host_id: &pin.host_id,
+            host_trust_gen: pin.host_trust_gen,
+            provider: &key.keys,
+            key: &key.id,
+        };
+        match Responder::on_init(&hctx, frame, parts.now.host.mono_ms) {
+            Ok((next, accept)) => {
+                let chan = self.chans.get_mut(handle).expect("checked");
+                chan.phase = Phase::AwaitFinish(next);
+                let text = envelope::frame(handle, &accept);
+                chan.queued += text.len();
+                chan.queue.push_back(text);
+            }
+            Err(refused) => {
+                let why = match refused.reply.is_some() {
+                    true => reason::HANDSHAKE_FAILED,
+                    false => reason::CLOSED,
+                };
+                self.reply_and_close(handle, refused.reply, why);
+            }
+        }
+    }
+
+    fn on_finish<J: Journal>(
+        &mut self,
+        handle: &str,
+        await_finish: AwaitFinish,
+        frame: &[u8],
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let mono = parts.now.host.mono_ms;
+        let opened = match await_finish.on_finish(frame, mono) {
+            Ok(opened) => opened,
+            Err(refused) => {
+                self.reply_and_close(handle, refused.reply, reason::HANDSHAKE_FAILED);
+                return Vec::new();
+            }
+        };
+        let Some(hello) = Hello::parse(opened.hello()) else {
+            let refused = opened.malformed();
+            self.reply_and_close(handle, refused.reply, reason::HANDSHAKE_FAILED);
+            return Vec::new();
+        };
+        let keyed = opened.key(&hello.proof);
+        let re = hello.id.clone();
+        let mut effects = Vec::new();
+        let refuse =
+            |me: &mut Self, keyed: atem_client::channel::responder::Keyed, e: SessionError| {
+                log(&format!(
+                    "refused a hello: {}{}",
+                    e.code,
+                    e.detail
+                        .as_deref()
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default()
+                ));
+                let frame = keyed.refuse(&e.to_bytes(), mono).ok();
+                me.reply_and_close(handle, frame, reason::CLOSED);
+            };
+        let membership = match hello.check() {
+            Ok(m) => m.clone(),
+            Err(r) => {
+                refuse(self, keyed, r.to_error(re.as_deref()));
+                return effects;
+            }
+        };
+        if !matches!(parts.list, DeviceList::Open { .. }) {
+            refuse(
+                self,
+                keyed,
+                error(code::BUSY, re.as_deref(), Some(DETAIL_UNPAIRED)),
+            );
+            return effects;
+        }
+        // §R9.7 step 6: the carriage before judging the sender (§R9.3).
+        let carriage = match (&mut parts.list, membership.entries.is_empty()) {
+            (DeviceList::Open { m, .. }, false) => {
+                let mut fences = HostFences::new(parts.host);
+                let result = m.apply_carriage(&membership.entries, &parts.now.host, &mut fences);
+                effects.extend(fences.effects);
+                Some(result)
+            }
+            _ => None,
+        };
+        if let Some(result) = &carriage {
+            // Every live attachment learns the new head now, whatever the
+            // carrier's own admission (its welcome names it).
+            effects.extend(self.carried(result, None, parts));
+            let refused = match result.carried {
+                Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
+                    Some(error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECORDED)))
+                }
+                Carried::Unpaired => Some(error(code::BUSY, re.as_deref(), Some(DETAIL_UNPAIRED))),
+                Carried::Frozen => Some(error(code::ACCOUNT_FROZEN, re.as_deref(), None)),
+                Carried::Committed | Carried::Unchanged => None,
+            };
+            if let Some(e) = refused {
+                refuse(self, keyed, e);
+                return effects;
+            }
+        }
+        let DeviceList::Open { m, .. } = &mut parts.list else {
+            unreachable!("checked above");
+        };
+        let pin = m.pin_of().clone();
+        let now = parts.now.host.clone();
+        let wall = now.wall_ms;
+        // A `hello` that would lift a hold (a manager's reconciliation)
+        // does so only after its `sig_c` is verified below: nothing of the
+        // hold changes for an unauthenticated `finish`.
+        let mut reconciles: Option<String> = None;
+        let resolved: Result<Authority, SessionError> = match &hello.proof.principal {
+            Principal::Native { device_id } | Principal::Service { device_id } => {
+                let decided = match m.decide_hello(
+                    device_id,
+                    Some(membership.head),
+                    carriage.as_ref(),
+                    membership.more,
+                    &now,
+                ) {
+                    MHello::Reconcile(admission) => {
+                        reconciles = Some(device_id.clone());
+                        MHello::Admit(admission)
+                    }
+                    other => other,
+                };
+                match decided {
+                    MHello::Frozen => Err(error(code::ACCOUNT_FROZEN, re.as_deref(), None)),
+                    MHello::NotRecorded => {
+                        Err(error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECORDED)))
+                    }
+                    MHello::NotReconciled => Err(error(
+                        code::BUSY,
+                        re.as_deref(),
+                        Some(DETAIL_NOT_RECONCILED),
+                    )),
+                    MHello::Admit(Admission::Member { state, .. }) => Authority::of_member(
+                        &hello.proof.principal,
+                        &state.member,
+                        &pin.host_id,
+                        wall,
+                    )
+                    .map_err(|r| r.to_error(re.as_deref())),
+                    MHello::Admit(other) => Err(admission_error(&other, re.as_deref())
+                        .unwrap_or_else(|| error(code::UNAUTHORIZED, re.as_deref(), None))),
+                    MHello::Reconcile(_) => unreachable!("mapped above"),
+                }
+            }
+            Principal::Browser { .. } => {
+                if let Some(detail) = self.browsers_refused(wall, now.mono_ms) {
+                    Err(error(code::BUSY, re.as_deref(), Some(detail)))
+                } else if m.is_frozen() {
+                    Err(error(code::ACCOUNT_FROZEN, re.as_deref(), None))
+                } else if m.faulted().is_some() {
+                    Err(error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECORDED)))
+                } else if m.held().is_some() {
+                    Err(error(
+                        code::BUSY,
+                        re.as_deref(),
+                        Some(DETAIL_NOT_RECONCILED),
+                    ))
+                } else if membership.more
+                    && hello
+                        .grant
+                        .as_ref()
+                        .and_then(|g| BrowserGrant::parse(g.clone()).ok())
+                        .is_some_and(|g| m.membership().member(&g.issuer).is_none())
+                {
+                    // §R9.3 step 5: the issuer may be in the next window.
+                    Err(
+                        admission_error(&Admission::Incomplete { head: m.head() }, re.as_deref())
+                            .unwrap_or_else(|| error(code::UNAUTHORIZED, re.as_deref(), None)),
+                    )
+                } else {
+                    let revoked = &self.revoked;
+                    Authority::resolve(
+                        m.membership(),
+                        &hello.proof.principal,
+                        hello.grant.as_ref(),
+                        &pin.host_id,
+                        pin.host_trust_gen,
+                        &now,
+                        &|id| revoked.contains(id, wall),
+                    )
+                    .map_err(|r| match r {
+                        Refusal::Membership(a) => admission_error(&a, re.as_deref())
+                            .unwrap_or_else(|| error(code::UNAUTHORIZED, re.as_deref(), None)),
+                        r => r.to_error(re.as_deref()),
+                    })
+                }
+            }
+        };
+        let authority = match resolved {
+            Ok(a) => a,
+            Err(e) => {
+                refuse(self, keyed, e);
+                return effects;
+            }
+        };
+        let mut channel = match keyed.admit(&authority.key, authority.channel_deadline_ms(&now)) {
+            Ok(channel) => channel,
+            Err(refusal) => {
+                log("refused a hello: handshake_failed (sig_c)");
+                let e = error(code::HANDSHAKE_FAILED, re.as_deref(), None);
+                let frame = refusal.reply(&e.to_bytes(), mono).ok();
+                self.reply_and_close(handle, frame, reason::CLOSED);
+                return effects;
+            }
+        };
+        // The proof is verified: a manager's reconciliation lifts the hold
+        // now (§R9.3 "Held"), or the hello is refused and the host stays held.
+        if let Some(device_id) = reconciles
+            && !m.reconcile(&device_id)
+        {
+            log("refused a hello: busy (device list not reconciled)");
+            let e = error(code::BUSY, re.as_deref(), Some(DETAIL_NOT_RECONCILED));
+            let frame = channel.seal(&e.to_bytes(), mono).ok();
+            channel.close();
+            self.reply_and_close(handle, frame, reason::CLOSED);
+            return effects;
+        }
+        // The session host's attachment: one per channel (its own client),
+        // speaking for the principal (r8 §H).
+        let attachment = new_id();
+        let permissions: Vec<r8::Permission> = authority
+            .permissions
+            .iter()
+            .map(|p| match p {
+                Permission::Control => r8::Permission::Control,
+                Permission::View => r8::Permission::View,
+            })
+            .collect();
+        let channel_ms_left = channel.deadline_ms().saturating_sub(mono);
+        let ms_left = authority.authorization_ms_left(wall, channel_ms_left);
+        let attach = Attach {
+            client: attachment.clone(),
+            principal: authority.name(),
+            attachment_gen: attachment.clone(),
+            permissions,
+            client_kind: match authority.client_kind {
+                ClientKind::Browser => r8::ClientKind::Browser,
+                ClientKind::Native | ClientKind::Service => r8::ClientKind::Native,
+            },
+            authorization_ms: ms_left,
+        };
+        if let Err(why) = parts.host.connect(attach) {
+            log(&format!(
+                "refused a hello: the session host refused the attachment ({why})"
+            ));
+            let e = error(code::BUSY, re.as_deref(), None);
+            let frame = channel.seal(&e.to_bytes(), mono).ok();
+            channel.close();
+            self.reply_and_close(handle, frame, reason::CLOSED);
+            return effects;
+        }
+        let (controller_session, _) = match parts.host.welcome_r9(&attachment, parts.now.mono) {
+            Ok(welcomed) => welcomed,
+            Err(code) => {
+                effects.extend(parts.host.disconnect(&attachment));
+                let detail = (code == r8::ErrorCode::Busy).then_some(DETAIL_JOURNAL_HALTED);
+                let e = error(&super::host::code_name(code), re.as_deref(), detail);
+                let frame = channel.seal(&e.to_bytes(), mono).ok();
+                channel.close();
+                self.reply_and_close(handle, frame, reason::CLOSED);
+                return effects;
+            }
+        };
+        effects.extend(parts.host.take_effects());
+        let ctx = parts.host.context().clone();
+        let mut features: Vec<String> = crate::session_protocol::revision::FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        features.extend(R9_FEATURES.iter().map(|f| f.to_string()));
+        let welcome = Welcome {
+            id: new_id(),
+            re: re.clone(),
+            account_id: ctx.account_id.clone(),
+            atem_device_id: ctx.atem_device_id.clone(),
+            host_trust_gen: ctx.host_trust_gen,
+            runtime_gen: ctx.runtime_gen.clone(),
+            controller_session,
+            attachment_gen: attachment.clone(),
+            client_kind: authority.client_kind,
+            permissions: authority.permissions.iter().copied().collect(),
+            authorization_ms_left: ms_left,
+            server_time: wall,
+            revision: REVISION,
+            features,
+            principal: authority.name(),
+            scope: authority.scope.clone(),
+            head: m.head(),
+            pending_recovery: m
+                .membership()
+                .pending_recovery(&now)
+                .iter()
+                .map(PendingRecovery::of)
+                .collect(),
+            channel_id: channel.channel_id().to_owned(),
+        };
+        let frame = match channel.seal(&welcome.to_bytes(), mono) {
+            Ok(frame) => frame,
+            Err(_) => {
+                effects.extend(parts.host.disconnect(&attachment));
+                self.reply_and_close(handle, None, reason::CLOSED);
+                return effects;
+            }
+        };
+        let transport = self.chans.get(handle).map(|c| c.transport);
+        log(&format!(
+            "welcomed {} ({}, {})",
+            authority.name(),
+            authority.client_kind.as_str(),
+            transport.map_or("?", Transport::as_str)
+        ));
+        let chan = self.chans.get_mut(handle).expect("checked");
+        let text = envelope::frame(handle, &frame);
+        chan.queued += text.len();
+        chan.queue.push_back(text);
+        chan.phase = Phase::Open(Box::new(Attached {
+            channel,
+            attachment: attachment.clone(),
+            authority,
+        }));
+        self.by_attachment.insert(attachment, handle.to_string());
+        effects
+    }
+
+    /// Everything a carriage requires beyond the device list itself, the
+    /// same on every route that advances the head while channels are live
+    /// (a `hello`'s carriage, the `membership` op, the host's own fetch),
+    /// so the routes can't drift: the fenced principals' errors noted, the
+    /// browsers whose issuer was removed or lost its roles fenced with them
+    /// (§R9.6 "issuer fenced"), push recipients re-derived (§R9.9: a
+    /// removed or demoted device's hints stop at once), and, when the head
+    /// moved, `membership_head` to every live attachment but `except` (the
+    /// carrier that gets its own reply) and those being fenced. Restart
+    /// replay has no live channel: its fences reach the session host
+    /// through `MembershipHost::open`, and a browser of a fenced issuer is
+    /// refused at admission ("issuer fenced").
+    pub fn carried<J: Journal>(
+        &mut self,
+        result: &CarriageResult,
+        except: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        self.note_fences(&result.fences);
+        self.push_recipients(parts);
+        let effects = self.fence_issued(&result.fences, parts);
+        if result.announce {
+            self.announce_except(except, parts);
+        }
+        effects
+    }
+
+    /// The fences a carriage made: each fenced principal's attachments get
+    /// its error before their close; browsers whose issuer was removed or
+    /// lost its roles are fenced with them (§R9.6 "issuer fenced").
+    fn note_fences(&mut self, fences: &[Fence]) {
+        for f in fences {
+            self.fence_errors
+                .entry(f.principal.clone())
+                .or_insert_with(|| fence_error(f.reason));
+        }
+    }
+
+    /// The browsers whose issuer `fences` fenced (removed or roles
+    /// changed): fenced too, through §H.
+    fn fence_issued<J: Journal>(
+        &mut self,
+        fences: &[Fence],
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let issuers: HashSet<&str> = fences
+            .iter()
+            .filter(|f| matches!(f.reason, FenceReason::Removed | FenceReason::Revoked))
+            .filter_map(|f| f.principal.strip_prefix("member:"))
+            .collect();
+        let browsers: Vec<String> = self
+            .chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a)
+                    if a.authority
+                        .issuer
+                        .as_deref()
+                        .is_some_and(|i| issuers.contains(i)) =>
+                {
+                    Some(a.authority.name())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut effects = Vec::new();
+        for b in browsers {
+            self.fence_errors
+                .entry(b.clone())
+                .or_insert_with(|| error(code::UNAUTHORIZED, None, Some("issuer fenced")));
+            effects.extend(parts.host.fence_principal(&b, 0));
+        }
+        effects
+    }
+
+    /// The end of a pass: fence errors don't outlive the effects they were
+    /// noted for.
+    pub fn end_pass(&mut self) {
+        self.fence_errors.clear();
+    }
+
+    /// Every r9 attachment gets `membership_head` (the head moved, or a
+    /// pending entry changed state).
+    pub fn announce<J: Journal>(&mut self, parts: &mut Parts<'_, J>) {
+        self.announce_except(None, parts);
+    }
+
+    // ── Records ──
+
+    fn on_record<J: Journal>(
+        &mut self,
+        att: &str,
+        authority: &Authority,
+        plain: &[u8],
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let mono = parts.now.host.mono_ms;
+        let value: Value = serde_json::from_slice(plain).unwrap_or(Value::Null);
+        let family = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let data = value.get("data").cloned().unwrap_or(Value::Null);
+        let re = data.get("id").and_then(Value::as_str).map(str::to_owned);
+        let refuse = |me: &mut Self, code: &str, detail: Option<&str>| {
+            let bytes = match family.as_str() {
+                "session" | "" => error(code, re.as_deref(), detail).to_bytes(),
+                _ => family_error(&family, &data, code),
+            };
+            me.seal_to(att, &bytes, mono);
+        };
+        // The one authority check for every request (§R9.6), before any
+        // field is decoded: the named session first, then the op.
+        let need = match Need::of_request(&family, &data) {
+            Ok(need) => need,
+            Err(denied) => {
+                refuse(self, denied.code(), None);
+                return Vec::new();
+            }
+        };
+        let verdict = match Need::session_of(&data) {
+            None => authority.authorize(need, None),
+            Some(sid) => {
+                // Out of scope and nonexistent take the same path: the
+                // scope is evaluated either way, then existence decides.
+                let host_id = parts.host.context().atem_device_id.clone();
+                let projects = parts.projects;
+                let matches = |entry: &str| projects.matches(sid, entry);
+                let r = SessionRef {
+                    host_id: &host_id,
+                    session_id: sid,
+                    project_matches: &matches,
+                };
+                let in_scope =
+                    authority.session_in_scope(r.host_id, r.session_id, r.project_matches);
+                let exists = parts.host.descriptor_of(sid).is_some();
+                if exists && in_scope {
+                    authority.authorize(need, Some(Some(&r)))
+                } else {
+                    Err(Denied::UnknownSession)
+                }
+            }
+        };
+        if let Err(denied) = verdict {
+            refuse(self, denied.code(), None);
+            return Vec::new();
+        }
+        if family == "session" {
+            match data.get("op").and_then(Value::as_str) {
+                Some("membership") => return self.membership_op(att, plain, re.as_deref(), parts),
+                Some("revoke_grant") => {
+                    return self.revoke_grant(att, authority, &data, re.as_deref(), parts);
+                }
+                Some("approval_seen") => {
+                    self.approval_seen(att, authority, &data, re.as_deref(), parts);
+                    return Vec::new();
+                }
+                Some("host_policy_set" | "host_policy_get") => {
+                    self.host_policy_op(att, authority, &data, re.as_deref(), parts);
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+        parts.host.receive(att, plain, parts.now.mono)
+    }
+
+    /// `host_policy_set`/`host_policy_get` → `host_policy_result{re}`
+    /// (§R9.8a). A native member holding `manage` at the current head, checked
+    /// here on every request and retry (roles change under a live channel).
+    fn host_policy_op<J: Journal>(
+        &mut self,
+        att: &str,
+        authority: &Authority,
+        data: &Value,
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) {
+        use atem_client::session::host_policy::{
+            HostPolicyChanged, HostPolicyResult, Outcome, Request,
+        };
+        let mono = parts.now.host.mono_ms;
+        let refuse = |me: &mut Self, code: &str, detail: Option<&str>| {
+            me.seal_to(att, &error(code, re, detail).to_bytes(), mono);
+        };
+        let request = match Request::from_data(data) {
+            Ok(request) => request,
+            Err(_) => return refuse(self, code::INVALID_REQUEST, None),
+        };
+        let DeviceList::Open { m, .. } = &parts.list else {
+            return refuse(self, code::BUSY, Some(DETAIL_UNPAIRED));
+        };
+        if m.held().is_some() {
+            return refuse(self, code::BUSY, Some(DETAIL_NOT_RECONCILED));
+        }
+        if !holds_manage(m, authority) {
+            return refuse(self, code::FORBIDDEN, None);
+        }
+        let Some((pairing, journal)) = self.policy_paths.clone() else {
+            return refuse(self, code::BUSY, Some(host_policy::DETAIL_UNREADABLE));
+        };
+        let account = m.membership().account_id().to_owned();
+        let genesis = m.membership().genesis_hash().to_hex();
+        let head = m.head();
+        let (request_id, answer) = match &request {
+            Request::Get { .. } => (
+                None,
+                host_policy::current(&pairing, &account, &genesis)
+                    .map(|c| (Outcome::Current, c.policy()))
+                    .map_err(host_policy::Refused::Unreadable),
+            ),
+            Request::Set {
+                request_id,
+                relay_only,
+                expected_revision,
+                ..
+            } => {
+                let mut store = Store::new(&pairing, &journal);
+                #[cfg(test)]
+                if let Some(fault) = self.policy_fault.take() {
+                    store.inject(fault);
+                }
+                (
+                    Some(request_id.clone()),
+                    host_policy::set(
+                        &mut store,
+                        &pairing,
+                        &account,
+                        &genesis,
+                        &host_policy::Change {
+                            principal: &authority.name(),
+                            request_id,
+                            relay_only: *relay_only,
+                            expected_revision: *expected_revision,
+                        },
+                    )
+                    .map(|r| (r.outcome, r.policy)),
+                )
+            }
+        };
+        let (outcome, policy) = match answer {
+            Ok(answer) => answer,
+            Err(host_policy::Refused::Reused) => {
+                return refuse(
+                    self,
+                    &super::host::code_name(r8::ErrorCode::RequestIdReused),
+                    None,
+                );
+            }
+            Err(host_policy::Refused::Unreadable(why)) => {
+                log(&format!("host policy: {why}"));
+                return refuse(self, code::BUSY, Some(host_policy::DETAIL_UNREADABLE));
+            }
+        };
+        let Some(handle) = self.by_attachment.get(att).cloned() else {
+            return;
+        };
+        let Some(channel_id) = self.chans.get(&handle).and_then(|c| match &c.phase {
+            Phase::Open(a) => Some(a.channel.channel_id().to_owned()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let ctx = parts.host.context();
+        let result = HostPolicyResult {
+            id: new_id(),
+            re: request.id().to_owned(),
+            request_id,
+            outcome,
+            policy,
+            account_id: ctx.account_id.clone(),
+            atem_device_id: ctx.atem_device_id.clone(),
+            host_trust_gen: ctx.host_trust_gen,
+            head,
+            channel_id,
+            attachment_gen: att.to_owned(),
+        };
+        self.seal_to(att, &result.to_bytes(), mono);
+        if matches!(outcome, Outcome::Committed | Outcome::Uncertain) {
+            // Every other manager attachment hears the current policy.
+            let others: Vec<(String, String)> = self
+                .chans
+                .values()
+                .filter_map(|c| match &c.phase {
+                    Phase::Open(a) if a.attachment != att && holds_manage(m, &a.authority) => {
+                        Some((a.attachment.clone(), a.channel.channel_id().to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (other, channel_id) in others {
+                let change = HostPolicyChanged {
+                    id: new_id(),
+                    policy,
+                    account_id: result.account_id.clone(),
+                    atem_device_id: result.atem_device_id.clone(),
+                    host_trust_gen: result.host_trust_gen,
+                    head,
+                    channel_id,
+                    attachment_gen: other.clone(),
+                };
+                self.seal_to(&other, &change.to_bytes(), mono);
+            }
+            log(&format!(
+                "relay only {} (revision {}, {})",
+                if policy.relay_only { "on" } else { "off" },
+                policy.revision,
+                outcome.as_str()
+            ));
+            self.policy_changes.push(policy.relay_only);
+            // No channel opens for the rest of this pass; the runtime's
+            // pass then keeps refusing them only while a local link waits
+            // to close (`set_refuse_opens`).
+            self.refuse_opens |= policy.relay_only;
+            // The result's write is what the local link waits for.
+            if let Some(chan) = self.chans.get_mut(&handle) {
+                chan.receipt_for = chan.queue.back().cloned();
+            }
+        }
+    }
+
+    /// A pending policy write is retried every 5 s until it is durable.
+    fn roll_policy_forward(&mut self, mono: u64) {
+        if mono < self.policy_roll_at {
+            return;
+        }
+        self.policy_roll_at = mono + POLICY_ROLL_MS;
+        if let Some((pairing, journal)) = &self.policy_paths
+            && store::present(&pairing.host_policy_pending)
+        {
+            let mut store = Store::new(pairing, journal);
+            match host_policy::roll_forward(&mut store, pairing) {
+                Ok(_) => log("host policy: the pending write is durable"),
+                Err(e) => self
+                    .input_log
+                    .log(mono, || format!("host policy: still uncertain ({e})")),
+            }
+        }
+    }
+
+    /// `membership{entries}` → `membership_head{re}` (§R9.8): the entries
+    /// carried on an open channel, applied as any carriage (§R9.3).
+    fn membership_op<J: Journal>(
+        &mut self,
+        att: &str,
+        plain: &[u8],
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let mono = parts.now.host.mono_ms;
+        // The record's own bytes, parsed strictly once (duplicate keys,
+        // exact numbers), as the `hello` route judges its carriage.
+        let entries: Option<Vec<StrictValue>> = StrictValue::parse(plain, usize::MAX)
+            .ok()
+            .and_then(|v| v.get("data"))
+            .and_then(|d| d.get("entries"))
+            .and_then(|e| e.items());
+        let Some(entries) = entries else {
+            self.seal_to(
+                att,
+                &error(code::INVALID_REQUEST, re, None).to_bytes(),
+                mono,
+            );
+            return Vec::new();
+        };
+        let DeviceList::Open { m, .. } = &mut parts.list else {
+            self.seal_to(
+                att,
+                &error(code::BUSY, re, Some(DETAIL_UNPAIRED)).to_bytes(),
+                mono,
+            );
+            return Vec::new();
+        };
+        let mut fences = HostFences::new(parts.host);
+        let result = m.apply_carriage(&entries, &parts.now.host, &mut fences);
+        let mut effects = fences.effects;
+        let reply = match result.carried {
+            Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
+                error(code::BUSY, re, Some(DETAIL_NOT_RECORDED)).to_bytes()
+            }
+            Carried::Unpaired => error(code::BUSY, re, Some(DETAIL_UNPAIRED)).to_bytes(),
+            Carried::Frozen => error(code::ACCOUNT_FROZEN, re, None).to_bytes(),
+            Carried::Committed | Carried::Unchanged => {
+                match result.evaluation.as_ref().and_then(|e| invalid_of(e, re)) {
+                    Some(e) => e.to_bytes(),
+                    None => {
+                        let pending: Vec<PendingRecovery> = m
+                            .membership()
+                            .pending_recovery(&parts.now.host)
+                            .iter()
+                            .map(PendingRecovery::of)
+                            .collect();
+                        r9::membership_head(&new_id(), re, m.head(), &pending)
+                            .to_string()
+                            .into_bytes()
+                    }
+                }
+            }
+        };
+        self.seal_to(att, &reply, mono);
+        // The carrier got its reply; everyone else the event.
+        effects.extend(self.carried(&result, Some(att), parts));
+        effects
+    }
+
+    fn announce_except<J: Journal>(&mut self, except: Option<&str>, parts: &mut Parts<'_, J>) {
+        let DeviceList::Open { m, .. } = &parts.list else {
+            return;
+        };
+        let pending: Vec<PendingRecovery> = m
+            .membership()
+            .pending_recovery(&parts.now.host)
+            .iter()
+            .map(PendingRecovery::of)
+            .collect();
+        let message = r9::membership_head(&new_id(), None, m.head(), &pending)
+            .to_string()
+            .into_bytes();
+        // Not to principals being fenced in this pass: their fence error
+        // is their last record.
+        let atts: Vec<String> = self
+            .chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a)
+                    if Some(a.attachment.as_str()) != except
+                        && !self.fence_errors.contains_key(&a.authority.name()) =>
+                {
+                    Some(a.attachment.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for att in atts {
+            self.seal_to(&att, &message, parts.now.host.mono_ms);
+        }
+    }
+
+    /// `revoke_grant{grant_id}` → `grant_revoked{re}` (§R9.6, §R9.8): the
+    /// grant id is journaled until its grant's expiry (≤ 256), then the
+    /// browser's attachments are fenced through §H.
+    fn revoke_grant<J: Journal>(
+        &mut self,
+        att: &str,
+        _authority: &Authority,
+        data: &Value,
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let mono = parts.now.host.mono_ms;
+        let wall = parts.now.host.wall_ms;
+        let Some(grant_id) = data
+            .get("grant_id")
+            .and_then(Value::as_str)
+            .filter(|g| atem_client::session::wire::is_uuid_v4(g))
+            .map(str::to_owned)
+        else {
+            self.seal_to(
+                att,
+                &error(code::INVALID_REQUEST, re, None).to_bytes(),
+                mono,
+            );
+            return Vec::new();
+        };
+        let principal = format!("browser:{grant_id}");
+        let until = self
+            .chans
+            .values()
+            .find_map(|c| match &c.phase {
+                Phase::Open(a) if a.authority.name() == principal => a.authority.expires_at,
+                _ => None,
+            })
+            // Not live: the latest a grant of that id could still live,
+            // after the host's trusted time (a wall clock that went back
+            // can't shorten it).
+            .unwrap_or(self.trusted_now(wall) + GRANT_MAX_LIFETIME_MS + GRANT_ISSUED_AHEAD_MS);
+        if self.revoked.revoke(&grant_id, until, wall).is_err() {
+            // Not recorded (a later hello with that grant isn't refused),
+            // but a live browser is fenced at once anyway (fail closed).
+            log("revoked grants journal full; a live browser is fenced in memory only");
+            self.fence_errors.insert(
+                principal.clone(),
+                error(code::UNAUTHORIZED, None, Some("grant revoked")),
+            );
+            let effects = parts.host.fence_principal(&principal, 0);
+            self.seal_to(
+                att,
+                &error(code::BUSY, re, Some("revoked grants journal full")).to_bytes(),
+                mono,
+            );
+            return effects;
+        }
+        self.revoked_until.retain(|_, t| wall < *t);
+        let t = self.revoked_until.entry(grant_id.clone()).or_insert(until);
+        *t = (*t).max(until);
+        let trusted = self.trusted_now(wall);
+        if let Some(q) = &mut self.quarantine {
+            q.anchor(trusted, mono);
+        }
+        // During a quarantine the write carries its record (§R9.6).
+        let recorded = self.save_revoked(wall);
+        // In effect at once, recorded or not (fail closed).
+        self.fence_errors.insert(
+            principal.clone(),
+            error(code::UNAUTHORIZED, None, Some("grant revoked")),
+        );
+        let effects = parts.host.fence_principal(&principal, 0);
+        let reply = match recorded {
+            Ok(()) => r9::grant_revoked(&new_id(), re.unwrap_or_default())
+                .to_string()
+                .into_bytes(),
+            Err(e) => {
+                log(&format!("cannot record a revoked grant: {e}"));
+                error(code::BUSY, re, Some("revocation not recorded")).to_bytes()
+            }
+        };
+        self.seal_to(att, &reply, mono);
+        effects
+    }
+
+    /// `approval_seen{binding, approval_id}` → `seen{re}` (§R9.9): the
+    /// attachment has `control` (and `approval` for a scoped principal,
+    /// checked by the authority), the approval is pending for exactly that
+    /// session and process. Only the first seen of a device counts; later
+    /// ones are answered `seen` too. A native device's first one is signed
+    /// and sent to the relay (`push_seen`) until acknowledged; services and
+    /// browsers are never hint recipients, so their seen suppresses
+    /// nothing and nothing is signed.
+    fn approval_seen<J: Journal>(
+        &mut self,
+        att: &str,
+        authority: &Authority,
+        data: &Value,
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) {
+        let mono = parts.now.host.mono_ms;
+        let target = data.get("binding").and_then(|b| b.get("target"));
+        let session = target
+            .and_then(|t| t.get("session_id"))
+            .and_then(Value::as_str);
+        let process = target
+            .and_then(|t| t.get("process_gen"))
+            .and_then(Value::as_str);
+        let approval = data.get("approval_id").and_then(Value::as_str);
+        let (Some(session), Some(process), Some(approval)) = (session, process, approval) else {
+            self.seal_to(
+                att,
+                &error(code::INVALID_REQUEST, re, None).to_bytes(),
+                mono,
+            );
+            return;
+        };
+        let current = parts
+            .host
+            .descriptor_of(session)
+            .is_some_and(|d| d.process_gen == process);
+        let pending = current
+            && parts
+                .host
+                .pending_approvals(session)
+                .iter()
+                .any(|a| a == approval);
+        if !pending {
+            self.seal_to(att, &error(code::STALE_TARGET, re, None).to_bytes(), mono);
+            return;
+        }
+        let device = match &authority.principal {
+            Principal::Native { device_id } | Principal::Service { device_id } => device_id.clone(),
+            Principal::Browser { grant_id, .. } => grant_id.clone(),
+        };
+        if self.seen.insert((approval.to_string(), device)) {
+            log(&format!("{} saw approval {approval}", authority.name()));
+        }
+        if let Principal::Native { device_id } = &authority.principal {
+            self.push.suppress(push_suppressed(parts));
+            let wall = parts.now.host.wall_ms;
+            self.push.seen(
+                approval,
+                session,
+                process,
+                device_id,
+                signer_of(&parts.list),
+                wall,
+            );
+        }
+        let reply = r9::seen(&new_id(), re.unwrap_or_default())
+            .to_string()
+            .into_bytes();
+        self.seal_to(att, &reply, mono);
+    }
+
+    // ── Push (§R9.9) ──
+
+    /// An approval opened (`Effect::PushApproval`): its open hints, sealed
+    /// per recipient. `created_at` is the `approval_request`'s (one clock
+    /// for the card and the hint), `expires_at` = `created_at` + `wait_ms`
+    /// (the hook's wait: Claude 600 s, Codex 300 s).
+    pub fn approval_opened<J: Journal>(
+        &mut self,
+        request: &r8::ApprovalRequest,
+        wait_ms: u64,
+        parts: &mut Parts<'_, J>,
+    ) {
+        self.push.suppress(push_suppressed(parts));
+        let wall = parts.now.host.wall_ms;
+        let Some(key) = approval_key(&parts.list, request) else {
+            return;
+        };
+        let plain = atem_client::push::HintPlain {
+            tool: request.tool.clone(),
+            summary: request.summary.clone(),
+        };
+        self.push.opened(
+            key,
+            request.created_at,
+            request.created_at.saturating_add(wait_ms),
+            &plain,
+            signer_of(&parts.list),
+            wall,
+        );
+    }
+
+    /// An approval stopped being pending (`Effect::PushResolved`): its
+    /// resolved hint.
+    pub fn approval_resolved<J: Journal>(
+        &mut self,
+        approval_id: &str,
+        reason: r8::ApprovalCloseReason,
+        parts: &mut Parts<'_, J>,
+    ) {
+        // Its `approval_closed` went out before this (the session host's
+        // order): the scope check needs its session no longer, so the
+        // bounded map only ever drops ended approvals' entries first.
+        if self.approval_sessions.remove(approval_id).is_some() {
+            self.approval_order.retain(|a| a != approval_id);
+        }
+        // Its first-seen marks too (a seen after it is `stale_target`).
+        self.seen.retain(|(a, _)| a != approval_id);
+        self.push.suppress(push_suppressed(parts));
+        let reason = serde_json::to_value(reason)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let wall = parts.now.host.wall_ms;
+        self.push
+            .resolved(approval_id, &reason, signer_of(&parts.list), wall);
+    }
+
+    /// A relay message on Atem's link (`{"type":"relay",…}`): a `push_ack`
+    /// ends the resends of what it names.
+    pub fn relay_message(&mut self, text: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        let matched = self.push.ack(&value);
+        if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
+            self.input_log.log(self.last_mono, || {
+                "a push_ack acknowledged nothing pending".into()
+            });
+        }
+    }
+
+    /// The head may have moved: open hints of devices no longer recipients
+    /// (removed, or lost `control`) are never sent again (§R9.9, §R9.6).
+    fn push_recipients<J: Journal>(&mut self, parts: &Parts<'_, J>) {
+        let wall = parts.now.host.wall_ms;
+        if let Some(signer) = signer_of(&parts.list) {
+            self.push.sync_recipients(signer.log, wall);
+        }
+    }
+
+    /// Hands the relay messages due now to `send` (Atem's link).
+    pub fn flush_relay(&mut self, send: &mut dyn FnMut(String) -> bool) {
+        self.push.flush(send);
+    }
+
+    /// The relay delivery's health for `atem status`.
+    pub fn push_status(&self, now_wall: u64) -> push::PushStatus {
+        self.push.status(now_wall)
+    }
+
+    /// The device list changed (a re-pin or unpair): the old identity's
+    /// hints are dropped.
+    pub fn reset_push(&mut self) {
+        self.push.reset();
+    }
+
+    // ── Out ──
+
+    /// A session-host message for the r9 attachment `att`: what its scope
+    /// doesn't cover is left out (§R9.6: out-of-scope sessions don't
+    /// exist for it), the rest sealed and queued.
+    pub fn deliver(
+        &mut self,
+        att: &str,
+        message: &R8Envelope,
+        projects: &dyn ProjectScope,
+        host_id: &str,
+        now_mono: u64,
+    ) {
+        if let R8Envelope::Session(m) = message
+            && let R8Op::ApprovalRequest(r) = &m.op
+            && !self.approval_sessions.contains_key(&r.approval_id)
+        {
+            if self.approval_order.len() >= MAX_APPROVAL_SESSIONS
+                && let Some(old) = self.approval_order.pop_front()
+            {
+                self.approval_sessions.remove(&old);
+            }
+            self.approval_order.push_back(r.approval_id.clone());
+            self.approval_sessions
+                .insert(r.approval_id.clone(), r.session_id.clone());
+        }
+        let Some(authority) = self.authority_of(att).cloned() else {
+            return;
+        };
+        let approvals = &self.approval_sessions;
+        let session_of = |id: &str| approvals.get(id).cloned();
+        let Some(message) = scoped(&authority, message, projects, host_id, &session_of) else {
+            return;
+        };
+        let bytes = r8::encode(&message);
+        self.seal_to(att, &bytes, now_mono);
+    }
+
+    /// A terminal-v1 or chat-v1 message (raw JSON) for the r9 attachment
+    /// `att`, about session `sid` (left out when out of its scope).
+    pub fn deliver_family(
+        &mut self,
+        att: &str,
+        sid: &str,
+        text: &str,
+        projects: &dyn ProjectScope,
+        host_id: &str,
+        now_mono: u64,
+    ) {
+        let Some(authority) = self.authority_of(att) else {
+            return;
+        };
+        if !authority.session_in_scope(host_id, sid, &|e| projects.matches(sid, e)) {
+            return;
+        }
+        self.seal_to(att, text.as_bytes(), now_mono);
+    }
+
+    /// Bytes queued for `att`'s channel (terminal frames hold back while
+    /// they wait).
+    pub fn backlog(&self, att: &str) -> usize {
+        self.by_attachment
+            .get(att)
+            .and_then(|h| self.chans.get(h))
+            .map_or(0, |c| c.queued)
+    }
+
+    /// The kids the live attachments' service `projects` scopes name
+    /// (`h1.<kid>.<hash>`): the keyed hashes the runtime must know.
+    pub fn scope_project_kids(&self) -> std::collections::BTreeSet<String> {
+        self.chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a) => a.authority.scope.as_ref()?.projects.clone(),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|e| {
+                e.strip_prefix("h1.")
+                    .and_then(|r| r.split_once('.'))
+                    .map(|(kid, _)| kid.to_string())
+            })
+            .collect()
+    }
+
+    /// Whether the r9 attachment `att` may see approvals (cards, rules):
+    /// unscoped principals may; a scoped one only with the `approval` op.
+    pub fn sees_approvals(&self, att: &str) -> bool {
+        self.authority_of(att).is_some_and(|a| {
+            a.scope
+                .as_ref()
+                .is_none_or(|scope| scope.ops.contains(&Op::Approval))
+        })
+    }
+
+    fn authority_of(&self, att: &str) -> Option<&Authority> {
+        let handle = self.by_attachment.get(att)?;
+        match &self.chans.get(handle)?.phase {
+            Phase::Open(a) => Some(&a.authority),
+            _ => None,
+        }
+    }
+
+    /// The session host closed the r9 attachment `att` (a fence): its
+    /// error (a fence's, if one was noted for its principal) is the last
+    /// record, then the channel closes.
+    pub fn close_attachment(&mut self, att: &str, now_mono: u64) {
+        let Some(handle) = self.by_attachment.remove(att) else {
+            return;
+        };
+        let Some(chan) = self.chans.get_mut(&handle) else {
+            return;
+        };
+        let Phase::Open(mut a) = std::mem::replace(&mut chan.phase, Phase::Closing) else {
+            return;
+        };
+        if let Some(e) = self.fence_errors.get(&a.authority.name())
+            && let Ok(frame) = a.channel.seal(&e.to_bytes(), now_mono)
+        {
+            let text = envelope::frame(&handle, &frame);
+            chan.queued += text.len();
+            chan.queue.push_back(text);
+        }
+        a.channel.close();
+        chan.close.get_or_insert(reason::CLOSED);
+    }
+
+    fn seal_to(&mut self, att: &str, plain: &[u8], now_mono: u64) {
+        let Some(handle) = self.by_attachment.get(att).cloned() else {
+            return;
+        };
+        let limit = self.limits.queued_bytes;
+        let Some(chan) = self.chans.get_mut(&handle) else {
+            return;
+        };
+        let Phase::Open(a) = &mut chan.phase else {
+            return;
+        };
+        match a.channel.seal(plain, now_mono) {
+            Ok(frame) => {
+                let text = envelope::frame(&handle, &frame);
+                chan.queued += text.len();
+                chan.queue.push_back(text);
+                if chan.queued > limit {
+                    // Fallen behind: closed explicitly, never a silent drop.
+                    log("a channel's output passed its bound; closed (busy)");
+                    self.overflow(&handle);
+                }
+            }
+            Err(e) => {
+                log(&format!(
+                    "a channel can't take a record ({}); closed",
+                    e.code()
+                ));
+                self.overflow(&handle);
+            }
+        }
+    }
+
+    /// Closes `handle` at once with `busy` (its queue goes); the attachment
+    /// is gone from the session host by the next pass ([`R9Host::reap`]).
+    fn overflow(&mut self, handle: &str) {
+        if let Some(chan) = self.chans.get_mut(handle) {
+            chan.queue.clear();
+            chan.queued = 0;
+            chan.close = Some(reason::BUSY);
+            if let Phase::Open(a) = std::mem::replace(&mut chan.phase, Phase::Closing) {
+                self.dead.push(a.attachment.clone());
+                self.by_attachment.remove(&a.attachment);
+            }
+        }
+    }
+
+    /// Attachments whose channel closed on Atem's side (overflow): the
+    /// session host forgets them.
+    pub fn reap<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for att in std::mem::take(&mut self.dead) {
+            effects.extend(parts.host.disconnect(&att));
+        }
+        effects
+    }
+
+    /// Hands what is queued to the link: the `unknown_channel` closes, then
+    /// each channel's queue in turn, and each closing channel's `close`
+    /// once its queue drained. `send` refuses when the link is full; the
+    /// rest waits.
+    /// `send`'s flag asks for the write's receipt (see `Chan::receipt_for`).
+    pub fn flush(&mut self, send: &mut dyn FnMut(String, bool) -> bool) {
+        if !self.flush_closes(&mut |text| send(text, false)) {
+            return;
+        }
+        // Fair service: one message per channel per round, the rounds
+        // starting with the channel the link last refused, so a busy
+        // channel can't hold the others back (§R9.7a "Bounds").
+        let mut handles: Vec<String> = self.chans.keys().cloned().collect();
+        if let Some(cursor) = &self.flush_cursor {
+            // Resume at the refused channel (it goes first next time).
+            let at = handles.partition_point(|h| h < cursor);
+            handles.rotate_left(at);
+        }
+        loop {
+            let mut progressed = false;
+            for handle in &handles {
+                let Some(chan) = self.chans.get_mut(handle) else {
+                    continue;
+                };
+                if let Some(text) = chan.queue.pop_front() {
+                    let len = text.len();
+                    let receipt = chan.receipt_for.as_ref() == Some(&text);
+                    if !send(text.clone(), receipt) {
+                        chan.queue.push_front(text);
+                        self.flush_cursor = Some(handle.clone());
+                        return;
+                    }
+                    if receipt {
+                        chan.receipt_for = None;
+                    }
+                    chan.queued = chan.queued.saturating_sub(len);
+                    progressed = true;
+                } else if let Some(why) = chan.close {
+                    if !send(envelope::close(handle, Some(why)), false) {
+                        self.flush_cursor = Some(handle.clone());
+                        return;
+                    }
+                    self.chans.remove(handle);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                return;
+            }
+        }
+    }
+
+    // ── Time ──
+
+    /// The pass: handshakes past their step (10 s), channels past their
+    /// lifetime (24 h, or the expiry), and principals whose expiry passed
+    /// (fenced through §H: a revocation, §R9.6).
+    pub fn tick<J: Journal>(&mut self, parts: &mut Parts<'_, J>) -> Vec<Effect> {
+        let mono = parts.now.host.mono_ms;
+        let wall = parts.now.host.wall_ms;
+        self.last_mono = mono;
+        self.browsers_refused(wall, mono);
+        self.roll_policy_forward(mono);
+        let mut effects = self.reap(parts);
+        let mut timeouts = Vec::new();
+        let mut ended = Vec::new();
+        let mut expired = Vec::new();
+        for (handle, chan) in &self.chans {
+            match &chan.phase {
+                Phase::AwaitInit { deadline } if mono > *deadline => timeouts.push(handle.clone()),
+                Phase::AwaitFinish(f) if mono > f.deadline_ms() => timeouts.push(handle.clone()),
+                Phase::Open(a) if a.authority.expired(wall) => expired.push(a.authority.name()),
+                Phase::Open(a) if mono >= a.channel.deadline_ms() => ended.push(handle.clone()),
+                _ => {}
+            }
+        }
+        for handle in timeouts {
+            let frame = Some(chwire::clear_error(ClearCode::HandshakeFailed));
+            self.reply_and_close(&handle, frame, reason::HANDSHAKE_FAILED);
+        }
+        for handle in ended {
+            effects.extend(self.fail(&handle, reason::EXPIRED, parts));
+        }
+        expired.sort();
+        expired.dedup();
+        for principal in expired {
+            log(&format!("{principal} expired; fenced"));
+            self.fence_errors.insert(
+                principal.clone(),
+                error(code::UNAUTHORIZED, None, Some("expired")),
+            );
+            effects.extend(parts.host.fence_principal(&principal, 0));
+        }
+        let before = self.revoked.len();
+        self.revoked.prune(wall);
+        if self.revoked.len() < before {
+            // An entry pruned at this wall time would name a valid grant
+            // again if the clock went back below it.
+            self.bound.high_water = self.bound.high_water.max(wall);
+        }
+        self.push_recipients(parts);
+        self.push.tick(push_suppressed(parts), wall);
+        effects
+    }
+
+    // ── Revoked grants journal ──
+
+    fn load_revoked(&mut self, pin_floor: Option<u64>) {
+        let Some(path) = self.revoked_path.clone() else {
+            return;
+        };
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let sidecar = path.with_file_name(revoked::SIDECAR_FILE);
+        let main = revoked::load(&path);
+        let side = revoked::load_sidecar(&sidecar);
+        let asides = revoked::damaged_asides(&dir);
+        // The pairing's copy of the bound (§R9.6): a floor alongside
+        // everything else. Unreadable on a pinned host, or above the
+        // journal's sidecar (a journal restored or rolled back), the
+        // journal can't be vouched for.
+        let copy = self.pairing_copy.as_deref().map(revoked::load_sidecar);
+        let copy_bound = match &copy {
+            Some(revoked::SidecarLoaded::Read(b)) => *b,
+            _ => revoked::Bound::default(),
+        };
+        let copy_lost =
+            pin_floor.is_some() && matches!(copy, Some(revoked::SidecarLoaded::Unreadable));
+        self.copy_bound = copy_bound;
+        // The files vouch for each other (§R9.6): every write leaves both
+        // (the sidecar first), and damage leaves a copy aside. A pinned
+        // device list vouches for them too (the pin seeds them). Only a
+        // host with none of them and no pinned list is fresh.
+        if matches!(main, revoked::Loaded::Missing)
+            && side == revoked::SidecarLoaded::Missing
+            && !asides
+        {
+            let Some(floor) = pin_floor else {
+                // Fresh; the pairing's copy (an earlier pairing's) still
+                // floors the bound.
+                self.bound = copy_bound;
+                self.write_pairing_copy();
+                return;
+            };
+            // Lost: the floor is the pairing's copy of the bound (the
+            // trusted time, kept outside the journal directory), the
+            // pinned list's floor and the journal directory's newest write.
+            self.bound = copy_bound.max(revoked::Bound {
+                until: 0,
+                high_water: floor.max(revoked::newest_mtime(&dir)),
+            });
+            log(&format!(
+                "the revoked grants are missing on a host with a pinned device list (the \
+                 journal directory was removed?); browser grants are refused for at least \
+                 65 min and until the wall clock passes {}",
+                self.bound.floor()
+            ));
+            self.quarantine = Some(revoked::Quarantine::starting(self.bound.floor()));
+            self.write_pairing_copy();
+            return;
+        }
+        let mut record = None;
+        let main_lost = match main {
+            revoked::Loaded::Missing => true,
+            revoked::Loaded::Unreadable => {
+                self.revoked_damaged = revoked::Damaged::found();
+                true
+            }
+            revoked::Loaded::Read {
+                revoked: map,
+                quarantine,
+            } => {
+                for (id, until) in map {
+                    self.revoked_until.insert(id.clone(), until);
+                    let _ = self.revoked.revoke(&id, until, 0);
+                }
+                record = quarantine;
+                false
+            }
+        };
+        let mut copy_ahead = copy_lost;
+        let (mut bound, side_lost) = match side {
+            revoked::SidecarLoaded::Read(b) => {
+                copy_ahead |= copy_bound.high_water > b.high_water || copy_bound.until > b.until;
+                (b, false)
+            }
+            other => {
+                if other == revoked::SidecarLoaded::Unreadable {
+                    self.sidecar_damaged = revoked::Damaged::found();
+                }
+                // The bound is lost: rebuilt from what is there (below),
+                // and, as an extra floor, the newest write time left in the
+                // journal directory (each write left its wall time there).
+                (
+                    revoked::Bound {
+                        until: 0,
+                        high_water: revoked::newest_mtime(&dir).max(pin_floor.unwrap_or(0)),
+                    },
+                    true,
+                )
+            }
+        };
+        bound.until = bound.until.max(record.map_or(0, |(_, u)| u));
+        bound.cover(self.revoked_until.values().copied());
+        let bound = bound.max(copy_bound);
+        self.bound = bound;
+        self.write_pairing_copy();
+        if main_lost || side_lost || copy_ahead {
+            // A revocation a lost file held can't be told from none
+            // (§R9.6, fail closed): every browser grant is refused until
+            // any grant it could name has expired, no earlier than the
+            // previous end or the high-water mark + the window (a wall
+            // clock set back can't shorten it), and for the window on this
+            // process's monotonic clock. A damaged file is kept aside at
+            // the first pass, and every write carries the quarantine.
+            let what = match (main_lost, side_lost) {
+                (true, true) => "revoked_grants and revoked_quarantine are unreadable or missing",
+                (true, false) => "revoked_grants is unreadable or missing",
+                (false, true) => "revoked_quarantine is unreadable or missing",
+                (false, false) => {
+                    "pairing/revoked_floor is unreadable or above the journal's bound (the \
+                     journal restored or rolled back?)"
+                }
+            };
+            log(&format!(
+                "{what}; browser grants are refused for at least 65 min and until the wall \
+                 clock passes {}",
+                bound.floor()
+            ));
+            self.quarantine = Some(revoked::Quarantine::starting(bound.floor()));
+        } else if let Some((started_at, until)) = record {
+            let until = until.max(bound.until);
+            log(&format!(
+                "revoked_grants records a quarantine until {until}; browser grants \
+                 are refused until then and for 65 min of this process"
+            ));
+            self.quarantine = Some(revoked::Quarantine::restored(started_at, until));
+            self.quarantine_recorded = true;
+        }
+    }
+
+    /// Raises the pairing's copy of the bound to the bound in memory, best
+    /// effort (at load; every write does it before the sidecar). Without a
+    /// pairing directory there is nothing to write.
+    fn write_pairing_copy(&mut self) {
+        match self.raise_pairing_copy(self.bound) {
+            Ok(merged) => self.bound = merged,
+            Err(e) => log(&format!("cannot write pairing/revoked_floor: {e}")),
+        }
+    }
+
+    /// The pairing's copy raised to `bound`, durably, and never lowered:
+    /// the file is read each time (a pin may have raised it while this
+    /// engine runs), and the result is the max of what it holds, what this
+    /// engine last wrote and `bound`. Returns that max, which the caller
+    /// writes to the sidecar too (so the sidecar is never below the copy).
+    fn raise_pairing_copy(&mut self, bound: revoked::Bound) -> std::io::Result<revoked::Bound> {
+        let Some(copy) = self.pairing_copy.clone() else {
+            return Ok(bound);
+        };
+        if !copy.parent().is_some_and(Path::is_dir) {
+            return Ok(bound);
+        }
+        let on_disk = revoked::load_sidecar(&copy);
+        let mut want = self.copy_bound.max(bound);
+        if let revoked::SidecarLoaded::Read(b) = on_disk {
+            want = want.max(b);
+        }
+        if on_disk != revoked::SidecarLoaded::Read(want) {
+            revoked::write_atomic(&copy, &revoked::encode_sidecar(want), None)?;
+        }
+        self.copy_bound = want;
+        Ok(want)
+    }
+
+    /// The host's trusted time: its wall clock, never below the high-water
+    /// mark (a wall clock that went back). Every revocation, quarantine and
+    /// retention bound is computed from it.
+    fn trusted_now(&self, wall: u64) -> u64 {
+        wall.max(self.bound.high_water)
+    }
+
+    /// Why browser grants are refused now, if they are: the revoked grants
+    /// couldn't be read (see `quarantine`), or the wall clock is below the
+    /// high-water mark (it went back). Anchors a quarantine found at this
+    /// start, records it durably (retried once a second), and ends it
+    /// (dropping the record from the file).
+    fn browsers_refused(&mut self, wall: u64, mono: u64) -> Option<&'static str> {
+        let trusted = self.trusted_now(wall);
+        if let Some(q) = &mut self.quarantine {
+            q.anchor(trusted, mono);
+            if !q.ended(wall, mono) {
+                if !self.quarantine_recorded && mono >= self.quarantine_retry_at {
+                    match self.save_revoked(wall) {
+                        Ok(()) => log("the revoked-grants quarantine is recorded"),
+                        Err(e) => {
+                            if self.quarantine_retry_at == 0 {
+                                log(&format!("cannot record the revoked-grants quarantine: {e}"));
+                            }
+                            self.quarantine_retry_at = mono + 1_000;
+                        }
+                    }
+                }
+                return Some(DETAIL_REVOKED_UNREADABLE);
+            }
+            self.quarantine = None;
+            self.quarantine_recorded = false;
+            log("the revoked-grants quarantine ended; browser grants are admitted again");
+            if let Err(e) = self.save_revoked(wall) {
+                // The record (or the damaged file) stays: the next start is
+                // quarantined again (fail closed).
+                log(&format!(
+                    "cannot drop the revoked-grants quarantine record: {e}"
+                ));
+            }
+        }
+        if wall < self.bound.behind() {
+            if !self.clock_back_logged {
+                self.clock_back_logged = true;
+                log(&format!(
+                    "the host wall clock is behind the revoked grants' high-water mark ({}); \
+                     browser grants are refused until it catches up (there is no override: \
+                     wait for the clock; removing runtime/ or the revoked grants' files doesn't \
+                     lift it, pairing/revoked_floor keeps the bound)",
+                    self.bound.behind()
+                ));
+            }
+            return Some(DETAIL_CLOCK_BACK);
+        }
+        self.clock_back_logged = false;
+        None
+    }
+
+    /// Writes the file: the known revocations and, during a quarantine,
+    /// its record. Damaged files still in place are kept aside first (and
+    /// never replaced unless that worked); the sidecar's bound (the record's
+    /// end, the high-water mark raised to `wall`) is durable before the
+    /// file is replaced.
+    fn save_revoked(&mut self, wall: u64) -> std::io::Result<()> {
+        let record = match &self.quarantine {
+            None => None,
+            Some(q) => Some(
+                q.wall
+                    .ok_or_else(|| std::io::Error::other("quarantine not anchored"))?,
+            ),
+        };
+        let mut bound = self.bound;
+        bound.high_water = bound.high_water.max(wall);
+        // Every retained entry ends within the window after the high-water
+        // mark, so a later quarantine (high-water + window) outlives it.
+        bound.cover(self.revoked_until.values().copied());
+        if let Some((_, until)) = record {
+            bound.until = bound.until.max(until);
+        }
+        let Some(path) = self.revoked_path.clone() else {
+            self.bound = bound;
+            return Ok(());
+        };
+        let sidecar = path.with_file_name(revoked::SIDECAR_FILE);
+        let crash = self.revoked_crash();
+        for (damaged, file) in [
+            (&mut self.revoked_damaged, &path),
+            (&mut self.sidecar_damaged, &sidecar),
+        ] {
+            if let Some(aside) = damaged.keep(file, wall, crash)? {
+                log(&format!(
+                    "the damaged {} is kept as {}",
+                    file.file_name().unwrap_or_default().to_string_lossy(),
+                    aside.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        // The pairing's copy first: it survives the journal directory. A
+        // copy a pin raised meanwhile raises this bound too.
+        let bound = self.raise_pairing_copy(bound)?;
+        revoked::write_atomic(&sidecar, &revoked::encode_sidecar(bound), None)?;
+        self.bound = bound;
+        revoked::checkpoint(revoked::Step::SidecarWritten, crash)?;
+        let body = revoked::encode(&self.revoked_until, record);
+        revoked::write_atomic(&path, &body, crash)?;
+        if self.quarantine.is_some() {
+            self.quarantine_recorded = true;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn revoked_crash(&self) -> Option<revoked::Step> {
+        self.revoked_crash
+    }
+
+    #[cfg(not(test))]
+    fn revoked_crash(&self) -> Option<revoked::Step> {
+        None
+    }
+}
+
+/// Why no push hint or seen may be signed or sent now (§R9.9 with §R9.3,
+/// §R9.4 and r8 §I): no device list, a held, frozen or faulted one, or a
+/// halted session journal.
+fn push_suppressed<J: Journal>(parts: &Parts<'_, J>) -> Option<&'static str> {
+    if parts.host.journal_halted() {
+        return Some("journal halted");
+    }
+    match &parts.list {
+        DeviceList::Open { m, .. } if m.is_frozen() => Some("device list frozen"),
+        DeviceList::Open { m, .. } if m.faulted().is_some() => Some("device list faulted"),
+        DeviceList::Open { m, .. } if m.held().is_some() => Some("device list held"),
+        DeviceList::Open { .. } => None,
+        DeviceList::Failed(_) => Some("device list failed"),
+        DeviceList::None => Some(push::NO_LIST),
+    }
+}
+
+/// The verified log and the host key that sign hints and seens.
+fn signer_of<'a>(list: &'a DeviceList<'_>) -> Option<push::Signer<'a>> {
+    match list {
+        DeviceList::Open { m, key } => Some(push::Signer {
+            log: m.membership(),
+            key,
+        }),
+        _ => None,
+    }
+}
+
+/// An approval's push identity on this host (§R9.9).
+fn approval_key(
+    list: &DeviceList<'_>,
+    request: &r8::ApprovalRequest,
+) -> Option<atem_client::push::ApprovalKey> {
+    let DeviceList::Open { m, .. } = list else {
+        return None;
+    };
+    let pin = m.pin_of();
+    Some(atem_client::push::ApprovalKey::new(
+        m.membership(),
+        &pin.host_id,
+        pin.host_trust_gen,
+        &request.session_id,
+        &request.process_gen,
+        &request.approval_id,
+    ))
+}
+
+/// §R9.7a: the compact inner frame, or its `ct`, over the bound.
+fn inner_too_large(frame: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Peek<'a> {
+        #[serde(borrow, default)]
+        ct: Option<&'a str>,
+    }
+    if frame.len() > MAX_INNER_FRAME {
+        return true;
+    }
+    serde_json::from_slice::<Peek>(frame)
+        .ok()
+        .and_then(|p| p.ct)
+        .is_some_and(|ct| ct.len() > MAX_CT_CHARS)
+}
+
+/// `membership_invalid`/`membership_incomplete` of a `membership` op's
+/// evaluation (its stop), if any.
+fn invalid_of(
+    eval: &atem_client::membership::Evaluation,
+    re: Option<&str>,
+) -> Option<SessionError> {
+    use atem_client::membership::Stop;
+    match &eval.stop {
+        Some(Stop::Invalid { .. }) | Some(Stop::NeedBefore { .. }) => admission_error(
+            &eval.admission(
+                "",
+                false,
+                &HostNow {
+                    wall_ms: 0,
+                    mono_ms: 0,
+                    boot_id: String::new(),
+                },
+            ),
+            re,
+        ),
+        _ => None,
+    }
+}
+
+/// `message` as `authority` may see it: sessions out of its scope left out
+/// of snapshots, events about them dropped; approvals only with the
+/// `approval` op (§R9.6). Unscoped (native) principals see everything.
+fn scoped(
+    authority: &Authority,
+    message: &R8Envelope,
+    projects: &dyn ProjectScope,
+    host_id: &str,
+    approval_session: &dyn Fn(&str) -> Option<String>,
+) -> Option<R8Envelope> {
+    let Some(scope) = &authority.scope else {
+        return Some(message.clone());
+    };
+    let in_scope =
+        |sid: &str| authority.session_in_scope(host_id, sid, &|e| projects.matches(sid, e));
+    let approvals = scope.ops.contains(&Op::Approval);
+    let R8Envelope::Session(m) = message else {
+        return Some(message.clone());
+    };
+    let mut m = m.clone();
+    match &mut m.op {
+        R8Op::Sessions { sessions, .. } => sessions.retain(|d| in_scope(&d.session_id)),
+        R8Op::SessionChanged { descriptor, .. } if !in_scope(&descriptor.session_id) => {
+            return None;
+        }
+        R8Op::LeaseChanged { session_id, .. } if !in_scope(session_id) => return None,
+        R8Op::ApprovalRules { session_id, .. } if !approvals || !in_scope(session_id) => {
+            return None;
+        }
+        R8Op::ApprovalRequest(r) if !approvals || !in_scope(&r.session_id) => return None,
+        // Its session from the request it closes; unknown: left out.
+        R8Op::ApprovalClosed { approval_id, .. }
+            if !approvals || !approval_session(approval_id).is_some_and(|s| in_scope(&s)) =>
+        {
+            return None;
+        }
+        R8Op::Receipt(r) if !in_scope(&r.target.session_id) => return None,
+        R8Op::Receipts { receipts } => receipts.retain(|r| in_scope(&r.target.session_id)),
+        _ => {}
+    }
+    Some(R8Envelope::Session(m))
+}

@@ -1,0 +1,95 @@
+{
+  "name": "r9-vectors-pairing",
+  "requires": "r9",
+  "kind": "vectors",
+  "note": "§R9.2 'Pairing': verifyCommit's public host_trust_gen (1 ≤ n ≤ 2^53−1, a JSON integer) and what a pairing does with it. `raw` messages are exact bytes; Astation accepts the valid ones (taking host_trust_gen into the signed add_host unchanged) and answers each invalid one with verifyAbort. The add_host cases and attempt rules are Atem's checks.",
+  "verify_commit": {
+    "valid": [
+      {
+        "case": "success",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":3}}",
+        "host_trust_gen": 3
+      },
+      {
+        "case": "largest",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":9007199254740991}}",
+        "host_trust_gen": 9007199254740991
+      }
+    ],
+    "invalid": [
+      {
+        "case": "absent",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}}"
+      },
+      {
+        "case": "null",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":null}}"
+      },
+      {
+        "case": "zero",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":0}}"
+      },
+      {
+        "case": "negative",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":-1}}"
+      },
+      {
+        "case": "non-integer",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":1.5}}"
+      },
+      {
+        "case": "integer written as a fraction",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":3.0}}"
+      },
+      {
+        "case": "exponent",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":3e0}}"
+      },
+      {
+        "case": "string",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":\"3\"}}"
+      },
+      {
+        "case": "over 2^53-1",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":9007199254740992}}"
+      },
+      {
+        "case": "duplicate key",
+        "raw": "{\"type\":\"verifyCommit\",\"data\":{\"device_id\":\"host-a\",\"commitment\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"host_trust_gen\":3,\"host_trust_gen\":4}}"
+      }
+    ]
+  },
+  "add_host_generation": [
+    {
+      "case": "the add_host names the advertised generation",
+      "advertised": 3,
+      "add_host": 3,
+      "result": "pinned"
+    },
+    {
+      "case": "tampered or mismatched: another generation",
+      "advertised": 3,
+      "add_host": 4,
+      "result": "refused",
+      "detail": "host key or trust generation differs"
+    },
+    {
+      "case": "the advertised generation changed after the commit (another pairing on Atem)",
+      "advertised": 3,
+      "current": 4,
+      "add_host": 3,
+      "result": "refused",
+      "detail": "the pairing changed; nothing is applied"
+    }
+  ],
+  "attempt": [
+    {
+      "case": "the link reconnects while the owner confirms",
+      "result": "void: Atem ends the attempt (verifyAbort when it can still send) and never applies a later deviceVerified; a new attempt has a new commitment"
+    },
+    {
+      "case": "atem unpair or atem pair runs while the owner confirms",
+      "result": "void: the late deviceVerified is dropped (pairing changed); nothing is pinned or trusted"
+    }
+  ]
+}

@@ -74,7 +74,6 @@ impl PairingRecord {
             shared: None,
             save_credentials: false,
             disconnected_at: None,
-            relay_only: false,
         }
     }
 
@@ -167,33 +166,16 @@ impl PairingRecord {
         Ok(())
     }
 
-    /// Astation's transport policy for this pairing (`transportPolicy`).
-    /// Never creates a pairing: false when the one with `astation_id` is
-    /// gone. A value already stored is not written again (still true).
+    /// Records that a later `credentialSync` from `astation_id` should be
+    /// kept for offline use (`atem pair --save`). Never creates a pairing.
     /// Callers hold the lock (`Captured::apply`).
-    pub fn set_relay_only(
-        paths: &PairingPaths,
-        astation_id: &str,
-        relay_only: bool,
-    ) -> Result<bool> {
-        match Self::load(paths)? {
-            Some(mut record) if record.astation_id == astation_id => {
-                if record.relay_only != relay_only {
-                    record.relay_only = relay_only;
-                    record.save(paths)?;
-                }
-                Ok(true)
-            }
-            _ => Ok(false),
+    pub fn set_save_credentials(paths: &PairingPaths, astation_id: &str) -> Result<()> {
+        if !Self::update_locked(paths, astation_id, |record| record.save_credentials = true)? {
+            bail!(
+                "the pairing with Astation {astation_id} was removed meanwhile; nothing was saved"
+            );
         }
-    }
-
-    /// Whether a connect may try the local `astation_ws`, given what loading
-    /// the record gave: not while the pairing's Astation says relay only, and
-    /// never when the record (or the profile) can't be read, since it might
-    /// say relay only (fail closed). First pairing (no record) may.
-    pub fn local_allowed<E>(loaded: Result<Option<&Self>, E>) -> bool {
-        matches!(loaded, Ok(record) if !record.is_some_and(|record| record.relay_only))
+        Ok(())
     }
 
     /// The valid session for `astation_id`.
@@ -483,20 +465,70 @@ pub fn capture(src: &Sources) -> Result<TrustState> {
     Ok(generations.state())
 }
 
-/// `atem unpair`: durably commits the next generation (so every capture of
-/// the old binding goes stale), then removes the pairing record. Returns
-/// the new generation. An unreadable record still goes (its binding counts
-/// for nothing: it is never read again).
+/// `atem unpair`: removes the r9 device list, durably commits the next
+/// generation (so every capture of the old binding goes stale), removes
+/// the pairing record, then the device list's last leftover. Returns the
+/// new generation. All under `trust_gen.lock`. The device list goes first:
+/// a failure before its removal began leaves the host paired as it was;
+/// once it began, the unpair completes. Its last leftover
+/// (`membership_applied`) stays until the generation is committed, so a
+/// paired host is never left without its list (it opens as failed). An
+/// unreadable record still goes (its binding counts for nothing: it is
+/// never read again).
+#[cfg(test)]
 pub fn unpair(src: &Sources) -> Result<u64> {
+    unpair_with_notices(src).map(|(next, _)| next)
+}
+
+/// `unpair`, with what the user should know (files that couldn't be
+/// removed).
+pub fn unpair_with_notices(src: &Sources) -> Result<(u64, Vec<String>)> {
+    use crate::session_protocol::membership;
     let _lock = lock(src)?;
     let generations = Generations {
         record: PairingRecord::load(&src.paths.pairing).unwrap_or(None),
         ..Generations::files(src)?
     };
     let next = generations.effective() + 1;
+    let mut notices = Vec::new();
+    // r9 §R9.3: a frozen list's genesis is kept on `frozen_genesis`, so it
+    // can't be re-paired to.
+    if let Err(e) = membership::forget_on_unpair(&src.paths.pairing) {
+        if !e.begun {
+            anyhow::bail!("could not remove the device list: {e}");
+        }
+        notices.push(left_over(&e.to_string()));
+    }
     commit_generation(src, next)?;
     remove_record(&src.paths.pairing)?;
-    Ok(next)
+    if notices.is_empty()
+        && let Err(e) = membership::forget_leftovers(&src.paths.pairing)
+    {
+        notices.push(left_over(&e));
+    }
+    Ok((next, notices))
+}
+
+fn left_over(error: &str) -> String {
+    format!(
+        "Some device-list files couldn't be removed ({error}); remote access stays off. Run `atem unpair` again."
+    )
+}
+
+/// `atem unpair` on a profile that isn't paired but still holds r9
+/// device-list files (an unpair that stopped midway): removes them, under
+/// `trust_gen.lock`. True when there was something to remove.
+pub fn remove_device_list_leftovers(src: &Sources) -> Result<bool> {
+    use crate::session_protocol::membership;
+    let _lock = lock(src)?;
+    if !membership::has_device_list_files(&src.paths.pairing) {
+        return Ok(false);
+    }
+    membership::forget_on_unpair(&src.paths.pairing)
+        .map_err(|e| anyhow::anyhow!("could not remove the device-list files: {e}"))?;
+    membership::forget_leftovers(&src.paths.pairing)
+        .map_err(|e| anyhow::anyhow!("could not remove the device-list files: {e}"))?;
+    Ok(true)
 }
 
 /// `atem pair`: a new binding with `astation_id` in the next generation,
@@ -520,11 +552,59 @@ pub fn bind_new(src: &Sources, expected: &TrustState, astation_id: &str) -> Resu
         .filter(|record| record.astation_id == astation_id)
         .unwrap_or_else(|| PairingRecord::new(astation_id));
     record.binding = Some(binding.clone());
-    // A transport policy belongs to the binding it arrived under; Astation
-    // sends it again after this pairing authenticates.
-    record.relay_only = false;
     commit_generation(src, host_trust_gen)?;
     record.save(paths)?;
+    Ok(TrustState {
+        host_trust_gen,
+        binding: Some(Binding {
+            binding_id: binding.binding_id,
+            astation_id: astation_id.to_string(),
+            host_trust_gen,
+            created_at: binding.created_at,
+        }),
+    })
+}
+
+/// `atem pair verify`: every verification ceremony reveals a fresh
+/// `host_channel_key`, so it runs under a new binding in the next trust
+/// generation (a host binding change, §R9.2): an `add_host` a previous,
+/// aborted ceremony may have had signed names a key this host never kept,
+/// and Astation can only add the new key at a higher generation. The
+/// pairing (its Astation, session and shared login) is kept; unlike
+/// `bind_new` this never creates one. Durable before `verifyCommit`.
+pub fn rebind_for_verification(
+    src: &Sources,
+    expected: &TrustState,
+    astation_id: &str,
+) -> Result<TrustState> {
+    let _lock = lock(src)?;
+    let paths = &src.paths.pairing;
+    let generations = Generations::read(src)?;
+    let host_trust_gen = generations.effective() + 1;
+    let current = expected
+        .binding
+        .as_ref()
+        .is_some_and(|binding| binding.astation_id == astation_id);
+    if !current || !generations.state().same(expected) {
+        bail!(CHANGED);
+    }
+    let Some(mut record) = PairingRecord::load(paths)?.filter(|r| r.astation_id == astation_id)
+    else {
+        bail!(CHANGED);
+    };
+    let binding = BindingRecord {
+        binding_id: uuid::Uuid::new_v4().to_string(),
+        host_trust_gen,
+        created_at: now_secs(),
+    };
+    record.binding = Some(binding.clone());
+    // The record first: its binding alone already makes `host_trust_gen`
+    // the effective generation (the highest of the files and the binding),
+    // so a failure here changes nothing, and one in the generation files
+    // after it leaves a consistent, higher generation (raised again at the
+    // next capture). Never a lower generation, never a lost pairing.
+    record.save(paths)?;
+    commit_generation(src, host_trust_gen)?;
     Ok(TrustState {
         host_trust_gen,
         binding: Some(Binding {
@@ -756,6 +836,107 @@ pub(crate) mod tests {
         Captured::now(&src).unwrap()
     }
 
+    /// A write that renamed its bytes into place and then failed (its
+    /// directory fsync, an uncertain outcome): the rebind reports the error
+    /// (so no `verifyCommit` follows), what is on disk is consistent at the
+    /// higher generation and still paired, and the next rebind goes higher.
+    #[test]
+    fn a_rebind_failing_after_a_rename_is_consistent_and_never_lower() {
+        for failing in ["record", "floor", "trust_gen"] {
+            let dir = tempfile::tempdir().unwrap();
+            let captured = bound_profile(dir.path(), "astation-1");
+            let src = captured.sources().clone();
+            let before = captured.state.clone();
+            let path = match failing {
+                "record" => src.paths.pairing.record.clone(),
+                "floor" => src.paths.cred.trust_gen_floor.clone(),
+                _ => src.paths.pairing.trust_gen.clone(),
+            };
+            {
+                let _failing = crate::memory::crypto::fail_after_rename(&path);
+                assert!(
+                    rebind_for_verification(&src, &before, "astation-1").is_err(),
+                    "{failing}"
+                );
+            }
+            let now = load(&src).unwrap();
+            assert_eq!(now.host_trust_gen, before.host_trust_gen + 1, "{failing}");
+            assert_eq!(
+                now.binding.as_ref().map(|b| b.astation_id.as_str()),
+                Some("astation-1"),
+                "{failing}: still paired"
+            );
+            let next =
+                rebind_for_verification(&src, &capture(&src).unwrap(), "astation-1").unwrap();
+            assert_eq!(next.host_trust_gen, before.host_trust_gen + 2, "{failing}");
+        }
+    }
+
+    /// `atem pair verify`'s rebind: the next generation, durable, the
+    /// pairing and its session kept; refused (nothing written) when the
+    /// pairing moved meanwhile, for another Astation or with no record.
+    #[test]
+    fn a_verification_rebind_raises_the_generation_and_keeps_the_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let src = captured.sources().clone();
+        let before = captured.state.clone();
+        let session = PairingRecord::load(&src.paths.pairing)
+            .unwrap()
+            .unwrap()
+            .session;
+        let after = rebind_for_verification(&src, &before, "astation-1").unwrap();
+        assert_eq!(after.host_trust_gen, before.host_trust_gen + 1);
+        let loaded = load(&src).unwrap();
+        assert!(loaded.same(&after), "durable: {loaded:?}");
+        let record = PairingRecord::load(&src.paths.pairing).unwrap().unwrap();
+        assert_eq!(record.astation_id, "astation-1");
+        assert_eq!(record.session, session, "the session stays");
+        // The old capture is stale now: another rebind from it is refused.
+        assert!(rebind_for_verification(&src, &before, "astation-1").is_err());
+        assert!(load(&src).unwrap().same(&after), "nothing written");
+        // Another Astation, or no pairing at all: refused.
+        assert!(rebind_for_verification(&src, &after, "astation-2").is_err());
+        unpair(&src).unwrap();
+        let unpaired = load(&src).unwrap();
+        assert!(rebind_for_verification(&src, &unpaired, "astation-1").is_err());
+        assert!(!src.paths.pairing.record.exists(), "never creates one");
+    }
+
+    /// A failed write before `verifyCommit`: the record's write failing
+    /// changes nothing; the generation files failing after it leave the
+    /// record's higher binding in effect. The pairing is never lost and
+    /// the generation never goes down.
+    #[test]
+    fn a_failed_verification_rebind_never_lowers_or_loses_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = bound_profile(dir.path(), "astation-1");
+        let src = captured.sources().clone();
+        let before = captured.state.clone();
+        {
+            let _failing = crate::memory::crypto::fail_writes_to(&src.paths.pairing.record);
+            assert!(rebind_for_verification(&src, &before, "astation-1").is_err());
+        }
+        assert!(
+            load(&src).unwrap().same(&before),
+            "the record's failure changed nothing"
+        );
+        let raised = {
+            let _failing = crate::memory::crypto::fail_writes_to(&src.paths.cred.trust_gen_floor);
+            assert!(rebind_for_verification(&src, &before, "astation-1").is_err());
+            load(&src).unwrap()
+        };
+        assert_eq!(raised.host_trust_gen, before.host_trust_gen + 1);
+        assert_eq!(
+            raised.binding.as_ref().map(|b| b.astation_id.as_str()),
+            Some("astation-1"),
+            "still paired, at the higher generation"
+        );
+        // The next capture raises the files; the next rebind goes higher.
+        let next = rebind_for_verification(&src, &capture(&src).unwrap(), "astation-1").unwrap();
+        assert_eq!(next.host_trust_gen, before.host_trust_gen + 2);
+    }
+
     #[test]
     fn a_new_profile_has_generation_zero_and_no_binding() {
         let dir = tempfile::tempdir().unwrap();
@@ -820,69 +1001,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn relay_only_decides_whether_local_may_be_tried() {
-        // First pairing: no record.
-        assert!(PairingRecord::local_allowed::<()>(Ok(None)));
-        assert!(
-            !PairingRecord::local_allowed::<()>(Err(())),
-            "an unreadable record never allows local"
-        );
-        let mut record = paired_record("astation-1");
-        assert!(PairingRecord::local_allowed::<()>(Ok(Some(&record))));
-        record.relay_only = true;
-        assert!(!PairingRecord::local_allowed::<()>(Ok(Some(&record))));
-        // Kept only when set; an older record reads as false.
-        let json = serde_json::to_value(&record).unwrap();
-        assert_eq!(json["relay_only"], true);
-        record.relay_only = false;
-        let json = serde_json::to_value(&record).unwrap();
-        assert!(json.get("relay_only").is_none());
-        let old: PairingRecord = serde_json::from_value(json).unwrap();
-        assert!(!old.relay_only);
-    }
-
-    #[test]
-    fn relay_only_is_never_saved_without_the_pairing_and_a_new_binding_clears_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let captured = bound_profile(dir.path(), "astation-1");
-        let src = captured.sources().clone();
-        let paths = &src.paths.pairing;
-        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
-        assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
-        // Another Astation's policy is not this pairing's.
-        assert!(!PairingRecord::set_relay_only(paths, "astation-2", false).unwrap());
-        assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
-        // A new binding starts without one (Astation sends it again).
-        interrupted_unpair(dir.path());
-        let before = load(&src).unwrap();
-        bind_new(&src, &before, "astation-1").unwrap();
-        assert!(!PairingRecord::load(paths).unwrap().unwrap().relay_only);
-        // Unpair removes it with the record; nothing re-creates it.
-        unpair(&src).unwrap();
-        assert!(!PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
-        assert!(!paths.record.exists());
-    }
-
-    /// A repeated value is not written again (the file stays the same
-    /// inode); a change replaces it.
-    #[test]
-    fn relay_only_repeated_is_not_rewritten() {
-        use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::tempdir().unwrap();
-        let captured = bound_profile(dir.path(), "astation-1");
-        let paths = &captured.sources().paths.pairing;
-        let inode = || std::fs::metadata(&paths.record).unwrap().ino();
-        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
-        let written = inode();
-        assert!(PairingRecord::set_relay_only(paths, "astation-1", true).unwrap());
-        assert_eq!(inode(), written, "a repeat writes nothing");
-        assert!(PairingRecord::load(paths).unwrap().unwrap().relay_only);
-        assert!(PairingRecord::set_relay_only(paths, "astation-1", false).unwrap());
-        assert_ne!(inode(), written, "a change is written");
-        assert!(!PairingRecord::load(paths).unwrap().unwrap().relay_only);
-    }
-
-    #[test]
     fn a_binding_of_an_older_generation_is_no_binding() {
         let dir = tempfile::tempdir().unwrap();
         let captured = bound_profile(dir.path(), "astation-1");
@@ -914,6 +1032,288 @@ pub(crate) mod tests {
                 .to_string(),
             CHANGED
         );
+    }
+
+    /// r9: the device list is removed first, under the lock; when that
+    /// fails the pairing is left as it was (no unpaired host keeps a list).
+    #[test]
+    fn unpair_removes_the_device_list_before_the_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        bound_profile(dir.path(), "astation-a");
+        let paths = &src.paths.pairing;
+        let gen_before = read_gen_file(&paths.trust_gen).unwrap();
+        // A frozen list whose genesis can't be kept: frozen_genesis is a
+        // directory, so its write fails.
+        std::fs::write(
+            &paths.membership,
+            format!(r#"{{"genesis_hash":"{}"}}"#, "a".repeat(64)),
+        )
+        .unwrap();
+        std::fs::write(&paths.freeze, b"x").unwrap();
+        std::fs::create_dir(&paths.frozen_genesis).unwrap();
+        assert!(unpair(&src).is_err());
+        assert_eq!(
+            read_gen_file(&paths.trust_gen).unwrap(),
+            gen_before,
+            "nothing committed"
+        );
+        assert!(
+            PairingRecord::load(paths).unwrap().is_some(),
+            "still paired"
+        );
+        assert!(paths.membership.exists(), "the list stays with the pairing");
+        std::fs::remove_dir(&paths.frozen_genesis).unwrap();
+        assert_eq!(unpair(&src).unwrap(), gen_before + 1);
+        assert!(!paths.membership.exists() && !paths.freeze.exists());
+        assert!(PairingRecord::load(paths).unwrap().is_none());
+        assert_eq!(
+            crate::session_protocol::membership::frozen_genesis(paths)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// r9 (re-review New Important 2): each step of the device list's
+    /// removal fails in turn; afterwards the host is either still paired
+    /// with its whole list, or unpaired. Never paired without a list that
+    /// opens as "no device list".
+    #[test]
+    fn a_failed_device_list_removal_never_leaves_a_paired_host_without_its_list() {
+        use crate::session_protocol::membership::store::{DlFile, Injected, Step, Store};
+        use crate::session_protocol::membership::{FORGET_FAULT, MembershipHost};
+        let steps = [
+            (DlFile::State, Step::Remove),
+            (DlFile::Carriage, Step::Remove),
+            (DlFile::Intent, Step::Remove),
+            (DlFile::Freeze, Step::Remove),
+            (DlFile::Fault, Step::Remove),
+            (DlFile::HostChannelKey, Step::Remove),
+            // `membership_applied` goes last, in `forget_leftovers`, after
+            // the generation is committed: its fault reaches it there.
+            (DlFile::Applied, Step::Remove),
+        ];
+        for (file, step) in steps {
+            let dir = tempfile::tempdir().unwrap();
+            let src = Sources::in_dir(dir.path());
+            bound_profile(dir.path(), "astation-a");
+            let paths = &src.paths.pairing;
+            let journal = crate::runtime::state_dir(dir.path()).join("journal");
+            crate::session_protocol::membership::store::private_dir(&journal).unwrap();
+            let store = Store::new(paths, &journal);
+            // A held r9 host with every file a list can have.
+            std::fs::write(&paths.membership, b"{}").unwrap();
+            for f in [
+                DlFile::Carriage,
+                DlFile::Intent,
+                DlFile::Fault,
+                DlFile::HostChannelKey,
+                DlFile::Applied,
+            ] {
+                std::fs::write(store.path(f), b"x").unwrap();
+            }
+            FORGET_FAULT.with(|f| f.set(Some(Injected { file, step })));
+            let result = unpair_with_notices(&src);
+            assert!(
+                FORGET_FAULT.with(|f| f.get()).is_none(),
+                "the fault was reached: {file:?}"
+            );
+            if file == DlFile::Applied {
+                // The last leftover's removal failed after the commit: the
+                // unpair completes and says so.
+                assert!(
+                    result
+                        .as_ref()
+                        .is_ok_and(|(_, notices)| !notices.is_empty()),
+                    "{result:?}"
+                );
+            }
+            let unpaired = result.is_ok();
+            let paired = PairingRecord::load(paths).unwrap().is_some();
+            assert_eq!(paired, !unpaired, "{file:?}");
+            let opened = MembershipHost::open(
+                paths,
+                &journal,
+                9,
+                &atem_client::membership::HostNow {
+                    wall_ms: 1,
+                    mono_ms: 1,
+                    boot_id: "b".into(),
+                },
+                &mut NoFences,
+            );
+            // The removal had begun (the unlink is done; only its directory
+            // fsync failed): the unpair completes.
+            assert!(unpaired, "{file:?}");
+            assert!(!paired && !paths.membership.exists(), "{file:?}");
+            let left = [
+                DlFile::Carriage,
+                DlFile::Intent,
+                DlFile::Fault,
+                DlFile::HostChannelKey,
+                DlFile::Applied,
+            ]
+            .into_iter()
+            .any(|f| store.present(f));
+            // Whatever is left fails closed until `atem pair`.
+            assert_eq!(matches!(opened, Ok(None)), !left, "{file:?}");
+        }
+        // The list's own unlink fails (a directory is in its way): nothing
+        // changed, the host stays paired and its list never opens as none.
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        bound_profile(dir.path(), "astation-a");
+        let paths = &src.paths.pairing;
+        std::fs::create_dir(&paths.membership).unwrap();
+        std::fs::write(paths.membership.join("x"), b"x").unwrap();
+        std::fs::write(&paths.fault, b"x").unwrap();
+        assert!(unpair(&src).is_err());
+        assert!(
+            PairingRecord::load(paths).unwrap().is_some(),
+            "still paired"
+        );
+        assert!(paths.fault.exists(), "its fault record kept");
+        let journal = crate::runtime::state_dir(dir.path()).join("journal");
+        let opened = MembershipHost::open(
+            paths,
+            &journal,
+            9,
+            &atem_client::membership::HostNow {
+                wall_ms: 1,
+                mono_ms: 1,
+                boot_id: "b".into(),
+            },
+            &mut NoFences,
+        );
+        assert!(opened.is_err(), "Failed, never None");
+    }
+
+    fn opens_as_none(src: &Sources, dir: &std::path::Path) -> bool {
+        let journal = crate::runtime::state_dir(dir).join("journal");
+        matches!(
+            crate::session_protocol::membership::MembershipHost::open(
+                &src.paths.pairing,
+                &journal,
+                9,
+                &atem_client::membership::HostNow {
+                    wall_ms: 1,
+                    mono_ms: 1,
+                    boot_id: "b".into(),
+                },
+                &mut NoFences,
+            ),
+            Ok(None)
+        )
+    }
+
+    /// A paired r9 profile: a (stub) device list and its applied head.
+    fn r9_profile(dir: &std::path::Path) -> Sources {
+        let src = Sources::in_dir(dir);
+        bound_profile(dir, "astation-a");
+        std::fs::write(&src.paths.pairing.membership, b"{}").unwrap();
+        let journal = crate::runtime::state_dir(dir).join("journal");
+        crate::session_protocol::membership::store::private_dir(&journal).unwrap();
+        std::fs::write(journal.join("membership_applied"), b"{}").unwrap();
+        src
+    }
+
+    /// Re-review 2, Important 1: the device list is removed, then the
+    /// trust generation can't be committed (its first write, the floor copy,
+    /// fails). The unpair fails, the pairing stays bound, and its device
+    /// list's last leftover keeps it failed (never "no device list").
+    #[test]
+    fn a_failed_generation_write_after_the_list_went_never_opens_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = r9_profile(dir.path());
+        let gen_before = read_gen_file(&src.paths.pairing.trust_gen).unwrap();
+        let unpair_err = {
+            let _failing = crate::memory::crypto::fail_writes_to(&src.paths.cred.trust_gen_floor);
+            unpair(&src).is_err()
+        };
+        let still_bound = load(&src).unwrap().binding.is_some();
+        assert!(unpair_err && still_bound);
+        assert_eq!(
+            read_gen_file(&src.paths.pairing.trust_gen).unwrap(),
+            gen_before
+        );
+        assert!(!src.paths.pairing.membership.exists());
+        assert!(!opens_as_none(&src, dir.path()), "Failed, never None");
+        // `atem unpair` again finishes it.
+        let (_, notices) = unpair_with_notices(&src).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(load(&src).unwrap().binding.is_none());
+        assert!(opens_as_none(&src, dir.path()));
+        assert!(!crate::session_protocol::membership::has_device_list_files(
+            &src.paths.pairing
+        ));
+    }
+
+    /// The floor copy is committed but `pairing/trust_gen` can't be
+    /// written: the generation is already the next one, so the old binding
+    /// is stale (never re-used), the device list still opens as failed, and
+    /// `atem unpair` again finishes, above the committed generation.
+    #[test]
+    fn a_committed_floor_with_a_failed_counter_write_never_reuses_the_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = r9_profile(dir.path());
+        let gen_before = load(&src).unwrap().host_trust_gen;
+        let unpair_err = {
+            let _failing = crate::memory::crypto::fail_writes_to(&src.paths.pairing.trust_gen);
+            unpair(&src).is_err()
+        };
+        assert!(unpair_err);
+        let state = load(&src).unwrap();
+        assert_eq!(state.host_trust_gen, gen_before + 1);
+        assert!(
+            state.binding.is_none(),
+            "the old binding is never current again"
+        );
+        assert!(!opens_as_none(&src, dir.path()), "Failed, never None");
+        let (next, notices) = unpair_with_notices(&src).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(next, gen_before + 2);
+        assert!(opens_as_none(&src, dir.path()));
+    }
+
+    /// Re-review 2, Minor 1: on a profile that isn't paired, `atem unpair`
+    /// still removes r9 leftovers (the message "run atem unpair, then atem
+    /// pair" works); with none it removes nothing.
+    #[test]
+    fn unpair_on_an_unpaired_profile_removes_device_list_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = r9_profile(dir.path());
+        let failing = crate::session_protocol::membership::store::Store::new(
+            &src.paths.pairing,
+            &crate::runtime::state_dir(dir.path()).join("journal"),
+        )
+        .path(crate::session_protocol::membership::store::DlFile::HostChannelKey);
+        // An unpair that stopped midway: a directory in the way of a leftover.
+        std::fs::create_dir(&failing).unwrap();
+        std::fs::write(failing.join("x"), b"x").unwrap();
+        let (_, notices) = unpair_with_notices(&src).unwrap();
+        assert_eq!(notices.len(), 1, "the partial removal is a notice");
+        assert!(notices[0].contains("atem unpair"), "{notices:?}");
+        assert!(load(&src).unwrap().binding.is_none(), "unpaired");
+        assert!(!opens_as_none(&src, dir.path()), "leftovers fail closed");
+        std::fs::remove_dir_all(&failing).unwrap();
+        assert!(remove_device_list_leftovers(&src).unwrap());
+        assert!(opens_as_none(&src, dir.path()));
+        assert!(!remove_device_list_leftovers(&src).unwrap(), "nothing left");
+        // A plain r8 profile: nothing to remove, nothing created.
+        let r8 = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(r8.path());
+        assert!(!remove_device_list_leftovers(&src).unwrap());
+        assert!(!crate::runtime::state_dir(r8.path()).exists());
+    }
+
+    struct NoFences;
+    impl crate::session_protocol::membership::Fences for NoFences {
+        fn fence(&mut self, _: &str, _: u64) {}
+        fn fault(&mut self, _: Option<&[String]>) {}
+        fn remote_principals(&self) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[test]

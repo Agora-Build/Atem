@@ -53,6 +53,32 @@ pub struct PairingPaths {
     /// `trust_gen`: the host trust generation; its lock (`trust_gen.lock`)
     /// guards every pairing change and every bound apply.
     pub trust_gen: PathBuf,
+    /// r9 device list (§R9.3; `session_protocol::membership`):
+    /// `membership.json` (the verified log, head, recovery, evidence, freeze).
+    pub membership: PathBuf,
+    /// `membership.carriage`: a carriage, durable before it is evaluated.
+    pub carriage: PathBuf,
+    /// `membership.intent`: the head about to be written.
+    pub intent: PathBuf,
+    /// `membership.freeze`: both conflicting entries of a freeze.
+    pub freeze: PathBuf,
+    /// `membership.fault`: a device-list write fault was observed.
+    pub fault: PathBuf,
+    /// `frozen_genesis`: genesis hashes this host was frozen on (kept by
+    /// `atem unpair`; ≤ 16).
+    pub frozen_genesis: PathBuf,
+    /// `revoked_floor`: a copy of the revoked browser grants' bound
+    /// (`runtime/journal/revoked_quarantine`), outside the journal directory
+    /// (kept by `atem unpair`; only ever raised).
+    pub revoked_floor: PathBuf,
+    /// `host_channel_key`: the host's atem-ch1 key (deleted by `atem unpair`).
+    pub host_channel_key: PathBuf,
+    /// `host_policy.json`: the relay-only policy a manager set (§R9.8a;
+    /// deleted by `atem unpair` and at a new pin).
+    pub host_policy: PathBuf,
+    /// `host_policy.pending`: the policy a write left uncertain (its bytes,
+    /// rolled forward at start); no local link while it exists.
+    pub host_policy_pending: PathBuf,
 }
 
 impl PairingPaths {
@@ -61,7 +87,24 @@ impl PairingPaths {
         Self {
             record: dir.join("pairing.enc"),
             trust_gen: dir.join("trust_gen"),
+            membership: dir.join("membership.json"),
+            carriage: dir.join("membership.carriage"),
+            intent: dir.join("membership.intent"),
+            freeze: dir.join("membership.freeze"),
+            fault: dir.join("membership.fault"),
+            frozen_genesis: dir.join("frozen_genesis"),
+            revoked_floor: dir.join("revoked_floor"),
+            host_channel_key: dir.join("host_channel_key"),
+            host_policy: dir.join("host_policy.json"),
+            host_policy_pending: dir.join("host_policy.pending"),
         }
+    }
+
+    /// `<profile>/pairing`.
+    pub fn dir(&self) -> &Path {
+        self.trust_gen
+            .parent()
+            .expect("trust_gen is in the pairing dir")
     }
 }
 

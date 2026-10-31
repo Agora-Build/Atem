@@ -68,10 +68,14 @@ pub enum Record {
     /// A principal's control state (§H): whether it holds `control`, and its
     /// `control_gen` (from 1, never decreasing). A revocation (the fence) is
     /// `control: false` with the raised generation; a later grant keeps it.
+    /// `fence_seq` (r9 §R9.3) is the newest membership entry whose fence
+    /// raised the generation (0: none), so replaying an entry's fences
+    /// never raises a generation twice.
     Control {
         principal: String,
         control: bool,
         control_gen: u64,
+        fence_seq: u64,
     },
 }
 
@@ -129,6 +133,12 @@ pub trait Journal {
     fn take_clean_close(&mut self) -> Option<u64>;
     /// After a restart: reload what is durable and accept appends again.
     fn reopen(&mut self) -> Result<(), JournalError>;
+    /// Forgets the control states of `principals` (the host found they can
+    /// no longer matter): they are left out of every later control write,
+    /// starting with the one that follows at once. Nothing is written here:
+    /// until that write the disk keeps them, which is harmless (more
+    /// history, never less).
+    fn forget_principals(&mut self, principals: &[String]);
 }
 
 /// In-memory journal with failure injection, for tests and the fixtures.
@@ -280,6 +290,12 @@ impl Journal for MemJournal {
         self.clean_close.take()
     }
 
+    fn forget_principals(&mut self, principals: &[String]) {
+        self.records.retain(
+            |r| !matches!(r, Record::Control { principal, .. } if principals.contains(principal)),
+        );
+    }
+
     fn reopen(&mut self) -> Result<(), JournalError> {
         self.failed = false;
         self.crashed = false;
@@ -316,6 +332,8 @@ pub struct Stored {
 pub struct ControlState {
     pub control: bool,
     pub control_gen: u64,
+    /// The newest membership entry that fenced this principal (0: none).
+    pub fence_seq: u64,
 }
 
 #[derive(Debug, Default)]
@@ -454,14 +472,17 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 principal,
                 control,
                 control_gen,
+                fence_seq,
             } => {
                 let current = out.principals.get(&principal).copied();
                 if current.is_none_or(|c| control_gen >= c.control_gen) {
+                    let fence_seq = fence_seq.max(current.map_or(0, |c| c.fence_seq));
                     out.principals.insert(
                         principal,
                         ControlState {
                             control,
                             control_gen,
+                            fence_seq,
                         },
                     );
                 }
@@ -584,13 +605,15 @@ mod tests {
             principal: "p1".into(),
             control,
             control_gen,
+            fence_seq: 0,
         };
         let r = replay(vec![control(false, 3), control(true, 2), control(true, 3)]).unwrap();
         assert_eq!(
             r.principals["p1"],
             ControlState {
                 control: true,
-                control_gen: 3
+                control_gen: 3,
+                fence_seq: 0,
             }
         );
         let rejected = Record::Rejected {

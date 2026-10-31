@@ -183,12 +183,13 @@ fn accepted(listener: &std::net::TcpListener, secs: u64) -> bool {
 }
 
 /// An unreadable pairing record is not "no pairing": the runtime never
-/// tries the local Astation endpoint (the record might say relay only),
-/// logs why, and a restarted runtime does the same. Without a record it
-/// does try it (first pairing).
+/// tries the local Astation endpoint, logs why, and a restarted runtime
+/// does the same. A host-policy write left uncertain (§R9.8a) keeps it off
+/// the local endpoint too. Without either it does try it (first pairing).
 #[test]
 fn an_unreadable_pairing_record_never_tries_the_local_astation() {
-    for damaged in [true, false] {
+    for case in ["damaged", "policy_pending", "none"] {
+        let damaged = case == "damaged";
         let dir = tempfile::Builder::new()
             .prefix("atem-rb")
             .tempdir_in("/tmp")
@@ -203,6 +204,9 @@ fn an_unreadable_pairing_record_never_tries_the_local_astation() {
         std::fs::set_permissions(&pairing, std::fs::Permissions::from_mode(0o700)).unwrap();
         if damaged {
             std::fs::write(pairing.join("pairing.enc"), b"not a sealed record").unwrap();
+        }
+        if case == "policy_pending" {
+            std::fs::write(pairing.join("host_policy.pending"), b"{}").unwrap();
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
@@ -226,8 +230,8 @@ fn an_unreadable_pairing_record_never_tries_the_local_astation() {
                 within(10, || hello(&socket).is_some()),
                 "the runtime didn't start listening"
             );
-            let tried = accepted(&listener, if damaged { 3 } else { 10 });
-            assert_eq!(tried, !damaged, "damaged {damaged}, restart {restart}");
+            let tried = accepted(&listener, if case == "none" { 10 } else { 3 });
+            assert_eq!(tried, case == "none", "{case}, restart {restart}");
             assert!(
                 child.0.try_wait().unwrap().is_none(),
                 "the runtime keeps running"
@@ -235,6 +239,9 @@ fn an_unreadable_pairing_record_never_tries_the_local_astation() {
             unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) };
             assert!(within(10, || child.0.try_wait().unwrap().is_some()));
             if !damaged {
+                if case == "policy_pending" {
+                    assert!(pairing.join("host_policy.pending").exists(), "kept");
+                }
                 break;
             }
             let output = std::fs::read_to_string(&log).unwrap();

@@ -942,7 +942,13 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Unpair { yes } => {
             let src = crate::profile::Sources::current()?;
             if !crate::status::profile_paired(&src) && !revocation_recorded(&src) {
-                println!("No pairing to remove.");
+                // r9: an unpair that stopped midway left device-list files.
+                if crate::pairing::remove_device_list_leftovers(&src)? {
+                    println!("Removed the leftover device-list files.");
+                    reload_runtime().await;
+                } else {
+                    println!("No pairing to remove.");
+                }
                 return Ok(());
             }
             let what = match crate::status::pairing(&src) {
@@ -1217,8 +1223,8 @@ fn revocation_recorded(src: &crate::profile::Sources) -> bool {
 /// `atem unpair` after the confirmation: first durably commits the next host
 /// trust generation (so work started under the old pairing can't apply
 /// anything, even if what follows is interrupted), then removes the pairing
-/// record (the user's own login, memory, vault data, trust pins and keys
-/// stay: `pairing::unpair`), and, when an
+/// record and the r9 device list (the user's own login, memory, vault data,
+/// trust pins and keys stay: `pairing::unpair_with_notices`), and, when an
 /// Astation revoked this device and `agent` (the running cred agent, if any)
 /// doesn't hold its keys unlocked, sets the revoked keys aside so the next
 /// `atem pair` verifies with new ones. Returns the notices to print: keys set
@@ -1228,9 +1234,8 @@ fn unpair_profile(
     src: &crate::profile::Sources,
     agent: Option<&dyn crate::memory::cred_agent::CredAgentApi>,
 ) -> Result<Vec<String>> {
-    crate::pairing::unpair(src)?;
+    let (_, mut notices) = crate::pairing::unpair_with_notices(src)?;
     // Unpaired from here on: what happens to revoked keys is only reported.
-    let mut notices = Vec::new();
     match crate::memory::verification::set_aside_revoked_keys(&src.paths.cred, agent) {
         Ok(Some(notice)) => notices.push(notice),
         Ok(None) => {}

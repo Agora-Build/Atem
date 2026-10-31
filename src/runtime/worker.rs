@@ -24,8 +24,8 @@
 use super::adopt::process_start_time;
 use super::worker_approvals::{Approvals, Event as ApprovalEvent};
 use super::worker_protocol::{
-    Activity, BrokerMsg, MAX_LINE, MAX_OUTPUT, WorkerMsg, WorkerRecord, WorkerSpec, b64,
-    decode_broker, encode_worker, write_bytes,
+    APPROVAL_HANDED, APPROVAL_IN_DIALOG, Activity, BrokerMsg, MAX_LINE, MAX_OUTPUT, WorkerMsg,
+    WorkerRecord, WorkerSpec, b64, decode_broker, encode_worker, write_bytes,
 };
 use crate::chat::adapter::{AgentAdapter, AgentEvent, Capabilities, LogItem};
 use crate::chat::approvals::Agent;
@@ -515,6 +515,10 @@ struct Worker {
     handle: PtyHandle,
     events: Option<mpsc::Receiver<PtyEvent>>,
     parser: vt100::Parser,
+    /// The agent's own approval dialog is on the canonical screen
+    /// (`chat::codex::dialog_on_screen`, `chat::claude::dialog_on_screen`):
+    /// chat prompts are held.
+    dialog_on_screen: bool,
     share: SharedTerminal,
     /// The agent's output for the session log.
     log: super::session_log::SessionLog,
@@ -645,6 +649,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         agent_pid,
         agent_start_time: agent_pid.and_then(process_start_time),
         exited: None,
+        project_key: spec.project_key.clone(),
     };
     if let Err(error) = write_record(&options.state, &record) {
         let _ = pty.resize_handle.stop();
@@ -664,6 +669,7 @@ pub async fn serve(spec: WorkerSpec, listener: UnixListener, options: WorkerOpti
         handle: pty.resize_handle,
         events: Some(pty.receiver),
         parser: vt100::Parser::new(rows, cols, crate::pty_session::SCROLLBACK_ROWS),
+        dialog_on_screen: false,
         offset: 0,
         dropped: 0,
         has_chat: adapter.is_some(),
@@ -887,6 +893,15 @@ impl Worker {
                 let start = self.offset;
                 let text = self.share.process(&mut self.parser, &self.input, &bytes);
                 self.log.append(&text);
+                let on_screen: Option<fn(&str) -> bool> = match &self.adapter {
+                    Some(ChatAdapter::Codex(_)) => Some(crate::chat::codex::dialog_on_screen),
+                    Some(ChatAdapter::Claude(_)) => Some(crate::chat::claude::dialog_on_screen),
+                    None => None,
+                };
+                if let Some(on_screen) = on_screen {
+                    self.dialog_on_screen = on_screen(&self.parser.screen().contents());
+                    self.hold_prompts();
+                }
                 self.offset += bytes.len() as u64;
                 if let Some(conn) = &mut self.conn {
                     if conn.resync || conn.backlog() > OUTPUT_BACKLOG {
@@ -913,6 +928,9 @@ impl Worker {
                         self.dropped += 1;
                         dropped(sequence)
                     }
+                    // A chat prompt reached the writer while Codex waited
+                    // for an approval: nothing written.
+                    FencedOutcome::Held => consumed(sequence, APPROVAL_IN_DIALOG),
                     FencedOutcome::Failed(error) => WorkerMsg::WriteResult {
                         seq: sequence,
                         ok: false,
@@ -978,7 +996,17 @@ impl Worker {
         } = &message
             && ((*release_approvals && self.release_for_input()) || self.consuming())
         {
-            self.send(&consumed(*seq));
+            self.send(&consumed(*seq, APPROVAL_HANDED));
+            return false;
+        }
+        // A chat prompt never reaches Codex's own approval dialog: its
+        // Enter would answer it (a release or a hook's end not yet passed
+        // on is latched first).
+        self.latch_dialogs();
+        if let BrokerMsg::Paste { seq, .. } = &message
+            && self.prompts_held()
+        {
+            self.send(&consumed(*seq, APPROVAL_IN_DIALOG));
             return false;
         }
         match message {
@@ -1076,6 +1104,17 @@ impl Worker {
                     a.release(&request_id);
                 }
             }
+            BrokerMsg::ApprovalsAnswered => {
+                let events = self
+                    .approvals
+                    .as_mut()
+                    .map(|a| a.answered_here())
+                    .unwrap_or_default();
+                if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+                    codex.answered_here();
+                }
+                self.send_approval_events(events);
+            }
             BrokerMsg::KnownApprovals { request_ids } => {
                 if let Some(a) = self.approvals.as_mut() {
                     a.keep_only(&request_ids);
@@ -1131,6 +1170,45 @@ impl Worker {
         false
     }
 
+    /// Codex: hands the adapter the open approvals and those that just got
+    /// "no decision" (its own dialog asks about them now); then, for any
+    /// agent, holds chat prompts at the PTY write boundary while it waits. Called
+    /// right after every change, not at the next pass: a prompt already
+    /// queued, or arriving before that pass, never reaches the dialog.
+    fn latch_dialogs(&mut self) {
+        let released = self
+            .approvals
+            .as_mut()
+            .map(|a| a.take_released())
+            .unwrap_or_default();
+        if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
+            codex.set_approvals(self.open_approvals.len(), released, now_ms());
+        }
+        self.hold_prompts();
+    }
+
+    /// Chat prompts are held at the PTY write boundary while the agent
+    /// waits for an approval, or while its approval dialog is on the screen.
+    fn hold_prompts(&self) {
+        self.input.hold_prompts(self.prompts_held());
+    }
+
+    /// A chat prompt must not be written now: the agent waits for an
+    /// approval (Codex: a remote answer or its own dialog; Claude: one of
+    /// the worker's open approvals, whose dialog Claude shows the whole
+    /// time, also a background agent's after its parent's turn ended), or
+    /// its dialog is on the screen. The session's status is the agent's own
+    /// (for Claude, its Notification ~6 s later): a prompt the broker
+    /// admits meanwhile is refused here, with nothing written.
+    fn prompts_held(&self) -> bool {
+        self.dialog_on_screen
+            || match &self.adapter {
+                Some(ChatAdapter::Codex(codex)) => codex.waiting(),
+                Some(ChatAdapter::Claude(_)) => !self.open_approvals.is_empty(),
+                None => false,
+            }
+    }
+
     /// Every waiting hook gets "no decision"; the ones released now.
     fn release_approvals(&mut self) -> Vec<String> {
         match self.approvals.as_mut() {
@@ -1144,6 +1222,7 @@ impl Worker {
     /// the released hooks still run (`consuming`).
     fn release_for_input(&mut self) -> bool {
         let released = self.release_approvals();
+        self.latch_dialogs();
         if released.is_empty() {
             return false;
         }
@@ -1176,13 +1255,28 @@ impl Worker {
     /// Reads the approvals directory (a request with no broker connected is
     /// released at once) and reports what happened.
     fn poll_approvals(&mut self) {
+        if super::test_hooks::approvals_held() {
+            return;
+        }
         let connected = self.conn.as_ref().is_some_and(|c| !c.tx.is_closed());
         let Some(a) = self.approvals.as_mut() else {
             return;
         };
         let evidence = std::mem::take(&mut self.approval_evidence);
         let events = a.poll(connected, evidence);
+        let hint = a.take_answer_hint();
         self.send_approval_events(events);
+        if hint {
+            self.answer_hint();
+        }
+    }
+
+    /// A tool like a waiting approval's call ran: the terminal is told how
+    /// to say it was answered there (nothing ends the wait by itself).
+    fn answer_hint(&mut self) {
+        self.send(&WorkerMsg::Notice {
+            text: super::worker_protocol::ANSWER_HINT.into(),
+        });
     }
 
     fn send_approval_events(&mut self, events: Vec<ApprovalEvent>) {
@@ -1205,10 +1299,7 @@ impl Worker {
                 | ApprovalEvent::RuleNotKept { .. } => {}
             }
         }
-        let released = self.approvals.as_mut().is_some_and(|a| a.take_released());
-        if let Some(ChatAdapter::Codex(codex)) = self.adapter.as_mut() {
-            codex.set_approvals(self.open_approvals.len(), released);
-        }
+        self.latch_dialogs();
         for event in events {
             let message = match event {
                 ApprovalEvent::Request { request_id, info } => WorkerMsg::ApprovalRequest {
@@ -1284,6 +1375,7 @@ impl Worker {
     /// ends), keeps the activity from it and forwards what it read.
     fn poll_chat(&mut self) {
         let evidence = self.approvals.is_some();
+        let codex = matches!(self.adapter, Some(ChatAdapter::Codex(_)));
         let Some(adapter) = self.adapter.as_mut().map(ChatAdapter::get) else {
             return;
         };
@@ -1292,18 +1384,29 @@ impl Worker {
         let events = adapter.poll_events();
         let mut log = adapter.poll_log();
         let capabilities = adapter.capabilities();
+        let hint = match self.adapter.as_mut() {
+            Some(ChatAdapter::Codex(codex)) => codex.take_answer_hint(),
+            _ => false,
+        };
+        if hint {
+            self.answer_hint();
+        }
         // What may end a waiting permission prompt (applied with the next
         // approvals poll): a new prompt or the turn's end, a tool refused in
         // the terminal — each stamped with when the agent reported it, so
         // it answers only a prompt opened before (one read in the same pass
         // as a newer request doesn't). Tool results are the worker's only:
-        // never forwarded.
+        // never forwarded. Codex may end a turn while its exec cell still
+        // waits for an approval: only an interrupted turn end answers one.
         if evidence {
             use super::worker_approvals::Evidence;
-            for e in &events {
-                if let AgentEvent::PromptSubmitted { at_ms, .. } | AgentEvent::TurnEnded { at_ms } =
-                    e
-                {
+            // Codex: a new prompt or an interrupted turn end gives its
+            // waiting hooks no decision (to its own dialog: the wait goes
+            // on there). Claude: neither ends anything (a background agent
+            // may ask while its parent's turn ends); its waits end with the
+            // hook, a remote answer or the person at the terminal.
+            for e in events.iter().filter(|_| codex) {
+                if let AgentEvent::PromptSubmitted { at_ms, .. } = e {
                     self.approval_evidence.push(Evidence::TurnEnded {
                         interrupted: false,
                         at_ms: *at_ms,
@@ -1312,6 +1415,8 @@ impl Worker {
             }
             for item in &log {
                 match item {
+                    LogItem::TurnEnded { outcome, .. }
+                        if !codex || *outcome != crate::chat::adapter::Outcome::Interrupted => {}
                     LogItem::TurnEnded { outcome, at_ms, .. } => {
                         self.approval_evidence.push(Evidence::TurnEnded {
                             interrupted: *outcome == crate::chat::adapter::Outcome::Interrupted,
@@ -1377,6 +1482,8 @@ impl Worker {
             (Activity::Unknown, None)
         };
         self.set_activity(state, detail);
+        // A dialog answered now lets prompts through again.
+        self.hold_prompts();
     }
 
     /// What the adapter's chat can't provide (`Capabilities::unavailable`).
@@ -1489,9 +1596,9 @@ struct Consume {
     ids: Vec<String>,
 }
 
-/// Input consumed because it handed a waiting approval to the agent's own
-/// dialog (nothing written).
-fn consumed(seq: u64) -> WorkerMsg {
+/// Input consumed (nothing written) because it handed a waiting approval to
+/// the agent's own dialog, or would have answered that dialog: `why`.
+fn consumed(seq: u64, why: &str) -> WorkerMsg {
     WorkerMsg::WriteResult {
         seq,
         ok: false,
@@ -1499,7 +1606,7 @@ fn consumed(seq: u64) -> WorkerMsg {
         dropped: false,
         no_effect: true,
         consumed: true,
-        error: Some(super::worker_protocol::APPROVAL_HANDED.into()),
+        error: Some(why.into()),
     }
 }
 
@@ -1615,6 +1722,7 @@ mod approval_settings_tests {
             rows: 24,
             cols: 80,
             socket: PathBuf::from("/nonexistent.sock"),
+            project_key: None,
         }
     }
 

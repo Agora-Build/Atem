@@ -44,31 +44,41 @@
 //! - Waiting: PermissionRequest never reaches `events/` (it is the
 //!   approvals' own protocol, `runtime/worker_approvals.rs`), so the worker
 //!   reports how many approvals of this session wait for a remote answer
-//!   and whether it gave some back to Codex's own dialog ("no decision":
-//!   input to Codex, no broker, a broker that doesn't know them)
+//!   and when it gave some back to Codex's own dialog ("no decision":
+//!   input to Codex, no broker, a broker that doesn't know them, a turn
+//!   end or the hook ending while it waited)
 //!   ([`CodexAdapter::set_approvals`]; its set is the only source of the
 //!   first). Waiting while either holds: not waiting → waiting is
-//!   `WaitingForPermission`, back `ToolFinished` (working), returned after
-//!   that poll's hook events. Codex's own dialog counts until its
-//!   PostToolUse or Interrupt hook, a Stop, a turn end or the turn's next
-//!   rollout item (a re-pin drops it); after a re-pin with approvals
-//!   open, `WaitingForPermission` again. A PreToolUse read while waiting is
-//!   dropped (Codex holds the tool while the hook or its dialog waits).
+//!   `WaitingForPermission` with `outlasts_turn` (Codex may end the turn
+//!   while its exec cell still waits for the approval, or with its dialog
+//!   open: the status stays waiting past the turn's end), back
+//!   `ToolFinished`, returned after that poll's hook events. Codex's own
+//!   dialog counts until it is dismissed, by evidence from after the
+//!   approval went there (Interrupt or UserPromptSubmit hook, the rollout's
+//!   next user message or interrupted turn end), or the person at the
+//!   terminal says it was answered (`answered_here`, the prefix `a`); never
+//!   by a tool result: Codex's PermissionRequest names no call, so no
+//!   result can be proven to be the asking call's (a re-pin drops it).
+//!   While it is open a chat prompt is
+//!   never pasted ([`CodexAdapter::dialog_open`]: the worker consumes it).
+//!   After a re-pin with approvals open, `WaitingForPermission` again. A
+//!   PreToolUse read while waiting is dropped (Codex holds the tool while
+//!   the hook or its dialog waits).
 //! - A format change in the rollout withdraws chat, as for Claude.
 //!   Messages arrive whole, never streamed; [`UNAVAILABLE`] says so.
 
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
 use super::rollout::RolloutReader;
 use crate::chat::adapter::{
-    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, UNAVAILABLE_ERROR_DETAILS,
-    UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
+    AgentAdapter, AgentEvent, Capabilities, LaunchPlan, LogItem, Outcome,
+    UNAVAILABLE_ERROR_DETAILS, UNAVAILABLE_REASONING, UNAVAILABLE_STREAMING,
 };
 use crate::chat::approvals::{Ancestry, HookAgent};
+pub use crate::chat::hook_events::{EventReader, RawEvent};
 
 /// Why a chat prompt is refused before Codex's first hook.
 pub const FIRST_PROMPT: &str = "type a first prompt in the terminal: Codex reports nothing before it (and Atem's Codex hooks must be trusted in its /hooks)";
@@ -83,13 +93,27 @@ pub const UNAVAILABLE: &[&str] = &[
 ];
 /// The status detail while an approval waits (`ChatSession` shows its own).
 const APPROVAL_DETAIL: &str = "approve in the terminal";
-/// Event files read per poll; the rest wait for the next.
-const EVENTS_PER_POLL: usize = 256;
-/// Largest event file read; a bigger one is dropped.
-const MAX_EVENT: u64 = 1024 * 1024;
-/// A `tmp.*` left by a killed hook, or an unreadable event file, goes
-/// after this long.
-const LEFTOVER: Duration = Duration::from_secs(60);
+
+/// An approval in Codex's own dialog: since `since` (unix ms) and after
+/// event `since_seq` (the newest read then).
+#[derive(Debug)]
+struct Dialog {
+    since: i64,
+    since_seq: u64,
+    /// A tool ended after it went there: the terminal was told how to say
+    /// it was answered (once).
+    hinted: bool,
+}
+
+/// Codex's permission wait: it outlasts the turn's end (an approval belongs
+/// to a tool call that can outlive the turn, and Codex's own dialog stays
+/// open after it).
+fn waiting_event() -> AgentEvent {
+    AgentEvent::WaitingForPermission {
+        detail: APPROVAL_DETAIL.into(),
+        outlasts_turn: true,
+    }
+}
 
 pub struct CodexAdapter {
     codex_home: PathBuf,
@@ -122,10 +146,19 @@ pub struct CodexAdapter {
     /// Approvals open for this session (the worker's count: waiting for a
     /// remote answer).
     approvals: usize,
-    /// An approval was released ("no decision"): Codex shows its own
-    /// dialog, so the status stays waiting until its PostToolUse or
-    /// Interrupt hook, a turn end, or the turn's next rollout item.
-    terminal_wait: bool,
+    /// Approvals that sit in Codex's own dialog: each got "no decision"
+    /// (released, closed by a prompt or turn end, its hook ended). Each
+    /// holds the status waiting until it is dismissed (an Interrupt hook or
+    /// `turn_aborted`, or a prompt went in: UserPromptSubmit, the rollout's
+    /// user message), all from after it went there, or the person at the
+    /// terminal says it was answered (`answered_here`). Never by a tool
+    /// result (no call id ties one to the approval), a Stop or a turn's
+    /// plain end (Codex may end the turn with the dialog still open).
+    dialogs: Vec<Dialog>,
+    /// A tool ended after a dialog opened (`take_answer_hint`).
+    answer_hint: bool,
+    /// The newest event sequence read.
+    last_seq: u64,
     /// The pinned session was pinned by a hook other than its SessionStart
     /// (async hooks publish in either order): that SessionStart, read
     /// later on the same rollout, is no restart.
@@ -156,7 +189,10 @@ impl CodexAdapter {
             announced: false,
             turn_open: false,
             approvals: 0,
-            terminal_wait: false,
+            dialogs: Vec::new(),
+            answer_hint: false,
+
+            last_seq: 0,
             start_unseen: false,
             session_started: false,
             withdrawn: None,
@@ -185,39 +221,82 @@ impl CodexAdapter {
     /// [`Self::set_approvals`] with nothing released.
     #[cfg(test)]
     pub fn set_open_approvals(&mut self, n: usize) {
-        self.set_approvals(n, false);
+        self.set_approvals(n, 0, 0);
     }
 
-    /// The worker's report after a pass: `open` approvals wait for a remote
-    /// answer, and `released` says some of this session's were given back
-    /// to Codex's own dialog ("no decision": input to Codex, no broker, a
-    /// broker that doesn't know them). Waiting while either holds.
-    pub fn set_approvals(&mut self, open: usize, released: bool) {
+    /// The worker's report: `open` approvals wait for a remote answer, and
+    /// `released` were given back to Codex's own dialog at `at_ms` ("no
+    /// decision": input to Codex, no broker, a broker that doesn't know
+    /// them, a prompt or turn end closing them, their hook ending while it
+    /// waited). Waiting while either holds.
+    pub fn set_approvals(&mut self, open: usize, released: usize, at_ms: i64) {
         let before = self.waiting();
         self.approvals = open;
-        self.terminal_wait |= released;
+        // Every event published by now (the script's counter, read or not
+        // yet): a later one was published after the dialog opened.
+        let since_seq = self.last_seq.max(self.published_seq());
+        self.dialogs.extend((0..released).map(|_| Dialog {
+            since: at_ms,
+            since_seq,
+            hinted: false,
+        }));
         self.status_change(before);
     }
 
-    /// Waiting for an approval: a remote answer or Codex's own dialog.
-    fn waiting(&self) -> bool {
-        self.approvals > 0 || self.terminal_wait
+    /// The person at the terminal says the approvals in Codex's own dialog
+    /// were answered there (the prefix `a`): their waits end.
+    pub fn answered_here(&mut self) {
+        let before = self.waiting();
+        self.dialogs.clear();
+        self.status_change(before);
     }
 
-    /// Codex's own dialog was answered (or the turn went on, or ended).
-    fn end_terminal_wait(&mut self) {
-        if self.terminal_wait {
-            let before = self.waiting();
-            self.terminal_wait = false;
-            self.status_change(before);
-        }
+    /// A tool ended after an approval went to Codex's own dialog, since the
+    /// last call: it may have been answered there, which only the person at
+    /// the terminal can say (the prefix `a`).
+    pub fn take_answer_hint(&mut self) -> bool {
+        std::mem::take(&mut self.answer_hint)
+    }
+
+    /// The script's events counter (`events/seq`): the newest event
+    /// published, read or not; 0 without one.
+    fn published_seq(&self) -> u64 {
+        self.dir
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join("events").join("seq")).ok())
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// An approval sits in Codex's own dialog: input typed now answers it,
+    /// so a chat prompt must not be pasted (the worker consumes it).
+    pub fn dialog_open(&self) -> bool {
+        !self.dialogs.is_empty()
+    }
+
+    /// Waiting for an approval: a remote answer or Codex's own dialog. A
+    /// chat prompt is never written meanwhile (the worker holds prompts).
+    pub fn waiting(&self) -> bool {
+        self.approvals > 0 || self.dialog_open()
+    }
+
+    /// No dialog of Codex's took the keys (dismissed with Esc, or a prompt
+    /// went in): every dialog opened before is gone. A hook event is
+    /// ordered by its sequence (published after the dialog opened), never
+    /// by its file time (filesystem clocks are coarse); a rollout record
+    /// has no sequence and is ordered by its own time, Codex's.
+    fn dialogs_gone(&mut self, at_ms: i64, seq: Option<u64>) {
+        let before = self.waiting();
+        self.dialogs.retain(|d| match seq {
+            Some(seq) => seq <= d.since_seq,
+            None => d.since >= at_ms,
+        });
+        self.status_change(before);
     }
 
     fn status_change(&mut self, before: bool) {
         match (before, self.waiting()) {
-            (false, true) => self.extra.push(AgentEvent::WaitingForPermission {
-                detail: APPROVAL_DETAIL.into(),
-            }),
+            (false, true) => self.extra.push(waiting_event()),
             (true, false) => self.extra.push(AgentEvent::ToolFinished),
             _ => {}
         }
@@ -330,6 +409,8 @@ impl CodexAdapter {
     fn map(&mut self, hook: Hook, out: &mut Vec<AgentEvent>) {
         match hook.event.as_str() {
             "UserPromptSubmit" => {
+                // A prompt went in: no dialog was taking the keys.
+                self.dialogs_gone(hook.at_ms, Some(hook.seq));
                 if let Some(text) = hook.prompt {
                     self.turn_open = true;
                     out.push(AgentEvent::PromptSubmitted {
@@ -340,20 +421,28 @@ impl CodexAdapter {
                 }
             }
             // While an approval waits Codex holds the tool: a PreToolUse
-            // read now came before it.
+            // read now came before it. A tool's end ends no wait: which call
+            // it was can't be told from the approval's.
             "PreToolUse" if !self.waiting() => out.push(AgentEvent::ToolStarted),
+            "PostToolUse" if !self.waiting() => out.push(AgentEvent::ToolFinished),
+            // A tool's end while a dialog waits ends nothing, but the
+            // terminal is told once per dialog how to end it.
             "PostToolUse" => {
-                // The tool ran: a dialog Codex showed was answered (its
-                // `ToolFinished` is this one).
-                self.terminal_wait = false;
-                out.push(AgentEvent::ToolFinished);
+                for d in self.dialogs.iter_mut() {
+                    if !d.hinted && hook.seq > d.since_seq {
+                        d.hinted = true;
+                        self.answer_hint = true;
+                    }
+                }
             }
             // Only wake-ups for the reader (the rollout's end record is the
-            // turn's end), but the turn is over: a deferred start may go,
-            // and a dialog Codex showed is gone.
-            "Stop" | "Interrupt" => {
+            // turn's end), but the turn is over: a deferred start may go.
+            // Stop leaves a dialog Codex showed open (Codex may end the turn
+            // before it is answered); Interrupt (Esc) dismissed it.
+            "Stop" => self.turn_open = false,
+            "Interrupt" => {
                 self.turn_open = false;
-                self.end_terminal_wait();
+                self.dialogs_gone(hook.at_ms, Some(hook.seq));
             }
             _ => {}
         }
@@ -386,9 +475,13 @@ impl AgentAdapter for CodexAdapter {
             return out;
         };
         let read = reader.poll();
+        let lost = reader.take_lost();
         let mut incoming = std::mem::take(&mut self.held);
         let mut bad = 0;
         for raw in read {
+            if let Some(raw) = &raw {
+                self.last_seq = self.last_seq.max(raw.seq);
+            }
             match raw.as_ref().and_then(Hook::from_raw) {
                 Some(hook) => incoming.push_back(hook),
                 None => bad += 1,
@@ -396,6 +489,9 @@ impl AgentAdapter for CodexAdapter {
         }
         if bad > 0 {
             self.notice("ignored a Codex hook event that could not be read");
+        }
+        for event in &lost {
+            eprintln!("atem worker: a Codex {event} hook event was lost");
         }
         while let Some(hook) = incoming.pop_front() {
             let start = hook.event == "SessionStart";
@@ -514,11 +610,9 @@ impl AgentAdapter for CodexAdapter {
             // a dialog of the old session is gone, and approvals still open
             // (the worker's count) wait again.
             self.extra.clear();
-            self.terminal_wait = false;
+            self.dialogs.clear();
             if self.approvals > 0 {
-                self.extra.push(AgentEvent::WaitingForPermission {
-                    detail: APPROVAL_DETAIL.into(),
-                });
+                self.extra.push(waiting_event());
             }
             self.deferred = None;
             self.session_started = true;
@@ -559,15 +653,23 @@ impl AgentAdapter for CodexAdapter {
                 _ => {}
             }
         }
-        // The turn went on (or ended): a dialog Codex showed was answered.
-        let went_on = items.iter().any(|i| {
-            !matches!(
-                i,
-                LogItem::Problem { .. } | LogItem::Backfill(_) | LogItem::TurnStarted { .. }
-            )
-        });
-        if went_on {
-            self.end_terminal_wait();
+        // Codex's dialogs are gone once a prompt went in or the turn was
+        // interrupted. A reply, a command (maybe another call's) or a plain
+        // turn end says nothing about them.
+        let gone = items
+            .iter()
+            .filter_map(|i| match i {
+                LogItem::UserMessage { created_at_ms, .. } => Some(*created_at_ms),
+                LogItem::TurnEnded {
+                    outcome: Outcome::Interrupted,
+                    at_ms,
+                    ..
+                } => Some(*at_ms),
+                _ => None,
+            })
+            .max();
+        if let Some(at_ms) = gone {
+            self.dialogs_gone(at_ms, None);
         }
         items
     }
@@ -608,6 +710,12 @@ pub struct Hook {
     pub prompt: Option<String>,
     /// The turn of a turn-scoped hook.
     pub turn_id: Option<String>,
+    /// The event's sequence (`RawEvent::seq`).
+    pub seq: u64,
+    /// A tool hook's `tool_name`, `tool_input.command` and `tool_use_id`.
+    pub tool_name: Option<String>,
+    pub command: Option<String>,
+    pub tool_use_id: Option<String>,
 }
 
 impl Hook {
@@ -617,138 +725,20 @@ impl Hook {
         Some(Hook {
             parent: raw.parent,
             at_ms: raw.at_ms,
+            seq: raw.seq,
             event: s("hook_event_name")?.to_string(),
             session_id: s("session_id")?.to_string(),
             transcript_path: PathBuf::from(s("transcript_path")?),
             source: s("source").unwrap_or_default().to_string(),
             prompt: s("prompt").map(str::to_string),
             turn_id: s("turn_id").map(str::to_string),
+            tool_name: s("tool_name").map(str::to_string),
+            tool_use_id: s("tool_use_id").map(str::to_string),
+            command: json
+                .pointer("/tool_input/command")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
-    }
-}
-
-/// One event file: the hook's `$$ $PPID` line, then its stdin JSON.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RawEvent {
-    /// The hook script's own pid.
-    pub pid: u32,
-    /// Its parent (Codex, or the shell Codex ran it in).
-    pub parent: u32,
-    /// The file's time (unix ms): when the hook wrote it.
-    pub at_ms: i64,
-    pub json: Value,
-}
-
-/// `"<pid> <ppid>\n<json>"` as written by the hook script.
-fn parse_event(text: &str, at_ms: i64) -> Option<RawEvent> {
-    let (head, body) = text.split_once('\n')?;
-    let mut ids = head.split(' ');
-    let pid = ids.next()?.parse().ok()?;
-    let parent = ids.next()?.parse().ok()?;
-    if ids.next().is_some() {
-        return None;
-    }
-    let json = serde_json::from_str::<Value>(body).ok()?;
-    Some(RawEvent {
-        pid,
-        parent,
-        at_ms,
-        json,
-    })
-}
-
-/// Reads the hook script's `events/ev-<seq>-<Event>.json` files in (seq,
-/// name) order (a repeated seq is fine), deleting each once read. Nothing
-/// else there is read: `tmp.*` (being written; removed once stale), `seq`,
-/// `seq.<pid>`, `seq.lock` (the script's).
-pub struct EventReader {
-    dir: PathBuf,
-}
-
-/// The seq of an `ev-<digits>-<Letters>.json` name.
-fn event_seq(name: &str) -> Option<u64> {
-    let rest = name.strip_prefix("ev-")?.strip_suffix(".json")?;
-    let (seq, event) = rest.split_once('-')?;
-    let valid = !seq.is_empty()
-        && seq.bytes().all(|b| b.is_ascii_digit())
-        && !event.is_empty()
-        && event.bytes().all(|b| b.is_ascii_alphabetic());
-    valid.then(|| seq.parse().ok()).flatten()
-}
-
-fn stale(meta: &std::fs::Metadata, now: SystemTime) -> bool {
-    meta.modified()
-        .ok()
-        .and_then(|t| now.duration_since(t).ok())
-        .is_some_and(|age| age > LEFTOVER)
-}
-
-/// A regular file (never through a symlink) and its time (unix ms):
-/// `Ok(None)` when larger than `MAX_EVENT`.
-fn read_event(path: &Path) -> std::io::Result<Option<(String, i64)>> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(std::io::Error::other("not a regular file"));
-    }
-    let at_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_millis() as i64);
-    let mut text = String::new();
-    file.take(MAX_EVENT + 1).read_to_string(&mut text)?;
-    Ok((text.len() as u64 <= MAX_EVENT).then_some((text, at_ms)))
-}
-
-impl EventReader {
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
-    }
-
-    /// The events in order; `None` for one that was too big, had no
-    /// `$$ $PPID` line or wasn't JSON (deleted all the same).
-    pub fn poll(&mut self) -> Vec<Option<RawEvent>> {
-        let Ok(rd) = std::fs::read_dir(self.dir.join("events")) else {
-            return Vec::new();
-        };
-        let now = SystemTime::now();
-        let mut files = Vec::new();
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(seq) = event_seq(&name) {
-                files.push((seq, name, e.path()));
-            } else if name.starts_with("tmp.")
-                && let Ok(meta) = std::fs::symlink_metadata(e.path())
-                && meta.is_file()
-                && stale(&meta, now)
-            {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-        files.sort();
-        files.truncate(EVENTS_PER_POLL);
-        let mut out = Vec::new();
-        for (_, _, path) in files {
-            match read_event(&path) {
-                Ok(text) => {
-                    let _ = std::fs::remove_file(&path);
-                    out.push(text.and_then(|(t, at_ms)| parse_event(&t, at_ms)));
-                }
-                Err(_) => {
-                    // Unreadable: kept for now, dropped once stale.
-                    if std::fs::symlink_metadata(&path).is_ok_and(|m| stale(&m, now)) {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-            }
-        }
-        out
     }
 }
 

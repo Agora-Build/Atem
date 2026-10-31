@@ -135,6 +135,26 @@ pub(crate) fn sweep_stale_temps(path: &Path) {
 #[cfg(test)]
 thread_local! {
     static FAILING_WRITES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FAILING_AFTER_RENAME: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test hook: `write_private` to `path` renames the new bytes into place,
+/// then fails (as a failed directory fsync would: the outcome on disk is
+/// uncertain), on this thread until the guard is dropped.
+#[cfg(test)]
+pub(crate) fn fail_after_rename(path: &Path) -> FailingAfterRename {
+    FAILING_AFTER_RENAME.with(|failing| failing.borrow_mut().push(path.to_path_buf()));
+    FailingAfterRename(path.to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) struct FailingAfterRename(PathBuf);
+
+#[cfg(test)]
+impl Drop for FailingAfterRename {
+    fn drop(&mut self) {
+        FAILING_AFTER_RENAME.with(|failing| failing.borrow_mut().retain(|path| *path != self.0));
+    }
 }
 
 /// Test hook: `write_private` to `path` fails on this thread until the
@@ -186,6 +206,10 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(error.into());
     }
     set_mode_600(path)?;
+    #[cfg(test)]
+    if FAILING_AFTER_RENAME.with(|failing| failing.borrow().iter().any(|failing| failing == path)) {
+        bail!("injected directory fsync failure for {}", path.display());
+    }
     #[cfg(unix)]
     {
         let parent = match path.parent() {
@@ -294,7 +318,7 @@ impl EncryptionContext {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
-        let agent = self.agent.as_deref().ok_or_else(|| anyhow!("encryption is off for this account"))?;
+        let agent = self.agent.as_deref().ok_or_else(|| anyhow!(crate::memory::account_keys::ENCRYPTION_OFF))?;
         if let Some(op) = ops.iter().find(|op| op.wire_len() > CRYPT_OP_MAX_BYTES) {
             bail!("a field is too large to encrypt ({} bytes)", op.field_len());
         }

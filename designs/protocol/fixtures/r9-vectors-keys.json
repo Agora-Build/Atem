@@ -89,13 +89,14 @@
     "not-recovery": {
       "alg": "ed25519",
       "pub_hex": "239d75b7174b38b0d01499540b5864e9314d1e78b9bcc01fe6ba609e20ec175e",
-      "secret_hex": "642d774781dbc61f1752618e40e1e546867291aaed0a6f97d1582a04ef6a5814"
+      "secret_hex": "642d774781dbc61f1752618e40e1e546867291aaed0a6f97d1582a04ef6a5814",
+      "note": "an Ed25519 key that is not the recovery key (label \"not the recovery key\"), used where a wrong signer is expected"
     },
     "note": "test keys only: secret = SHA-256(enc([\"atem-r9-test-key\", label])); p256 public keys are SEC1 uncompressed (65 bytes), all binary values base64url without padding in wire objects, hex here",
     "recovery": {
       "R_hex": "de7b07c173601dbcd9053ef7679fcd3a6864af071005397179134682a438dcc6",
       "kit_tag_hex": "38d5aeaebad0af036ba7bafdc86ab259",
-      "note": "the genesis Recovery Kit (kit 1). x25519_secret = SHA-512(sign_seed)[0..32] (X25519 clamps it), x25519_pub = the Montgomery form of sign_pub: K backups are sealed to it (R9.5). The kit also carries account_id acct-test-1, genesis_hash = E1's entry_hash and kit_tag_hex (R9.5 \"Recovery Kit v2\"; r9-vectors-recovery kit)",
+      "note": "the genesis Recovery Kit (kit 1). x25519_secret = SHA-512(sign_seed)[0..32] (X25519 clamps it), x25519_pub = the Montgomery form of sign_pub: K backups are sealed to it (R9.5). The kit also carries account_id acct-test-1, genesis_hash = E1's entry_hash and kit_tag_hex (R9.5 \"Recovery Kit v2\"; r9-vectors-recovery kit). R = SHA-256(enc([\"atem-r9-test-key\", \"recovery kit R\"]))",
       "sign_pub_hex": "98767c988ff0cf727ae9917811e9c4ed63b7fb48608d4c32688db79f2ed94360",
       "sign_seed_hex": "2454f41411a6cd67aff0ba0833f1b7bec16dfe3830d97cc0600feb3505f5b616",
       "x25519_pub_hex": "bf4e6c788975c3b940a9f5c0a51021855c6e2ddebd4da5910c5487604bccab11",

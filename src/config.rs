@@ -314,7 +314,7 @@ impl AtemConfig {
                     .and_then(|login| login.subject.as_deref())
                     .unwrap_or("-");
                 let saved = if record.save_credentials { "yes" } else { "no" };
-                let relay_only = if record.relay_only { "  [relay only]" } else { "" };
+                let relay_only = if crate::session_protocol::r9::host_policy::local_allowed(&paths.pairing) { "" } else { "  [relay only]" };
                 lines.push(format!(
                     "Paired:   {}  (login: {})  [save: {}]{}",
                     record.astation_id, shared, saved, relay_only

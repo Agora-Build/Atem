@@ -114,6 +114,26 @@ impl App {
         self.op_route.as_ref().map(|route| route.link_gen)
     }
 
+    /// `atem pair verify`: the link's pairing moves to a new binding in the
+    /// next trust generation (`pairing::rebind_for_verification`), and the
+    /// link adopts it, so it stays current. Returns (before, after) for the
+    /// operation's own handle.
+    pub(crate) fn rebind_for_verification(
+        &mut self,
+        astation_id: &str,
+    ) -> anyhow::Result<(crate::pairing::TrustState, crate::pairing::TrustState)> {
+        let capture = self
+            .astation_client
+            .capture()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!(crate::pairing::NO_BINDING))?;
+        let before = capture.state.clone();
+        let after =
+            crate::pairing::rebind_for_verification(capture.sources(), &before, astation_id)?;
+        self.astation_client.adopt_binding(&before, &after)?;
+        Ok((before, after))
+    }
+
     /// A first pairing made `client` (authenticated, bound to the new
     /// pairing): it replaces the link, as a reconnect would.
     pub(crate) fn install_astation_link(&mut self, client: AstationClient) {
@@ -123,6 +143,7 @@ impl App {
         self.connected_astation_id = client.connected_astation_id().map(str::to_string);
         self.astation_client = client;
         self.astation_connected = true;
+        self.astation_routed = false;
         self.astation_link_gen += 1;
         self.pairing_code = None;
         self.last_session_refresh = Some(Instant::now());

@@ -10,6 +10,7 @@ pub mod commands;
 pub mod host_bridge;
 pub mod op_client;
 pub mod ops;
+pub mod project_scope;
 pub mod protocol;
 pub mod push_queue;
 pub mod refusal_log;

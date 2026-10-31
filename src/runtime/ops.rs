@@ -13,6 +13,7 @@ use super::protocol::{AnswerValue, AskKind, OpKind, OpOptions, PrintLevel, Runti
 use crate::memory::cred_agent::{CredAgentApi, LOCKED, blocking, default_agent};
 use crate::memory::unlock::{AstationLink, shown};
 use crate::pair_verify::{CodeAnswer, VerifyFailure};
+use crate::pairing_wire::{PAIRING_V, valid_astation_id};
 use crate::paths::CredPaths;
 use crate::profile::Sources;
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -36,8 +37,6 @@ pub const NO_LINK: &str =
 pub const INTERRUPTED: &str = "atem was interrupted";
 /// How long the token refresh waits for Astation's `credentialSync`.
 const CREDENTIALS_WAIT: Duration = Duration::from_secs(15);
-/// How long a first pairing waits for Astation's credentials.
-const PAIR_CREDENTIALS_WAIT: Duration = Duration::from_secs(60);
 
 /// The operation's user interface: the CLI that asked for it.
 pub(crate) trait OpUi: Send + Sync {
@@ -259,6 +258,14 @@ pub(super) enum OpCall {
         client: Box<AstationClient>,
         reply: oneshot::Sender<()>,
     },
+    /// `atem pair verify`: the link's pairing moves to the next trust
+    /// generation before the ceremony (`App::rebind_for_verification`).
+    Rebind {
+        astation_id: String,
+        reply: oneshot::Sender<
+            Result<(crate::pairing::TrustState, crate::pairing::TrustState), String>,
+        >,
+    },
     /// The operation ended (its `done` was sent).
     Finished {
         request_id: String,
@@ -438,6 +445,22 @@ async fn pair_verify<U: OpUi>(
         link_to(calls, env, &astation_id, "the paired Astation", true),
     )
     .await?;
+    // A fresh ceremony is a fresh host_channel_key: it runs in the next
+    // host trust generation (durable before verifyCommit), so Astation can
+    // add the new key even if an earlier, aborted ceremony had an add_host
+    // signed. The pairing and its session stay.
+    let (reply, rebound) = oneshot::channel();
+    calls
+        .send(OpCall::Rebind {
+            astation_id: astation_id.clone(),
+            reply,
+        })
+        .map_err(|_| anyhow!("the atem runtime is stopping"))?;
+    let (before, after) = rebound
+        .await
+        .map_err(|_| anyhow!("the atem runtime is stopping"))?
+        .map_err(|error| anyhow!(error))?;
+    view.adopt_binding(&before, &after)?;
     ui.print(
         PrintLevel::Info,
         &format!("Verifying this device with Astation {astation_id}..."),
@@ -449,6 +472,10 @@ async fn pair_verify<U: OpUi>(
     settle_encryption(&mut view, ui).await;
     verified
 }
+
+/// `verifyAbort` reason when this host's record of frozen device lists
+/// can't be read (no local path; the remedy is shown locally).
+pub(crate) const FROZEN_GENESIS_UNREADABLE: &str = "this host's record of frozen device lists can't be read; pairing is refused until it is restored on the host";
 
 /// The CLI's answer to "does the code match?".
 fn code_answer(answer: Option<AnswerValue>) -> CodeAnswer {
@@ -504,10 +531,19 @@ pub(crate) async fn verify_device<U: OpUi>(
         blocking(move || device_keys_for_verification(&paths, agent.as_ref())).await?
     };
     let handshake = Handshake::start(keys);
+    // r9 (§R9.2): the binding's generation, captured with the commitment
+    // for this attempt (the capture never changes; a new pairing voids it).
+    let host_trust_gen = capture.bound_to(astation_id)?.host_trust_gen;
+    if !(1..=atem_client::canonical::MAX_SAFE_INTEGER).contains(&host_trust_gen) {
+        bail!(
+            "the host trust generation {host_trust_gen} can't be sent; run atem unpair, then atem pair"
+        );
+    }
     client
         .send_message(AstationMessage::VerifyCommit {
             device_id: device_id.clone(),
             commitment: STANDARD.encode(handshake.commitment()),
+            host_trust_gen,
         })
         .await?;
 
@@ -539,7 +575,44 @@ pub(crate) async fn verify_device<U: OpUi>(
                 enc_pub,
                 recovery_sign_pub,
                 nonce,
-            } => AstationKeys::from_wire(&sign_pub, &enc_pub, &recovery_sign_pub, &nonce)?,
+                genesis_hash,
+            } => {
+                // r9 (no compatibility): the ceremony pins the account's
+                // device list; an Astation that names none can't pair.
+                let Some(genesis_hash) = genesis_hash else {
+                    let failure = VerifyFailure::local(
+                        "Atem needs a device list (atem-session r9)",
+                        anyhow!(
+                            "This Astation doesn't send a device list yet (atem-session r9). Update Astation, then run `atem pair verify`."
+                        ),
+                    );
+                    return Err(
+                        abandon_verification(client, &paths.trust, astation_id, failure).await,
+                    );
+                };
+                match AstationKeys::from_wire(
+                    &sign_pub,
+                    &enc_pub,
+                    &recovery_sign_pub,
+                    &nonce,
+                    &genesis_hash,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        let failure = VerifyFailure::local(
+                            format!("atem refused verifyKeys: {error:#}"),
+                            error,
+                        );
+                        return Err(abandon_verification(
+                            client,
+                            &paths.trust,
+                            astation_id,
+                            failure,
+                        )
+                        .await);
+                    }
+                }
+            }
             AstationMessage::VerifyAbort { reason } => {
                 bail!("Astation stopped device verification: {}", shown(&reason))
             }
@@ -547,12 +620,29 @@ pub(crate) async fn verify_device<U: OpUi>(
         },
     };
 
+    // r9 (§R9.4): this host's frozen device lists must be readable before
+    // the codes are compared and Touch ID is asked (the certificate's list
+    // is checked against them); an unreadable copy fails now, the remedy
+    // shown here, a short reason without a local path sent to Astation.
+    let pairing = capture.sources().paths.pairing.clone();
+    let frozen = blocking(move || {
+        Ok(crate::session_protocol::membership::frozen_genesis(
+            &pairing,
+        ))
+    })
+    .await?;
+    if let Err(error) = frozen {
+        let failure = VerifyFailure::local(FROZEN_GENESIS_UNREADABLE, anyhow!(error));
+        return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+    }
+
     let reveal = handshake.reveal();
     client
         .send_message(AstationMessage::VerifyReveal {
             device_pub: STANDARD.encode(reveal.device_pub),
             device_sign_pub: STANDARD.encode(reveal.device_sign_pub),
             unlock_auth_pub: STANDARD.encode(reveal.unlock_auth_pub),
+            host_channel_pub: atem_client::encoding::b64u(&reveal.host_channel_pub),
             nonce: STANDARD.encode(reveal.nonce_a),
         })
         .await?;
@@ -610,8 +700,14 @@ pub(crate) async fn verify_device<U: OpUi>(
         // The raw agent: the whole apply holds the pairing lock already.
         let (paths, agent, capture) = (paths.clone(), raw_agent.clone(), capture.clone());
         let astation_id = astation_id.to_string();
-        let keys = handshake.into_keys();
+        let (keys, host_seed) = handshake.into_parts();
+        let (astation, host_id) = (astation.clone(), device_id.clone());
         blocking(move || {
+            let host = crate::pair_verify::HostPinning {
+                astation: &astation,
+                host_id: &host_id,
+                host_seed: &host_seed,
+            };
             crate::pair_verify::apply_device_verified(
                 &capture,
                 &paths,
@@ -619,6 +715,7 @@ pub(crate) async fn verify_device<U: OpUi>(
                 &astation_id,
                 keys,
                 &reply,
+                &host,
             )
         })
         .await
@@ -683,15 +780,6 @@ pub(crate) async fn verify_device<U: OpUi>(
 
 // ── atem pair (first pairing) ──
 
-/// Tokens from Astation's `credentialSync` during a first pairing.
-struct Received {
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
-    login_id: Option<String>,
-    astation_id: String,
-}
-
 async fn pair<U: OpUi>(
     save: bool,
     ui: &U,
@@ -727,36 +815,25 @@ async fn pair<U: OpUi>(
             "Approve the pairing in your Astation app.",
         );
     }
-    let save_credentials = save
-        || match ui
-            .ask(
-                AskKind::YesNo,
-                "Save credentials so they keep working when Astation disconnects?",
-            )
-            .await
-        {
-            Some(answer) => answer == AnswerValue::Yes,
-            None => bail!(INTERRUPTED),
-        };
-    // For peers that support it; the local choice is what's stored.
-    client
-        .send_message(AstationMessage::PairSavePreference { save_credentials })
-        .await?;
-    ui.print(
-        PrintLevel::Info,
-        "Waiting for Astation to send SSO credentials...",
-    );
-    let received = guard(ui, async {
-        tokio::time::timeout(PAIR_CREDENTIALS_WAIT, credentials_from(&mut client, ui))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "Pairing timed out waiting for credentials. (Astation may not yet support SSO token sync — check Astation version.)"
-                )
-            })?
-    })
-    .await?;
-    let astation_id = received.astation_id.clone();
+    // Astation's routing id, nothing else (no credentials, no account);
+    // trust comes from the verification below. Locally the authenticated
+    // loopback challenge named it; over the relay the token-free bootstrap
+    // asks for it.
+    let (astation_id, attempt_id) = if result == "local" {
+        let astation_id = client
+            .connected_astation_id()
+            .filter(|id| valid_astation_id(id))
+            .ok_or_else(|| anyhow!("The local Astation didn't name itself; update Astation."))?
+            .to_string();
+        (astation_id, String::new())
+    } else {
+        guard(ui, async {
+            tokio::time::timeout(PAIR_INTRODUCTION_WAIT, introduction_from(&mut client, ui))
+                .await
+                .map_err(|_| anyhow!(PAIRING_EXPIRED))?
+        })
+        .await?
+    };
     let mut active = if result != "local" {
         ui.print(
             PrintLevel::Info,
@@ -766,7 +843,12 @@ async fn pair<U: OpUi>(
         // encryption messages it held are applied on the authenticated one.
         let held = client.take_held_encryption();
         drop(client);
-        let mut identity = env.new_client(&src)?.with_pairing_notice(ui.printer());
+        // The same attempt: the room's code and the hello's id, so
+        // Astation attaches this link to it (never a second code).
+        let mut identity = env
+            .new_client(&src)?
+            .with_pairing_notice(ui.printer())
+            .with_pairing_attempt(&result, &attempt_id);
         guard(
             ui,
             identity.connect_relay_identity(config.astation_relay_url(), &astation_id),
@@ -786,37 +868,14 @@ async fn pair<U: OpUi>(
     // connection goes on under it.
     let after = crate::pairing::bind_new(&src, &before, &astation_id)?;
     active.adopt_binding(&before, &after)?;
-    let login = crate::records::Login::shared_by_astation(
-        received.login_id.clone(),
-        crate::records::Tokens {
-            access_token: received.access_token.clone(),
-            refresh_token: received.refresh_token.clone(),
-            expires_at: received.expires_at,
-        },
-    );
-    active.apply_bound(&astation_id, || {
-        crate::records::PairingRecord::receive_login(
-            &src.paths.pairing,
-            &astation_id,
-            login,
-            Some(save_credentials),
-        )
-    })?;
-    ui.print(
-        PrintLevel::Info,
-        &match &received.login_id {
-            Some(id) => format!("Paired with Astation. (SSO: {id})"),
-            None => "Paired with Astation.".to_string(),
-        },
-    );
-    ui.print(
-        PrintLevel::Info,
-        if save_credentials {
-            "Credentials saved — will work offline."
-        } else {
-            "Credentials are session-only (5 min grace period after disconnect)."
-        },
-    );
+    if save {
+        // Optional service credentials are separate from pairing: this only
+        // records the preference for a later `credentialSync`.
+        active.apply_bound(&astation_id, || {
+            crate::records::PairingRecord::set_save_credentials(&src.paths.pairing, &astation_id)
+        })?;
+    }
+    ui.print(PrintLevel::Info, "Paired with Astation.");
     // The new connection is the runtime's link from now on; the
     // verification runs on it.
     let held = active.take_held_encryption();
@@ -848,12 +907,94 @@ async fn pair<U: OpUi>(
     verified
 }
 
-/// Astation's `credentialSync` on the pairing connection, applying (or
-/// holding) encryption messages on the way.
-async fn credentials_from<U: OpUi>(client: &mut AstationClient, ui: &U) -> Result<Received> {
+/// How long a first pairing waits for Astation's introduction (the relay's
+/// pairing room lives 600 s).
+const PAIR_INTRODUCTION_WAIT: Duration = Duration::from_secs(600);
+
+/// The hello is sent again this often until Astation answers (Astation may
+/// join the pairing room after it was first sent).
+const PAIR_HELLO_EVERY: Duration = Duration::from_secs(3);
+
+const PAIRING_EXPIRED: &str = "Pairing expired before Astation answered. Run `atem pair` again and enter the new code in Astation.";
+
+/// What Astation said back to a pairing hello.
+#[derive(Debug, PartialEq, Eq)]
+enum PairingReply {
+    /// Not about this attempt (another `id`): ignored.
+    Other,
+    Introduction(String),
+    Refused(String),
+}
+
+/// Reads one `pairing` message for the attempt `hello_id`.
+fn pairing_reply(
+    hello_id: &str,
+    v: u64,
+    op: &str,
+    id: &str,
+    astation_id: Option<&str>,
+    code: Option<&str>,
+) -> PairingReply {
+    if id != hello_id {
+        return PairingReply::Other;
+    }
+    if v != PAIRING_V {
+        return PairingReply::Refused(format!(
+            "Astation speaks pairing v{v}; this atem needs v{PAIRING_V}. Update atem or Astation."
+        ));
+    }
+    match (op, astation_id) {
+        ("introduction", Some(a)) if code.is_none() && valid_astation_id(a) => {
+            PairingReply::Introduction(a.into())
+        }
+        ("introduction", _) => PairingReply::Refused("Astation sent an invalid introduction.".into()),
+        ("error", _) => PairingReply::Refused(match code.unwrap_or_default() {
+            "not_signed_in" => {
+                "Astation isn't signed in to Agora.Build. Sign in on the Mac, then run `atem pair` again.".into()
+            }
+            "pairing_cancelled" => "The pairing was cancelled in Astation.".into(),
+            "pairing_expired" => PAIRING_EXPIRED.into(),
+            "unsupported_version" => {
+                "Astation doesn't support this atem's pairing. Update atem or Astation.".into()
+            }
+            other => format!("Astation refused the pairing ({}).", shown(other)),
+        }),
+        _ => PairingReply::Refused("Astation sent an unknown pairing message. Update atem.".into()),
+    }
+}
+
+/// The token-free pairing bootstrap v1 on the pairing connection: sends
+/// `pairing hello{id}` (again every few seconds, same `id`) until
+/// Astation's `introduction{id, astation_id}`, applying (or holding)
+/// encryption messages on the way; returns Astation's routing id and the
+/// hello's id (the attempt the identity link continues). The relay buffers
+/// nothing, so the same hello is resent until Astation is in the room. A
+/// `credentialSync` (an Astation from
+/// before the bootstrap) is refused with an upgrade message: no legacy
+/// fallback.
+async fn introduction_from<U: OpUi>(
+    client: &mut AstationClient,
+    ui: &U,
+) -> Result<(String, String)> {
+    let hello_id = uuid::Uuid::new_v4().to_string();
+    let hello = || AstationMessage::Pairing {
+        v: PAIRING_V,
+        op: "hello".into(),
+        id: hello_id.clone(),
+        astation_id: None,
+        code: None,
+    };
+    let mut every = tokio::time::interval(PAIR_HELLO_EVERY);
     loop {
-        let Some(message) = client.recv_message_async().await else {
-            bail!("Astation connection closed before sending credentials.");
+        let message = tokio::select! {
+            _ = every.tick() => {
+                client.send_message(hello()).await?;
+                continue;
+            }
+            message = client.recv_message_async() => message,
+        };
+        let Some(message) = message else {
+            bail!("Astation connection closed before Astation answered the pairing.");
         };
         match client.handle_encryption_message(&message).await {
             Ok(Some(status)) => {
@@ -874,22 +1015,33 @@ async fn credentials_from<U: OpUi>(client: &mut AstationClient, ui: &U) -> Resul
                 continue;
             }
         }
-        if let AstationMessage::CredentialSync {
-            access_token,
-            refresh_token,
-            expires_at,
-            login_id,
-            astation_id,
-            ..
-        } = message
-        {
-            return Ok(Received {
-                access_token,
-                refresh_token,
-                expires_at,
-                login_id,
+        match message {
+            AstationMessage::Pairing {
+                v,
+                op,
+                id,
                 astation_id,
-            });
+                code,
+            } => match pairing_reply(
+                &hello_id,
+                v,
+                &op,
+                &id,
+                astation_id.as_deref(),
+                code.as_deref(),
+            ) {
+                PairingReply::Other => {}
+                PairingReply::Introduction(astation_id) => return Ok((astation_id, hello_id)),
+                PairingReply::Refused(why) => bail!(why),
+            },
+            AstationMessage::PairingInvalid { reason } => bail!(
+                "Astation sent an invalid pairing message ({}). Update atem or Astation, then run `atem pair` again.",
+                shown(&reason)
+            ),
+            AstationMessage::CredentialSync { .. } => bail!(
+                "This Astation uses the old credential-based pairing. Update Astation, then run `atem pair` again."
+            ),
+            _ => {}
         }
     }
 }
@@ -1053,4 +1205,54 @@ async fn token<U: OpUi>(
     tokio::time::timeout(CREDENTIALS_WAIT, view_recv)
         .await
         .map_err(|_| anyhow!("timed out waiting for Astation"))?
+}
+
+#[cfg(test)]
+mod pairing_bootstrap_tests {
+    use super::{PairingReply, pairing_reply, valid_astation_id};
+
+    const ID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+
+    #[test]
+    fn only_a_v1_introduction_for_this_attempt_names_astation() {
+        let r =
+            |v, op, id, a: Option<&str>, code: Option<&str>| pairing_reply(ID, v, op, id, a, code);
+        assert_eq!(
+            r(1, "introduction", ID, Some("astation-46307CB4-1707"), None),
+            PairingReply::Introduction("astation-46307CB4-1707".into())
+        );
+        // Another attempt's message is no answer.
+        assert_eq!(
+            r(1, "introduction", "other", Some("astation-x"), None),
+            PairingReply::Other
+        );
+        for refused in [
+            r(2, "introduction", ID, Some("astation-x"), None),
+            r(1, "introduction", ID, None, None),
+            r(1, "introduction", ID, Some("bad id/../x"), None),
+            r(1, "introduction", ID, Some(""), None),
+            r(1, "error", ID, None, Some("pairing_cancelled")),
+            r(1, "error", ID, None, Some("weird")),
+            r(
+                1,
+                "introduction",
+                ID,
+                Some("astation-x"),
+                Some("pairing_cancelled"),
+            ),
+            r(1, "hello", ID, None, None),
+        ] {
+            assert!(matches!(refused, PairingReply::Refused(_)), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_routing_id_is_short_and_plain() {
+        assert!(valid_astation_id(
+            "astation-46307CB4-1707-433C-855D-8B6B27279625"
+        ));
+        assert!(!valid_astation_id(&"a".repeat(129)));
+        assert!(!valid_astation_id("a b"));
+        assert!(!valid_astation_id("a/b"));
+    }
 }

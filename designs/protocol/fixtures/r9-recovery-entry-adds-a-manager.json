@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "R9.5: the recovery_add signed by the genesis recovery key chains from Atem's head and is applied like any entry; it adds a manager and removes nobody.",
+  "note": "R9.5: the recovery_add signed by the genesis recovery key chains from Atem's head and is applied like any entry; it adds a manager and removes nobody. Amended for the 24 h wait (R9.5): newmac carries R7 and is refused recovery_pending; the entry takes effect after 24 h on the host clock, with no new entry, and newmac is then welcomed as a manager.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -50,6 +50,42 @@
       "carry": [
         "R7"
       ]
+    },
+    {
+      "expect": "newmac",
+      "match": {
+        "op": "error",
+        "code": "recovery_pending",
+        "entry_hash": "${hash:R7}",
+        "effective_at": 1793264001000
+      }
+    },
+    {
+      "assert": {
+        "head": "R7",
+        "pending": {
+          "R7": "pending"
+        },
+        "members": [
+          "dev-mac",
+          "dev-phone",
+          "svc-discord"
+        ]
+      }
+    },
+    {
+      "advance_ms": 86400000
+    },
+    {
+      "assert": {
+        "pending": {
+          "R7": "active"
+        }
+      }
+    },
+    {
+      "connect": "newmac",
+      "carry": []
     },
     {
       "expect": "newmac",

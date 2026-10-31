@@ -184,6 +184,9 @@ struct Waiting {
     /// The session rule whose allow the worker wrote for it (auto-allowed);
     /// revoking the rule withdraws that allow while the hook hasn't taken it.
     auto_rule: Option<String>,
+    /// A result like its call's came while it waited: the person at the
+    /// terminal was told how to say it was answered (once).
+    hinted: bool,
     state: State,
 }
 
@@ -200,11 +203,15 @@ pub struct Approvals {
     codex_session: Option<String>,
     /// Events produced outside `poll`, sent with its next result.
     queued: Vec<Event>,
-    /// Codex: one of this session's requests got "no decision" since the
-    /// last `take_released`, so Codex shows its own dialog for it.
-    released: bool,
+    /// Codex: this session's requests that got "no decision" since the
+    /// last `take_released` (released, closed by a prompt or an interrupt,
+    /// or their hook ended without one): Codex shows its own dialog for
+    /// each.
+    released: usize,
     /// Codex: the Atem session rules of this agent process, oldest first.
     rules: Vec<Kept>,
+    /// A result like a waiting request's call came (`take_answer_hint`).
+    answer_hint: bool,
 }
 
 /// A session rule the worker keeps.
@@ -277,8 +284,9 @@ impl Approvals {
             waiting: BTreeMap::new(),
             codex_session: None,
             queued: Vec::new(),
-            released: false,
+            released: 0,
             rules: Vec::new(),
+            answer_hint: false,
         }
     }
 
@@ -347,7 +355,8 @@ impl Approvals {
             }
             if self.withdraw(&id) {
                 self.write_decision(&id, "");
-                self.released = true;
+                let to_dialog = self.waiting.get(&id).is_some_and(|w| self.to_dialog(w));
+                self.released += usize::from(to_dialog);
             }
         }
     }
@@ -459,10 +468,10 @@ impl Approvals {
             return;
         };
         let reported = w.reported;
-        let to_dialog = self.agent == Agent::Codex && w.ours;
+        let to_dialog = self.to_dialog(w);
         match w.state.clone() {
             State::Open => {
-                self.released |= to_dialog;
+                self.released += usize::from(to_dialog);
                 self.write_decision(id, "");
                 self.set(id, State::Released);
                 if reported {
@@ -474,7 +483,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
-                    self.released |= to_dialog;
+                    self.released += usize::from(to_dialog);
                     self.write_decision(id, "");
                     self.set(id, State::Released);
                     self.queued.push(Event::Applied {
@@ -489,10 +498,74 @@ impl Approvals {
         }
     }
 
-    /// Codex: some of this session's requests got "no decision" (its own
+    /// Codex: this session's requests that got "no decision" (its own
     /// dialog shows them) since the last call.
-    pub fn take_released(&mut self) -> bool {
+    /// A tool like a waiting request's call ran since the last call: the
+    /// request may have been answered in the agent's own dialog, which only
+    /// the person at the terminal can say (the prefix `a`).
+    pub fn take_answer_hint(&mut self) -> bool {
+        std::mem::take(&mut self.answer_hint)
+    }
+
+    /// A result with a waiting request's tool and input (still open, or
+    /// our decision not taken): it ends nothing (no call id ties it to the
+    /// request), but the terminal is told once per request how to end it.
+    fn hint(&mut self, tool_name: &str, input: &Value, at_ms: i64) {
+        for w in self.waiting.values_mut() {
+            if !w.hinted
+                && w.reported
+                && matches!(w.state, State::Open | State::Decided { .. })
+                && w.opened_ms <= at_ms + RESULT_SLACK_MS
+                && w.request
+                    .as_ref()
+                    .is_some_and(|r| same_tool(r, tool_name, input))
+            {
+                w.hinted = true;
+                self.answer_hint = true;
+            }
+        }
+    }
+
+    pub fn take_released(&mut self) -> usize {
         std::mem::take(&mut self.released)
+    }
+
+    /// Codex shows its own dialog once `w` gets no decision: only for this
+    /// session's own Codex hooks.
+    fn to_dialog(&self, w: &Waiting) -> bool {
+        self.agent == Agent::Codex && w.ours
+    }
+
+    /// The person at the terminal says the approvals waiting were answered
+    /// there, in the agent's own dialog (the prefix `a`): each hook gets "no
+    /// decision" (our decision not taken yet is withdrawn) and a reported
+    /// one closes `answered_terminal`. An explicit human assertion: nothing
+    /// else ends a wait on the strength of the terminal.
+    pub fn answered_here(&mut self) -> Vec<Event> {
+        let ids: Vec<String> = self.waiting.keys().cloned().collect();
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(w) = self.waiting.get(&id) else {
+                continue;
+            };
+            let reported = w.reported;
+            let answered = match w.state.clone() {
+                State::Open => true,
+                State::Decided { .. } => self.withdraw(&id),
+                State::Claimed { .. } | State::Released => false,
+            };
+            if answered {
+                self.write_decision(&id, "");
+                self.set(&id, State::Released);
+                if reported {
+                    out.push(Event::Closed {
+                        request_id: id.clone(),
+                        reason: ApprovalCloseReason::AnsweredTerminal,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// The broker's `release_approval` (the host closed it): "no decision".
@@ -800,6 +873,7 @@ impl Approvals {
                 ours,
                 pending_rule: None,
                 auto_rule: None,
+                hinted: false,
                 state: State::Open,
             },
         );
@@ -868,23 +942,28 @@ impl Approvals {
         }
     }
 
-    /// The request `ev` is about: the oldest open one with the same tool and
-    /// input (opened by the evidence's time), else the oldest with our
-    /// decision out.
+    /// The request whose decision a tool result can judge: the only one
+    /// with the same tool and input whose hook took Atem's decision
+    /// (`Claimed`), opened by the result's time. A result never ends a wait
+    /// (open, or our decision not taken yet): the agents' PermissionRequest
+    /// names no call, so no result can be proven to be the asking call's.
     fn target(&self, tool_name: &str, input: &Value, at_ms: i64) -> Option<String> {
-        let mut candidates: Vec<(&String, &Waiting)> = self
+        let candidates: Vec<&String> = self
             .waiting
             .iter()
             .filter(|(_, w)| {
-                w.state != State::Released
+                matches!(w.state, State::Claimed { .. })
                     && w.opened_ms <= at_ms + RESULT_SLACK_MS
                     && w.request
                         .as_ref()
                         .is_some_and(|r| same_tool(r, tool_name, input))
             })
+            .map(|(id, _)| id)
             .collect();
-        candidates.sort_by_key(|(_, w)| (w.state != State::Open, w.opened));
-        candidates.first().map(|(id, _)| (*id).clone())
+        match candidates[..] {
+            [id] => Some(id.clone()),
+            _ => None,
+        }
     }
 
     fn weigh(&mut self, ev: Evidence, out: &mut Vec<Event>) {
@@ -921,6 +1000,7 @@ impl Approvals {
                 if let Some(id) = self.target(tool_name, input, *at_ms) {
                     self.resolve(&id, &ev, out);
                 }
+                self.hint(tool_name, input, *at_ms);
             }
         }
     }
@@ -938,9 +1018,13 @@ impl Approvals {
             } => ApprovalCloseReason::Interrupted,
             _ => ApprovalCloseReason::AnsweredTerminal,
         };
+        // "No decision" after a prompt or a turn end (not a tool that ran):
+        // Codex may show its own dialog for it.
+        let to_dialog = self.to_dialog(w) && matches!(ev, Evidence::TurnEnded { .. });
         match w.state.clone() {
             State::Released => {}
             State::Open => {
+                self.released += usize::from(to_dialog);
                 if reported {
                     out.push(Event::Closed {
                         request_id: id.into(),
@@ -952,6 +1036,7 @@ impl Approvals {
             }
             State::Decided { allow, deny } => {
                 if self.withdraw(id) {
+                    self.released += usize::from(to_dialog);
                     out.push(Event::Closed {
                         request_id: id.into(),
                         reason,
@@ -998,8 +1083,12 @@ impl Approvals {
             } else {
                 ApprovalCloseReason::Interrupted
             };
+            // A Codex hook that ended without a decision: Codex shows its
+            // own dialog.
+            let to_dialog = self.to_dialog(w);
             match w.state.clone() {
                 State::Open if !alive => {
+                    self.released += usize::from(to_dialog);
                     if w.reported {
                         out.push(Event::Closed {
                             request_id: id.clone(),
@@ -1012,6 +1101,7 @@ impl Approvals {
                 // timeout).
                 State::Decided { allow, deny } if !alive => {
                     if self.withdraw(&id) {
+                        self.released += usize::from(to_dialog);
                         out.push(Event::Closed {
                             request_id: id.clone(),
                             reason: gone,
@@ -1041,6 +1131,7 @@ impl Approvals {
             for (prefix, suffix) in [
                 ("req", ".json"),
                 ("pid", ""),
+                ("evseq", ""),
                 ("dec", ".json"),
                 ("taken", ".json"),
                 ("claimed", ""),

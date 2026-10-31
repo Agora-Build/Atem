@@ -44,9 +44,17 @@ pub fn write_pairing(config: &Path, astation_id: &str, trust_gen: u64) {
         shared: None,
         save_credentials: false,
         disconnected_at: None,
-        relay_only: false,
     };
     let plain = serde_json::to_vec(&record).unwrap();
     let sealed = machine_key::encrypt(machine_key::PAIRING, &plain).unwrap();
     std::fs::write(&paths.record, sealed).unwrap();
+}
+
+/// The saved session of `config`'s pairing record (`session_id`), if any.
+pub fn saved_session_id(config: &Path) -> Option<String> {
+    let paths = ProfilePaths::in_dir(config).pairing;
+    let raw = std::fs::read(&paths.record).ok()?;
+    let plain = machine_key::decrypt(machine_key::PAIRING, &raw).ok()?;
+    let record: records::PairingRecord = serde_json::from_slice(&plain).ok()?;
+    record.session.map(|s| s.session_id)
 }

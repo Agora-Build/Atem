@@ -1,0 +1,159 @@
+{
+  "name": "r9-envelope-unknown-and-duplicate",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.7a: a frame for a handle Atem doesn't hold gets one close{unknown_channel} per handle (never a loop: a close is never answered); a duplicate open of a live handle is ignored and never replaces its keys or attachment; a close of an unknown handle is ignored.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      },
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      },
+      {
+        "name": "svc",
+        "principal": "service:svc-discord",
+        "key": "svc-discord"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "link_up": true
+    },
+    {
+      "connect": "phone",
+      "channel": "ch-phone",
+      "transport": "relay",
+      "carry": []
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome"
+      }
+    },
+    {
+      "envelope_in": {
+        "type": "channel",
+        "event": "frame",
+        "channel": "ch-ghost",
+        "frame": {
+          "ch": "atem-ch1",
+          "op": "rec",
+          "ct": "AAAAAAAAAAAAAAAAAAAAAA"
+        }
+      }
+    },
+    {
+      "expect_envelope": {
+        "match": {
+          "event": "close",
+          "channel": "ch-ghost",
+          "reason": "unknown_channel"
+        }
+      }
+    },
+    {
+      "envelope_in": {
+        "type": "channel",
+        "event": "frame",
+        "channel": "ch-ghost",
+        "frame": {
+          "ch": "atem-ch1",
+          "op": "rec",
+          "ct": "AAAAAAAAAAAAAAAAAAAAAA"
+        }
+      }
+    },
+    {
+      "expect_no_envelope": {
+        "channel": "ch-ghost",
+        "for_ms": 100
+      }
+    },
+    {
+      "envelope_in": {
+        "type": "channel",
+        "event": "close",
+        "channel": "ch-ghost",
+        "reason": "unknown_channel"
+      }
+    },
+    {
+      "expect_no_envelope": {
+        "channel": "ch-ghost",
+        "for_ms": 100
+      }
+    },
+    {
+      "envelope_in": {
+        "type": "channel",
+        "event": "open",
+        "channel": "ch-phone",
+        "transport": "relay"
+      }
+    },
+    {
+      "expect_no_envelope": {
+        "channel": "ch-phone",
+        "for_ms": 100
+      }
+    },
+    {
+      "send": "phone",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "list",
+          "id": "aaaaaaaa-0000-4000-8000-000000000201"
+        }
+      }
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "sessions"
+      }
+    },
+    {
+      "assert": {
+        "channels": 1,
+        "attachments": 1
+      }
+    }
+  ]
+}

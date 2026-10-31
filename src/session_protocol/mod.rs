@@ -27,6 +27,8 @@ pub mod file_journal;
 pub mod host;
 #[allow(dead_code)]
 pub mod journal;
+pub mod membership;
+pub mod r9;
 #[allow(dead_code)]
 pub mod revision;
 #[allow(dead_code)]

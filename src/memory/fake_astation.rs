@@ -60,6 +60,7 @@ pub(crate) fn pin_for_account(
         enc_pub: astation.enc_pub(),
         recovery_sign_pub: [6; 32],
         nonce_s: [7; 32],
+        genesis_hash: [9; 32],
     };
     let mut trust = TrustStore::load_from(&paths.trust).unwrap();
     trust.set_pending(

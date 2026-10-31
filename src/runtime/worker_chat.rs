@@ -77,7 +77,7 @@ fn cut_event(event: &mut AgentEvent, max: usize) {
         AgentEvent::PromptSubmitted { text, .. } => {
             cut(text, max);
         }
-        AgentEvent::WaitingForPermission { detail } | AgentEvent::NotReady { detail } => {
+        AgentEvent::WaitingForPermission { detail, .. } | AgentEvent::NotReady { detail } => {
             cut(detail, max);
         }
         AgentEvent::SessionStarted { source, .. } => {

@@ -66,6 +66,9 @@ pub struct View {
     /// The stream position the next output byte has.
     pub next_offset: u64,
     pub astation: bool,
+    /// The runtime's r9 device list, when it has one (the row shows its
+    /// label: held, frozen, paused, failed, recovery pending).
+    pub device_list: Option<crate::runtime::protocol::DeviceListStatus>,
     pub ui: terminal_view::State,
     /// The agent's exit status once it ended.
     pub exited: Option<String>,
@@ -93,6 +96,7 @@ impl View {
             parser: vt100::Parser::new(24, 80, crate::pty_session::SCROLLBACK_ROWS),
             next_offset: 0,
             astation,
+            device_list: None,
             ui: terminal_view::State::new(prefix),
             exited: None,
             redraw: false,
@@ -155,7 +159,21 @@ impl View {
                 return Applied::Reattach;
             }
             RuntimeMsg::Astation { connected } => self.astation = connected,
-            RuntimeMsg::Notice { text } => self.notice(text),
+            RuntimeMsg::DeviceList { status } => {
+                // A new state is a notice (its text says what to do).
+                if let Some(s) = status.as_ref().filter(|s| s.label.is_some())
+                    && self.device_list.as_ref().map(|d| &d.text) != Some(&s.text)
+                {
+                    self.notice(format!("Device list: {}", s.text));
+                }
+                self.device_list = status;
+            }
+            // A worker's notice names the key as `{prefix}` (only the
+            // frontend knows its prefix).
+            RuntimeMsg::Notice { text } => {
+                let text = text.replace("{prefix}", &self.ui.prefix.label());
+                self.notice(text)
+            }
             RuntimeMsg::Error { text, op } if op.as_deref() == Some("attach") => {
                 return Applied::Failed(text);
             }
@@ -179,7 +197,9 @@ impl View {
             return "Atem | Esc: close help | Up/Down: scroll details".to_string();
         }
         if self.ui.pending {
-            return format!("{prefix} | h:detach g:take x:stop r:redraw [:history c:copy ?:help");
+            return format!(
+                "{prefix} | h:detach g:take a:answered x:stop r:redraw [:history c:copy ?:help"
+            );
         }
         if let Some(browse) = &self.ui.browse {
             return format!(
@@ -207,12 +227,20 @@ impl View {
             "Local"
         };
         let link = if self.astation { "✓" } else { "✗" };
+        let list = self
+            .device_list
+            .as_ref()
+            .and_then(|d| d.label.as_deref())
+            .map(|label| format!(" | {label}"))
+            .unwrap_or_default();
         let notice = if self.ui.messages.is_empty() {
             ""
         } else {
             " | Notice"
         };
-        format!("Atem | {provider} | {control} | Astation {link}{notice} | {prefix} then ?:help")
+        format!(
+            "Atem | {provider} | {control} | Astation {link}{list}{notice} | {prefix} then ?:help"
+        )
     }
 
     /// History at `offset` rows back, from the local parser.
@@ -299,7 +327,7 @@ fn pieces(bytes: &[u8]) -> Vec<Vec<u8>> {
 fn help_text(ui: &terminal_view::State) -> String {
     let prefix = ui.prefix.label();
     let mut text = format!(
-        "{prefix}, then:\n\nh / m  Detach; the session keeps running (atem agent attach reopens it)\ng      Take control back from a remote viewer\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nterminal_prefix in ~/.config/atem/config.toml or ATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
+        "{prefix}, then:\n\nh / m  Detach; the session keeps running (atem agent attach reopens it)\ng      Take control back from a remote viewer\na      An approval was answered here, in the agent's own dialog: end its wait\n       (Atem can't tell from the agent; chat prompts are held until then)\nx      Stop the agent\nr      Redraw the screen\n[      Browse local history\nc      Copy the visible terminal text\n?      Open these details\n\nPress the prefix twice to send it to the agent.\nterminal_prefix in ~/.config/atem/config.toml or ATEM_TERMINAL_PREFIX changes the prefix (for example Ctrl-a).\n\nHistory: arrows move, Space starts a selection, Enter copies; Esc returns live.\nMouse selection stays with your terminal or tmux.\nCopy requests use the tmux buffer or OSC 52; the outer terminal must support clipboard access.\n\nRecent notices (newest first):\n"
     );
     for message in ui.messages.iter().rev() {
         text.push('\n');
@@ -347,6 +375,7 @@ pub async fn attach_in<B: Backend>(
         .unwrap_or_default()
         .terminal_prefix;
     let mut view = View::new(sid, client.welcome.astation, prefix.as_deref());
+    view.device_list = client.welcome.device_list.clone();
     let mut client = client;
     loop {
         let (mut reader, mut writer) = client.split();
@@ -381,6 +410,7 @@ pub async fn attach_in<B: Backend>(
                 terminal.draw(|frame| view.draw(frame))?;
                 client = RuntimeClient::reconnect().await?;
                 view.astation = client.welcome.astation;
+                view.device_list = client.welcome.device_list.clone();
             }
         }
     }
@@ -552,6 +582,16 @@ async fn handle_key(
                 })
                 .await?;
         }
+        Action::Answered => {
+            if view.exited.is_none() {
+                writer
+                    .send(&ClientMsg::ApprovalsAnswered {
+                        session_id: view.sid.clone(),
+                    })
+                    .await?;
+                view.notice("Marked the waiting approvals as answered here".into());
+            }
+        }
         Action::Stop => {
             if view.exited.is_none() {
                 writer
@@ -664,6 +704,17 @@ mod tests {
     }
 
     #[test]
+    fn a_workers_notice_names_this_frontends_prefix() {
+        let mut view = View::new(SID, false, Some("ctrl-a"));
+        view.apply(RuntimeMsg::Notice {
+            text: crate::runtime::worker_protocol::ANSWER_HINT.into(),
+        });
+        let (text, _) = view.ui.feedback.clone().unwrap();
+        assert!(text.ends_with("press Ctrl+a then a"), "{text}");
+        assert!(!text.contains("{prefix}"), "{text}");
+    }
+
+    #[test]
     fn the_screen_is_the_restore_then_output_in_order_without_repeats() {
         let mut view = View::new(SID, false, None);
         attached(&mut view, "one", 10);
@@ -683,6 +734,43 @@ mod tests {
         attached(&mut view, "fresh", 99);
         assert_eq!(view.parser.screen().contents().trim_end(), "fresh");
         assert_eq!(view.next_offset, 99);
+    }
+
+    /// r9: the row shows the device list's short state (held, frozen,
+    /// paused, failed, a pending recovery), and a new state is a notice
+    /// saying what to do; back to normal, the segment goes.
+    #[test]
+    fn the_status_row_shows_the_device_list_state() {
+        use crate::runtime::protocol::DeviceListStatus;
+        let mut view = View::new(SID, true, None);
+        attached(&mut view, "x", 0);
+        let held = DeviceListStatus {
+            state: "held".into(),
+            text: "held (a device-list write fault was recorded); ...".into(),
+            label: Some("Remote held".into()),
+            ..Default::default()
+        };
+        view.apply(RuntimeMsg::DeviceList { status: Some(held) });
+        view.ui.feedback = None;
+        let row = view.status_line();
+        assert!(
+            row.contains("| Astation ✓ | Remote held | Notice |"),
+            "{row}"
+        );
+        assert!(
+            view.ui
+                .messages
+                .iter()
+                .any(|m| m.contains("Device list: held"))
+        );
+        view.apply(RuntimeMsg::DeviceList {
+            status: Some(DeviceListStatus {
+                state: "open".into(),
+                text: "pinned at seq 4 (0 remote clients)".into(),
+                ..Default::default()
+            }),
+        });
+        assert!(!view.status_line().contains("Remote held"));
     }
 
     #[test]

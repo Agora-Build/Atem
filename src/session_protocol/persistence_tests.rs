@@ -418,11 +418,13 @@ fn a_failed_fence_write_leaves_either_state_and_the_same_outcome() {
             ControlState {
                 control: false,
                 control_gen: 2,
+                fence_seq: 0,
             }
         } else {
             ControlState {
                 control: true,
                 control_gen: 1,
+                fence_seq: 0,
             }
         };
         assert_eq!(control, Some(expected), "undo_fails {undo_fails}");
@@ -582,6 +584,7 @@ fn recovered_work_is_resolved_before_a_connect_changes_control() {
         principal: "c1".into(),
         control: true,
         control_gen: 1,
+        fence_seq: 0,
     })
     .unwrap();
     j.append(journal::Record::Accepted {
@@ -611,4 +614,156 @@ fn recovered_work_is_resolved_before_a_connect_changes_control() {
     let r = host.receipt(&rid(1)).unwrap();
     assert_eq!(r.state, ReceiptState::Rejected);
     assert_eq!(r.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+}
+
+/// r9 (§R9.6): every browser grant is its own principal. Their control
+/// states don't accumulate in `principals`: a browser principal with no
+/// attachment, no lease and no unfinished work can never matter again
+/// (its grant's revocation and its issuer's fence are checked at
+/// admission), so it is pruned at the next control write. The file stays
+/// bounded over many grants; a browser with queued work keeps its raised
+/// generation, across a restart too.
+#[test]
+fn browser_principals_dont_accumulate_in_the_principals_file() {
+    const KEEP: &str = "browser:bbbbbbbb-0000-4000-8000-000000000001";
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let mut setup = setup_json();
+    setup["clients"][0]["name"] = json!(KEEP);
+    let journal = FileJournal::open(&state).unwrap();
+    let mut rt = FakeRuntime::from_json_with(setup, HostConfig::default(), journal);
+    // KEEP holds the lease and has a prompt queued behind a running one.
+    let b = json!({"target": target(), "attachment_gen": rt.attachment(KEEP)});
+    rt.send(
+        KEEP,
+        &session("acquire", json!({"binding": b, "takeover": false})),
+    );
+    let mut b = b.clone();
+    b["lease_epoch"] = json!(1);
+    for n in [1, 2] {
+        let m = session(
+            "submit",
+            json!({"binding": b, "request_id": rid(n), "kind": "prompt",
+                   "payload": {"text": "run the tests"}}),
+        );
+        rt.send(KEEP, &m);
+    }
+    assert_eq!(state_of(&rt, 2).map(|s| s.0), Some(ReceiptState::Accepted));
+    // Gone, and its lease ends; its queued work stays.
+    let fx = rt.host.disconnect(&rt.attachment(KEEP));
+    rt.apply(fx);
+    let later = rt.now() + 20_000;
+    rt.set_now(later);
+    assert_eq!(rt.host.lease_holder(S1), None);
+    assert_eq!(state_of(&rt, 2).map(|s| s.0), Some(ReceiptState::Accepted));
+    let size = || std::fs::metadata(state.join("principals")).unwrap().len();
+    let mut early = 0;
+    for n in 0..300u64 {
+        let principal = format!("browser:cccccccc-0000-4000-8000-{n:012}");
+        let att = format!("dddddddd-0000-4000-8000-{n:012}");
+        rt.connect_only(
+            &principal,
+            &att,
+            vec![Permission::View, Permission::Control],
+            600_000,
+        );
+        // Its expiry (or a revoke, or its issuer's fence).
+        let fx = rt.host.fence_principal(&principal, 0);
+        rt.apply(fx);
+        if n == 10 {
+            early = size();
+        }
+    }
+    assert!(size() <= early, "{} > {early}", size());
+    let (_, _, principals) = rt.host.debug_ids();
+    assert!(principals.len() <= 3, "{principals:?}");
+    assert!(principals.iter().any(|p| p == KEEP), "{principals:?}");
+    // A restart reads it back; KEEP's work is still waiting (control not
+    // confirmed yet), nothing is disabled.
+    restart(&mut rt, GEN2, 8);
+    assert!(rt.host.start_error().is_none());
+    assert!(!rt.host.journal_halted());
+    assert_eq!(state_of(&rt, 2).map(|s| s.0), Some(ReceiptState::Accepted));
+    let (_, _, principals) = rt.host.debug_ids();
+    assert!(principals.iter().any(|p| p == KEEP), "{principals:?}");
+}
+
+/// Re-review N3: a missing `principals` file next to queued work is lost
+/// control history, not a fresh one: after a clean close, queued work whose
+/// principal the file doesn't name is rejected "authorization history
+/// unknown", never dispatched when the principal connects again.
+#[test]
+fn a_lost_principals_file_rejects_queued_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let e = hold(&mut rt);
+    for n in [1, 2] {
+        let m = prompt(&rt, e, n);
+        rt.send("c1", &m);
+    }
+    assert_eq!(state_of(&rt, 2).unwrap().0, ReceiptState::Accepted);
+    std::fs::remove_file(dir.path().join("state/principals")).unwrap();
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(state_of(&rt, 2), rejected(DETAIL_HISTORY_UNKNOWN));
+    rt.event_reconnect_c1();
+    assert_eq!(state_of(&rt, 2), rejected(DETAIL_HISTORY_UNKNOWN));
+    assert_eq!(rt.pty.dispatch_attempts, 1, "only the first, before");
+}
+
+/// Re-review N3: an older `principals` file (a generation below the one
+/// queued work was accepted at) is lost history too: rejected, never run.
+#[test]
+fn an_older_principals_file_rejects_queued_work() {
+    const C1C: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let principals = dir.path().join("state/principals");
+    let old = std::fs::read(&principals).unwrap();
+    // c1 loses `control` (generation 2) and gets it back.
+    for (permissions, att) in [
+        (vec![Permission::View], C1B),
+        (vec![Permission::View, Permission::Control], C1C),
+    ] {
+        event(
+            &mut rt,
+            HostEvent::SetPermissions {
+                client: "c1".into(),
+                permissions,
+                attachment_gen: att.into(),
+            },
+        );
+    }
+    got(&mut rt);
+    let e = hold(&mut rt);
+    for n in [1, 2] {
+        let m = prompt(&rt, e, n);
+        rt.send("c1", &m);
+    }
+    assert_eq!(state_of(&rt, 2).unwrap().0, ReceiptState::Accepted);
+    std::fs::write(&principals, old).unwrap();
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(state_of(&rt, 2), rejected(DETAIL_HISTORY_UNKNOWN));
+    assert_eq!(rt.pty.dispatch_attempts, 1);
+}
+
+/// Re-review N3 (proof, no change needed): a lost refusal list can't let a
+/// request answered "acceptance not recorded" run. The failed admission
+/// write halted the journal, so that run never closed cleanly, and the
+/// next start rejects every recovered request ("authorization history
+/// unknown") even when its `accepted` record reached the disk.
+#[test]
+fn a_lost_refusal_list_never_runs_a_refused_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path());
+    let e = hold(&mut rt);
+    // The admission's fsync fails and its rollback too: the record stays.
+    rt.host.journal_mut().fail_fsync_of(1, true);
+    let m = prompt(&rt, e, 1);
+    rt.send("c1", &m);
+    assert_eq!(got(&mut rt)[0]["detail"], DETAIL_ACCEPTANCE_NOT_RECORDED);
+    std::fs::remove_file(dir.path().join("state/refused")).unwrap();
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(state_of(&rt, 1), rejected(DETAIL_HISTORY_UNKNOWN));
+    rt.event_reconnect_c1();
+    assert_eq!(rt.pty.dispatch_attempts, 0);
 }

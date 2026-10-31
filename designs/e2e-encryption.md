@@ -107,7 +107,7 @@ holding `K` never opens a credential.
 
 | Key | Type | Purpose | Held by |
 |---|---|---|---|
-| Account key `K` | 256-bit random, short id `kid` | Root of memory, skills and vault encryption; used only through HKDF subkeys | Astation Keychain; every verified device, sealed |
+| Account key `K` | 256-bit random, short id `kid` | Root of memory, skills and vault encryption: the AEAD key of `e1.` fields and the HMAC key of `h1.` hashes (directly, see below) | Astation Keychain; every verified device, sealed |
 | Scope key | 256-bit random, one per credential scope | Encrypts the credential values of one project (or global) | Astation Keychain; granted devices, sealed |
 | Index key | 256-bit random | HMACs credential names and project keys, so the relay can look up rows without learning names | Astation Keychain; every verified device, sealed |
 | Signing key | P-256, Secure Enclave, generation `sign_gen` | Signs every grant, mode change, device certificate, revocation list, credential row and manifest | Astation only; atems pin the public half |
@@ -118,15 +118,26 @@ holding `K` never opens a credential.
 | Storage key | 256-bit random, one per device, replaced at every unlock | Seals `device_keys.sealed` on disk | Astation Keychain only; agent memory while unlocked |
 | Recovery secret `R` | 256-bit random | Root of recovery. See "Recovery kit" | The recovery kit only |
 
-Subkeys, so no key is used for two jobs:
+How `K` is used (as built; the subkey separation an earlier draft of
+this design described was never implemented):
 
 ```
-K_enc     = HKDF-SHA256(K, info = "atem-k-enc-v1")       # AEAD for memory, skills, vault
-K_project = HKDF-SHA256(K, info = "atem-k-project-v1")   # HMAC of memory project keys
-K_dedupe  = HKDF-SHA256(K, info = "atem-k-dedupe-v1")    # HMAC content_hash
+e1. field = XChaCha20-Poly1305 under K itself            # memory, skills, vault
+h1. hash  = HMAC-SHA256 under K itself                   # memory/skill project keys, content_hash,
+                                                         #   service `projects` scopes (§R9.6)
+migration proof key = HKDF-SHA256(K, info = "atem-migration-proof-v1")
 I_name    = HKDF-SHA256(index_key, info = "atem-idx-name-v1")
 I_scope   = HKDF-SHA256(index_key, info = "atem-idx-scope-v1")
 ```
+
+`K` thus keys both an AEAD and an HMAC (different primitives, no known
+interaction; finding 13 below). Changing either to a derived subkey would
+change every stored `e1.` ciphertext and `h1.` hash (relay rows, project
+names, service scopes) and needs a migration. The one definition of the
+`h1.` project hash outside the cred agent is `atem_client::project`
+(`project_hash`, `project_hash_from_mac`; designs/protocol/atem-client-bindings.md
+"Service members"), checked equal to the agent's by
+`memory::account_keys::tests::the_shared_core_project_hash_is_the_agents`.
 
 ```mermaid
 flowchart TB
@@ -230,14 +241,14 @@ for two key sets that produce the same short code: it gets one guess with a
 1. atem generates a **fresh** device key, device signing key and unlock-auth
    key (never reusing today's plain `device_key`, which old backups hold),
    and a random 32-byte `nonce_a`. It sends only the commitment
-   `C = SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a))`.
+   `C = SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub, nonce_a))` (r9 added the `host_channel_key`, atem-session-v1.md §R9.2 "Pairing").
 2. Astation, having received `C`, sends its signing public key, its
    encryption public key, the recovery signing public key and a random
    `nonce_s`.
 3. atem reveals its three public keys and `nonce_a`. Astation checks them
    against `C` and aborts on mismatch.
 4. Both sides compute the safety code over the whole transcript:
-   `code = base32(SHA-256(enc("atem-safety-code-v1", device_pub, device_sign_pub, unlock_auth_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, nonce_a, nonce_s)))[:12]`,
+   `code = base32(SHA-256(enc("atem-safety-code-v2", device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, genesis_hash, nonce_a, nonce_s)))[:12]` (r9, §R9.2),
    shown as `7F3A-91C2-4D0B`.
 5. **Both sides confirm.** `atem pair` prints the code and asks
    `codes match? [y/N]`. Astation's dialog shows the same code, the device
@@ -871,13 +882,13 @@ data becomes readable on the server again):
 | Data | Encrypted | Stays plain (the relay needs it) |
 |---|---|---|
 | Memory | `content` | id, scope, machine, confidence, source, timestamps, validity, seq |
-| Memory | | `project`: `HMAC(K_project, key)` |
-| Memory | | `content_hash` becomes `HMAC(K_dedupe, content)` |
+| Memory | | `project`: `h1.` = `HMAC-SHA256(K, key)` |
+| Memory | | `content_hash` becomes `h1.` = `HMAC-SHA256(K, content)` |
 | Skill | every file's bytes, and file paths | name, scope, project (HMAC), version, timestamps |
 | Vault | entry `content`, `summary` | vault id, entry number, version, writer, timestamps |
 
 - **Format.** `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305
-  under `K_enc` with a random 24-byte nonce. The associated data binds the
+  under `K` with a random 24-byte nonce. The associated data binds the
   record id, field name, scope, project HMAC, and the version or vault
   entry number, so the relay can't move a ciphertext to another record,
   field, project or entry.
@@ -890,7 +901,7 @@ data becomes readable on the server again):
   invalidated fact, and a revoked device can't write.
 - **No going back.** atem never replaces a record it holds with an older
   version or an earlier validity state.
-- **Project keys** would reveal repo names. `HMAC(K_project, key)` keeps
+- **Project keys** would reveal repo names. `HMAC-SHA256(K, key)` keeps
   per-project filtering working; atem keeps the hash → name mapping
   locally.
 - **`content_hash`** is what the relay dedupes on. A plain SHA-256 of a
@@ -1275,7 +1286,7 @@ project `…/a/bc` + name `d`).
 
 | Use | Format | Bound to |
 |---|---|---|
-| Memory / skill / vault field | `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 under `K_enc` | `enc("atem-mem-field-v1", record id, field, scope, project_hmac, version or entry number)` |
+| Memory / skill / vault field | `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 under `K` | `enc("atem-mem-field-v1", record id, field, scope, project_hmac, version or entry number)` |
 | Memory write signature | Ed25519, device signing key | `atem-mem-write-v1` |
 | Credential value | `c1.<scope_kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 | `enc("atem-cred-v1", account, scope_hmac, kid, name_hmac, version)` |
 | Credential display name | same, under the scope key | `enc("atem-cred-name-v1", account, scope_hmac, name_hmac)` |
@@ -1285,11 +1296,11 @@ project `…/a/bc` + name `d`).
 | `device_keys.sealed` | JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`; XChaCha20-Poly1305 under the 32-byte storage key; plaintext is the device key, the device signing key and (step 2b) `account_keys`, per account the current kid and key and the previous keys; the payload `version` is 2 when `account_keys` is present, else 1 (the unlock-auth key lives in its own 0600 file `unlock_auth_key`) | AAD `enc("atem-device-keys-v1", device_id, storage_kid)` |
 | Credential names | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
 | Credential scopes | `HMAC-SHA256(I_scope, project_key)` | — |
-| Memory projects | `HMAC-SHA256(K_project, project_key)` | — |
+| Memory projects (and service `projects` scopes) | `h1.<kid>.<hex HMAC-SHA256(K, project_key)>` | — |
 | Astation signatures | P-256 ECDSA (Secure Enclave), SHA-256, carried as fixed 64-byte `r ‖ s`; Astation converts from the Enclave's DER and normalizes to low-S; atem rejects high-S | the statement's encoding |
 | Device, unlock-auth and recovery signatures | Ed25519, 64 bytes | the statement's encoding |
-| Safety code | `base32(SHA-256(enc("atem-safety-code-v1", device_pub, device_sign_pub, unlock_auth_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, nonce_a, nonce_s)))[:12]` after commit-then-reveal; `astation_sign_pub` is the 65-byte uncompressed point | — |
-| Commitment | `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a))` | — |
+| Safety code | `base32(SHA-256(enc("atem-safety-code-v2", device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub, astation_sign_pub, astation_enc_pub, recovery_sign_pub, genesis_hash, nonce_a, nonce_s)))[:12]` after commit-then-reveal; `astation_sign_pub` is the 65-byte uncompressed point | — |
+| Commitment | `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub, nonce_a))` | — |
 | Verification transcript | `SHA-256(enc("atem-verify-transcript-v1", commitment, nonce_a, nonce_s))`, carried in `atem-device-verified-v1` | — |
 
 New atem crates: `p256` (verify), `ed25519-dalek`, `hpke`, `zeroize`.
@@ -1330,7 +1341,7 @@ and in the shipped #36 code; the design above includes every fix.
 | 10 | medium | Backup blob lacked pins and revocations and could be rolled back | Versioned blob with pins, revocations, baselines; atems report the highest version |
 | 11 | medium | Clone detected only at the real box's next reboot | Ticket rolls every 15 minutes, crash-safe ("Unlock policy") |
 | 12 | medium | Revocation left `K`, index key and pairing session | Revocation kills the session and rotates all three ("Revoking a device") |
-| 13 | low | Ambiguous concatenation, `K` reused for AEAD and HMAC, unauthenticated display names, unspecified signature encoding | Length-prefixed encoding, HKDF subkeys, bound display name, low-S `r ‖ s` ("Formats") |
+| 13 | low | Ambiguous concatenation, `K` reused for AEAD and HMAC, unauthenticated display names, unspecified signature encoding | Length-prefixed encoding, bound display name, low-S `r ‖ s` ("Formats"); HKDF subkeys for the index key and the migration proof only: `K` itself still keys both `e1.` and `h1.` (not changed: it would re-key every stored value) |
 | 14 | low | Pre-encryption plain text survives in old database backups | Stated in the threat model and "Moving existing data over" |
 
 Findings 1, 4 and 5 affect code already shipped in #36. No account is
@@ -1396,7 +1407,7 @@ atem can't complete verification against a real Astation until these land.
 3. Signatures: `signature.rawRepresentation` (64-byte `r ‖ s`). CryptoKit may return high-S; normalize to low-S (`s = n − s` when `s > n/2`) before sending. atem rejects high-S.
 4. Verification:
    - on `verifyCommit`, store `{device_id, commitment}` and reply `verifyKeys` with a fresh 32-byte nonce;
-   - on `verifyReveal`, check `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, nonce_a)) == commitment`, else send `verifyAbort`;
+   - on `verifyReveal`, check `SHA-256(enc("atem-verify-commit-v1", device_pub, device_sign_pub, unlock_auth_pub, host_channel_pub, nonce_a)) == commitment`, else send `verifyAbort`;
    - compute the safety code (see "Formats") and show it with the device name; Approve needs Touch ID; Deny sends `verifyAbort`;
    - compute `transcript = SHA-256(enc("atem-verify-transcript-v1", commitment, nonce_a, nonce_s))` for this attempt;
    - on approve, pin the three device keys, then send `deviceVerified` with a signed `atem-device-verified-v1` (including `transcript`, at epoch `E`), the current account state re-signed as `atem-account-state-v1` at epoch `E+1` (mode `off` if encryption was never turned on; its epoch must be `>=` the certificate's), and a signed `K` grant if `K` exists;
@@ -1424,6 +1435,8 @@ Inputs:
 | Astation encryption key (X25519 secret) | 32 × `66` |
 | recovery signing key (Ed25519 seed) | 32 × `77` |
 | `nonce_s` | 32 × `88` |
+| `host_channel_key` (Ed25519 seed, r9) | 32 × `aa` |
+| `genesis_hash` (r9) | 32 × `bb` |
 | account, device_id, kid | `"acct-1"`, `"dev-1"`, `"0123abcd"` |
 | account state | sign_gen 1, mode `"on"`, kid `"0123abcd"`, epoch 2 |
 | device certificate | sign_gen 1, epoch 1, transcript below |
@@ -1439,23 +1452,24 @@ Derived public keys:
 | `sign_pub` (x963, 65 bytes) | `0457e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34c5ab3770ba573bdff5414065640ffb5b346dfa84dec4db4d68e5f59cc471c2ec` |
 | `enc_pub` | `219e4d800da968d2a5fcb009c784f4746c7138edb9ee4844b739e830b05cf424` |
 | `recovery_sign_pub` | `c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7` |
+| `host_channel_pub` (r9) | `e734ea6c2b6257de72355e472aa05a4c487e6b463c029ed306df2f01b5636b58` |
 
 Outputs:
 
 | Value | Result |
 |---|---|
 | `enc("atem", "", 01 02)` | `000000046174656d00000000000000020102` |
-| commitment | `24763549320fde4498bc72c2cf8b6bb6deb3df3911e611a762d912d0c5a8be05` |
-| safety code | `MN3H-A74N-FJE4` |
-| transcript | `101b660209618c9130060c9cb737e9647b8ec0ab826684009427bd9cbabcec5f` |
+| commitment | `44c67e878ff3ab25acc7f0b84ad08b3e0ca107aba9fe3ce98d351c48f31661c4` |
+| safety code | `UVCK-F5EV-JFQ7` |
+| transcript | `8e38877976a0c0ca63cfbb24ffa209178b2eb2f290de41544279d38305fe8007` |
 | `atem-account-state-v1` | `000000156174656d2d6163636f756e742d73746174652d763100000006616363742d31000000080000000000000001000000026f6e000000083031323361626364000000080000000000000002` |
-| `atem-device-verified-v1` | `000000176174656d2d6465766963652d76657269666965642d763100000006616363742d31000000080000000000000001000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00000002017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce00000020101b660209618c9130060c9cb737e9647b8ec0ab826684009427bd9cbabcec5f000000080000000000000001` |
+| `atem-device-verified-v1` | `000000176174656d2d6465766963652d76657269666965642d763100000006616363742d31000000080000000000000001000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00000002017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce000000208e38877976a0c0ca63cfbb24ffa209178b2eb2f290de41544279d38305fe8007000000080000000000000001` |
 | grant `info` | `000000126174656d2d6772616e742d696e666f2d763100000006616363742d31000000014b000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000008303132336162636400000000` |
 | `encapped_key` | `b5aad53eeb4319e1d910ec0440f849d19e0a3aa9fe3bcb91342bd80e48835755` |
 | `ciphertext` | `c3f37d28128d3516989f0a41d3c087f40ef8b17cbaa114ab928e4f5ae764136eba6d809254b08bd347694a94c6510500` |
 | `sealed_hash` | `5373b5bb2fa7696625db127b4a17bcd30e87ce858fee861f85ddcf7c41dcfc7c` |
 | `atem-grant-v1` | `0000000d6174656d2d6772616e742d763100000006616363742d31000000080000000000000001000000014b000000056465762d31000000207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f1300000008303132336162636400000000000000205373b5bb2fa7696625db127b4a17bcd30e87ce858fee861f85ddcf7c41dcfc7c` |
-| certificate signature (`r ‖ s`) | `fff634a2bd4621e42ec788123d0222e3bbda96705baf2ac0d210fcd76e0b05d930d0781c1d133ae5b99a0aeaad5546c4e5c53502a1557c2cc295594be900bf9f` |
+| certificate signature (`r ‖ s`) | `d6cc6dec219c3365efa911d66e3ce76dcc716e6f505559e326902864b521e20b33ef21d4b1bedd5ebd014fe8c4a079b500e5d444be043890cdb5c024c49b5ab9` |
 | grant signature (`r ‖ s`) | `01848754ec7cdc93c706a49cd176b683575115a9f838c3f23a092710703b90ae02f746331708f148a01b2e774472bf48851f8ad1f5ee33e430cd5925e48fc0e6` |
 
 The HPKE seal is randomized; `encapped_key` and `ciphertext` above came

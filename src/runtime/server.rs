@@ -160,6 +160,8 @@ struct Server {
     host_error: Option<String>,
     /// The Astation link state the clients last heard.
     astation: bool,
+    /// The device list state the clients last heard.
+    device_list: Option<super::protocol::DeviceListStatus>,
     /// The running Astation operation (pairing, unlock), one at a time.
     op: Option<ActiveOp>,
     op_calls: mpsc::UnboundedSender<OpCall>,
@@ -238,6 +240,15 @@ pub async fn serve(
             }
         };
     app.hosted = Some(crate::app::hosted::Hosted::default());
+    // §R9.7b: the relay link (already connecting) answers the relay's
+    // challenge from the device list as opened, then as each pass leaves it.
+    crate::session_protocol::r9::route::set(
+        &app.host_route,
+        match &bridge {
+            Some(bridge) => bridge.route_state(),
+            None => crate::session_protocol::r9::route::RouteState::Off("remote sessions disabled"),
+        },
+    );
     let (op_calls, mut op_called) = mpsc::unbounded_channel::<OpCall>();
     let mut server = Server {
         app,
@@ -256,6 +267,7 @@ pub async fn serve(
         bridge,
         host_error,
         astation: false,
+        device_list: None,
         op: None,
         op_calls,
         op_waiting: None,
@@ -273,7 +285,13 @@ pub async fn serve(
                 server.host_pass().await;
                 server.forward_status();
                 server.forward_astation();
+                server.forward_device_list();
                 server.op_tick();
+                // §R9.7b: after a pin or reconciliation, once no operation
+                // runs and no r9 channel is mid-admission.
+                let op_running = server.op.is_some() || server.op_waiting.is_some();
+                let admitting = server.bridge.as_ref().is_some_and(HostBridge::r9_admitting);
+                server.app.route_reconnect_due(op_running, admitting);
             }
             Some(call) = op_called.recv() => server.op_call(call),
             Some(stream) = accepted.recv() => server.add_client(stream),
@@ -508,6 +526,29 @@ impl Server {
     }
 
     /// Every greeted client hears when the Astation link goes up or down.
+    /// The r9 device list's state, to every greeted client when it changes
+    /// (the status row shows it).
+    fn forward_device_list(&mut self) {
+        let status = self
+            .bridge
+            .as_ref()
+            .and_then(HostBridge::device_list_status);
+        // Clients see the state, not the client count.
+        let shown = |s: &Option<super::protocol::DeviceListStatus>| {
+            s.as_ref()
+                .map(|s| (s.state.clone(), s.label.clone(), s.text.clone()))
+        };
+        if shown(&status) == shown(&self.device_list) {
+            self.device_list = status;
+            return;
+        }
+        self.device_list = status.clone();
+        let message = RuntimeMsg::DeviceList { status };
+        for client in self.clients.values().filter(|c| c.greeted) {
+            client.send(&message);
+        }
+    }
+
     fn forward_astation(&mut self) {
         let connected = self.app.astation_connected;
         if connected == self.astation {
@@ -786,6 +827,7 @@ impl Server {
                             astation: self.astation,
                             host_error,
                             worker_protocol: Some(super::worker_protocol::WORKER_PROTOCOL),
+                            device_list: self.device_list.clone(),
                         });
                     }
                 }
@@ -829,8 +871,26 @@ impl Server {
                         "launch",
                     );
                 }
+                // Debug builds: the r9 fixtures' sessions keep the ids their
+                // signed grants name (`ATEM_TEST_SESSION_ID` in the launch
+                // environment; refused when taken).
+                #[cfg(debug_assertions)]
+                let session_id = match env
+                    .0
+                    .iter()
+                    .find(|(k, _)| k == "ATEM_TEST_SESSION_ID")
+                    .and_then(|(_, v)| SessionId::parse(v))
+                {
+                    Some(sid) if self.sessions.contains_key(&sid) => {
+                        return self.error(id, "That session id is taken", "launch");
+                    }
+                    Some(sid) => sid,
+                    None => SessionId::new(),
+                };
+                #[cfg(not(debug_assertions))]
+                let session_id = SessionId::new();
                 let request = SpawnRequest {
-                    session_id: SessionId::new(),
+                    session_id,
                     process_gen: uuid::Uuid::new_v4().to_string(),
                     provider,
                     args,
@@ -956,6 +1016,23 @@ impl Server {
                 self.adjust_size(&sid, rows, cols);
                 self.restore(&sid);
             }
+            ClientMsg::ApprovalsAnswered { session_id } => {
+                let Some(sid) = self.attached_by(id, &session_id) else {
+                    return self.error(id, "Attach to the session first", "approvals_answered");
+                };
+                let Some(session) = self.sessions.get(&sid).filter(|s| s.is_live()) else {
+                    return self.send(
+                        id,
+                        &RuntimeMsg::Notice {
+                            text: "The session has ended".into(),
+                        },
+                    );
+                };
+                if let Err(error) = session.approvals_answered() {
+                    return self.error(id, error.to_string(), "approvals_answered");
+                }
+                eprintln!("atem runtime: {sid}: approvals marked answered at a local frontend");
+            }
             ClientMsg::List => {
                 let sessions = self.order.iter().map(|sid| self.summary(sid)).collect();
                 self.send(id, &RuntimeMsg::Sessions { sessions });
@@ -1022,12 +1099,17 @@ impl Server {
                     .astation_client
                     .capture()
                     .is_some_and(|capture| capture.check().is_err());
-                if self.app.astation_connected && stale {
+                if (self.app.astation_connected || self.app.astation_routed) && stale {
                     self.app.drop_astation_link(
                         "The Astation pairing changed; the link was dropped".into(),
                     );
+                } else if let Some(reason) = self.app.station_changed() {
+                    // Another Station is configured: nothing of the old
+                    // one's context (attachments, channels, leases) stays.
+                    eprintln!("atem runtime: {reason}");
+                    self.app.drop_astation_link(reason);
                 }
-                if !self.app.astation_connected {
+                if !self.app.astation_connected && !self.app.astation_routed {
                     // Credentials or pairing may have changed: try again now.
                     self.app.astation_reconnect_at = Some(Instant::now());
                 }
@@ -1053,9 +1135,11 @@ impl Server {
         use crate::websocket_client::LinkVia;
         let app = &self.app;
         let connected = app.astation_connected && !app.astation_client.is_ws_closed();
-        let (transport, relay) = match app.astation_client.via().filter(|_| connected) {
+        // Shown while Astation authenticates it too (§R9.7b).
+        let routed = app.astation_routed && !connected && !app.astation_client.is_ws_closed();
+        let (transport, relay) = match app.astation_client.via().filter(|_| connected || routed) {
             Some(LinkVia::Local) => (Some(Transport::Local), None),
-            Some(LinkVia::Relay { label }) => (Some(Transport::Relay), Some(label.clone())),
+            Some(LinkVia::Relay { label, .. }) => (Some(Transport::Relay), Some(label.clone())),
             None => (None, None),
         };
         let link = self.bridge.as_ref().map(HostBridge::link_status);
@@ -1070,6 +1154,7 @@ impl Server {
             retrying: !connected
                 && (app.astation_connect_rx.is_some() || app.astation_reconnect_at.is_some()),
             reauthenticating: connected && app.astation_reauth.is_some(),
+            routed,
             attachment: link.as_ref().is_some_and(|l| l.attachment),
             welcomed: link.as_ref().and_then(|l| l.welcomed.clone()),
             refused: link.as_ref().and_then(|l| l.refused.clone()),
@@ -1077,6 +1162,10 @@ impl Server {
             host_error,
             adopting: self.adopting,
             sessions: self.order.iter().map(|sid| self.summary(sid)).collect(),
+            device_list: self
+                .bridge
+                .as_ref()
+                .and_then(HostBridge::device_list_status),
         }
     }
 
@@ -1168,13 +1257,25 @@ impl Server {
                 reply,
             } => {
                 self.op_waiting = Some((encryption, credentials, reply));
-                if !self.app.astation_connected && self.app.astation_connect_rx.is_none() {
+                // A routed link (§R9.7b) retries nothing: its last advice,
+                // if Astation refused it, answers the operation.
+                if !self.app.astation_connected
+                    && !self.app.astation_routed
+                    && self.app.astation_connect_rx.is_none()
+                {
                     // Try now rather than at the next retry; only that
                     // attempt's failure answers this operation.
                     self.app.astation_connect_error = None;
                     self.app.astation_reconnect_at = Some(Instant::now());
                 }
                 self.op_tick();
+            }
+            OpCall::Rebind { astation_id, reply } => {
+                let _ = reply.send(
+                    self.app
+                        .rebind_for_verification(&astation_id)
+                        .map_err(|error| format!("{error:#}")),
+                );
             }
             OpCall::Install { client, reply } => {
                 self.app.install_astation_link(*client);
@@ -1225,7 +1326,12 @@ impl Server {
         }
         if !self.app.astation_connected
             && self.op_waiting.is_some()
-            && let Some(advice) = self.app.astation_connect_error.take()
+            && let Some(advice) = if self.app.astation_routed {
+                // Kept for every operation until Astation authenticates it.
+                self.app.astation_connect_error.clone()
+            } else {
+                self.app.astation_connect_error.take()
+            }
             && let Some((_, _, reply)) = self.op_waiting.take()
         {
             let _ = reply.send(Err(advice));

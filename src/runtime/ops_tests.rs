@@ -97,6 +97,14 @@ struct Peer {
     /// The viewer's screen: frames applied up to `view_at`.
     view: vt100::Parser,
     view_at: usize,
+    /// r9: per channel handle, the index in `seen` read up to.
+    channel_at: std::collections::HashMap<String, usize>,
+}
+
+/// A client's monotonic ms (its own clock).
+fn client_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
 impl Peer {
@@ -140,8 +148,89 @@ impl Peer {
             welcome: Value::Null,
             view: vt100::Parser::new(24, 80, 0),
             view_at: 0,
+            channel_at: Default::default(),
         };
         (format!("ws://{address}/ws"), peer)
+    }
+
+    /// r9 (§R9.7a): the next `frame` Atem sends on `handle` (its inner
+    /// frame's bytes), or `Err(reason)` for its `close`.
+    async fn channel_next(&mut self, handle: &str) -> Result<Vec<u8>, Option<String>> {
+        let from = self.channel_at.get(handle).copied().unwrap_or(0);
+        let h = handle.to_string();
+        let at = self
+            .wait_from(from, |v| {
+                v["type"] == "channel" && v["channel"] == h.as_str()
+            })
+            .await;
+        self.channel_at.insert(handle.to_string(), at + 1);
+        let v = self.seen[at].clone();
+        match v["event"].as_str() {
+            Some("frame") => Ok(serde_json::to_vec(&v["frame"]).unwrap()),
+            _ => Err(v["reason"].as_str().map(str::to_string)),
+        }
+    }
+
+    /// The router side: one client frame on `handle`.
+    fn channel_send(&self, handle: &str, frame: &[u8]) {
+        self.to_atem
+            .send(crate::session_protocol::r9::envelope::frame(handle, frame))
+            .unwrap();
+    }
+
+    /// Opens `handle` and runs a full `atem-ch1` handshake for `identity`
+    /// with `log`'s keys; the attachment, or the refusal's code and detail.
+    async fn r9_connect(
+        &mut self,
+        handle: &str,
+        log: &crate::session_protocol::membership::r9log::TestLog,
+        host_id: &str,
+        identity: atem_client::connect::Identity,
+    ) -> Result<atem_client::connect::Attached, (String, Option<String>)> {
+        use crate::session_protocol::r9::envelope;
+        self.to_atem
+            .send(envelope::open(handle, envelope::Transport::Direct))
+            .unwrap();
+        let (connecting, init) = atem_client::connect::Connector::new(host_id)
+            .start(&log.log, client_ms())
+            .map_err(|e| (format!("{e:?}"), None))?;
+        self.channel_send(handle, &init);
+        let accept = self
+            .channel_next(handle)
+            .await
+            .map_err(|r| ("closed".into(), r))?;
+        if let Ok(atem_client::channel::wire::Frame::Error { code }) =
+            atem_client::channel::wire::parse_frame(&accept)
+        {
+            return Err((code, None));
+        }
+        let (welcoming, finish) = connecting
+            .on_accept(&accept, &log.log, &log.keys, &identity, client_ms())
+            .map_err(|e| (format!("{e:?}"), None))?;
+        self.channel_send(handle, &finish);
+        let first = self
+            .channel_next(handle)
+            .await
+            .map_err(|r| ("closed".into(), r))?;
+        match welcoming.on_frame(&first, &log.log, client_ms()) {
+            Ok(attached) => Ok(attached),
+            Err(atem_client::connect::ConnectError::Refused { error, .. }) => {
+                Err((error.code.clone(), error.detail.clone()))
+            }
+            Err(e) => Err((format!("{e:?}"), None)),
+        }
+    }
+
+    /// Sends `frame` on `handle` and returns the events of Atem's next record.
+    async fn r9_round(
+        &mut self,
+        handle: &str,
+        attached: &mut atem_client::connect::Attached,
+        frame: &[u8],
+    ) -> Vec<atem_client::connect::Event> {
+        self.channel_send(handle, frame);
+        let reply = self.channel_next(handle).await.expect("a record");
+        attached.on_frame(&reply, client_ms()).unwrap()
     }
 
     fn send(&self, message: &AstationMessage) {
@@ -292,6 +381,19 @@ struct Verifier {
     device_id: String,
     nonce_s: [u8; 32],
     account: String,
+    /// r9: the account's device list (the Mac genesis, signed by `fake`).
+    log: std::cell::RefCell<crate::session_protocol::membership::r9log::TestLog>,
+    /// `verifyCommit.host_trust_gen` (§R9.2).
+    advertised: u64,
+}
+
+/// The host trust generation of the profile at `dir`.
+fn trust_gen(dir: &Path) -> u64 {
+    crate::pairing::load(&crate::profile::Sources::in_dir(dir))
+        .unwrap()
+        .binding
+        .unwrap()
+        .host_trust_gen
 }
 
 impl Verifier {
@@ -303,13 +405,22 @@ impl Verifier {
             .unwrap()
             .try_into()
             .unwrap();
+        // r9: the advertised generation, as Astation must read it.
+        let advertised =
+            atem_client::ceremony::verify_commit_host_trust_gen(commit.to_string().as_bytes())
+                .expect("verifyCommit carries host_trust_gen");
         let fake = FakeAstation::new();
         let nonce_s = [7u8; 32];
+        let log = crate::session_protocol::membership::r9log::TestLog::genesis(
+            account,
+            &fake.sign_secret_bytes(),
+        );
         peer.send(&AstationMessage::VerifyKeys {
             sign_pub: STANDARD.encode(fake.sign_pub()),
             enc_pub: STANDARD.encode(fake.enc_pub()),
             recovery_sign_pub: STANDARD.encode([6u8; 32]),
             nonce: STANDARD.encode(nonce_s),
+            genesis_hash: Some(log.genesis_hash().to_hex()),
         });
         Self {
             fake,
@@ -317,12 +428,13 @@ impl Verifier {
             device_id: commit["data"]["device_id"].as_str().unwrap().to_string(),
             nonce_s,
             account: account.to_string(),
+            log: std::cell::RefCell::new(log),
+            advertised,
         }
     }
 
-    /// Waits for `verifyReveal`; the signed `deviceVerified` for it.
-    async fn certificate(&self, peer: &mut Peer) -> AstationMessage {
-        let reveal = peer.next("verifyReveal").await;
+    /// The signed `deviceVerified` for `reveal` (its list as it stands).
+    fn certificate_for(&self, reveal: &Value) -> AstationMessage {
         let key = |name: &str| -> [u8; 32] {
             STANDARD
                 .decode(reveal["data"][name].as_str().unwrap())
@@ -351,6 +463,55 @@ impl Verifier {
             device_verified: self.fake.sign(&certificate.encode()),
             account_state: self.fake.sign(&state.encode()),
             grants: Vec::new(),
+            membership: Some(json!({"entries": self.log.borrow().wire()})),
+        }
+    }
+
+    /// Waits for `verifyReveal`; the signed `deviceVerified` for it, with
+    /// the device list ending at this host's `add_host` (trust generation
+    /// `host_trust_gen`, the revealed host channel key).
+    async fn certificate(&self, peer: &mut Peer, host_trust_gen: u64) -> AstationMessage {
+        let reveal = peer.next("verifyReveal").await;
+        let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
+            reveal["data"]["host_channel_pub"].as_str().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        // Astation copies the advertised generation into the add_host.
+        assert_eq!(self.advertised, host_trust_gen, "the binding's generation");
+        self.log
+            .borrow_mut()
+            .add_host_pub(&self.device_id, self.advertised, &host_pub);
+        let key = |name: &str| -> [u8; 32] {
+            STANDARD
+                .decode(reveal["data"][name].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let certificate = DeviceVerified {
+            account: self.account.clone(),
+            sign_gen: 1,
+            device_id: self.device_id.clone(),
+            device_pub: key("device_pub"),
+            device_sign_pub: key("device_sign_pub"),
+            unlock_auth_pub: key("unlock_auth_pub"),
+            transcript: transcript_for(&self.commitment, &key("nonce"), &self.nonce_s),
+            epoch: 1,
+        };
+        let state = AccountState {
+            account: self.account.clone(),
+            sign_gen: 1,
+            mode: crate::memory::crypto::EncryptionMode::Off,
+            kid: None,
+            epoch: 1,
+        };
+        AstationMessage::DeviceVerified {
+            device_verified: self.fake.sign(&certificate.encode()),
+            account_state: self.fake.sign(&state.encode()),
+            grants: Vec::new(),
+            membership: Some(json!({"entries": self.log.borrow().wire()})),
         }
     }
 }
@@ -635,10 +796,10 @@ async fn verify_until_the_question(
     rt: &Runtime,
     peer: &mut Peer,
     account: &str,
-) -> (Op, u64, AstationMessage) {
+) -> (Op, u64, AstationMessage, Verifier) {
     let op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
     let verifier = Verifier::keys(peer, account).await;
-    let certificate = verifier.certificate(peer).await;
+    let certificate = verifier.certificate(peer, trust_gen(&rt.profile)).await;
     let mut op = op;
     let (question, kind, text) = op.ask().await;
     assert_eq!(kind, AskKind::YesNo);
@@ -650,7 +811,7 @@ async fn verify_until_the_question(
         "{:?}",
         op.printed
     );
-    (op, question, certificate)
+    (op, question, certificate, verifier)
 }
 
 #[test]
@@ -666,7 +827,7 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
         // An unverified link gets no session attachment.
         assert_eq!(peer.hello().await["op"], "error");
 
-        let (mut op, question, certificate) =
+        let (mut op, question, certificate, verifier) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -684,24 +845,58 @@ fn pair_verify_runs_on_the_runtimes_link_and_sessions_stay_attached() {
             op.printed
         );
         assert!(verified_as(&rt.keys(), "acct-op"));
+        // r9: the ceremony pinned the account's device list and this host's
+        // channel key.
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(pairing.membership.exists(), "the device list is pinned");
+        assert!(
+            pairing.host_channel_key.exists(),
+            "with the host channel key"
+        );
 
-        // The same link (never reconnected) is now a verified pairing: it
-        // attaches, and sees the session the local frontend kept attached.
+        // The same link (never reconnected) carries r9 now: the device
+        // list pinned while the runtime ran is picked up, an r8 hello is
+        // refused (no compatibility) and the Mac, the list's genesis member,
+        // is admitted through the channel envelope on that link.
         assert!(
             !peer.drain(Duration::from_millis(200)).await,
             "the link closed"
         );
-        let welcome = peer.hello().await;
-        assert_eq!(welcome["op"], "welcome", "{welcome}");
-        assert_eq!(welcome["account_id"], "acct-op");
-        assert_eq!(welcome["atem_device_id"], ATEM_ID);
+        let refused = peer.hello().await;
+        assert_eq!(refused["op"], "error", "{refused}");
+        assert_eq!(refused["code"], "unsupported_version");
+        assert_eq!(refused["revision"], 9);
+        let mac = atem_client::connect::Identity::native(
+            crate::session_protocol::membership::r9log::MAC,
+            crate::session_protocol::membership::r9log::auth(
+                crate::session_protocol::membership::r9log::MAC,
+            ),
+        );
+        let log = verifier.log.into_inner();
+        let mut attached = peer
+            .r9_connect("mac-1", &log, ATEM_ID, mac)
+            .await
+            .unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let w = attached.welcome().clone();
+        assert_eq!(w.account_id, "acct-op");
+        assert_eq!(w.atem_device_id, ATEM_ID);
+        assert_eq!(w.principal, "member:dev-mac");
+        assert_eq!(w.head, log.log.head());
+        let (_, frame) = attached.list(client_ms()).unwrap();
+        let events = peer.r9_round("mac-1", &mut attached, &frame).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, atem_client::connect::Event::Session(m)
+                if matches!(&m.op, crate::session_protocol::wire::Op::Sessions { sessions, .. }
+                    if sessions.iter().any(|d| d.session_id == session.id.as_str())))),
+            "{events:?}"
+        );
         frontend
             .send(&ClientMsg::input(&session.id, b"AFTER\r"))
             .await
             .unwrap();
         shows(&mut frontend, "AFTER").await;
-        peer.subscribe_until(&session.id, &session.generation, "AFTER")
-            .await;
         rt.shutdown().await;
     });
 }
@@ -714,7 +909,7 @@ fn a_cli_gone_mid_verification_aborts_it_and_a_late_certificate_is_dropped() {
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
-        let (mut op, question, certificate) =
+        let (mut op, question, certificate, _) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -744,7 +939,7 @@ fn a_lost_link_fails_the_verification_without_replay() {
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut frontend = rt.client().await;
         let session = rt.attached_session(&mut frontend).await;
-        let (mut op, question, _certificate) =
+        let (mut op, question, _certificate, _) =
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -781,7 +976,7 @@ fn a_second_operation_is_refused_while_one_runs() {
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
-        let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let (mut op, question, _, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
         for kind in [OpKind::CredUnlock, OpKind::Pair, OpKind::PairVerify] {
             let mut second = Op::start(rt.client().await, kind, OpOptions::default()).await;
             assert_eq!(second.done().await.unwrap_err(), BUSY);
@@ -809,6 +1004,7 @@ fn a_reply_without_an_operation_is_dropped() {
             device_verified: verifier.sign(b"x"),
             account_state: verifier.sign(b"y"),
             grants: Vec::new(),
+            membership: None,
         });
         peer.send(&AstationMessage::UnlockDenied {
             reason: "no".into(),
@@ -889,6 +1085,63 @@ fn first_pairing_pairs_makes_the_connection_the_link_and_verifies_on_it() {
     first_pairing(None);
 }
 
+/// The pairing bootstrap's receive path: what the link's reader makes of
+/// raw frames (the contract's 4096-byte bound including, exact shapes, no
+/// unknown or duplicate fields, UUID ids, v1), before `atem pair` sees them.
+#[test]
+fn pairing_frames_are_read_strictly_on_the_receive_path() {
+    local(async {
+        let dir = short_dir();
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let (url, peer) = Peer::listen().await;
+        let mut client = link_to(&profile, &url, relay()).await;
+        const ID: &str = "1dc7bd24-391c-4d16-8b6e-1121e75a2af8";
+        let intro = format!(
+            r#"{{"type":"pairing","data":{{"v":1,"op":"introduction","id":"{ID}","astation_id":"{ASTATION}"}}}}"#
+        );
+        let padded = |len: usize| format!("{intro}{}", " ".repeat(len - intro.len()));
+        let cases: Vec<(String, bool)> = vec![
+            (intro.clone(), true),
+            (intro.clone(), true), // a retransmitted reply reads the same
+            (padded(4096), true),
+            (padded(4097), false),
+            (intro.replace(r#""v":1"#, r#""v":2"#), false),
+            (intro.replace(ID, "not-a-uuid"), false),
+            (
+                intro.replace(r#"}}"#, r#","code":"pairing_cancelled"}}"#),
+                false,
+            ),
+            (intro.replace(r#"}}"#, r#","extra":1}}"#), false),
+            (
+                intro.replace(
+                    r#""astation_id""#,
+                    r#""astation_id":"astation-x","astation_id""#,
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"type":"pairing","data":{{"v":1,"op":"error","id":"{ID}","code":"not_signed_in"}}}}"#
+                ),
+                true,
+            ),
+        ];
+        for (frame, valid) in &cases {
+            peer.to_atem.send(frame.clone()).unwrap();
+            let message = tokio::time::timeout(WAIT, client.recv_message_async())
+                .await
+                .expect("a message")
+                .expect("the link is open");
+            match message {
+                AstationMessage::Pairing { .. } => assert!(valid, "accepted: {frame}"),
+                AstationMessage::PairingInvalid { .. } => assert!(!valid, "refused: {frame}"),
+                other => panic!("{other:?} for {frame}"),
+            }
+        }
+    });
+}
+
 /// A record without a binding (left by v0.7.2's background reconnect) is
 /// not a pairing: `atem pair` proceeds and replaces it.
 #[test]
@@ -948,23 +1201,14 @@ fn first_pairing(leftover: Option<&str>) {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         });
-        let (question, kind, text) = op.ask().await;
-        assert_eq!(kind, AskKind::YesNo);
-        assert!(text.contains("Save credentials"), "{text}");
-        op.answer(question, AnswerValue::Yes).await;
-        let preference = peer.next("pairSavePreference").await;
-        assert_eq!(preference["data"]["save_credentials"], true);
-        peer.send(&AstationMessage::CredentialSync {
-            access_token: "access".into(),
-            refresh_token: "refresh".into(),
-            expires_at: crate::credentials::now_secs() + 3600,
-            login_id: Some("me".into()),
-            astation_id: ASTATION.into(),
-            save_credentials: true,
-        });
+        // Local pairing: the authenticated loopback challenge named
+        // Astation, so no bootstrap hello and no credentials (the
+        // token-free design); the verification below establishes trust.
         // Verification on the same connection, now the runtime's link.
         let verifier = Verifier::keys(&mut peer, "acct-new").await;
-        let certificate = verifier.certificate(&mut peer).await;
+        let certificate = verifier
+            .certificate(&mut peer, trust_gen(&rt.profile))
+            .await;
         let (question, _, _) = op.ask().await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
@@ -975,17 +1219,20 @@ fn first_pairing(leftover: Option<&str>) {
             pending_kid: None,
         });
         op.done().await.unwrap();
+        assert!(op.printed.iter().any(|l| l == "Paired with Astation."));
         assert!(
-            op.printed
-                .iter()
-                .any(|l| l.contains("Paired with Astation. (SSO: me)"))
+            !peer.seen.iter().any(|m| m["type"] == "pairing"),
+            "no bootstrap on a local link"
         );
+        assert!(!op.printed.iter().any(|l| l.contains("SSO")));
 
         let src = crate::profile::Sources::in_dir(&rt.profile);
         let binding = crate::pairing::load(&src).unwrap().binding.unwrap();
         assert_eq!(binding.astation_id, ASTATION);
-        assert!(fresh_shared(&rt.profile).is_some());
-        assert!(record(&rt.profile).save_credentials);
+        // No Login fabricated, nothing to save without `--save`.
+        assert!(fresh_shared(&rt.profile).is_none());
+        assert!(record(&rt.profile).shared.is_none());
+        assert!(!record(&rt.profile).save_credentials);
         assert_eq!(record(&rt.profile).astation_id, ASTATION);
         assert_eq!(
             record(&rt.profile).session.unwrap().session_id,
@@ -993,10 +1240,11 @@ fn first_pairing(leftover: Option<&str>) {
             "the pairing saved the granted session"
         );
         assert!(verified_as(&rt.keys(), "acct-new"));
-        // The pairing connection is the runtime's link: it attaches.
-        let welcome = peer.hello().await;
-        assert_eq!(welcome["op"], "welcome", "{welcome}");
-        assert_eq!(welcome["account_id"], "acct-new");
+        // The pairing pinned a device list: the link's r8 hello is refused
+        // (no compatibility; r9 clients come through the channel).
+        let refused = peer.hello().await;
+        assert_eq!(refused["op"], "error", "{refused}");
+        assert_eq!(refused["revision"], 9);
         rt.shutdown().await;
     });
 }
@@ -1364,6 +1612,7 @@ async fn link_to(
 fn relay() -> crate::websocket_client::LinkVia {
     crate::websocket_client::LinkVia::Relay {
         label: "relay".into(),
+        url: "https://relay.test".into(),
     }
 }
 
@@ -1371,166 +1620,132 @@ fn local_via() -> crate::websocket_client::LinkVia {
     crate::websocket_client::LinkVia::Local
 }
 
-fn stored(relay_only: bool) -> Value {
-    json!({"relay_only": relay_only, "stored": true})
+/// The profile's host policy, as a commit leaves it (§R9.8a).
+fn set_policy(profile: &Path, relay_only: bool) {
+    crate::session_protocol::r9::host_policy::write_for_test(
+        &crate::paths::ProfilePaths::in_dir(profile).pairing,
+        relay_only,
+    );
 }
 
-fn not_stored(relay_only: bool, reason: &str) -> Value {
-    json!({"relay_only": relay_only, "stored": false, "reason": reason})
-}
-
-fn acks(peer: &Peer) -> Vec<Value> {
-    peer.seen
-        .iter()
-        .filter(|m| m["type"] == "transportPolicyAck")
-        .map(|m| m["data"].clone())
-        .collect()
-}
-
-/// `transportPolicy` is kept in the link's bound pairing and acknowledged
-/// `stored: true` with the value stored; a repeat is the same no-op, a relay
-/// link stays, and `false` clears it.
-#[test]
-fn transport_policy_is_kept_in_the_bound_pairing_and_acknowledged() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let (mut app, mut peer) = linked_app(&profile, relay()).await;
-        for relay_only in [true, true, false, false] {
-            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only })
-                .await;
-            let ack = peer.next("transportPolicyAck").await;
-            assert_eq!(ack["data"], stored(relay_only));
-            assert_eq!(record(&profile).relay_only, relay_only);
-            assert!(app.astation_connected, "a relay link stays");
-        }
-    });
-}
-
-/// A link without a bound pairing (the loopback proof on a profile never
-/// paired) stores nothing, creates no pairing and says `not_paired`.
-#[test]
-fn transport_policy_on_a_link_without_a_pairing_is_not_paired() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        std::fs::create_dir_all(&profile).unwrap();
-        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        let ack = peer.next("transportPolicyAck").await;
-        assert_eq!(ack["data"], not_stored(true, "not_paired"));
-        let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
-        assert!(!paths.record.exists(), "never creates a pairing");
-        assert!(
-            app.astation_connected,
-            "nothing stored: the local link stays"
+/// A commit of `relay_only` as the host bridge reports it: the policy is
+/// stored, the App told, and (`Some`) the channel's result frame handed to
+/// the writer with its receipt. Returns the frame's text.
+fn commit(app: &mut App, profile: &Path, relay_only: bool, written: bool) {
+    set_policy(profile, relay_only);
+    app.host_policy_changed(relay_only);
+    if written {
+        let text = format!(
+            r#"{{"type":"channel","data":{{"op":"frame","channel":"c","frame":"{relay_only}"}}}}"#
         );
-    });
-}
-
-/// A stale link (its pairing removed, or replaced by a new pairing) gets
-/// `pairing_changed`; the new binding is never touched and nothing comes back.
-#[test]
-fn transport_policy_on_a_stale_link_is_pairing_changed() {
-    for re_pair in [false, true] {
-        local(async {
-            let dir = short_dir();
-            let profile = dir.path().join("profile");
-            paired(&profile);
-            let (mut app, mut peer) = linked_app(&profile, relay()).await;
-            let src = crate::profile::Sources::in_dir(&profile);
-            crate::pairing::unpair(&src).unwrap();
-            if re_pair {
-                let before = crate::pairing::capture(&src).unwrap();
-                crate::pairing::bind_new(&src, &before, ASTATION).unwrap();
-            }
-            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-                .await;
-            let ack = peer.next("transportPolicyAck").await;
-            assert_eq!(
-                ack["data"],
-                not_stored(true, "pairing_changed"),
-                "re_pair {re_pair}"
-            );
-            let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
-            if re_pair {
-                assert!(!record(&profile).relay_only, "the new binding is untouched");
-            } else {
-                assert!(!paths.record.exists(), "never re-creates the pairing");
-            }
-            assert!(
-                app.status_message
-                    .unwrap()
-                    .starts_with("Transport policy not saved")
-            );
-        });
+        let (sent, receipt) = app.astation_client.try_send_channel_with(text, true);
+        assert!(sent);
+        app.relay_only_receipt(receipt.expect("asked for"));
     }
 }
 
-/// Relay only arriving on a local link: stored, acknowledged, then the
+/// The channel frames the peer got (the policy results in these tests).
+fn results(peer: &Peer) -> usize {
+    peer.seen.iter().filter(|m| m["type"] == "channel").count()
+}
+
+/// `atem runtime reload` after `astation_relay_url` changed: a relay link
+/// reached at the old Station is dropped (its attachments and channels go
+/// with it) and the reconnect goes to the configured Station at once; the
+/// same Station (a trailing `/` aside) or a local link stays.
+#[test]
+fn a_reload_to_another_station_drops_the_relay_link() {
+    local(async {
+        let profile = crate::config::AtemConfig::config_dir();
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        app.config.astation_relay_url = Some("https://relay.test/".into());
+        assert_eq!(app.station_changed(), None, "the same Station");
+        app.config.astation_relay_url = Some("https://station-dev.agora.build".into());
+        let reason = app.station_changed().expect("another Station");
+        assert_eq!(
+            reason,
+            "The Station changed (https://relay.test → https://station-dev.agora.build); the link was dropped and reconnects there"
+        );
+        app.drop_astation_link(reason);
+        assert!(peer.drain(WAIT).await, "the old Station's link was dropped");
+        assert!(!app.astation_connected && !app.astation_routed);
+        assert!(
+            app.astation_reconnect_at
+                .is_some_and(|at| at <= Instant::now()),
+            "reconnects at once"
+        );
+        assert_eq!(app.station_changed(), None, "no link: nothing to drop");
+        // A local link is no Station's.
+        let (mut local_app, mut local_peer) = linked_app(&profile, local_via()).await;
+        local_app.config.astation_relay_url = Some("https://station-dev.agora.build".into());
+        assert_eq!(local_app.station_changed(), None);
+        assert!(!local_peer.drain(Duration::from_millis(100)).await);
+    });
+}
+
+/// A relay link stays on any commit; `false` on a local link keeps it.
+#[test]
+fn a_relay_link_and_a_false_commit_never_drop() {
+    local(async {
+        // The runtime's own profile: relay-only decisions read it.
+        let profile = crate::config::AtemConfig::config_dir();
+        paired(&profile);
+        let (mut app, mut peer) = linked_app(&profile, relay()).await;
+        commit(&mut app, &profile, true, true);
+        assert!(app.relay_only_drop.is_none(), "a relay link stays");
+        let (mut local_app, mut local_peer) = linked_app(&profile, local_via()).await;
+        commit(&mut local_app, &profile, false, true);
+        assert!(local_app.relay_only_drop.is_none());
+        for _ in 0..5 {
+            app.process_astation_messages().await;
+            local_app.process_astation_messages().await;
+        }
+        assert!(app.astation_connected && local_app.astation_connected);
+        assert!(!peer.drain(Duration::from_millis(100)).await);
+        assert!(!local_peer.drain(Duration::from_millis(100)).await);
+    });
+}
+
+/// Relay only committed on a local link: the result is written, then the
 /// local link is dropped so the reconnect goes through the relay.
 #[test]
-fn relay_only_drops_a_local_link_after_the_ack() {
+fn relay_only_drops_a_local_link_after_the_result() {
     local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
+        // The runtime's own profile: relay-only decisions read it.
+        let profile = crate::config::AtemConfig::config_dir();
         paired(&profile);
         let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        let ack = peer.next("transportPolicyAck").await;
-        assert_eq!(ack["data"], stored(true));
-        assert!(record(&profile).relay_only);
-        // The pass drops it once the ack was written.
+        commit(&mut app, &profile, true, true);
+        assert!(app.relay_only_drop_pending());
         pass_until_dropped(&mut app, WAIT).await;
         assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
         assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
         assert!(peer.drain(WAIT).await, "the local socket closed");
-        // Relay only off on a local link: kept, no reconnect.
-        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: false })
-            .await;
-        assert_eq!(peer.next("transportPolicyAck").await["data"], stored(false));
-        assert!(!record(&profile).relay_only);
-        assert!(app.astation_connected);
+        assert_eq!(results(&peer), 1, "the result arrived before the close");
     });
 }
 
-/// While an Astation operation runs on the local link, relay only is stored
-/// and acknowledged at once (a repeat too) but the link stays until the
-/// operation ends; then it is dropped, once.
+/// While an Astation operation runs on the local link, the drop waits until
+/// it ends; then the link is dropped, once.
 #[test]
 fn relay_only_waits_for_the_operation_on_the_local_link() {
     local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
+        // The runtime's own profile: relay-only decisions read it.
+        let profile = crate::config::AtemConfig::config_dir();
         paired(&profile);
         let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        let (tx, _op) = mpsc::channel(4);
-        app.op_route = Some(crate::app::op_route::OpRoute {
-            link_gen: app.astation_link_gen,
-            tx,
-            encryption: false,
-            credentials: false,
-        });
-        for _ in 0..2 {
-            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-                .await;
-            assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
-        }
-        assert!(record(&profile).relay_only);
+        let _op = op_on_link(&mut app);
+        commit(&mut app, &profile, true, true);
+        commit(&mut app, &profile, true, true);
         app.process_astation_messages().await;
         assert!(app.astation_connected, "the operation keeps its link");
         assert!(!peer.drain(Duration::from_millis(200)).await);
         app.close_op_route();
-        app.process_astation_messages().await;
-        assert!(!app.astation_connected, "dropped once the operation ended");
+        pass_until_dropped(&mut app, WAIT).await;
         assert!(app.astation_reconnect_at.is_some());
-        assert!(app.relay_only_drop.is_none());
         assert!(peer.drain(WAIT).await, "the local socket closed");
-        assert_eq!(acks(&peer).len(), 2);
+        assert_eq!(results(&peer), 2);
     });
 }
 
@@ -1553,22 +1768,18 @@ async fn pass_until_dropped(app: &mut App, limit: Duration) {
     assert!(app.relay_only_drop.is_none());
 }
 
-/// Relay only on a local link with no operation: the pass returns at once
-/// while the writer holds the ack and keeps the link; once the ack is
-/// written the link is dropped; the peer gets the ack, then the close.
+/// The pass returns at once while the writer holds the result and keeps the
+/// link; once the result is written the link is dropped; the peer gets the
+/// result, then the close.
 #[test]
-fn relay_only_immediate_drop_waits_for_the_ack_without_holding_the_pass() {
+fn relay_only_drop_waits_for_the_result_without_holding_the_pass() {
     local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
+        // The runtime's own profile: relay-only decisions read it.
+        let profile = crate::config::AtemConfig::config_dir();
         paired(&profile);
         let (mut app, mut peer) = linked_app(&profile, local_via()).await;
         let paused = app.astation_client.pause_writer_for_test();
-        let started = Instant::now();
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        assert!(started.elapsed() < Duration::from_secs(1), "never waits");
-        assert!(record(&profile).relay_only);
+        commit(&mut app, &profile, true, true);
         for _ in 0..10 {
             let pass = Instant::now();
             app.process_astation_messages().await;
@@ -1576,21 +1787,16 @@ fn relay_only_immediate_drop_waits_for_the_ack_without_holding_the_pass() {
                 pass.elapsed() < Duration::from_secs(1),
                 "the pass never waits"
             );
-            assert!(app.astation_connected, "the ack isn't written yet");
+            assert!(app.astation_connected, "the result isn't written yet");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!peer.drain(Duration::from_millis(100)).await);
-        assert!(acks(&peer).is_empty(), "held by the writer");
+        assert_eq!(results(&peer), 0, "held by the writer");
         paused.resume();
         pass_until_dropped(&mut app, WAIT).await;
         assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
-        assert!(app.astation_reconnect_at.is_some());
         assert!(peer.drain(WAIT).await, "the local socket closed");
-        assert_eq!(
-            acks(&peer),
-            vec![stored(true)],
-            "the ack arrived before the close"
-        );
+        assert_eq!(results(&peer), 1, "the result arrived before the close");
     });
 }
 
@@ -1606,112 +1812,79 @@ fn op_on_link(app: &mut App) -> mpsc::Receiver<AstationMessage> {
     rx
 }
 
-/// The deferred drop keeps a delivery barrier: the operation ends while the
-/// writer still holds the ack, so the link stays (the pass never waits for
-/// it) until the ack is written; the peer gets the ack, then the close.
+/// A result never written (the writer holds it), or never even handed to
+/// the writer (its channel's queue is behind): the drop still happens, 5 s
+/// after no operation runs on the link.
 #[test]
-fn relay_only_deferred_drop_waits_for_the_ack_to_be_written() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        let _op = op_on_link(&mut app);
-        let paused = app.astation_client.pause_writer_for_test();
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        assert!(record(&profile).relay_only);
-        app.close_op_route();
-        for _ in 0..10 {
-            let started = Instant::now();
-            app.process_astation_messages().await;
+fn relay_only_gives_up_on_the_result_after_5_s() {
+    for written in [true, false] {
+        local(async {
+            let profile = crate::config::AtemConfig::config_dir();
+            paired(&profile);
+            let (mut app, _peer) = linked_app(&profile, local_via()).await;
+            let _op = op_on_link(&mut app);
+            // Held, never resumed (the real writer stays alive).
+            let _paused = app.astation_client.pause_writer_for_test();
+            commit(&mut app, &profile, true, written);
+            app.close_op_route();
+            let ended = Instant::now();
+            pass_until_dropped(&mut app, Duration::from_secs(8)).await;
             assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "the pass never waits"
+                ended.elapsed() >= Duration::from_secs(5),
+                "written {written}"
             );
-            assert!(app.astation_connected, "the ack isn't written yet");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(!peer.drain(Duration::from_millis(100)).await);
-        assert!(acks(&peer).is_empty(), "held by the writer");
-        paused.resume();
-        let started = Instant::now();
-        while app.astation_connected {
-            assert!(started.elapsed() < WAIT, "dropped once the ack was written");
-            app.process_astation_messages().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(app.astation_reconnect_at.is_some());
-        assert!(app.relay_only_drop.is_none());
-        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
-        assert!(peer.drain(WAIT).await, "the local socket closed");
-        assert_eq!(
-            acks(&peer),
-            vec![stored(true)],
-            "the ack arrived before the close"
-        );
-    });
+            assert!(app.astation_reconnect_at.is_some());
+            assert_eq!(
+                app.status_message.as_deref(),
+                Some(RELAY_ONLY_RECONNECT),
+                "dropped for relay only, not a closed socket"
+            );
+        });
+    }
 }
 
-/// A deferred drop whose ack is never written still happens, 5 s after the
-/// operation ended (the same bound as the immediate path's flush).
+/// A drop is cancelled by a later committed `false` (also while the `true`
+/// result is held), checked again at the close (a policy that allows local
+/// by then), and forgotten when its link is replaced.
 #[test]
-fn relay_only_deferred_drop_gives_up_on_the_ack_after_5_s() {
+fn relay_only_drop_is_cancelled_by_false_and_fenced_by_a_new_link() {
     local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let (mut app, _peer) = linked_app(&profile, local_via()).await;
-        let _op = op_on_link(&mut app);
-        // Held, never resumed (the real writer stays alive).
-        let _paused = app.astation_client.pause_writer_for_test();
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        app.close_op_route();
-        let ended = Instant::now();
-        while app.astation_connected {
-            assert!(ended.elapsed() < Duration::from_secs(8));
-            app.process_astation_messages().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ended.elapsed() >= Duration::from_secs(5));
-        assert!(app.astation_reconnect_at.is_some());
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some(RELAY_ONLY_RECONNECT),
-            "dropped for relay only, not a closed socket"
-        );
-    });
-}
-
-/// A deferred drop is cancelled by a later stored `false`, and forgotten
-/// when its link is replaced (it never drops another link).
-#[test]
-fn relay_only_deferred_drop_is_cancelled_by_false_and_fenced_by_a_new_link() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
+        // The runtime's own profile: relay-only decisions read it.
+        let profile = crate::config::AtemConfig::config_dir();
         paired(&profile);
         // Cancelled by false.
         let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        let _op = op_on_link(&mut app);
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: false })
-            .await;
-        assert!(app.relay_only_drop.is_none());
-        app.close_op_route();
+        let paused = app.astation_client.pause_writer_for_test();
+        commit(&mut app, &profile, true, true);
         app.process_astation_messages().await;
-        assert!(app.astation_connected, "false cancelled the drop");
-        peer.drain(Duration::from_millis(200)).await;
-        assert_eq!(acks(&peer), vec![stored(true), stored(false)]);
-        assert!(!record(&profile).relay_only);
+        assert!(app.relay_only_drop.is_some(), "waiting for the result");
+        commit(&mut app, &profile, false, true);
+        assert!(app.relay_only_drop.is_none(), "cancelled");
+        paused.resume();
+        for _ in 0..20 {
+            app.process_astation_messages().await;
+            peer.drain(Duration::from_millis(20)).await;
+        }
+        assert!(app.astation_connected, "kept");
+        assert!(!peer.closed);
+        assert_eq!(results(&peer), 2);
+        // The policy allows local by the close (changed without a commit
+        // reaching the App): the close is skipped.
+        let (mut app, _peer) = linked_app(&profile, local_via()).await;
+        commit(&mut app, &profile, true, true);
+        set_policy(&profile, false);
+        for _ in 0..20 {
+            app.process_astation_messages().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(app.astation_connected, "checked again at the close");
+        assert!(app.relay_only_drop.is_none());
         // Fenced: the link is replaced before the operation ends.
         let (mut app, _old) = linked_app(&profile, local_via()).await;
         let _op = op_on_link(&mut app);
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
+        commit(&mut app, &profile, true, false);
         assert!(app.relay_only_drop.is_some());
+        set_policy(&profile, false);
         let (url, mut new) = Peer::listen().await;
         app.astation_client = link_to(&profile, &url, local_via()).await;
         app.astation_link_gen += 1;
@@ -1738,32 +1911,38 @@ async fn land_local_link(app: &mut App, url: &str) {
     app.astation_connect_rx = Some(rx);
 }
 
-/// A local link landing while the stored record says relay only (it
-/// changed after the connect loop read it) is dropped by the next pass,
-/// without an ack.
+/// A local link landing while the host policy says relay only (it changed
+/// after the connect loop read it), or a write of it is uncertain, is
+/// dropped by the next pass.
 #[test]
 fn a_local_link_landing_under_relay_only_is_dropped() {
-    local(async {
-        let config = crate::config::AtemConfig::config_dir();
-        paired(&config);
-        let (url, mut peer) = Peer::listen().await;
-        let mut app = App::new();
-        app.last_session_refresh = Some(Instant::now());
-        app.astation_reconnect = false;
-        land_local_link(&mut app, &url).await;
-        crate::pairing::tests::edit(&config, |record| record.relay_only = true);
-        app.poll_astation_connect();
-        assert!(app.astation_connected);
-        assert!(app.relay_only_drop_pending());
-        pass_until_dropped(&mut app, WAIT).await;
-        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
-        assert!(peer.drain(WAIT).await, "the local socket closed");
-        assert!(acks(&peer).is_empty(), "no ack without a policy message");
-    });
+    for pending in [false, true] {
+        local(async {
+            let config = crate::config::AtemConfig::config_dir();
+            paired(&config);
+            let (url, mut peer) = Peer::listen().await;
+            let mut app = App::new();
+            app.last_session_refresh = Some(Instant::now());
+            app.astation_reconnect = false;
+            land_local_link(&mut app, &url).await;
+            if pending {
+                let paths = crate::paths::ProfilePaths::in_dir(&config).pairing;
+                std::fs::write(&paths.host_policy_pending, b"{}").unwrap();
+            } else {
+                set_policy(&config, true);
+            }
+            app.poll_astation_connect();
+            assert!(app.astation_connected);
+            assert!(app.relay_only_drop_pending());
+            pass_until_dropped(&mut app, WAIT).await;
+            assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
+            assert!(peer.drain(WAIT).await, "the local socket closed");
+        });
+    }
 }
 
 /// A config.toml that doesn't parse is not a damaged pairing record: a
-/// local link landing under a readable record that allows local stays (no
+/// local link landing under a readable record and no policy stays (no
 /// drop, so no reconnect loop).
 #[test]
 fn a_broken_config_toml_never_drops_a_local_link() {
@@ -1793,219 +1972,62 @@ fn a_broken_config_toml_never_drops_a_local_link() {
     });
 }
 
-/// A stored `false` after the operation ended, while the writer still holds
-/// the `true` ack (the 5 s window running), cancels the drop: the link stays
-/// once both acks are written.
-#[test]
-fn a_stored_false_while_the_ack_is_held_cancels_the_drop() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        let _op = op_on_link(&mut app);
-        let paused = app.astation_client.pause_writer_for_test();
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        app.close_op_route();
-        app.process_astation_messages().await;
-        assert!(app.astation_connected, "the ack is held");
-        assert!(app.relay_only_drop.is_some(), "waiting for the ack");
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: false })
-            .await;
-        assert!(app.relay_only_drop.is_none(), "cancelled");
-        paused.resume();
-        for _ in 0..20 {
-            app.process_astation_messages().await;
-            peer.drain(Duration::from_millis(20)).await;
-        }
-        assert!(app.astation_connected, "kept");
-        assert!(!peer.closed);
-        assert_eq!(acks(&peer), vec![stored(true), stored(false)]);
-        assert!(!record(&profile).relay_only);
-    });
-}
-
 /// No Astation operation is handed a local link relay only is about to
 /// drop: it waits for the next link.
 #[test]
 fn no_operation_gets_a_link_relay_only_is_dropping() {
     local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
+        // The runtime's own profile: relay-only decisions read it.
+        let profile = crate::config::AtemConfig::config_dir();
         paired(&profile);
         let (mut app, _peer) = linked_app(&profile, local_via()).await;
         let _paused = app.astation_client.pause_writer_for_test();
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
+        commit(&mut app, &profile, true, true);
         assert!(app.relay_only_drop_pending());
         assert!(app.open_op_route(false, false).is_none());
         assert!(app.op_route.is_none());
         // A relay link (the next one) is handed out.
         let (mut app, _peer) = linked_app(&profile, relay()).await;
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
+        commit(&mut app, &profile, true, true);
         assert!(!app.relay_only_drop_pending());
         assert!(app.open_op_route(false, false).is_some());
     });
 }
 
-/// A record that can't be written: `stored: false` with `save_failed`,
-/// nothing stored, and the local link stays.
+/// The plaintext policy of earlier builds is refused as a removed op: no
+/// effect, nothing stored, the local link stays (§R9.8a).
 #[test]
-fn transport_policy_save_failure_is_acked_save_failed() {
+fn the_plaintext_transport_policy_is_refused_with_no_effect() {
     local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
+        // The runtime's own profile: relay-only decisions read it.
+        let profile = crate::config::AtemConfig::config_dir();
         paired(&profile);
         let (mut app, mut peer) = linked_app(&profile, local_via()).await;
-        let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
-        let before = std::fs::read(&paths.record).unwrap();
-        let _failing = crate::memory::crypto::fail_writes_to(&paths.record);
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        let ack = peer.next("transportPolicyAck").await;
-        assert_eq!(ack["data"], not_stored(true, "save_failed"));
-        assert_eq!(
-            std::fs::read(&paths.record).unwrap(),
-            before,
-            "nothing stored"
-        );
-        assert!(!record(&profile).relay_only);
-        app.process_astation_messages().await;
-        assert!(app.astation_connected, "no disconnect");
-        assert!(app.relay_only_drop.is_none());
-        assert!(!peer.drain(Duration::from_millis(200)).await);
-        assert!(
-            app.status_message
-                .unwrap()
-                .starts_with("Transport policy not saved")
-        );
-    });
-}
-
-/// A repeated value is acknowledged `stored: true` without rewriting the
-/// record (same inode); the binding and session are still checked (a stale
-/// link's repeat is `pairing_changed`).
-#[test]
-fn a_repeated_transport_policy_is_not_rewritten() {
-    use std::os::unix::fs::MetadataExt;
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
-        let inode = || std::fs::metadata(&paths.record).unwrap().ino();
-        let (mut app, mut peer) = linked_app(&profile, relay()).await;
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
-        let written = inode();
-        {
-            // Even a write that would fail is not attempted.
-            let _failing = crate::memory::crypto::fail_writes_to(&paths.record);
-            app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-                .await;
-            assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
-        }
-        assert_eq!(inode(), written, "not rewritten");
-        // A stale link's repeat is still refused.
-        let src = crate::profile::Sources::in_dir(&profile);
-        crate::pairing::unpair(&src).unwrap();
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        assert_eq!(
-            peer.next("transportPolicyAck").await["data"],
-            not_stored(true, "pairing_changed")
-        );
-    });
-}
-
-/// A policy arriving while the link re-authenticates is dropped like every
-/// other request; Astation's resend after the authentication is applied.
-#[test]
-fn transport_policy_during_re_authentication_is_dropped_then_applied() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let (mut app, mut peer) = linked_app(&profile, relay()).await;
-        app.astation_reauth = Some(Instant::now() + Duration::from_secs(15));
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        peer.drain(Duration::from_millis(200)).await;
-        assert!(acks(&peer).is_empty(), "{:#?}", peer.seen);
-        assert!(!record(&profile).relay_only);
-        // Authenticated again; Astation sends it after every authentication.
-        app.astation_reauth = None;
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        assert_eq!(peer.next("transportPolicyAck").await["data"], stored(true));
-        assert!(record(&profile).relay_only);
-    });
-}
-
-/// A replaced connection: what the old link still had queued is never read
-/// (no ack, no effect); the new link's policies apply in order, the later
-/// one winning.
-#[test]
-fn the_later_link_s_transport_policy_wins() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let (mut app, mut old) = linked_app(&profile, relay()).await;
-        old.send(&AstationMessage::TransportPolicy { relay_only: true });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // The link is replaced (a reconnect) before the old one's message is read.
-        app.drop_astation_link("replaced".into());
-        let (url, mut new) = Peer::listen().await;
-        app.astation_client = link_to(&profile, &url, relay()).await;
-        app.astation_connected = true;
-        app.astation_link_gen += 1;
-        new.send(&AstationMessage::TransportPolicy { relay_only: true });
-        new.send(&AstationMessage::TransportPolicy { relay_only: false });
-        for _ in 0..50 {
+        peer.to_atem
+            .send(r#"{"type":"transportPolicy","data":{"relay_only":true}}"#.into())
+            .unwrap();
+        for _ in 0..10 {
             app.process_astation_messages().await;
-            if acks(&new).len() == 2 {
-                break;
-            }
-            new.drain(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(acks(&new), vec![stored(true), stored(false)]);
-        assert!(!record(&profile).relay_only, "the later value");
-        old.drain(Duration::from_millis(200)).await;
-        assert!(
-            acks(&old).is_empty(),
-            "the old link's message was never applied"
+        peer.drain(Duration::from_millis(200)).await;
+        let refusal = peer
+            .seen
+            .iter()
+            .find(|m| m["type"] == "session")
+            .expect("answered");
+        assert_eq!(refusal["data"]["code"], "unsupported_version", "{refusal}");
+        assert_eq!(
+            refusal["data"]["detail"],
+            crate::app::hosted::REMOVED_POLICY_OP
         );
+        let paths = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        assert!(!paths.host_policy.exists(), "nothing stored");
+        assert!(app.astation_connected && app.relay_only_drop.is_none());
     });
 }
 
-/// The ack's flush gives up after 5 s (a writer that never writes): the
-/// local link is dropped anyway, with the policy stored.
-#[test]
-fn relay_only_drops_the_local_link_when_the_ack_flush_times_out() {
-    local(async {
-        let dir = short_dir();
-        let profile = dir.path().join("profile");
-        paired(&profile);
-        let (mut app, _peer) = linked_app(&profile, local_via()).await;
-        // Held, never resumed (the real writer stays alive).
-        let _paused = app.astation_client.pause_writer_for_test();
-        let started = Instant::now();
-        app.handle_astation_message(AstationMessage::TransportPolicy { relay_only: true })
-            .await;
-        assert!(started.elapsed() < Duration::from_secs(1), "never waits");
-        assert!(record(&profile).relay_only);
-        pass_until_dropped(&mut app, Duration::from_secs(8)).await;
-        assert!(started.elapsed() >= Duration::from_secs(5));
-        assert_eq!(app.status_message.as_deref(), Some(RELAY_ONLY_RECONNECT));
-        assert!(app.astation_reconnect_at.is_some());
-    });
-}
-
-/// The connect loop skips the local `astation_ws` while the stored policy
+/// The connect loop skips the local `astation_ws` while the host policy
 /// says relay only, also in a new App (a restarted runtime); with the relay
 /// unreachable it fails without trying local and retries in 30 s (no spin).
 /// Without relay only it tries local.
@@ -2015,16 +2037,7 @@ fn the_connect_loop_skips_local_while_relay_only() {
         local(async {
             let config = crate::config::AtemConfig::config_dir();
             paired(&config);
-            {
-                // Stored by an earlier runtime's link.
-                let (mut app, mut peer) = linked_app(&config, relay()).await;
-                app.handle_astation_message(AstationMessage::TransportPolicy { relay_only })
-                    .await;
-                assert_eq!(
-                    peer.next("transportPolicyAck").await["data"],
-                    stored(relay_only)
-                );
-            }
+            set_policy(&config, relay_only);
             let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             std::fs::write(
                 config.join("config.toml"),
@@ -2056,11 +2069,11 @@ fn the_connect_loop_skips_local_while_relay_only() {
 }
 
 /// An unreadable pairing record is not "no pairing": the connect loop
-/// tries neither the local `astation_ws` (it might say relay only) nor the
-/// relay (no Astation id), says why (to a waiting operation and in the
-/// status) and retries in 30 s; a new App (a restarted runtime) does the
-/// same. A missing record tries local (first pairing); a readable relay-only
-/// one tries only the relay (the listeners do see attempts).
+/// tries neither the local `astation_ws` nor the relay (no Astation id),
+/// says why (to a waiting operation and in the status) and retries in 30 s;
+/// a new App (a restarted runtime) does the same. A missing record tries
+/// local (first pairing); a readable record under relay only tries only the
+/// relay (the listeners do see attempts).
 #[test]
 fn the_connect_loop_never_tries_local_with_an_unreadable_record() {
     for case in ["damaged", "missing", "relay_only"] {
@@ -2075,7 +2088,7 @@ fn the_connect_loop_never_tries_local_with_an_unreadable_record() {
                 }
                 "relay_only" => {
                     paired(&config);
-                    crate::pairing::tests::edit(&config, |record| record.relay_only = true);
+                    set_policy(&config, true);
                 }
                 _ => {}
             }
@@ -2176,7 +2189,7 @@ fn the_runtime_is_not_replaced_while_an_operation_runs() {
         let (url, mut peer) = Peer::listen().await;
         let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir.clone(), Some(&url), Arc::new(test_agent(&keys))).await;
-        let (mut op, question, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let (mut op, question, _, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
         let mut other = rt.client().await;
         other.send(&ClientMsg::Restart).await.unwrap();
         let refused = expect(&mut other, |m| match m {
@@ -2209,6 +2222,299 @@ fn the_runtime_is_not_replaced_while_an_operation_runs() {
         // The operation goes on.
         op.answer(question, AnswerValue::No).await;
         assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        rt.shutdown().await;
+    });
+}
+
+/// r9 (no compatibility): an Astation whose `verifyKeys` names no device
+/// list can't pair; Atem aborts the verification and pins nothing.
+#[test]
+fn a_verify_keys_without_a_genesis_is_refused() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        peer.next("verifyCommit").await;
+        let fake = FakeAstation::new();
+        peer.send(&AstationMessage::VerifyKeys {
+            sign_pub: STANDARD.encode(fake.sign_pub()),
+            enc_pub: STANDARD.encode(fake.enc_pub()),
+            recovery_sign_pub: STANDARD.encode([6u8; 32]),
+            nonce: STANDARD.encode([7u8; 32]),
+            genesis_hash: None,
+        });
+        let abort = peer.next("verifyAbort").await;
+        assert_eq!(
+            abort["data"]["reason"],
+            "Atem needs a device list (atem-session r9)"
+        );
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!pending(&rt.keys()), "no pending pin");
+        rt.shutdown().await;
+    });
+}
+
+/// Every `atem pair verify` ceremony runs in the next host trust
+/// generation (durable before `verifyCommit`): a retry after an aborted
+/// ceremony reveals a fresh `host_channel_key`, which Astation can only add
+/// at a higher generation than an `add_host` it may already have signed.
+/// The pairing (Astation, session) is kept and the link stays current.
+#[test]
+fn each_verification_runs_in_the_next_trust_generation_and_keeps_the_pairing() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let start = trust_gen(&rt.profile);
+        let session = record(&rt.profile).session.unwrap().session_id;
+        for attempt in 1..=2u64 {
+            let mut op =
+                Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+            let commit = peer.next("verifyCommit").await;
+            assert_eq!(
+                commit["data"]["host_trust_gen"],
+                start + attempt,
+                "attempt {attempt}: {commit}"
+            );
+            assert_eq!(trust_gen(&rt.profile), start + attempt, "durable first");
+            // Astation cancels this attempt (as an aborted ceremony).
+            peer.send(&AstationMessage::VerifyAbort {
+                reason: "cancelled".into(),
+            });
+            assert!(op.done().await.is_err());
+            assert_eq!(record(&rt.profile).astation_id, ASTATION);
+            assert_eq!(
+                record(&rt.profile).session.unwrap().session_id,
+                session,
+                "the pairing and its session stay"
+            );
+        }
+        rt.shutdown().await;
+    });
+}
+
+/// The rebind persists across a runtime restart: after an aborted
+/// ceremony the runtime stops; a new runtime's `pair verify` goes one
+/// generation higher again.
+#[test]
+fn the_next_generation_survives_a_runtime_restart() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir.clone(), Some(&url), Arc::new(test_agent(&keys))).await;
+        let start = trust_gen(&rt.profile);
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        assert_eq!(
+            peer.next("verifyCommit").await["data"]["host_trust_gen"],
+            start + 1
+        );
+        peer.send(&AstationMessage::VerifyAbort {
+            reason: "cancelled".into(),
+        });
+        assert!(op.done().await.is_err());
+        rt.shutdown().await;
+        // The old runtime's socket file (a real restart replaces it too).
+        let _ = std::fs::remove_file(dir.path().join("rt.sock"));
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        assert_eq!(
+            trust_gen(&rt.profile),
+            start + 1,
+            "durable across the restart"
+        );
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        assert_eq!(
+            peer.next("verifyCommit").await["data"]["host_trust_gen"],
+            start + 2
+        );
+        peer.send(&AstationMessage::VerifyAbort {
+            reason: "cancelled".into(),
+        });
+        assert!(op.done().await.is_err());
+        rt.shutdown().await;
+    });
+}
+
+/// A save error during the rebind (before or after the rename) ends the
+/// operation before `verifyCommit`: nothing is sent, nothing is lowered.
+#[test]
+fn a_failed_rebind_sends_no_verify_commit() {
+    for after_rename in [false, true] {
+        local(async {
+            let dir = Rc::new(short_dir());
+            paired(&dir.path().join("profile"));
+            let (url, mut peer) = Peer::listen().await;
+            let keys = CredPaths::in_dir(&dir.path().join("profile"));
+            let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+            let start = trust_gen(&rt.profile);
+            let record = crate::paths::ProfilePaths::in_dir(&rt.profile)
+                .pairing
+                .record;
+            let (_before, _after);
+            if after_rename {
+                _after = Some(crate::memory::crypto::fail_after_rename(&record));
+            } else {
+                _before = Some(crate::memory::crypto::fail_writes_to(&record));
+            }
+            let mut op =
+                Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+            assert!(op.done().await.is_err(), "after_rename {after_rename}");
+            peer.drain(Duration::from_millis(300)).await;
+            assert!(
+                !peer.seen.iter().any(|m| m["type"] == "verifyCommit"),
+                "after_rename {after_rename}: no verifyCommit"
+            );
+            assert!(trust_gen(&rt.profile) >= start, "never lower");
+            rt.shutdown().await;
+        });
+    }
+}
+
+/// r9: a device list whose `add_host` names another key than the one this
+/// ceremony revealed is refused; the verification fails and nothing is
+/// pinned or trusted.
+#[test]
+fn a_device_list_for_another_host_key_fails_the_verification() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let verifier = Verifier::keys(&mut peer, "acct-op").await;
+        let reveal = peer.next("verifyReveal").await;
+        assert!(reveal["data"]["host_channel_pub"].is_string());
+        verifier.log.borrow_mut().add_host_pub(
+            &verifier.device_id,
+            trust_gen(&rt.profile),
+            &[9; 32],
+        );
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        let certificate = match verifier.certificate_for(&reveal) {
+            AstationMessage::DeviceVerified {
+                device_verified,
+                account_state,
+                grants,
+                ..
+            } => AstationMessage::DeviceVerified {
+                device_verified,
+                account_state,
+                grants,
+                membership: Some(json!({"entries": verifier.log.borrow().wire()})),
+            },
+            _ => unreachable!(),
+        };
+        peer.send(&certificate);
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            abort["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("host key or trust generation"),
+            "{abort}"
+        );
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
+        rt.shutdown().await;
+    });
+}
+
+/// r9 (§R9.2, `r9-vectors-pairing` "another generation"): an `add_host`
+/// naming another generation than `verifyCommit` advertised (tampered or
+/// mismatched) is refused; nothing is pinned or trusted.
+#[test]
+fn an_add_host_for_another_generation_fails_the_verification() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let verifier = Verifier::keys(&mut peer, "acct-op").await;
+        assert_eq!(verifier.advertised, trust_gen(&rt.profile));
+        let reveal = peer.next("verifyReveal").await;
+        let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
+            reveal["data"]["host_channel_pub"].as_str().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        verifier.log.borrow_mut().add_host_pub(
+            &verifier.device_id,
+            verifier.advertised + 1,
+            &host_pub,
+        );
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        peer.send(&verifier.certificate_for(&reveal));
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            abort["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("host key or trust generation"),
+            "{abort}"
+        );
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists());
+        assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
+        rt.shutdown().await;
+    });
+}
+
+/// Re-review F4: an unreadable `frozen_genesis` is found before the codes
+/// are compared and Touch ID is asked: Atem aborts right after
+/// `verifyKeys` with a short reason (no local path), shows the remedy
+/// locally, and pins nothing.
+#[test]
+fn an_unreadable_frozen_genesis_aborts_before_touch_id() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&dir.path().join("profile")).pairing;
+        crate::paths::write_test_file(&pairing.frozen_genesis, b"{not json");
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let _verifier = Verifier::keys(&mut peer, "acct-op").await;
+        // The next message is the abort: no reveal, no question.
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            !peer.seen.iter().any(|m| m["type"] == "verifyReveal"),
+            "aborted before the reveal (no codes, no Touch ID)"
+        );
+        let reason = abort["data"]["reason"].as_str().unwrap();
+        assert_eq!(reason, crate::runtime::ops::FROZEN_GENESIS_UNREADABLE);
+        assert!(
+            reason.chars().count() <= 200 && !reason.contains('/'),
+            "{reason}"
+        );
+        op.printed(
+            "remove pairing/frozen_genesis and runtime/journal/frozen_genesis in Atem's config \
+             directory (~/.config/atem by default)",
+        )
+        .await;
+        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!pending(&rt.keys()), "no pending pin");
         rt.shutdown().await;
     });
 }
