@@ -1,4 +1,9 @@
-# Voice chat and brainstorm with project context
+# Talk to Your Project: voice discussion with project context
+
+A voice conversation about the project you're building: grounded in the
+project's own context, with tool calls that ask the coding agent in Atem for
+more information or hand it work. It replaces the earlier voice-coding
+pipeline (`voice-coding-stages.md`, removed).
 
 Status: proposed (user decisions, 2026-10-17). Not scheduled. Its
 prerequisites (chat-v1, the Codex adapter, approvals) are released in Atem v0.8.0 (2026-10-31).

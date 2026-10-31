@@ -28,13 +28,13 @@ Built and usable today, but not yet at their best — actively being improved.
 
 [Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates [Chisel](https://github.com/Agora-Build/chisel), atem, and AI agents — it receives annotation tasks from the browser, routes them to the right atem instance, and tracks task status. The integration is partially wired and maturing alongside Astation.
 
-### Voice-Driven Coding
-
-Speak to code: Astation captures audio, a ConvoAI agent transcribes it, atem routes the text to Claude Code for implementation, and responses flow back as speech. End-to-end plumbing exists; it's being hardened into a smooth workflow.
-
 ## Under discussion
 
 Not committed yet — being shaped before they become roadmap items. Opinions welcome.
+
+### Talk to Your Project
+
+A voice conversation about what you're building, from your phone or Mac: ask what's going on, brainstorm, and decide what's next, with answers grounded in the project's own context (decisions, design docs, commits and session summaries that Atem curates and, per project and opt-in, uploads for retrieval). When the conversation turns into work, the voice agent uses tool calls to reach the coding agent running in Atem: it asks Claude Code or Codex for more information (live status, its latest replies) or, after reading the request back to you, hands it a task, then tells you when the turn completes. Approvals stay taps on your phone, never voice. An Astation feature on top of Atem's agent chat, approvals and r9 remote access (all shipped); it replaces the earlier voice-coding pipeline, which was removed. Design: [designs/voice-context.md](designs/voice-context.md).
 
 ### `atem serv agent <github-repo-url>`
 
