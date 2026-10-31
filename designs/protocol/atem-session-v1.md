@@ -1,6 +1,8 @@
 # atem-session v1: sessions, control leases, receipts and approvals (r8: revision admission, chat history pages, receipt results, chat Send acquire, lease-free approvals)
 
-Status: **r8 is implemented in Atem and authoritative** (2026-10-18). The
+Status: **r8 and r9 are implemented in Atem and released in Atem v0.8.0 (2026-10-31)**; r9
+(the appendix "r9") is authoritative on a host with a device list, which
+refuses r8; r8 (2026-10-18) stays for hosts without one. The
 appendix "r8" at the end is the contract wherever it differs from the r7.3
 text above it: required `hello.revision: 8` and `welcome.features` (§A),
 history pages in the sequenced stream with bounded selectors and coverage
@@ -8,12 +10,13 @@ history pages in the sequenced stream with bounded selectors and coverage
 chat Send that acquires the lease with the prompt (`chat.send_acquire`, §F),
 lease-free approval answers (`approval.lease_free`, §G), the submitter
 principal and its durable control fence (§H) and one admission persistence
-rule (§I, which removes §6's double-I/O exception). Atem's host speaks only
-r8: a `hello` without `revision: 8` is refused, so Astation must send it.
+rule (§I, which removes §6's double-I/O exception). Without a device list
+Atem's host speaks only r8: a `hello` without `revision: 8` is refused.
 The shared fixtures and where they run are in `atem-host-handoff.md`; the
 consolidated Astation note is `r8-astation-handoff.md`.
-**r9 (signed off 2026-10-19; implemented by Atem 2026-10-20, PR #89, not
-yet merged):** the appendix "r9" at the end specifies remote clients that
+**r9 (signed off 2026-10-19; implemented by Atem 2026-10-20, PR #89, merged
+into `main` and released in v0.8.0 on 2026-10-31; joint live tests with
+Astation passed):** the appendix "r9" at the end specifies remote clients that
 reach Atem without the Mac (native members, scoped services, browser
 grants) over the end-to-end channel `atem-ch1`, authorized by a signed
 membership log pinned at pairing. Atem implements it in `atem-client`
@@ -603,7 +606,9 @@ refused.
 
 - **Closing without the remote answer** (`approval_closed`, the card goes
   away, push resolved): `answered_terminal` (answered in the agent's own
-  prompt first), `interrupted` (Esc, or the hook was killed), `timed_out`
+  prompt first; the agents name no call in their permission request, so a
+  tool result never ends a wait: Atem learns it when the local user presses
+  the prefix, then `a`, or from a dismissal), `interrupted` (Esc, or the hook was killed), `timed_out`
   (the hook's limit), `released` (Atem gave the prompt back to the agent:
   input reached a Codex session, which hides its prompt while the hook
   waits, so any input — local, or the lease holder's — first answers the

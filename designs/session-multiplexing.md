@@ -5,7 +5,10 @@ Date: 2026-10-15
 Status: product decisions and all six initial defaults approved by the user on
 2026-10-15. The consolidated CLI workflow below is also approved. Architecture
 recommendations and remaining engineering specifications are identified below.
-This approval records the design; implementation has not started.
+This approval recorded the design (2026-10-15); it has since been
+implemented (the runtime broker and workers, leases and receipts,
+`atem pair verify`, `atem status`) and released in Atem v0.8.0 (2026-10-31); AGENTS.md describes the
+current behaviour.
 
 ## 1. Product decisions
 

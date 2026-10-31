@@ -1,6 +1,8 @@
 # Device Authentication v2
 
 > **Storage superseded (2026-10-19):** the user's login is `~/.config/atem/login.enc` and the one pairing is `~/.config/atem/pairing/` (`pairing.enc`, `trust_gen`); see AGENTS.md "Configuration & Storage". This document is kept as history.
+>
+> **Since then:** pairing is the token-free bootstrap v1 (no credentials during pairing; `atem pair verify` rebinds to the next host trust generation); a verified host with a device list can keep off the local link (r9 **relay only**, §R9.8a) and hold a relay link with no Astation online (the host route proof, §R9.7b); the default Station is `https://station.agora.build` (production; dev profiles set `https://station-dev.agora.build`), and `atem runtime reload` after a Station change drops the old Station's relay link. AGENTS.md is authoritative.
 
 Status: implemented for direct and identity-relay connections. This document is
 the authoritative Atem-side contract. The matching Astation specification is

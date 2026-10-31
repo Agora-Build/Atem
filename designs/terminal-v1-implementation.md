@@ -9,7 +9,8 @@
 > provider ids and the agent list are removed), and sessions outlive the
 > frontend in `atem worker`s. The plain TUI refuses remote session messages.
 
-Updated: 2026-10-13. Status: implemented in Atem; not released.
+Updated: 2026-10-13. Status: implemented in Atem, released in Atem v0.8.0 (2026-10-31) (remote control
+since r6 through session-v1 leases; r8, and r9 on a host with a device list).
 The Astation terminal UI and its acceptance tests remain to be implemented by
 the Astation owner. This document is the integration contract for the first
 host build. It takes precedence over illustrative protocol names in
@@ -46,9 +47,10 @@ stream, or additional network listener.
 - Reverse-video highlights preserve both explicit and terminal-default colors.
   Codex's own startup animation and status spinner remain visible while active;
   the renderer removes cells when the CLI clears them.
-- The default Atem prefix is **Ctrl+]**, then `h` (hide), `g` (take local
-  control), `x` (stop), `r` (redraw), `[` (local history), `c` (copy), or `?`
-  (help and notices). Reopening the same menu entry resumes its PTY. Taking
+- The default Atem prefix is **Ctrl+]**, then `h` or `m` (detach), `g` (take
+  local control), `a` (an approval was answered in the agent's own dialog),
+  `x` (stop), `r` (redraw), `[` (local history), `c` (copy), or `?` (help and
+  notices). Reopening the same menu entry resumes its PTY. Taking
   local control invalidates queued remote input. Press the prefix twice to
   send it literally to the agent; unknown prefixed keys are forwarded.
 - `ATEM_TERMINAL_PREFIX=Ctrl-a` changes the prefix. Choose a prefix that does

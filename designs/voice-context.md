@@ -1,7 +1,15 @@
-# Voice chat and brainstorm with project context
+# Build by Talk: get the whole project clear by talking
 
-Status: proposed (user decisions, 2026-10-17). Not scheduled; follows the
-agent chat work (chat-v1, Codex adapter, approvals).
+Talking is the fastest way to get a whole project clear. Build by Talk is a
+voice conversation that brings you, the project's knowledge and its coding agents
+together: grounded in the project's own context, with tool calls that ask
+the coding agents in Atem for more information or hand them work. It replaces the earlier voice-coding
+pipeline (`voice-coding-stages.md`, removed).
+
+Status: planned (user, 2026-10-31): it will be built; the build starts later
+(not started). Design decisions by the user, 2026-10-17. Its prerequisites
+(chat-v1, the Codex adapter, approvals, r9 remote access) are released in
+Atem v0.8.0 (2026-10-31).
 
 ## Goal
 

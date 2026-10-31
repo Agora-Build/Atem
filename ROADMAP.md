@@ -6,6 +6,12 @@ Where atem is headed. This is a direction, not a contract — items shift as we 
 
 ## Upcoming
 
+### Build by Talk
+
+Talking is the fastest way to get a whole project clear. Build by Talk is a voice conversation, from your phone or Mac, that brings you, the project's knowledge and its coding agents together. Ask where things stand, work through a design, decide what's next. Answers come from the project's own context: decisions, design docs, commits and session summaries, which Atem collects and, per project and opt-in, uploads for retrieval. When a decision turns into work, Build by Talk reaches the coding agents running in Atem through tool calls. It asks Claude Code or Codex for more information (live status, latest replies), or reads a task back to you and hands it over, then tells you when the work is done. Approvals stay taps on your phone, never voice. It's an Astation feature built on Atem's agent chat, approvals and r9 remote access (all shipped), and it replaces the earlier voice-coding pipeline, which was removed.
+
+→ Planned; the build starts later (Astation and Atem). Design: [designs/voice-context.md](designs/voice-context.md).
+
 ### Windows support (PowerShell)
 
 atem ships for Linux and macOS today. Native Windows support means `atem` runs in PowerShell — adding the `windows-msvc` build target, verifying the ConPTY/`portable-pty` path, a Windows daemon-detach pattern, and an `install.ps1`.
@@ -24,17 +30,9 @@ Telephony is provider-agnostic: atem takes generic SIP trunk parameters, so numb
 
 Built and usable today, but not yet at their best — actively being improved.
 
-### AI Agents
-
-`atem agent launch` opens the original Claude Code or Codex CLI in an Atem terminal that Astation can view and control. It works today (see the README), but the implementation is early; reliability and the UX are being refined.
-
 ### Astation Integration
 
 [Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates [Chisel](https://github.com/Agora-Build/chisel), atem, and AI agents — it receives annotation tasks from the browser, routes them to the right atem instance, and tracks task status. The integration is partially wired and maturing alongside Astation.
-
-### Voice-Driven Coding
-
-Speak to code: Astation captures audio, a ConvoAI agent transcribes it, atem routes the text to Claude Code for implementation, and responses flow back as speech. End-to-end plumbing exists; it's being hardened into a smooth workflow.
 
 ## Under discussion
 
@@ -52,7 +50,7 @@ Recent notable additions (see [releases](https://github.com/Agora-Build/Atem/rel
 
 - Atem Memory (`atem sync`, `atem memory`, `atem skill`) — agents share facts and skills across agents and machines, with fact history and offline search
 - `atem vault` — a shared, versioned context store for handing work between agents
-- Remote agent control — Astation types text and control keys into a running Claude Code / Codex session
+- AI agents (`atem agent launch|attach|list|stop`, v0.8.0) — the original Claude Code and Codex CLIs in Atem terminals that outlive the runtime; Astation, your phone and approved services view, control and chat with them over atem-session r9, and answer their permission prompts
 - MCP server support in `convo.toml` — agents can call tools from MCP servers
 - `atem serv files` — serve a directory/file over HTTPS, with Markdown rendering
 - ConvoAI MLLM pipeline (OpenAI Realtime, Gemini Live) end-to-end

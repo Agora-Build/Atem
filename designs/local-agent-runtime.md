@@ -1,6 +1,12 @@
 # Local Coding Agent Runtime
 
-Status: design with an initial Atem host implementation in the worktree (2026-10-13); Astation UI pending.
+Status: historical design (2026-10-13). What it proposed shipped differently:
+the runtime broker and per-session workers (`designs/agent-runtime.md`),
+`atem agent launch|attach|list|stop`, chat and approvals, remote access over
+atem-session r8/r9; released in Atem v0.8.0 (2026-10-31). The body describes the code baseline below
+(e.g. the Ctrl+B path and `agentInput`, both gone); the current prefix is
+Ctrl+] (`h`/`m` detach, `g`, `a`, `x`, `r`, `[`, `c`, `?`) and AGENTS.md is
+authoritative for behaviour.
 
 See [Shared terminal: first Atem build](terminal-v1-implementation.md) for the
 implemented command, exact wire contract, canonical-screen rendering refinement,
