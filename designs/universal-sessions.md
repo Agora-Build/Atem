@@ -1,6 +1,8 @@
 # Portable Device Sessions
 
-> **Storage superseded (2026-10-19):** the user's login is `~/.config/atem/login.enc` and the one pairing is `~/.config/atem/pairing/` (`pairing.enc`, `trust_gen`); see AGENTS.md "Configuration & Storage". This document is kept as history.
+> **Storage superseded (2026-10-19):** the user's login is `~/.config/atem/login.enc` and the one pairing is `~/.config/atem/pairing/` (`pairing.enc`, `trust_gen`); see AGENTS.md "Configuration & Storage". This document is kept as history. There is exactly one pairing at a time
+> (one Astation per Atem, `pairing/pairing.enc`): sessions keyed by several
+> Astation ids below are gone.
 
 Status: implemented by device authentication v2.
 

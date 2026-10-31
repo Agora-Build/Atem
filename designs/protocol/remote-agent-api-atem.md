@@ -1,6 +1,8 @@
 # Remote agent API without the Mac: Atem's response
 
-Status: Atem response **r3**, 2026-10-19. r3: the exact formats now live in
+Status: implemented as atem-session r9 and released in Atem v0.8.0
+(2026-10-31); "Today" and "exists today" below mean the pre-r9 code at
+`0801a4f`. Atem response **r3**, 2026-10-19. r3: the exact formats now live in
 the **r9 appendix** of [atem-session-v1.md](atem-session-v1.md) ("Appendix: r9",
 §R9.1–§R9.13) with fixtures `fixtures/r9-*.json`; where this document and the
 appendix differ, the appendix wins. §10 answers Astation's review of r2 point
@@ -30,7 +32,7 @@ through the Mac; approvals are push-based and need `control`, not the lease
 | 3. Formats and channel | RFC 8785 JSON bodies signed over `enc(domain, jcs)`; `alg` ∈ {`p256`, `ed25519`} pinned per key in the log; one SIGMA-I suite: X25519 ephemerals, both long-term keys sign the transcript, HKDF-SHA256, ChaCha20-Poly1305, strict counters, no rekey, no resumption |
 | 4. Client core | Atem owns `crates/atem-client`: sans-I/O Rust (log verifier, channel both roles, r9 client machines, fixture runner), UniFFI for Swift/Kotlin, wasm-bindgen for browsers and JS bots; the Atem host links the same verifier and channel |
 
-## 2. What exists today (code at `0801a4f`)
+## 2. What existed before r9 (code at `0801a4f`)
 
 | Piece | Where | Today |
 |---|---|---|

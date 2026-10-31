@@ -1,11 +1,11 @@
 # Atem host handoff: atem-session r8 on `feat/r8` (r6 runtime, r7 approvals)
 
-r9 (on `feat/r9`, PR #89): "Shared fixtures (r9) against the real runtime"
+r9 (PR #89, merged into `main` and released in v0.8.0): "Shared fixtures (r9) against the real runtime"
 and "r9 binding and effect contract (for Astation)" below.
 
 ## atem-session r8 on `feat/r8` (2026-10-18)
 
-Atem's host now speaks **r8 only** ([atem-session-v1.md](atem-session-v1.md),
+Atem's host speaks **r8 only** when it has no device list (one with a device list speaks r9 and refuses r8) ([atem-session-v1.md](atem-session-v1.md),
 appendix "r8", authoritative). The consolidated note for the Astation agent,
 with every fixture change, every reading to confirm and the work Astation
 must do, is [r8-astation-handoff.md](r8-astation-handoff.md).
@@ -45,8 +45,8 @@ must do, is [r8-astation-handoff.md](r8-astation-handoff.md).
 
 - Results: all 72 fixtures pass in the core runner; 25 pass against the real
   runtime and 40 can't be expressed there (see "Shared fixtures (r8)").
-- **Pin**: the merge commit of the r8 PR into `main`. Until it merges, pin
-  `feat/r8` at `10e089a`.
+- **Pin**: the merge commit of the r8 PR into `main` (merged; `feat/r8` no
+  longer exists). For r9, pin the release tag `v0.8.0`.
 
 The sections below describe the runtime (r6) and approvals (r7) as they
 were handed over; where they say an answer carries `acquire` or needs the

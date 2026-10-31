@@ -2,7 +2,8 @@
 
 Status: built. MVP: Atem #23, #24; relay Astation #19. Phase 1.1 (**Fact
 validity**, **Search**, **Skill history and restore**): relay side (migrations
-0004/0005) merged and deployed (Astation PR #22); atem `feat/memory-1.1`.
+0004/0005) merged and deployed (Astation PR #22); atem side merged in #26
+(2026-09-30).
 Spans two repos: **Atem** (CLI, local store, adapters, sync client) and
 **Astation** (relay-server `/api/memory`, `/api/skills` + Postgres).
 

@@ -1,8 +1,9 @@
 # Atem runtime: one owner for every agent session and the Astation connection
 
-Status: **implemented on `feat/runtime`** (2026-10-16; plans
+Status: **implemented and released in Atem v0.8.0 (2026-10-31)** (built 2026-10-16; plans
 `designs/plans/2026-10-16-runtime-host-integration.md` and its
-predecessors), not yet released. See "Implementation status" below for what
+predecessors); the host serves atem-session r8, and r9 on a host with a
+device list. See "Implementation status" below for what
 was built and where it deviates from this text. Proposed 2026-10-15
 (decisions A–C agreed with the user). **Superseded where it differs by the approved
 [session-multiplexing.md](session-multiplexing.md)** (Astation + user,
@@ -65,7 +66,7 @@ below disagrees, this section wins.
    workflow, runtime, workers, journal, host lease logic) against that
    contract as it lands.
 
-## Implementation status (feat/runtime, 2026-10-16)
+## Implementation status (built 2026-10-16, released in v0.8.0)
 
 Built as the Alignment section says, not as the older text below where they
 differ:
@@ -81,7 +82,7 @@ differ:
 - **One writer authority.** The broker grants input epochs; the worker drops
   a write whose epoch is older than its current one at the PTY write
   boundary. Local input revokes any remote lease first.
-- **Session host.** The broker runs atem-session r6.2 (compatibility mode,
+- **Session host.** The broker runs atem-session (r6.2 when built; now r8, and r9 on a host with a device list, which refuses r8; compatibility mode,
   `designs/protocol/atem-session-v1.md`) over a `FileJournal` in
   `<config>/runtime/journal/`; the runtime's one Astation link is one
   attachment, new on every connect or re-authentication. Only a paired,
@@ -349,7 +350,7 @@ HTTP-only commands (`atem sync`, `memory`, `skill`, `vault`) are unchanged.
 
 ### Astation-visible changes
 
-Replaced by atem-session r6.2: the complete list of wire-visible changes, and
+Replaced by atem-session r6.2 (now r8/r9): the complete list of wire-visible changes, and
 how to run the host, are in
 [protocol/atem-host-handoff.md](protocol/atem-host-handoff.md). Mark tasks go
 to a live Claude session whose working directory contains
@@ -427,8 +428,8 @@ and controllable in Astation throughout, verification approved with Touch ID.
 ## Delivery
 
 Planned as three PRs released together (step 1 alone would leave a
-long-lived runtime racing a direct `atem pair`). Built instead on one branch,
-`feat/runtime`, by the plans in `designs/plans/2026-10-16-*`; the
+long-lived runtime racing a direct `atem pair`). Built instead on one branch
+(`feat/runtime`, since merged into `main`), by the plans in `designs/plans/2026-10-16-*`; the
 aliases, `agent_id` routing and agent list in step 1 were dropped (atem-session
 r6, no compatibility):
 

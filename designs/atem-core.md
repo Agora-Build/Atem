@@ -1,6 +1,8 @@
 # atem-core: shared token library (Rust API + C ABI)
 
-Status: approved 2026-10-12/13 (handoff from the Astation agent, saved as the
+Status: built and released (since Atem v0.6.15: the xcframework, header and
+SHA-256 sums are attached to every release); the Astation integration is a
+follow-up. Approved 2026-10-12/13 (handoff from the Astation agent, saved as the
 "Shared-library handoff" memories in project github.com/agora-build/atem;
 layout and distribution chosen by the user on 2026-10-13). This document is the
 spec the implementation plan argues from.

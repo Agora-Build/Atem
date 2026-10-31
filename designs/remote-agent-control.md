@@ -9,7 +9,7 @@
 > provider ids and the agent list are removed), and sessions outlive the
 > frontend in `atem worker`s. The plain TUI refuses remote session messages.
 
-Status: legacy focused-PTY input plus initial terminal-v1 host implementation; Astation terminal UI pending
+Status: **historical**. The focused-PTY input it describes (`agentInput`, `agentPrompt`, `voiceCommand`, `voiceRequest`, `handle_agent_input`) was removed in atem-session r6 and is not in any release; everything below that reads as implemented describes the old code. The live path is atem-session r8/r9 ([protocol/atem-session-v1.md](protocol/atem-session-v1.md)), released in Atem v0.8.0 (2026-10-31).
 Owner: Brent G
 Updated: 2026-10-13
 Feasibility review: Atem `538887b`; local Astation checkout HEAD `5460de4`.

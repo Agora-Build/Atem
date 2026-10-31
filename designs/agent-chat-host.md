@@ -1,7 +1,9 @@
 # Agent chat (chat-v1): Atem host side
 
 Status: design approved 2026-10-15; Atem host side built (Claude and Codex
-adapters). atem-session r8 (2026-10-18, implemented) replaces the #75 paging
+adapters) and released in Atem v0.8.0 (2026-10-31), where remote clients also reach it over
+atem-session r9 (end-to-end `atem-ch1` channels; chat-v1 runs unchanged
+inside them). atem-session r8 (2026-10-18, implemented) replaces the #75 paging
 (`open{before}`, `status.page`) with history pages in the sequenced stream,
 adds coverage, receipt results, chat Send that acquires the lease and
 lease-free approval answers; this document describes the r8 behaviour (the

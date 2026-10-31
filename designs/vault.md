@@ -17,7 +17,7 @@ Concretely:
   existing one with `--entry-id`).
 - `atem vault read --vault-id <id>` prints the current contents; `--history`
   shows every version ever written.
-- `atem vault watch --vault-id <id>` blocks and re-renders when another atem
+- (planned, v1.5; not built) `atem vault watch --vault-id <id>` blocks and re-renders when another atem
   writes.
 
 The store is hosted by the **relay-server (station)** and backed by **Postgres**.

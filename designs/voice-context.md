@@ -1,7 +1,7 @@
 # Voice chat and brainstorm with project context
 
-Status: proposed (user decisions, 2026-10-17). Not scheduled; follows the
-agent chat work (chat-v1, Codex adapter, approvals).
+Status: proposed (user decisions, 2026-10-17). Not scheduled. Its
+prerequisites (chat-v1, the Codex adapter, approvals) are released in Atem v0.8.0 (2026-10-31).
 
 ## Goal
 

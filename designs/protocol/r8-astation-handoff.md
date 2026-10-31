@@ -1,5 +1,9 @@
 # atem-session r8: handoff to Astation
 
+Historical (2026-10-18): r8 is merged into `main` and released (v0.8.0,
+which also ships r9; a host with a device list refuses r8). The branch
+`feat/r8` and its pins below no longer exist; pin the release tag.
+
 For the Astation agent, 2026-10-18. Atem's host implements r8 of
 [atem-session-v1.md](atem-session-v1.md) (appendix "r8", now authoritative)
 on branch `feat/r8`. This note is the one place that lists what changed in

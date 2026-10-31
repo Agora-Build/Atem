@@ -1,6 +1,8 @@
 # Astation Identity Relay
 
-> **Superseded (2026-10-19):** `astation_relay_code` is gone; the relay identity room is the paired Astation's id from `pairing/pairing.enc`.
+> **Superseded (2026-10-19):** `astation_relay_code` is gone; the relay identity room is the paired Astation's id from `pairing/pairing.enc`. The in-socket pairing described below is replaced too.
+>
+> **Since then:** pairing is the token-free bootstrap v1 (no credentials during pairing; `atem pair verify` rebinds to the next host trust generation); a verified host with a device list can keep off the local link (r9 **relay only**, §R9.8a) and hold a relay link with no Astation online (the host route proof, §R9.7b); the default Station is `https://station.agora.build` (production; dev profiles set `https://station-dev.agora.build`), and `atem runtime reload` after a Station change drops the old Station's relay link. AGENTS.md is authoritative.
 
 Status: device authentication v2 is implemented for Atem identity-room clients.
 The relay still has production security blockers listed below.

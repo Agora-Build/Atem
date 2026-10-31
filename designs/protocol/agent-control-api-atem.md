@@ -1,6 +1,8 @@
 # Agent control API: Atem's response to Astation's proposal (r2)
 
-Status: Atem response r2, 2026-10-17. r1 answered "Agent control API:
+Status: historical. r8 is implemented and released (v0.8.0, which also ships
+r9); "Today" below means the code at `53577a7`, long superseded. Atem
+response r2, 2026-10-17. r1 answered "Agent control API:
 Astation and Atem joint proposal" r1 ([Astation #52](https://github.com/Agora-Build/Astation/issues/52));
 r2 answers Astation's review of r1 (four required points, accepted
 corrections) and its proposal r2. Baseline: Atem `main` at `53577a7` (#75),

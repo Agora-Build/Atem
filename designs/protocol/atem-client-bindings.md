@@ -1,7 +1,7 @@
 # atem-client bindings: the binding and effect contract
 
-Status: built (Task 5 of `designs/plans/2026-10-20-r9.md`), for Astation's
-integration. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
+Status: built (Task 5 of `designs/plans/2026-10-20-r9.md`) and released in Atem v0.8.0 (2026-10-31);
+Astation integrates the bindings, and the joint live tests passed. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
 `atem-session-v1.md` (§R9.5–§R9.9). Integration view:
 `remote-agent-api-atem.md` §6.
 

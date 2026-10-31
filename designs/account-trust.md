@@ -1,6 +1,7 @@
 # §9 proposal: one pairing, many devices on the same account
 
-Status: Atem-side proposal for joint review, 2026-10-16; freshness and forks
+Status: implemented (atem-session r9: `crates/atem-client` membership
+verifier, `src/session_protocol/membership/`) and released in Atem v0.8.0 (2026-10-31). Atem-side proposal for joint review, 2026-10-16; freshness and forks
 replaced by the user's final decision of 2026-10-19 (§3.5, re-pairing as the reset; exact rules in
 [protocol/remote-agent-api-atem.md](protocol/remote-agent-api-atem.md) §3; exact formats in the
 r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md), §R9.1–§R9.13). Answers
@@ -158,7 +159,7 @@ encryption keys are kept as today.
 | Forward through the paired Mac | Phone stops working when the Mac sleeps; Mac becomes a single point of failure |
 | Pair every device with every Atem | Exactly what the user doesn't want; N×M ceremonies |
 | One shared account private key copied to all devices | Can't stay in Secure Enclave; a leak can't be revoked per device |
-| **Signed device list pinned at pairing (proposed)** | Pair once; add a device once; per-device revocation; relay is only storage |
+| **Signed device list pinned at pairing (chosen, implemented)** | Pair once; add a device once; per-device revocation; relay is only storage |
 
 ## 5. What changes on each side
 
