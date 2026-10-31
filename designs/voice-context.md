@@ -6,8 +6,10 @@ together: grounded in the project's own context, with tool calls that ask
 the coding agents in Atem for more information or hand them work. It replaces the earlier voice-coding
 pipeline (`voice-coding-stages.md`, removed).
 
-Status: proposed (user decisions, 2026-10-17). Not scheduled. Its
-prerequisites (chat-v1, the Codex adapter, approvals) are released in Atem v0.8.0 (2026-10-31).
+Status: planned (user, 2026-10-31): it will be built; the build starts later
+(not started). Design decisions by the user, 2026-10-17. Its prerequisites
+(chat-v1, the Codex adapter, approvals, r9 remote access) are released in
+Atem v0.8.0 (2026-10-31).
 
 ## Goal
 

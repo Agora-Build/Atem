@@ -6,6 +6,12 @@ Where atem is headed. This is a direction, not a contract — items shift as we 
 
 ## Upcoming
 
+### Build by Talk
+
+Talking is the fastest way to get a whole project clear. Build by Talk is a voice conversation, from your phone or Mac, that brings you, the project's knowledge and its coding agents together. Ask where things stand, work through a design, decide what's next. Answers come from the project's own context: decisions, design docs, commits and session summaries, which Atem collects and, per project and opt-in, uploads for retrieval. When a decision turns into work, Build by Talk reaches the coding agents running in Atem through tool calls. It asks Claude Code or Codex for more information (live status, latest replies), or reads a task back to you and hands it over, then tells you when the work is done. Approvals stay taps on your phone, never voice. It's an Astation feature built on Atem's agent chat, approvals and r9 remote access (all shipped), and it replaces the earlier voice-coding pipeline, which was removed.
+
+→ Planned; the build starts later (Astation and Atem). Design: [designs/voice-context.md](designs/voice-context.md).
+
 ### Windows support (PowerShell)
 
 atem ships for Linux and macOS today. Native Windows support means `atem` runs in PowerShell — adding the `windows-msvc` build target, verifying the ConPTY/`portable-pty` path, a Windows daemon-detach pattern, and an `install.ps1`.
@@ -31,10 +37,6 @@ Built and usable today, but not yet at their best — actively being improved.
 ## Under discussion
 
 Not committed yet — being shaped before they become roadmap items. Opinions welcome.
-
-### Build by Talk
-
-Talking is the fastest way to get a whole project clear. Build by Talk is a voice conversation, from your phone or Mac, that brings you, the project's knowledge and its coding agents together. Ask where things stand, work through a design, decide what's next. Answers come from the project's own context: decisions, design docs, commits and session summaries, which Atem collects and, per project and opt-in, uploads for retrieval. When a decision turns into work, Build by Talk reaches the coding agents running in Atem through tool calls. It asks Claude Code or Codex for more information (live status, latest replies), or reads a task back to you and hands it over, then tells you when the work is done. Approvals stay taps on your phone, never voice. It's an Astation feature built on Atem's agent chat, approvals and r9 remote access (all shipped), and it replaces the earlier voice-coding pipeline, which was removed. Design: [designs/voice-context.md](designs/voice-context.md).
 
 ### `atem serv agent <github-repo-url>`
 
