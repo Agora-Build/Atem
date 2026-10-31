@@ -16,6 +16,8 @@ curl -fsSL https://dl.agora.build/atem/install.sh | bash
 npm install -g @agora-build/atem
 ```
 
+Supported platforms (README "Supported platforms", from the v0.8.0 release binaries): macOS 11+ on Apple silicon and 10.12+ on Intel (Rust's default deployment targets; the macOS 15 CI runners only change the SDK), Linux x86_64 with glibc 2.38+ (its GLIBC_2.39 need is weak) and arm64 with glibc 2.39+ (cross-linked, a hard need), both built on `ubuntu-latest` (Ubuntu 24.04), no Windows (only `atem-core` builds there). Agent hooks verified with Claude Code 2.1.302 and Codex CLI 0.163.0. Re-check after a toolchain or runner change: the Mach-O `LC_BUILD_VERSION` minos of the darwin binaries and the highest non-weak `GLIBC_` version the Linux binaries need (`readelf -V`: a `Flags: WEAK` entry doesn't count).
+
 ## Development Commands
 
 ```bash
