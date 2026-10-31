@@ -1,6 +1,6 @@
 # Voice-Driven Coding Implementation Stages
 
-> **Status: historical; voice coding was removed.** The Atem side (`VoiceRequest`/`VoiceResponse`, `voiceCommand`, `voice_toggle` prompts) was removed in atem-session r6, and the App no longer drives voice (the RTM code in `src/rtm_client.rs` and `native/` is kept but unused). The stage statuses below ("Ready for testing", "COMPLETED", test counts) are from the time and describe no current code; see designs/protocol/atem-session-v1.md, and designs/voice-context.md for the proposed successor, **Talk to Your Project** (voice discussion grounded in project context, with tool calls to the coding agent).
+> **Status: historical; voice coding was removed.** The Atem side (`VoiceRequest`/`VoiceResponse`, `voiceCommand`, `voice_toggle` prompts) was removed in atem-session r6, and the App no longer drives voice (the RTM code in `src/rtm_client.rs` and `native/` is kept but unused). The stage statuses below ("Ready for testing", "COMPLETED", test counts) are from the time and describe no current code; see designs/protocol/atem-session-v1.md, and designs/voice-context.md for the proposed successor, **Huddle** (get the whole project clear by talking: grounded in project context, with tool calls to the coding agents).
 
 ## Overview
 

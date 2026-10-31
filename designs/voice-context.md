@@ -1,8 +1,9 @@
-# Talk to Your Project: voice discussion with project context
+# Huddle: get the whole project clear by talking
 
-A voice conversation about the project you're building: grounded in the
-project's own context, with tool calls that ask the coding agent in Atem for
-more information or hand it work. It replaces the earlier voice-coding
+Talking is the fastest way to get a whole project clear. Huddle is a voice
+conversation that brings you, the project's knowledge and its coding agents
+together: grounded in the project's own context, with tool calls that ask
+the coding agents in Atem for more information or hand them work. It replaces the earlier voice-coding
 pipeline (`voice-coding-stages.md`, removed).
 
 Status: proposed (user decisions, 2026-10-17). Not scheduled. Its
