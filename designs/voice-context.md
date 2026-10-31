@@ -1,8 +1,7 @@
-# Bema: get the whole project clear by talking
+# Build by Talk: get the whole project clear by talking
 
-(The bema was the speaker's platform in the Athenian Agora, where you stood
-to address the assembly.) Talking is the fastest way to get a whole project clear. Bema is a voice
-conversation that brings you, the project's knowledge and its coding agents
+Talking is the fastest way to get a whole project clear. Build by Talk is a
+voice conversation that brings you, the project's knowledge and its coding agents
 together: grounded in the project's own context, with tool calls that ask
 the coding agents in Atem for more information or hand them work. It replaces the earlier voice-coding
 pipeline (`voice-coding-stages.md`, removed).

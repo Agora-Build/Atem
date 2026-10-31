@@ -32,9 +32,9 @@ Built and usable today, but not yet at their best — actively being improved.
 
 Not committed yet — being shaped before they become roadmap items. Opinions welcome.
 
-### Bema
+### Build by Talk
 
-*Named after the speaker's platform in the Athenian Agora.* Talking is the fastest way to get a whole project clear. Bema is a voice conversation, from your phone or Mac, that brings you, the project's knowledge and its coding agents together. Ask where things stand, work through a design, decide what's next. Answers come from the project's own context: decisions, design docs, commits and session summaries, which Atem collects and, per project and opt-in, uploads for retrieval. When a decision turns into work, Bema reaches the coding agents running in Atem through tool calls. It asks Claude Code or Codex for more information (live status, latest replies), or reads a task back to you and hands it over, then tells you when the work is done. Approvals stay taps on your phone, never voice. It's an Astation feature built on Atem's agent chat, approvals and r9 remote access (all shipped), and it replaces the earlier voice-coding pipeline, which was removed. Design: [designs/voice-context.md](designs/voice-context.md).
+Talking is the fastest way to get a whole project clear. Build by Talk is a voice conversation, from your phone or Mac, that brings you, the project's knowledge and its coding agents together. Ask where things stand, work through a design, decide what's next. Answers come from the project's own context: decisions, design docs, commits and session summaries, which Atem collects and, per project and opt-in, uploads for retrieval. When a decision turns into work, Build by Talk reaches the coding agents running in Atem through tool calls. It asks Claude Code or Codex for more information (live status, latest replies), or reads a task back to you and hands it over, then tells you when the work is done. Approvals stay taps on your phone, never voice. It's an Astation feature built on Atem's agent chat, approvals and r9 remote access (all shipped), and it replaces the earlier voice-coding pipeline, which was removed. Design: [designs/voice-context.md](designs/voice-context.md).
 
 ### `atem serv agent <github-repo-url>`
 

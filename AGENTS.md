@@ -216,7 +216,7 @@ designs/
 ├── connection-priority.md # Connection cascade: local > relay
 ├── relay-support.md     # Relay server support
 ├── voice-coding-stages.md # Historical: the removed voice-coding pipeline
-├── voice-context.md          # Proposed (Astation): Bema, get the whole project clear by talking (project context + tool calls to the coding agents)
+├── voice-context.md          # Proposed (Astation): Build by Talk, get the whole project clear by talking (project context + tool calls to the coding agents)
 ├── remote-agent-control.md   # Historical: Astation → atem → agent (agentInput/voice, removed in atem-session r6)
 ├── local-agent-runtime.md    # Launch the original claude/codex CLI in Atem, local and remote access to one session
 ├── agent-runtime.md          # `atem runtime` broker + `atem worker`s, local protocol, operations through the runtime (implemented)
