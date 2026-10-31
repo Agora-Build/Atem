@@ -22,6 +22,26 @@ on `main` can describe features newer than the latest release. Check
 the commands you need, or build `main` below. Run a source build using its
 explicit path, such as `./target/release/atem`, to avoid an older installed CLI.
 
+### Supported platforms
+
+| Platform | Release binary | Minimum |
+|---|---|---|
+| macOS, Apple silicon | `darwin-aarch64` | macOS 11 (Big Sur) |
+| macOS, Intel | `darwin-x86_64` | macOS 10.12 (Sierra) |
+| Linux, x86_64 | `linux-x86_64` | glibc 2.38 (Ubuntu 24.04, Debian 13, Fedora 39, RHEL 10 or newer) |
+| Linux, arm64 | `linux-aarch64` | glibc 2.39 (Ubuntu 24.04, Debian 13, Fedora 40, RHEL 10 or newer) |
+
+Windows is not supported (Atem needs Unix PTYs and sockets); the `atem-core`
+token library alone builds and is tested there. On an older Linux, build
+from source below. The minimums are the ones recorded in the v0.8.0
+binaries: Rust's default macOS deployment targets (the CI runner's SDK
+doesn't change them) and the glibc of the Linux build image
+(`ubuntu-latest`).
+
+Approvals and chat use the agents' hooks, verified with Claude Code 2.1.302
+and Codex CLI 0.163.0; Codex needs `[codex] hooks = true` (asked once at
+`atem agent launch codex`).
+
 ### Build from source
 
 ```bash
