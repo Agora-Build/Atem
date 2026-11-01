@@ -29,5 +29,5 @@ Generation source: [unicode-width](https://github.com/unicode-rs/unicode-width),
 licensed under MIT or Apache-2.0; the upstream package includes the Unicode
 data license. These assets contain no fonts or downloaded executable scripts.
 
-See `designs/terminal-v1-implementation.md` for framing, acknowledgement,
+See `designs/shared-terminal.md` for framing, acknowledgement,
 input handling, renderer limits and the Astation integration contract.

@@ -16,8 +16,7 @@ from the workspace's reviewed dependencies (`p256`, `ed25519-dalek`,
 `x25519-dalek`, `hkdf`, `hmac`, `sha2`, `hpke`); comparisons of hashes and tags
 are constant-time and secrets are wiped on drop.
 
-Status: r9 is implemented (plan `designs/plans/2026-10-20-r9.md`, Tasks
-1–9): encodings and signatures (§R9.1–§R9.2), the membership-log verifier
+Status: r9 is implemented and released (Atem v0.8.0): encodings and signatures (§R9.1–§R9.2), the membership-log verifier
 and its writers (§R9.2–§R9.5), the `atem-ch1` channel in both roles
 (§R9.7), the r9 client machines with r8's session-v1 inside, principals,
 push hints and `seen` (§R9.6–§R9.9), the Recovery Kit, K backups and the

@@ -1,6 +1,6 @@
 //! ConvoAI config: TOML → strongly-typed struct → Agora REST JSON payload.
 //!
-//! Mapping is mechanical; see docs/superpowers/specs/2026-04-14-atem-serv-convo-design.md §2.
+//! Mapping is mechanical; see designs/convo.md.
 //! `params` sub-tables are passed through as `toml::Value` (converted to
 //! `serde_json::Value` later) so atem does not need to know every vendor's shape.
 
