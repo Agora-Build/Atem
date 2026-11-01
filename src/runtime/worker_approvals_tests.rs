@@ -828,6 +828,58 @@ fn a_codex_request_without_a_session_id_must_come_from_the_agent_itself() {
     let _ = direct.wait();
 }
 
+/// A prompt stamped on a whole second (`.000`, as one in a thousand
+/// millisecond times are) never answers a request opened half a second
+/// later: it was the CI flake where a remote allow found the approval
+/// already closed. Times are compared as they are.
+#[test]
+fn a_prompt_on_a_whole_second_leaves_a_later_request_open() {
+    let s = Session::new();
+    let mut a = watcher(&s, Agent::Codex);
+    let hook = s.hook("codex", 30, SECRET_BASH);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let req = loop {
+        if let Some(name) = s.files().into_iter().find(|f| f.starts_with("req-")) {
+            break s.approvals().join(name);
+        }
+        assert!(Instant::now() < deadline, "no request");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // The request opened at S + 500 ms; the prompt is stamped S.000.
+    let second = (now_ms() / 1000 - 3) * 1000;
+    let opened = std::time::UNIX_EPOCH + Duration::from_millis(second as u64 + 500);
+    std::fs::File::options()
+        .write(true)
+        .open(&req)
+        .unwrap()
+        .set_modified(opened)
+        .unwrap();
+    let id = request_id(&events(&mut a, true)[0]);
+    let out = a.poll(
+        true,
+        vec![Evidence::TurnEnded {
+            interrupted: false,
+            at_ms: Some(second),
+        }],
+    );
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(a.waiting(), 1);
+    // A prompt after it does answer it.
+    let out = a.poll(
+        true,
+        vec![Evidence::TurnEnded {
+            interrupted: false,
+            at_ms: Some(second + 501),
+        }],
+    );
+    assert_eq!(
+        out,
+        vec![closed(&id, ApprovalCloseReason::AnsweredTerminal)]
+    );
+    assert_eq!(printed(hook), "");
+    assert!(drained(&mut a).is_empty());
+}
+
 /// Evidence read in the same pass as a newer request (the turn's own
 /// prompt, a turn end reported before it) never closes it; evidence from
 /// after it does. Both agents.
@@ -836,10 +888,7 @@ fn turn_evidence_older_than_a_request_leaves_it_open() {
     for (agent, name) in [(Agent::Claude, "claude"), (Agent::Codex, "codex")] {
         let s = Session::new();
         let mut a = watcher(&s, agent);
-        let mut before = now_ms() - 2000;
-        if before % 1000 == 0 {
-            before -= 1;
-        }
+        let before = now_ms() - 2000;
         let hook = s.hook(name, 30, SECRET_BASH);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !s.files().iter().any(|f| f.starts_with("req-")) {

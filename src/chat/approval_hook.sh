@@ -142,7 +142,10 @@ if [ "$1" = event ]; then
         if [ -h "$l" ]; then
             p=$(readlink "$l" 2>/dev/null)
             case $p in
-                '' | *[!0-9]*) ;;
+                # Released meanwhile: nothing to remove (removing now could
+                # take a lock another hook has just made).
+                '') return 0 ;;
+                *[!0-9]*) ;; # not a pid: no live hook made it
                 *) kill -0 "$p" 2>/dev/null && return 1 ;;
             esac
             [ "$(readlink "$l" 2>/dev/null)" = "$p" ] && rm -f "$l" 2>/dev/null
