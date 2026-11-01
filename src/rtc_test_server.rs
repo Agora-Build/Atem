@@ -72,7 +72,17 @@ pub fn register_server(entry: &ServerEntry) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", entry.id));
     let json = serde_json::to_string_pretty(entry)?;
-    std::fs::write(path, json)?;
+    // Its URLs carry the server's access code: this user only.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(json.as_bytes())?;
     Ok(())
 }
 
@@ -250,11 +260,13 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
 
-    let local_url = format!("https://localhost:{}/", port);
-    let network_url = format!("https://{}:{}/", sslip, port);
+    // Every page and API needs this server's access code (in its URLs).
+    let access = Arc::new(crate::web_server::access::AccessCode::for_server(port, true));
+    let local_url = access.url(&format!("https://localhost:{}/", port));
+    let network_url = access.url(&format!("https://{}:{}/", sslip, port));
     let custom_urls: Vec<String> = extra_hostnames
         .iter()
-        .map(|h| format!("https://{}:{}/", h.trim(), port))
+        .map(|h| access.url(&format!("https://{}:{}/", h.trim(), port)))
         .collect();
 
     // ── Background mode: re-exec as daemon ──────────────────────────────
@@ -292,6 +304,7 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
 
         let child = std::process::Command::new(exe)
             .args(&daemon_args)
+            .env(crate::web_server::access::ENV, access.code())
             .stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
@@ -399,6 +412,7 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
         let channel = channel.clone();
         let rtc_user_id = rtc_user_id.clone();
         let rtm_user_id = rtm_user_id.clone();
+        let access = access.clone();
 
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
@@ -413,6 +427,7 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
             if let Err(e) = handle_connection(
                 tls_stream,
                 peer,
+                &access,
                 &app_id,
                 &app_certificate,
                 &channel,
@@ -434,6 +449,7 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
 async fn handle_connection(
     mut stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     _peer: SocketAddr,
+    access: &crate::web_server::access::AccessCode,
     app_id: &str,
     app_certificate: &str,
     default_channel: &str,
@@ -454,6 +470,9 @@ async fn handle_connection(
         }
     };
     let request = String::from_utf8_lossy(&buf);
+    if !crate::web_server::access::admit(&mut stream, access, &request).await? {
+        return Ok(());
+    }
 
     // Parse first line: METHOD PATH HTTP/1.x
     let first_line = request.lines().next().unwrap_or("");

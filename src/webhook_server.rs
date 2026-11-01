@@ -446,8 +446,12 @@ pub async fn run_server(cfg: ServeWebhooksConfig) -> Result<()> {
         daemon_args.push("--background".into());
         daemon_args.push("--serv-daemon".into());
 
+        // The daemon serves its console with this code (handed over in its
+        // environment).
+        let access = crate::web_server::access::AccessCode::for_server(port, false);
         let child = std::process::Command::new(exe)
             .args(&daemon_args)
+            .env(crate::web_server::access::ENV, access.code())
             .stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
@@ -458,7 +462,7 @@ pub async fn run_server(cfg: ServeWebhooksConfig) -> Result<()> {
             kind: "webhooks".to_string(),
             port,
             channel: String::new(),
-            local_url: format!("http://127.0.0.1:{}", port),
+            local_url: access.url(&format!("http://127.0.0.1:{}/", port)),
             network_url: String::new(),
             started_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -471,6 +475,7 @@ pub async fn run_server(cfg: ServeWebhooksConfig) -> Result<()> {
         println!("atem serv webhooks");
         println!("  config:  {}", toml_path.display());
         println!("  port:    {}", port);
+        println!("  Console: {}", access.url(&format!("http://127.0.0.1:{}/", port)));
         println!("  ID:      {}", sid);
         println!("  PID:     {}", child.id());
         println!("  Log:     {}", log_path.display());
@@ -483,7 +488,10 @@ pub async fn run_server(cfg: ServeWebhooksConfig) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await
         .map_err(|e| anyhow::anyhow!("Bind 0.0.0.0:{} failed: {}", port, e))?;
     let actual_port = listener.local_addr()?.port();
-    let local_url = format!("http://127.0.0.1:{}", actual_port);
+    // The console needs this server's access code; POST /webhook doesn't
+    // (Agora's registered URL can't carry it; the signature guards it).
+    let access = Arc::new(crate::web_server::access::AccessCode::for_server(actual_port, false));
+    let local_url = access.url(&format!("http://127.0.0.1:{}/", actual_port));
 
     // Optionally bring up ngrok tunnel.
     let mut ngrok_child: Option<std::process::Child> = None;
@@ -503,7 +511,7 @@ pub async fn run_server(cfg: ServeWebhooksConfig) -> Result<()> {
     if let Some(u) = &public_url {
         println!("  Public:  {}/webhook", u);
     } else {
-        println!("  Public:  (tunnel disabled — POSTs must reach {} directly)", local_url);
+        println!("  Public:  (tunnel disabled — POSTs must reach http://127.0.0.1:{}/webhook directly)", actual_port);
     }
     if secret.is_empty() {
         println!("  Secret:  not set — signature validation SKIPPED (set `secret` in webhooks.toml to enable)");
@@ -568,8 +576,9 @@ pub async fn run_server(cfg: ServeWebhooksConfig) -> Result<()> {
             let (mut stream, peer) = listener.accept().await?;
             let secret  = secret.clone();
             let tx      = tx.clone();
+            let access  = access.clone();
             tokio::spawn(async move {
-                let _ = handle_connection(&mut stream, peer.to_string(), &secret, &tx).await;
+                let _ = handle_connection(&mut stream, peer.to_string(), &access, &secret, &tx).await;
             });
         }
         #[allow(unreachable_code)]
@@ -607,6 +616,7 @@ fn unix_ms() -> u64 {
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     peer:   String,
+    access: &crate::web_server::access::AccessCode,
     secret: &Arc<String>,
     tx:     &Arc<broadcast::Sender<WebhookEvent>>,
 ) -> Result<()> {
@@ -650,6 +660,12 @@ async fn handle_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path   = parts.next().unwrap_or("");
+    // Everything but Agora's POST needs the access code.
+    if (method, path) != ("POST", "/webhook")
+        && !crate::web_server::access::admit(stream, access, header_str).await?
+    {
+        return Ok(());
+    }
 
     match (method, path) {
         ("GET", "/") => {
@@ -745,7 +761,7 @@ async fn send_response(
         _ => "OK",
     };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
         status, status_text, content_type, body.len()
     );
     stream.write_all(head.as_bytes()).await?;
@@ -1017,6 +1033,8 @@ mod tests {
     async fn end_to_end_post_webhook_returns_200_and_broadcasts_sse() {
         // Pick a port unlikely to clash with `cargo test` parallelism.
         let port: u16 = 19090 + (rand::random::<u16>() % 500);
+        const CODE: &str = "AbCdEfGhIjKlMnOpQrStUv";
+        crate::web_server::access::use_code_for_test(CODE);
         let cfg = ServeWebhooksConfig {
             config_path: Some(std::path::PathBuf::from("/dev/null")),
             port,
@@ -1044,7 +1062,7 @@ mod tests {
             let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await.expect("sse connect");
             let req = format!(
-                "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n",
+                "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: atem_access_{port}={CODE}\r\nConnection: keep-alive\r\n\r\n",
             );
             s.write_all(req.as_bytes()).await.unwrap();
             let mut buf = String::new();
@@ -1092,8 +1110,24 @@ mod tests {
         // 404 path
         let resp404 = reqwest::Client::new()
             .get(format!("{}/no-such-route", base))
+            .header("Cookie", format!("atem_access_{port}={CODE}"))
             .send().await.unwrap();
         assert_eq!(resp404.status().as_u16(), 404);
+
+        // The console needs the code: none is a plain 404, the code in the
+        // URL sets the cookie and redirects without it.
+        let no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build().unwrap();
+        let closed = no_redirect.get(format!("{}/", base)).send().await.unwrap();
+        assert_eq!(closed.status().as_u16(), 404);
+        let events = no_redirect.get(format!("{}/events", base)).send().await.unwrap();
+        assert_eq!(events.status().as_u16(), 404);
+        let enter = no_redirect.get(format!("{}/?t={CODE}", base)).send().await.unwrap();
+        assert_eq!(enter.status().as_u16(), 302);
+        assert_eq!(enter.headers()["location"], "/");
+        let cookie = enter.headers()["set-cookie"].to_str().unwrap();
+        assert!(cookie.starts_with(&format!("atem_access_{port}={CODE};")), "{cookie}");
 
         server.abort();
     }

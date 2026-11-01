@@ -169,6 +169,18 @@ pub struct HistoryEntry {
     pub body:     String,
 }
 
+impl HistoryEntry {
+    /// This entry with credentials masked in a JSON body (`mask_secrets`);
+    /// a body that isn't JSON is kept.
+    fn masked(mut self) -> Self {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&self.body) {
+            mask_secrets(&mut v);
+            self.body = serde_json::to_string_pretty(&v).unwrap_or(self.body);
+        }
+        self
+    }
+}
+
 const HISTORY_CAPACITY: usize = 200;
 
 /// Append to the history log, evicting oldest entries past CAPACITY.
@@ -353,11 +365,13 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     let bound_port = listener.local_addr()?.port();
 
-    let local_url   = format!("https://localhost:{}/", bound_port);
-    let network_url = format!("https://{}:{}/", sslip, bound_port);
+    // Every page and API needs this server's access code (in its URLs).
+    let access = Arc::new(crate::web_server::access::AccessCode::for_server(bound_port, true));
+    let local_url   = access.url(&format!("https://localhost:{}/", bound_port));
+    let network_url = access.url(&format!("https://{}:{}/", sslip, bound_port));
     let custom_urls: Vec<String> = extra_hostnames
         .iter()
-        .map(|h| format!("https://{}:{}/", h.trim(), bound_port))
+        .map(|h| access.url(&format!("https://{}:{}/", h.trim(), bound_port)))
         .collect();
 
     let project_name = crate::config::ProjectCache::name_for_app_id(&app_id);
@@ -405,12 +419,13 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
         let convo_cfg = convo_cfg.clone();
         let state     = state.clone();
         let history   = history.clone();
+        let access    = access.clone();
         tokio::spawn(async move {
             let tls = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let _ = handle_connection(tls, &app_id, &app_cert, &resolved, &convo_cfg, state, history, attach_mode).await;
+            let _ = handle_connection(tls, &access, &app_id, &app_cert, &resolved, &convo_cfg, state, history, attach_mode).await;
         });
     }
 }
@@ -433,6 +448,7 @@ fn mask_secrets(v: &mut serde_json::Value) {
     fn looks_secret(name: &str) -> bool {
         let n = name.to_ascii_lowercase();
         n.contains("key")
+            || n.contains("authorization")
             || n.contains("token")
             || n.contains("secret")
             || n.contains("cert")
@@ -667,8 +683,10 @@ async fn run_background(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    access:     &crate::web_server::access::AccessCode,
     app_id:     &str,
     app_cert:   &str,
     resolved:   &Arc<ResolvedConfig>,
@@ -683,6 +701,9 @@ async fn handle_connection(
         _ => return Ok(()),
     };
     let request = String::from_utf8_lossy(&buf);
+    if !crate::web_server::access::admit(&mut stream, access, &request).await? {
+        return Ok(());
+    }
     let first = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first.split_whitespace().collect();
     if parts.len() < 2 {
@@ -959,12 +980,21 @@ async fn handle_connection(
             ).await?;
         }
 
-        ("GET", "/api/convo/history") => {
+        ("GET", "/api/convo/history") | ("GET", "/api/convo/history?full=1") => {
             // Process-lifetime log of every request/response atem has made
             // against Agora's ConvoAI REST endpoints. Bounded at
             // HISTORY_CAPACITY entries (oldest evicted). Consumed by the
-            // "Show History" button on the page.
-            let entries: Vec<HistoryEntry> = history.lock().await.iter().cloned().collect();
+            // "API History" button on the page: credentials masked (a
+            // screen share shows none); `?full=1` (the "Copy with full
+            // credentials" button) keeps them.
+            let full = path.ends_with("?full=1");
+            let entries: Vec<HistoryEntry> = history
+                .lock()
+                .await
+                .iter()
+                .cloned()
+                .map(|e| if full { e } else { e.masked() })
+                .collect();
             let body = serde_json::json!({ "entries": entries, "capacity": HISTORY_CAPACITY });
             crate::web_server::request::send_response(
                 &mut stream, 200, "application/json", body.to_string().as_bytes()
@@ -1256,6 +1286,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
     <button id="startAgentBtn" class="btn btn-join" onclick="startAgent()">Start Agent</button>
     <button id="stopAgentBtn"  class="btn btn-leave" onclick="stopAgent()"  style="display:none">Stop Agent</button>
     <button id="historyBtn"    class="btn btn-stats" onclick="toggleHistory()">API History</button>
+    <button id="historyCopyBtn" class="btn btn-stats" onclick="copyFullHistory()" style="display:none" title="Credentials are masked on screen; this copies the requests with them">Copy with full credentials</button>
   </div>
   <div id="historyPanel" class="history-panel"></div>
   <div class="convo-sub-title">Live transcription</div>
@@ -1957,7 +1988,39 @@ async function toggleHistory() {{
   const btn   = document.getElementById('historyBtn');
   const visible = panel.classList.toggle('visible');
   btn.classList.toggle('active', visible);
+  document.getElementById('historyCopyBtn').style.display = visible ? '' : 'none';
   if (visible) await refreshHistory();
+}}
+// The history as text, one block per request or response.
+function formatHistory(entries) {{
+  const fmt = (e) => {{
+    const ts = new Date(e.ts_ms).toISOString().slice(11, 23);
+    const head = e.kind === 'request'
+      ? '→ ' + (e.method || 'POST') + ' ' + e.url
+      : '← ' + (e.status || '') + ' ' + e.url;
+    let body = e.body || '';
+    // Pretty-print JSON bodies that came back as raw strings.
+    try {{
+      if (body && (body.trim().startsWith('{{') || body.trim().startsWith('['))) {{
+        body = JSON.stringify(JSON.parse(body), null, 2);
+      }}
+    }} catch (_) {{}}
+    return '[' + ts + '] ' + head + (body ? '\n' + body : '');
+  }};
+  return entries.map(fmt).join('\n\n');
+}}
+// Credentials stay masked on screen; this copies them in full.
+async function copyFullHistory() {{
+  const btn = document.getElementById('historyCopyBtn');
+  try {{
+    const r = await fetch('/api/convo/history?full=1');
+    const data = await r.json();
+    await navigator.clipboard.writeText(formatHistory(data.entries || []));
+    btn.textContent = 'Copied';
+  }} catch (e) {{
+    btn.textContent = 'Copy failed';
+  }}
+  setTimeout(() => {{ btn.textContent = 'Copy with full credentials'; }}, 2000);
 }}
 async function refreshHistory() {{
   const panel = document.getElementById('historyPanel');
@@ -1969,21 +2032,7 @@ async function refreshHistory() {{
       panel.textContent = '(no ConvoAI API calls yet — click Start Agent to see /join + /leave request/response bodies)';
       return;
     }}
-    const fmt = (e) => {{
-      const ts = new Date(e.ts_ms).toISOString().slice(11, 23);
-      const head = e.kind === 'request'
-        ? '→ ' + (e.method || 'POST') + ' ' + e.url
-        : '← ' + (e.status || '') + ' ' + e.url;
-      let body = e.body || '';
-      // Pretty-print JSON bodies that came back as raw strings.
-      try {{
-        if (body && (body.trim().startsWith('{{') || body.trim().startsWith('['))) {{
-          body = JSON.stringify(JSON.parse(body), null, 2);
-        }}
-      }} catch (_) {{}}
-      return '[' + ts + '] ' + head + (body ? '\n' + body : '');
-    }};
-    panel.textContent = entries.map(fmt).join('\n\n');
+    panel.textContent = formatHistory(entries);
     panel.scrollTop = panel.scrollHeight;
   }} catch (e) {{
     panel.textContent = 'Could not fetch history: ' + e.message;
@@ -2428,6 +2477,36 @@ window.addEventListener('load', async () => {{
 
 #[cfg(test)]
 mod tests {
+
+    /// The page shows the history with credentials masked (a screen share
+    /// shows none); the copy button asks for it in full.
+    #[test]
+    fn history_bodies_are_masked_unless_asked_in_full() {
+        let entry = super::HistoryEntry {
+            ts_ms: 1,
+            kind: "request".into(),
+            method: Some("POST".into()),
+            url: "https://api.agora.io/x/join".into(),
+            status: None,
+            body: serde_json::json!({
+                "properties": {
+                    "llm": { "api_key": "sk-secret-1", "url": "https://llm",
+                             "headers": { "Authorization": "Bearer sk-secret-2" } },
+                    "tts": { "params": { "key": "tts-secret-3" } },
+                    "channel": "chan"
+                }
+            })
+            .to_string(),
+        };
+        let masked = entry.clone().masked();
+        for secret in ["sk-secret-1", "sk-secret-2", "tts-secret-3"] {
+            assert!(!masked.body.contains(secret), "{secret} in {}", masked.body);
+            assert!(entry.body.contains(secret));
+        }
+        assert!(masked.body.contains("\"chan\"") && masked.body.contains("https://llm"));
+        let text = super::HistoryEntry { body: "not json".into(), ..entry };
+        assert_eq!(text.clone().masked().body, text.body);
+    }
     use super::*;
 
     #[test]

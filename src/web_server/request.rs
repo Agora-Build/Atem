@@ -99,7 +99,7 @@ pub async fn send_response(
     };
 
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
         status, status_text, content_type, body.len()
     );
 
