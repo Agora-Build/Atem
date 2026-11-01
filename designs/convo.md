@@ -137,7 +137,8 @@ atem serv convo [--channel NAME] [--rtc-user-id ID] [--agent-user-id ID] [--conf
 
 The server binds `0.0.0.0` with a self-signed certificate for loopback, the LAN address (as an
 `sslip.io` name) and `extra_hostnames` from `config.toml`, so a phone on the LAN can open it. It
-prints Local, Network and Custom URLs and opens the browser. It does not register in `serv list`.
+prints Local, Network and Custom URLs, each with this start's access code (`?t=…`), and opens the
+browser. Every route below needs the code (see Credentials). It does not register in `serv list`.
 
 | Route | Purpose |
 |---|---|
@@ -145,7 +146,7 @@ prints Local, Network and Custom URLs and opens the browser. It does not registe
 | `POST /api/token` | RTC+RTM token, 1 h. The page sends its own `rtm_user_id`. |
 | `POST /api/convo/start` | Mint token, build body, `POST .../join`. Returns `{agent_id, name, started_at}`. |
 | `POST /api/convo/stop` | `POST .../agents/<id>/leave` with a fresh 1 h token. Always clears local state. |
-| `GET /api/convo/status`, `/api/convo/history` | `{running, agent_id, name, started_at, avatar_configured}`; the last 200 REST requests and responses (in memory). |
+| `GET /api/convo/status`, `/api/convo/history` | `{running, agent_id, name, started_at, avatar_configured}`; the last 200 REST requests and responses (in memory), credentials masked; `?full=1` keeps them. |
 
 Start body (all optional): `avatar`, `preset`, `env`, `geofence_area`, `encryption_mode`,
 `encryption_key`, `encryption_salt`, `enable_dump` (sets `parameters.enable_dump`, a server-side
@@ -177,7 +178,7 @@ without waiting for `/join`. The daemon:
 1. Mints the token and posts `/join` (avatar only if `enable_avatar` and `[agent.avatar]`; encryption
    and geofence only from `convo.toml`; preset from `[agent].preset`).
 2. Logs the URL and body to `<servers dir>/<channel>.log`, masking values of keys that contain `key`,
-   `token`, `secret`, `cert`, `password` or `credential` as `***<N chars>`.
+   `authorization`, `token`, `secret`, `cert`, `password` or `credential` as `***<N chars>`.
 3. Polls `GET .../agents/<id>` every `poll_interval_secs` with the join token and writes
    `last_status` (the response's `status`, `HTTP_<code>` or `ERR`) and `last_checked_at` to its
    registry file.
@@ -211,10 +212,14 @@ dump). You join with your own RTC uid and talk to the agent. End it with `atem s
 
 ### Credentials
 
-- The page does not receive the provider keys, with two exceptions: `GET /api/convo/history` returns
-  the `/join` body as sent (keys included), and the page embeds the `[atem.encryption]` key and salt.
-- The server has no authentication and listens on all interfaces. Anyone who can reach the port can
-  start or stop the agent and read the history. Use it on a trusted network.
+- Every page and API needs the server's access code, new at each start and printed in its URLs
+  (`?t=…`). Opening such a URL sets an HttpOnly cookie for this port and redirects to the URL without
+  the code; anything else is a plain 404, so other devices on the network can't use the server
+  (`src/web_server/access.rs`, shared by all `atem serv` servers).
+- API History shows the requests with credentials masked (the same masking as the log), so a screen
+  share shows no keys. Its **Copy with full credentials** button fetches `?full=1` and copies them
+  unmasked.
+- The page embeds the `[atem.encryption]` key and salt (the local RTC client needs them).
 
 ### Browser toolkit
 
