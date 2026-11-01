@@ -8,16 +8,13 @@ use crate::memory::cred_agent::AgentLook;
 use crate::runtime::client::{Look, version_of};
 use std::collections::BTreeMap;
 
-/// The first line: `atem 0.8.0 (build …) · protocol session r9 (r8 without
-/// a device list), local v1`. A host with a device list speaks r9 and
-/// refuses r8; one without speaks r8.
+/// The first line: `atem 0.8.0 (build …) · protocol r9`, the atem-session
+/// revision this build speaks (designs/protocol/README.md).
 pub fn first_line(own: &str) -> String {
     format!(
-        "atem {} (build {own}) \u{b7} protocol session r{} (r{} without a device list), local v{}",
+        "atem {} (build {own}) \u{b7} protocol r{}",
         version_of(own),
-        atem_client::session::r9::REVISION,
-        crate::session_protocol::revision::REVISION,
-        crate::runtime::protocol::PROTOCOL
+        atem_client::session::r9::REVISION
     )
 }
 
@@ -169,10 +166,10 @@ mod tests {
     }
 
     #[test]
-    fn nothing_running_is_one_line_with_the_protocols() {
+    fn nothing_running_is_one_line_with_the_protocol() {
         assert_eq!(
             render(OWN, &Look::NotRunning, &None),
-            "atem 0.7.2 (build 0.7.2+100.000000000-5) \u{b7} protocol session r9 (r8 without a device list), local v1\n"
+            "atem 0.7.2 (build 0.7.2+100.000000000-5) \u{b7} protocol r9\n"
         );
     }
 

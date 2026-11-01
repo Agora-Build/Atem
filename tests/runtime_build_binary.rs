@@ -77,10 +77,7 @@ fn another_builds_runtime_is_replaced_and_restart_keeps_the_sessions() {
     let (out, _, ok) = sandbox.atem(&["--version"]);
     assert!(ok);
     assert!(out.starts_with("atem "), "{out}");
-    assert!(
-        out.contains("protocol session r9 (r8 without a device list), local v1"),
-        "{out}"
-    );
+    assert!(out.contains("· protocol r9"), "{out}");
     assert!(
         out.contains(&format!("runtime    0.0.1 (build {FAKE_BUILD}, pid {fake})  [another build: run atem runtime restart]")),
         "{out}"
