@@ -1649,7 +1649,7 @@ fn results(peer: &Peer) -> usize {
     peer.seen.iter().filter(|m| m["type"] == "channel").count()
 }
 
-/// `atem runtime reload` after `astation_relay_url` changed: a relay link
+/// The runtime's `reload` after `astation_relay_url` changed: a relay link
 /// reached at the old Station is dropped (its attachments and channels go
 /// with it) and the reconnect goes to the configured Station at once; the
 /// same Station (a trailing `/` aside) or a local link stays.

@@ -297,7 +297,8 @@ impl App {
     }
 
     /// The relay link was reached at another Station than the configured
-    /// one (`astation_relay_url` changed, then `atem runtime reload`): why
+    /// one (`astation_relay_url` changed, then the runtime's `reload`, which
+    /// `atem unpair` and `atem logout` send): why
     /// it must be dropped, so the reconnect reaches the configured Station
     /// at once. A local link, or none, is never another Station's.
     pub fn station_changed(&self) -> Option<String> {

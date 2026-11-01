@@ -632,7 +632,7 @@ pub enum LinkVia {
     Local,
     /// The relay's host and this Atem's id in the room (`label`), and the
     /// Station URL it was reached at (`url`, compared with the configured
-    /// one at `atem runtime reload`).
+    /// one at the runtime's `reload`).
     Relay { label: String, url: String },
 }
 
