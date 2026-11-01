@@ -138,7 +138,7 @@ src/
 ├── convo_config.rs      # ConvoAI TOML parsing + Agora REST /join body builder
 ├── convo_test_server.rs # atem serv convo — ConvoAI test server + --background mode
 ├── convo_wizard.rs      # atem config convo — interactive config wizard + validation
-├── web_server/          # Shared HTTPS scaffolding (cert, request, /api/token, net, html, browser open)
+├── web_server/          # Shared HTTPS scaffolding (cert, request, /api/token, net, html, browser open, access: the access code every `atem serv` page and API needs)
 ├── command.rs           # Serial task queue for mark tasks
 ├── dispatch.rs          # Work item dispatcher for mark tasks
 ├── pair_verify.rs       # atem pair / atem pair verify device verification: /dev/tty code confirmation, verifyAbort on failure
@@ -290,7 +290,7 @@ Key methods:
 
 **Tests never touch the real profile** (`src/test_profile.rs`): under `cfg(test)` every function that resolves the profile (`~/.config/atem`), the runtime dir or the cred agent asks `test_profile`, which panics unless the test injected a temp profile (`test_profile::use_dir`/`temp`) or a cred agent (`use_agent`) on its thread (`blocking` carries them to worker threads). New tests must inject one. Binary tests (`tests/*.rs`) run `atem` with a temp `HOME` and `XDG_RUNTIME_DIR` and fake agents, and only signal processes they started. Debug builds read `ATEM_TEST_CLOCK_FILE`/`ATEM_TEST_PTY_FAULTS` (`runtime/test_hooks.rs`) for the fixture harness (a client never passes `ATEM_TEST_*` on to a runtime it starts); release builds don't.
 
-**Webhook Server** (`webhook_server.rs`): Receives Agora webhook POSTs (ConvoAI events 101–111, 201–202; RTC NCS events) on a local HTTP port. Optionally spawns `ngrok http <port>` or `cloudflared tunnel --url <port>` to expose the listener publicly. Validates `Agora-Signature-V2` (HMAC-SHA256) against `secret` from `webhooks.toml` when configured, skips validation with a banner warning otherwise. Broadcasts each accepted event to a live web console (SSE) at `GET /` and prints a one-line summary to stdout. `--background` mode: standard daemon shape — registers in `~/.config/atem/servers/webhooks-<port>.json`, redirects stdout/stderr to `webhooks-<port>.log`, manageable via `atem serv list / kill / killall`. ngrok collision detection (refuses to start when a foreign ngrok already owns `:4040` and prints actionable next steps including the paid-plan link). cloudflared failure path captures stderr tail and surfaces it.
+**Webhook Server** (`webhook_server.rs`): Receives Agora webhook POSTs (ConvoAI events 101–111, 201–202; RTC NCS events) on a local HTTP port. Optionally spawns `ngrok http <port>` or `cloudflared tunnel --url <port>` to expose the listener publicly. Validates `Agora-Signature-V2` (HMAC-SHA256) against `secret` from `webhooks.toml` when configured, skips validation with a banner warning otherwise. Broadcasts each accepted event to a live web console (SSE) at `GET /` and prints a one-line summary to stdout. The console and `/events` need the server's access code (`web_server/access.rs`, below); `POST /webhook` doesn't (Agora's registered URL can't carry it; the signature guards it). `--background` mode: standard daemon shape — registers in `~/.config/atem/servers/webhooks-<port>.json`, redirects stdout/stderr to `webhooks-<port>.log`, manageable via `atem serv list / kill / killall`. ngrok collision detection (refuses to start when a foreign ngrok already owns `:4040` and prints actionable next steps including the paid-plan link). cloudflared failure path captures stderr tail and surfaces it.
 
 ### Configuration & Storage (`config.rs`)
 
@@ -575,6 +575,7 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   User joins the channel with their RTC uid + matching encryption to
   talk to the live daemon-owned agent.
 
+- **Access code (`web_server/access.rs`)**: every `atem serv` server (rtc, convo, files, the webhooks console) makes a random code at each start (16 bytes, base64url) and prints its URLs with `?t=<code>`. A request carrying it gets an HttpOnly, SameSite=Lax cookie named per port (`atem_access_<port>`; `Secure` on HTTPS) and a 302 to the same URL without the code; every later page and API request needs the cookie; anything else is a plain 404 (`access::admit` before routing; codes compared in constant time). Responses carry `Referrer-Policy: no-referrer`, and `Access-Control-Allow-Origin: *` is gone. A `--background` parent hands the code to its daemon in `ATEM_SERV_ACCESS_CODE` (never on the command line, which `ps` shows to every user); registry files are 0600. ConvoAI's API History serves bodies masked (`mask_secrets`, now also `authorization`); `?full=1` (the page's **Copy with full credentials** button) keeps them.
 - **`atem serv list/kill/killall` registry conventions**: All servers
   (rtc, convo, webhooks, files) write JSON entries to `~/.config/atem/servers/`.
   Convo entries use the channel name itself as the id (no kind/port

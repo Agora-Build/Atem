@@ -112,8 +112,11 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
             "--serv-daemon".into(),
         ];
 
+        // The daemon serves with this code (handed over in its environment).
+        let access = crate::web_server::access::AccessCode::for_server(port, true);
         let child = std::process::Command::new(exe)
             .args(&daemon_args)
+            .env(crate::web_server::access::ENV, access.code())
             .stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
@@ -124,11 +127,11 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
         let extra_hostnames = crate::config::AtemConfig::load()
             .map(|c| c.extra_hostnames())
             .unwrap_or_default();
-        let local_url   = format!("https://localhost:{}{}", port, target_path);
-        let network_url = format!("https://{}:{}{}", sslip, port, target_path);
+        let local_url   = access.url(&format!("https://localhost:{}{}", port, target_path));
+        let network_url = access.url(&format!("https://{}:{}{}", sslip, port, target_path));
         let custom_urls: Vec<String> = extra_hostnames
             .iter()
-            .map(|h| format!("https://{}:{}{}", h.trim(), port, target_path))
+            .map(|h| access.url(&format!("https://{}:{}{}", h.trim(), port, target_path)))
             .collect();
         let entry = crate::rtc_test_server::ServerEntry {
             id: sid.clone(),
@@ -192,11 +195,13 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
         crate::config::AtemConfig::store_files_port(bound_port);
     }
 
-    let local_url   = format!("https://localhost:{}{}", bound_port, target_path);
-    let network_url = format!("https://{}:{}{}", sslip, bound_port, target_path);
+    // Every page needs this server's access code (in its URLs).
+    let access = Arc::new(crate::web_server::access::AccessCode::for_server(bound_port, true));
+    let local_url   = access.url(&format!("https://localhost:{}{}", bound_port, target_path));
+    let network_url = access.url(&format!("https://{}:{}{}", sslip, bound_port, target_path));
     let custom_urls: Vec<String> = extra_hostnames
         .iter()
-        .map(|h| format!("https://{}:{}{}", h.trim(), bound_port, target_path))
+        .map(|h| access.url(&format!("https://{}:{}{}", h.trim(), bound_port, target_path)))
         .collect();
 
     let header = if cfg._daemon { "atem serv files (daemon)" } else { "atem serv files" };
@@ -222,15 +227,20 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
         let (stream, _) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let root = root.clone();
+        let access = access.clone();
         tokio::spawn(async move {
             if let Ok(tls) = acceptor.accept(stream).await {
-                let _ = handle_connection(tls, &root).await;
+                let _ = handle_connection(tls, &access, &root).await;
             }
         });
     }
 }
 
-async fn handle_connection<S>(mut stream: S, root: &Path) -> Result<()>
+async fn handle_connection<S>(
+    mut stream: S,
+    access: &crate::web_server::access::AccessCode,
+    root: &Path,
+) -> Result<()>
 where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     // Read the request line + headers (we ignore body — GET only).
@@ -238,6 +248,9 @@ where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     let n = stream.read(&mut buf).await?;
     if n == 0 { return Ok(()); }
     let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    if !crate::web_server::access::admit(&mut stream, access, head).await? {
+        return Ok(());
+    }
     let request_line = head.lines().next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -482,7 +495,7 @@ where S: tokio::io::AsyncWrite + Unpin,
         _   => "OK",
     };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
         status, reason, ct, body.len()
     );
     stream.write_all(head.as_bytes()).await?;
@@ -494,6 +507,43 @@ where S: tokio::io::AsyncWrite + Unpin,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request through the access gate: no code is a plain 404, the code
+    /// in the URL sets the cookie and redirects without it, the cookie
+    /// serves the file.
+    #[tokio::test]
+    async fn files_need_the_access_code() {
+        const CODE: &str = "AbCdEfGhIjKlMnOpQrStUv";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::web_server::access::use_code_for_test(CODE);
+        let access = crate::web_server::access::AccessCode::for_server(8443, true);
+        let ask = |request: String| {
+            let (root, access) = (root.clone(), &access);
+            async move {
+                let (mut client, server) = tokio::io::duplex(64 * 1024);
+                client.write_all(request.as_bytes()).await.unwrap();
+                handle_connection(server, access, &root).await.unwrap();
+                let mut out = Vec::new();
+                client.read_to_end(&mut out).await.unwrap();
+                String::from_utf8_lossy(&out).into_owned()
+            }
+        };
+        let none = ask("GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n".into()).await;
+        assert!(none.starts_with("HTTP/1.1 404 Not Found\r\n"), "{none}");
+        assert!(!none.contains("hello"));
+        let enter = ask(format!("GET /a.txt?t={CODE} HTTP/1.1\r\nHost: x\r\n\r\n")).await;
+        assert!(enter.starts_with("HTTP/1.1 302 Found\r\n"), "{enter}");
+        assert!(enter.contains("\r\nLocation: /a.txt\r\n"), "{enter}");
+        let served = ask(format!(
+            "GET /a.txt HTTP/1.1\r\nHost: x\r\nCookie: atem_access_8443={CODE}\r\n\r\n"
+        ))
+        .await;
+        assert!(served.starts_with("HTTP/1.1 200 OK\r\n"), "{served}");
+        assert!(served.contains("Referrer-Policy: no-referrer"), "{served}");
+        assert!(served.ends_with("hello"), "{served}");
+    }
     use tempfile::TempDir;
 
     #[test]
