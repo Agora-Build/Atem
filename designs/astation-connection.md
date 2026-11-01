@@ -86,7 +86,7 @@ The saved session:
 - Device verification is commit-then-reveal: a 12-character safety code the user compares, Touch ID on the Mac, then the signed `deviceVerified` applied atomically. A failure keeps the pairing, and `atem pair verify` retries. See AGENTS.md ("SSO auth") and [e2e-encryption.md](e2e-encryption.md#devices).
 - `atem pair verify` runs on the runtime's link, authenticated with the saved session. It first moves the pairing to a new binding in the next host trust generation (`pairing::rebind_for_verification`, durable before `verifyCommit`), because every ceremony reveals a fresh `host_channel_key`. The Astation, session and shared login stay.
 - Verification pins the account's signed device list. Relay only and the host route proof build on it. See [account-trust.md](account-trust.md).
-- `atem unpair` commits the next host trust generation, removes the pairing record and sends the runtime `reload`.
+- `atem unpair` commits the next host trust generation, removes the pairing record and tells a running runtime, which drops that pairing's link with its attachments.
 
 ## Relay identity room and Stations
 
@@ -141,8 +141,5 @@ Transport security:
 
 ## Switching Stations and pairings
 
-- The runtime's local `reload` request re-reads config.toml and the pairing. `atem unpair` and `atem logout` send it to a running runtime; they never start one.
-- A link whose pairing changed is dropped with its attachments. The runtime also checks this every 5 s, so an unpair works without `reload`.
-- A relay link reached at another Station than the configured `astation_relay_url` (a trailing `/` aside) is dropped at `reload` (`App::station_changed`, `LinkVia::Relay.url`). Its attachments, channels and leases go with it, and the reconnect goes to the configured Station at once.
-- A local link stays at a Station change.
-- v0.8.0 has no `atem runtime reload` subcommand. After editing `astation_relay_url`, run `atem runtime restart` (sessions keep running); any later reconnect also reads the new URL.
+- To use another Station, change `astation_relay_url` in config.toml (or set `ASTATION_RELAY_URL`), then run `atem runtime restart`. Sessions keep running; the new runtime connects to the new Station.
+- `atem unpair` and `atem logout` tell a running runtime (they never start one). It drops a link whose pairing changed, with its attachments. The runtime also checks the pairing every 5 s, so an unpair takes effect either way.

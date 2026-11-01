@@ -90,7 +90,7 @@ differ:
   are removed with no compatibility.
 - **Operations.** `atem pair`, `atem pair verify`, `atem cred unlock|projects`
   and the paired-token refresh run in the broker on its link, as described
-  below; `atem unpair` and `atem logout` send `reload`.
+  below; `atem unpair` and `atem logout` tell a running runtime, which drops the link of a changed pairing.
 - **Session logs** are written by the worker when an agent that printed
   something ends (`<config>/logs/<session_id>/session.ansi`, `summary.md`).
 
@@ -266,7 +266,7 @@ JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.
 | `session` | runtime | the attached session's changed summary (status, remote control, state) |
 | `astation` | runtime | `connected`, on every change of the Astation link |
 | `reclaim` | client | `session_id`: take control back from a remote lease holder (prefix `g`) |
-| `reload` | client | re-read credentials, sessions and config (after `unpair`, `logout`, config edits); a link whose pairing is gone is dropped with its attachments |
+| `reload` | client | sent by `atem unpair` and `atem logout`: re-read the login and pairing; a link whose pairing is gone is dropped with its attachments |
 | `status` | client / runtime | read-only → `status {status}`: the link (`astation`, `transport` local/relay, `relay` label `<host> as <atem_id>`, `retrying`, `reauthenticating`), the attachment (`attachment`, `welcomed{revision, at_ms, ms_left}`, `refused{revision, needs, at_ms}` of the last refused `hello`), `journal_halted`, `host_error`, `adopting`, `sessions` (each with its worker's `worker_build`); never a secret |
 | `restart` / `restarting` | client / runtime | the runtime exits after this pass so the client can start its own build, which adopts the workers; refused (`error`, "An Astation operation is running…") while an operation runs |
 | `astation_op` | client | `request_id`, `kind` (`pair`, `pair_verify`, `cred_unlock`, `cred_projects`, `token`), `options` (`save` for `pair`; `astation_id` for `token`; `cwd` for `cred_projects`) |
