@@ -423,8 +423,19 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut item = make_item("t1");
         item.cwd = dir.path().to_path_buf();
-        let (success, output) = run_background(script.to_str().unwrap(), &item).await;
-        assert!(success);
+        // A fork elsewhere in this test process can hold the script's write
+        // handle for a moment ("Text file busy", a known race when a test
+        // writes an executable and runs it): retry while it does.
+        let mut tries = 0;
+        let (success, output) = loop {
+            let (success, output) = run_background(script.to_str().unwrap(), &item).await;
+            tries += 1;
+            if success || !output.contains("Text file busy") || tries == 50 {
+                break (success, output);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(success, "{output}");
         assert_eq!(
             output.trim(),
             dir.path().canonicalize().unwrap().to_str().unwrap()
