@@ -970,10 +970,11 @@ impl Approvals {
         match &ev {
             Evidence::TurnEnded { at_ms, .. } => {
                 // A request opened after it (read in the same pass) is not
-                // what the turn's end or the new prompt answered. A
-                // whole-second time (a filesystem keeping seconds) counts
-                // to the end of its second.
-                let at = at_ms.map(|at| if at % 1000 == 0 { at + 999 } else { at });
+                // what the turn's end or the new prompt answered. Times are
+                // compared as they are: a millisecond time ending in `.000`
+                // is no whole second (one in a thousand are), and a source
+                // that keeps whole seconds says so itself (`hook_events`).
+                let at = *at_ms;
                 let ids: Vec<String> = self
                     .waiting
                     .iter()

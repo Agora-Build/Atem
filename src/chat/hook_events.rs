@@ -105,11 +105,15 @@ fn read_event(path: &Path) -> std::io::Result<Option<(String, i64)>> {
     if !meta.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
+    // A filesystem that keeps whole seconds (no nanoseconds at all): the
+    // event was made up to the end of that second.
     let at_ms = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_millis() as i64);
+        .map_or(0, |d| {
+            d.as_millis() as i64 + if d.subsec_nanos() == 0 { 999 } else { 0 }
+        });
     let mut text = String::new();
     file.take(MAX_EVENT + 1).read_to_string(&mut text)?;
     Ok((text.len() as u64 <= MAX_EVENT).then_some((text, at_ms)))
@@ -282,5 +286,32 @@ impl EventReader {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// A file time is taken as it is; one with no nanoseconds at all (a
+    /// filesystem keeping whole seconds) counts to the end of its second.
+    #[test]
+    fn an_event_time_is_exact_unless_the_filesystem_keeps_whole_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ev-0000000001-Stop.json");
+        std::fs::write(&path, "1 2\n{}").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        for (set, want) in [
+            (Duration::from_millis(1_793_000_000_123), 1_793_000_000_123),
+            // `.000` with nanoseconds: an exact millisecond time.
+            (Duration::new(1_793_000_000, 400), 1_793_000_000_000),
+            // No nanoseconds: whole seconds only.
+            (Duration::from_secs(1_793_000_000), 1_793_000_000_999),
+        ] {
+            file.set_modified(UNIX_EPOCH + set).unwrap();
+            let (_, at_ms) = read_event(&path).unwrap().unwrap();
+            assert_eq!(at_ms, want, "{set:?}");
+        }
     }
 }

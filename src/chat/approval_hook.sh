@@ -137,12 +137,18 @@ if [ "$1" = event ]; then
     [ "$ev" = PermissionRequest ] && { rm -f "$t" "$m"; exit 0; }
     # The lock is free unless a live hook holds it: one whose holder is
     # gone (or that names no pid: no hook makes one) is removed, only if it
-    # still names that holder. Fails (1) while a live hook holds it.
+    # still names that holder. Fails (1) while a live hook holds it. `$1`
+    # `waited`: after the whole wait (below).
     free_stale() {
         if [ -h "$l" ]; then
             p=$(readlink "$l" 2>/dev/null)
             case $p in
-                '' | *[!0-9]*) ;;
+                # Nothing read: the lock was released meanwhile, or it is a
+                # link to nothing (macOS allows one; no hook makes it). At
+                # once, nothing is removed: removing now could take a lock
+                # another hook has just made. After the whole wait, it goes.
+                '') [ "${1:-}" = waited ] || return 0 ;;
+                *[!0-9]*) ;; # not a pid: no live hook made it
                 *) kill -0 "$p" 2>/dev/null && return 1 ;;
             esac
             [ "$(readlink "$l" 2>/dev/null)" = "$p" ] && rm -f "$l" 2>/dev/null
@@ -173,7 +179,7 @@ if [ "$1" = event ]; then
         fi
         if [ "$n" -ge $((${sync:-2} * 10)) ] || ! kill -0 "$w" 2>/dev/null; then
             untime
-            free_stale || fail
+            free_stale waited || fail
             ln -s "$$" "$l" 2>/dev/null && break
             fail
         fi
