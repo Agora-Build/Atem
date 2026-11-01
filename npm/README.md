@@ -310,11 +310,11 @@ locally takes control back at once), and chat with the agent: sending a
 prompt takes control when nobody holds it (if another device does, Astation
 asks before taking over), the whole retained conversation can be scrolled
 back page by page, and each finished prompt names its reply messages.
-Every remote request names the exact session. A verified host speaks
-atem-session r9: Astation, your phone and approved services reach it over
-end-to-end encrypted channels checked against your account's signed device
-list, so older (r8) clients are refused; old `agentInput`, `agentPrompt`,
-voice and `userCommand` messages were removed.
+Every remote request names the exact session. On a verified host,
+Astation, your phone and approved services reach it over end-to-end
+encrypted channels checked against your account's signed device list. Keep
+Atem and Astation up to date together: an older Astation is refused until
+it is updated.
 
 Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
 
@@ -397,7 +397,7 @@ The first `atem agent launch codex` asks once whether to add Atem's hooks
 (one per Codex event, for approvals and chat) to `~/.codex/hooks.json`, after
 your own (a backup is kept as `hooks.json.atem-bak`); to turn them off later,
 set `hooks = false` under `[codex]` in `~/.config/atem/config.toml` — the next
-`atem agent launch codex` removes them. See §6a and the r8 appendix of the [session protocol](https://github.com/Agora-Build/Atem/blob/main/designs/protocol/atem-session-v1.md).
+`atem agent launch codex` removes them. See the [session protocol](https://github.com/Agora-Build/Atem/blob/main/designs/protocol/atem-session-v1.md) for the details.
 
 ## TUI Modes
 
