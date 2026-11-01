@@ -7,18 +7,25 @@ signed account state, signed RFC 9180 HPKE grants for `K`). Build step 2a
 is built on the atem side (2026-10-10): `device_keys.sealed` under a
 storage key held by the home Astation, the cred agent (`atem cred-agent`),
 Touch ID unlock through Astation, storage-key rotation at every unlock,
-and `atem cred unlock|lock|status`. The Astation side of steps 0–2a is
-pending (see "Astation work for steps 0–1" and "Astation work for step
-2a"); until it lands, atems stay unverified and keep plain-text sync.
+and `atem cred unlock|lock|status`. The Astation side of steps 0–2a was
+pending then (see "Astation work for steps 0–1" and "Astation work for step
+2a"); it has since landed (devices verify, unlock and escrow live, and
+encryption is on for the account).
 Build step 2b is built on the atem side (2026-10-11): `K` and its previous
 keys live in the sealed payload of `device_keys.sealed`, only the cred agent
 uses them (batched `Crypt` requests), the mode and kid come from the signed
 account state alone, project names live in `project_names.json`, and
 `data_keys.enc` is moved in at the first unlock and deleted. 2b needs nothing
-new from Astation. Device-signed writes (3), the recovery
+new from Astation. Also built on the atem side since: encrypted
+credential-project reports (`atem cred projects`,
+`docs/credential-project-reporting.md`) and migration with its signed
+completion ("Migration completion lifecycle"). Everything here is in Atem
+v0.8.0. Device-signed writes (3), the recovery
 secret (4), credentials (5–6, 8) and auto-unlock (7): design approved for
 planning (2026-10-09), hardened after an independent security review the
-same day (see "Review findings"). Not built.
+same day (see "Review findings"). Not built: `atem cred get` and the other
+credential commands are designed only (`atem cred unlock|lock|projects` are
+built).
 Owner: Brent G
 
 ## Goal
@@ -1344,9 +1351,10 @@ and in the shipped #36 code; the design above includes every fix.
 | 13 | low | Ambiguous concatenation, `K` reused for AEAD and HMAC, unauthenticated display names, unspecified signature encoding | Length-prefixed encoding, bound display name, low-S `r ‖ s` ("Formats"); HKDF subkeys for the index key and the migration proof only: `K` itself still keys both `e1.` and `h1.` (not changed: it would re-key every stored value) |
 | 14 | low | Pre-encryption plain text survives in old database backups | Stated in the threat model and "Moving existing data over" |
 
-Findings 1, 4 and 5 affect code already shipped in #36. No account is
-encrypted in practice yet, because Astation's key manager isn't built, but
-they must be fixed before it ships (build step 0).
+Findings 1, 4 and 5 affect code already shipped in #36. At the review
+(2026-10-09) no account was encrypted in practice, because Astation's key
+manager wasn't built; they had to be fixed before it shipped (build step 0),
+and were.
 
 ## Wire messages (build steps 0–1)
 
@@ -1750,8 +1758,8 @@ encryption key (32 × `66`) and verifies the device signature.
 | Astation | Secure Enclave signing key and encryption key; signed account state, device certificates, grants, directory, revocations; key manager for `K`; scope, index and storage keys; Credentials and Devices tabs; verification dialog; unlock prompts, auto-unlock checks, tickets; recovery secret `R` in the kit, `atem-k-backup-v2` sealed to the kit's public key, recovery with a 24-hour host-clock wait and manager approve/veto, kit replacement |
 | Relay | Store and serve signed statements; per-account plain-text refusal; `credentials`, `cred_manifests`, `cred_directory`, `cred_grants`, `cred_devices`, `cred_recovery`, `cred_fetch_log`; credential writes from the Astation session only; grant-scoped reads; device signatures on memory rows; live-twin and network observations forwarded to Astation |
 
-The Astation `feat/recovery-kit` branch has no e2e key handling yet
-(`keyGrant`, `encryptionMode`).
+At the time (2026-10-09) the Astation `feat/recovery-kit` branch had no e2e
+key handling (`keyGrant`, `encryptionMode`); it has since been built.
 
 Suggested build order:
 0. Fix #36 on atem before Astation's key manager ships: ignore unsigned

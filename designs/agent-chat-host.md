@@ -1,7 +1,9 @@
 # Agent chat (chat-v1): Atem host side
 
 Status: design approved 2026-10-15; Atem host side built (Claude and Codex
-adapters). atem-session r8 (2026-10-18, implemented) replaces the #75 paging
+adapters) and released in Atem v0.8.0 (2026-10-31), where remote clients also reach it over
+atem-session r9 (end-to-end `atem-ch1` channels; chat-v1 runs unchanged
+inside them). atem-session r8 (2026-10-18, implemented) replaces the #75 paging
 (`open{before}`, `status.page`) with history pages in the sequenced stream,
 adds coverage, receipt results, chat Send that acquires the lease and
 lease-free approval answers; this document describes the r8 behaviour (the
@@ -23,8 +25,7 @@ in, which events mean what, how the session log is parsed) lives in one
 adapter per agent; the chat state, message model, wire protocol, security and
 reconnect handling are shared. Two adapters: **Claude Code**, and **Codex**
 (its rollout JSONL plus Atem's Codex hooks, which need per-installation trust;
-`src/chat/codex/adapter.rs`, spec `designs/fixtures/codex-hooks/README.md`,
-plan `designs/plans/2026-10-17-codex-chat.md`); other agents (Gemini CLI, OpenCode, Copilot CLI,
+`src/chat/codex/adapter.rs`, spec `designs/fixtures/codex-hooks/README.md`); other agents (Gemini CLI, OpenCode, Copilot CLI,
 Aider, …) get an adapter only once their logs and events are checked. An agent
 without an adapter keeps the shared terminal, reports status `unknown` and has
 no `chat-v1` capability.

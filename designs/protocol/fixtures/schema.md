@@ -78,7 +78,7 @@ gate each one on the host work it needs (`R8_FIXTURE_NEEDS` in
 are implemented, so the core runner runs all of them. The real-runtime
 runner reports the ones it can't express as NOT RUN with the reason (more
 than one client, journal faults, `chat_evict`, `worker_gap`, …); see
-`../atem-host-handoff.md` for the current counts.
+`../README.md` for where they run.
 
 - In an r8 scenario the harness's setup `hello` carries `"revision": 8` and
   the `welcome` must echo `revision: 8` and carry `features`.
@@ -198,8 +198,7 @@ versions) is Astation's; the host side of it is
 `r9-*.json` files carry `"requires": "r9"` and exercise appendix "r9" of
 `../atem-session-v1.md`, implemented by Atem. They run in
 `crates/atem-client`'s tests (vectors, client and relay sides) and in
-Atem's `tests/r9_runner` (host side, against the real runtime; results and
-the items no channel can express in `../atem-host-handoff.md`). The r8
+Atem's `tests/r9_runner` (host side, against the real runtime; see `../README.md`). The r8
 runners report every one as NOT RUN ("requires r9 …",
 `revision::R9_NOT_RUN`) and only check that it parses, is named after its
 file and has a known `kind`. The steps below are the contract for the r9
