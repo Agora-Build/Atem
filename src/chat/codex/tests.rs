@@ -998,10 +998,15 @@ mod script {
         let mut waited_out = 0;
         for t in threads {
             let ((ok, stdout, stderr), took) = t.join().unwrap();
-            assert!(ok && stdout.is_empty() && stderr.is_empty());
-            if took >= Duration::from_millis(1900) {
-                waited_out += 1;
-            }
+            // A hook that waited the lock's ~2 s bound out may fail: a
+            // synchronous event that can't publish blocks its tool (exit 2,
+            // with a message). Any other succeeds silently.
+            let waited = took >= Duration::from_millis(1900);
+            waited_out += usize::from(waited);
+            assert!(
+                waited || (ok && stdout.is_empty() && stderr.is_empty()),
+                "ok {ok}, stdout {stdout:?}, stderr {stderr:?} after {took:?}"
+            );
         }
         // Published: distinct, consecutive seqs from 1, the counter at the
         // last. All of them, unless the machine is so slow that the hooks

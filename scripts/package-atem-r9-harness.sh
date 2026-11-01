@@ -96,7 +96,7 @@ Run (Linux x86_64, python3 on /usr/bin):
 
 Limits: a fixed flow; fake routing (no entry point for Astation's router
 or relay yet); the fake Claude Code only; Linux x86_64 only (the sandbox
-cleans up through /proc). See designs/protocol/atem-host-handoff.md.
+cleans up through /proc). See designs/protocol/README.md.
 README
 
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$WORK" -cf - "$NAME" \

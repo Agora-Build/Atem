@@ -4,7 +4,7 @@ name: r9-harness
 # headless multi-device harness (tests/r9_harness.rs) prebuilt with the atem
 # it drives, the fake Claude Code, a run script and a sample transcript from
 # a consumer-style run, with SHA-256 sums and a source pin
-# (scripts/package-atem-r9-harness.sh; designs/protocol/atem-host-handoff.md).
+# (scripts/package-atem-r9-harness.sh; designs/protocol/README.md).
 # Uploaded as a workflow artifact only; no secret is used.
 
 on:
