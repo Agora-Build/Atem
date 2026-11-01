@@ -163,7 +163,13 @@ impl Rig {
             .env("ASTATION_WS", &self.astation.url)
             .env("ASTATION_RELAY_URL", "http://127.0.0.1:1");
         if let Some(clock) = &self.clock {
-            command.env("ATEM_TEST_HOST_CLOCK", &clock.path);
+            // The host clock is a file a thread rewrites every 20 ms; on a
+            // loaded machine it lags, and the per-link one-init-a-second
+            // limit (checked by the engine tests) could refuse an init the
+            // test spaced 1.1 s apart: off here, as in the fixture runner.
+            command
+                .env("ATEM_TEST_HOST_CLOCK", &clock.path)
+                .env("ATEM_TEST_NO_INIT_LIMIT", "1");
         }
         let child = command
             .stdin(Stdio::null())

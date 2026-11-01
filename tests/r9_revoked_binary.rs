@@ -163,6 +163,10 @@ impl Rig {
             .env("ASTATION_WS", &self.astation.url)
             .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
             .env("ATEM_TEST_HOST_CLOCK", &self.clock.path)
+            // The host clock lags on a loaded machine: the one-init-a-second
+            // limit (the engine tests check it) could answer `busy` before the
+            // refusal this file checks.
+            .env("ATEM_TEST_NO_INIT_LIMIT", "1")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
