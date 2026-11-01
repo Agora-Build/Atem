@@ -1,9 +1,8 @@
 # atem-client bindings: the binding and effect contract
 
-Status: built (Task 5 of `designs/plans/2026-10-20-r9.md`) and released in Atem v0.8.0 (2026-10-31);
+Status: built and released in Atem v0.8.0 (2026-10-31);
 Astation integrates the bindings, and the joint live tests passed. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
-`atem-session-v1.md` (§R9.5–§R9.9). Integration view:
-`remote-agent-api-atem.md` §6.
+`atem-session-v1.md` (§R9.5–§R9.9). Overview of the protocols: [README.md](README.md).
 
 `atem-client` is the shared r9 client core: canonical encoding and
 signatures, the membership verifier, `atem-ch1`, the r9 hello/welcome, r8's

@@ -39,7 +39,7 @@ deliberately **not** MCP).
 
 - The relay-server (station) is already the shared rendezvous every atem can
   reach (LAN / VPN / relay), already has session auth (see [[session-auth]],
-  [[relay-support]]), and is the only always-on component multiple atems share.
+  [astation-connection.md](astation-connection.md)), and is the only always-on component multiple atems share.
 - Vault content must survive restarts and be readable by an atem that was
   offline when it was written → a **durable** store. Postgres (chosen over R2)
   gives transactional append, per-vault counters, and a cheap "latest version
@@ -221,7 +221,7 @@ All carry `?id=<client_id>` + session auth; all run the authz predicates above.
 ## Open questions
 
 1. **`work_session_id` source.** Is the "work session" the relay room
-   (= astation_id, per [[relay-support]]), the pairing session, or a new explicit
+   (= astation_id, per [astation-connection.md](astation-connection.md)), the pairing session, or a new explicit
    id minted by `atem vault new`? Leaning: the work session = the relay room the
    atems share, so two atems paired to the same Astation are automatically in one
    work session.

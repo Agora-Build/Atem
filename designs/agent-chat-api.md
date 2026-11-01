@@ -10,8 +10,8 @@ coverage, receipt results, chat Send that acquires the lease, lease-free
 approval answers; plus sessions, leases, receipts, approvals and Atem session
 rules from r7.x; on a host with a device list, r9: the same messages
 inside an end-to-end `atem-ch1` channel, appendix "r9"), `designs/agent-chat-host.md`
-(chat-v1 host side) and `designs/protocol/atem-host-handoff.md` (what Astation
-and the relay do). Field names below were checked against `src/chat/wire.rs`,
+(chat-v1 host side) and `designs/protocol/README.md` (the protocols and where
+their tests run). Field names below were checked against `src/chat/wire.rs`,
 `src/chat/session.rs`, `src/chat/history.rs`, `src/chat/adapter.rs`,
 `src/session_protocol/` and `src/runtime/host_bridge.rs`.
 

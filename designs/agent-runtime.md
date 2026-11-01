@@ -1,74 +1,70 @@
 # Atem runtime: one owner for every agent session and the Astation connection
 
-Status: **implemented and released in Atem v0.8.0 (2026-10-31)** (built 2026-10-16; plans
-`designs/plans/2026-10-16-runtime-host-integration.md` and its
-predecessors); the host serves atem-session r8, and r9 on a host with a
-device list. See "Implementation status" below for what
-was built and where it deviates from this text. Proposed 2026-10-15
-(decisions A–C agreed with the user). **Superseded where it differs by the approved
-[session-multiplexing.md](session-multiplexing.md)** (Astation + user,
-2026-10-15); see "Alignment with session-multiplexing.md" below, which is
-binding for Atem. It is phase 2 of [local-agent-runtime.md](local-agent-runtime.md)
-("background PTY owner, private local attach/detach, stable session
-identities") and answers Astation's handoff "Atem pair versus running agent
-host: connection ownership race" (2026-10-15).
+Status: **current design, implemented and released in Atem v0.8.0
+(2026-10-31)**. The host serves atem-session r8, and r9 on a host with a
+device list. "Product decisions" are the approved rules; "Implementation
+status" says what was built and where it differs from the design text after
+it. The wire contract is [protocol/atem-session-v1.md](protocol/atem-session-v1.md)
+(overview: [protocol/README.md](protocol/README.md)); see also
+[shared-terminal.md](shared-terminal.md), [agent-chat-host.md](agent-chat-host.md)
+and [account-trust.md](account-trust.md).
 
-## Alignment with session-multiplexing.md
+## Product decisions
 
-The approved product design changes this document as follows. Where the text
-below disagrees, this section wins.
+Approved by the user and Astation (2026-10-15); where the text below
+disagrees, this section and "Implementation status" win. Device trust
+(enrollment, freshness, browser grants, recovery, relay confidentiality) was
+decided later: [account-trust.md](account-trust.md) and the contract's r9 appendix.
 
-1. **Workers own agents.** Each session runs in its own `atem worker` process
-   that owns the agent process, PTY, output collection and submission journal.
-   The runtime is a broker (Astation connections, registry, cred agent access,
-   local IPC). A runtime crash or frontend exit does not end workers; a new
-   runtime adopts surviving workers through authenticated local IPC, checking
-   session id, process generation and process-start metadata (never a pid
-   alone). A worker or agent crash, or a reboot, shows the session as
-   Interrupted / Recovery Required; a provider resume, when offered, is a new
-   process generation. Transcripts are never replayed into a new process.
-2. **CLI workflow.** `atem status` (read-only, offline, stale marks; labels
-   Account / Pairing / Verification / Credentials / Authorization / Relay /
-   Local agents; the user removed the `atem cred status` alias that
-   session-multiplexing.md §1 still lists). `atem pair` reports status and
-   changes nothing when already paired; `atem pair verify` verifies the existing
-   binding (no-op when validly verified; interruption keeps the pairing);
-   `atem cred unlock` never starts pairing or verification (unverified → "run
-   `atem pair verify`"); `atem cred lock` works offline; `atem unpair` removes the
-   binding, commits a new host trust generation and invalidates remote
-   authorization while keeping account data and running agents. The
-   "`atem pair` cases" below are replaced by this.
-3. **Control leases.** One controller per session; a renewable lease that
-   expires after 15 s without renewal (earlier when authorization expires);
-   many viewers; explicit takeover leaves the old controller a viewer; local
-   terminal input wins atomically; every mutation path (terminal, chat, future
-   APIs) checks target, controller identity, lease epoch and permissions;
-   stale epochs and old process generations are rejected.
-4. **Receipts.** A worker durably records a submission (request id bound to the
-   exact target and payload digest) before acknowledging acceptance; states
-   accepted / executing / completed / rejected / outcome-unknown; duplicates
-   return the recorded outcome; same id with other content is rejected. Raw
-   keystrokes are a live stream, never replayed. Retention: receipts for the
-   session's life + 7 days, Atem-owned conversation history 30 days after
-   closure (configurable limits, export/delete), bounded raw scrollback.
-   Records owner-only and encrypted under the local key policy, no plaintext
-   fallback.
-5. **Transports.** Astation's direct port-8080 connection and the relay are thin
-   adapters over one identity, registry, lease and receipt implementation.
-   Authorization freshness: at most 24 h after the last validated trust update;
-   at the deadline remote viewing/control pause while agents and the local
-   terminal continue.
-6. **Joint contract first.** Trust anchor and enrollment, membership,
-   freshness proofs, end-to-end encrypted transport, QR grants and the session
-   / lease / receipt wire messages are specified jointly with Astation as a
-   versioned contract with fixtures (`designs/protocol/`) before either side
-   implements the parts that communicate. Atem builds the local parts (CLI
-   workflow, runtime, workers, journal, host lease logic) against that
-   contract as it lands.
+- **One runtime per profile** (OS user and config directory) owns the
+  Astation link, the session registry and cred agent access; every other
+  `atem` is its client, and concurrent starts elect one owner without
+  displacing it. Pairing, verification and unlock never disturb a session.
+- **Sessions outlive frontends.** Closing a launch window detaches; the
+  session keeps running and stays visible in Astation. The runtime starts on
+  demand and exits when idle (no system service). Several sessions run at
+  once, several of one provider included (at most 16). Launching is local
+  only and needs no pairing.
+- **Workers own agents** and survive the broker, which adopts them only on a
+  matching session id, process generation and OS start time. A worker or
+  agent crash or a reboot shows `interrupted`/`recovery_required`: nothing is
+  restarted, and a transcript is never replayed into a new process.
+- **One controller at a time.** Many viewers; one controller per session on a
+  15 s lease (capped by the authorization), renewed by the client, taken over
+  explicitly (the old controller stays a viewer). Local typing takes control
+  back: it revokes any remote lease before it is written. Every mutation
+  names the session and process generation and is checked against the lease
+  epoch; queued bytes of an old lease or process are dropped. A disconnect
+  lets the lease expire; a reconnect replays nothing. Approvals need
+  `control`, not the lease (r8 §G), and the lease never approves anything.
+- **Receipts.** A submission is accepted once its record is durable (in the
+  broker's journal); its `request_id` binds target and payload digest. A
+  duplicate gets the recorded receipt; work executing at a crash is
+  `outcome_unknown`, never retried; accepted work outlives its controller's
+  lease. Raw keystrokes are a live stream, never replayed. Receipts last the
+  session plus 7 days (at most 4096 per session). The journal keeps no prompt
+  text past acceptance (owner-only, not encrypted), and Atem keeps no
+  conversation store (the approved 30-day history was not built).
+- **Transports.** The direct port-8080 link and the relay are thin adapters
+  over one registry, lease and receipt implementation; neither grants trust.
+  Remote access is bounded (24 h per r8 attachment or r9 native channel, a
+  grant's expiry), then pauses until it authenticates again; agents and the
+  local terminal go on.
+- **Astation** views sessions, terminals and chats; with `control` and the
+  lease it types, prompts (a chat Send may take the lease), interrupts and
+  stops; with `control` alone it answers approvals and revokes session rules;
+  it assigns mark tasks.
+- **CLI.** `atem status` is the one read-only, offline status command (no
+  `atem cred status`). `atem pair` on a paired profile only reports;
+  replacing a pairing is `atem unpair`, then `atem pair`. `atem pair verify`
+  verifies the existing pairing and keeps it on failure. `atem cred
+  unlock|lock` never start pairing or verification (lock works offline).
+  `atem unpair` commits a new host trust generation and ends remote access,
+  keeping account data, keys and running agents.
 
 ## Implementation status (built 2026-10-16, released in v0.8.0)
 
-Built as the Alignment section says, not as the older text below where they
+Built as "Product decisions" says, not as the older text below where they
 differ:
 
 - **Broker and workers.** `atem runtime` is the broker; every session runs in
@@ -81,7 +77,9 @@ differ:
   hold.
 - **One writer authority.** The broker grants input epochs; the worker drops
   a write whose epoch is older than its current one at the PTY write
-  boundary. Local input revokes any remote lease first.
+  boundary. Local input revokes any remote lease first. A remote write also
+  carries its lease's deadline (`not_after`, on CLOCK_MONOTONIC), and the
+  worker drops it there once that has passed.
 - **Session host.** The broker runs atem-session (r6.2 when built; now r8, and r9 on a host with a device list, which refuses r8; compatibility mode,
   `designs/protocol/atem-session-v1.md`) over a `FileJournal` in
   `<config>/runtime/journal/`; the runtime's one Astation link is one
@@ -89,8 +87,7 @@ differ:
   verified Astation gets one. Terminal-v1 and chat-v1 are bound to session-v1
   (bindings and leases); `agentInput`, `agentPrompt`, voice, `userCommand`,
   terminal-v1 `control`/`list`, provider-name terminal ids and the agent list
-  are removed with no compatibility (the "Astation-visible changes" section
-  below is replaced by `designs/protocol/atem-host-handoff.md`).
+  are removed with no compatibility.
 - **Operations.** `atem pair`, `atem pair verify`, `atem cred unlock|projects`
   and the paired-token refresh run in the broker on its link, as described
   below; `atem unpair` and `atem logout` send `reload`.
@@ -103,21 +100,15 @@ Deviations from the text below:
   launch in progress and no non-passive client; there is no separate
   30-second rule for a runtime started only for an operation (the operation's
   CLI stays connected while it runs).
-- `atem pair` on an already paired profile only prints the status (Alignment
-  item 2); re-pairing over a live connection ("`atem pair` cases" 1–3) does not
-  exist: `atem unpair`, then `atem pair`.
-- `atem status` is the only status command: the user removed the `atem cred
-  status` alias (session-multiplexing.md §1, maintained by Astation, still
-  lists it).
+- `atem pair` on an already paired profile only prints the status (Product
+  decisions); re-pairing over a live connection ("`atem pair` cases" 1–3) does
+  not exist: `atem unpair`, then `atem pair`.
 - Remote viewers and controllers are not limited to "one viewer per session"
-  by the runtime; the limit is the one link (one attachment).
-- Shared fixtures (`tests/runtime_fixtures_binary.rs`): nine host fixtures
-  pass against the real runtime, and `removed-ops-have-no-effect` passes
-  folded onto one attachment; the multi-attachment fixtures run only in the
-  core harness (one Astation link today) and closed-session has no runtime
-  trigger yet. A remote write carries its lease's deadline (`not_after`, on
-  CLOCK_MONOTONIC) and the worker drops it at the PTY write boundary once
-  that has passed. See `designs/protocol/atem-host-handoff.md`.
+  by the runtime: r8 has one attachment (the one Astation link), r9 one per
+  channel, several devices at once.
+- The shared atem-session host fixtures run against the real runtime
+  (`tests/runtime_fixtures_binary.rs`); [protocol/README.md](protocol/README.md)
+  says where each set runs.
 
 ## Problem
 
@@ -133,7 +124,7 @@ only one of them at a time.
 
 ## Requirements
 
-From the user and Astation's handoff:
+From the user and Astation:
 
 - Several agents run at once on one machine and profile (Codex, Claude, and
   several sessions of the same provider); Astation shows and addresses all of
@@ -150,17 +141,6 @@ From the user and Astation's handoff:
   delays. Astation keeps its connection-generation checks and owner approval;
   an approval is never redirected to another socket and a verification is
   never replayed.
-
-## Decisions
-
-- **A. Closing a launch window detaches.** The session keeps running in the
-  runtime and stays visible in Astation. `atem agent attach <id>` reopens it;
-  `atem agent list` and `atem agent stop <id>` manage it; the prefix key `x`
-  still stops it. On detach the terminal prints one line saying the session is
-  still running and how to reattach or stop it.
-- **B. The runtime starts on demand** and exits when idle (see "Lifetime").
-  No system service is installed.
-- **C. Delivery in three PRs, released together** (see "Delivery").
 
 ## Architecture
 
@@ -230,13 +210,14 @@ atem pair / cred / list  ─┘  (same user)    └─ one authenticated Astatio
 - A frontend sends keys, paste and resize; the runtime sends a restore
   snapshot followed by output (the canonical-screen frames terminal-v1 uses).
   The status row, prefix keys and `terminal_prefix` stay in the frontend;
-  `h`/`m` (hide) become detach.
+  `h`/`m` (hide) become detach, which prints one line saying the session is
+  still running and how to reattach or stop it; `x` still stops it.
 - One local frontend per session: attaching from a second terminal moves the
   session there and the first frontend detaches with a notice.
 - Local input counts as terminal input for chat-v1's draft check; the remote
   control lease rules (prefix `g` reclaims) are unchanged.
 - Bare `atem` keeps its menu; its Claude/Codex entries launch a session
-  through the runtime (step 3).
+  through the runtime.
 
 ### Lifetime
 
@@ -350,9 +331,9 @@ HTTP-only commands (`atem sync`, `memory`, `skill`, `vault`) are unchanged.
 
 ### Astation-visible changes
 
-Replaced by atem-session r6.2 (now r8/r9): the complete list of wire-visible changes, and
-how to run the host, are in
-[protocol/atem-host-handoff.md](protocol/atem-host-handoff.md). Mark tasks go
+Everything Astation sees of sessions is atem-session: the contract is
+[protocol/atem-session-v1.md](protocol/atem-session-v1.md), and
+[protocol/README.md](protocol/README.md) gives the overview. Mark tasks go
 to a live Claude session whose working directory contains
 `.chisel/tasks/<task_id>.json`; with none, the task fails with "no Claude
 session for this project; run `atem agent launch claude` there".
@@ -385,8 +366,9 @@ every atem on a machine together.
 - The runtime never holds device keys; the cred agent keeps them.
 - Launch environments may contain provider credentials: bounded, passed only
   to the spawned agent, dropped after spawn, never logged or listed.
-- Remote authorization is unchanged: Astation pairing, re-authentication and
-  terminal-v1 control leases.
+- Remote authorization: the verified Astation pairing (r9: the
+  device list, [account-trust.md](account-trust.md)), re-authentication and
+  session-v1 control leases.
 
 ## Testing
 
@@ -400,8 +382,8 @@ Atem side:
   id; chat on the Claude one; stop one while the other runs; broker restart
   with adopted workers.
 - The shared atem-session host fixtures against the real binaries
-  (`tests/runtime_fixtures_binary.rs`; results in
-  `protocol/atem-host-handoff.md`).
+  (`tests/runtime_fixtures_binary.rs`; see
+  [protocol/README.md](protocol/README.md)).
 - Pairing and unlock (fake Astation, a session attached throughout):
   verification completes on the runtime's connection and the session's
   terminal and chat are still attached and unchanged afterwards; Touch ID
@@ -417,35 +399,13 @@ Atem side:
   (shortened by a test-only setting); `pair` refuses when the runtime is
   unreachable.
 
-Astation/relay side (for the Astation team, listed in the handoff reply):
+Astation/relay side (for the Astation team):
 cross-replica replacement, stale approval rejection on their side, close code
 4001, and owner-authenticated device verification in a separately owned test
 session.
 
 Manual: Codex and Claude launched separately, `atem pair` again, both visible
 and controllable in Astation throughout, verification approved with Touch ID.
-
-## Delivery
-
-Planned as three PRs released together (step 1 alone would leave a
-long-lived runtime racing a direct `atem pair`). Built instead on one branch
-(`feat/runtime`, since merged into `main`), by the plans in `designs/plans/2026-10-16-*`; the
-aliases, `agent_id` routing and agent list in step 1 were dropped (atem-session
-r6, no compatibility):
-
-1. **Runtime and sessions.** `atem runtime`, local protocol, `launch` /
-   `attach` / `list` / `stop`, several sessions, agent list and terminal-v1 by
-   session id (with aliases), chat-v1 per session, routing by `agent_id`, mark
-   tasks by working directory. `App`'s fixed Claude/Codex slots (in
-   `app.rs`, `app/terminal.rs`, `app/chat.rs`) become a map keyed by session;
-   session and Astation logic move into the runtime; the TUI becomes a
-   frontend. This is the large step (`app.rs` ≈ 2.3k lines, `app/*` ≈ 1.8k).
-2. **Astation operations through the runtime.** The UI trait; `atem pair`,
-   `atem cred unlock|projects` and paired-token refresh as runtime clients;
-   operation serialization and reply routing; `reload` from `unpair`/`logout`.
-3. **Cleanup.** Bare `atem` menu through the runtime; remove remaining in-TUI
-   ownership; update AGENTS.md, README, terminal-v1 and chat-v1 docs; send
-   Astation the wire changes and the questions above.
 
 ## Out of scope
 

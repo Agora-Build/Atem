@@ -25,8 +25,7 @@ in, which events mean what, how the session log is parsed) lives in one
 adapter per agent; the chat state, message model, wire protocol, security and
 reconnect handling are shared. Two adapters: **Claude Code**, and **Codex**
 (its rollout JSONL plus Atem's Codex hooks, which need per-installation trust;
-`src/chat/codex/adapter.rs`, spec `designs/fixtures/codex-hooks/README.md`,
-plan `designs/plans/2026-10-17-codex-chat.md`); other agents (Gemini CLI, OpenCode, Copilot CLI,
+`src/chat/codex/adapter.rs`, spec `designs/fixtures/codex-hooks/README.md`); other agents (Gemini CLI, OpenCode, Copilot CLI,
 Aider, …) get an adapter only once their logs and events are checked. An agent
 without an adapter keeps the shared terminal, reports status `unknown` and has
 no `chat-v1` capability.

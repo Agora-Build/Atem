@@ -502,8 +502,8 @@ configured.
 Direct LAN currently uses plaintext `ws://`. Authentication prevents a stolen
 session ID from being sufficient, but it does not stop traffic inspection or an
 active LAN attacker during initial pairing. Treat direct LAN as pre-production
-until WSS certificate pinning is implemented. The wire contract and test matrix
-are documented in [`designs/session-auth.md`](designs/session-auth.md).
+until WSS certificate pinning is implemented. How Atem connects to Astation and authenticates is described in
+[`designs/astation-connection.md`](designs/astation-connection.md).
 
 ### TUI Modes
 

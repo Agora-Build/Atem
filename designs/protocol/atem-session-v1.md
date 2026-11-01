@@ -12,8 +12,7 @@ lease-free approval answers (`approval.lease_free`, §G), the submitter
 principal and its durable control fence (§H) and one admission persistence
 rule (§I, which removes §6's double-I/O exception). Without a device list
 Atem's host speaks only r8: a `hello` without `revision: 8` is refused.
-The shared fixtures and where they run are in `atem-host-handoff.md`; the
-consolidated Astation note is `r8-astation-handoff.md`.
+The shared fixtures and where they run: [README.md](README.md).
 **r9 (signed off 2026-10-19; implemented by Atem 2026-10-20, PR #89, merged
 into `main` and released in v0.8.0 on 2026-10-31; joint live tests with
 Astation passed):** the appendix "r9" at the end specifies remote clients that
@@ -22,8 +21,7 @@ grants) over the end-to-end channel `atem-ch1`, authorized by a signed
 membership log pinned at pairing. Atem implements it in `atem-client`
 (with its Swift, Kotlin and WASM bindings) and the runtime host; its
 fixtures (`fixtures/r9-*.json`, `requires: "r9"`) run in atem-client's
-tests and against the real runtime (`atem-host-handoff.md`). r8 stays
-authoritative until r9 ships on both sides.
+tests and against the real runtime ([README.md](README.md)).
 r9 note (2026-10-20), a clarification of signed-off r8 text, not a
 change: §3's replaced-attachment sentence read "its leases end (none is
 carried over)", which a reader could take to mean a dropped or
@@ -38,7 +36,7 @@ nine features. The implementation corrected the appendix where it was
 wrong or silent; each change is listed in the appendix's "Implementation
 notes" and was flagged to Astation. Fixtures: the five r7 approval fixtures
 that answered with `acquire` or expected `stale_lease` on an answer are
-deleted (superseded by §G; replacements named in `atem-host-handoff.md`),
+deleted (superseded by §G),
 `r8-approval-card-carries-the-close-reason` is new, and
 `r8-hello-without-revision-8-is-refused-before-any-attachment` and
 `r8-approval-answer-keeps-the-holders-deadline` were corrected.
@@ -86,8 +84,7 @@ browser implementations; §9 remains the security gate. History: r1 (`7a0c691`),
 (`1bf805c`, [r3 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r3-review.md))
 and r4 (`fd907cc`, [r4 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r4-review.md))
 were reviewed by Astation ([r1 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
-[r2 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r2-review.md),
-summarised in [session-multiplexing.md](../session-multiplexing.md) §12). r2
+[r2 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r2-review.md)). r2
 answered r1 items 1–7 and 9; r3 answered r2 review items 1–5; r4 answered the three r3 corrections; r5 answers the three r4 findings. Item 8 (trust, freshness, end-to-end channel,
 QR grants) stays an implementation gate (§9). Not final until both sides
 accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
@@ -846,16 +843,15 @@ and generations, the `resume_proof` format, and QR grant binding.
 
 Status: **implemented in Atem**, 2026-10-18 (drafted 2026-10-17, answering
 Astation's review of Atem's agent control API response r1,
-`agent-control-api-atem.md` r2). This appendix replaces the affected r7.x
+and Atem's response r2). This appendix replaces the affected r7.x
 text above. Every `r8-*` fixture (`fixtures/schema.md`, "r8 fixtures")
 passes in Atem's core runner, and the ones a single real link can express
-pass against the real runtime (`atem-host-handoff.md`); Swift conformance
+pass against the real runtime ([README.md](README.md)); Swift conformance
 is Astation's. No backward compatibility: an r8 host and an r8 client
 refuse every r7 peer.
 
 **Implementation notes (2026-10-18).** What building r8 showed the text
-above had wrong or left open, now written into the sections below (each is
-listed for Astation in `r8-astation-handoff.md`). Notes 1, 3, 6 and 13
+above had wrong or left open, now written into the sections below. Notes 1, 3, 6 and 13
 change or narrow the signed text and need Astation's agreement; the others
 only make precise what the signed text leaves open.
 
@@ -1710,21 +1706,19 @@ crash before the grant: no lease, and after the restart `rejected`
 
 ## Appendix: r9 (signed off 2026-10-19; implemented by Atem 2026-10-20)
 
-Status: **implemented by Atem** (2026-10-20: `crates/atem-client`, its
-bindings and the runtime host; PR #89, merged only once Astation ships its
-side). Released Atem speaks r8 until r9 ships on both sides; until then r8
-(above) is the contract. A build of the PR (its packages and harness)
-already refuses r8 on a host once a device list is pinned.
+Status: **implemented by Atem and released in v0.8.0** (2026-10-31:
+`crates/atem-client`, its bindings and the runtime host; PR #89). A host
+with a pinned device list speaks r9 and refuses r8; one without speaks r8
+(above).
 r9 adds remote clients that reach Atem independently of the Mac: native
 members (Mac, iPhone, iPad, Android), scoped bots (`service`) and short
 browser grants, all over one end-to-end channel (`atem-ch1`) whose
 authority is a signed membership log pinned at pairing. It answers the
 §9 gate for those features. Design and user decisions:
-`remote-agent-api-atem.md` (r3) and `../account-trust.md`. Astation's
+`../account-trust.md` (Atem's response r3 is in git history). Astation's
 reviews of r2, of the first r9 pin `ffe840d` (its r3 review) and of
 `016abe7` (its r4 review, both 2026-10-19; "Astation r4 review N" in
-this appendix means the latter) are answered point by point in `remote-agent-api-atem.md`
-§10. Fixtures: `fixtures/r9-*.json`
+this appendix means the latter) were answered point by point in Atem's response r3 (§10). Fixtures: `fixtures/r9-*.json`
 (`requires: "r9"`; run by atem-client's tests and, host side, against the
 real runtime; the r8 runners report them NOT RUN),
 format in `fixtures/schema.md` "r9 fixtures".

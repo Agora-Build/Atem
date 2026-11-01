@@ -1,6 +1,6 @@
 //! terminal-v1's wire types (`{"type":"terminal","data":{"v":1,"op":…}}`):
 //! requests from a viewer and the host's `attached`/`frame`/`written`/
-//! `exited`/`error` (designs/terminal-v1-implementation.md). The host's
+//! `exited`/`error` (designs/shared-terminal.md). The host's
 //! frame stream is the atem binary's (`src/terminal_share.rs`, which
 //! re-exports these).
 use serde::{Deserialize, Serialize};
