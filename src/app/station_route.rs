@@ -160,6 +160,17 @@ mod tests {
         app.astation_connected_at = Some(Instant::now() - Duration::from_secs(11));
         assert!(app.connected_retry_at() <= Instant::now());
     }
+
+    #[tokio::test]
+    async fn allow_direct_without_a_station_handoff_keeps_the_relay() {
+        let (mut app, _dir, _scope) = connected().await;
+        app.astation_client.set_via_for_test(LinkVia::Relay {
+            label: "test relay".into(),
+        });
+        app.host_policy_changed(false);
+        assert!(app.station_routing.switch.is_none());
+        assert!(app.astation_connected);
+    }
 }
 
 impl App {
@@ -349,11 +360,13 @@ impl App {
             && super::relay_only::local_allowed()
             && self
                 .astation_client
-                .profile()
-                .and_then(|src| {
-                    crate::station_route::destination(&src, &self.astation_client.device_atem_id())
+                .with_station_route(|src, context, token| {
+                    // Existing relay clients keep their socket unless a
+                    // selected-Station handoff needs to return to direct.
+                    Ok(crate::station_route::load(src, context, token)?
+                        .is_some_and(|selection| !selection.direct_blocked))
                 })
-                .is_ok_and(|(_, blocked)| !blocked)
+                .unwrap_or(false)
         {
             self.station_routing.switch = Some(Switch::Direct {
                 generation: self.astation_link_gen,
