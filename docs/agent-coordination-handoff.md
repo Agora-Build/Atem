@@ -115,15 +115,28 @@ an automated test side effect.
 
 ## Shared-memory publication status
 
-On 2026-11-02, both `atem memory add --scope global --agent codex` attempts were
-refused by the pairing gate. `atem status` reported `Pairing: not paired`.
-Nothing from those attempts was stored or queued in Atem Memory. This file
-preserves the handoff in Git; it is not a successful shared-memory publication.
-After this profile is paired, the context can be published with:
+Published to global Atem Memory on 2026-11-02 after the user paired this
+profile. Both facts were read back as valid with assigned relay sequence
+numbers, and the pending synchronization queue is empty:
+
+- `mem_41753bdbc7164f0ea0d0ccb8acded287`, seq 1222: approval, implementation
+  status, design references and Atem/Astation/Station ownership.
+- `mem_889b3425a3404290bbc8524fa4935e1c`, seq 1223: feature requirements,
+  durable launch/delivery, optional boot hosting and execution boundaries.
+
+The first attempt before pairing was refused. After pairing, the default
+CLI build could store locally but could not synchronize through the running
+credential agent of another build. Publication used the installed npm Atem
+binary matching the running runtime and credential agent; neither process
+was restarted. `atem sync --no-harvest` confirmed no remaining changes.
+
+Agents can find the handoff with:
 
 ```sh
-atem memory add --scope global --agent codex "$(cat docs/agent-coordination-handoff.md)"
+atem sync --no-harvest
+atem memory search event-driven --scope global --full
+atem memory search notifications --scope global --full
 ```
 
-Resolve relative paths from the Atem checkout. Keep this status current if the
-handoff is later published or implementation advances.
+Keep the facts and this status current as the shared contract and
+implementation advance.
