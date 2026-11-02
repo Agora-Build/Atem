@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
+use crate::web_server::tunnels::field;
 
 use crate::convo_config::{CliOverrides, ConvoConfig, EnvDef, ResolvedConfig};
 
@@ -377,29 +378,6 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     let project_name = crate::config::ProjectCache::name_for_app_id(&app_id);
 
     println!("Convo AI Engine running:");
-    println!("  Local:   {}", local_url);
-    println!("  Network: {}", network_url);
-    for u in &custom_urls {
-        println!("  Custom:  {}", u);
-    }
-    println!();
-    println!("  App ID:   {}", app_id);
-    if let Some(ref name) = project_name {
-        println!("  Project:  {}", name);
-    }
-    println!("  Channel:  {}", resolved.channel);
-    println!("  Config:   {}", toml_path.display());
-    println!("  RTC User: {}", resolved.rtc_user_id);
-    println!("  Agent:    {} (avatar {})",
-             resolved.agent_user_id,
-             if resolved.avatar_configured { "configured" } else { "off" });
-    println!();
-    println!("Press Ctrl+C to stop.");
-    println!();
-
-    if !cfg.no_browser {
-        let _ = crate::web_server::browser::open_browser(&local_url);
-    }
 
     let state: Arc<Mutex<AgentState>> = Arc::new(Mutex::new(AgentState::default()));
     let history: Arc<Mutex<std::collections::VecDeque<HistoryEntry>>> =
@@ -410,24 +388,45 @@ pub async fn run_server(cfg: ServeConvoConfig) -> Result<()> {
     let convo_cfg = Arc::new(convo);
 
     let attach_mode = cfg.attach;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let acceptor  = acceptor.clone();
-        let app_id    = app_id.clone();
-        let app_cert  = app_cert.clone();
-        let resolved  = resolved.clone();
-        let convo_cfg = convo_cfg.clone();
-        let state     = state.clone();
-        let history   = history.clone();
-        let access    = access.clone();
-        tokio::spawn(async move {
-            let tls = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = handle_connection(tls, &access, &app_id, &app_cert, &resolved, &convo_cfg, state, history, attach_mode).await;
-        });
-    }
+    let serve = async {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let acceptor  = acceptor.clone();
+            let app_id    = app_id.clone();
+            let app_cert  = app_cert.clone();
+            let resolved  = resolved.clone();
+            let convo_cfg = convo_cfg.clone();
+            let state     = state.clone();
+            let history   = history.clone();
+            let access    = access.clone();
+            tokio::spawn(async move {
+                let tls = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let _ = handle_connection(tls, &access, &app_id, &app_cert, &resolved, &convo_cfg, state, history, attach_mode).await;
+            });
+        }
+    };
+    crate::web_server::tunnels::serve(bound_port, serve, |report| {
+        report.print_urls(&access, "/", &local_url, &network_url, &custom_urls);
+        println!();
+        field("App ID", &app_id);
+        if let Some(ref name) = project_name {
+            field("Project", name);
+        }
+        field("Channel", &resolved.channel);
+        field("Config", toml_path.display());
+        field("RTC User", &resolved.rtc_user_id);
+        field("Agent", format!("{} (avatar {})", resolved.agent_user_id,
+            if resolved.avatar_configured { "configured" } else { "off" }));
+        println!();
+        report.print_warnings();
+        println!("Press Ctrl+C to stop.");
+        if !cfg.no_browser {
+            let _ = crate::web_server::browser::open_browser(&local_url);
+        }
+    }).await
 }
 
 fn default_config_path() -> PathBuf {

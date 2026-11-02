@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use crate::web_server::browser::open_browser;
 use crate::web_server::net::{get_lan_ip, sslip_host};
+use crate::web_server::tunnels::field;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -302,9 +303,13 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
         daemon_args.push("--no-browser".into());
         daemon_args.push("--serv-daemon".into());
 
-        let child = std::process::Command::new(exe)
+        // The daemon must bind this port before it can announce its tunnels.
+        drop(listener);
+        let tunnels = crate::web_server::tunnels::BackgroundReport::new()?;
+        let mut child = std::process::Command::new(exe)
             .args(&daemon_args)
             .env(crate::web_server::access::ENV, access.code())
+            .env(crate::web_server::tunnels::REPORT_ENV, tunnels.path())
             .stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
@@ -328,15 +333,13 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
         register_server(&entry)?;
 
         println!("RTC server started in background:");
-        println!("  ID:      {}", sid);
-        println!("  PID:     {}", child.id());
-        println!("  Local:   {}", local_url);
-        println!("  Network: {}", network_url);
-        for u in &custom_urls {
-            println!("  Custom:  {}", u);
-        }
-        println!("  Log:     {}", log_path.display());
+        let report = tunnels.read(&mut child).await;
+        report.print_urls(&access, "/", &local_url, &network_url, &custom_urls);
+        field("ID", &sid);
+        field("PID", child.id());
+        field("Log", log_path.display());
         println!();
+        report.print_warnings();
         println!("Use `atem serv list` to see running servers.");
         println!("Use `atem serv kill {}` to stop it.", sid);
         return Ok(());
@@ -361,40 +364,11 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
             last_checked_at: None,
         };
         register_server(&entry)?;
-
-        // Clean up on Ctrl+C
-        let cleanup_id = sid.clone();
-        ctrlc::set_handler(move || {
-            let _ = unregister_server(&cleanup_id);
-            std::process::exit(0);
-        })
-        .ok();
     }
 
     // ── Foreground output ───────────────────────────────────────────────
     let project_name = crate::config::ProjectCache::name_for_app_id(&app_id);
     println!("RTC Test Server running:");
-    println!("  Local:   {}", local_url);
-    println!("  Network: {}", network_url);
-    for u in &custom_urls {
-        println!("  Custom:  {}", u);
-    }
-    println!();
-    println!("  App ID:  {}", app_id);
-    if let Some(ref name) = project_name {
-        println!("  Project: {}", name);
-    }
-    println!("  Channel: {}", channel);
-    println!();
-    println!("Press Ctrl+C to stop.");
-    println!();
-
-    // Open browser
-    if !config.no_browser {
-        if let Err(e) = open_browser(&local_url) {
-            eprintln!("Could not open browser: {}", e);
-        }
-    }
 
     let app_id = Arc::new(app_id);
     let app_certificate = Arc::new(app_certificate);
@@ -404,44 +378,67 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
     let with_rtm = config.with_rtm;
     let rtm_user_id = Arc::new(config.rtm_user_id);
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let app_id = app_id.clone();
-        let app_certificate = app_certificate.clone();
-        let channel = channel.clone();
-        let rtc_user_id = rtc_user_id.clone();
-        let rtm_user_id = rtm_user_id.clone();
-        let access = access.clone();
+    let serve = async {
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            let acceptor = acceptor.clone();
+            let app_id = app_id.clone();
+            let app_certificate = app_certificate.clone();
+            let channel = channel.clone();
+            let rtc_user_id = rtc_user_id.clone();
+            let rtm_user_id = rtm_user_id.clone();
+            let access = access.clone();
 
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    // TLS handshake failures are expected (cert warnings, probes)
-                    let _ = e;
-                    return;
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // TLS handshake failures are expected (cert warnings, probes)
+                        let _ = e;
+                        return;
+                    }
+                };
+
+                if let Err(e) = handle_connection(
+                    tls_stream,
+                    peer,
+                    &access,
+                    &app_id,
+                    &app_certificate,
+                    &channel,
+                    expire_secs,
+                    rtc_user_id.as_deref(),
+                    with_rtm,
+                    rtm_user_id.as_deref(),
+                )
+                .await
+                {
+                    eprintln!("[{}] Error: {}", peer, e);
                 }
-            };
-
-            if let Err(e) = handle_connection(
-                tls_stream,
-                peer,
-                &access,
-                &app_id,
-                &app_certificate,
-                &channel,
-                expire_secs,
-                rtc_user_id.as_deref(),
-                with_rtm,
-                rtm_user_id.as_deref(),
-            )
-            .await
-            {
-                eprintln!("[{}] Error: {}", peer, e);
+            });
+        }
+    };
+    let result = crate::web_server::tunnels::serve(port, serve, |report| {
+        report.print_urls(&access, "/", &local_url, &network_url, &custom_urls);
+        println!();
+        field("App ID", &app_id);
+        if let Some(ref name) = project_name {
+            field("Project", name);
+        }
+        field("Channel", &channel);
+        println!();
+        report.print_warnings();
+        println!("Press Ctrl+C to stop.");
+        if !config.no_browser {
+            if let Err(e) = open_browser(&local_url) {
+                eprintln!("Could not open browser: {}", e);
             }
-        });
+        }
+    }).await;
+    if config._daemon {
+        let _ = unregister_server(&server_id("rtc", &channel, port));
     }
+    result
 }
 
 /// Handle a single TLS connection — parse the HTTP request and route.

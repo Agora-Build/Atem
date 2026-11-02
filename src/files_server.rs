@@ -1,8 +1,8 @@
 //! `atem serv files <DIR>` — static-file HTTPS server for sharing
 //! AI-generated documents (md, html, png, …) on a remote machine.
 //!
-//! Foreground mode binds 0.0.0.0:<port>, prints Local/Network/Custom
-//! URLs (matching `serv rtc`/`serv convo`), and serves files under
+//! Foreground mode binds 0.0.0.0:<port>, groups Local/LAN/tunnel/Custom
+//! URLs in an aligned block, and serves files under
 //! the chosen directory. Markdown files are rendered to HTML by
 //! default; append `?raw=1` to any URL to view the raw bytes.
 //!
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use crate::web_server::tunnels::field;
 
 pub struct ServeFilesConfig {
     pub dir: PathBuf,
@@ -114,9 +115,11 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
 
         // The daemon serves with this code (handed over in its environment).
         let access = crate::web_server::access::AccessCode::for_server(port, true);
-        let child = std::process::Command::new(exe)
+        let tunnels = crate::web_server::tunnels::BackgroundReport::new()?;
+        let mut child = std::process::Command::new(exe)
             .args(&daemon_args)
             .env(crate::web_server::access::ENV, access.code())
+            .env(crate::web_server::tunnels::REPORT_ENV, tunnels.path())
             .stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
@@ -151,16 +154,14 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
         crate::rtc_test_server::register_server(&entry)?;
 
         println!("atem serv files");
-        println!("  dir:     {}", root.display());
-        println!("  Local:   {}", local_url);
-        println!("  Network: {}", network_url);
-        for u in &custom_urls {
-            println!("  Custom:  {}", u);
-        }
-        println!("  ID:      {}", sid);
-        println!("  PID:     {}", child.id());
-        println!("  Log:     {}", log_path.display());
+        let report = tunnels.read(&mut child).await;
+        field("DIR", root.display());
+        report.print_urls(&access, &target_path, &local_url, &network_url, &custom_urls);
+        field("ID", &sid);
+        field("PID", child.id());
+        field("Log", log_path.display());
         println!();
+        report.print_warnings();
         println!("Use `atem serv list` to see running servers.");
         println!("Use `atem serv kill {}` (or `killall`) to stop.", sid);
         return Ok(());
@@ -206,34 +207,37 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
 
     let header = if cfg._daemon { "atem serv files (daemon)" } else { "atem serv files" };
     println!("{}", header);
-    println!("  dir:     {}", root.display());
-    println!("  Local:   {}", local_url);
-    println!("  Network: {}", network_url);
-    for u in &custom_urls {
-        println!("  Custom:  {}", u);
-    }
-    if !cfg._daemon {
-        println!();
-        println!("Press Ctrl+C to stop.");
-    }
-    println!();
-
-    if !cfg.no_browser && !cfg._daemon {
-        let _ = crate::web_server::browser::open_browser(&local_url);
-    }
 
     let root = Arc::new(root);
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let root = root.clone();
-        let access = access.clone();
-        tokio::spawn(async move {
-            if let Ok(tls) = acceptor.accept(stream).await {
-                let _ = handle_connection(tls, &access, &root).await;
-            }
-        });
+    let serve = async {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let acceptor = acceptor.clone();
+            let root = root.clone();
+            let access = access.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    let _ = handle_connection(tls, &access, &root).await;
+                }
+            });
+        }
+    };
+    let result = crate::web_server::tunnels::serve(bound_port, serve, |report| {
+        field("DIR", root.display());
+        report.print_urls(&access, &target_path, &local_url, &network_url, &custom_urls);
+        println!();
+        report.print_warnings();
+        if !cfg._daemon {
+            println!("Press Ctrl+C to stop.");
+        }
+        if !cfg.no_browser && !cfg._daemon {
+            let _ = crate::web_server::browser::open_browser(&local_url);
+        }
+    }).await;
+    if cfg._daemon {
+        let _ = crate::rtc_test_server::unregister_server(&format!("files-{bound_port}"));
     }
+    result
 }
 
 async fn handle_connection<S>(
