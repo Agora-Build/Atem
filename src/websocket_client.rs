@@ -187,6 +187,9 @@ struct OutboundMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AstationMessage {
+    /// Strictly decoded by the selected-Station transport handoff.
+    #[serde(skip)]
+    StationRoute(String),
     /// A `session`, `terminal` or `agentChat` message as its raw JSON text:
     /// the session host decodes those strictly itself. Inbound messages of
     /// those families always arrive as this; outbound, the text is written
@@ -575,6 +578,7 @@ pub struct AstationClient {
     is_op_view: bool,
     /// How this client reached Astation, once connected (`atem status`).
     via: Option<LinkVia>,
+    relay_origin: Option<String>,
     /// The runtime's host route state (§R9.7b): a relay link answers the
     /// relay's `host_challenge` from it (`with_host_route`).
     host_route: Option<crate::session_protocol::r9::route::RouteHandle>,
@@ -720,6 +724,7 @@ impl AstationClient {
             agent: None,
             is_op_view: false,
             via: None,
+            relay_origin: None,
             host_route: None,
             route_link: None,
             routed: None,
@@ -901,6 +906,24 @@ impl AstationClient {
         self.guarded(apply)
     }
 
+    pub(crate) fn with_station_route<T>(
+        &self,
+        apply: impl FnOnce(&crate::profile::Sources, &atem_client::station_route::Context, &str) -> Result<T>,
+    ) -> Result<T> {
+        let astation_id = self.pinned_astation_id().ok_or_else(|| anyhow!("no paired Astation"))?;
+        self.apply_bound(astation_id, || {
+            if self.saved_session(astation_id)?.is_none() {
+                return Err(anyhow!("no usable paired session for Station routing"));
+            }
+            let src = self.profile_sources()?;
+            let (context, token) = crate::station_route::identity(&src, &self.device_atem_id())?;
+            if context.astation_id != astation_id {
+                return Err(anyhow!(crate::pairing::CHANGED));
+            }
+            apply(&src, &context, &token)
+        })
+    }
+
     /// A saved session may answer `astation_id` only when the captured
     /// pairing binding is with it: after an `atem unpair` that stopped before
     /// removing the sessions (or one for another Astation), it is never used.
@@ -956,6 +979,22 @@ impl AstationClient {
     /// How this client reached Astation (`None`: not connected yet).
     pub fn via(&self) -> Option<&LinkVia> {
         self.via.as_ref()
+    }
+
+    pub(crate) fn relay_origin(&self) -> Option<&str> {
+        self.relay_origin.as_deref()
+    }
+
+    pub(crate) fn selected_destination_current(&self) -> bool {
+        self.profile_sources().and_then(|src| {
+            let (origin, blocked) = crate::station_route::destination(&src, &self.device_atem_id())?;
+            Ok(match self.via() {
+                Some(LinkVia::Local) => !blocked && crate::session_protocol::r9::host_policy::local_allowed(&src.paths.pairing),
+                Some(LinkVia::Relay { .. }) => self.relay_origin() == Some(
+                    atem_client::station_route::normalize_relay(&origin).unwrap_or(origin).as_str()),
+                None => false,
+            })
+        }).unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -1094,6 +1133,7 @@ impl AstationClient {
         self.capture = None;
         self.routed = None;
         self.routed_auth = None;
+        self.relay_origin = None;
     }
 
     /// Connect WebSocket and authenticate (local Astation connections).
@@ -1258,6 +1298,11 @@ impl AstationClient {
                                 Ok(message) => message,
                                 Err(reason) => AstationMessage::PairingInvalid { reason: reason.to_string() },
                             }),
+                            None if serde_json::from_str::<serde_json::Value>(&text).ok()
+                                .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("stationRoute")) => {
+                                (text.len() <= atem_client::station_route::MAX_BYTES)
+                                    .then_some(AstationMessage::StationRoute(text))
+                            }
                             None => serde_json::from_str::<AstationMessage>(&text).ok(),
                         };
                         if let Some(astation_msg) = astation_msg
@@ -1942,6 +1987,14 @@ impl AstationClient {
             .map_err(|e| anyhow!("Failed to send message: {}", e))
     }
 
+    pub(crate) fn try_send_wire_receipt(&self, text: String) -> Result<DeliveryReceipt> {
+        let (delivered, receipt) = tokio::sync::oneshot::channel();
+        self.sender.as_ref().ok_or_else(|| anyhow!("Not connected to Astation"))?
+            .send(OutboundMessage { message: AstationMessage::SessionWire(text), delivered: Some(delivered) })
+            .map_err(|_| anyhow!("Astation transport closed"))?;
+        Ok(receipt)
+    }
+
     /// An r9 channel envelope for the link (§R9.7a). `false` when the link
     /// is gone or already holds `CHANNEL_INFLIGHT_BYTES` of unwritten
     /// envelopes: the caller keeps it queued and tries again.
@@ -2432,6 +2485,8 @@ impl AstationClient {
             self.via = Some(LinkVia::Relay {
                 label: relay_label(relay_url, &atem_id),
             });
+            self.relay_origin = Some(atem_client::station_route::normalize_relay(relay_url)
+                .unwrap_or_else(|_| relay_url.trim_end_matches('/').to_owned()));
         }
         result
     }

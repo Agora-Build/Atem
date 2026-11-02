@@ -80,6 +80,7 @@ pub mod push;
 pub mod restore;
 pub mod session;
 pub mod signed;
+pub mod station_route;
 #[cfg(feature = "software-keys")]
 pub mod software;
 

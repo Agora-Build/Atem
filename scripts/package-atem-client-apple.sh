@@ -75,9 +75,11 @@ ZIP="atem-client-${VERSION}-apple-swiftpm.zip"
 (cd "$OUT" && ditto -c -k --keepParent AtemClient "$ZIP")
 cp "$WORK/gen/atem_client_ffiFFI.h" "$OUT/atem-client-${VERSION}-atem_client_ffiFFI.h"
 PIN="atem-client-${VERSION}-SOURCE.json"
+VECTOR="atem-client-${VERSION}-station-route-v1.json"
+cp designs/protocol/fixtures/station-route/v1.json "$OUT/$VECTOR"
 ./scripts/atem-client-source-pin.sh "$OUT/$PIN" apple-swiftpm "default (uniffi)" \
   "xcodebuild=$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')" \
   "swift=$(swift --version 2>&1 | sed -n 1p)"
-(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" > "atem-client-${VERSION}-SHA256SUMS.txt")
+(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" > "atem-client-${VERSION}-SHA256SUMS.txt")
 echo "Packaged into $OUT:"
 ls -l "$OUT"

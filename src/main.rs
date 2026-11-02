@@ -27,6 +27,7 @@ mod memory;
 mod pair_verify;
 mod pairing;
 mod pairing_wire;
+mod station_route;
 mod machine_key;
 mod paths;
 mod profile;
