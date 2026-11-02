@@ -656,7 +656,9 @@ Ops: `hello`, `list`, chat `open`/`submit` or session-v1 `submit`
   authorized for 24 h, then fenced and reconnected. Chat content is readable by the
   relay (end-to-end encryption of chat is a follow-up).
 - No remote session launch: sessions start locally with `atem agent launch` (or the
-  bare `atem` menu). Clients only attach to what is already running.
+  bare `atem` menu). Clients only attach to what is already running. Optional
+  background hosting and remote launch are proposed in
+  [agent-hosting.md](agent-hosting.md); they are not implemented.
 - Sizes: prompt 32 768 bytes; message 131 072 bytes (≤ 2048 parts); a history
   page 50 messages / 256 KiB of content / 1 MiB serialized (older pages and
   lookups with `history`, 8 a second); `receipt.result` 32 reply ids; 8

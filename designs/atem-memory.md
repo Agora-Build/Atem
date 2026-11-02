@@ -26,6 +26,13 @@ Machines may be anywhere on the Internet. They need no public IP, no SSH or
 shared LAN, and no overlap in when they're online. They sync through the
 relay-server, and each keeps a local copy so it works offline.
 
+The planned [agent notifications design](agent-notifications.md) adds
+event-driven handoffs: an explicit work request references committed context,
+and the receiving runtime queues it for an authorized agent. Ordinary memory
+adds, sync and managed-block updates do not start agent turns. Local offline
+memory must be published before another machine is notified to act on it.
+This coordination layer is not implemented.
+
 ## Non-goals
 
 - **Credential values.** Memory and skills never carry API keys, tokens, or

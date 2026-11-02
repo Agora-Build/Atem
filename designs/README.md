@@ -29,6 +29,8 @@ in detail and wins where a design differs.
 
 | Document | What it covers |
 |---|---|
+| [agent-hosting.md](agent-hosting.md) | Optional OS service with boot startup, one runtime across terminal/tmux/Herdr, and remote creation of new agent sessions (draft; not implemented) |
+| [agent-notifications.md](agent-notifications.md) | Event-driven work between agents on different machines: memory/vault references, durable delivery, runtime inbox and safe agent dispatch (draft; not implemented) |
 | [build-by-talk.md](build-by-talk.md) | Build by Talk: get the whole project clear by talking, with tool calls to the coding agents (Astation and Atem; not started) |
 | [e2e-encryption.md](e2e-encryption.md) | Credentials (`atem cred get` and the rest), device-signed writes, the recovery secret, auto-unlock |
 | [agora-account-grouping.md](agora-account-grouping.md) | Proposed: merge Astations under one Agora login (opt-in) |

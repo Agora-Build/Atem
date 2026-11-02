@@ -191,6 +191,14 @@ into a prompt / agent.
 
 ## Notification flow
 
+This section describes the planned v1.5 context-update hints; `watch` and
+these notifications are not implemented. The separate
+[agent notifications design](agent-notifications.md) proposes durable,
+directed work requests that a destination runtime can queue and deliver to
+an agent. Those requests need an authenticated execution grant, durable
+delivery and task deduplication beyond this best-effort hint. Ordinary vault
+writes and `watch` do not start agent turns.
+
 ```
 atem A: POST /api/vault/v-7Kf3qD   (append e4)
             └─ server commits the row, then broadcasts to the relay room:

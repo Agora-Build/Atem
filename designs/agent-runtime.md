@@ -9,6 +9,10 @@ it. The wire contract is [protocol/atem-session-v1.md](protocol/atem-session-v1.
 [shared-terminal.md](shared-terminal.md), [agent-chat-host.md](agent-chat-host.md)
 and [account-trust.md](account-trust.md).
 
+Optional managed hosting with boot startup and remote session creation is
+proposed separately in [agent-hosting.md](agent-hosting.md). It is not
+implemented and does not change the current on-demand lifetime below.
+
 ## Product decisions
 
 Approved by the user and Astation (2026-10-15); where the text below
