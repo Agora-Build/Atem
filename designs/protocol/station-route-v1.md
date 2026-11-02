@@ -24,6 +24,13 @@ not become the routing controller by sharing an account or having `manage`.
 
 ## Exact Wire
 
+Only the current shared station-route protocol, v1, is supported. Atem
+closes a routing exchange with a missing or different version, reports an
+explicit upgrade requirement, and backs off for 30 seconds. It does not
+translate older messages or fall back to an older protocol. Atem and
+Astation application build numbers need not match; their shared protocol
+must match. The published native v1 helpers remain the wire contract.
+
 The host sends on its authenticated Astation WebSocket:
 
 ```json
@@ -196,13 +203,13 @@ needs a separate contract, not forwarding existing credentials.
 - Binary tests exercise the real runtime and worker with isolated peers,
   an encrypted R9 prompt/receipt, migration and an unavailable relay.
 
-Native still needs to integrate the sender with its effective
-`stationRelayUrl`, consume the same source/binding/vector, then verify the
-provisioned app on dev/custom relays, rapid changes, re-authentication,
-unavailable relays and direct re-enable. Fixture success does not prove a
-live switch. Preserve the retained Genie runtime, active integration and
-healthy station-dev replicas. No deployed service or user agent is restarted
-by this implementation or its tests.
+The native sender uses the shared helpers with its effective
+`stationRelayUrl`. Live verification of the provisioned app on dev/custom
+relays, rapid changes, re-authentication, unavailable relays and direct
+re-enable still requires a paired route-capable host. Fixture success does
+not prove a live switch. Preserve the retained Genie runtime, active
+integration and healthy station-dev replicas. No deployed service or user
+agent is restarted by this implementation or its tests.
 
 The prebuilt Apple artifact includes `atem-client-<version>-station-route-v1.json`
 in its SHA-256 manifest alongside the SwiftPM zip, C header and source pin.

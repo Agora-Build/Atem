@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_direct_without_a_station_handoff_keeps_the_relay() {
+    async fn allow_direct_before_a_station_handoff_keeps_the_relay() {
         let (mut app, _dir, _scope) = connected().await;
         app.astation_client.set_via_for_test(LinkVia::Relay {
             label: "test relay".into(),
@@ -170,6 +170,35 @@ mod tests {
         app.host_policy_changed(false);
         assert!(app.station_routing.switch.is_none());
         assert!(app.astation_connected);
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_station_protocol_requires_upgrade_and_backs_off() {
+        for version in [None, Some(0), Some(2)] {
+            let (mut app, dir, _scope) = connected().await;
+            let mut message: serde_json::Value = serde_json::from_str(&offer(&app)).unwrap();
+            match version {
+                Some(version) => message["data"]["v"] = version.into(),
+                None => {
+                    message["data"].as_object_mut().unwrap().remove("v");
+                }
+            }
+            app.receive_station_route(&message.to_string());
+            assert!(!app.astation_connected);
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("upgrade Atem and Astation")
+            );
+            assert!(
+                app.astation_reconnect_at
+                    .unwrap()
+                    .duration_since(Instant::now())
+                    > Duration::from_secs(29)
+            );
+            assert!(!dir.path().join("pairing/station_route.json").exists());
+        }
     }
 }
 
@@ -228,8 +257,16 @@ impl App {
         if !self.astation_connected || self.station_routing.link_gen != self.astation_link_gen {
             return;
         }
-        let Ok(message) = Message::parse(text.as_bytes()) else {
-            return;
+        let message = match Message::parse(text.as_bytes()) {
+            Ok(message) => message,
+            Err(atem_client::station_route::UNSUPPORTED_VERSION) => {
+                let reason = atem_client::station_route::UNSUPPORTED_VERSION;
+                eprintln!("atem runtime: {reason}");
+                self.drop_astation_link(reason.into());
+                self.astation_reconnect_at = Some(Instant::now() + REFRESH);
+                return;
+            }
+            Err(_) => return,
         };
         if matches!(message, Message::Changed { .. }) {
             let due = self

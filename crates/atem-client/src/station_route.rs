@@ -11,6 +11,8 @@ use crate::encoding::{b64u, b64u_decode_array, enc};
 pub const MAX_BYTES: usize = 4096;
 pub const LABEL: &[u8] = b"atem-station-route-v1";
 pub const ACCEPTED_LABEL: &[u8] = b"atem-station-route-accepted-v1";
+pub const UNSUPPORTED_VERSION: &str =
+    "station-route v1 is required; upgrade Atem and Astation to the current shared protocol";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +239,17 @@ impl Message {
     pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
         let value = parse_strict(bytes, MAX_BYTES, Numbers::IntegersOnly)
             .map_err(|_| "invalid routing JSON")?;
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("stationRoute") {
+            return Err("invalid routing type");
+        }
+        if value
+            .get("data")
+            .and_then(|data| data.get("v"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        {
+            return Err(UNSUPPORTED_VERSION);
+        }
         let envelope: Envelope =
             serde_json::from_value(value).map_err(|_| "invalid routing message")?;
         if envelope.kind != "stationRoute" {
@@ -255,7 +268,7 @@ impl Message {
                     .map_err(|_| "invalid route proof")?;
                 b64u_decode_array::<32>(&accepted.proof).map_err(|_| "invalid acceptance proof")?;
             }
-            _ => return Err("unsupported routing version"),
+            _ => return Err(UNSUPPORTED_VERSION),
         }
         Ok(envelope.data)
     }

@@ -208,3 +208,20 @@ fn station_route_strict_shapes_and_origins() {
     accepted["data"]["accepted"]["offer"]["proof"] = json!("invalid");
     assert!(Message::parse(accepted.to_string().as_bytes()).is_err());
 }
+
+#[test]
+fn station_route_requires_the_current_shared_version() {
+    for version in [None, Some(0), Some(2)] {
+        let mut message = vector()["offer"].clone();
+        match version {
+            Some(version) => message["data"]["v"] = json!(version),
+            None => {
+                message["data"].as_object_mut().unwrap().remove("v");
+            }
+        }
+        assert_eq!(
+            Message::parse(message.to_string().as_bytes()),
+            Err(atem_client::station_route::UNSUPPORTED_VERSION)
+        );
+    }
+}
