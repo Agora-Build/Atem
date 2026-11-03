@@ -1,6 +1,6 @@
 # Remote agent launch and notifications: cross-repository handoff
 
-Updated: 2026-11-02 UTC.
+Updated: 2026-11-03 UTC.
 
 The user approved starting both features and asked for this context to be
 shared with the Astation and Station agents. The current designs are on
@@ -198,7 +198,8 @@ numbers, and the pending synchronization queue is empty:
 
 - `mem_5042b6dba55a4c9a8cade59e6a15f8c6`, seq 1224: current local receiver
   implementation, contract, tests and remaining ownership. Replaces the
-  original approval/status fact at seq 1222; code remains uncommitted/unreleased.
+  original approval/status fact at seq 1222; this is the historical receiver
+  validation before implementation publication.
 - `mem_889b3425a3404290bbc8524fa4935e1c`, seq 1223: feature requirements,
   durable launch/delivery, optional boot hosting and execution boundaries.
 
@@ -219,16 +220,17 @@ atem memory search notifications --scope global --full
 Keep the facts and this status current as the shared contract and
 implementation advance.
 
-Receiver validation on 2026-11-02: workspace compilation, 38 focused unit
-tests and 49 binary tests across host-work/runtime/runtime-build/agent-launch/
-worker suites pass. The host-work target contains fifteen scenarios (18 tests
-including support tests), covering runtime start/check, concurrent startup,
-build reuse, approved exports, remote launch and notification dispatch.
-Earlier 205 shared-client/binding tests and the scoped-service binary suite
-also pass. The 1,931-test
-unit run exposed four fixture-discovery failures from putting request vectors
-beside scenario fixtures; moving them to their dedicated subdirectory fixes
-all four, with the full 16-test fixture group passing on rerun. Current store
-tests and workspace compilation also pass. Agents are fake providers in temp
-profiles; live provider APIs, OS boot services and Station publication are
-not exercised by these checks.
+Implementation is committed on `feat/agent-launch-notifications`. The branch
+includes main's selected-relay fix from PR #113 (`f3ce342`), which was merged
+after all platform and package checks passed.
+
+Receiver validation on 2026-11-03: workspace compilation passes. After merging
+PR #113, all 1,920 unit tests, 25 host-work binary tests, 10 scoped-service
+binary tests, five selected-relay binary tests and 219 shared-client/binding
+tests pass (two binding end-to-end tests require their external runners and
+remain ignored by the Rust-only command). CI now includes `host_work_binary`
+in its debug-hook test list. Tests cover remote-launch deduplication and
+adoption, approved environment variables, draft/lease/approval blocking,
+sender fencing, message fanout, screenshot transfer and the shared task queue.
+Agents are fake providers in temp profiles; live provider APIs, OS boot
+services and deployed Station publication are not exercised by these checks.

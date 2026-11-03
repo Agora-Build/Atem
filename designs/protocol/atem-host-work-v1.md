@@ -138,8 +138,10 @@ automatic launch-on-arrival is not implemented.
 
 Durable task acceptance precedes acknowledgment. The runtime schedules work
 without model polling, FIFO per session for all work sources including mark.
-An earlier blocked or unresolved task holds later tasks for the same session;
-other sessions can proceed. Busy, unknown readiness, draft input, approvals, an
+Earlier blocked, submitting, submitted or ambiguous work holds later tasks for
+the same session; other sessions can proceed. A completed prompt releases its
+queue slot while the task awaits its explicit correlated result. Busy, unknown
+readiness, draft input, approvals, an
 existing lease or absent current authority leave work blocked. Ready/unowned
 sessions receive a normal acquiring session-v1 prompt, without takeover or
 local-origin injection. Persist `submitting` with a fixed receipt ID before
