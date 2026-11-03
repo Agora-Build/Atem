@@ -90,10 +90,11 @@ pub fn register_server(entry: &ServerEntry) -> Result<()> {
 /// Remove a server entry JSON file.
 pub fn unregister_server(id: &str) -> Result<()> {
     let path = servers_dir().join(format!("{}.json", id));
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 /// Check if a PID is still alive using kill(pid, 0).
@@ -144,7 +145,8 @@ fn kill_server(id: &str) -> Result<()> {
     if is_pid_alive(server.pid) {
         unsafe { libc::kill(server.pid as i32, libc::SIGTERM); }
     }
-    std::fs::remove_file(&path)?;
+    // The daemon may unregister itself as soon as SIGTERM is delivered.
+    unregister_server(id)?;
     Ok(())
 }
 
@@ -1423,6 +1425,20 @@ if (!document.getElementById('fetchBtn').disabled) {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_cleanup_tolerates_another_remover_but_preserves_other_errors() {
+        let _profile = crate::test_profile::temp();
+        let dir = servers_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cleanup.json");
+        std::fs::write(&path, "registered").unwrap();
+        unregister_server("cleanup").unwrap();
+        // The command and daemon both clean up the same registration.
+        unregister_server("cleanup").unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(unregister_server("cleanup").is_err());
+    }
 
     #[test]
     fn server_entry_round_trip_with_status_field() {

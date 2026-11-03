@@ -63,6 +63,8 @@ pub struct Options {
 /// A launch that finished on its task.
 struct LaunchDone {
     client: u64,
+    remote: Option<String>,
+    no_start: bool,
     request: SpawnRequest,
     /// The worker and the session's creation time.
     result: anyhow::Result<(WorkerHandle, u64)>,
@@ -506,16 +508,8 @@ impl Server {
         }
     }
 
-    /// The App's Astation link messages concern every session: a notice for
-    /// every frontend. Mark-task notices go to their session's frontend
-    /// only; those of no session to the log.
+    /// The App's Astation link messages concern every frontend.
     fn forward_status(&mut self) {
-        for (sid, text) in std::mem::take(&mut self.app.task_notices) {
-            match sid {
-                Some(sid) => self.session_notice(&sid, text),
-                None => eprintln!("atem runtime: {text}"),
-            }
-        }
         let Some(text) = self.app.status_message.take() else {
             return;
         };
@@ -569,7 +563,8 @@ impl Server {
     /// No live session, no launch under way and no client: the runtime may
     /// exit (workers that ended or can't be adopted stay on disk).
     fn idle_expired(&mut self) -> bool {
-        let idle = self.live_count() == 0
+        let idle = !self.bridge.as_ref().is_some_and(|b| b.hosting_enabled())
+            && self.live_count() == 0
             && self.launching == 0
             && !self.adopting
             && self.clients.values().all(|c| c.greeted && c.passive);
@@ -598,9 +593,26 @@ impl Server {
         self.launching = self.launching.saturating_sub(1);
         let LaunchDone {
             client,
+            remote,
+            no_start,
             request,
             result,
         } = done;
+        if let Some(id) = &remote {
+            if let Some(bridge) = self.bridge.as_mut() {
+                use atem_client::session::host_work::LaunchState;
+                bridge.remote_launched(
+                    id,
+                    if result.is_ok() {
+                        LaunchState::Started
+                    } else if no_start {
+                        LaunchState::Failed
+                    } else {
+                        LaunchState::OutcomeUnknown
+                    },
+                );
+            }
+        }
         match result {
             Ok((handle, created_at_ms)) => {
                 eprintln!(
@@ -612,8 +624,13 @@ impl Server {
                 let session = BrokerSession::launched(handle, &request, created_at_ms);
                 let summary = session.summary(false);
                 self.insert_session(session);
-                self.send(client, &RuntimeMsg::Launched { session: summary });
+                if remote.is_none() {
+                    self.send(client, &RuntimeMsg::Launched { session: summary });
+                }
             }
+            Err(_) if remote.is_some() => eprintln!(
+                "atem runtime: remote launch did not confirm a start; query its durable outcome"
+            ),
             Err(error) => self.error(
                 client,
                 format!("Could not start {}: {error:#}", request.provider.product()),
@@ -659,10 +676,6 @@ impl Server {
                 continue;
             };
             let pumped = session.pump();
-            if pumped.ended && self.app.main_task_session.as_ref() == Some(&sid) {
-                // The active mark task's session ended: finalize it.
-                self.app.dispatcher.set_main_needs_finalize();
-            }
             if pumped.ended {
                 eprintln!(
                     "atem runtime: {sid} {} ({})",
@@ -905,6 +918,8 @@ impl Server {
                     let result = launcher.spawn(request.clone(), env).await;
                     let _ = tx.send(LaunchDone {
                         client: id,
+                        remote: None,
+                        no_start: false,
                         request,
                         result,
                     });
@@ -1450,28 +1465,8 @@ impl Server {
         None
     }
 
-    /// The session host's pass (after the App's): mark-task prompts the App
-    /// queued, then the host itself.
+    /// The session host's pass, including the shared durable work scheduler.
     async fn host_pass(&mut self) {
-        let writes = self
-            .app
-            .hosted
-            .as_mut()
-            .map(|h| std::mem::take(&mut h.writes))
-            .unwrap_or_default();
-        for (task_id, sid, text) in writes {
-            // Local-origin input under the current epoch; no lease is revoked
-            // (the App only sends a task while no remote lease is held).
-            let written = match self.sessions.get_mut(&sid) {
-                Some(session) => session.write(text.as_bytes()),
-                None => Err(anyhow::anyhow!("The session has ended")),
-            };
-            if let Err(error) = written {
-                self.app
-                    .mark_write_failed(&task_id, &error.to_string())
-                    .await;
-            }
-        }
         match self.bridge.as_mut() {
             Some(bridge) => bridge.tick(&mut self.app, &mut self.sessions, self.adopting),
             None => {
@@ -1480,23 +1475,58 @@ impl Server {
                 for session in self.sessions.values_mut() {
                     session.release_untaken();
                 }
-                if let Some(hosted) = self.app.hosted.as_mut() {
-                    hosted.sessions = self
-                        .sessions
-                        .values()
-                        .filter_map(|s| {
-                            Some(crate::app::hosted::HostedSession {
-                                id: s.id.clone(),
-                                provider: Provider::from_alias(&s.provider)?,
-                                cwd: s.cwd.clone(),
-                                live: s.is_live(),
-                                remote_controlled: false,
-                                last_used: s.last_used,
-                            })
-                        })
-                        .collect();
-                }
             }
+        }
+        let launches = self
+            .bridge
+            .as_mut()
+            .map(|b| b.take_remote_launches())
+            .unwrap_or_default();
+        for launch in launches {
+            if self.restart || self.live_count() + self.launching >= crate::session::MAX_LIVE {
+                if let Some(bridge) = self.bridge.as_mut() {
+                    bridge.remote_launched(
+                        &launch.request_id,
+                        atem_client::session::host_work::LaunchState::Failed,
+                    );
+                }
+                continue;
+            }
+            let request = SpawnRequest {
+                session_id: SessionId::parse(&launch.session_id).expect("reserved session id"),
+                process_gen: launch.process_gen.clone(),
+                provider: Provider::from_alias(&launch.profile.provider)
+                    .expect("validated provider"),
+                args: launch.profile.args.clone(),
+                cwd: launch.profile.cwd.clone(),
+                rows: 24,
+                cols: 100,
+            };
+            self.launching += 1;
+            let launcher = self.options.launcher.clone();
+            let (tx, wake) = (self.launches.clone(), self.wake.clone());
+            tokio::spawn(async move {
+                let (result, no_start) = match tokio::task::spawn_blocking(move || {
+                    launch.profile.launch(launch.session_id, launch.process_gen)
+                })
+                .await
+                {
+                    Ok(Ok((checked, env))) => (
+                        launcher.spawn_guarded(checked, env, launch.guard).await,
+                        false,
+                    ),
+                    Ok(Err(error)) => (Err(error), true),
+                    Err(_) => (Err(anyhow::anyhow!("profile preparation failed")), true),
+                };
+                let _ = tx.send(LaunchDone {
+                    client: 0,
+                    remote: Some(launch.request_id),
+                    no_start,
+                    request,
+                    result,
+                });
+                wake.notify_one();
+            });
         }
     }
 

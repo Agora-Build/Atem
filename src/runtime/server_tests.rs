@@ -744,7 +744,7 @@ fn the_runtime_environment_is_sanitized() {
         ("ATEM_TEST_PTY_FAULTS", "/tmp/faults"),
     ]
     .map(|(k, v)| (OsString::from(k), OsString::from(v)));
-    let kept: Vec<String> = super::client::runtime_env_from(vars.into_iter())
+    let kept: Vec<String> = super::client::runtime_env_from(vars.clone().into_iter(), &[])
         .into_iter()
         .map(|(k, _)| k.into_string().unwrap())
         .collect();
@@ -759,6 +759,16 @@ fn the_runtime_environment_is_sanitized() {
             "RUST_LOG"
         ]
     );
+    let kept: Vec<String> = super::client::runtime_env_from(
+        vars.into_iter(),
+        &["ANTHROPIC_API_KEY", "ATEM_TEST_CLOCK_FILE"],
+    )
+    .into_iter()
+    .map(|(key, _)| key.into_string().unwrap())
+    .collect();
+    assert!(kept.iter().any(|key| key == "ANTHROPIC_API_KEY"));
+    assert!(!kept.iter().any(|key| key == "CLAUDE_CLI_BIN"));
+    assert!(!kept.iter().any(|key| key.starts_with("ATEM_TEST_")));
 }
 
 async fn list(client: &mut RuntimeClient) -> Vec<SessionSummary> {

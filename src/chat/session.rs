@@ -821,8 +821,12 @@ impl ChatSession {
                 if self.started && same_log && continues {
                     return out;
                 }
+                // The first startup hook can be observed after terminal
+                // typing. It is no evidence that those bytes were submitted.
+                if self.started {
+                    self.input_mark = input_count;
+                }
                 self.started = true;
-                self.input_mark = input_count;
                 self.wait_held = false;
                 self.held_past_turn = false;
                 self.set_status(State::Ready, None, now_ms, &mut out);
@@ -1518,6 +1522,15 @@ mod tests {
         let mut s = ChatSession::new("g1".into(), 0);
         s.on_event(started(), 1, 0);
         s
+    }
+
+    #[test]
+    fn late_initial_start_hook_does_not_consume_a_terminal_draft() {
+        let mut s = ChatSession::new("g1".into(), 0);
+        s.on_event(started(), 1, 3);
+        assert_eq!(s.status().state, State::Ready);
+        assert!(s.has_unsent_input(3));
+        assert!(s.submit("r", "g1", "remote prompt", 3, false).is_err());
     }
     fn user(id: &str, turn: &str, text: &str) -> LogItem {
         LogItem::UserMessage {

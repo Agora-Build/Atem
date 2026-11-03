@@ -92,20 +92,23 @@ pub struct RuntimeClient {
 }
 
 /// The environment `atem runtime` is started with: what it needs to find its
-/// files and settings, never the user's whole environment (sessions get
-/// their launching frontend's environment instead) and never the
-/// `ATEM_TEST_*` hooks (`test_hooks.rs`), which only tests set, on the
-/// process they start.
+/// files and settings plus variables explicitly approved in enabled launch
+/// profiles, never the user's whole environment. Local sessions get their
+/// launching frontend's environment instead. `ATEM_TEST_*` hooks are never
+/// forwarded, even when named in a profile.
 pub fn runtime_env_from(
     vars: impl Iterator<Item = (OsString, OsString)>,
+    approved: &[&str],
 ) -> Vec<(OsString, OsString)> {
     vars.filter(|(key, _)| {
         let key = key.to_string_lossy();
-        matches!(
-            key.as_ref(),
-            "PATH" | "HOME" | "XDG_RUNTIME_DIR" | "RUST_LOG"
-        ) || (key.starts_with("ATEM_") && !key.starts_with("ATEM_TEST_"))
-            || key.starts_with("ASTATION_")
+        !key.starts_with("ATEM_TEST_")
+            && (matches!(
+                key.as_ref(),
+                "PATH" | "HOME" | "XDG_RUNTIME_DIR" | "RUST_LOG"
+            ) || key.starts_with("ATEM_")
+                || key.starts_with("ASTATION_")
+                || approved.contains(&key.as_ref()))
     })
     .collect()
 }
@@ -114,7 +117,15 @@ pub fn runtime_env_from(
 fn start_runtime(log: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("could not find the atem executable")?;
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let envs = runtime_env_from(std::env::vars_os());
+    let config = super::host_work::Config::load(&crate::config::AtemConfig::config_dir())
+        .unwrap_or_default();
+    let approved: Vec<&str> = config
+        .profiles
+        .iter()
+        .filter(|_| config.enabled)
+        .flat_map(|p| p.env_names.iter().map(String::as_str))
+        .collect();
+    let envs = runtime_env_from(std::env::vars_os(), &approved);
     crate::daemon::spawn_detached_clean(&exe, "runtime", &home, log, &envs)
         .context("could not start the atem runtime")?;
     Ok(())
@@ -662,6 +673,64 @@ pub(crate) async fn restart_runtime(
         "Atem's runtime restarted as build {} (was {theirs}); sessions kept: {running} running.",
         client.welcome.build
     ))
+}
+
+/// `atem runtime start`: initialize the disabled configuration if missing,
+/// then start or reuse this profile's runtime without replacing another build.
+pub async fn start() -> Result<()> {
+    let dir = crate::config::AtemConfig::config_dir();
+    let created = super::host_work::ensure_config(&dir)?;
+    let config = super::host_work::Config::load(&dir)?;
+    let locator = Locator::default_paths();
+    let existing = RuntimeClient::existing_at(&locator, true).await?;
+    let was_running = existing.is_some();
+    let client = match existing {
+        Some(client) => client,
+        None => {
+            let log = locator.log.clone();
+            RuntimeClient::connect_or_start_with(&locator, move || start_runtime(&log), START_WAIT)
+                .await?
+        }
+    };
+    println!(
+        "Atem's runtime is {} (pid {}, protocol {}, build {}).",
+        if was_running {
+            "already running"
+        } else {
+            "running"
+        },
+        client.welcome.pid,
+        client.welcome.protocol,
+        client.welcome.build
+    );
+    if created {
+        println!(
+            "Created {} (hosting disabled).",
+            dir.join(super::host_work::CONFIG_FILE).display()
+        );
+    }
+    println!(
+        "Remote launch and notification configuration: {} ({}).",
+        if config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        dir.join(super::host_work::CONFIG_FILE).display()
+    );
+    if !config.enabled {
+        println!(
+            "The on-demand idle timeout still applies. Configure profiles/routes, then run `atem runtime check`."
+        );
+    }
+    if let Some(error) = &client.welcome.host_error {
+        println!("{error}");
+    }
+    if client.welcome.build != crate::memory::cred_agent::build_id() {
+        println!("Another build is running; use `atem runtime restart` to switch builds.");
+    }
+    println!("Runtime log: {}", locator.log.display());
+    Ok(())
 }
 
 /// `atem runtime restart` for this user's runtime.

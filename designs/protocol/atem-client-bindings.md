@@ -14,6 +14,43 @@ R9 authority. Stage the selected endpoint and verify acceptance before
 committing R9 relay-only policy on a direct socket. Conformance uses
 `fixtures/station-route/v1.json`.
 
+Remote launch and messages use the existing production binding surface. Check
+the admitted welcome's features, then send session-family JSON through
+`ClientConnection::send_json` (Swift/Kotlin/WASM: `sendJson`; Rust core:
+`Attached::send`). Results arrive as
+`ClientEvent::Family { family: "session", op: "host_work_result", json }`.
+The core checks the exact host, channel, attachment and request correlation
+before emitting that event; apps still inspect errors and each result state.
+
+| Feature | Operations | Contract |
+|---|---|---|
+| `host.launch` | `host_profiles`, `host_launch`, `host_launch_query` | [Host work](atem-host-work-v1.md) |
+| `host.work` | `work_enqueue`, `work_query`, `work_cancel`, `work_complete` | [Host work](atem-host-work-v1.md) |
+| `host.messages` | `message_publish`, `message_query` | [Messages](atem-messages-v1.md) |
+| `host.attachments` | `attachment_put` | [PNG transfer and marks](atem-task-attachments-v1.md) |
+
+Persist launch request IDs and immutable message/task identities before sending.
+Recover uncertain results with their query operations; a retry uses a fresh
+exchange `id` and preserves the original request or envelope. A `started` launch
+does not mean chat is ready, and `awaiting_result` work does not mean the task
+is complete. The client tracks at most 64 outstanding host-work exchanges;
+reconnect and query after a lost response rather than filling that bound.
+
+Upgrade every participating strict membership verifier before signing grants
+with the new `launch`, `message` or `notify` ops. Existing grants do not acquire
+these permissions automatically. Native launch/work needs account control and
+local host consent; services additionally need the explicit scoped ops. The
+current Station marks path reuses the token's `agent.view`/`agent.prompt`
+scopes plus separately approved signed `message`/`notify` permissions. Service
+launch token scopes and HTTP adapters remain Station/Auth/Portal integration
+work; `agent.prompt` alone does not authorize creating a process.
+
+Every production SDK artifact includes
+`atem-client-<version>-host-work-requests-v1.json` in its SHA-256 manifest. These
+are the shared positive/negative request vectors from
+`fixtures/host-work/requests-v1.json`, run by the Rust core's tests. They are
+fixture data, not an additional binding export or a live integration test.
+
 Status: built and released in Atem v0.8.0 (2026-10-31);
 Astation integrates the bindings, and the joint live tests passed. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
 `atem-session-v1.md` (§R9.5–§R9.9). Overview of the protocols: [README.md](README.md).

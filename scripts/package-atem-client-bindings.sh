@@ -193,6 +193,9 @@ PIN="atem-client-${VERSION}-SOURCE.json"
   "$(printf '%s\n' "${FEATURES[@]}" | paste -sd ';' - | sed 's/;/; /g')" \
   ${TOOLS[@]+"${TOOLS[@]}"}
 FILES+=("$PIN")
+WORK_VECTOR="atem-client-${VERSION}-host-work-requests-v1.json"
+cp designs/protocol/fixtures/host-work/requests-v1.json "$OUT/$WORK_VECTOR"
+FILES+=("$WORK_VECTOR")
 SUMS="atem-client-${VERSION}-SHA256SUMS.txt"
 (cd "$OUT" && sha256sum "${FILES[@]}" >"$SUMS")
 echo "Packaged into $OUT:"

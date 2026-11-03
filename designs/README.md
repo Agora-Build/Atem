@@ -12,6 +12,9 @@ in detail and wins where a design differs.
 | [protocol/README.md](protocol/README.md) | The protocols Atem speaks, how atem-session evolved (r8, r9), where the shared fixtures run |
 | [protocol/atem-session-v1.md](protocol/atem-session-v1.md) | The atem-session wire contract (the r9 appendix is authoritative on a host with a device list) |
 | [protocol/atem-client-bindings.md](protocol/atem-client-bindings.md) | atem-client, the shared client core, and its Swift, Kotlin and WASM bindings |
+| [protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md) | Opt-in host launch and directed-work receiver (feature branch; integration review) |
+| [protocol/atem-messages-v1.md](protocol/atem-messages-v1.md) | Unified text/context messages, multiple recipients, durable receipts and sender checks (feature branch) |
+| [protocol/atem-task-attachments-v1.md](protocol/atem-task-attachments-v1.md) | Chisel/mark shared queue, PNG uploads and online Chisel/Station sender (local feature branches) |
 | [agent-runtime.md](agent-runtime.md) | `atem runtime` and its `atem worker`s: sessions, leases, receipts, the local protocol, Astation operations |
 | [shared-terminal.md](shared-terminal.md) | The shared terminal (terminal-v1): canonical-screen frames, credit, keys |
 | [agent-chat-host.md](agent-chat-host.md) | Agent chat (chat-v1) on the host: Claude and Codex adapters, status, approvals |
@@ -29,8 +32,8 @@ in detail and wins where a design differs.
 
 | Document | What it covers |
 |---|---|
-| [agent-hosting.md](agent-hosting.md) | Optional OS service with boot startup, one runtime across terminal/tmux/Herdr, and remote creation of new agent sessions (draft; not implemented) |
-| [agent-notifications.md](agent-notifications.md) | Event-driven work between agents on different machines: memory/vault references, durable delivery, runtime inbox and safe agent dispatch (draft; not implemented) |
+| [agent-hosting.md](agent-hosting.md) | Optional boot service design; remote-launch receiver and zero-session lifetime implemented on the feature branch |
+| [agent-notifications.md](agent-notifications.md) | Event-driven work design; Atem shared queue and online Chisel/Station delivery implemented locally; offline transport and general UI pending |
 | [build-by-talk.md](build-by-talk.md) | Build by Talk: get the whole project clear by talking, with tool calls to the coding agents (Astation and Atem; not started) |
 | [e2e-encryption.md](e2e-encryption.md) | Credentials (`atem cred get` and the rest), device-signed writes, the recovery secret, auto-unlock |
 | [agora-account-grouping.md](agora-account-grouping.md) | Proposed: merge Astations under one Agora login (opt-in) |

@@ -1,6 +1,11 @@
 # Agent notifications and work across machines
 
-Status: design draft, 2026-11-02. Not implemented. The user proposed that an
+Status: design and local implementation, 2026-11-02. The Atem durable message
+receipts and shared task queue, text/context envelope, multiple explicit recipients and readiness-aware
+existing-session dispatcher are implemented on the feature branch; see the
+[message API](protocol/atem-messages-v1.md) and
+[host-work extension](protocol/atem-host-work-v1.md). Station publication/replay,
+automatic launch-on-arrival and Astation UI remain planned. The user proposed that an
 agent publish context in memory/vault and notify another Atem, whose runtime
 then delivers work to a coding agent. The coding agent should not poll for
 messages on a timer.
@@ -35,14 +40,31 @@ Heartbeats, bounded transport retries and reconnect backoff remain runtime
 responsibilities. No timer asks a coding agent to run memory searches, vault
 reads or an equivalent inbox check.
 
+Remote launch and notifications share one runtime. On the feature branch,
+`atem runtime start` starts it in the background or reuses it; `atem runtime
+check` validates approved profiles/routes without starting processes. Enable
+hosting explicitly to stay online with zero sessions. An offline receiver
+cannot receive new events; Station must retain and deliver them after reconnect.
+Optional boot-service installation remains separate planned work.
+
 ## 2. Context, notification and work
+
+Regular messages and context notifications use the same envelope. It contains
+an authenticated sender, one or more resolved recipients, inline text, exact
+memory/vault snapshots, or both. A short message needs no vault entry. Content
+stores remain canonical; per-recipient delivery and execution progress stays on
+the original message/task receipt. Receiving a message and permission to submit agent input
+are separate decisions. Native account members need no additional copied
+token for ordinary notices; services need a scoped credential. The implemented
+receiver checks sender identity against the admitted channel. Durable Station
+forwarding and Atem host sender proofs remain separate integration work.
 
 | Item | Responsibility |
 |---|---|
 | Memory fact or vault entry | Durable context the recipient can read and reference |
 | Context-change notification | Tell a runtime that subscribed context changed; optionally sync/apply it |
 | Explicit work request | Ask an authorized target to perform a task with referenced context |
-| Receiver inbox | Keep work pending while offline, busy, awaiting approval or waiting for launch |
+| Runtime task queue | Keep accepted work pending while busy, awaiting approval or waiting for launch; Station retains offline delivery |
 | Correlated result | Report progress/completion to the originating workflow |
 
 Saving a fact does not automatically start coding work on every machine.
@@ -125,20 +147,20 @@ to deliver the durable event.
 
 ## 5. Delivery, acknowledgment and recovery
 
-The Station has a durable outbox; the receiver has a durable local inbox.
+The Station has a durable outbox; Atem retains accepted work in its durable task queue.
 Use at-least-once event delivery with idempotent task acceptance. Do not
 claim exactly-once execution of coding-agent side effects.
 
-- Acknowledge event delivery only after durable inbox storage. This says
+- Acknowledge event delivery only after durable task/receipt storage. This says
   nothing about agent acceptance or task completion.
-- Persist the receive cursor with inbox acceptance. Duplicate events are
+- Persist the receive cursor with durable task acceptance. Duplicate events are
   acknowledged without creating another task.
 - Reconnect from the durable cursor, catching up into live delivery without
   a snapshot/live gap. Retry missing acknowledgments in the transport.
 - Commit dispatch, startup recovery and reconnect drive delivery. Coding
   agents never poll; backend transport retry timers are permitted.
 - Define bounded retention, queue limits and backpressure. Never acknowledge
-  work that a full inbox cannot retain. Report expiry explicitly.
+  work that a full task queue cannot retain. Report expiry explicitly.
 - If event retention has a gap, recover from durable pending-work state;
   do not advance the cursor past missing work silently.
 
@@ -148,7 +170,7 @@ Locked credentials or a denied read produce an observable blocked state.
 
 ## 6. Agent dispatch
 
-An inbox scheduler in the runtime reacts to new work, readiness/turn-end,
+The shared task scheduler in the runtime reacts to new work, readiness/turn-end,
 approval resolution, lease release and input/draft changes. It needs no
 model call to determine whether work is queued.
 
@@ -159,8 +181,8 @@ readiness remains blocked with a reason.
 
 At submission, revalidate sender authority and destination/project/profile.
 Use structured prompt acceptance, receipts, leases and worker input epochs.
-Peer work remains remote-origin: do not label it local typing or reuse the
-mark-task local-origin exception to bypass a controller. An active human or
+Peer work remains remote-origin: do not label it local typing or reuse a
+local-origin exception to bypass a controller. An active human or
 remote controller is not silently displaced. The protocol must specify the
 scheduler principal and permitted lease acquisition. Dedicated role sessions
 are a useful default for unattended workflows.
@@ -230,15 +252,25 @@ does not subscribe to executable historical work without owner configuration.
 | Runtime's existing local/relay connection machinery | Reconnect/authentication precedent; specify a coordination subscription reachable on either route |
 | r9 sealed approval hints | Encryption/signing principles; approval-specific operations/authority do not become task dispatch |
 | Chat readiness, drafts, receipts and worker fencing | Safe delivery to either Codex or Claude |
-| Mark-task dispatcher | Queueing precedent; currently Claude-specific, not a cross-machine authorized inbox |
+| Chisel/mark | Uses the shared authorized per-session queue; screenshot upload is separate from the task envelope |
 | Optional hosting / remote launch | Receive with zero sessions and create an approved agent when permitted |
 
-Atem owns the notify interface, subscriptions, durable inbox, role routing,
+Atem owns the notify interface, subscriptions, durable task queue, role routing,
 scheduler, result correlation and diagnostics. The Station owns authenticated
 publication, transactional outbox, durable replay, cross-replica dispatch and
 access checks. Astation/integrated apps configure roles and show pending,
 blocked and completed work. A Mac UI need not remain open for independently
 authorized Atem runtimes to exchange work through the Station.
+
+[Chisel/mark screenshots](protocol/atem-task-attachments-v1.md) now have an
+implemented online Atem receiver and Chisel/Station sender in sibling feature
+worktrees. Chisel sends actual PNG bytes to the authenticated Station marks
+endpoint; its streamed response owns a live R9 service channel through task
+queueing/turn-end. The legacy ID-only assignment is refused with upgrade guidance.
+The separate mark dispatcher/background triage and public `runtime inbox`
+command are removed. No offline artifacts/outbox/replay are included, per the
+user's current scope. Shared/native SDK rollout and explicit grant opt-in remain
+production prerequisites; the hosted API release gate is unchanged.
 
 This draft implements no subscription, wakeup command, new grant, service
 registration or hosted-execution activation.

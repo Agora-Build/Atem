@@ -431,6 +431,7 @@ impl AwaitWelcome {
         let lifetime = welcome.authorization_ms_left.min(NATIVE_LIFETIME_MS);
         self.channel.limit_lifetime(now_ms + lifetime);
         let mut attached = Attached {
+            host_work: HashMap::new(),
             host_policy: HostPolicyTracker::new(&welcome, false),
             channel: self.channel,
             authorization_deadline: now_ms + lifetime,
@@ -556,6 +557,7 @@ enum Outstanding {
 
 /// A welcomed attachment: the channel, the `welcome`, and r8's machines.
 pub struct Attached {
+    host_work: HashMap<String, crate::session::host_work::Request>,
     channel: Channel,
     welcome: Welcome,
     host_head: HostHead,
@@ -688,6 +690,47 @@ impl Attached {
 
     /// Any session-family message the app built (terminal-v1, chat-v1).
     pub fn send(&mut self, message: &Value, now_ms: u64) -> Result<Vec<u8>, ConnectError> {
+        let data = &message["data"];
+        if message["type"] == "session"
+            && matches!(
+                data["op"].as_str(),
+                Some(
+                    "host_profiles"
+                        | "host_launch"
+                        | "host_launch_query"
+                        | "work_enqueue"
+                        | "work_query"
+                        | "work_cancel"
+                        | "work_complete"
+                        | "message_publish"
+                        | "message_query"
+                        | "attachment_put"
+                )
+            )
+        {
+            let request = crate::session::host_work::Request::from_data(data)
+                .map_err(ConnectError::Request)?;
+            let w = &self.welcome;
+            if request.host().account_id != w.account_id
+                || request.host().atem_device_id != w.atem_device_id
+                || request.host().host_trust_gen != w.host_trust_gen
+            {
+                return Err(ConnectError::Request("stale host target"));
+            }
+            let feature = request.feature();
+            if !w.features.iter().any(|f| f == feature) {
+                return Err(ConnectError::Request("host feature not available"));
+            }
+            if self.host_work.contains_key(request.id()) {
+                return Err(ConnectError::Request("duplicate host work message id"));
+            }
+            if self.host_work.len() >= 64 {
+                return Err(ConnectError::Request("too many host work requests"));
+            }
+            let frame = self.seal(message, now_ms)?;
+            self.host_work.insert(request.id().to_owned(), request);
+            return Ok(frame);
+        }
         self.seal(message, now_ms)
     }
 
@@ -986,7 +1029,30 @@ impl Attached {
                 let observed = self.host_policy.observe_change(&change);
                 return Ok(vec![Event::HostPolicyChanged { change, observed }]);
             }
+            Incoming::HostWorkResult(response) => {
+                let bound = response.attachment_gen == self.welcome.attachment_gen
+                    && response.channel_id == self.channel_id()
+                    && self
+                        .host_work
+                        .get(&response.re)
+                        .is_some_and(|req| response.answers(req));
+                if !bound {
+                    return Err(ConnectError::Malformed("unbound host work result"));
+                }
+                self.host_work.remove(&response.re);
+                return Ok(vec![Event::Family(FamilyMessage {
+                    family: "session".into(),
+                    data: Some(
+                        serde_json::to_value(&*response).expect("serializable host work result"),
+                    ),
+                    binding: None,
+                    request: None,
+                })]);
+            }
             Incoming::Error(error) => {
+                if let Some(re) = &error.re {
+                    self.host_work.remove(re);
+                }
                 // r8's machines see r8's errors (a lease request's refusal).
                 if let Ok(Envelope::Session(msg)) = wire::decode(&plain) {
                     self.session_message(&msg, now_ms, &mut events);

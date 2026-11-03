@@ -374,6 +374,15 @@ impl WorkerHandle {
         expect: &Expect,
         start: Option<Option<LaunchEnv>>,
     ) -> Result<Self> {
+        Self::connect_guarded(socket, expect, start, None).await
+    }
+
+    async fn connect_guarded(
+        socket: &Path,
+        expect: &Expect,
+        start: Option<Option<LaunchEnv>>,
+        guard: Option<&SpawnGuard>,
+    ) -> Result<Self> {
         let stream = UnixStream::connect(socket)
             .await
             .map_err(|e| anyhow!("cannot reach the worker at {}: {e}", socket.display()))?;
@@ -394,6 +403,10 @@ impl WorkerHandle {
         }
         let (read, mut write) = stream.into_split();
         if let Some(env) = start {
+            // Check again after connect/peer verification, at the Start boundary.
+            if guard.is_some_and(|g| !g()) {
+                bail!("remote launch authorization changed");
+            }
             write
                 .write_all(encode_broker(&BrokerMsg::Start { env }).as_bytes())
                 .await?;
@@ -516,6 +529,17 @@ pub async fn spawn(
     request: &SpawnRequest,
     env: Option<LaunchEnv>,
 ) -> Result<WorkerHandle> {
+    spawn_guarded(paths, request, env, None).await
+}
+
+pub type SpawnGuard = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+pub async fn spawn_guarded(
+    paths: &WorkerPaths,
+    request: &SpawnRequest,
+    env: Option<LaunchEnv>,
+    guard: Option<SpawnGuard>,
+) -> Result<WorkerHandle> {
     if let Some(env) = &env {
         crate::session::check_env(&env.to_os()).map_err(|e| anyhow!(e))?;
     }
@@ -526,6 +550,9 @@ pub async fn spawn(
         tokio::task::spawn_blocking(move || crate::memory::project::project_key_for(&cwd))
             .await
             .ok();
+    if guard.as_ref().is_some_and(|g| !g()) {
+        bail!("remote launch authorization changed");
+    }
     let spec = WorkerSpec {
         session_id: sid.to_string(),
         process_gen: request.process_gen.clone(),
@@ -559,10 +586,28 @@ pub async fn spawn(
         pid,
         start_time: None,
     };
+    let spawned_start = process_start_time(pid);
     let mut last = anyhow!("the worker didn't start listening");
     for _ in 0..100 {
         if spec.socket.exists() {
-            match WorkerHandle::connect(&spec.socket, &expect, Some(env.clone())).await {
+            if guard.as_ref().is_some_and(|g| !g()) {
+                // This worker was just created by this task and has not
+                // received Start, so it owns no coding-agent process yet.
+                if spawned_start.is_some() && process_start_time(pid) == spawned_start {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }
+                bail!("remote launch authorization changed");
+            }
+            match WorkerHandle::connect_guarded(
+                &spec.socket,
+                &expect,
+                Some(env.clone()),
+                guard.as_ref(),
+            )
+            .await
+            {
                 Ok(handle) => return Ok(handle),
                 Err(error) => {
                     // A connection that got as far as `start` is not retried.

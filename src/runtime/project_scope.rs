@@ -245,6 +245,9 @@ fn kid_of(entry: &str) -> Option<&str> {
 }
 
 impl ProjectScopes {
+    pub fn key_of(&self, sid: &str) -> Option<&str> {
+        self.keys.get(sid).map(String::as_str)
+    }
     pub fn new(hasher: Arc<dyn ProjectHasher>) -> Self {
         let (tx, rx) = mpsc::channel();
         ProjectScopes {

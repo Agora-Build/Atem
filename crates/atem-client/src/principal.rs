@@ -54,10 +54,16 @@ pub enum Op {
     /// §G approval answers.
     Approval,
     RuleRevoke,
+    /// Create a session through an explicitly approved host launch profile.
+    Launch,
+    /// Enqueue directed work through an explicitly approved host route.
+    Notify,
+    /// Receive a message in the host inbox; grants no agent control.
+    Message,
 }
 
 impl Op {
-    pub const ALL: [Op; 7] = [
+    pub const ALL: [Op; 10] = [
         Op::View,
         Op::Prompt,
         Op::Interrupt,
@@ -65,6 +71,9 @@ impl Op {
         Op::Terminal,
         Op::Approval,
         Op::RuleRevoke,
+        Op::Launch,
+        Op::Notify,
+        Op::Message,
     ];
 
     pub fn parse(name: &str) -> Option<Op> {
@@ -80,12 +89,15 @@ impl Op {
             Op::Terminal => "terminal",
             Op::Approval => "approval",
             Op::RuleRevoke => "rule_revoke",
+            Op::Launch => "launch",
+            Op::Notify => "notify",
+            Op::Message => "message",
         }
     }
 
-    /// Every op but `view` is a control op.
+    /// Inbox messages and reads grant no control over a coding agent.
     pub const fn is_control(self) -> bool {
-        !matches!(self, Op::View)
+        !matches!(self, Op::View | Op::Message)
     }
 }
 
@@ -149,6 +161,13 @@ impl Need {
             ("session", "approval_seen") => Need::Seen,
             ("session", "revoke_grant") => Need::RevokeGrant,
             ("session", "host_policy_set" | "host_policy_get") => Need::HostPolicy,
+            ("session", "host_profiles" | "host_launch" | "host_launch_query") => {
+                Need::Op(Op::Launch)
+            }
+            ("session", "work_enqueue" | "work_query" | "work_cancel" | "work_complete") => {
+                Need::Op(Op::Notify)
+            }
+            ("session", "message_publish" | "message_query" | "attachment_put") => Need::Op(Op::Message),
             ("session", "membership") => Need::Op(Op::View),
             ("terminal", "input" | "resize") => Need::Op(Op::Terminal),
             ("terminal", "stop") => Need::Op(Op::Stop),
@@ -740,7 +759,7 @@ impl Authority {
             (_, Need::HostPolicy) => self.client_kind == ClientKind::Native,
             (None, Need::Seen) => control,
             (Some(scope), Need::Seen) => control && scope.ops.contains(&Op::Approval),
-            (None, Need::Op(Op::View)) => true,
+            (None, Need::Op(Op::View | Op::Message)) => true,
             (None, Need::Op(_) | Need::Lease) => control,
             (Some(scope), Need::Op(op)) => scope.ops.contains(&op),
             (Some(scope), Need::Lease) => [Op::Prompt, Op::Interrupt, Op::Stop, Op::Terminal]

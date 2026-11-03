@@ -808,6 +808,25 @@ impl<J: Journal> SessionHost<J> {
         &self.ctx
     }
 
+    pub fn binding_for_work(&self, attachment: &str, target: &Target) -> Option<(Binding, String)> {
+        let a = self.attachments.get(attachment)?;
+        let session = self.sessions.get(&target.session_id)?;
+        if !self.same_host(target)
+            || session.spec.process_gen != target.process_gen
+            || !a.can(Permission::Control)
+        {
+            return None;
+        }
+        Some((
+            Binding {
+                target: target.clone(),
+                attachment_gen: attachment.to_owned(),
+                lease_epoch: session.lease.as_ref().map(|_| session.lease_epoch),
+            },
+            a.controller_session.clone()?,
+        ))
+    }
+
     pub fn journal(&self) -> &J {
         &self.journal
     }

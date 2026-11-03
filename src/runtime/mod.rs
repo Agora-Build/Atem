@@ -8,6 +8,8 @@ pub mod broker;
 pub mod client;
 pub mod commands;
 pub mod host_bridge;
+pub mod host_work;
+mod host_attachments;
 pub mod op_client;
 pub mod ops;
 pub mod project_scope;
@@ -80,7 +82,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// `atem runtime` (hidden): serves this config dir's sessions until it is
+/// Foreground `atem runtime`: serves this config dir's sessions until it is
 /// idle, signalled or replaced. A runtime already serving the config dir
 /// makes this one exit successfully. Its sessions' workers outlive it; the
 /// next runtime adopts them.

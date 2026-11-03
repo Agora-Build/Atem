@@ -581,6 +581,9 @@ impl BrokerSession {
         let seq = self.next_seq;
         let release = self.releases_approvals();
         worker.write_until(seq, bytes, self.input_epoch, not_after, release)?;
+        // Chat batches can lag behind terminal writes (or contain no new
+        // events). Protect the draft as soon as input is handed to the worker.
+        self.input_count = self.input_count.saturating_add(1);
         self.next_seq += 1;
         self.in_flight.insert(seq, (bytes.len(), tag));
         self.last_used = Instant::now();
@@ -801,7 +804,7 @@ impl BrokerSession {
                     // History from a log switched to (resume): clients reload it.
                     self.chat_reset = Some(CloseReason::Switched);
                 }
-                self.input_count = input_count;
+                self.input_count = self.input_count.max(input_count);
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
                 self.chat_unavailable = unavailable;
@@ -1026,7 +1029,7 @@ impl BrokerSession {
                     let outs = self.chat.on_process_exit(now_ms());
                     self.chat_out.extend(outs);
                 }
-                self.input_count = input_count;
+                self.input_count = self.input_count.max(input_count);
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
                 self.chat_unavailable = unavailable;
@@ -1105,6 +1108,31 @@ impl Launcher {
         let path = super::worker::record_path(&state, request.session_id.as_str());
         let created_at_ms = super::worker::read_record(&path)
             .map_or(now_ms() as u64, |record| record.created_at_ms);
+        Ok((handle, created_at_ms))
+    }
+
+    pub async fn spawn_guarded(
+        self,
+        request: SpawnRequest,
+        env: LaunchEnv,
+        guard: adopt::SpawnGuard,
+    ) -> anyhow::Result<(WorkerHandle, u64)> {
+        let state = self.state().to_path_buf();
+        let handle = match self {
+            Launcher::Process(paths) => {
+                adopt::spawn_guarded(&paths, &request, Some(env), Some(guard)).await?
+            }
+            #[cfg(test)]
+            Launcher::InProcess(in_process) => {
+                if !guard() {
+                    anyhow::bail!("remote launch authorization changed");
+                }
+                in_process.spawn(request.clone(), env).await?
+            }
+        };
+        let path = super::worker::record_path(&state, request.session_id.as_str());
+        let created_at_ms =
+            super::worker::read_record(&path).map_or(now_ms() as u64, |r| r.created_at_ms);
         Ok((handle, created_at_ms))
     }
 }

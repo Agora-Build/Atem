@@ -1274,85 +1274,26 @@ fn a_link_that_is_not_a_verified_pairing_gets_no_attachment() {
 }
 
 #[test]
-fn mark_tasks_wait_for_a_remote_lease_holder_and_are_written_without_one() {
+fn legacy_mark_assignment_cannot_inject_local_origin_input() {
     local(async {
         let mut rt = Runtime::start(true).await;
         let mut client = rt.client().await;
         let project = rt.dir.path().join("project");
         std::fs::create_dir_all(project.join(".chisel/tasks")).unwrap();
-        std::fs::write(
-            project.join(".chisel/tasks/t1.json"),
-            json!({"title": "Project B"}).to_string(),
-        )
-        .unwrap();
-        // Claude as an agent that records what it is typed.
-        let agent = script(
-            rt.dir.path(),
-            "recorder",
-            "stty -echo\nprintf 'READY\\r\\n'\nsleep 1\nexec cat >> typed.txt",
-        );
+        std::fs::write(project.join(".chisel/tasks/t1.json"),
+            json!({"title":"must not execute"}).to_string()).unwrap();
+        let agent = script(rt.dir.path(), "recorder",
+            "stty -echo\nprintf 'READY\\r\\n'\nsleep 1\nexec cat >> typed.txt");
         let typed = project.join("typed.txt");
-        let session = rt
-            .launch(&mut client, "claude", &agent, Some(&project))
-            .await;
-        let (sid, pg) = (session.id.clone(), session.generation.clone());
-        let peer = &mut rt.peer;
-        peer.hello().await;
-        peer.terminal("subscribe", &sid, &pg, json!({}), None);
-        peer.wait(|v| is_terminal(v, "attached")).await;
-        screen_until(peer, &sid, &pg, "READY").await;
-
-        // A remote lease holder exists: the task waits.
-        let epoch = peer.acquire(&sid, &pg).await;
-        // Let the broker mirror the lease to the App.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        peer.send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
-        peer.drain(Duration::from_millis(800)).await;
-        let text = std::fs::read_to_string(&typed).unwrap_or_default();
-        assert!(!text.contains("Page title"), "{text:?}");
-
-        // Released: the task is typed, as local-origin input.
-        let id = peer.request(
-            "release",
-            json!({"binding": peer.binding(&sid, &pg, Some(epoch))}),
-        );
-        assert_eq!(peer.reply(&id).await["op"], "lease_released");
-        // A local reclaim right after (no remote lease, no remote bytes)
-        // never drops the queued prompt.
-        client
-            .send(&ClientMsg::Attach {
-                session_id: sid.clone(),
-                rows: 24,
-                cols: 80,
-            })
-            .await
-            .unwrap();
-        for _ in 0..5 {
-            client
-                .send(&ClientMsg::Reclaim {
-                    session_id: sid.clone(),
-                })
-                .await
-                .unwrap();
-        }
-        tokio::time::timeout(WAIT, async {
-            loop {
-                let text = std::fs::read_to_string(&typed).unwrap_or_default();
-                if text.contains("Page title: Project B") {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("the mark task was never typed");
-        // No lease was revoked or granted by it.
-        assert!(
-            !peer
-                .seen
-                .iter()
-                .any(|v| is_session(v, "lease_changed") && v["data"]["reason"] == "local_input")
-        );
+        let session = rt.launch(&mut client, "claude", &agent, Some(&project)).await;
+        rt.peer.hello().await;
+        rt.peer.send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
+        let result = rt.peer.wait(|v| v["type"] == "markTaskResult").await;
+        assert_eq!(result["data"]["success"], false);
+        assert!(result["data"]["message"].as_str().unwrap().contains("message_publish"));
+        rt.peer.drain(Duration::from_millis(250)).await;
+        assert!(!std::fs::read_to_string(&typed).unwrap_or_default().contains("must not execute"));
+        let _ = session;
         rt.shutdown().await;
     });
 }
@@ -2142,48 +2083,6 @@ fn a_local_resize_under_a_remote_lease_waits_for_the_reclaim() {
         })
         .await;
         assert_eq!((session.rows, session.cols), (30, 100));
-        rt.shutdown().await;
-    });
-}
-
-#[test]
-fn mark_task_notices_reach_only_the_frontend_of_their_session() {
-    local(async {
-        let mut rt = Runtime::start(true).await;
-        let mut client = rt.client().await;
-        let mut other = rt.client().await;
-        let project = rt.dir.path().join("project");
-        std::fs::create_dir_all(project.join(".chisel/tasks")).unwrap();
-        std::fs::write(
-            project.join(".chisel/tasks/t1.json"),
-            json!({"title": "Project B"}).to_string(),
-        )
-        .unwrap();
-        let agent = echo_agent(rt.dir.path());
-        let claude = rt
-            .launch(&mut client, "claude", &agent, Some(&project))
-            .await;
-        let codex = rt.launch(&mut other, "codex", &agent, None).await;
-        attach_client(&mut client, &claude.id, 24, 80).await;
-        attach_client(&mut other, &codex.id, 24, 80).await;
-        rt.peer.hello().await;
-        rt.peer
-            .send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
-        let notice = expect(&mut client, |m| match m {
-            RuntimeMsg::Notice { text } if text.contains("t1") && text.contains("Claude") => {
-                Some(text)
-            }
-            _ => None,
-        })
-        .await;
-        assert!(notice.contains("t1"));
-        let heard = collect(&mut other, Duration::from_millis(800)).await;
-        assert!(
-            !heard
-                .iter()
-                .any(|m| matches!(m, RuntimeMsg::Notice { text } if text.contains("t1"))),
-            "another session's frontend got the task's notice: {heard:?}"
-        );
         rt.shutdown().await;
     });
 }
