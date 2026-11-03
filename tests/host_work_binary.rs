@@ -169,8 +169,19 @@ impl Dev {
         } else {
             Identity::native(id, auth(id))
         };
-        let handle = uuid();
-        let a = r.connect(&handle, log, HOST, &identity).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (handle, a) = loop {
+            let handle = uuid();
+            match r.connect(&handle, log, HOST, &identity) {
+                Ok(a) => break (handle, a),
+                Err((code, _)) if code == "busy" && Instant::now() < deadline => {
+                    // Release builds enforce one handshake per second.
+                    r.close(&handle);
+                    std::thread::sleep(Duration::from_millis(1100));
+                }
+                Err(error) => panic!("host-work client admission failed: {error:?}"),
+            }
+        };
         Self {
             handle,
             a,
