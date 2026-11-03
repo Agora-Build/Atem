@@ -645,7 +645,21 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&files.socket).unwrap());
-        let listener = bind_socket(&files, own_uid()).unwrap();
+        // Another test may fork with this listener open; its CLOEXEC copy
+        // keeps the socket live until exec, even after our listener is dropped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let listener = loop {
+            match bind_socket(&files, own_uid()) {
+                Ok(listener) => break listener,
+                Err(error)
+                    if error.kind() == io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("could not replace the dead test socket: {error}"),
+            }
+        };
         assert_eq!(
             std::fs::metadata(&files.socket).unwrap().mode() & 0o777,
             0o600
