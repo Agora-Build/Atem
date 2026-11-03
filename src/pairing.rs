@@ -229,6 +229,11 @@ fn read_no_follow(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 
 /// Removes the record (nothing when there is none).
 fn remove_record(paths: &PairingPaths) -> Result<()> {
+    match std::fs::remove_file(&paths.station_route) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.into()),
+    }
     match std::fs::remove_file(&paths.record) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

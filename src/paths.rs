@@ -79,6 +79,8 @@ pub struct PairingPaths {
     /// `host_policy.pending`: the policy a write left uncertain (its bytes,
     /// rolled forward at start); no local link while it exists.
     pub host_policy_pending: PathBuf,
+    /// Authenticated selected-Station routing metadata (not credentials).
+    pub station_route: PathBuf,
 }
 
 impl PairingPaths {
@@ -97,6 +99,7 @@ impl PairingPaths {
             host_channel_key: dir.join("host_channel_key"),
             host_policy: dir.join("host_policy.json"),
             host_policy_pending: dir.join("host_policy.pending"),
+            station_route: dir.join("station_route.json"),
         }
     }
 

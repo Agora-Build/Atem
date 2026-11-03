@@ -14,6 +14,82 @@ fn mac() -> Identity {
     Identity::native(r9log::MAC, r9log::auth(r9log::MAC))
 }
 
+#[test]
+fn selected_station_direct_block_requires_a_durable_manager_set_to_clear() {
+    use atem_client::station_route::{Context, Offer, Request};
+    let mut rig = rig();
+    let (account, host, genesis) =
+        crate::session_protocol::membership::peek_pin_genesis(&rig.pairing).unwrap();
+    let request = Request {
+        id: R1.into(),
+        route_revision: 0,
+        policy_revision: 0,
+        context: Context {
+            astation_id: "native-test".into(),
+            atem_id: "atem-test".into(),
+            binding_id: "binding-test".into(),
+            host_trust_gen: 1,
+            session_id: "session-test".into(),
+            account_id: Some(account),
+            genesis_hash: Some(genesis),
+            host_device_id: Some(host.host_id),
+        },
+    };
+    let selection = crate::station_route::Selection {
+        offer: Offer::sign(
+            request,
+            "https://station-dev.agora.build",
+            true,
+            b"test-token",
+        )
+        .unwrap(),
+        direct_blocked: true,
+    };
+    crate::station_route::save(&rig.pairing, &selection).unwrap();
+    let path = rig.pairing.dir().join("station_route.json");
+    let blocked = || {
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["direct_blocked"].as_bool().unwrap()
+    };
+    get(&mut rig, "ch-mac", false);
+    results(&mut rig, "ch-mac");
+    assert!(blocked(), "a policy read cannot relax a route restriction");
+    set(&mut rig, "ch-phone", false, R1);
+    assert_eq!(errors(&mut rig, "ch-phone")[0].0, "forbidden");
+    assert!(blocked());
+    set(&mut rig, "ch-mac", false, R1);
+    assert_eq!(results(&mut rig, "ch-mac")[0].0.outcome, Outcome::Unchanged);
+    assert!(
+        blocked(),
+        "a policy from before this selection cannot clear it"
+    );
+    set(&mut rig, "ch-mac", true, R2);
+    assert_eq!(results(&mut rig, "ch-mac")[0].0.policy.revision, 1);
+    let r3 = "aaaaaaaa-0000-4000-8000-0000000000a3";
+    let r4 = "aaaaaaaa-0000-4000-8000-0000000000a4";
+    {
+        let _fault = crate::memory::crypto::fail_writes_to(&path);
+        set(&mut rig, "ch-mac", false, r3);
+        assert_eq!(errors(&mut rig, "ch-mac")[0].0, "busy");
+        assert!(blocked());
+    }
+    get(&mut rig, "ch-mac", false);
+    assert_eq!(results(&mut rig, "ch-mac")[0].0.policy.revision, 2);
+    assert!(blocked(), "a get cannot clear the restriction");
+    set(&mut rig, "ch-mac", false, r4);
+    assert_eq!(results(&mut rig, "ch-mac")[0].0.outcome, Outcome::Unchanged);
+    assert!(!blocked());
+    let mut newer = selection;
+    newer.offer.request.policy_revision = 2;
+    newer.direct_blocked = true;
+    crate::station_route::save(&rig.pairing, &newer).unwrap();
+    retry(&mut rig, "ch-mac", false, r3, 1);
+    assert_eq!(results(&mut rig, "ch-mac")[0].0.outcome, Outcome::Committed);
+    assert!(
+        blocked(),
+        "an older committed request cannot undo a newer restriction"
+    );
+}
+
 /// A rig whose engine stores the policy, with the Mac (a manager) and the
 /// phone (control, no manage) attached.
 fn rig() -> Rig {

@@ -77,6 +77,7 @@ impl App {
     /// and no operation runs on it, at most 5 s later. `false` cancels a
     /// drop still waiting. Never waits itself (`check_relay_only_drop`).
     pub(crate) fn host_policy_changed(&mut self, relay_only: bool) {
+        self.station_policy_changed(relay_only);
         if !relay_only {
             self.relay_only_drop = None;
             return;
@@ -105,6 +106,8 @@ impl App {
             && pending.link_gen == self.astation_link_gen
         {
             pending.barrier = Barrier::Writing(receipt);
+        } else {
+            self.station_policy_receipt(receipt);
         }
     }
 
@@ -118,7 +121,7 @@ impl App {
     /// Whether relay only is about to drop the current link: no Astation
     /// operation or r9 channel is handed this link (they wait for the next).
     pub(crate) fn relay_only_drop_pending(&self) -> bool {
-        self.astation_connected && self.drop_waits()
+        self.astation_connected && (self.drop_waits() || self.station_direct_blocked())
     }
 
     /// A local link that (re)authenticated while the host policy says relay

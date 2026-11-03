@@ -1,5 +1,19 @@
 # atem-client bindings: the binding and effect contract
 
+Selected-Station addition (native integration pending):
+`stationRouteOffer(requestJson:relayUrl:relayOnly:sessionToken:)` uses the
+shared strict decoder, origin normalization and domain-separated HMAC for
+[Selected Station Handoff v1](station-route-v1.md). Native must validate and
+recheck the exact authenticated session, account, selected Station and
+connection before signing/sending. After saving the selection, the host sends
+an authenticated `accepted` acknowledgment; native verifies it against its
+exact pending offer with
+`stationRouteVerifyAccepted(offerJson:acceptedJson:sessionToken:)` and
+rechecks the captured app context. The helpers perform no I/O and grant no
+R9 authority. Stage the selected endpoint and verify acceptance before
+committing R9 relay-only policy on a direct socket. Conformance uses
+`fixtures/station-route/v1.json`.
+
 Status: built and released in Atem v0.8.0 (2026-10-31);
 Astation integrates the bindings, and the joint live tests passed. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
 `atem-session-v1.md` (§R9.5–§R9.9). Overview of the protocols: [README.md](README.md).

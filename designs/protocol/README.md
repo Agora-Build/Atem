@@ -10,6 +10,10 @@ current behavior in detail.
 
 ## The protocols
 
+Selected Station transport handoff: [station-route-v1.md](station-route-v1.md).
+The Atem receiver/shared native helper are implemented; native sender
+integration and live dev/custom switching remain pending.
+
 Everything remote travels on Atem's one outbound WebSocket link, either to
 Astation on the same machine (`:8080`) or to the relay. Atem opens no port.
 The local protocols run over same-user Unix sockets.

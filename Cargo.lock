@@ -270,6 +270,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "url",
  "x25519-dalek",
  "zeroize",
 ]

@@ -3963,12 +3963,14 @@ impl ProjectHasher for NoHasher {
 /// is authenticating an authenticated link again (a routed one keeps it).
 fn r9_app_link(app: &App) -> Option<u64> {
     // A routed link keeps its r9 carrier while Astation authenticates it.
-    (app.r9_link_up() && (app.astation_reauth.is_none() || app.astation_routed))
+    (app.r9_link_up() && !app.station_direct_blocked()
+        && (app.astation_reauth.is_none() || app.astation_routed))
         .then_some(app.astation_link_gen)
 }
 
 fn app_link(app: &App) -> Option<u64> {
-    (app.astation_connected && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
+    (app.astation_connected && !app.station_direct_blocked()
+        && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
         .then_some(app.astation_link_gen)
 }
 

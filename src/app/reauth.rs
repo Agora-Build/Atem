@@ -181,6 +181,7 @@ impl App {
         self.astation_reauth = None;
         let upgraded = std::mem::take(&mut self.astation_routed);
         self.astation_connected = true;
+        self.astation_connected_at = Some(Instant::now());
         self.astation_link_gen += 1;
         if upgraded {
             self.astation_connect_error = None;
