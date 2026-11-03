@@ -13,20 +13,14 @@ use crossterm::{
         enable_raw_mode,
     },
 };
-use serde_json::Value;
 use std::{
-    collections::HashMap,
-    fs,
     io,
-    path::PathBuf,
     process::Command,
     time::Instant,
 };
 use tokio::time::Duration;
 
 use crate::agora_api::{BffProject, format_projects};
-use crate::session::SessionId;
-use crate::dispatch::{TaskDispatcher, WorkItem, WorkKind};
 use crate::config::AtemConfig;
 use crate::runtime::protocol::SessionSummary;
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -34,9 +28,9 @@ use crate::websocket_client::{AstationClient, AstationMessage};
 /// Why the connect loop tried nothing: the pairing record can't be read.
 pub const PAIRING_UNREADABLE: &str = "the pairing record can't be read; not connecting to Astation (neither locally nor through the relay). Restore it from a backup, or run `atem unpair`, then `atem pair`";
 
-/// A mark task whose file no live Claude session's directory has.
-pub const NO_PROJECT_SESSION: &str =
-    "no Claude session for this project; run `atem agent launch claude` there";
+/// Legacy ID-only notifications cannot authenticate a task sender or transfer files.
+pub const MARK_UPGRADE_REQUIRED: &str =
+    "Chisel/mark requires message_publish with a mark payload and uploaded screenshot; upgrade the Astation/Chisel sender";
 
 #[derive(Debug, Clone)]
 pub enum AppMode {
@@ -106,8 +100,6 @@ pub struct App {
     pub show_certificates: bool,
     pub cached_projects: Vec<BffProject>,
     pub config: AtemConfig,
-    pub dispatcher: TaskDispatcher,
-    pub work_items: HashMap<String, WorkItem>,
     pub pairing_code: Option<String>,
     /// The menu: the runtime's sessions as its last `list` gave them (the
     /// agent panel), or why it couldn't be asked.
@@ -126,11 +118,6 @@ pub struct App {
     /// Deadline of a re-authentication proof sent over the open socket that
     /// Astation has not accepted yet (see `app/reauth.rs`).
     pub astation_reauth: Option<Instant>,
-    /// The session the active main mark task was sent to.
-    pub main_task_session: Option<SessionId>,
-    /// Mark-task notices for `atem runtime`: those naming a session go to
-    /// that session's frontend only, the others to the runtime's log.
-    pub task_notices: Vec<(Option<SessionId>, String)>,
     /// The running Astation operation's replies (`atem runtime`; see
     /// `app/op_route.rs`).
     pub op_route: Option<op_route::OpRoute>,
@@ -176,8 +163,6 @@ impl App {
             show_certificates: false,
             cached_projects: Vec::new(),
             config,
-            dispatcher: TaskDispatcher::new(),
-            work_items: HashMap::new(),
             pairing_code: None,
             runtime_sessions: Vec::new(),
             runtime_note: None,
@@ -185,8 +170,6 @@ impl App {
             astation_connect_rx: None,
             astation_reconnect_at: None,
             astation_reauth: None,
-            main_task_session: None,
-            task_notices: Vec::new(),
             op_route: None,
             astation_connect_error: None,
             relay_only_drop: None,
@@ -421,41 +404,11 @@ impl App {
         Ok(())
     }
 
-    /// A mark-task notice about session `sid` (`None`: no session's).
-    fn task_notice(&mut self, sid: Option<SessionId>, text: String) {
-        self.task_notices.push((sid, text));
-    }
-
-    /// The host part of `atem runtime`'s loop, every tick: the Astation
-    /// connection and its messages, and mark tasks (the sessions are the
-    /// broker's).
+    /// Process the runtime's Astation link; executable work belongs to the broker.
     pub async fn tick_host(&mut self) {
-        // Check if background Astation connection has completed
         self.poll_astation_connect();
-
-        // Check if a reconnect retry timer has elapsed (fires only while awake)
         self.check_astation_reconnect();
-
-        // Process any pending Astation messages (also detects WS disconnect)
         self.process_astation_messages().await;
-
-        // Dispatcher: drain triage verdicts and try to send next task to main
-        self.dispatcher.poll_triage_results();
-        self.try_dispatch_main().await;
-
-        // Dispatcher: collect completed background task results
-        for result in self.dispatcher.poll_background_results() {
-            let _ = self
-                .astation_client
-                .send_mark_result(&result.task_id, result.success, &result.output)
-                .await;
-            self.work_items.remove(&result.task_id);
-        }
-
-        // Dispatcher: deferred finalize flag (set when Claude session ends mid-task)
-        if self.dispatcher.take_main_needs_finalize() {
-            self.finalize_mark_task(true).await;
-        }
     }
 
     /// Spawn a background task that connects to Astation without blocking.
@@ -747,31 +700,9 @@ impl App {
                 // `auth_required` and auth replies were handled by
                 // `intercept_astation_reauth`; other status updates need nothing.
             }
-            AstationMessage::MarkTaskAssignment { task_id, received_at_ms } => {
-                self.task_notice(None, format!("\u{1f4cc} Task received: {}", task_id));
-                let Some(target) = self.mark_task_session(&task_id) else {
-                    self.task_notice(None, format!("\u{274c} Task {}: {}", task_id, NO_PROJECT_SESSION));
-                    let _ = self
-                        .astation_client
-                        .send_mark_result(&task_id, false, NO_PROJECT_SESSION)
-                        .await;
-                    return;
-                };
-                match self.load_and_build_work_item(&task_id, received_at_ms, &target) {
-                    Ok(item) => {
-                        let main_busy = self.dispatcher.main_is_active();
-                        self.work_items.insert(task_id.clone(), item.clone());
-                        self.dispatcher.submit(item, main_busy);
-                        self.try_dispatch_main().await;
-                    }
-                    Err(err) => {
-                        self.task_notice(Some(target.clone()), format!("\u{274c} Failed to load task {}: {}", task_id, err));
-                        let _ = self
-                            .astation_client
-                            .send_mark_result(&task_id, false, &format!("Failed to load task: {}", err))
-                            .await;
-                    }
-                }
+            AstationMessage::MarkTaskAssignment { task_id, .. } => {
+                let _ = self.astation_client
+                    .send_mark_result(&task_id, false, MARK_UPGRADE_REQUIRED).await;
             }
             AstationMessage::SessionWire(text) => {
                 self.session_wire(text);
@@ -856,184 +787,6 @@ impl App {
                     record.disconnected_at = Some(crate::credentials::now_secs());
                 })
             });
-        }
-    }
-
-    // MARK: - Mark Task Processing
-
-    /// `<cwd>/.chisel/tasks/<task_id>.json` (a task id is a file name, never a path).
-    pub(crate) fn mark_task_path(cwd: &std::path::Path, task_id: &str) -> Option<PathBuf> {
-        let name = std::path::Path::new(task_id);
-        let mut parts = name.components();
-        let plain = matches!(
-            (parts.next(), parts.next()),
-            (Some(std::path::Component::Normal(_)), None)
-        );
-        plain.then(|| cwd.join(".chisel/tasks").join(format!("{task_id}.json")))
-    }
-
-    /// The live Claude session whose directory has the task (most recently used first).
-    /// Only inside the runtime (`hosted`): the menu TUI runs no sessions.
-    pub fn mark_task_session(&self, task_id: &str) -> Option<SessionId> {
-        self.hosted.as_ref()?.mark_task_session(task_id)
-    }
-
-    /// Load the task JSON from `session`'s directory and build a WorkItem for it.
-    pub fn load_and_build_work_item(&self, task_id: &str, received_at_ms: u64, session: &SessionId) -> Result<WorkItem> {
-        let cwd = self
-            .hosted
-            .as_ref()
-            .and_then(|hosted| hosted.session(session))
-            .map(|s| s.cwd.clone())
-            .ok_or_else(|| anyhow::anyhow!("The session has ended"))?;
-        let task_path = Self::mark_task_path(&cwd, task_id)
-            .ok_or_else(|| anyhow::anyhow!("Invalid task id"))?;
-        let task_json = fs::read_to_string(&task_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read task file: {}", e))?;
-        let task: Value = serde_json::from_str(&task_json)
-            .map_err(|e| anyhow::anyhow!("Failed to parse task JSON: {}", e))?;
-        let prompt = self.build_mark_task_prompt(&task);
-        Ok(WorkItem {
-            task_id: task_id.to_string(),
-            received_at_ms,
-            kind: WorkKind::MarkTask,
-            prompt,
-            session: session.clone(),
-            cwd,
-        })
-    }
-
-    /// Pop the next task from the dispatcher's main queue and send it to the
-    /// Claude session it was routed to (the broker writes it). Waits while a
-    /// remote lease holder controls that session.
-    pub async fn try_dispatch_main(&mut self) {
-        if self.dispatcher.main_is_active() {
-            return;
-        }
-        let Some(next) = self.dispatcher.peek_main() else { return; };
-        let target = self.work_items.get(next).map(|item| item.session.clone());
-        let controlled = match (&self.hosted, &target) {
-            (Some(hosted), Some(id)) => hosted.session(id).is_some_and(|s| s.live && s.remote_controlled),
-            _ => false,
-        };
-        if controlled {
-            return;
-        }
-
-        let task_id = match self.dispatcher.next_for_main() {
-            Some(id) => id,
-            None => return,
-        };
-
-        let item = match self.work_items.get(&task_id) {
-            Some(item) => item.clone(),
-            None => {
-                self.task_notice(None, format!("\u{274c} Task item not found: {}", task_id));
-                self.dispatcher.complete_main();
-                return;
-            }
-        };
-
-        let id = item.session.clone();
-        let live = self.hosted.as_ref().and_then(|h| h.session(&id)).is_some_and(|s| s.live);
-        if !live {
-            let _ = self
-                .astation_client
-                .send_mark_result(&task_id, false, NO_PROJECT_SESSION)
-                .await;
-            self.dispatcher.complete_main();
-            self.work_items.remove(&task_id);
-            // Try the next task.
-            Box::pin(self.try_dispatch_main()).await;
-            return;
-        }
-
-        if let Some(hosted) = self.hosted.as_mut() {
-            // The broker writes it through the session's worker (local-origin
-            // input: no remote lease exists, and none is revoked).
-            hosted.writes.push((task_id.clone(), id.clone(), format!("{}\n\r", item.prompt)));
-            self.main_task_session = Some(id.clone());
-            self.task_notice(Some(id), format!("\u{1f4cc} Task {} \u{2192} Claude", task_id));
-        }
-    }
-
-    fn build_mark_task_prompt(&self, task: &Value) -> String {
-        let mut prompt = String::new();
-
-        prompt.push_str("You have a UI annotation task from Chisel Dev. ");
-        prompt.push_str("A user drew annotations on a screenshot of their web app and wants you to implement the changes.\n\n");
-
-        if let Some(url) = task.get("url").and_then(|v| v.as_str()) {
-            prompt.push_str(&format!("Page URL: {}\n", url));
-        }
-        if let Some(title) = task.get("title").and_then(|v| v.as_str()) {
-            prompt.push_str(&format!("Page title: {}\n", title));
-        }
-
-        // Screenshot path for vision
-        if let Some(screenshot) = task.get("screenshot").and_then(|v| v.as_str()) {
-            prompt.push_str(&format!("\nScreenshot (annotated): {}\n", screenshot));
-            prompt.push_str("Please look at this screenshot to understand the visual context.\n");
-        }
-
-        // Annotations
-        if let Some(annotations) = task.get("annotations").and_then(|v| v.as_array()) {
-            prompt.push_str(&format!("\nAnnotations ({}):\n", annotations.len()));
-            for (i, ann) in annotations.iter().enumerate() {
-                let tool = ann.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let text = ann.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                let x = ann.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let y = ann.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                prompt.push_str(&format!(
-                    "  {}. [{}] at ({:.0}, {:.0})",
-                    i + 1,
-                    tool,
-                    x,
-                    y
-                ));
-                if !text.is_empty() {
-                    prompt.push_str(&format!(" — \"{}\"", text));
-                }
-                prompt.push('\n');
-            }
-        }
-
-        // Source files
-        if let Some(files) = task.get("sourceFiles").and_then(|v| v.as_array()) {
-            prompt.push_str(&format!("\nProject source files ({} files available):\n", files.len()));
-            for f in files.iter().take(20) {
-                if let Some(path) = f.as_str() {
-                    prompt.push_str(&format!("  - {}\n", path));
-                }
-            }
-            if files.len() > 20 {
-                prompt.push_str(&format!("  ... and {} more\n", files.len() - 20));
-            }
-        }
-
-        prompt.push_str("\nPlease implement the changes indicated by the annotations. ");
-        prompt.push_str("Focus on the visual changes the user has marked up.");
-
-        prompt
-    }
-
-    /// Called when a Claude session ends to report mark task result and dispatch next queued task.
-    pub async fn finalize_mark_task(&mut self, success: bool) {
-        self.main_task_session = None;
-        if let Some(task_id) = self.dispatcher.complete_main() {
-            let message = if success {
-                "Task completed by Claude"
-            } else {
-                "Claude session ended before completing task"
-            };
-            let _ = self
-                .astation_client
-                .send_mark_result(&task_id, success, message)
-                .await;
-            self.work_items.remove(&task_id);
-
-            // Dispatch next queued task
-            self.try_dispatch_main().await;
         }
     }
 

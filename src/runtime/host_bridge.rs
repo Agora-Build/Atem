@@ -27,8 +27,8 @@
 //! epoch), so bytes queued under the old lease are dropped at the worker's
 //! write boundary; remote bytes are also checked with `admit_write` right
 //! before they are sent. Local frontend input goes through `local_input`
-//! (it revokes any remote lease) before it is written. Mark tasks write as
-//! local-origin input without revoking: they only run with no lease holder.
+//! (it revokes any remote lease) before it is written. Chisel/mark tasks use
+//! the same authorized prompt receipts as other executable messages.
 //!
 //! Dispatch: a prompt is pasted through the worker once the chat session
 //! accepted it (`ChatSession::submit`); its receipt completes when the chat
@@ -69,7 +69,7 @@ use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
 use super::worker_protocol::{Activity as WorkerActivity, ApplyOutcome, HeldRule, RuleGrant};
 use crate::app::App;
-use crate::app::hosted::{HostedSession, refusal};
+use crate::app::hosted::refusal;
 use crate::chat::adapter::{ApprovalCard, ApprovalCardState};
 use crate::chat::history::{self, Conversations, HistoryCall, HistoryKey, Opening, is_card};
 use crate::chat::session::{Out, State as ChatState};
@@ -100,6 +100,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[path = "host_work_bridge.rs"]
+mod host_work_bridge;
 
 /// `advance` runs this often.
 const ADVANCE_EVERY: u64 = 100;
@@ -480,6 +483,7 @@ struct Link {
 }
 
 pub struct HostBridge {
+    work: host_work_bridge::State,
     host: SessionHost<FileJournal>,
     dir: std::path::PathBuf,
     clock: Clock,
@@ -718,6 +722,7 @@ impl HostBridge {
             None => Arc::new(NoHasher),
         };
         Ok(Self {
+            work: host_work_bridge::State::open(dir, profile.is_some()),
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
             r9: {
@@ -1437,6 +1442,7 @@ impl HostBridge {
         sessions: &mut BTreeMap<SessionId, BrokerSession>,
         adopting: bool,
     ) {
+        self.work_config();
         // Displayed times (descriptors, receipts, `welcome.server_time`)
         // follow the host clock, which moves while the machine sleeps.
         self.host
@@ -1548,8 +1554,12 @@ impl HostBridge {
             self.r9_exec(effects, &mut cx);
         }
         self.test_carriage(&mut cx);
+        self.work_config();
         self.project_pass(&mut cx);
         self.sync_all(&mut cx);
+        if !adopting {
+            self.work_pass(&mut cx);
+        }
         self.drain_remote(&mut cx);
         self.frames(&mut cx);
         self.heartbeats(&mut cx);
@@ -1577,22 +1587,6 @@ impl HostBridge {
         // able to again (pinned, reconciled): its link proves its route.
         if crate::session_protocol::r9::route::set(&app.host_route, self.route_state()) {
             app.route_reconnect = Some(std::time::Instant::now());
-        }
-        if let Some(hosted) = app.hosted.as_mut() {
-            hosted.sessions = cx
-                .sessions
-                .values()
-                .filter_map(|s| {
-                    Some(HostedSession {
-                        id: s.id.clone(),
-                        provider: Provider::from_alias(&s.provider)?,
-                        cwd: s.cwd.clone(),
-                        live: s.is_live(),
-                        remote_controlled: self.host.lease_holder(s.id.as_str()).is_some(),
-                        last_used: s.last_used,
-                    })
-                })
-                .collect();
         }
         for relay_only in policy_changes {
             app.host_policy_changed(relay_only);

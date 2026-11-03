@@ -403,6 +403,15 @@ fn one_authority_check_per_request() {
     );
     assert_eq!(need("session", json!({"op": "approval_seen"})), Need::Seen);
     assert_eq!(
+        need("session", json!({"op": "message_publish"})),
+        Need::Op(Op::Message)
+    );
+    assert_eq!(
+        need("session", json!({"op": "message_query"})),
+        Need::Op(Op::Message)
+    );
+    assert!(!Op::Message.is_control());
+    assert_eq!(
         need("terminal", json!({"op": "input"})),
         Need::Op(Op::Terminal)
     );

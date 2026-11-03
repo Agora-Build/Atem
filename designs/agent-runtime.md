@@ -9,9 +9,13 @@ it. The wire contract is [protocol/atem-session-v1.md](protocol/atem-session-v1.
 [shared-terminal.md](shared-terminal.md), [agent-chat-host.md](agent-chat-host.md)
 and [account-trust.md](account-trust.md).
 
-Optional managed hosting with boot startup and remote session creation is
-proposed separately in [agent-hosting.md](agent-hosting.md). It is not
-implemented and does not change the current on-demand lifetime below.
+Optional hosting is described separately in [agent-hosting.md](agent-hosting.md).
+The feature branch adds `atem runtime start` (detached startup or reuse),
+`atem runtime check`, approved remote session creation and directed-work
+notifications; see [the host-work extension](protocol/atem-host-work-v1.md).
+Healthy hosting explicitly enabled in private `runtime.toml` keeps the same
+runtime online with zero sessions. Default on-demand lifetime below is
+unchanged. OS service installation and boot startup remain planned.
 
 ## Product decisions
 
@@ -57,7 +61,7 @@ decided later: [account-trust.md](account-trust.md) and the contract's r9 append
 - **Astation** views sessions, terminals and chats; with `control` and the
   lease it types, prompts (a chat Send may take the lease), interrupts and
   stops; with `control` alone it answers approvals and revokes session rules;
-  it assigns mark tasks.
+  it publishes Chisel/mark through the shared authenticated task queue.
 - **CLI.** `atem status` is the one read-only, offline status command (no
   `atem cred status`). `atem pair` on a paired profile only reports;
   replacing a pairing is `atem unpair`, then `atem pair`. `atem pair verify`
@@ -379,7 +383,7 @@ every atem on a machine together.
 Atem side:
 
 - Unit: session ids, registry, protocol encode/decode and limits, version
-  check, backpressure, mark-task routing by working directory, operation
+  check, backpressure, shared task routing by approved project/session, operation
   serialization and reply routing.
 - In-process with fake agents and a fake Astation (`runtime/*_tests.rs`):
   session-v1 registry, leases and receipts; terminal-v1 subscribe by session

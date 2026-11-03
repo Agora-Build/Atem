@@ -102,7 +102,7 @@ pub enum Commands {
     /// Runs the cred agent (started automatically when keys are needed)
     #[command(hide = true)]
     CredAgent,
-    /// Atem's background runtime (agent sessions, the Astation link): `atem runtime restart`
+    /// Atem's runtime (agent sessions, the Astation link): `atem runtime start` or `atem runtime restart`
     Runtime {
         #[command(subcommand)]
         command: Option<RuntimeCommands>,
@@ -435,6 +435,10 @@ pub enum PairCommands {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum RuntimeCommands {
+    /// Start the runtime in the background, or reuse the running one
+    Start,
+    /// Validate remote-launch profiles and notification routes without starting agents
+    Check,
     /// Restart the runtime as this build; sessions keep running
     Restart,
 }
@@ -1114,6 +1118,18 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Runtime {
             command: Some(RuntimeCommands::Restart),
         } => crate::runtime::client::restart().await,
+        Commands::Runtime {
+            command: Some(RuntimeCommands::Start),
+        } => {
+            crate::auth::require_pairing("Remote agent launch and notifications")?;
+            crate::runtime::client::start().await
+        }
+        Commands::Runtime {
+            command: Some(RuntimeCommands::Check),
+        } => {
+            crate::auth::require_pairing("Remote agent launch and notifications")?;
+            crate::runtime::host_work::check(&crate::config::AtemConfig::config_dir())
+        }
         Commands::Worker { state, session } => crate::runtime::worker::run_worker(state, session).await,
     }
 }
@@ -2004,10 +2020,20 @@ mod tests {
     }
 
     #[test]
-    fn runtime_runs_bare_and_restarts_visibly() {
+    fn runtime_runs_bare_and_exposes_start_check_and_restart() {
         use clap::CommandFactory;
         let cli = Cli::try_parse_from(["atem", "runtime"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Runtime { command: None })));
+        let cli = Cli::try_parse_from(["atem", "runtime", "start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime { command: Some(RuntimeCommands::Start) })
+        ));
+        let cli = Cli::try_parse_from(["atem", "runtime", "check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime { command: Some(RuntimeCommands::Check) })
+        ));
         let cli = Cli::try_parse_from(["atem", "runtime", "restart"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -2015,6 +2041,10 @@ mod tests {
         ));
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("runtime restart"), "{help}");
+        assert!(help.contains("runtime start"), "{help}");
+        assert!(!help.contains("host init"), "{help}");
+        assert!(Cli::try_parse_from(["atem", "host", "init"]).is_err());
+        assert!(Cli::try_parse_from(["atem", "host", "check"]).is_err());
         let mut command = Cli::command();
         let runtime = command.find_subcommand_mut("runtime").unwrap();
         let help = runtime.render_help().to_string();

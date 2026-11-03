@@ -1,0 +1,80 @@
+# Atem runtime - remote agent launch and directed work
+# Installed automatically as ~/.config/atem/runtime.toml by `atem runtime start`.
+# Keep the installed file private: chmod 0600 ~/.config/atem/runtime.toml
+# Validate your changes with `atem runtime check` (requires pairing).
+#
+# Fill in approved profiles/routes below, then explicitly set enabled = true.
+# Healthy enabled hosting keeps the runtime online with zero agent sessions.
+# This does not install a boot service or start coding agents automatically.
+version = 1
+enabled = false
+
+# -- Approved launch profiles -------------------------------------------------
+# Uncomment a profile and replace its example paths, Git project and principals.
+# cwd must be the existing canonical absolute directory (resolve symlinks).
+# project is the normalized Git remote, without its scheme, user or .git suffix.
+# principals are enrolled member/service/browser IDs, not hostnames or logins.
+# These local approvals supplement the caller's current account permissions.
+# Increase revision when changing a profile's approvals or launch settings.
+#
+# Codex example: runs `codex --profile oss` in the approved directory.
+# [[profiles]]
+# id = "backend-codex"
+# revision = 1
+# label = "Backend Codex"
+# provider = "codex"
+# cwd = "/absolute/canonical/path/to/backend"
+# project = "github.com/your-org/backend"
+# args = ["--profile", "oss"]
+# principals = ["member:YOUR_ASTATION_DEVICE_ID", "service:YOUR_COORDINATOR_SERVICE_ID"]
+# env_names = ["OSS_API_KEY"]
+#
+# Optional private JSON object of variable names to string values (never sourced).
+# Only names in this profile's env_names may appear; file values override exports.
+# Keep the environment file private (0600); do not put credential values here.
+# env_file = "/absolute/private/backend-env.json"
+#
+# Claude example: runs `claude --model sonnet` in the approved directory.
+# [[profiles]]
+# id = "mobile-claude"
+# revision = 1
+# label = "Mobile Claude"
+# provider = "claude"
+# cwd = "/absolute/canonical/path/to/mobile"
+# project = "github.com/your-org/mobile"
+# args = ["--model", "sonnet"]
+# principals = ["member:YOUR_ASTATION_DEVICE_ID", "service:YOUR_COORDINATOR_SERVICE_ID"]
+# env_names = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]
+# env_file = "/absolute/private/mobile-env.json"
+#
+# Remote callers select a profile; they cannot supply commands, paths, args or
+# environment values. List the provider variables your setup needs in env_names.
+# Named exports are captured when a new runtime starts with hosting enabled.
+# Repeating `runtime start` reuses the process and does not update its environment.
+# An approved env_file can supply values independently of the terminal's exports.
+
+# -- Notification routes ------------------------------------------------------
+# Enabled hosting also accepts text/context notices from authenticated native
+# members. Ordinary notices do not need a profile principal entry or start work.
+# Services need the scoped "message" op. Executable message recipients also
+# need "notify" and "prompt" plus the route's explicit principal approval.
+# Inspect delivery through the publishing client's message/task receipts.
+#
+# A route selects an approved profile and the principals allowed to send work.
+# Work targets an existing session matching that profile's project/provider/cwd.
+# A coordinator may explicitly launch a session first, then enqueue work.
+# Automatic launch-on-notification is not implemented. Busy agents, drafts,
+# approvals and active control leases hold work until safe delivery is possible.
+# Increase revision when changing a route's approvals or selected profile.
+#
+# [[routes]]
+# id = "backend"
+# revision = 1
+# profile_id = "backend-codex"
+# principals = ["member:YOUR_ASTATION_DEVICE_ID", "service:YOUR_COORDINATOR_SERVICE_ID"]
+#
+# [[routes]]
+# id = "mobile"
+# revision = 1
+# profile_id = "mobile-claude"
+# principals = ["member:YOUR_ASTATION_DEVICE_ID", "service:YOUR_COORDINATOR_SERVICE_ID"]

@@ -14,6 +14,14 @@ Everything remote travels on Atem's one outbound WebSocket link, either to
 Astation on the same machine (`:8080`) or to the relay. Atem opens no port.
 The local protocols run over same-user Unix sockets.
 
+The feature-branch [host-work extension](atem-host-work-v1.md) specifies
+opt-in remote launch and directed work inside r9 channels, including the
+membership-verifier upgrade needed for its new launch/message/notify scope ops.
+The [message extension](atem-messages-v1.md) adds inline text, exact context,
+one or many resolved recipients and independent durable delivery receipts.
+[Task screenshots and Chisel/mark](atem-task-attachments-v1.md) specifies PNG
+uploads and mark tasks in the same per-session queue.
+
 | Protocol | Between | Version today | Specified in |
 |---|---|---|---|
 | atem-session (`session` messages) | Astation, phones, bots (services) and browsers ↔ the Atem host (`atem runtime`): session list, control leases, prompts, receipts, approvals | v1, revision **r9**; **r8** on a host without a device list | [atem-session-v1.md](atem-session-v1.md) |
@@ -29,7 +37,7 @@ The local protocols run over same-user Unix sockets.
 An r8 host has no device list, so it sends no sealed hints: it sends
 `push_approval` and `push_resolved` relay messages instead. The other
 messages on the Astation link (authentication, `credentialSync`, device
-verification, key grants, unlock, mark tasks) carry no version number; they
+verification, key grants, unlock) carry no version number; they
 are listed in AGENTS.md ("WebSocket messages") and ../e2e-encryption.md.
 
 ## What "v1" means

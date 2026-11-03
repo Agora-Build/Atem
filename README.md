@@ -176,6 +176,8 @@ atem agent launch claude -- --help      # Use -- to read the agent's own help
 atem agent list                         # The sessions the background runtime holds
 atem agent attach ses-…                 # Reopen a session (screen restored)
 atem agent stop ses-…                   # Stop a session
+atem runtime start                      # Start/reuse the background runtime (paired machines)
+atem runtime check                      # Validate remote-launch profiles and notification routes
 atem runtime restart                    # Restart the runtime as this build; sessions keep running
 atem --version                          # This atem, and the runtime, cred agent and workers while they run
 ```
@@ -193,8 +195,8 @@ and Codex sessions can run at once, and they keep running if the runtime
 itself restarts. The runtime also holds this machine's one Astation
 connection: `atem pair`, `atem pair verify`, `atem cred unlock` and `atem cred
 projects` run on it (they start the runtime if needed) and never open their
-own, so pairing never disconnects a running session. When a command of
-another atem build (an upgrade, a dev build) uses the runtime, it replaces the
+own, so pairing never disconnects a running session. When an agent command or
+Astation operation from another atem build (an upgrade, a dev build) uses the runtime, it replaces the
 runtime by its own build first and prints `Atem's runtime updated to … (was
 …); sessions kept.`; the new runtime adopts the sessions. It doesn't when the
 new build couldn't adopt them (it names the sessions that block it), while an
@@ -203,6 +205,33 @@ ago (two atem builds in use); `atem runtime restart` applies it then. `atem
 status` and `atem --version` only look. When an agent that
 printed something ends, its last output and a short summary are saved under
 `~/.config/atem/logs/<session id>/`.
+
+For opt-in remote agent launch and notifications, `atem runtime start` creates
+a private `~/.config/atem/runtime.toml` if missing, initially disabled, and
+starts or reuses the background runtime. Existing configuration, agents and
+the running runtime's build are preserved. Configure approved launch profiles,
+notification routes and principals, then use `atem runtime check` to validate
+them. Healthy hosting with `enabled = true` keeps the runtime online with zero
+sessions; otherwise its ordinary idle timeout applies. Both commands require
+pairing. Bare `atem runtime` runs in the foreground. OS service installation
+and boot startup remain planned. See the
+[host-work contract](designs/protocol/atem-host-work-v1.md) for feature-branch
+implementation and integration status.
+
+The feature-branch [message API](designs/protocol/atem-messages-v1.md) accepts
+ordinary text, versioned memory/vault context, or both, for one or many explicit
+recipients. Receiving a notice does not grant agent control. Agent recipients
+still use approved routes and normal prompt receipts. Station's durable
+publication/replay, direct Atem senders and app interfaces remain integration
+work; the shared client API can already send through admitted native/service
+channels. Progress stays on the original message/task receipt.
+
+Chisel/mark uses this same task queue. Its annotated PNG uploads separately over
+the encrypted channel; the task names an immutable screenshot reference. Atem
+verifies the bytes and gives the coding agent a private local image path.
+See the [mark and attachment contract](designs/protocol/atem-task-attachments-v1.md).
+The old ID-only `markTaskAssignment` is refused with upgrade guidance; Chisel and
+Astation must adopt the new sender flow before mark execution works with this build.
 
 If you are paired and verified, Astation can view each session, take control
 of it (one controller at a time, on a lease Astation keeps renewing; typing
@@ -523,6 +552,23 @@ Astation integration is in progress — see [ROADMAP.md](ROADMAP.md).
 
 ## Configuration
 
+Atem has four user-facing TOML configuration types under `~/.config/atem/`.
+Optional features use their own file; not every installation needs all four.
+
+| File | Sample | Purpose |
+|---|---|---|
+| `config.toml` | [config.example.toml](configs/config.example.toml) | General CLI/TUI settings, Astation/relay endpoints and generated machine identity |
+| `runtime.toml` | [runtime.example.toml](configs/runtime.example.toml) | Approved remote-launch profiles, notification routes and zero-session hosting (feature branch) |
+| `convo.toml` | [convo.example.toml](configs/convo.example.toml) | `atem serv convo` agent, model, voice and RTC settings |
+| `webhooks.toml` | [webhooks.example.toml](configs/webhooks.example.toml) | `atem serv webhooks` listener, signature validation and tunnel settings |
+
+`runtime.toml` is managed through `atem runtime start` and validated with
+`atem runtime check`. It is separate from general settings because it holds
+explicit execution approvals. Its optional provider environment files supply
+only allowlisted variables. Pairing records, credential files, databases,
+logs, locks and sockets are generated state rather than additional settings
+files.
+
 ### Login
 
 ```bash
@@ -538,7 +584,9 @@ Files in `~/.config/atem/`:
 | File | Contents | Encryption |
 |------|----------|------------|
 | `config.toml` | Non-sensitive settings (Astation/relay URLs, extra_hostnames, SSO/BFF overrides) and this atem's generated identity (`instance_id`, `atem_id`) | None |
+| `runtime.toml` | Approved remote-launch profiles, notification routes and opt-in hosting (feature branch; disabled by default) | None (chmod 0600) |
 | `convo.toml` | ConvoAI agent config (API keys, provider params) | None (chmod 0600) |
+| `webhooks.toml` | Webhook listener, HMAC validation and tunnel settings | None |
 | `login.enc` | Your own `atem login` (who issued it, your login id, its tokens) | AES-256-GCM (machine-bound) |
 | `pairing/` | The Astation pairing: `pairing.enc` (Astation id, session, the login Astation shares, the save choice) and `trust_gen` (a counter `atem unpair` moves on) | `pairing.enc` AES-256-GCM (machine-bound) |
 | `project_cache.enc` | Project list + active project selection | AES-256-GCM (machine-bound) |

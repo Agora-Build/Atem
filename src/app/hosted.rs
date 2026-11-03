@@ -1,18 +1,15 @@
 //! The App inside `atem runtime`: it holds the Astation connection, but the
 //! sessions are the broker's (each in an `atem worker`) and the session
-//! host is the broker's (src/runtime/host_bridge.rs). The broker mirrors its
-//! sessions here each tick for mark tasks, takes the session-family messages
-//! the App received (`inbox`) and writes the mark-task prompts it queued
-//! (`writes`).
+//! host is the broker's (src/runtime/host_bridge.rs). The broker takes the
+//! session-family messages the App received (`inbox`). Executable messages,
+//! including Chisel/mark, use the broker's durable work scheduler.
 //!
 //! The TUI without a runtime (bare `atem`) opens no Astation connection at
 //! all, so it never sees a session-family message.
 use super::App;
 use crate::runtime::refusal_log;
-use crate::session::{Provider, SessionId};
 use crate::session_protocol::wire::{self, Envelope, ErrorCode, Op, SessionMessage};
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::time::Instant;
 
 /// Messages kept for the session host per pass, at most.
@@ -36,27 +33,11 @@ pub const ROUTE_RECONNECT_FLUSH: std::time::Duration = std::time::Duration::from
 /// mid-admission (a client that keeps opening channels can't hold it off).
 pub const ROUTE_RECONNECT_ADMISSION: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// One broker session as mark tasks see it.
-#[derive(Debug, Clone)]
-pub struct HostedSession {
-    pub id: SessionId,
-    pub provider: Provider,
-    pub cwd: PathBuf,
-    /// The agent runs in a connected worker.
-    pub live: bool,
-    /// A remote lease holder exists.
-    pub remote_controlled: bool,
-    pub last_used: Instant,
-}
-
 #[derive(Debug, Default)]
 pub struct Hosted {
     /// Session-family messages from the authenticated link, with the link
     /// generation they arrived on (raw JSON, decoded strictly by the host).
     pub inbox: VecDeque<(u64, String)>,
-    pub sessions: Vec<HostedSession>,
-    /// Mark-task prompts to write: (task id, session, text).
-    pub writes: Vec<(String, SessionId, String)>,
     /// Refusals answered here (oversize, a full inbox): (link generation,
     /// runtime.log line), written by the broker under its rate limit.
     pub refused: Vec<(u64, String)>,
@@ -74,26 +55,6 @@ pub struct Hosted {
     pub relay: VecDeque<(u64, String)>,
     /// Relay messages dropped (over a bound), for runtime.log.
     pub relay_dropped: u64,
-}
-
-impl Hosted {
-    pub fn session(&self, id: &SessionId) -> Option<&HostedSession> {
-        self.sessions.iter().find(|s| &s.id == id)
-    }
-
-    /// The live Claude session whose directory has the task (most recently used first).
-    pub fn mark_task_session(&self, task_id: &str) -> Option<SessionId> {
-        let mut sessions: Vec<&HostedSession> = self
-            .sessions
-            .iter()
-            .filter(|s| s.provider == Provider::Claude && s.live)
-            .collect();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_used));
-        sessions
-            .into_iter()
-            .find(|s| App::mark_task_path(&s.cwd, task_id).is_some_and(|p| p.is_file()))
-            .map(|s| s.id.clone())
-    }
 }
 
 impl App {
@@ -316,17 +277,6 @@ impl App {
             Instant::now()
         });
     }
-
-    /// The broker could not write a mark task's prompt: the task fails.
-    pub async fn mark_write_failed(&mut self, task_id: &str, error: &str) {
-        self.main_task_session = None;
-        let _ = self
-            .astation_client
-            .send_mark_result(task_id, false, error)
-            .await;
-        self.dispatcher.complete_main();
-        self.work_items.remove(task_id);
-    }
 }
 
 /// The answer to a session-family message when no session host serves it
@@ -339,7 +289,8 @@ pub fn refusal(re: Option<String>) -> String {
 pub const REMOVED_OP: &str = "removed in atem-session r6";
 
 /// The detail of the refusal of a plaintext relay-only message (§R9.8a).
-pub const REMOVED_POLICY_OP: &str = "removed: relay only is set inside an r9 channel (host_policy_set)";
+pub const REMOVED_POLICY_OP: &str =
+    "removed: relay only is set inside an r9 channel (host_policy_set)";
 
 /// A session `error{code}` answering `re`.
 pub fn error_text(re: Option<String>, code: ErrorCode) -> String {

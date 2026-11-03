@@ -1,9 +1,13 @@
 # Optional background hosting and remote agent launch
 
-Status: design draft, 2026-11-02. Not implemented. The user requested
+Status: design draft, 2026-11-02. The Atem remote-launch receiver and optional
+zero-session lifetime are implemented on the feature branch; see the
+[host-work extension](protocol/atem-host-work-v1.md). OS service installation
+and Astation UI remain planned. The user requested
 remote creation of new Codex/Claude sessions and approved optional service
-installation with automatic startup after reboot. The service mechanics,
-commands and remote launch contract below are proposed implementation choices.
+installation with automatic startup after reboot. The service mechanics and
+service commands below are proposed implementation choices; the feature-branch
+receiver contract is specified in the host-work extension.
 
 Current behavior remains documented in [agent-runtime.md](agent-runtime.md).
 The remote contract remains [atem-session-v1](protocol/atem-session-v1.md);
@@ -34,8 +38,9 @@ These are the product requirements:
 
 - Service installation is optional. Installing or upgrading the Atem
   package alone does not install, enable or start an OS service.
-- Without a service, the existing on-demand runtime and ten-minute idle
-  exit remain the default.
+- With hosting disabled, the existing on-demand runtime and ten-minute idle
+  exit remain the default. Opting into healthy hosting keeps the runtime
+  online with zero sessions, including without an OS service.
 - Explicit service installation enables startup after reboot and starts
   the runtime now. Managed hosting stays available with zero agent sessions.
 - Service startup does not start agents, resume old conversations, replay
@@ -109,9 +114,26 @@ logout; do not restart an old agent to manufacture that guarantee.
 If startup fails, preserve workers and profile data, report the failure and
 provide a local recovery path. Never create a second profile as a fallback.
 
-## 4. Proposed local commands
+## 4. Local commands and proposed service commands
 
-All commands in this section are proposed, not available today.
+These runtime commands are implemented on the feature branch:
+
+| Command | Effect |
+|---|---|
+| `atem runtime start` | Start in the background or reuse the existing runtime without replacing its build; create a disabled private configuration only when missing |
+| `atem runtime check` | Validate approved launch profiles, environment sources and notification routes; start no processes |
+| `atem runtime` | Run in the foreground, including inside tmux/Herdr; the profile lock prevents duplicate runtimes |
+| `atem runtime restart` | Replace the broker with this build; verified surviving workers are adopted |
+
+`runtime start` and `runtime check` require pairing. Starting a runtime grants
+no remote launch or notification permissions: configure approved profiles,
+routes and principals and explicitly set `enabled = true` in `runtime.toml`.
+Both features use the same runtime. Without enabled hosting, its ordinary idle
+timeout still applies. Repeated start preserves configuration and the running
+process's environment. Starting a runtime does not install an OS service or
+enable startup after reboot.
+
+All service commands below remain proposed, not available today.
 
 | Command | Effect |
 |---|---|

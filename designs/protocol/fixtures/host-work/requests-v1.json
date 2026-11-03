@@ -1,0 +1,1118 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "approved_profile_launch",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "host_launch",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "profile_id": "backend",
+          "profile_revision": 1,
+          "expires_at": 1793620800000
+        }
+      }
+    },
+    {
+      "name": "list_profiles",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "host_profiles"
+        }
+      }
+    },
+    {
+      "name": "recover_launch",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "host_launch_query",
+          "request_id": "22222222-2222-4222-8222-222222222222"
+        }
+      }
+    },
+    {
+      "name": "enqueue_immutable_context",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_enqueue",
+          "route_id": "backend",
+          "route_revision": 1,
+          "task": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "target": {
+              "account_id": "account",
+              "atem_device_id": "host",
+              "host_trust_gen": 1,
+              "session_id": "ses-aaaaaaaaaaaa",
+              "process_gen": "33333333-3333-4333-8333-333333333333"
+            },
+            "expires_at": 1793620800000,
+            "prompt": "Implement the API contract",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "api-contract",
+                "version": 1,
+                "text": "API contract v1",
+                "digest": "5e83f35f11a945cffed09c9e294f34db55544884095050fba43b3525f7574523"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "work_query",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_query",
+          "task_id": "22222222-2222-4222-8222-222222222222"
+        }
+      }
+    },
+    {
+      "name": "work_cancel",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_cancel",
+          "task_id": "22222222-2222-4222-8222-222222222222"
+        }
+      }
+    },
+    {
+      "name": "complete_with_immutable_result",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_complete",
+          "task_id": "22222222-2222-4222-8222-222222222222",
+          "result": {
+            "kind": "vault",
+            "id": "api-contract",
+            "version": 1,
+            "text": "API contract v1",
+            "digest": "5e83f35f11a945cffed09c9e294f34db55544884095050fba43b3525f7574523"
+          }
+        }
+      }
+    },
+    {
+      "name": "no_remote_environment",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "host_launch",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "profile_id": "backend",
+          "profile_revision": 1,
+          "expires_at": 1793620800000,
+          "env": {
+            "KEY": "test-only"
+          }
+        }
+      }
+    },
+    {
+      "name": "no_remote_command",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "host_launch",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "profile_id": "backend",
+          "profile_revision": 1,
+          "expires_at": 1793620800000,
+          "command": "sh -c true"
+        }
+      }
+    },
+    {
+      "name": "no_unbound_cwd",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "host_launch",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "profile_id": "backend",
+          "profile_revision": 1,
+          "expires_at": 1793620800000,
+          "cwd": "/tmp"
+        }
+      }
+    },
+    {
+      "name": "revision_must_be_positive",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "host_launch",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "profile_id": "backend",
+          "profile_revision": 0,
+          "expires_at": 1793620800000
+        }
+      }
+    },
+    {
+      "name": "unsafe_integer",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 9007199254740992
+          },
+          "op": "host_launch",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "profile_id": "backend",
+          "profile_revision": 1,
+          "expires_at": 1793620800000
+        }
+      }
+    },
+    {
+      "name": "context_digest_mismatch",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_enqueue",
+          "route_id": "backend",
+          "route_revision": 1,
+          "task": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "target": {
+              "account_id": "account",
+              "atem_device_id": "host",
+              "host_trust_gen": 1,
+              "session_id": "ses-aaaaaaaaaaaa",
+              "process_gen": "33333333-3333-4333-8333-333333333333"
+            },
+            "expires_at": 1793620800000,
+            "prompt": "Implement the API contract",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "api-contract",
+                "version": 1,
+                "text": "changed",
+                "digest": "5e83f35f11a945cffed09c9e294f34db55544884095050fba43b3525f7574523"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "context_version_zero",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_enqueue",
+          "route_id": "backend",
+          "route_revision": 1,
+          "task": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "target": {
+              "account_id": "account",
+              "atem_device_id": "host",
+              "host_trust_gen": 1,
+              "session_id": "ses-aaaaaaaaaaaa",
+              "process_gen": "33333333-3333-4333-8333-333333333333"
+            },
+            "expires_at": 1793620800000,
+            "prompt": "Implement the API contract",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "api-contract",
+                "version": 0,
+                "text": "API contract v1",
+                "digest": "5e83f35f11a945cffed09c9e294f34db55544884095050fba43b3525f7574523"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "target_unknown_fields",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_enqueue",
+          "route_id": "backend",
+          "route_revision": 1,
+          "task": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "target": {
+              "account_id": "account",
+              "atem_device_id": "host",
+              "host_trust_gen": 1,
+              "session_id": "ses-aaaaaaaaaaaa",
+              "process_gen": "33333333-3333-4333-8333-333333333333",
+              "future": true
+            },
+            "expires_at": 1793620800000,
+            "prompt": "Implement the API contract",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "api-contract",
+                "version": 1,
+                "text": "API contract v1",
+                "digest": "5e83f35f11a945cffed09c9e294f34db55544884095050fba43b3525f7574523"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "host_target_mismatch",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_enqueue",
+          "route_id": "backend",
+          "route_revision": 1,
+          "task": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "target": {
+              "account_id": "account",
+              "atem_device_id": "host",
+              "host_trust_gen": 2,
+              "session_id": "ses-aaaaaaaaaaaa",
+              "process_gen": "33333333-3333-4333-8333-333333333333"
+            },
+            "expires_at": 1793620800000,
+            "prompt": "Implement the API contract",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "api-contract",
+                "version": 1,
+                "text": "API contract v1",
+                "digest": "5e83f35f11a945cffed09c9e294f34db55544884095050fba43b3525f7574523"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "terminal_escape_rejected",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_enqueue",
+          "route_id": "backend",
+          "route_revision": 1,
+          "task": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "target": {
+              "account_id": "account",
+              "atem_device_id": "host",
+              "host_trust_gen": 1,
+              "session_id": "ses-aaaaaaaaaaaa",
+              "process_gen": "33333333-3333-4333-8333-333333333333"
+            },
+            "expires_at": 1793620800000,
+            "prompt": "run\u001b[31m",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "api-contract",
+                "version": 1,
+                "text": "API contract v1",
+                "digest": "5e83f35f11a945cffed09c9e294f34db55544884095050fba43b3525f7574523"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "inline_work_without_context",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_enqueue",
+          "route_id": "backend",
+          "route_revision": 1,
+          "task": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "target": {
+              "account_id": "account",
+              "atem_device_id": "host",
+              "host_trust_gen": 1,
+              "session_id": "ses-aaaaaaaaaaaa",
+              "process_gen": "33333333-3333-4333-8333-333333333333"
+            },
+            "expires_at": 1793620800000,
+            "prompt": "Implement the API contract",
+            "context": []
+          }
+        }
+      }
+    },
+    {
+      "name": "duplicate_json_key",
+      "valid": false,
+      "raw": "{\"type\":\"session\",\"data\":{\"v\":1,\"id\":\"11111111-1111-4111-8111-111111111111\",\"host\":{\"account_id\":\"account\",\"atem_device_id\":\"host\",\"host_trust_gen\":1},\"op\":\"host_launch\",\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"profile_id\":\"backend\",\"profile_revision\":1,\"profile_revision\":2,\"expires_at\":1793620800000}}"
+    },
+    {
+      "name": "message_inline_host",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              }
+            ],
+            "text": "Ready to work",
+            "context": []
+          }
+        }
+      },
+      "digest": "a93d592c5a8486d1f2915f860c5dd92d89dcfd437250b052c90071afa21c8c5b"
+    },
+    {
+      "name": "message_context_only_project",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "project",
+                  "route_id": "backend",
+                  "route_revision": 1
+                }
+              }
+            ],
+            "text": "",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "contract",
+                "version": 3,
+                "digest": "d995790c4fe41cf0098e4e42e52d07307bdb5ee8e6087230713308a57febcc17",
+                "text": "Exact version three"
+              }
+            ]
+          }
+        }
+      },
+      "digest": "1609ae342e04bfaf0bb5fe257f49a47c23243c3203129d63a93490405c035857"
+    },
+    {
+      "name": "message_inline_agent",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "agent",
+                  "route_id": "backend",
+                  "route_revision": 1,
+                  "target": {
+                    "account_id": "account",
+                    "atem_device_id": "backend",
+                    "host_trust_gen": 1,
+                    "session_id": "ses-abcdefghijkl",
+                    "process_gen": "55555555-5555-4555-8555-555555555555"
+                  }
+                }
+              }
+            ],
+            "text": "Ready to work",
+            "context": []
+          }
+        }
+      },
+      "digest": "1030899d9d6a778c97947981e3e5abb277f91024c51b8a13f02fe5c8f66fa0fe"
+    },
+    {
+      "name": "message_multiple_hosts",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              },
+              {
+                "recipient_id": "66666666-6666-4666-8666-666666666666",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "mobile",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              }
+            ],
+            "text": "Ready to work",
+            "context": []
+          }
+        }
+      },
+      "digest": "b93bb376c1177b211b1001bded8c77748c4dd3e8d949ddd005294044d95999ff"
+    },
+    {
+      "name": "message_requires_content",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              }
+            ],
+            "text": "",
+            "context": []
+          }
+        }
+      }
+    },
+    {
+      "name": "message_duplicate_recipient",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              },
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              }
+            ],
+            "text": "Ready to work",
+            "context": []
+          }
+        }
+      }
+    },
+    {
+      "name": "message_cross_account_recipient",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              },
+              {
+                "recipient_id": "66666666-6666-4666-8666-666666666666",
+                "host": {
+                  "account_id": "other-account",
+                  "atem_device_id": "mobile",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              }
+            ],
+            "text": "Ready to work",
+            "context": []
+          }
+        }
+      }
+    },
+    {
+      "name": "message_unknown_sender_field",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 1793620860000,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              }
+            ],
+            "text": "Ready to work",
+            "context": [],
+            "unverified_sender": "member:other"
+          }
+        }
+      }
+    },
+    {
+      "name": "message_unsafe_expiry",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_publish",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message": {
+            "message_id": "11111111-1111-4111-8111-111111111111",
+            "workflow_id": "22222222-2222-4222-8222-222222222222",
+            "sender": "member:phone",
+            "created_at": 1793620800000,
+            "expires_at": 9007199254740992,
+            "recipients": [
+              {
+                "recipient_id": "33333333-3333-4333-8333-333333333333",
+                "host": {
+                  "account_id": "account",
+                  "atem_device_id": "backend",
+                  "host_trust_gen": 1
+                },
+                "destination": {
+                  "kind": "host"
+                }
+              }
+            ],
+            "text": "Ready to work",
+            "context": []
+          }
+        }
+      }
+    },
+    {
+      "name": "message_query",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "message_query",
+          "id": "44444444-4444-4444-8444-444444444444",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "backend",
+            "host_trust_gen": 1
+          },
+          "message_id": "11111111-1111-4111-8111-111111111111"
+        }
+      }
+    },
+    {
+      "name": "png_chunk",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "attachment_put",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "attachment": {
+            "attachment_id": "22222222-2222-4222-8222-222222222222",
+            "digest": "a4948167923e1cf8bba9420436c01a9804175d0f3a3bee25c40360da2b9abf8e",
+            "size": 68,
+            "media_type": "image/png"
+          },
+          "offset": 0,
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII="
+        }
+      }
+    },
+    {
+      "name": "attachment_path",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "attachment_put",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "attachment": {
+            "attachment_id": "../../screen.png",
+            "digest": "a4948167923e1cf8bba9420436c01a9804175d0f3a3bee25c40360da2b9abf8e",
+            "size": 68,
+            "media_type": "image/png"
+          },
+          "offset": 0,
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII="
+        }
+      }
+    },
+    {
+      "name": "attachment_too_large",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "attachment_put",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "attachment": {
+            "attachment_id": "22222222-2222-4222-8222-222222222222",
+            "digest": "a4948167923e1cf8bba9420436c01a9804175d0f3a3bee25c40360da2b9abf8e",
+            "size": 8388609,
+            "media_type": "image/png"
+          },
+          "offset": 0,
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII="
+        }
+      }
+    },
+    {
+      "name": "attachment_svg",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "attachment_put",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "attachment": {
+            "attachment_id": "22222222-2222-4222-8222-222222222222",
+            "digest": "a4948167923e1cf8bba9420436c01a9804175d0f3a3bee25c40360da2b9abf8e",
+            "size": 68,
+            "media_type": "image/svg+xml"
+          },
+          "offset": 0,
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII="
+        }
+      }
+    },
+    {
+      "name": "chunk_past_end",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "attachment_put",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "attachment": {
+            "attachment_id": "22222222-2222-4222-8222-222222222222",
+            "digest": "a4948167923e1cf8bba9420436c01a9804175d0f3a3bee25c40360da2b9abf8e",
+            "size": 68,
+            "media_type": "image/png"
+          },
+          "offset": 68,
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII="
+        }
+      }
+    },
+    {
+      "name": "chunk_invalid_base64",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "attachment_put",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "attachment": {
+            "attachment_id": "22222222-2222-4222-8222-222222222222",
+            "digest": "a4948167923e1cf8bba9420436c01a9804175d0f3a3bee25c40360da2b9abf8e",
+            "size": 68,
+            "media_type": "image/png"
+          },
+          "offset": 0,
+          "data": "!!"
+        }
+      }
+    },
+    {
+      "name": "chunk_empty",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "attachment_put",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "attachment": {
+            "attachment_id": "22222222-2222-4222-8222-222222222222",
+            "digest": "a4948167923e1cf8bba9420436c01a9804175d0f3a3bee25c40360da2b9abf8e",
+            "size": 68,
+            "media_type": "image/png"
+          },
+          "offset": 0,
+          "data": ""
+        }
+      }
+    }
+  ]
+}

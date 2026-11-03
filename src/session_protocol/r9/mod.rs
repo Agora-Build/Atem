@@ -247,6 +247,7 @@ struct Attached {
     channel: Channel,
     attachment: String,
     authority: Authority,
+    grant: Option<atem_client::SignedObject>,
 }
 
 enum Phase {
@@ -287,7 +288,14 @@ pub struct R9Status {
 }
 
 /// The r9 admission engine for one runtime (see the module docs).
+pub struct HostWorkRequest {
+    pub attachment: String,
+    pub request: atem_client::session::host_work::Request,
+}
+
 pub struct R9Host {
+    host_work_enabled: bool,
+    host_work_requests: VecDeque<HostWorkRequest>,
     limits: Limits,
     /// The live link generation.
     link: Option<u64>,
@@ -475,6 +483,86 @@ impl Default for R9Host {
 }
 
 impl R9Host {
+    pub fn enable_host_work(&mut self, enabled: bool) {
+        self.host_work_enabled = enabled;
+    }
+
+    pub fn take_host_work(&mut self) -> Vec<HostWorkRequest> {
+        self.host_work_requests.drain(..).collect()
+    }
+
+    pub fn current_work_authority<J: Journal>(
+        &self,
+        attachment: &str,
+        parts: &Parts<'_, J>,
+    ) -> Option<Authority> {
+        let handle = self.by_attachment.get(attachment)?;
+        let Phase::Open(a) = &self.chans.get(handle)?.phase else {
+            return None;
+        };
+        let DeviceList::Open { m, .. } = &parts.list else {
+            return None;
+        };
+        if m.is_frozen()
+            || m.held().is_some()
+            || m.faulted().is_some()
+            || parts.host.journal_halted()
+            || parts.now.host.mono_ms >= a.channel.deadline_ms()
+        {
+            return None;
+        }
+        let ctx = parts.host.context();
+        if a.authority.client_kind == ClientKind::Browser
+            && (self.quarantine.is_some()
+                || parts.now.host.wall_ms < self.bound.high_water.max(self.bound.until))
+        {
+            return None;
+        }
+        let fresh = Authority::resolve(
+            m.membership(),
+            &a.authority.principal,
+            a.grant.as_ref(),
+            &ctx.atem_device_id,
+            ctx.host_trust_gen,
+            &parts.now.host,
+            &|id| self.revoked.contains(id, parts.now.host.wall_ms),
+        )
+        .ok()?;
+        if fresh.key != a.authority.key {
+            return None;
+        }
+        Some(fresh)
+    }
+
+    pub fn host_work_reply(
+        &mut self,
+        attachment: &str,
+        request: &atem_client::session::host_work::Request,
+        result: Result<atem_client::session::host_work::ResultBody, &'static str>,
+        now: u64,
+    ) {
+        let Some(handle) = self.by_attachment.get(attachment) else {
+            return;
+        };
+        let Some(Phase::Open(a)) = self.chans.get(handle).map(|c| &c.phase) else {
+            return;
+        };
+        let bytes = match result {
+            Ok(body) => atem_client::session::host_work::result(
+                &new_id(),
+                request.id(),
+                request.host(),
+                attachment,
+                a.channel.channel_id(),
+                body,
+            )
+            .to_string()
+            .into_bytes(),
+            Err(code) => error(code, Some(request.id()), None).to_bytes(),
+        };
+        self.seal_to(attachment, &bytes, now);
+    }
+
     /// An engine with these bounds; revoked grants are journaled in
     /// `journal_dir/revoked_grants` (none: memory only, tests).
     pub fn new(limits: Limits, journal_dir: Option<&Path>) -> Self {
@@ -493,6 +581,8 @@ impl R9Host {
     ) -> Self {
         let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
         let mut host = R9Host {
+            host_work_enabled: false,
+            host_work_requests: VecDeque::new(),
             limits,
             link: None,
             chans: BTreeMap::new(),
@@ -1344,6 +1434,14 @@ impl R9Host {
             .map(|f| f.to_string())
             .collect();
         features.extend(R9_FEATURES.iter().map(|f| f.to_string()));
+        if self.host_work_enabled {
+            features.extend([
+                atem_client::session::host_work::LAUNCH_FEATURE.to_owned(),
+                atem_client::session::host_work::WORK_FEATURE.to_owned(),
+                atem_client::session::messages::FEATURE.to_owned(),
+                atem_client::session::attachments::FEATURE.to_owned(),
+            ]);
+        }
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1393,6 +1491,7 @@ impl R9Host {
             channel,
             attachment: attachment.clone(),
             authority,
+            grant: hello.grant.clone(),
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -1547,6 +1646,34 @@ impl R9Host {
             return Vec::new();
         }
         if family == "session" {
+            if matches!(
+                data.get("op").and_then(Value::as_str),
+                Some(
+                    "host_profiles"
+                        | "host_launch"
+                        | "host_launch_query"
+                        | "work_enqueue"
+                        | "work_query"
+                        | "work_cancel"
+                        | "work_complete"
+                        | "message_publish"
+                        | "message_query"
+                        | "attachment_put"
+                )
+            ) {
+                if !self.host_work_enabled || self.host_work_requests.len() >= 64 {
+                    refuse(self, code::BUSY, Some("agent hosting is disabled or busy"));
+                } else {
+                    match atem_client::session::host_work::Request::decode(plain) {
+                        Ok(request) => self.host_work_requests.push_back(HostWorkRequest {
+                            attachment: att.to_owned(),
+                            request,
+                        }),
+                        Err(code) => refuse(self, code, None),
+                    }
+                }
+                return Vec::new();
+            }
             match data.get("op").and_then(Value::as_str) {
                 Some("membership") => return self.membership_op(att, plain, re.as_deref(), parts),
                 Some("revoke_grant") => {

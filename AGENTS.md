@@ -27,6 +27,7 @@ cargo run                                # Run TUI application
 cargo run -- [command]                   # Run with CLI arguments
 cargo test                               # Run tests (1,450+; use -- --test-threads=1 if a test flakes); tests must inject a temp profile (src/test_profile.rs)
 cargo test --test runtime_fixtures_binary # Shared atem-session host fixtures against the real runtime (ATEM_FIXTURE=<name> runs one)
+cargo test --test host_work_binary -- --test-threads=1 # Opt-in remote launch + directed work over encrypted r9 channels (temp profiles/fake agents)
 ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored --nocapture --test-threads=1 # Approvals with the REAL claude/codex CLIs (real API calls; export only the needed variables, e.g. OSS_API_KEY / ANTHROPIC_AUTH_TOKEN, never a whole credentials file; each agent gets only its own; Codex runs --profile oss)
 cargo test -p atem-core -p atem-core-ffi # Token library + C ABI tests (workspace members)
 ./scripts/check-atem-core-ffi.sh         # Build libatem_core_ffi.a, drive it from C (and Swift on macOS)
@@ -58,16 +59,16 @@ crates/
 └── atem-client-ffi/     # its bindings: UniFFI (Swift, Kotlin/JNA) and wasm-bindgen (feature `wasm`); `host`, `software-keys`, `test-vectors` never in shipped packages; bindings/{swift,kotlin,js} conformance; contract designs/protocol/atem-client-bindings.md
 src/
 ├── main.rs              # Entry point, CLI parsing (clap)
-├── app.rs               # Menu TUI state (bare `atem`, no Astation connection); inside `atem runtime`: the Astation link, auth, credentialSync, mark task queue (sessions are the broker's)
+├── app.rs               # Menu TUI state (bare `atem`, no Astation connection); inside `atem runtime`: the Astation link, auth, credentialSync; executable messages use the broker queue
 ├── app/reauth.rs        # re-authentication when Astation sends auth_required over an open socket
-├── app/hosted.rs        # the App inside `atem runtime`: session-family inbox for the broker's host, broker sessions for mark tasks (bare `atem` opens no Astation connection)
+├── app/hosted.rs        # the App inside `atem runtime`: session-family messages for the broker's host (bare `atem` opens no Astation connection)
 ├── app/op_route.rs      # a running Astation operation's handshake replies go to it only (dropped once it ended)
 ├── app/relay_only.rs    # relay only (§R9.8a): the connect loop's local check, the local link drop after a committed result
 ├── runtime/             # `atem runtime` (the broker) and `atem worker` — see "Runtime" below
 │   ├── mod.rs           #   run_runtime: one per config dir (runtime.lock), socket, state dir `<config>/runtime`
 │   ├── server.rs        #   local protocol server: frontends, launch/attach/input/paste/resize/reclaim/list/stop/reload, Astation operations, the 16 ms pass
 │   ├── protocol.rs      #   local protocol v1 (JSON lines over the same-user socket)
-│   ├── client.rs        #   RuntimeClient: find the runtime or start it detached; hello/welcome; replace a runtime of another build (`replace_other_build`); `atem runtime restart`; the passive `look` (`status`)
+│   ├── client.rs        #   RuntimeClient: find the runtime or start it detached; hello/welcome; replace a runtime of another build (`replace_other_build`); `atem runtime start|restart`; the passive `look` (`status`)
 │   ├── commands.rs      #   `atem agent launch|attach|list|stop` as runtime clients
 │   ├── broker.rs        #   BrokerSession per session: worker connection, screen mirror, chat state, activity, input epoch, exit
 │   ├── adopt.rs         #   spawn workers; adopt survivors (session id + process generation + OS start time), else interrupted/recovery_required
@@ -78,6 +79,9 @@ src/
 │   ├── push_queue.rs    #   push_approval/push_resolved for the relay: latest state while the link is down, bounded
 │   ├── session_log.rs   #   session.ansi + summary.md under `<config>/logs/<session_id>/`
 │   ├── host_bridge.rs   #   atem-session host in the broker: SessionHost + FileJournal over the workers (attachments, leases, receipts, approvals, terminal-v1 frames, chat-v1 and its r8 history, receipt results)
+│   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes, environment sources, durable launch/task/attachment SQLite records (feature branch)
+│   ├── host_attachments.rs # PNG chunk persistence, sender binding, verified private cache for task prompts (feature branch)
+│   ├── host_work_bridge.rs # host launch/query and directed-work scheduling over normal receipts; config/authority rechecks, no takeover, explicit results
 │   ├── refusal_log.rs   #   runtime.log lines for refused session-family requests (no content; rate-limited per link)
 │   ├── ops.rs           #   Astation operations on the broker's link: pair, pair verify, cred unlock/projects, paired-token refresh
 │   ├── op_client.rs     #   the CLI side of an operation: print/ask/answer/done (answers from /dev/tty)
@@ -139,8 +143,6 @@ src/
 ├── convo_test_server.rs # atem serv convo — ConvoAI test server + --background mode
 ├── convo_wizard.rs      # atem config convo — interactive config wizard + validation
 ├── web_server/          # Shared HTTPS scaffolding (cert, request, /api/token, net, html, browser open, access: the access code every `atem serv` page and API needs)
-├── command.rs           # Serial task queue for mark tasks
-├── dispatch.rs          # Work item dispatcher for mark tasks
 ├── pair_verify.rs       # atem pair / atem pair verify device verification: /dev/tty code confirmation, verifyAbort on failure
 ├── status.rs            # atem status: read-only (local files + passive looks at the running runtime and cred agent); also decides pair (no-op when paired), pair verify and the cred unlock gate
 ├── version.rs           # atem --version: this build and protocols, then the running runtime, cred agent and workers (same passive looks)
@@ -235,23 +237,55 @@ docs/
 
 ### Core Components
 
+**Host work extension** (feature branch, `designs/protocol/atem-host-work-v1.md`):
+`atem runtime start|check` (tier 2) manages an explicitly disabled-by-default
+private `runtime.toml`. Start creates missing configuration and starts or
+reuses the detached runtime without replacing another build; check validates
+without starting processes. Enabled healthy hosting keeps zero-session runtimes
+online. Detached startup forwards only runtime variables and enabled profiles'
+explicitly approved environment names, excluding test hooks.
+Encrypted r9 `host_profiles`/`host_launch`/`host_launch_query` use local approved
+profiles and durable reserved identities. `work_enqueue`/`work_query`/
+`work_cancel`/`work_complete` use a private durable task queue, current scoped
+authority and normal session-v1 prompt receipts, blocking on drafts, busy or
+unknown readiness, approvals and leases. Turn-end waits for an explicit result.
+Boot-service installation, Station publication/replay and Astation UI remain
+separate planned work; upgrade strict membership verifiers before enrolling
+the new launch/message/notify scope ops. The default runtime idle policy is unchanged.
+`host.messages` adds `message_publish`/`message_query` with inline text and/or
+exact context snapshots, multiple resolved recipients and per-recipient progress
+(`crates/atem-client/src/session/messages.rs`, `designs/protocol/atem-messages-v1.md`).
+The current channel principal must equal the envelope sender; its key is pinned
+in the private receipt store. Native members can store notices without execution consent;
+scoped services need non-control `message`. Agent deliveries still need the
+route's notify/prompt consent. Envelope, recipient decisions and queued tasks
+commit together. Progress stays on the original message/task receipt; there is
+no `runtime inbox` command. Station durable outbox,
+offline origin proofs and direct Atem host sender admission remain unimplemented.
+
 **TUI State Machine** (`app.rs`): bare `atem` is a menu and a client of `atem runtime`; it opens no Astation connection (the runtime owns the machine's one link). Enum-based mode switching via `AppMode`:
 - `MainMenu` - Navigation between features
 - `TokenGeneration` - Token creation UI
 - `CommandExecution` - Shell command runner
 - `AgentPanel` - The runtime's sessions (Enter attaches); agent sessions open in `tui/frontend.rs`
 
-**Mark Task Queue** (`app.rs`, `dispatch.rs`, `command.rs`; inside `atem runtime`): Receives task assignments from Astation, reads task JSON from the local `.chisel/tasks/` directory of the live broker Claude session whose working directory holds it (none: `markTaskResult` fails with "no Claude session for this project; run `atem agent launch claude` there"), builds prompts from annotations + screenshots, writes them to that session through its worker as local-origin input (no lease is revoked; a task waits while a remote lease holder exists), reports results back.
+**Shared Task Queue / Chisel/mark** (`runtime/host_work.rs`, `runtime/host_work_bridge.rs`):
+Executable messages and mark tasks share durable work records and FIFO order per
+session. Blocked/submitted/uncertain work holds later work on that session;
+independent sessions can proceed. All use current r9 sender authority,
+notify/prompt route consent, readiness/draft/approval/lease checks and normal
+session-v1 prompt receipts. Turn-end is `awaiting_result`; completion is explicit.
+No separate mark queue, model triage or background `claude -p` remains.
 
-Key pieces:
-- `App.dispatcher: TaskDispatcher` - routes each `WorkItem` to its project's broker Claude session (serial `TaskQueue`: FIFO, one active, deferred-finalize flag) or, when main is busy and a slot is free (max 2), to a background `claude -p` if a one-turn triage call (`claude -p --model haiku`) picks background (`CLAUDE_CLI_BIN` overrides the binary)
-- `App.work_items: HashMap<String, WorkItem>` - built items by task ID
-
-Key methods:
-- `load_and_build_work_item()` - reads the task JSON, builds the prompt (`build_mark_task_prompt()`)
-- `try_dispatch_main()` - when main is idle and the target session has no remote lease holder, pops the next task and queues its prompt for the broker (`Hosted::writes`)
-- `finalize_mark_task()` - reports the main task's result to Astation, dispatches the next
-- The runtime's pass drains triage verdicts and background results and runs `finalize_mark_task()` when the deferred-finalize flag is set
+`host.attachments` adds encrypted `attachment_put` chunks (96 KiB decoded, PNG
+only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender
+principal/key. Verified private local PNG paths are appended before dispatch;
+missing/incomplete bytes block work. Limits: 256 uploads and 128 MiB reserved
+bytes, no automatic pruning. `message.mark` carries typed annotation metadata
+and an immutable screenshot descriptor. See `designs/protocol/atem-task-attachments-v1.md`.
+Legacy ID-only `markTaskAssignment` returns failed `markTaskResult` with upgrade
+guidance, never reads local task files or injects input. Chisel/Astation must
+migrate their sender; Station offline artifact delivery is separate work.
 
 **Astation Integration** (`websocket_client.rs`): WebSocket protocol with `AstationMessage` enum:
 - `MarkTaskAssignment { task_id, received_at_ms }` - received from Astation
@@ -295,6 +329,12 @@ Key methods:
 ### Configuration & Storage (`config.rs`)
 
 **Files in `~/.config/atem/`:**
+
+Four user-facing TOML configuration types: general `config.toml`, feature-branch
+`runtime.toml` (approved launch profiles/routes and opt-in hosting), `convo.toml`
+and `webhooks.toml`. The remaining files below are generated state. Runtime
+configuration stays private (0600) and separate from general settings because
+it grants explicit execution approvals.
 
 | File | Contents | Encryption |
 |------|----------|------------|
@@ -412,22 +452,19 @@ New cross-machine or cross-agent features are tier 2 and must gate with
 ## Mark Task Flow
 
 ```
-Chisel (browser) ──POST──→ Express/Chisel middleware
-                            ↓ saves .chisel/tasks/{taskId}.json + .png
-                            ↓ WS markTaskNotify → Astation
-Astation hub ←── markTaskNotify {taskId, status, description}
-  ↓ picks best Atem instance
-  ↓ markTaskAssignment {taskId, receivedAtMs}
-atem runtime receives assignment on its link (websocket_client.rs)
-  ↓ handle_astation_message() in app.rs
-  ↓ the live broker Claude session whose cwd holds .chisel/tasks/{taskId}.json (none: fails)
-  ↓ load_and_build_work_item(): reads the task JSON from LOCAL disk
-  ↓ build_mark_task_prompt() → annotations + screenshot + source files
-  ↓ dispatcher.submit() → main queue (or background `claude -p` via triage)
-  ↓ try_dispatch_main(): waits while a remote lease holder exists, then the
-    broker writes the prompt through the session's worker (local-origin input)
-  ↓ markTaskResult {taskId, success, message} → Astation
+Chisel saves local task JSON + annotated PNG
+  -> authorized Chisel/Astation publisher reads the PNG bytes (sender migration needed)
+  -> encrypted attachment_put chunks to the selected Atem host
+  -> message_publish with mark metadata + screenshot descriptor + approved agent target
+  -> shared durable task queue (FIFO per session), readiness/authority/lease checks
+  -> verify screenshot, materialize private PNG, normal session-v1 prompt receipt
+  -> message_query/work_query progress, explicit work_complete result
 ```
+
+The Atem receiver is implemented locally. Old `markTaskAssignment` notifications
+are refused with upgrade guidance. Chisel/Astation file transfer/publication and
+Station offline artifact storage remain integration work; do not claim these
+receiver tests validate them. No user process/service is restarted for tests.
 
 ## Release Process
 

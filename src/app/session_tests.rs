@@ -1,11 +1,8 @@
-//! The App inside the runtime: removed remote ops, and mark tasks routed to
-//! the broker's Claude session of their project.
+//! The App inside the runtime: removed remote ops and the legacy mark refusal.
 use super::App;
-use super::hosted::{Hosted, HostedSession};
-use crate::session::{Provider, SessionId};
+use super::hosted::Hosted;
 use crate::websocket_client::AstationMessage;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[test]
 fn removed_remote_ops_do_not_parse() {
@@ -71,81 +68,30 @@ async fn mark_result(
     .expect("no markTaskResult")
 }
 
-fn hosted(provider: Provider, cwd: &Path, offset: u64) -> HostedSession {
-    HostedSession {
-        id: SessionId::new(),
-        provider,
-        cwd: cwd.to_path_buf(),
-        live: true,
-        remote_controlled: false,
-        last_used: Instant::now() + Duration::from_secs(offset),
+#[tokio::test]
+async fn legacy_mark_assignment_requires_the_authenticated_message_path() {
+    let _profile = crate::test_profile::temp();
+    let mut app = App::new();
+    let mut rx = astation(&mut app).await;
+    app.hosted = Some(Hosted::default());
+    for id in ["mark_123", "../project/.chisel/tasks/t1"] {
+        app.handle_astation_message(AstationMessage::MarkTaskAssignment {
+            task_id: id.into(),
+            received_at_ms: 0,
+        })
+        .await;
+        let (task_id, success, message) = mark_result(&mut rx).await;
+        assert_eq!(task_id, id);
+        assert!(!success);
+        assert_eq!(message, super::MARK_UPGRADE_REQUIRED);
+        assert!(app.hosted.as_ref().unwrap().inbox.is_empty());
     }
 }
 
-#[tokio::test]
-async fn mark_tasks_go_to_the_claude_session_of_their_project() {
-    let _profile = crate::test_profile::temp();
-    let root = tempfile::tempdir().unwrap();
-    let (a, b) = (root.path().join("a"), root.path().join("b"));
-    std::fs::create_dir_all(b.join(".chisel/tasks")).unwrap();
-    std::fs::create_dir_all(&a).unwrap();
-    std::fs::write(b.join(".chisel/tasks/t1.json"), r#"{"title":"Project B"}"#).unwrap();
-    let mut app = App::new();
-    let mut rx = astation(&mut app).await;
-    let in_b = hosted(Provider::Claude, &b, 1);
-    app.hosted = Some(Hosted {
-        sessions: vec![
-            hosted(Provider::Claude, &a, 5),
-            in_b.clone(),
-            hosted(Provider::Codex, &b, 9),
-        ],
-        ..Hosted::default()
-    });
-
-    app.handle_astation_message(AstationMessage::MarkTaskAssignment {
-        task_id: "t1".into(),
-        received_at_ms: 0,
-    })
-    .await;
-    // The broker writes the prompt to the Claude session in project B.
-    let writes = std::mem::take(&mut app.hosted.as_mut().unwrap().writes);
-    assert_eq!(writes.len(), 1);
-    let (task_id, sid, prompt) = &writes[0];
-    assert_eq!((task_id.as_str(), sid), ("t1", &in_b.id));
-    assert!(prompt.contains("Page title: Project B"), "{prompt}");
-    assert!(prompt.ends_with("\n\r"));
-    assert_eq!(app.work_items["t1"].cwd, b);
-
-    // No live Claude session has the task: it fails at once.
-    app.handle_astation_message(AstationMessage::MarkTaskAssignment {
-        task_id: "t2".into(),
-        received_at_ms: 0,
-    })
-    .await;
-    let (task_id, success, message) = mark_result(&mut rx).await;
-    assert_eq!(task_id, "t2");
-    assert!(!success);
-    assert_eq!(
-        message,
-        "no Claude session for this project; run `atem agent launch claude` there"
-    );
-    // A task id is a file name, never a path.
-    app.handle_astation_message(AstationMessage::MarkTaskAssignment {
-        task_id: "../b/.chisel/tasks/t1".into(),
-        received_at_ms: 0,
-    })
-    .await;
-    let (_, success, _) = mark_result(&mut rx).await;
-    assert!(!success);
-    assert!(app.hosted.as_ref().unwrap().writes.is_empty());
-}
-
 #[test]
-fn the_menu_tui_hosts_no_sessions_for_mark_tasks() {
+fn the_menu_tui_hosts_no_sessions() {
     let _profile = crate::test_profile::temp();
-    let app = App::new();
-    assert!(app.hosted.is_none());
-    assert_eq!(app.mark_task_session("t1"), None);
+    assert!(App::new().hosted.is_none());
 }
 
 /// A fake Astation that sends what the test queues and records every text
@@ -255,6 +201,5 @@ async fn removed_ops_are_answered_unsupported_with_no_effect() {
         assert!(reply["data"].get("re").is_none(), "{reply}");
     }
     let hosted = app.hosted.as_ref().unwrap();
-    assert!(hosted.inbox.is_empty() && hosted.writes.is_empty());
-    assert!(app.work_items.is_empty());
+    assert!(hosted.inbox.is_empty());
 }

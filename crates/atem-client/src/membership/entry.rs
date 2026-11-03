@@ -31,9 +31,12 @@ pub const MAX_SCOPE_HOSTS: usize = 16;
 pub const MAX_SCOPE_ITEMS: usize = 64;
 
 /// The ops of a service scope or a grant (§R9.6). `view` is always required.
-pub const OPS: [&str; 7] = [
+pub const OPS: [&str; 10] = [
     "approval",
     "interrupt",
+    "launch",
+    "message",
+    "notify",
     "prompt",
     "rule_revoke",
     "stop",

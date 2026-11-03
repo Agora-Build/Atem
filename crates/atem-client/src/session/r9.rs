@@ -595,6 +595,7 @@ pub enum Incoming {
         re: String,
     },
     HostPolicyResult(Box<crate::session::host_policy::HostPolicyResult>),
+    HostWorkResult(Box<crate::session::host_work::Response>),
     HostPolicyChanged(Box<crate::session::host_policy::HostPolicyChanged>),
     /// Any other message (r8's session ops, terminal-v1, chat-v1).
     Other,
@@ -634,6 +635,9 @@ impl Incoming {
             },
             "host_policy_result" => Incoming::HostPolicyResult(Box::new(
                 crate::session::host_policy::HostPolicyResult::from_data(data)?,
+            )),
+            "host_work_result" => Incoming::HostWorkResult(Box::new(
+                crate::session::host_work::Response::from_data(data)?,
             )),
             "host_policy_changed" => Incoming::HostPolicyChanged(Box::new(
                 crate::session::host_policy::HostPolicyChanged::from_data(data)?,

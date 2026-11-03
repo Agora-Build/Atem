@@ -7,7 +7,6 @@
 # ── Astation ─────────────────────────────────────────────────────────
 # astation_ws         = "ws://127.0.0.1:8080/ws"
 # astation_relay_url  = "https://station.agora.build"
-# astation_relay_code = "astation-..." # learned automatically after authentication
 #
 # For an offline LAN connection, point astation_ws at the Mac running Astation:
 # astation_ws = "ws://192.168.1.20:8080/ws"
@@ -36,3 +35,8 @@
 # cert as a DNS SAN and printed as a "Custom:" URL on server start.
 #
 # extra_hostnames = ["genie.netbird.cloud", "dev.mytailnet.ts.net"]
+
+# -- Shared agent terminal ----------------------------------------------------
+# Prefix for local terminal actions (default Ctrl+]). The environment variable
+# ATEM_TERMINAL_PREFIX takes precedence.
+# terminal_prefix = "Ctrl-a"
