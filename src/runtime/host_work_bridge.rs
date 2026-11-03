@@ -786,11 +786,16 @@ impl HostBridge {
                 self.work.store.as_ref().unwrap().save_work(&r)?;
                 continue;
             }
-            let attachment = self.r9.attachment_ids().into_iter().find(|att| {
-                self.work_authority(att).is_some_and(|a| {
-                    a.name() == r.principal && self.work_allowed(&r, &a, cx.sessions)
-                })
-            });
+            let attachment = self
+                .r9
+                .attachments()
+                .into_iter()
+                .map(|(attachment, _)| attachment)
+                .find(|att| {
+                    self.work_authority(att).is_some_and(|a| {
+                        a.name() == r.principal && self.work_allowed(&r, &a, cx.sessions)
+                    })
+                });
             let first = occupied.insert(r.task.target.session_id.clone());
             let reason = if !first {
                 Some("waiting for an earlier task on this session")
