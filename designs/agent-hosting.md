@@ -126,8 +126,12 @@ These runtime commands are implemented on the feature branch:
 | `atem runtime restart` | Replace the broker with this build; verified surviving workers are adopted |
 
 `runtime start` and `runtime check` require pairing. Starting a runtime grants
-no remote launch or notification permissions: configure approved profiles,
-routes and principals and explicitly set `enabled = true` in `runtime.toml`.
+no remote launch or notification permissions: configure approved profiles
+and routes and explicitly set `enabled = true` in `runtime.toml`. A profile or
+route without `principals` is open to the paired Astation (`member:<its id>`,
+from the pairing record); its own list replaces that default. `atem runtime
+check` lists the device list's members and services with whether each may
+launch.
 Both features use the same runtime. Without enabled hosting, its ordinary idle
 timeout still applies. Repeated start preserves configuration and the running
 process's environment. Starting a runtime does not install an OS service or

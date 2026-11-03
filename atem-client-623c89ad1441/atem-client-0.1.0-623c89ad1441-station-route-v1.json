@@ -1,0 +1,87 @@
+{
+  "description": "Synthetic vector, independently generated with Python hashlib/hmac. Never a real credential.",
+  "test_session_token": "test-only-session-secret",
+  "input_hex": "000000156174656d2d73746174696f6e2d726f7574652d7631000001b77b2272656c61795f6f6e6c79223a747275652c2272656c61795f75726c223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c2272657175657374223a7b22636f6e74657874223a7b226163636f756e745f6964223a226163636f756e742d74657374222c226173746174696f6e5f6964223a226173746174696f6e2d74657374222c226174656d5f6964223a226174656d2d74657374222c2262696e64696e675f6964223a2262696e64696e672d74657374222c2267656e657369735f68617368223a2231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132222c22686f73745f6465766963655f6964223a22686f73742d74657374222c22686f73745f74727573745f67656e223a31352c2273657373696f6e5f6964223a2273657373696f6e2d74657374227d2c226964223a2261616161616161612d626262622d346363632d386464642d656565656565656565656565222c22706f6c6963795f7265766973696f6e223a332c22726f7574655f7265766973696f6e223a377d7d",
+  "request": {
+    "type": "stationRoute",
+    "data": {
+      "v": 1,
+      "op": "request",
+      "request": {
+        "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "context": {
+          "astation_id": "astation-test",
+          "atem_id": "atem-test",
+          "binding_id": "binding-test",
+          "host_trust_gen": 15,
+          "session_id": "session-test",
+          "account_id": "account-test",
+          "genesis_hash": "1212121212121212121212121212121212121212121212121212121212121212",
+          "host_device_id": "host-test"
+        },
+        "route_revision": 7,
+        "policy_revision": 3
+      }
+    }
+  },
+  "offer": {
+    "type": "stationRoute",
+    "data": {
+      "v": 1,
+      "op": "offer",
+      "offer": {
+        "request": {
+          "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+          "context": {
+            "astation_id": "astation-test",
+            "atem_id": "atem-test",
+            "binding_id": "binding-test",
+            "host_trust_gen": 15,
+            "session_id": "session-test",
+            "account_id": "account-test",
+            "genesis_hash": "1212121212121212121212121212121212121212121212121212121212121212",
+            "host_device_id": "host-test"
+          },
+          "route_revision": 7,
+          "policy_revision": 3
+        },
+        "relay_url": "https://station-dev.agora.build",
+        "relay_only": true,
+        "proof": "ewhHlNAS-HlLKQ2XvC_Ol3WP5-l5vBHQs2Hv88F7o8s"
+      }
+    }
+  },
+  "accepted_input_hex": "0000001e6174656d2d73746174696f6e2d726f7574652d61636365707465642d7631000002207b226469726563745f626c6f636b6564223a747275652c226f66666572223a7b2270726f6f66223a22657768486c4e41532d486c4c4b51325876435f4f6c335750352d6c357642485173324876383846376f3873222c2272656c61795f6f6e6c79223a747275652c2272656c61795f75726c223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c2272657175657374223a7b22636f6e74657874223a7b226163636f756e745f6964223a226163636f756e742d74657374222c226173746174696f6e5f6964223a226173746174696f6e2d74657374222c226174656d5f6964223a226174656d2d74657374222c2262696e64696e675f6964223a2262696e64696e672d74657374222c2267656e657369735f68617368223a2231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132313231323132222c22686f73745f6465766963655f6964223a22686f73742d74657374222c22686f73745f74727573745f67656e223a31352c2273657373696f6e5f6964223a2273657373696f6e2d74657374227d2c226964223a2261616161616161612d626262622d346363632d386464642d656565656565656565656565222c22706f6c6963795f7265766973696f6e223a332c22726f7574655f7265766973696f6e223a377d7d2c22726f7574655f7265766973696f6e223a387d",
+  "accepted": {
+    "type": "stationRoute",
+    "data": {
+      "v": 1,
+      "op": "accepted",
+      "accepted": {
+        "offer": {
+          "request": {
+            "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "context": {
+              "astation_id": "astation-test",
+              "atem_id": "atem-test",
+              "binding_id": "binding-test",
+              "host_trust_gen": 15,
+              "session_id": "session-test",
+              "account_id": "account-test",
+              "genesis_hash": "1212121212121212121212121212121212121212121212121212121212121212",
+              "host_device_id": "host-test"
+            },
+            "route_revision": 7,
+            "policy_revision": 3
+          },
+          "relay_url": "https://station-dev.agora.build",
+          "relay_only": true,
+          "proof": "ewhHlNAS-HlLKQ2XvC_Ol3WP5-l5vBHQs2Hv88F7o8s"
+        },
+        "route_revision": 8,
+        "direct_blocked": true,
+        "proof": "EUNBsr8jmQa4urOp--M0c0qmYep-3uYVrt4_zH-vghU"
+      }
+    }
+  }
+}

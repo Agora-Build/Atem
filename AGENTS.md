@@ -79,7 +79,7 @@ src/
 │   ├── push_queue.rs    #   push_approval/push_resolved for the relay: latest state while the link is down, bounded
 │   ├── session_log.rs   #   session.ansi + summary.md under `<config>/logs/<session_id>/`
 │   ├── host_bridge.rs   #   atem-session host in the broker: SessionHost + FileJournal over the workers (attachments, leases, receipts, approvals, terminal-v1 frames, chat-v1 and its r8 history, receipt results)
-│   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes, environment sources, durable launch/task/attachment SQLite records (feature branch)
+│   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes (no `principals`: the paired Astation's `member:<id>`; errors name the field/line or the profile and rule; `runtime check` lists who may launch), environment sources, durable launch/task/attachment SQLite records (feature branch)
 │   ├── host_attachments.rs # PNG chunk persistence, sender binding, verified private cache for task prompts (feature branch)
 │   ├── host_work_bridge.rs # host launch/query and directed-work scheduling over normal receipts; config/authority rechecks, no takeover, explicit results
 │   ├── refusal_log.rs   #   runtime.log lines for refused session-family requests (no content; rate-limited per link)

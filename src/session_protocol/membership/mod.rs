@@ -2179,6 +2179,44 @@ pub fn peek_pin_genesis(pairing: &PairingPaths) -> Option<(String, HostPin, Stri
     ))
 }
 
+/// The pinned device list's active members as launch principals, read
+/// only (`atem runtime check`): `(principal, what it is, may launch)`.
+/// Natives may launch with `control`; a service with `launch` in its scope,
+/// no session restriction (a launch makes a new session) and an unexpired
+/// grant. `None` without a readable list.
+pub fn passive_principals(pairing: &PairingPaths) -> Option<Vec<(String, String, bool)>> {
+    use atem_client::membership::{MemberKind, Role};
+    let (m, _, _) = store::read_private(&pairing.membership)
+        .ok()
+        .flatten()
+        .and_then(|b| parse_json(&b))
+        .and_then(|v| parse_state(&v))?;
+    let now = host_now().wall_ms;
+    Some(
+        m.members()
+            .into_iter()
+            .filter_map(|id| m.member(id))
+            .map(|state| match &state.member.kind {
+                MemberKind::Native { roles, .. } => {
+                    let names: Vec<&str> = roles.iter().map(|r| r.as_str()).collect();
+                    (
+                        format!("member:{}", state.member.device_id),
+                        format!("device ({})", names.join(", ")),
+                        roles.contains(&Role::Control),
+                    )
+                }
+                MemberKind::Service { scope, expires_at } => (
+                    format!("service:{}", state.member.device_id),
+                    format!("service ({})", scope.ops.join(", ")),
+                    scope.ops.iter().any(|op| op == "launch")
+                        && scope.sessions.is_none()
+                        && *expires_at > now,
+                ),
+            })
+            .collect(),
+    )
+}
+
 /// The device list as the files say, read without writing anything (for
 /// `atem status` with no runtime running): `None` without any r9 file;
 /// else (state, what it means, its capacity when it could be read, pending

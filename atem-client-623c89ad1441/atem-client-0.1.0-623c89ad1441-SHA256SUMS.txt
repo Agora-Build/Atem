@@ -1,0 +1,4 @@
+752ef7bbd589762b6e4d6a609202be7a0d555cf4982a301ed8702c1466134c98  atem-client-0.1.0-623c89ad1441-apple-swiftpm.zip
+1422b9470b0b829603ed6a314343ab60173cdfef254a1fa9cdc1080d8dba522f  atem-client-0.1.0-623c89ad1441-atem_client_ffiFFI.h
+a20178aef7f99e87a94e9fee5ea97c4c6d549294b3f71a16cc3d6a0eac2da612  atem-client-0.1.0-623c89ad1441-SOURCE.json
+557516203b77b6739f7a6968eee5fa7ac38438bfb9afcc9c3b08298cdbfa49ce  atem-client-0.1.0-623c89ad1441-station-route-v1.json
