@@ -763,12 +763,15 @@ fn the_macs_link_drops_and_the_phone_goes_on_over_the_relay() {
     let rig = Rig::new();
     let (sid, fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
+    let authenticated_at = Instant::now();
     let log = &rig.log;
     let mut m = Dev::connect(&mut router, "mac", "direct", log, &mac());
     next_init();
     let mut p = Dev::connect(&mut router, "phone", "relay", log, &phone());
     m.list(&mut router, &sid);
     p.list(&mut router, &sid);
+    // Established links reconnect immediately; short-lived links back off.
+    std::thread::sleep(Duration::from_secs(11).saturating_sub(authenticated_at.elapsed()));
     let lease = m.acquire(&mut router, &sid, None);
     assert_eq!(lease["binding"]["lease_epoch"], 1, "{lease}");
     let dropped_at = Instant::now();

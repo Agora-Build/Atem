@@ -38,7 +38,7 @@ The runtime connects when it starts and whenever it has no link (`App::spawn_ast
 3. Relay: only with a pairing record. Join the paired Astation's identity room and authenticate without pairing, or be routed (r9).
 4. Both fail: no link, and another attempt in 30 s.
 
-- A dropped authenticated link reconnects at once.
+- A dropped authenticated link reconnects at once after it stayed up for ten seconds; shorter-lived links retry after 30 seconds to avoid flicker. Deliberate selected-Station migrations reconnect at once.
 - Retry timers run on the monotonic clock, so they count awake time only.
 - Without a pairing record only the local step runs.
 - The order applies at each connect. An established relay link stays when local becomes reachable again.
@@ -90,12 +90,18 @@ The saved session:
 
 ## Relay identity room and Stations
 
+The [selected-Station handoff](protocol/station-route-v1.md) lets Atem use
+its paired Astation's effective relay ahead of `astation_relay_url`, without
+a runtime or worker restart. Atem's receiver and the shared native sender
+helper are implemented; native integration and joint live verification remain
+pending. An authenticated dev/custom selection has no production fallback.
+
 - The Station is the relay service at `astation_relay_url`. `https://` becomes `wss://` (`http://` becomes `ws://`).
 - Atem joins `<station>/ws?role=atem&code=<astation_id>&atem_id=<atem_id>`.
 - Astation keeps a room named by its id. The relay tells the Atems in one room apart by `atem_id`.
 - The room code authorizes nothing. A session proof, or the host route proof, is still required.
 - The production Station `https://station.agora.build` is the compiled default. Dev profiles set `https://station-dev.agora.build` in config.toml.
-- Vault, memory and skills HTTP calls go to the same Station with the pairing's session id (`auth::require_pairing`).
+- Vault, memory and skills HTTP calls use the separately configured Station with the pairing's session id (`auth::require_pairing`); the selected-Station WebSocket handoff does not change those HTTP destinations or credential audiences.
 
 Transport security:
 
@@ -141,5 +147,5 @@ Transport security:
 
 ## Switching Stations and pairings
 
-- To use another Station, change `astation_relay_url` in config.toml (or set `ASTATION_RELAY_URL`), then run `atem runtime restart`. Sessions keep running; the new runtime connects to the new Station.
+- Native's authenticated selected-Station handoff changes the runtime's relay without a restart. Before that integration is available, a manually configured relay still uses `astation_relay_url` (or `ASTATION_RELAY_URL`) and `atem runtime restart`; a saved authenticated selection takes priority over this fallback.
 - `atem unpair` and `atem logout` tell a running runtime (they never start one). It drops a link whose pairing changed, with its attachments. The runtime also checks the pairing every 5 s, so an unpair takes effect either way.

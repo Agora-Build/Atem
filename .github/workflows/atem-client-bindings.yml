@@ -21,6 +21,7 @@ on:
       - "designs/protocol/fixtures/**"
       - "scripts/check-atem-client-bindings.sh"
       - "scripts/package-atem-client-apple.sh"
+      - "scripts/check-atem-client-apple.sh"
       - "scripts/package-atem-client-bindings.sh"
       - "scripts/check-atem-client-packages.sh"
       - "scripts/test-check-atem-client-packages.sh"
@@ -34,6 +35,7 @@ on:
       - "designs/protocol/fixtures/**"
       - "scripts/check-atem-client-bindings.sh"
       - "scripts/package-atem-client-apple.sh"
+      - "scripts/check-atem-client-apple.sh"
       - "scripts/package-atem-client-bindings.sh"
       - "scripts/check-atem-client-packages.sh"
       - "scripts/test-check-atem-client-packages.sh"
@@ -265,6 +267,9 @@ jobs:
             echo "a test-only or host-role export is in the package" >&2
             exit 1
           fi
+          # Consume the zipped production build through its actual Swift ABI.
+          EXPECT_COMMIT="$ATEM_CLIENT_HEAD" \
+            ./scripts/check-atem-client-apple.sh "$ATEM_CLIENT_VERSION" "$OUT"
           # Only what Astation downloads goes up (not the unzipped package).
           rm -rf "$OUT/AtemClient"
 

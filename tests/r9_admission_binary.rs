@@ -20,6 +20,18 @@ use support::{Sandbox, within};
 const ACCOUNT: &str = "acct-r9";
 const HOST: &str = "host-r9";
 
+fn session_reply(router: &mut Router<'_>) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let value = router
+            .other_within(deadline.saturating_duration_since(Instant::now()))
+            .expect("the runtime sent no session reply");
+        if value["type"] == "session" {
+            return value;
+        }
+    }
+}
+
 struct Rig {
     sandbox: Sandbox,
     astation: FakeAstation,
@@ -199,7 +211,7 @@ fn clients_share_the_link_and_are_fenced_one_by_one() {
             "id": "aaaaaaaa-0000-4000-8000-0000000000a1", "revision": 8}})
         .to_string(),
     );
-    let refused = router.next_other();
+    let refused = session_reply(&mut router);
     assert_eq!(refused["data"]["code"], "unsupported_version", "{refused}");
     assert_eq!(refused["data"]["revision"], 9);
 
@@ -544,7 +556,7 @@ fn a_pin_while_the_runtime_runs_is_picked_up() {
             "id": "aaaaaaaa-0000-4000-8000-0000000000b1", "revision": 8}})
         .to_string(),
     );
-    assert_eq!(router.next_other()["data"]["op"], "welcome");
+    assert_eq!(session_reply(&mut router)["data"]["op"], "welcome");
     write_pin(&rig.sandbox.config(), &rig.log, HOST, 1, &rig.host_seed);
     // The very first connect after the pin is served: the pin is seen
     // before the envelopes of that pass, which are never dropped. (Spaced

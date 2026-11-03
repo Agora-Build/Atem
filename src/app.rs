@@ -2,6 +2,7 @@ pub mod hosted;
 pub mod op_route;
 mod reauth;
 mod relay_only;
+mod station_route;
 #[cfg(test)]
 mod session_tests;
 
@@ -66,6 +67,7 @@ pub struct App {
     pub status_message: Option<String>,
     pub astation_client: AstationClient,
     pub astation_connected: bool,
+    pub astation_connected_at: Option<Instant>,
     /// Inside `atem runtime`: the relay link is routed for r9 only on a host
     /// route proof (§R9.7b), no Astation authenticated it. It carries channel
     /// envelopes and push relay messages, nothing of Astation's; held
@@ -127,6 +129,7 @@ pub struct App {
     /// The local link relay only drops once the Astation operation running
     /// on it ends and the policy result was written (`app/relay_only.rs`).
     pub relay_only_drop: Option<relay_only::RelayOnlyDrop>,
+    station_routing: station_route::Routing,
     /// The unreadable pairing record error last logged by the connect loop
     /// (logged again only when it changes).
     pub pairing_unreadable: Option<String>,
@@ -151,6 +154,7 @@ impl App {
             status_message: None,
             astation_client: AstationClient::new(),
             astation_connected: false,
+            astation_connected_at: None,
             astation_routed: false,
             astation_routed_at: None,
             astation_link_gen: 0,
@@ -173,6 +177,7 @@ impl App {
             op_route: None,
             astation_connect_error: None,
             relay_only_drop: None,
+            station_routing: station_route::Routing::default(),
             pairing_unreadable: None,
             #[cfg(test)]
             pairing_unreadable_logged: 0,
@@ -424,6 +429,12 @@ impl App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.astation_connect_rx = Some(rx);
         let host_route = self.host_route.clone();
+        let src = crate::profile::Sources {
+            config: config.clone(),
+            paths: crate::paths::ProfilePaths::default_paths(),
+            query_agent: false,
+            runtime: None,
+        };
         tokio::spawn(async move {
             // Connection priority:
             // 1. Local URL (from config or default ws://127.0.0.1:8080/ws)
@@ -432,7 +443,7 @@ impl App {
             // 2. Relay (wss://station.agora.build) - remote connection
 
             let local_url = config.astation_ws();
-            let mut client = crate::websocket_client::AstationClient::new();
+            let mut client = crate::websocket_client::AstationClient::new().with_profile(src.clone());
 
             // A refused or missing saved session is worth telling a
             // pairing or unlock that waits for this link.
@@ -451,7 +462,17 @@ impl App {
             // skipped while the host policy says relay only (or can't be
             // read, or a write of it is uncertain).
             let loaded = relay_only::stored_record();
-            let local_allowed = loaded.is_ok() && relay_only::local_allowed();
+            let destination = crate::station_route::destination(&src, &client.device_atem_id());
+            let (relay_url, direct_blocked) = match destination {
+                Ok(destination) => destination,
+                Err(_) => {
+                    let _ = tx.send(Err(anyhow::Error::new(crate::runtime::ops::SessionAdvice(
+                        "selected Station state unreadable; no routing fallback".into(),
+                    ))));
+                    return;
+                }
+            };
+            let local_allowed = loaded.is_ok() && !direct_blocked && relay_only::local_allowed();
             let record = match loaded {
                 Ok(record) => record,
                 Err(error) => {
@@ -476,8 +497,8 @@ impl App {
             // Local unavailable or not allowed: the paired Astation's
             // identity room on the relay (no pairing, no relay connection).
             if let Some(relay_code) = record.map(|record| record.astation_id) {
-                let relay_url = config.astation_relay_url().to_string();
                 let mut relay_client = crate::websocket_client::AstationClient::new()
+                    .with_profile(src)
                     .with_host_route(host_route);
                 match relay_client
                     .connect_relay_identity_without_pairing(&relay_url, &relay_code)
@@ -502,6 +523,13 @@ impl App {
     pub fn poll_astation_connect(&mut self) {
         if let Some(rx) = &mut self.astation_connect_rx {
             match rx.try_recv() {
+                Ok(Ok((client, _))) if crate::session_protocol::membership::store::present(
+                    &crate::paths::ProfilePaths::default_paths().pairing.station_route,
+                ) && !client.selected_destination_current() => {
+                    self.astation_connect_rx = None;
+                    self.astation_reconnect_at = Some(Instant::now());
+                    self.status_message = Some("The selected Station changed while connecting; retrying".into());
+                }
                 Ok(Ok((client, code))) if client.routed() => {
                     // §R9.7b: the relay routed this host on its proof; no
                     // Astation authenticated the link (r9 traffic only).
@@ -537,6 +565,7 @@ impl App {
                     self.astation_reconnect_at = None; // Clear any pending retry
                     self.astation_client = client;
                     self.astation_connected = true;
+                    self.astation_connected_at = Some(Instant::now());
                     self.astation_link_gen += 1;
                     self.astation_connect_error = None;
                     self.pairing_unreadable = None;
@@ -622,6 +651,10 @@ impl App {
             return;
         }
         // A running pairing or unlock's replies are its own.
+        if let AstationMessage::StationRoute(text) = &message {
+            self.receive_station_route(text);
+            return;
+        }
         let Some(message) = self.route_to_op(message) else {
             return;
         };
@@ -791,6 +824,7 @@ impl App {
     }
 
     pub async fn process_astation_messages(&mut self) {
+        self.poll_station_route();
         // Drain all pending messages (non-blocking try_recv loop)
         let mut message_count = 0;
         while message_count < 32 {
@@ -800,6 +834,7 @@ impl App {
         }
         self.check_astation_reauth_deadline();
         self.check_relay_only_drop();
+        self.check_station_switch();
 
         // Detect WebSocket disconnect (channel closed after draining remaining messages)
         if self.astation_routed && self.astation_client.is_ws_closed() {
@@ -814,8 +849,8 @@ impl App {
             self.on_astation_disconnect();
             self.astation_client = crate::websocket_client::AstationClient::new();
             self.rebuild_menu();
-            // Schedule immediate reconnect attempt
-            self.astation_reconnect_at = Some(Instant::now());
+            // A short-lived link backs off instead of flickering repeatedly.
+            self.astation_reconnect_at = Some(self.connected_retry_at());
             self.status_message = Some("Astation disconnected — reconnecting…".to_string());
         }
 
@@ -837,6 +872,15 @@ impl App {
                 now + Duration::from_secs(30)
             }
             _ => now,
+        }
+    }
+
+    pub fn connected_retry_at(&self) -> Instant {
+        let now = Instant::now();
+        if self.astation_connected_at.is_some_and(|at| now.duration_since(at) < Duration::from_secs(10)) {
+            now + Duration::from_secs(30)
+        } else {
+            now
         }
     }
 

@@ -1780,6 +1780,18 @@ impl R9Host {
                 return refuse(self, code::BUSY, Some(host_policy::DETAIL_UNREADABLE));
             }
         };
+        let direct_reenabled = if matches!(&request, Request::Set { relay_only: false, .. })
+            && outcome.confirms()
+            && policy.state == atem_client::session::host_policy::PolicyState::Durable
+        {
+            match crate::station_route::allow_direct(&pairing, &account, &genesis, policy.revision) {
+                Ok(changed) => changed,
+                Err(_) => return refuse(self, code::BUSY, Some("selected Station state unreadable")),
+            }
+        } else { false };
+        if direct_reenabled && outcome == Outcome::Unchanged {
+            self.policy_changes.push(false);
+        }
         let Some(handle) = self.by_attachment.get(att).cloned() else {
             return;
         };
@@ -1804,6 +1816,9 @@ impl R9Host {
             attachment_gen: att.to_owned(),
         };
         self.seal_to(att, &result.to_bytes(), mono);
+        if direct_reenabled && let Some(chan) = self.chans.get_mut(&handle) {
+            chan.receipt_for = chan.queue.back().cloned();
+        }
         if matches!(outcome, Outcome::Committed | Outcome::Uncertain) {
             // Every other manager attachment hears the current policy.
             let others: Vec<(String, String)> = self

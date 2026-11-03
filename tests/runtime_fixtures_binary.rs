@@ -786,7 +786,8 @@ impl Host {
     /// Waits for the runtime's next authenticated link and makes it the
     /// client's (not welcomed yet).
     fn authenticated_link(&mut self) -> Result<(), String> {
-        let deadline = Instant::now() + WAIT;
+        // Short-lived authenticated links back off for 30 seconds.
+        let deadline = Instant::now() + Duration::from_secs(30) + WAIT;
         while self.authenticated <= self.link {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.astation.events.recv_timeout(left) {
@@ -820,8 +821,8 @@ impl Host {
     }
 
     fn attach(&mut self, attachment_gen: &str) -> Result<(), String> {
-        let deadline = Instant::now() + WAIT;
         self.authenticated_link()?;
+        let deadline = Instant::now() + WAIT;
         loop {
             let id = uuid();
             let hello = json!({"type": "session",
