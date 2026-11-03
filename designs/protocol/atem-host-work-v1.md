@@ -30,7 +30,8 @@ disable operations on an existing channel, which then fail closed.
 Services/browsers need explicit `launch` or `notify` ops; work also needs
 `prompt`. Native members need control. All principals additionally require
 local profile/route consent naming their full `member:<device_id>`,
-`service:<device_id>` or `browser:<grant_id>`. Memory/vault access grants no
+`service:<device_id>` or `browser:<grant_id>`; a profile or route that
+names none consents for the paired Astation only (`member:<its id>`). Memory/vault access grants no
 execution authority. Recheck current membership, key, expiry, scopes,
 held/faulted/frozen state, browser revocation/quarantine, durable principal
 control generation and local consent. Queued work waits for its original
@@ -54,7 +55,8 @@ profiles/routes. Each profile approves:
 
 - ID, positive revision, label, provider (`claude`/`codex`).
 - Canonical absolute directory and normalized Git project key.
-- CLI args, e.g. `["--profile", "oss"]`, and allowed principals.
+- CLI args, e.g. `["--profile", "oss"]`, and allowed principals (default: the
+  paired Astation).
 - Environment variable names and optional absolute private JSON env file.
 
 Remote requests cannot provide paths, commands, arguments or environment

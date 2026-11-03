@@ -209,9 +209,13 @@ printed something ends, its last output and a short summary are saved under
 For opt-in remote agent launch and notifications, `atem runtime start` creates
 a private `~/.config/atem/runtime.toml` if missing, initially disabled, and
 starts or reuses the background runtime. Existing configuration, agents and
-the running runtime's build are preserved. Configure approved launch profiles,
-notification routes and principals, then use `atem runtime check` to validate
-them. Healthy hosting with `enabled = true` keeps the runtime online with zero
+the running runtime's build are preserved. Configure approved launch profiles
+and notification routes, then use `atem runtime check` to validate them. A
+profile or route without `principals` is open to the Astation this Atem is
+paired with; list principals only to allow other devices or services.
+`atem runtime check` names any problem (the field and line, or the profile and
+rule) and lists your device list's members and services with their IDs and
+whether each may launch. Healthy hosting with `enabled = true` keeps the runtime online with zero
 sessions; otherwise its ordinary idle timeout applies. Both commands require
 pairing. Bare `atem runtime` runs in the foreground. OS service installation
 and boot startup remain planned. See the

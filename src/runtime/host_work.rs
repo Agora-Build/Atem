@@ -43,7 +43,9 @@ pub struct Profile {
     pub project: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Explicitly approved principals, including the kind prefix.
+    /// Explicitly approved principals, including the kind prefix; none: the
+    /// paired Astation (`Config::load`).
+    #[serde(default)]
     pub principals: Vec<String>,
     #[serde(default)]
     pub env_names: Vec<String>,
@@ -57,6 +59,8 @@ pub struct Route {
     pub id: String,
     pub revision: u64,
     pub profile_id: String,
+    /// None: the paired Astation (`Config::load`).
+    #[serde(default)]
     pub principals: Vec<String>,
 }
 
@@ -66,6 +70,49 @@ fn principal_ok(principal: &str) -> bool {
             .strip_prefix(prefix)
             .is_some_and(atem_client::session::wire::is_opaque_id)
     })
+}
+
+/// What is wrong with a profile's or route's principals (after the paired
+/// Astation filled an empty list), if anything.
+fn principals_problem(principals: &[String]) -> Option<String> {
+    if principals.is_empty() {
+        return Some(
+            "no principals: list them, or pair with Astation (`atem pair`) so the paired \
+             Astation is the default"
+                .into(),
+        );
+    }
+    if principals.len() > 64 {
+        return Some("at most 64 principals".into());
+    }
+    principals.iter().find(|p| !principal_ok(p)).map(|p| {
+        format!(
+            "`{p}` is not a principal: use `member:<id>`, `service:<id>` or `browser:<id>` \
+             (`atem runtime check` lists them)"
+        )
+    })
+}
+
+/// `member:<id>` of the Astation the profile at `dir` is paired with (its
+/// current binding), the default launch principal.
+fn paired_member(dir: &Path) -> Option<String> {
+    let paths = crate::paths::ProfilePaths::in_dir(dir).pairing;
+    crate::records::PairingRecord::load(&paths)
+        .ok()
+        .flatten()
+        .filter(|r| r.binding.is_some())
+        .map(|r| format!("member:{}", r.astation_id))
+}
+
+/// The parser's own reason and line; never the file's text.
+fn schema_error(text: &str, error: &toml::de::Error) -> anyhow::Error {
+    match error.span() {
+        Some(span) => {
+            let line = text[..span.start.min(text.len())].matches('\n').count() + 1;
+            anyhow!("invalid runtime.toml (line {line}): {}", error.message())
+        }
+        None => anyhow!("invalid runtime.toml: {}", error.message()),
+    }
 }
 
 fn private_read(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -106,10 +153,23 @@ impl Config {
             }
             Err(e) => return Err(e).context("reading host configuration"),
         };
-        let config: Self = toml::from_str(std::str::from_utf8(&bytes)?)
-            .map_err(|_| anyhow!("invalid runtime.toml; check the configuration schema"))?;
+        let text = std::str::from_utf8(&bytes).context("runtime.toml is not UTF-8")?;
+        let mut config: Self = toml::from_str(text).map_err(|e| schema_error(text, &e))?;
+        config.inherit(paired_member(dir));
         config.validate()?;
         Ok(config)
+    }
+
+    /// Profiles and routes that name no principals are open to `paired`,
+    /// the paired Astation's member (none when not paired).
+    fn inherit(&mut self, paired: Option<String>) {
+        let default: Vec<String> = paired.into_iter().collect();
+        for p in self.profiles.iter_mut().filter(|p| p.principals.is_empty()) {
+            p.principals = default.clone();
+        }
+        for r in self.routes.iter_mut().filter(|r| r.principals.is_empty()) {
+            r.principals = default.clone();
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -119,41 +179,63 @@ impl Config {
         }
         let mut profiles = BTreeSet::new();
         for p in &self.profiles {
-            if !is_opaque_id(&p.id)
-                || p.revision == 0
-                || !profiles.insert(p.id.clone())
-                || p.label.is_empty()
+            let problem = if !is_opaque_id(&p.id) {
+                Some("id must be 1-64 letters, digits, `.`, `_`, `:` or `-`".to_string())
+            } else if !profiles.insert(p.id.clone()) {
+                Some("id is used by another profile".into())
+            } else if p.revision == 0 {
+                Some("revision must be at least 1".into())
+            } else if p.label.is_empty()
                 || p.label.len() > 128
                 || p.label.chars().any(char::is_control)
-                || !matches!(p.provider.as_str(), "claude" | "codex")
-                || !p.cwd.is_absolute()
-                || p.project.is_empty()
-                || p.principals.is_empty()
-                || p.principals.len() > 64
-                || !p.principals.iter().all(|s| principal_ok(s))
-                || p.args.len() > super::protocol::MAX_ARGS
+            {
+                Some("label must be 1-128 printable characters".into())
+            } else if !matches!(p.provider.as_str(), "claude" | "codex") {
+                Some("provider must be `claude` or `codex`".into())
+            } else if !p.cwd.is_absolute() {
+                Some("cwd must be an absolute path".into())
+            } else if p.project.is_empty() {
+                Some(
+                    "project must name the cwd's project (its Git remote, else `local:<folder>`)"
+                        .into(),
+                )
+            } else if let Some(problem) = principals_problem(&p.principals) {
+                Some(problem)
+            } else if p.args.len() > super::protocol::MAX_ARGS
                 || p.args.iter().map(String::len).sum::<usize>() > super::protocol::MAX_ARGS_BYTES
                 || p.args.iter().any(|a| a.contains('\0'))
-                || p.env_file.as_ref().is_some_and(|p| !p.is_absolute())
-                || p.env_names.len() > 128
+            {
+                Some("args are too many or too long".into())
+            } else if p.env_file.as_ref().is_some_and(|p| !p.is_absolute()) {
+                Some("env_file must be an absolute path".into())
+            } else if p.env_names.len() > 128
                 || p.env_names
                     .iter()
                     .any(|n| n.is_empty() || n.contains(['=', '\0']))
             {
-                bail!("invalid host launch profile");
+                Some("env_names must be at most 128 variable names".into())
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                bail!("profile `{}`: {problem}", p.id);
             }
         }
         let mut routes = BTreeSet::new();
         for r in &self.routes {
-            if !is_opaque_id(&r.id)
-                || r.revision == 0
-                || !routes.insert(&r.id)
-                || !profiles.contains(&r.profile_id)
-                || r.principals.is_empty()
-                || r.principals.len() > 64
-                || !r.principals.iter().all(|s| principal_ok(s))
-            {
-                bail!("invalid host work route");
+            let problem = if !is_opaque_id(&r.id) {
+                Some("id must be 1-64 letters, digits, `.`, `_`, `:` or `-`".to_string())
+            } else if !routes.insert(&r.id) {
+                Some("id is used by another route".into())
+            } else if r.revision == 0 {
+                Some("revision must be at least 1".into())
+            } else if !profiles.contains(&r.profile_id) {
+                Some(format!("profile_id `{}` names no profile", r.profile_id))
+            } else {
+                principals_problem(&r.principals)
+            };
+            if let Some(problem) = problem {
+                bail!("route `{}`: {problem}", r.id);
             }
         }
         Ok(())
@@ -603,6 +685,7 @@ pub fn ensure_config(dir: &Path) -> Result<bool> {
 }
 
 pub fn check(dir: &Path) -> Result<()> {
+    let paired = paired_member(dir);
     let config = Config::load(dir)?;
     println!(
         "Agent hosting: {}",
@@ -612,19 +695,65 @@ pub fn check(dir: &Path) -> Result<()> {
             "disabled"
         }
     );
+    let named = |list: &[String]| -> String {
+        list.iter()
+            .map(|p| {
+                if Some(p) == paired.as_ref() {
+                    format!("{p} (paired Astation)")
+                } else {
+                    p.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     for profile in &config.profiles {
         profile
             .launch(
                 crate::session::SessionId::new().to_string(),
                 uuid::Uuid::new_v4().to_string(),
             )
-            .with_context(|| format!("checking profile {}", profile.id))?;
+            .with_context(|| format!("checking profile `{}`", profile.id))?;
         println!(
-            "  {}: {} (revision {})",
-            profile.id, profile.provider, profile.revision
+            "  {}: {} in {} (revision {}); may launch: {}",
+            profile.id,
+            profile.provider,
+            profile.cwd.display(),
+            profile.revision,
+            named(&profile.principals)
         );
     }
     println!("{} notification route(s).", config.routes.len());
+    for route in &config.routes {
+        println!(
+            "  {} -> {}; may send: {}",
+            route.id,
+            route.profile_id,
+            named(&route.principals)
+        );
+    }
+    let pairing = crate::paths::ProfilePaths::in_dir(dir).pairing;
+    match crate::session_protocol::membership::passive_principals(&pairing) {
+        Some(principals) => {
+            println!("Principals in this account's device list:");
+            for (principal, what, launch) in principals {
+                let note = if Some(&principal) == paired.as_ref() {
+                    "; the paired Astation"
+                } else {
+                    ""
+                };
+                println!(
+                    "  {principal}  {what}; {}{note}",
+                    if launch {
+                        "may launch"
+                    } else {
+                        "may not launch"
+                    }
+                );
+            }
+        }
+        None => println!("No device list on this host yet (pair and verify with Astation)."),
+    }
     Ok(())
 }
 
@@ -893,6 +1022,150 @@ mod tests {
                 uuid::Uuid::new_v4().to_string()
             )
             .is_err()
+        );
+    }
+
+    fn load_error(dir: &Path) -> String {
+        match Config::load(dir) {
+            Ok(_) => panic!("the configuration loaded"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn write_config(dir: &Path, text: &str) {
+        let path = dir.join(CONFIG_FILE);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    const PROFILE: &str = r#"
+version = 1
+enabled = true
+
+[[profiles]]
+id = "backend-codex"
+revision = 1
+label = "Backend Codex"
+provider = "codex"
+cwd = "/tmp/backend"
+project = "local:backend"
+
+[[routes]]
+id = "backend"
+revision = 1
+profile_id = "backend-codex"
+"#;
+
+    /// A profile or route that names no principals is open to the paired
+    /// Astation; unpaired, it names what to do.
+    #[test]
+    fn principals_default_to_the_paired_astation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), PROFILE);
+        let error = load_error(dir.path());
+        assert!(
+            error.starts_with("profile `backend-codex`: no principals")
+                && error.contains("atem pair"),
+            "{error}"
+        );
+        crate::pairing::tests::write_bound(dir.path(), "astation-X1", 2, "binding-1", ("s", "t"));
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.profiles[0].principals, ["member:astation-X1"]);
+        assert_eq!(config.routes[0].principals, ["member:astation-X1"]);
+        // A list of its own replaces the default.
+        write_config(
+            dir.path(),
+            &PROFILE.replace(
+                "project = \"local:backend\"\n",
+                "project = \"local:backend\"\nprincipals = [\"service:svc-1\"]\n",
+            ),
+        );
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.profiles[0].principals, ["service:svc-1"]);
+        assert_eq!(config.routes[0].principals, ["member:astation-X1"]);
+    }
+
+    /// The parser's own reason with its line; a broken rule names the
+    /// profile and the rule.
+    #[test]
+    fn invalid_files_say_what_and_where() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::pairing::tests::write_bound(dir.path(), "astation-X1", 2, "binding-1", ("s", "t"));
+        write_config(
+            dir.path(),
+            &PROFILE.replace("project = \"local:backend\"\n", ""),
+        );
+        let error = load_error(dir.path());
+        assert!(error.starts_with("invalid runtime.toml (line "), "{error}");
+        assert!(error.contains("missing field `project`"), "{error}");
+        write_config(
+            dir.path(),
+            &PROFILE.replace(
+                "project = \"local:backend\"\n",
+                "project = \"local:backend\"\nprincipals = [\"member:YOUR ASTATION\"]\n",
+            ),
+        );
+        let error = load_error(dir.path());
+        assert!(
+            error.starts_with("profile `backend-codex`: `member:YOUR ASTATION` is not a principal"),
+            "{error}"
+        );
+        write_config(
+            dir.path(),
+            &PROFILE.replace("provider = \"codex\"", "provider = \"vim\""),
+        );
+        let error = load_error(dir.path());
+        assert_eq!(
+            error,
+            "profile `backend-codex`: provider must be `claude` or `codex`"
+        );
+        write_config(
+            dir.path(),
+            &PROFILE.replace("profile_id = \"backend-codex\"", "profile_id = \"nope\""),
+        );
+        let error = load_error(dir.path());
+        assert_eq!(error, "route `backend`: profile_id `nope` names no profile");
+    }
+
+    /// `atem runtime check` lists the device list's members and services
+    /// with their principal IDs and whether each may launch: natives with
+    /// `control`; services with `launch` and an unexpired grant (a signed
+    /// scope never pairs `launch` with a session restriction).
+    #[test]
+    fn check_lists_who_may_launch() {
+        use crate::session_protocol::membership::r9log::{MAC, TestLog, secret};
+        use crate::session_protocol::membership::{HostPin, MembershipHost, passive_principals};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::ProfilePaths::in_dir(dir.path());
+        assert_eq!(passive_principals(&paths.pairing), None);
+        let mut log = TestLog::genesis("acct-w", &secret("w astation"));
+        log.add_host("host-w", 1, &secret("w host"));
+        log.add_native("dev-view", &["view"]);
+        let later = crate::session_protocol::membership::r9log::host_now().wall_ms + 3_600_000;
+        log.add_service("svc-launch", &["host-w"], None, &["launch", "view"], later);
+        log.add_service("svc-prompt", &["host-w"], None, &["prompt", "view"], later);
+        let journal = crate::runtime::state_dir(dir.path()).join("journal");
+        crate::session_protocol::membership::store::private_dir(&journal).unwrap();
+        let pin = HostPin {
+            host_id: "host-w".into(),
+            host_trust_gen: 1,
+        };
+        MembershipHost::pin(&paths.pairing, &journal, &pin, &log.log, &secret("w host")).unwrap();
+        let mut got = passive_principals(&paths.pairing).unwrap();
+        got.sort();
+        let may: Vec<(String, bool)> = got.iter().map(|(p, _, m)| (p.clone(), *m)).collect();
+        assert_eq!(
+            may,
+            vec![
+                (format!("member:{MAC}"), true),
+                ("member:dev-view".to_string(), false),
+                ("service:svc-launch".to_string(), true),
+                ("service:svc-prompt".to_string(), false),
+            ]
+        );
+        assert!(
+            got[0].1.starts_with("device (") && got[0].1.contains("control"),
+            "{got:?}"
         );
     }
 }
