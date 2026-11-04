@@ -2163,8 +2163,10 @@ mod tests {
     fn an_agent_whose_socket_is_replaced_stops() {
         let dir = short_dir();
         let (socket, paths, agent, stopped) = watched_agent(dir.path());
-        std::fs::remove_file(&socket).unwrap();
-        let _other = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Another listener takes the path in one step: it is never missing.
+        let staged = socket.with_extension("new");
+        let _other = std::os::unix::net::UnixListener::bind(&staged).unwrap();
+        std::fs::rename(&staged, &socket).unwrap();
         stopped
             .recv_timeout(Duration::from_secs(5))
             .expect("an agent whose socket was replaced kept serving");
