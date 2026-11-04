@@ -200,6 +200,7 @@ pub fn cmd_list_servers() -> Result<()> {
     // not narrower than 24 chars (legacy rtc-* ids fit in that).
     let id_width = servers.iter().map(|s| s.id.len()).max().unwrap_or(24).max(24);
     let statuses: Vec<String> = servers.iter().map(server_status).collect();
+    let dir = servers_dir();
     let status_width = statuses.iter().map(|s| s.chars().count()).max().unwrap_or(6).max(6);
     println!(
         "{:>3}  {:<width$} {:>8} {:>6}  {:<swidth$}  {}",
@@ -208,7 +209,7 @@ pub fn cmd_list_servers() -> Result<()> {
     for (i, (s, status)) in servers.iter().zip(&statuses).enumerate() {
         println!(
             "{:>3}  {:<width$} {:>8} {:>6}  {:<swidth$}  {}",
-            i + 1, s.id, s.pid, s.port, status, page_url(s).unwrap_or("—"),
+            i + 1, s.id, s.pid, s.port, status, list_url(s, &dir).as_deref().unwrap_or("—"),
             width = id_width, swidth = status_width
         );
     }
@@ -219,6 +220,36 @@ pub fn cmd_list_servers() -> Result<()> {
 /// for a server without a page (a ConvoAI background agent: `serv attach`).
 fn page_url(s: &ServerEntry) -> Option<&str> {
     [s.network_url.as_str(), s.local_url.as_str()].into_iter().find(|u| !u.is_empty())
+}
+
+/// The Custom URLs the server printed (`extra_hostnames`): its registry
+/// `links`, else, for an entry from before they were stored, the `Custom:`
+/// lines at the start of its log (what it printed, matching its
+/// certificate; never rebuilt from today's config).
+fn custom_urls(s: &ServerEntry, dir: &std::path::Path) -> Vec<String> {
+    use std::io::Read;
+    if !s.links.is_empty() {
+        return s.links.iter().filter(|l| l.label == "Custom").map(|l| l.url.clone()).collect();
+    }
+    let mut head = String::new();
+    if let Ok(file) = std::fs::File::open(dir.join(format!("{}.log", s.id))) {
+        let _ = file.take(64 * 1024).read_to_string(&mut head);
+    }
+    head.lines()
+        .filter_map(|line| line.trim_start().strip_prefix("Custom:"))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `serv list`'s URL: a Custom one (the user's own hostname) if the server
+/// has one, else the page URL (LAN, else local).
+fn list_url(s: &ServerEntry, dir: &std::path::Path) -> Option<String> {
+    custom_urls(s, dir)
+        .into_iter()
+        .next()
+        .or_else(|| page_url(s).map(str::to_string))
 }
 
 /// The URL carries an access code (`?t=`, servers started by 0.8.1 or later).
@@ -299,6 +330,12 @@ fn server_info(s: &ServerEntry, now: u64, dir: &std::path::Path) -> String {
     }
     for link in &s.links {
         line(&format!("{}:", link.label), link.url.clone());
+    }
+    if s.links.is_empty() {
+        // An entry from before links were stored: its log's Custom lines.
+        for url in custom_urls(s, dir) {
+            line("Custom:", url);
+        }
     }
     match page_url(s) {
         None => line("Page:", format!("none (a ConvoAI background agent: `atem serv attach {}`)", s.id)),
@@ -1625,6 +1662,30 @@ mod tests {
         assert!(old.contains("Access:      no access code (started before 0.8.1)"), "{old}");
         let convo = server_info(&entry("convo", "", ""), 1_000_000, std::path::Path::new("/srv"));
         assert!(convo.contains("Page:        none (a ConvoAI background agent: `atem serv attach convo-1`)"), "{convo}");
+    }
+
+    /// The list shows a Custom URL first (stored links; for an older entry,
+    /// its log's `Custom:` lines), else LAN, else local.
+    #[test]
+    fn the_list_prefers_custom_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = entry("files", "https://localhost:1/a.md?t=abc", "https://lan:1/a.md?t=abc");
+        assert_eq!(list_url(&s, dir.path()).as_deref(), Some("https://lan:1/a.md?t=abc"));
+        s.links = vec![
+            ServerLink { label: "Cloudflared".into(), url: "https://x.trycloudflare.com/a.md?t=abc".into() },
+            ServerLink { label: "Custom".into(), url: "https://box.vpn:1/a.md?t=abc".into() },
+        ];
+        assert_eq!(list_url(&s, dir.path()).as_deref(), Some("https://box.vpn:1/a.md?t=abc"));
+        // An older entry: no links; its log has what it printed.
+        let old = entry("files", "https://localhost:2/", "https://lan:2/");
+        std::fs::write(
+            dir.path().join("files-1.log"),
+            "atem serv files\n  Local:   https://localhost:2/\n  Network: https://lan:2/\n  Custom:  https://genie.vpn:2/\nGET /\n",
+        )
+        .unwrap();
+        assert_eq!(list_url(&old, dir.path()).as_deref(), Some("https://genie.vpn:2/"));
+        let info = server_info(&old, 1_000_000, dir.path());
+        assert!(info.contains("Custom:      https://genie.vpn:2/\n"), "{info}");
     }
 
     /// Entries written before `links` existed still parse.

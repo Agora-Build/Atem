@@ -620,7 +620,9 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   index (`#`), `ID`, `PID`, `PORT`, `STATUS` (convo: cached from its 60s
   poller, `—` until the first poll; others: `running`, plus `(no access
   code)` for a page started before 0.8.1; dead entries are pruned) and
-  `URL` (the LAN URL, else local; `—` for a convo daemon, which has no
+  `URL` (a Custom URL first, the user's `extra_hostnames`: from `links`,
+  or for an entry from before `links`, the `Custom:` lines its log
+  printed; else LAN, else local; `—` for a convo daemon, which has no
   page). `info <id|#>` prints one entry: kind, PID, port, status, start,
   channel, every URL it printed (Local, LAN, then `links`: Cloudflared,
   Ngrok, Custom, each with the access code; the background parent writes
