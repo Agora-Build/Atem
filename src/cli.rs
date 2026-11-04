@@ -405,6 +405,11 @@ pub enum ServCommands {
     },
     /// List running background servers
     List,
+    /// Show one background server: status, URLs (with its access code), log
+    Info {
+        /// Server ID or index from `atem serv list`
+        id: String,
+    },
     /// Kill a background server by ID
     Kill {
         /// Server ID (e.g. rtc-demo-8443)
@@ -1062,6 +1067,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
                 crate::files_server::run_server(config).await
             }
             ServCommands::List => crate::rtc_test_server::cmd_list_servers(),
+            ServCommands::Info { id } => crate::rtc_test_server::cmd_server_info(&id),
             ServCommands::Kill { id } => crate::rtc_test_server::cmd_kill_server(&id),
             ServCommands::Killall => crate::rtc_test_server::cmd_kill_all_servers(),
             ServCommands::Attach { id, port, no_browser } => {
@@ -1918,6 +1924,17 @@ mod tests {
                 serv_command: ServCommands::List
             })
         ));
+    }
+
+    #[test]
+    fn cli_serv_info_parses() {
+        let cli = Cli::try_parse_from(["atem", "serv", "info", "3"]).unwrap();
+        match cli.command {
+            Some(Commands::Serv {
+                serv_command: ServCommands::Info { id },
+            }) => assert_eq!(id, "3"),
+            _ => panic!("expected Serv Info command"),
+        }
     }
 
     #[test]

@@ -470,6 +470,7 @@ pub async fn run_server(cfg: ServeWebhooksConfig) -> Result<()> {
                 .as_secs(),
             last_status: None,
             last_checked_at: None,
+            links: Vec::new(),
         };
         crate::rtc_test_server::register_server(&entry)?;
         println!("atem serv webhooks");

@@ -249,7 +249,8 @@ atem serv files ~/docs --background     # Port auto-picked; reused next run
 atem serv webhooks                      # Receive Agora webhooks locally (auto-tunneled via ngrok)
 atem serv webhooks --no-tunnel          # Local listener only — bring your own tunnel
 atem serv webhooks --background         # Run as background daemon
-atem serv list                          # List running background servers (#, ID, PID, STATUS)
+atem serv list                          # List running background servers (#, ID, PID, PORT, STATUS, URL)
+atem serv info <ID|#>                   # One server: status, start, every URL with its access code, log
 atem serv kill <ID|#>                   # Kill a server (POSTs /leave for convo)
 atem serv killall                       # Kill all background servers
 

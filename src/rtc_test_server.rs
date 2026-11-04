@@ -47,6 +47,18 @@ pub struct ServerEntry {
     /// Unix seconds when last_status was last updated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_checked_at: Option<u64>,
+    /// The page's other URLs as printed at start (`Cloudflared`, `Ngrok`,
+    /// `Custom`), each with the access code, filled in once the daemon's
+    /// tunnels reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<ServerLink>,
+}
+
+/// One more URL of a server's page, labelled as `atem serv` prints it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServerLink {
+    pub label: String,
+    pub url: String,
 }
 
 // ── Server registry ─────────────────────────────────────────────────────
@@ -187,21 +199,121 @@ pub fn cmd_list_servers() -> Result<()> {
     // Determine ID column width — wide enough for the longest id but
     // not narrower than 24 chars (legacy rtc-* ids fit in that).
     let id_width = servers.iter().map(|s| s.id.len()).max().unwrap_or(24).max(24);
+    let statuses: Vec<String> = servers.iter().map(server_status).collect();
+    let status_width = statuses.iter().map(|s| s.chars().count()).max().unwrap_or(6).max(6);
     println!(
-        "{:>3}  {:<width$} {:>6} {:>8}  {}",
-        "#", "ID", "PID", "PORT", "STATUS", width = id_width
+        "{:>3}  {:<width$} {:>8} {:>6}  {:<swidth$}  {}",
+        "#", "ID", "PID", "PORT", "STATUS", "URL", width = id_width, swidth = status_width
     );
-    for (i, s) in servers.iter().enumerate() {
-        // STATUS column: the last_status from the daemon's 60s poll, or
-        // "—" before the first poll completes.
-        let status = s.last_status.as_deref().unwrap_or("—");
+    for (i, (s, status)) in servers.iter().zip(&statuses).enumerate() {
         println!(
-            "{:>3}  {:<width$} {:>6} {:>8}  {}",
-            i + 1, s.id, s.pid, s.port, status,
-            width = id_width
+            "{:>3}  {:<width$} {:>8} {:>6}  {:<swidth$}  {}",
+            i + 1, s.id, s.pid, s.port, status, page_url(s).unwrap_or("—"),
+            width = id_width, swidth = status_width
         );
     }
     Ok(())
+}
+
+/// The page to open: the network URL, else the local one (webhooks); `None`
+/// for a server without a page (a ConvoAI background agent: `serv attach`).
+fn page_url(s: &ServerEntry) -> Option<&str> {
+    [s.network_url.as_str(), s.local_url.as_str()].into_iter().find(|u| !u.is_empty())
+}
+
+/// The URL carries an access code (`?t=`, servers started by 0.8.1 or later).
+fn has_access_code(url: &str) -> bool {
+    url.split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|kv| kv.starts_with("t=")))
+}
+
+/// STATUS: a ConvoAI agent's state from its daemon's 60 s poll (`—` before
+/// the first); any other listed server is running (dead ones are pruned),
+/// flagged when its page has no access code (started before 0.8.1, open to
+/// anyone on the network).
+fn server_status(s: &ServerEntry) -> String {
+    if s.kind == "convo" {
+        return s.last_status.clone().unwrap_or_else(|| "—".into());
+    }
+    match page_url(s) {
+        Some(url) if !has_access_code(url) => "running (no access code)".into(),
+        _ => "running".into(),
+    }
+}
+
+/// `atem serv info <id|#>`: everything the registry knows about one
+/// server: kind, process, status, start, channel, its URLs (with the access
+/// code when it has one) and its log.
+pub fn cmd_server_info(id: &str) -> Result<()> {
+    let id = resolve_id_or_index(id)?;
+    let servers = list_servers();
+    let s = servers
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| anyhow::anyhow!("No running server '{id}'. See `atem serv list`."))?;
+    print!("{}", server_info(s, now_secs(), &servers_dir()));
+    Ok(())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `serv info`'s text for `s` at `now` (unix seconds).
+fn server_info(s: &ServerEntry, now: u64, dir: &std::path::Path) -> String {
+    use crate::memory::model::format_datetime;
+    let ago = |secs: u64| {
+        let d = now.saturating_sub(secs);
+        match d {
+            0..=119 => format!("{d} s ago"),
+            120..=7199 => format!("{} min ago", d / 60),
+            7200..=172_799 => format!("{} h ago", d / 3600),
+            _ => format!("{} days ago", d / 86_400),
+        }
+    };
+    let mut out = String::new();
+    let mut line = |label: &str, value: String| out.push_str(&format!("{label:<13}{value}\n"));
+    line("ID:", s.id.clone());
+    line("Kind:", s.kind.clone());
+    line("PID:", s.pid.to_string());
+    line("Port:", s.port.to_string());
+    line("Status:", server_status(s));
+    if let Some(checked) = s.last_checked_at {
+        line("Polled:", format!("{} UTC ({})", format_datetime(checked as i64), ago(checked)));
+    }
+    line(
+        "Started:",
+        format!("{} UTC ({})", format_datetime(s.started_at as i64), ago(s.started_at)),
+    );
+    if !s.channel.is_empty() {
+        line("Channel:", s.channel.clone());
+    }
+    if !s.local_url.is_empty() {
+        line("Local:", s.local_url.clone());
+    }
+    if !s.network_url.is_empty() {
+        line("LAN:", s.network_url.clone());
+    }
+    for link in &s.links {
+        line(&format!("{}:", link.label), link.url.clone());
+    }
+    match page_url(s) {
+        None => line("Page:", format!("none (a ConvoAI background agent: `atem serv attach {}`)", s.id)),
+        Some(url) if has_access_code(url) => {
+            line("Access:", "access code in every URL (`?t=…`); open them as printed".into())
+        }
+        Some(_) => line(
+            "Access:",
+            "no access code (started before 0.8.1): anyone on the network can open it; \
+             restart it to get one"
+                .into(),
+        ),
+    }
+    line("Log:", dir.join(format!("{}.log", s.id)).display().to_string());
+    out
 }
 
 pub fn cmd_kill_server(id: &str) -> Result<()> {
@@ -317,7 +429,7 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
             .stderr(log_file)
             .spawn()?;
 
-        let entry = ServerEntry {
+        let mut entry = ServerEntry {
             id: sid.clone(),
             pid: child.id(),
             kind: "rtc".to_string(),
@@ -331,11 +443,16 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
                 .as_secs(),
             last_status: None,
             last_checked_at: None,
+            links: Vec::new(),
         };
         register_server(&entry)?;
 
         println!("RTC server started in background:");
         let report = tunnels.read(&mut child).await;
+        // Every URL it printed (after the daemon's own registration), for
+        // `atem serv info`.
+        entry.links = report.links(&access, "/", &custom_urls);
+        register_server(&entry)?;
         report.print_urls(&access, "/", &local_url, &network_url, &custom_urls);
         field("ID", &sid);
         field("PID", child.id());
@@ -364,6 +481,7 @@ pub async fn run_server(mut config: RtcTestConfig) -> Result<()> {
                 .as_secs(),
             last_status: None,
             last_checked_at: None,
+            links: Vec::new(),
         };
         register_server(&entry)?;
     }
@@ -1440,6 +1558,83 @@ mod tests {
         assert!(unregister_server("cleanup").is_err());
     }
 
+    fn entry(kind: &str, local: &str, lan: &str) -> ServerEntry {
+        ServerEntry {
+            id: format!("{kind}-1"),
+            pid: 7,
+            kind: kind.into(),
+            port: 8443,
+            channel: String::new(),
+            local_url: local.into(),
+            network_url: lan.into(),
+            started_at: 1_000_000,
+            last_status: None,
+            last_checked_at: None,
+            links: Vec::new(),
+        }
+    }
+
+    /// STATUS: a ConvoAI agent's polled state; any other listed server is
+    /// running, flagged when its page has no access code.
+    #[test]
+    fn status_and_url_of_each_kind() {
+        let coded = entry("files", "https://localhost:1/?t=abc", "https://lan:1/a.md?x=1&t=abc");
+        assert_eq!(server_status(&coded), "running");
+        assert_eq!(page_url(&coded), Some("https://lan:1/a.md?x=1&t=abc"));
+        let old = entry("files", "https://localhost:1/", "https://lan:1/");
+        assert_eq!(server_status(&old), "running (no access code)");
+        // A query named like the code isn't one.
+        assert!(!has_access_code("https://lan:1/?at=1&tt=2"));
+        // Webhooks: the console is local only.
+        let hooks = entry("webhooks", "http://127.0.0.1:9090/?t=abc", "");
+        assert_eq!(page_url(&hooks), Some("http://127.0.0.1:9090/?t=abc"));
+        // A ConvoAI background agent: its polled state, no page.
+        let mut convo = entry("convo", "", "");
+        assert_eq!(server_status(&convo), "—");
+        convo.last_status = Some("RUNNING".into());
+        assert_eq!(server_status(&convo), "RUNNING");
+        assert_eq!(page_url(&convo), None);
+    }
+
+    /// `serv info` shows every URL the server printed, each with its code,
+    /// and says whether it has one.
+    #[test]
+    fn info_shows_every_url() {
+        let mut s = entry("files", "https://localhost:1/?t=abc", "https://lan:1/?t=abc");
+        s.links = vec![
+            ServerLink { label: "Cloudflared".into(), url: "https://x.trycloudflare.com/?t=abc".into() },
+            ServerLink { label: "Custom".into(), url: "https://dev.box:1/?t=abc".into() },
+        ];
+        let text = server_info(&s, 1_000_000 + 7200, std::path::Path::new("/srv"));
+        assert_eq!(
+            text,
+            "ID:          files-1\n\
+             Kind:        files\n\
+             PID:         7\n\
+             Port:        8443\n\
+             Status:      running\n\
+             Started:     1970-01-12 13:46 UTC (2 h ago)\n\
+             Local:       https://localhost:1/?t=abc\n\
+             LAN:         https://lan:1/?t=abc\n\
+             Cloudflared: https://x.trycloudflare.com/?t=abc\n\
+             Custom:      https://dev.box:1/?t=abc\n\
+             Access:      access code in every URL (`?t=…`); open them as printed\n\
+             Log:         /srv/files-1.log\n"
+        );
+        let old = server_info(&entry("files", "https://localhost:1/", ""), 1_000_000, std::path::Path::new("/srv"));
+        assert!(old.contains("Access:      no access code (started before 0.8.1)"), "{old}");
+        let convo = server_info(&entry("convo", "", ""), 1_000_000, std::path::Path::new("/srv"));
+        assert!(convo.contains("Page:        none (a ConvoAI background agent: `atem serv attach convo-1`)"), "{convo}");
+    }
+
+    /// Entries written before `links` existed still parse.
+    #[test]
+    fn entries_without_links_still_parse() {
+        let old = r#"{"id":"files-1","pid":7,"kind":"files","port":1,"channel":"","local_url":"","network_url":"","started_at":1}"#;
+        let e: ServerEntry = serde_json::from_str(old).unwrap();
+        assert!(e.links.is_empty());
+    }
+
     #[test]
     fn server_entry_round_trip_with_status_field() {
         // Regression: serializing/deserializing must preserve the new
@@ -1456,6 +1651,7 @@ mod tests {
             started_at: 1700000000,
             last_status: Some("RUNNING".into()),
             last_checked_at: Some(1700000060),
+            links: Vec::new(),
         };
         let json = serde_json::to_string(&e).unwrap();
         let back: ServerEntry = serde_json::from_str(&json).unwrap();

@@ -152,6 +152,34 @@ impl StartupReport {
         }
     }
 
+    /// The URLs `print_urls` prints after Local and LAN (public tunnels,
+    /// each with the access code, then the custom hostnames), for the
+    /// server registry (`atem serv info`).
+    pub fn links(
+        &self,
+        access: &AccessCode,
+        target_path: &str,
+        custom: &[String],
+    ) -> Vec<crate::rtc_test_server::ServerLink> {
+        let mut links: Vec<_> = [Provider::Cloudflared, Provider::Ngrok]
+            .into_iter()
+            .filter_map(|provider| {
+                self.links
+                    .iter()
+                    .find(|link| link.provider == provider)
+                    .map(|link| crate::rtc_test_server::ServerLink {
+                        label: provider.label().into(),
+                        url: access.url(&format!("{}{target_path}", link.url)),
+                    })
+            })
+            .collect();
+        links.extend(custom.iter().map(|url| crate::rtc_test_server::ServerLink {
+            label: "Custom".into(),
+            url: url.clone(),
+        }));
+        links
+    }
+
     pub fn print_warnings(&self) {
         for failure in &self.failures {
             eprintln!(
@@ -427,6 +455,51 @@ impl BackgroundReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry gets the URLs printed after Local and LAN, each public
+    /// one with the access code.
+    #[test]
+    fn registry_links_carry_the_code() {
+        crate::web_server::access::use_code_for_test("AbCdEfGhIjKlMnOpQrStUv");
+        let access = AccessCode::for_server(8443, true);
+        let report = StartupReport {
+            links: vec![
+                Link {
+                    provider: Provider::Ngrok,
+                    url: "https://n.ngrok-free.app".into(),
+                },
+                Link {
+                    provider: Provider::Cloudflared,
+                    url: "https://c.trycloudflare.com".into(),
+                },
+            ],
+            failures: vec![],
+            warnings: vec![],
+        };
+        let links: Vec<(String, String)> = report
+            .links(
+                &access,
+                "/a.md",
+                &["https://dev.box:8443/a.md?t=x".to_string()],
+            )
+            .into_iter()
+            .map(|l| (l.label, l.url))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                (
+                    "Cloudflared".into(),
+                    "https://c.trycloudflare.com/a.md?t=AbCdEfGhIjKlMnOpQrStUv".into()
+                ),
+                (
+                    "Ngrok".into(),
+                    "https://n.ngrok-free.app/a.md?t=AbCdEfGhIjKlMnOpQrStUv".into()
+                ),
+                ("Custom".into(), "https://dev.box:8443/a.md?t=x".into()),
+            ]
+        );
+    }
 
     #[test]
     fn ngrok_diagnostics_extract_codes_without_copying_raw_errors() {
