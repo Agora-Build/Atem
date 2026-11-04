@@ -403,8 +403,9 @@ body {{
   display: flex; justify-content: flex-end;
   border-bottom: 1px solid #d1d9e0; margin-bottom: 24px; padding-bottom: 8px;
 }}
-.toolbar a {{ color: #0969da; text-decoration: none; font-size: 13px; }}
-.toolbar a:hover {{ text-decoration: underline; }}
+.toolbar a, .toolbar button {{ color: #0969da; text-decoration: none; font-size: 13px; }}
+.toolbar button {{ background: none; border: none; padding: 0; margin-right: 16px; cursor: pointer; font-family: inherit; }}
+.toolbar a:hover, .toolbar button:hover {{ text-decoration: underline; }}
 h1, h2, h3, h4 {{ border-bottom: 1px solid #eaecef; padding-bottom: 6px; }}
 h1 {{ font-size: 2em; }} h2 {{ font-size: 1.5em; }}
 code {{ background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-size: 85%; font-family: ui-monospace, SFMono-Regular, monospace; }}
@@ -422,12 +423,16 @@ hr {{ border: none; border-top: 1px solid #d1d9e0; margin: 24px 0; }}
 </head>
 <body>
 <div class="toolbar">
+  {copy}
   <a href="{raw}">View raw</a>
 </div>
 {body}
+{copy_link}
 </body>
 </html>
-"#, title = title_esc, raw = body_esc_link, body = body)
+"#, title = title_esc, raw = body_esc_link, body = body,
+        copy = crate::web_server::access::copy_link_button("copy-link"),
+        copy_link = crate::web_server::access::COPY_LINK)
 }
 
 fn render_directory(fs_path: &Path, root: &Path, url_path: &str) -> Response {
@@ -475,16 +480,23 @@ ul {{ list-style: none; padding: 0; }}
 li {{ padding: 4px 0; }}
 a {{ color: #0969da; text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
+.toolbar {{ display: flex; justify-content: flex-end; }}
+.toolbar button {{ background: none; border: none; padding: 0; color: #0969da; font-size: 13px; cursor: pointer; font-family: inherit; }}
+.toolbar button:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
+<div class="toolbar">{copy}</div>
 <h1>Index of {display}</h1>
 <ul>
 {rows}
 </ul>
+{copy_link}
 </body>
 </html>
-"#, display = display_esc, rows = rows);
+"#, display = display_esc, rows = rows,
+        copy = crate::web_server::access::copy_link_button("copy-link"),
+        copy_link = crate::web_server::access::COPY_LINK);
     Response::ok("text/html; charset=utf-8", body.into_bytes())
 }
 
@@ -608,6 +620,9 @@ mod tests {
         assert!(html.contains("<strong>bold</strong>"));
         assert!(html.contains(r#"href="?raw=1""#), "raw view link missing");
         assert!(html.contains("<title>test.md</title>"));
+        let copy = html.find("data-atem-copy-link").expect("Copy link missing");
+        assert!(copy < html.find("View raw").unwrap(), "Copy link comes first");
+        assert!(html.contains(crate::web_server::access::LINK_PATH));
     }
 
     #[test]
@@ -677,5 +692,7 @@ mod tests {
         let body = String::from_utf8_lossy(&r.body);
         assert!(body.contains("visible.md"));
         assert!(!body.contains(".hidden"));
+        assert!(body.contains("data-atem-copy-link"), "Copy link missing");
+        assert!(body.contains(crate::web_server::access::LINK_PATH));
     }
 }

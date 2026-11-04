@@ -821,6 +821,7 @@ header { padding: 12px 20px; border-bottom: 1px solid #30363d; background: #161b
 header h1 { font-size: 16px; font-weight: 600; }
 header .pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #21262d; color: #7d8590; }
 header .pill.ok { background: #196c2e; color: #fff; }
+header [data-atem-copy-link] { margin-left: auto; font-size: 12px; padding: 2px 8px; border-radius: 4px; border: 1px solid #555; background: none; color: #8b949e; cursor: pointer; }
 #events { padding: 12px 20px; }
 .ev { border: 1px solid #30363d; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }
 .ev .head { padding: 8px 12px; display: flex; gap: 12px; align-items: baseline; cursor: pointer; background: #161b22; }
@@ -840,6 +841,7 @@ header .pill.ok { background: #196c2e; color: #fff; }
   <h1>atem serv webhooks</h1>
   <span id="status" class="pill">connecting…</span>
   <span class="pill" id="count">0 events</span>
+  <!--copy-link-button-->
 </header>
 <div id="events">
   <div class="empty">Waiting for the first webhook POST.</div>
@@ -895,14 +897,27 @@ es.onmessage = (m) => {
   catch (err) { console.warn('bad SSE payload', err); }
 };
 </script>
+<!--copy-link-script-->
 </body>
 </html>
-"##.to_string()
+"##
+    .replace(
+        "<!--copy-link-button-->",
+        &crate::web_server::access::copy_link_button("copy-link"),
+    )
+    .replace("<!--copy-link-script-->", crate::web_server::access::COPY_LINK)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_has_copy_link() {
+        let html = build_console_html();
+        assert!(html.contains("data-atem-copy-link"), "Copy link missing");
+        assert!(html.contains(crate::web_server::access::LINK_PATH));
+    }
 
     #[test]
     fn label_for_known_codes() {
@@ -1107,6 +1122,17 @@ mod tests {
         assert!(sse_buf.contains("\"event_type\":101"), "SSE buf: {}", sse_buf);
         assert!(sse_buf.contains("\"label\":\"agent_joined\""), "SSE buf: {}", sse_buf);
         assert!(sse_buf.contains("\"agent_id\":\"agent-x\""), "SSE buf: {}", sse_buf);
+
+        // The console's Copy link asks the server for its code.
+        let link = client
+            .get(format!("{base}{}", crate::web_server::access::LINK_PATH))
+            .header("Cookie", format!("atem_access_{port}={CODE}"))
+            .send()
+            .await
+            .expect("GET link");
+        assert_eq!(link.status().as_u16(), 200);
+        let link: serde_json::Value = link.json().await.unwrap();
+        assert_eq!(link["t"], CODE);
 
         // 404 path
         let resp404 = reqwest::Client::new()
