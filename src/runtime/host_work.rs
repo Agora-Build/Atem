@@ -1142,6 +1142,9 @@ mod tests {
         let first = task();
         let mut second = task();
         let mut message = Message {
+            kind: Default::default(),
+            reply_to: None,
+            from_session: None,
             mark: None,
             message_id: uuid::Uuid::new_v4().to_string(),
             workflow_id: first.task.workflow_id.clone(),

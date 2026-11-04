@@ -637,6 +637,8 @@ impl HostBridge {
     ) -> bool {
         use atem_client::session::messages::Destination;
         match &recipient.destination {
+            // Select expansion is local until the cross-instance contract is agreed.
+            Destination::Select { .. } => false,
             Destination::Host => a.scope.as_ref().is_none_or(|scope| {
                 scope.projects.is_none()
                     && scope.sessions.is_none()
@@ -697,6 +699,9 @@ impl HostBridge {
         let store = self.work.store.as_ref().ok_or("busy")?;
         let message_id = match req {
             hw::Request::Publish { message, .. } => {
+                if message.kind != atem_client::session::messages::MessageKind::Request {
+                    return Err("unsupported_version");
+                }
                 if message.sender != a.name() {
                     return Err("forbidden");
                 }
