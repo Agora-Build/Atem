@@ -11,6 +11,8 @@ use std::sync::atomic::AtomicBool;
 
 #[path = "collab_bridge.rs"]
 mod collab_bridge;
+#[path = "collab_launch_bridge.rs"]
+mod collab_launch_bridge;
 
 /// The local sender exists only on the broker's internal attachment.
 pub(crate) enum Sender {
@@ -66,6 +68,7 @@ struct PendingLaunch {
     profile: Profile,
     expires_at: u64,
     permit: Arc<AtomicBool>,
+    local_route: Option<crate::runtime::host_work::Route>,
 }
 
 pub(super) struct State {
@@ -449,7 +452,18 @@ impl HostBridge {
                 && self.work.config.profile(&p.profile.id) == Some(&p.profile)
                 && self.host.control_gen(&p.principal) == p.control_gen
                 && authority.as_ref().is_some_and(|a| {
-                    a.name() == p.principal && self.profile_allowed(&p.profile, a, true)
+                    a.name() == p.principal
+                        && match &p.local_route {
+                            Some(route) => {
+                                matches!(a, Sender::Local)
+                                    && self.local_healthy()
+                                    && self.work.config.route(&route.id) == Some(route)
+                                    && route.principals.iter().any(|p| p == "local")
+                                    && route.launch
+                                        == crate::runtime::host_work::RouteLaunch::OnMessage
+                            }
+                            None => self.profile_allowed(&p.profile, a, true),
+                        }
                 });
             if !allowed {
                 p.permit.store(false, Ordering::SeqCst);
@@ -588,6 +602,7 @@ impl HostBridge {
                         profile: p.clone(),
                         expires_at: *expires_at,
                         permit,
+                        local_route: None,
                     },
                 );
                 self.work.launches.push_back(RemoteLaunch {
@@ -947,6 +962,9 @@ impl HostBridge {
                 r.status.state = WorkState::Expired;
                 r.status.detail = "expired before submission".into();
                 self.work.store.as_ref().unwrap().save_work(&r)?;
+                continue;
+            }
+            if self.collab_wait_for_launch(&mut r)? {
                 continue;
             }
             let local = (r.principal == "local" && !self.local_attachment().is_empty())

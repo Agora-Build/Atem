@@ -721,3 +721,102 @@ fn result_context_is_frozen_and_another_session_cannot_reply() {
         1
     );
 }
+
+fn configure_launch(rig: &mut Rig) -> PathBuf {
+    let fake = rig.sandbox.dir.path().join("launched-agent");
+    std::fs::create_dir_all(&fake).unwrap();
+    let env = rig.sandbox.dir.path().join("approved-environment.json");
+    private(&env, &json!({"CLAUDE_CLI_BIN":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approvals/fake-agent.py"),"FAKE_DIR":fake}).to_string());
+    rig.config = rig.config.replace(
+        "labels = [\"tag:c\"]",
+        "labels = [\"tag:c\"]\nlaunch = \"on_message\"",
+    );
+    rig.config = rig.config.replace(
+        "label = \"c\"",
+        &format!(
+            "label = \"c\"\nenv_names = [\"CLAUDE_CLI_BIN\", \"FAKE_DIR\"]\nenv_file = {env:?}"
+        ),
+    );
+    rig.restart();
+    fake
+}
+
+#[test]
+fn a_message_to_an_empty_route_launches_one_agent() {
+    let mut rig = Rig::new();
+    let fake = configure_launch(&mut rig);
+    let (_, a) = rig.launch("a", "sender");
+    let id = rig.send(&a, 1, "tag:c", "start the approved route");
+    within("launched agent prompt", || {
+        std::fs::read_to_string(fake.join("input"))
+            .unwrap_or_default()
+            .contains("start the approved route")
+    });
+    assert_eq!(
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let task = rig.status(&id)["tasks"][0]["task_id"].clone();
+    rig.restart();
+    assert_eq!(rig.status(&id)["tasks"][0]["task_id"], task);
+    assert_eq!(
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        std::fs::read_to_string(fake.join("events"))
+            .unwrap()
+            .lines()
+            .filter(|s| *s == "started")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn launch_stays_off_by_default() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let id = rig.send(&a, 1, "tag:c", "no owner launch consent");
+    let status = rig.status(&id);
+    assert_eq!(status["detail"], "no_match");
+    assert!(status["tasks"].as_array().unwrap().is_empty());
+    assert_eq!(
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_failed_launch_fails_its_task() {
+    let mut rig = Rig::new();
+    let _ = configure_launch(&mut rig);
+    std::fs::remove_dir(rig.sandbox.home.join("c")).unwrap();
+    let (_, a) = rig.launch("a", "sender");
+    let id = rig.send(&a, 1, "tag:c", "missing approved cwd");
+    within("failed launch task", || {
+        rig.status(&id)["tasks"][0]["state"] == "failed"
+    });
+    assert!(
+        rig.status(&id)["tasks"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("launch")
+    );
+    assert_eq!(
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}

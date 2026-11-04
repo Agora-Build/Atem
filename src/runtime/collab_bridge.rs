@@ -499,7 +499,10 @@ impl HostBridge {
         Ok(())
     }
 
-    fn collab_candidates(&self, sessions: &BTreeMap<SessionId, BrokerSession>) -> Vec<Candidate> {
+    pub(super) fn collab_candidates(
+        &self,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> Vec<Candidate> {
         let mut candidates = Vec::new();
         for route in &self.work.config.routes {
             if !route.principals.iter().any(|p| p == "local") {
@@ -538,11 +541,12 @@ impl HostBridge {
     }
 
     pub fn collab_directory(
-        &self,
+        &mut self,
         atem_id: &str,
         selector: Option<&str>,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<Vec<DirectoryRow>> {
+        self.work_config();
         let selector: Option<Selector> = selector
             .map(str::parse)
             .transpose()
@@ -651,8 +655,17 @@ impl HostBridge {
             &request.memory,
             &request.vault,
         )?;
-        if request.launch {
-            bail!("launch on message is not available yet");
+        if request.launch
+            && !request.to.iter().any(|s| {
+                s.parse::<Selector>().is_ok_and(|s| {
+                    matches!(s,
+            Selector::Instance { atem_id: id, route_id: Some(_) } if id == atem_id)
+                })
+            })
+        {
+            bail!(
+                "use --launch with atem:<atem_id>/<route_id>; the route must allow launch = on_message"
+            );
         }
         let origin = sessions
             .get(from)
@@ -734,25 +747,10 @@ impl HostBridge {
             bail!("invalid message content");
         }
         let from = message.from_session.as_deref().unwrap();
-        let Destination::Select { selectors, .. } = &message.recipients[0].destination else {
-            bail!("invalid local destination");
-        };
-        let selectors = selectors
-            .iter()
-            .map(|s| s.parse())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!("{e}"))?;
-        let resolved = collab::resolve(
-            atem_id,
-            &self.collab_candidates(sessions),
-            &selectors,
-            MAX_AGENTS,
-            from,
-            &message.message_id,
-            &message.recipients[0].recipient_id,
-        );
+        let plan = self.collab_resolve(atem_id, message, sessions)?;
+        let resolved = &plan.tasks;
         let mut work = Vec::new();
-        for r in &resolved {
+        for r in resolved {
             let route = self.work.config.route(&r.route_id).unwrap();
             let profile = self.work.config.profile(&route.profile_id).unwrap();
             let target = wire::Target {
@@ -793,7 +791,10 @@ impl HostBridge {
                     result: None,
                 },
             };
-            if !self.work_allowed(&record, &Sender::Local, sessions) {
+            if !(self.work_allowed(&record, &Sender::Local, sessions)
+                || r.launch_request_id.is_some()
+                    && self.work_route_allowed(&record, &Sender::Local))
+            {
                 bail!("route {} no longer permits local work", route.id);
             }
             work.push(record);
@@ -855,8 +856,10 @@ impl HostBridge {
                         },
                     )?;
                 }
-                collab::persist(tx, &message, &resolved)
+                self.collab_reserve_launches(tx, &plan)?;
+                collab::persist(tx, &message, resolved)
             })?;
+        self.collab_start_launches(plan, message.expires_at);
         Ok(())
     }
 
@@ -997,7 +1000,11 @@ impl HostBridge {
         Ok(())
     }
 
-    pub fn collab_status(&self, id: Option<&str>) -> Result<Vec<MessageView>> {
+    pub fn collab_status(&mut self, id: Option<&str>) -> Result<Vec<MessageView>> {
+        self.work_config();
+        if self.work.store.is_some() && !self.work_store_ready(&self.work_host()) {
+            bail!("collaboration receipt store unavailable");
+        }
         let Some(store) = self.work.store.as_ref() else {
             return Ok(vec![]);
         };

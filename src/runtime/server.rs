@@ -1163,7 +1163,7 @@ impl Server {
             ClientMsg::MessageStatus { message_id } => {
                 let result = self
                     .bridge
-                    .as_ref()
+                    .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
                     .and_then(|b| b.collab_status(message_id.as_deref()));
                 match result {
@@ -1185,7 +1185,7 @@ impl Server {
             ClientMsg::MessageDirectory { selector } => {
                 let result = self
                     .bridge
-                    .as_ref()
+                    .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
                     .and_then(|b| {
                         b.collab_directory(
