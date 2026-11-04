@@ -437,45 +437,42 @@ impl HostBridge {
                     task.status.detail = "turn ended without a reply".into();
                     if self.work.config.route(&task.route_id).is_some_and(|r| {
                         r.auto_report == crate::runtime::host_work::AutoReport::FinalMessage
-                    }) {
-                        if let Some(session) = SessionId::parse(&task.task.target.session_id)
-                            .and_then(|s| sessions.get(&s))
-                        {
-                            let text = session
-                                .chat
-                                .retained()
-                                .filter(|m| {
-                                    m.role == crate::chat::session::Role::Assistant
-                                        && Some(m.turn_id.as_str()) == grant.turn_id.as_deref()
-                                })
-                                .filter_map(|m| {
-                                    let text = m
-                                        .parts
-                                        .iter()
-                                        .filter_map(|p| {
-                                            if let crate::chat::adapter::Part::Text {
-                                                markdown,
-                                                ..
-                                            } = p
-                                            {
-                                                Some(markdown.as_str())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    (!text.is_empty()).then_some(text)
-                                })
-                                .last();
-                            if let Some(text) = text {
-                                task.status.detail.push_str(": ");
-                                task.status.detail.extend(
-                                    text.chars()
-                                        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-                                        .take(200),
-                                );
-                            }
+                    }) && let Some(session) = SessionId::parse(&task.task.target.session_id)
+                        .and_then(|s| sessions.get(&s))
+                    {
+                        let text = session
+                            .chat
+                            .retained()
+                            .filter(|m| {
+                                m.role == crate::chat::session::Role::Assistant
+                                    && Some(m.turn_id.as_str()) == grant.turn_id.as_deref()
+                            })
+                            .filter_map(|m| {
+                                let text = m
+                                    .parts
+                                    .iter()
+                                    .filter_map(|p| {
+                                        if let crate::chat::adapter::Part::Text {
+                                            markdown, ..
+                                        } = p
+                                        {
+                                            Some(markdown.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                (!text.is_empty()).then_some(text)
+                            })
+                            .last();
+                        if let Some(text) = text {
+                            task.status.detail.push_str(": ");
+                            task.status.detail.extend(
+                                text.chars()
+                                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                                    .take(200),
+                            );
                         }
                     }
                     store.save_work(&task)?;
@@ -857,7 +854,7 @@ impl HostBridge {
                     )?;
                 }
                 self.collab_reserve_launches(tx, &plan)?;
-                collab::persist(tx, &message, resolved)
+                collab::persist(tx, message, resolved)
             })?;
         self.collab_start_launches(plan, message.expires_at);
         Ok(())

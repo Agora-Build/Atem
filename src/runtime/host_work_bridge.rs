@@ -16,7 +16,7 @@ mod collab_launch_bridge;
 
 /// The local sender exists only on the broker's internal attachment.
 pub(crate) enum Sender {
-    Remote(Authority),
+    Remote(Box<Authority>),
     Local,
 }
 
@@ -269,7 +269,7 @@ impl HostBridge {
             return self.local_healthy().then_some(Sender::Local);
         }
         self.r9_call(|r9, parts| r9.current_work_authority(attachment, parts))
-            .map(Sender::Remote)
+            .map(|authority| Sender::Remote(Box::new(authority)))
     }
 
     fn profile_allowed(&self, profile: &Profile, authority: &Sender, launch: bool) -> bool {

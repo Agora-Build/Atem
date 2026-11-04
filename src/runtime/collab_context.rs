@@ -38,7 +38,7 @@ impl VaultRef {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContextSpec {
-    Memory { memory: Memory },
+    Memory { memory: Box<Memory> },
     Vault { reference: VaultRef },
 }
 
@@ -77,7 +77,9 @@ pub fn capture(dir: &Path, memories: &[String], vaults: &[String]) -> Result<Vec
             if memory.content.len() > hw::MAX_CONTEXT_BYTES {
                 bail!("context is too large");
             }
-            specs.push(ContextSpec::Memory { memory });
+            specs.push(ContextSpec::Memory {
+                memory: Box::new(memory),
+            });
         }
     }
     for text in vaults {
@@ -294,7 +296,9 @@ mod tests {
             attempts: AtomicUsize::new(0),
             mismatch: false,
         };
-        let specs = vec![ContextSpec::Memory { memory: memory() }];
+        let specs = vec![ContextSpec::Memory {
+            memory: Box::new(memory()),
+        }];
         assert!(publish(&p, &specs).await.is_err());
         assert!(publish(&p, &specs).await.is_err());
         let snapshots = publish(&p, &specs).await.unwrap();
@@ -310,10 +314,15 @@ mod tests {
             mismatch: true,
         };
         assert_eq!(
-            publish(&p, &[ContextSpec::Memory { memory: memory() }])
-                .await
-                .unwrap_err()
-                .to_string(),
+            publish(
+                &p,
+                &[ContextSpec::Memory {
+                    memory: Box::new(memory()),
+                }]
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
             "context changed"
         );
     }

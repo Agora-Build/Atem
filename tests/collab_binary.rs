@@ -638,6 +638,41 @@ fn a_silent_turn_gets_a_report_not_a_result() {
 }
 
 #[test]
+fn a_final_message_report_stays_status_only_until_an_explicit_reply() {
+    let mut rig = Rig::new();
+    rig.config = rig
+        .config
+        .replace("send = true", "send = true\nresult_timeout = \"1s\"")
+        .replace(
+            "labels = [\"tag:a\"]",
+            "labels = [\"tag:a\"]\nresults = true",
+        )
+        .replace(
+            "labels = [\"tag:b\"]",
+            "labels = [\"tag:b\"]\nauto_report = \"final_message\"",
+        );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "report the assistant text as progress");
+    let task = await_task(&rig, &id, &b);
+    within("final assistant report", || {
+        rig.status(&id)["tasks"][0]["detail"] == "turn ended without a reply: done"
+    });
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "awaiting_result");
+    assert!(std::fs::read(a.join("input")).unwrap().is_empty());
+    assert_eq!(
+        rig.agent(
+            &b,
+            1,
+            &["message", "reply", "--task", &task, "explicit completion"]
+        )["code"],
+        0
+    );
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
+}
+
+#[test]
 fn result_context_is_frozen_and_another_session_cannot_reply() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -776,6 +811,67 @@ fn a_message_to_an_empty_route_launches_one_agent() {
             .filter(|s| *s == "started")
             .count(),
         1
+    );
+}
+
+#[test]
+fn explicit_launch_uses_the_instance_address_and_keeps_route_consent() {
+    let mut rig = Rig::new();
+    let fake = configure_launch(&mut rig);
+    let (_, a) = rig.launch("a", "sender");
+    let directory = rig.request(
+        json!({"op":"message_directory","selector":"tag:c"}),
+        "message_directory",
+    );
+    let atem_id = directory["rows"][0]["atem_id"].as_str().unwrap();
+    let unapproved = format!("atem:{atem_id}/b");
+    let output = rig.agent(
+        &a,
+        1,
+        &[
+            "message",
+            "send",
+            "--to",
+            &unapproved,
+            "--launch",
+            "explicit flag cannot authorize this route",
+        ],
+    );
+    assert_eq!(output["code"], 0, "{output}");
+    let id = output["stdout"].as_str().unwrap().trim();
+    assert_eq!(rig.status(id)["detail"], "no_match");
+    assert_eq!(
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let approved = format!("atem:{atem_id}/c");
+    let output = rig.agent(
+        &a,
+        2,
+        &[
+            "message",
+            "send",
+            "--to",
+            &approved,
+            "--launch",
+            "explicit approved launch",
+        ],
+    );
+    assert_eq!(output["code"], 0, "{output}");
+    within("explicit launched prompt", || {
+        std::fs::read_to_string(fake.join("input"))
+            .unwrap_or_default()
+            .contains("explicit approved launch")
+    });
+    assert_eq!(
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
 }
 
