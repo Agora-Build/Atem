@@ -6,7 +6,7 @@ Copy the one you need, edit, drop it into the config dir.
 | File | Where it goes | What it's for |
 |------|---------------|---------------|
 | [config.example.toml](config.example.toml) | `~/.config/atem/config.toml` | Astation WebSocket / relay URL, BFF / SSO overrides, extra hostnames for the self-signed cert |
-| [runtime.example.toml](runtime.example.toml) | `~/.config/atem/runtime.toml` | `atem runtime` remote-launch profiles, notification routes and optional zero-session hosting (feature branch; disabled by default) |
+| [runtime.example.toml](runtime.example.toml) | `~/.config/atem/runtime.toml` | `atem runtime` remote-launch profiles, notification routes and optional zero-session hosting (disabled by default) |
 | [convo.example.toml](convo.example.toml) | `~/.config/atem/convo.toml` | `atem serv convo` — agent provider blocks (LLM/ASR/TTS/avatar), preset list, HIPAA / geofence / encryption / `enable_avatar` defaults |
 | [webhooks.example.toml](webhooks.example.toml) | `~/.config/atem/webhooks.toml` | `atem serv webhooks` — local port, HMAC secret, ngrok / cloudflared tunnel provider |
 

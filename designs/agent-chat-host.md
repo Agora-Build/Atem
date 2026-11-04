@@ -99,7 +99,7 @@ chat state. It is the only agent-specific code.
 trait AgentAdapter {
     /// Extra launch arguments and environment, given the agent's own args
     /// (Claude: --settings, --session-id). Errors leave chat unsupported.
-    fn prepare_launch(&self, args: &[String], dir: &Path) -> Result<LaunchPlan>;
+    fn prepare_launch(&mut self, args: &[String], dir: &Path) -> Result<LaunchPlan>;
     /// Poll the agent's lifecycle source (Claude: hook event files).
     fn poll_events(&mut self) -> Vec<AgentEvent>;
     /// Poll the agent's session log from the saved position (Claude: transcript JSONL).
@@ -488,9 +488,10 @@ on the existing authenticated Astation connection.
 - Outgoing text and tool summaries pass Atem's credential detector
   (`src/memory/secrets.rs`); matches become `[redacted]`. Thinking, tool output
   and file contents are never sent.
-- Transport: the existing TLS connection through the relay, so the relay can
-  read chat content. End-to-end encryption of chat (e.g. with the account key)
-  is a follow-up.
+- Transport: on a host with a device list (r9, Atem v0.8.0) chat-v1 runs
+  inside the end-to-end `atem-ch1` channel, so the relay can't read it. On an
+  r8 host it travels over the TLS connection through the relay, which can
+  read chat content.
 
 ## Failure handling
 
@@ -556,10 +557,12 @@ Additive to `mem_b3ccce1f`:
 
 ## Out of scope (v1)
 
-Adapters other than Claude Code and Codex; streaming
-token-by-token (the transcript holds whole content blocks); end-to-end
-encryption of chat; push delivery of chat messages (approvals ask the relay
-to push, §6a); attachments/images.
+**Not implemented:** adapters other than Claude Code and Codex; streaming
+token-by-token (the transcript holds whole content blocks); push delivery of
+chat messages (approvals ask the relay to push, §6a); attachments/images in
+chat (task screenshots reach agents through directed work since v0.8.2,
+[host work v1](protocol/atem-host-work-v1.md#6-attachments-and-mark)). End-to-end
+encryption of chat came with r9's `atem-ch1` channels (v0.8.0).
 
 ## Codex
 

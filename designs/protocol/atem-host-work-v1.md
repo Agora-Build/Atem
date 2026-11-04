@@ -1,189 +1,498 @@
-# Host launch and directed work
+# Host work v1: launch, directed work, messages and attachments
 
-Status: Atem receiver implemented on the feature branch, under integration
-review, 2026-11-02. Astation UI, Station publication/replay and optional OS
-service installation are separate work. This extension does not enable the
-hosted execution API. Types: `atem_client::session::host_work`; real-runtime
-tests: `tests/host_work_binary.rs`.
+Status: implemented and released (Atem v0.8.2).
 
-Shared request vectors live in `fixtures/host-work/requests-v1.json`; the
-client core runs them independently of the r8 session scenario fixtures.
+This extension of atem-session r9 lets an admitted client create sessions
+through launch profiles the host owner approved, queue directed work, publish
+messages and upload task screenshots. Configuration, scheduling behavior and
+limits are described in [../agent-hosting.md](../agent-hosting.md). Channels,
+principals and scopes are the r9 appendix of
+[atem-session-v1.md](atem-session-v1.md); the protocol overview is
+[README.md](README.md).
 
-## Transport and authority
+Types: `atem_client::session::{host_work, messages, attachments, mark}`. Host:
+`src/runtime/host_work.rs`, `host_work_bridge.rs`, `host_attachments.rs`.
+Shared request vectors: `fixtures/host-work/requests-v1.json`, run by the
+client core's tests and listed in every SDK's checksum manifest.
 
-Requests are session messages inside an admitted encrypted atem-ch1 channel.
-They require no binding to a session that has not yet been created:
+## 1. Features and transport
+
+| Feature | Ops |
+|---|---|
+| `host.launch` | `host_profiles`, `host_launch`, `host_launch_query` |
+| `host.work` | `work_enqueue`, `work_query`, `work_cancel`, `work_complete` |
+| `host.messages` | `message_publish`, `message_query` |
+| `host.attachments` | `attachment_put` |
+
+A host lists all four in r9 `welcome.features` when hosting is enabled and
+healthy and its work database is open, else none; an r8 host never does.
+Clients check the feature before sending. When hosting turns off under an open
+channel, or 64 host-work requests already wait for the host's next pass, a
+request is `busy` ("agent hosting is disabled or busy").
+
+Requests are `session` messages inside an admitted `atem-ch1` channel. They
+name the host, not a session binding (example in §3). Every request:
+
+- has `v: 1` and an `id` that is a fresh UUID v4 per exchange. A retry sends a
+  new `id` with the same content.
+- has a `host` equal to the channel's `welcome` (`account_id`,
+  `atem_device_id`, `host_trust_gen`); otherwise `stale_target`.
+- is at most 256 KiB, strict JSON: no duplicate keys, integers only, each at
+  most 2^53 − 1.
+- has exactly the fields below. Unknown fields are `invalid_request`, and the
+  request must serialize back to the same JSON, so optional fields are omitted,
+  never `null` or empty (`attachments`, `mark`).
+
+Formats: a UUID v4 is lowercase; an opaque id is 1–128 bytes of
+`[A-Za-z0-9._:-]`; a digest is lowercase hex SHA-256 (64 characters); a
+session id is `ses-` plus 12 characters of `a`–`z` and `2`–`7`; times are Unix
+milliseconds on the host's wall clock.
+
+## 2. Authority
+
+### Ops
+
+R9.6 gains three ops for service `scope.ops` and browser grant `ops`:
+
+| Op | Requests | Control op |
+|---|---|---|
+| `launch` | `host_profiles`, `host_launch`, `host_launch_query` | yes |
+| `notify` | `work_enqueue`, `work_query`, `work_cancel`, `work_complete` | yes |
+| `message` | `message_publish`, `message_query`, `attachment_put` | no |
+
+A native member needs the `control` role for the `launch` and `notify`
+requests; the `message` requests are open to every native member. The channel
+checks the op before decoding (`forbidden`). Existing grants don't gain these
+ops. Membership verifiers older than these ops reject signed entries that
+carry them: upgrade every verifier on the account before enrolling one.
+
+### Host checks
+
+Each request resolves the caller's authority again from the current device
+list. Held, frozen or faulted membership, a halted journal, an expired
+channel, a browser quarantine, or a key that differs from the channel's is
+`unauthorized`.
+
+- **Launch.** The profile's `principals` name the caller (none listed: the
+  paired Astation's `member:<id>`). The caller's scope has no `sessions`
+  restriction, and a `projects` restriction covers the profile's project.
+- **Work.** The route's `principals` name the caller (same default). The caller
+  holds `notify` and `prompt`, its `control_gen` equals the one recorded at
+  enqueue, its scope covers the target session, and the target still matches
+  the route's profile (§4). Checked at enqueue, on every query and before
+  dispatch.
+- **Messages.** Browsers are `forbidden`. The envelope's `sender` equals the
+  channel's principal. Destination rules are in §5.
+- **Uploads.** Browsers are `forbidden`. A service's `scope.hosts` includes
+  this host.
+
+The host records the principal of each launch, task and message, and the
+principal's key for tasks, messages and uploads. A query from another
+principal or key is `forbidden`. A launch or task id reused with other content
+or by another principal is `request_id_reused`; a message id reused by another
+sender is `forbidden`.
+
+## 3. Launch
+
+| Op | Fields | Result `kind` |
+|---|---|---|
+| `host_profiles` | — | `profiles` |
+| `host_launch` | `request_id`, `profile_id`, `profile_revision`, `expires_at` | `launch` |
+| `host_launch_query` | `request_id` | `launch` |
 
 ```json
-{"type":"session","data":{
-  "v":1,"op":"host_profiles","id":"11111111-1111-4111-8111-111111111111",
-  "host":{"account_id":"account","atem_device_id":"host","host_trust_gen":1}
-}}
+{"type":"session","data":{"v":1,"op":"host_launch","id":"11111111-1111-4111-8111-111111111111",
+  "host":{"account_id":"account","atem_device_id":"host","host_trust_gen":1},
+  "request_id":"22222222-2222-4222-8222-222222222222",
+  "profile_id":"backend","profile_revision":1,"expires_at":1793620800000}}
 ```
 
-`id` is a fresh UUID v4 per exchange. The host triple must match exactly.
-Requests reject unknown fields, duplicate JSON keys, unsafe integers and
-messages over 256 KiB. Healthy opted-in hosts advertise `host.launch` and
-`host.work`, `host.messages` and `host.attachments`; clients check the feature before sending. Configuration can
-disable operations on an existing channel, which then fail closed.
+- `request_id`: UUID v4 chosen by the client and kept across retries.
+- `profile_id`: opaque id. `profile_revision`: at least 1, equal to the
+  profile's current revision (else `forbidden`).
+- `expires_at`: later than now and at most 24 h ahead (else
+  `invalid_request`). The host refuses to spawn after it.
+- Commands, arguments, paths and environment values are never accepted.
 
-Services/browsers need explicit `launch` or `notify` ops; work also needs
-`prompt`. Native members need control. All principals additionally require
-local profile/route consent naming their full `member:<device_id>`,
-`service:<device_id>` or `browser:<grant_id>`; a profile or route that
-names none consents for the paired Astation only (`member:<its id>`). Memory/vault access grants no
-execution authority. Recheck current membership, key, expiry, scopes,
-held/faulted/frozen state, browser revocation/quarantine, durable principal
-control generation and local consent. Queued work waits for its original
-principal's live authorized channel. Regrant does not revive fenced work.
+The host checks, in order: the profile and the caller's permission
+(`forbidden`); an existing `request_id` (the same principal and the same
+digest over host, profile id, revision and expiry return the recorded status,
+even after expiry; anything else is `request_id_reused`); the expiry
+(`invalid_request`); the live-session limit (`busy`); the durable reservation
+(`busy` when full or on a storage failure).
 
-Feature negotiation is additive for accounts without new grants. **New signed
-scope op names require upgraded membership verifiers:** older strict clients
-reject entries containing `launch`, `message` or `notify`. Upgrade participating SDKs
-before enrolling those scopes. Do not modify a live account in tests.
+`host_profiles` lists only the profiles the caller may launch; `host_launch`
+and `host_launch_query` return the launch's status:
 
-## Local configuration and lifetime
+```json
+{"kind":"profiles","profiles":[{"id":"backend","revision":1,"label":"Backend Codex","provider":"codex"}]}
+{"kind":"launch","launch":{"request_id":"…","session_id":"ses-abcdefghijkl","process_gen":"…","state":"starting"}}
+```
 
-`atem runtime start` starts the runtime detached, or reuses the running one
-without replacing its build or changing its environment. If missing, it creates
-private `runtime.toml` with `enabled = false`; existing approvals are never
-overwritten. `atem runtime check` validates the configuration and environment
-sources without starting the runtime or an agent. Both require pairing. Bare
-`atem runtime` retains its foreground behavior. The generated file embeds the
-[runtime sample](../../configs/runtime.example.toml), which documents
-profiles/routes. Each profile approves:
+States: `starting` (request, session id and process generation reserved
+durably before this reply), `started` (the worker launched the agent; not chat
+readiness), `failed` (nothing was started) and `outcome_unknown` (it may have
+started; never retried). At a runtime restart, `starting` becomes `started`
+when a worker with the reserved process generation was adopted, else
+`outcome_unknown`.
 
-- ID, positive revision, label, provider (`claude`/`codex`).
-- Canonical absolute directory and normalized Git project key.
-- CLI args, e.g. `["--profile", "oss"]`, and allowed principals (default: the
-  paired Astation).
-- Environment variable names and optional absolute private JSON env file.
+`host_launch_query` returns the caller's own launch. An unknown id, another
+principal's launch, or a profile that was removed, changed revision or no
+longer allows the caller is `forbidden`.
 
-Remote requests cannot provide paths, commands, arguments or environment
-values. Launch checks the directory and current Git project again. Project
-scopes use the approved project's keyed hash; session-scoped grants cannot
-create an unbound new session.
+A started session appears in the registry (`list`, `session_changed`) under
+the returned `session_id` and `process_gen`. Send prompts through the normal
+receipts once its activity is `ready`.
 
-Environment contains basic runtime variables (HOME/PATH/locale), explicitly
-named runtime variables and approved JSON-file values. Files must be bounded,
-regular, same-user, private, and not symlinks. JSON is never sourced as shell
-code; only allowlisted names may appear. Name variables such as `OSS_API_KEY`
-and the applicable provider base URL in `env_names`. When starting a new
-detached runtime, Atem forwards only the ordinary runtime environment and
-variables explicitly named by enabled profiles; unapproved provider variables
-and test hooks are excluded. A private JSON file is another source for approved
-values and overrides runtime exports. Another terminal's exports, including a
-repeated `runtime start`, cannot update an existing runtime. Values never enter
-launch results or journals.
+## 4. Directed work
 
-Config reloads each second and is checked at the worker Start boundary.
-Increase revisions on approval changes. Invalid configuration or failed
-durability disables hosting until corrected and the runtime restarted.
-Commands do not restart a running runtime. Healthy `enabled = true` hosting
-keeps the runtime online with zero sessions. Both remote launch and notifications
-use this same runtime. Use `atem runtime start` for detached operation or bare
-`atem runtime` in the foreground. With hosting disabled, the ordinary idle
-timeout still applies. **OS boot services are not implemented**;
-the optional systemd/launchd design remains in `../agent-hosting.md`.
-
-## Launch operations
-
-| op | Additional fields | Result |
+| Op | Fields | Result `kind` |
 |---|---|---|
-| `host_profiles` | none | approved profile id/revision/label/provider |
-| `host_launch` | UUID v4 `request_id`, `profile_id`, `profile_revision`, `expires_at` | durable launch status |
-| `host_launch_query` | `request_id` | same principal's recorded status |
+| `work_enqueue` | `route_id`, `route_revision`, `task` | `work` |
+| `work_query` | `task_id` | `work` |
+| `work_cancel` | `task_id` | `work` |
+| `work_complete` | `task_id`, `result` | `work` |
 
-Expiry is absolute host wall milliseconds, after now and at most 24h ahead.
-Retries keep the original request ID/profile/revision/expiry with a fresh
-message ID. Digest covers host/profile/revision/expiry. Identical retries
-return saved state; different input or principal is `request_id_reused`.
+### Task
 
-Reserve the request/session/process IDs durably before spawn. Use the normal
-PTY worker with authorization checks before spawn and Start. `starting` means
-reserved; `started` confirms worker launch, not chat readiness. Local
-`atem agent attach <session_id>` and remote terminal/chat share that CLI.
-Definite preparation failures are `failed`; ambiguous starts are
-`outcome_unknown` and never replayed. Restart adopts a verified survivor with
-the reserved process identity or keeps the outcome unknown.
+```json
+{"task_id":"…","workflow_id":"…","expires_at":1793620800000,
+ "target":{"account_id":"account","atem_device_id":"host","host_trust_gen":1,
+           "session_id":"ses-abcdefghijkl","process_gen":"…"},
+ "prompt":"Add the /v2/orders endpoint",
+ "context":[{"kind":"vault","id":"api-contract","version":3,"digest":"<SHA-256 of text>","text":"…"}]}
+```
 
-## Directed work operations
-
-| op | Additional fields |
+| Field | Rule |
 |---|---|
-| `work_enqueue` | `route_id`, `route_revision`, `task` |
-| `work_query` | `task_id` |
-| `work_cancel` | `task_id` (queued/blocked only; never interrupts) |
-| `work_complete` | `task_id`, immutable `result` snapshot |
+| `task_id`, `workflow_id` | UUID v4; `task_id` is the task's identity |
+| `target` | the request's host triple, a session id and a UUID v4 `process_gen` |
+| `expires_at` | later than now and at most 24 h ahead at enqueue (else `invalid_request`) |
+| `prompt` | not blank, at most 17 KiB, no NUL |
+| `context` | 0–8 context snapshots |
+| `attachments` | optional: 1–4 distinct screenshot descriptors (§6); omitted when none |
 
-Task: UUID v4 `task_id`, UUID v4 `workflow_id`, existing full session `target`,
-`expires_at`, nonempty `prompt` and 0–8 context snapshots. Optional `attachments`
-carry up to four immutable screenshot descriptors; omit when empty. See the
-[attachment/mark contract](atem-task-attachments-v1.md) for transfer and bounds. Target contains the
-host triple, `session_id`, `process_gen`. Snapshot: `kind` (`memory`/`vault`),
-opaque `id`, positive integer `version`, lowercase hex SHA-256 `digest` of
-exact UTF-8 `text`, and `text`. Rendered prompt with attribution/correlation
-is at most 32 KiB; no controls except newline/tab. Each snapshot is bounded
-to 128 KiB (the rendered-prompt limit further restricts task context).
+A context snapshot, also the shape of a result, has `kind` (`memory` or
+`vault`), `id` (opaque id), `version` (at least 1), `digest` (SHA-256 of the
+UTF-8 `text`) and `text` (at most 128 KiB, no NUL). The host checks the
+digest, not that the content was published or that the sender may read it:
+the publisher vouches for both. The host renders the prompt as:
 
-This increment accepts **resolved immutable snapshots from the authorized
-publisher** and verifies their digest. It does not fetch or prove a Station
-commit itself. The publisher must verify committed publication and context
-access for this route. Station must agree this boundary before production
-delivery; a digest alone is not publication evidence. Content stays inside
-the encrypted channel and private local task store, never relay routing metadata.
+```text
+[Atem task <task_id> / workflow <workflow_id>]
+<prompt>
 
-A route selects a profile/principal allowlist. Target must match its directory,
-provider, launch-time Git project and profile/route revisions. First scope:
-existing sessions. A coordinator may launch, wait for readiness, then enqueue;
-automatic launch-on-arrival is not implemented.
+[Context Vault:<id> version <version> sha256 <digest>]
+<text>
+```
 
-Durable task acceptance precedes acknowledgment. The runtime schedules work
-without model polling, FIFO per session for all work sources including mark.
-Earlier blocked, submitting, submitted or ambiguous work holds later tasks for
-the same session; other sessions can proceed. A completed prompt releases its
-queue slot while the task awaits its explicit correlated result. Busy, unknown
-readiness, draft input, approvals, an
-existing lease or absent current authority leave work blocked. Ready/unowned
-sessions receive a normal acquiring session-v1 prompt, without takeover or
-local-origin injection. Persist `submitting` with a fixed receipt ID before
-submission. Reconcile that receipt after restart; ambiguity never retries.
-Duplicate enqueue never creates another prompt. Leases follow existing
-release/expiry rules; the scheduler does not renew or take them over.
+The rendered prompt is at most 32,768 bytes (28,672 with attachments, which
+leaves room for the paths the host appends) and has no control characters
+other than newline and tab.
 
-States: `queued`, `blocked`, `submitting`, `submitted`, `awaiting_result`,
-`completed`, `failed`, `cancelled`, `expired`, `outcome_unknown`. A completed
-prompt receipt means `awaiting_result`, not task completion. The originating
-authorized coordinator publishes a correlated result and calls work_complete
-with its immutable snapshot. Identical completion is idempotent; conflicts
-are refused. The coordinator owns result routing and workflow limits.
+### Enqueue
 
-## Replies, durability and integration
+The route names a profile. The target must be a session on this host with the
+same `process_gen` and the profile's directory, provider and project key; it
+may have been launched locally or remotely.
 
-Success: `host_work_result`, fresh `id`, request `re`, `host`, `attachment_gen`,
-`channel_id`, and `result`. Result `kind` is `profiles`, `launch` or `work`,
-with a corresponding body. The additive [message API](atem-messages-v1.md)
-also returns `kind: message`; uploads return `kind: attachment`. Launch body: request/session/process IDs and state.
-Work body: task/receipt IDs, state, detail and nullable explicit result.
-Errors use ordinary encrypted session errors: busy, forbidden, unauthorized,
-stale_target, invalid_request, request_id_reused.
+The host checks, in order: the route (`forbidden` when unknown); an existing
+`task_id` (the same principal and the same digest over host, route id,
+revision and task return the status while the route still allows the caller,
+else `forbidden`; anything else is `request_id_reused`); permission and
+target (`forbidden`); the expiry (`invalid_request`); storage (`busy` at a
+capacity limit or on a storage failure). The reply follows the durable
+`queued` record.
 
-`Attached::send` tracks at most 64 exchanges and verifies host/channel/
-attachment/request correlation before emitting `Event::Family` with family
-`session` and host_work_result data. Swift/Kotlin/WASM use their existing
-Family JSON event. Query operations recover status after lost replies.
-Unsolicited status subscriptions are not implemented in this increment.
+### Status
 
-`<config>/runtime/host-work.sqlite` uses synchronous commits and binds to one
-account/host/trust generation. Limits: 4,096 launch identities, 4,096 work
-identities, 256 unfinished tasks. Tombstones outlive the session list; capacity
-returns busy. No silent eviction can turn an old retry into new work.
-Administrative archival/compaction requires a future contract. Deleting the
-database is not a safe retry strategy. Preserve it on host identity changes;
-the old binding fails closed.
+```json
+{"kind":"work","work":{"task_id":"…","receipt_id":"…","state":"blocked","detail":"terminal has unsent input","result":null}}
+```
 
-Station owns atomic publication/outbox, replay/cursors, replica-safe delivery,
-lost-ack recovery, result routing and delivery while local Astation is selected.
-This document specifies the receiver acknowledgment, not a Station HTTP API.
-Astation owns New Agent/route/status UX. Existing hosted execution rollout
-policy remains unchanged.
+| State | Meaning |
+|---|---|
+| `queued` | accepted, not yet scheduled |
+| `blocked` | waiting; `detail` says why |
+| `submitting` | the dispatch intent is durable; the prompt is being submitted |
+| `submitted` | the prompt's receipt is accepted or executing |
+| `awaiting_result` | the prompt's turn ended; no result yet |
+| `completed` | `work_complete` stored the result |
+| `failed` | the prompt was rejected, or couldn't be built |
+| `cancelled` | cancelled before submission |
+| `expired` | not submitted by `expires_at` |
+| `outcome_unknown` | the submission is uncertain; never resubmitted |
+
+`receipt_id` (UUID v4, fixed at enqueue) is the session-v1 `request_id` of the
+prompt. `detail` is display text of at most 1024 bytes; clients don't parse
+it. `result` is a context snapshot exactly when the state is `completed`, else
+`null`.
+
+### Dispatch
+
+Tasks of one session run in enqueue order. A task that is queued, blocked,
+submitting, submitted or `outcome_unknown` holds the later tasks of its
+session; one awaiting its result doesn't. A task is dispatched when the
+sender has an authorized channel open that passes the work checks, the session
+is live with chat and `ready`, the terminal has no unsent input, nobody holds
+the lease, no approval is open on the session, and its attachments are
+verified. The host then records `submitting` and submits on the sender's
+attachment:
+
+```json
+{"type":"session","data":{"v":1,"op":"submit","id":"…","binding":{…},"request_id":"<receipt_id>",
+  "kind":"prompt","payload":{"text":"<rendered prompt>"},"acquire":true}}
+```
+
+The receipt sets the task's state: `accepted` or `executing` →
+`submitted`, `completed` → `awaiting_result`, `rejected` → `failed`,
+`outcome_unknown` → `outcome_unknown`. No receipt after the submit, or a task
+found `submitting` at a restart, is `outcome_unknown`; it is reconciled from
+the receipt journal when a receipt exists. A task is never submitted twice.
+The host never renews or takes over a lease for it.
+
+### Query, cancel, complete
+
+Each names the caller's own task under a route that still allows the caller;
+anything else is `forbidden`. An `outcome_unknown` task is reconciled from its
+receipt first.
+
+- `work_query` returns the status.
+- `work_cancel` moves `queued` or `blocked` to `cancelled` (again on
+  `cancelled`: the same status). Other states are `busy`. It never interrupts
+  a turn; use session-v1 `interrupt`.
+- `work_complete` carries `result`, a context snapshot. From
+  `awaiting_result` it moves to `completed`. The same result again returns the
+  status; another result is `request_id_reused`; other states are `busy`.
+
+## 5. Messages
+
+| Op | Fields | Result `kind` |
+|---|---|---|
+| `message_publish` | `message` | `message` |
+| `message_query` | `message_id` | `message` |
+
+### Envelope
+
+```json
+{"message_id":"…","workflow_id":"…","sender":"member:phone",
+ "created_at":1793620800000,"expires_at":1793620860000,
+ "recipients":[{"recipient_id":"…",
+   "host":{"account_id":"account","atem_device_id":"backend","host_trust_gen":1},
+   "destination":{"kind":"host"}}],
+ "text":"The backend contract is ready to review","context":[]}
+```
+
+| Field | Rule |
+|---|---|
+| `message_id`, `workflow_id` | UUID v4 |
+| `sender` | `member:<id>` or `service:<id>`, equal to the channel's principal |
+| `created_at`, `expires_at` | `expires_at` after `created_at`, at most 24 h later |
+| `recipients` | 1–32, one `account_id`, distinct `recipient_id`s and destinations |
+| `text` | at most 16 KiB, no control characters other than newline and tab |
+| `context` | 0–8 context snapshots (§4) |
+| `mark` | optional (§6); omitted when absent |
+
+A message has text that isn't blank, context or a mark, and serializes to at
+most 240 KiB. At first acceptance `created_at` is at most 60 s ahead of the
+host's clock and `expires_at` is in the future (else `invalid_request`).
+
+A recipient has a UUID v4 `recipient_id`, a `host` triple and a
+`destination`:
+
+| `destination` | Fields | Effect |
+|---|---|---|
+| `{"kind":"host"}` | — | a durable notice; no agent input |
+| `{"kind":"project",…}` | `route_id`, `route_revision` | a durable notice for the route's project; no agent input |
+| `{"kind":"agent",…}` | `route_id`, `route_revision`, `target` | one task (§4) |
+
+An agent destination's `target` is in its recipient's host. Two agent
+recipients can't name the same target, and other destinations can't repeat
+on one host. A `message_publish` names a host that has at least one recipient.
+
+An agent recipient becomes a task with `task_id` = `recipient_id`, the
+message's `workflow_id`, `target`, `expires_at` and `context`, the prompt
+`[Message <message_id> from <sender>]` followed by the text (and the mark), and
+the mark's screenshot as its attachment. It must be a valid task (§4).
+
+The message digest is the lowercase hex SHA-256 of the JCS form of the
+envelope; recipient order counts.
+
+### Publish
+
+For each of this host's recipients, in envelope order, the delivery is
+`{"state":"stored"}` (a notice), `{"state":"work","work":{…}}` (a queued task)
+or `{"state":"refused","code":"forbidden"}` when the sender may not reach it:
+
+- Host notice: any native member; a service without `projects` or `sessions`
+  restrictions whose `hosts` include the recipient's host.
+- Project notice: the route exists at that revision; any native member; a
+  service without a `sessions` restriction whose scope covers the host and the
+  route's project.
+- Agent: the route as above, the target in scope, and every work check of §4.
+
+The envelope, every decision and every task commit in one transaction before
+the reply. At a capacity limit or on a storage failure nothing is kept and the
+reply is `busy`. A refusal is final for that `message_id`.
+
+The host checks, in order: the `message` op and not a browser (`forbidden`);
+`sender` equal to the channel's principal (`forbidden`); an existing
+`message_id` (another sender or key is `forbidden`, other content
+`request_id_reused`, the same content returns the current receipt, or
+`forbidden` if an accepted recipient left the caller's scope); the times
+(`invalid_request`); the commit (`busy`).
+
+```json
+{"kind":"message","message":{"message_id":"…","digest":"…","sender":"member:phone","recipients":[
+  {"recipient_id":"…","delivery":{"state":"stored"}},
+  {"recipient_id":"…","delivery":{"state":"work","work":{"task_id":"…","receipt_id":"…",
+    "state":"queued","detail":"waiting for a ready agent","result":null}}}]}}
+```
+
+The receipt lists this host's recipients only. In a receipt, `work.result` is
+a reference `{"kind","id","version","digest"}` without text; `work_query` with
+the recipient id returns the whole snapshot. A receipt may carry the codes
+`forbidden` and `stale_target`; this host sends only `forbidden`.
+
+`message_query` returns the sender's own message with current task progress;
+an unknown id is `forbidden`. A message's tasks are ordinary tasks:
+`work_query`, `work_cancel` and `work_complete` take the recipient id.
+
+`Message::publications()` builds one `message_publish` per distinct host, each
+carrying the whole envelope. It keeps nothing: the client retains the envelope
+and retries each host with a fresh `id` until it accepted.
+
+## 6. Attachments and mark
+
+### `attachment_put`
+
+```json
+{"type":"session","data":{"v":1,"op":"attachment_put","id":"…","host":{…},
+  "attachment":{"attachment_id":"22222222-2222-4222-8222-222222222222",
+    "digest":"<SHA-256 of the PNG>","size":123456,"media_type":"image/png"},
+  "offset":0,"data":"<standard padded base64 of this chunk>"}}
+```
+
+| Field | Rule |
+|---|---|
+| `attachment_id` | UUID v4 |
+| `digest` | SHA-256 of the whole PNG |
+| `size` | 33 to 8,388,608 bytes |
+| `media_type` | `image/png` |
+| `offset` | byte offset, below `size` |
+| `data` | standard padded base64 of 1–98,304 bytes; `offset` plus its length at most `size` |
+
+- A new upload starts at offset 0 (else `invalid_request`).
+- The descriptor equals the first chunk's (else `request_id_reused`).
+- A chunk at the received length is appended. One before it must lie within
+  the stored bytes and equal them (it returns the progress), else
+  `request_id_reused`. One past it is a gap: `invalid_request`.
+- The chunk that completes the upload is kept only if the digest matches and
+  the bytes are a PNG: signature, an `IHDR` first chunk, width and height
+  1–16,384, area at most 40,000,000 pixels. Otherwise `invalid_request`.
+- A new upload past 256 uploads or 128 MiB of declared sizes is `busy`.
+
+Each chunk is durable before the reply,
+`{"kind":"attachment","upload":{"attachment":{…},"received":98304,"ready":false}}`;
+`ready` is true exactly when `received` equals `size`. After a lost reply or a
+restart, send the chunks again from offset 0 (stored ones return the
+progress) or from `received`.
+
+Uploads belong to the uploading principal and key. A task can use only the
+uploads of the sender that enqueued it. An upload grants no agent input.
+
+### Mark
+
+`message.mark` makes a message a Chisel/mark task. Every recipient is an
+`agent` destination. Text and context may be empty.
+
+```json
+{"mark_id":"mark_1793620800000_abcd12","url":"http://localhost:3000/","title":"Settings",
+ "screenshot":{"attachment_id":"…","digest":"…","size":123456,"media_type":"image/png"},
+ "annotations":[{"tool":"arrow","text":"Make this red","x":320,"y":160}]}
+```
+
+| Field | Rule |
+|---|---|
+| `mark_id` | opaque id: a source correlation id, not a file name |
+| `url` | at most 2048 bytes; text only, never fetched |
+| `title` | at most 512 bytes |
+| `screenshot` | an attachment descriptor |
+| `annotations` | at most 128: `tool` ≤ 32 bytes, `text` ≤ 1024 bytes, `x`, `y` integer pixels 0–16,384 |
+
+The rendered mark is at most 16 KiB with no control characters other than
+newline and tab. At dispatch the host verifies each attachment, writes it to a
+private file and appends to the prompt:
+
+```text
+[Verified screenshot <attachment_id> sha256 <digest>]
+Read this PNG: <path>
+```
+
+A missing or incomplete upload blocks the task ("waiting for verified
+screenshot attachments"). If the paths push the prompt over 32,768 bytes the
+task fails.
+
+The ID-only `markTaskAssignment` on the Astation link is answered with
+`markTaskResult{success: false}` and a message to upgrade the sender. Atem
+reads no `.chisel/tasks/` file and writes no input for it.
+
+## 7. Replies and errors
+
+Every success is a `host_work_result`:
+
+```json
+{"type":"session","data":{"v":1,"op":"host_work_result","id":"<fresh UUID v4>","re":"<request id>",
+  "host":{…},"attachment_gen":"<the channel's>","channel_id":"<the channel's>",
+  "result":{"kind":"profiles|launch|work|message|attachment",…}}}
+```
+
+A failure is the ordinary encrypted session `error` with `re` set to the
+request's `id`:
+
+| Code | When |
+|---|---|
+| `forbidden` | a missing op or local consent, out of scope, an unknown id or another principal's, a sender mismatch |
+| `unauthorized` | the caller's authority is no longer current |
+| `stale_target` | the host triple doesn't match |
+| `invalid_request` | decoding, a field rule, an expiry, an upload gap, bad PNG bytes |
+| `request_id_reused` | the same id with other content |
+| `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state |
+
+After a lost reply, query (`host_launch_query`, `work_query`,
+`message_query`) or resend the same content with a fresh `id`. Never mint a
+new `request_id`, `task_id` or `message_id` for the same intent.
+
+## 8. Client core
+
+`Attached::send` decodes these requests with the host's rules, checks the host
+triple and the feature against `welcome`, refuses a duplicate exchange `id`
+and keeps at most 64 exchanges outstanding. A `host_work_result` is accepted
+only on the channel's `attachment_gen` and `channel_id`, for an outstanding
+exchange it answers (same host and ids; for a message the digest, sender and
+this host's recipient ids in order; for an upload the descriptor and progress
+past the chunk; for `work_complete` the same result), and is emitted as
+`Event::Family` (family `session`). A session `error` with `re` ends the
+exchange. The Swift, Kotlin and WASM bindings use the existing Family JSON
+event.
+
+## 9. Host storage
+
+`<config>/runtime/host-work.sqlite` keeps launches, tasks, messages with their
+receipts, and upload bytes, each durable before its reply, bound to one host
+triple (under another, hosting stays off). Nothing is pruned or evicted: at a
+limit (4,096 launches, tasks or messages; 256 unfinished tasks; 256 uploads or
+128 MiB) new requests are `busy`, so an old retry never becomes new work.
+
+## 10. Planned (not implemented)
+
+- **Not implemented:** progress events. Launch, task and message status are
+  query-only.
+- **Not implemented:** launch on arrival. An agent destination names an
+  existing live session.
+- **Not implemented:** store-and-forward. Channel records can't be replayed on
+  a new channel, so a Station can't deliver a stored envelope for its sender,
+  and dispatch needs the sender's live channel. There is no origin proof and no
+  host-to-host sender.
+- **Not implemented:** resolving an `outcome_unknown` task, and archival or
+  compaction of the host's records.

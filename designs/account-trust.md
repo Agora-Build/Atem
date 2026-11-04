@@ -80,11 +80,12 @@ the genesis hash (so a relay can't swap in another account's log).
 
 Settings → Devices → Remove "Old iPad" on any manager device → `remove` entry
 signed and appended. Atem applies it the next time any trusted device connects
-(every connection must bring entries up to its own head), or when Atem fetches
-the log itself. Applying it is immediate: the removed device's live
+(every connection must bring entries up to its own head). Applying it is immediate: the removed device's live
 attachments are fenced and its queued work is rejected (r8 §H, `control_gen`).
 Atem keeps its head durably, so it never goes back to an older list. There are
 no revocation acknowledgements.
+**Not implemented:** Atem fetching the log from the relay itself (§R9.3 allows
+it; only a debug-build test hook carries entries that way).
 
 ### 3.5 Freshness and forks (user decision, 2026-10-19)
 
@@ -169,8 +170,7 @@ connection. **Relay:** store and serve the log per account (append-only,
 reject non-chaining appends as a convenience — not trusted). **Atem:** verify
 the chain, pin at pairing, a durable head, apply suffixes before admission,
 the conflict rule and freeze message, applying the recovery-key entry like any entry, challenge/response in `hello`, roles → permissions, accept many attachments at
-once (the runtime already multiplexes viewers; today it only admits the paired
-Astation).
+once (built in r9; before it the runtime admitted only the paired Astation).
 
 ## 6. Steps
 
@@ -307,19 +307,22 @@ approval requests. Notification delivery and lease ownership are independent:
 
 1. Every approval opens a card for all devices with `control` — no lease needed
    to receive it.
-2. Atem asks the relay (over its authenticated link) to push it:
-   `push_approval{approval_id, atem_device_id, session_id, tool, summary,
-   expires_at}`; the relay delivers via **APNs (iOS) / FCM (Android)** to every
+2. Atem asks the relay (over its authenticated link) to push it: on an r8
+   host `push_approval{approval_id, atem_device_id, session_id, tool, summary,
+   expires_at}`; on a host with a device list a host-signed `push_hint` per
+   member with `control`, tool and summary HPKE-sealed to its `enc_key`
+   (§R9.9). The relay delivers via **APNs (iOS) / FCM (Android)** to every
    device on the account with `control`, online or not. Astation owns the push
    credentials, device token registration and the notification UI.
 3. The notification shows "Claude on Genie wants to run `npm test`" (tool +
-   short redacted summary only); marked `mutable-content` so iOS can decrypt it on
-   device once end-to-end encryption lands.
+   short redacted summary only); marked `mutable-content` so iOS can decrypt
+   the sealed hint on device.
 4. Tapping wakes the app, which reconnects, authenticates as a member device and
    receives the pending approval; Allow once / Always allow (Claude) / Deny.
 5. The answer needs `control` and the exact pending request, never the lease
    (r8 §G): it doesn't take, renew or move the lease, and `acquire` is refused.
-6. Answered elsewhere, expired or closed → `push_resolved{approval_id}` replaces
+6. Answered elsewhere, expired or closed → `push_resolved{approval_id}` (r9: a
+   resolved `push_hint`) replaces
    the notification everywhere (collapse-id / FCM tag = approval_id); a late tap
    says "already answered".
 7. Hook waits: Claude 600 s (dialog stays visible; first answer wins), Codex

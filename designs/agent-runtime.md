@@ -10,12 +10,14 @@ it. The wire contract is [protocol/atem-session-v1.md](protocol/atem-session-v1.
 and [account-trust.md](account-trust.md).
 
 Optional hosting is described separately in [agent-hosting.md](agent-hosting.md).
-The feature branch adds `atem runtime start` (detached startup or reuse),
+Atem v0.8.2 added `atem runtime start` (detached startup or reuse),
 `atem runtime check`, approved remote session creation and directed-work
 notifications; see [the host-work extension](protocol/atem-host-work-v1.md).
-Healthy hosting explicitly enabled in private `runtime.toml` keeps the same
-runtime online with zero sessions. Default on-demand lifetime below is
-unchanged. OS service installation and boot startup remain planned.
+Since v0.8.3 a launch profile or route without `principals` is open to the
+paired Astation only. Healthy hosting explicitly enabled in private
+`runtime.toml` keeps the same runtime online with zero sessions. Default
+on-demand lifetime below is unchanged. **Not implemented:** OS service
+installation and boot startup (planned).
 
 ## Product decisions
 
@@ -32,7 +34,8 @@ decided later: [account-trust.md](account-trust.md) and the contract's r9 append
   session keeps running and stays visible in Astation. The runtime starts on
   demand and exits when idle (no system service). Several sessions run at
   once, several of one provider included (at most 16). Launching is local
-  only and needs no pairing.
+  and needs no pairing; since v0.8.2 a remote client can also launch from a
+  profile the host approved in `runtime.toml` (opt-in).
 - **Workers own agents** and survive the broker, which adopts them only on a
   matching session id, process generation and OS start time. A worker or
   agent crash or a reboot shows `interrupted`/`recovery_required`: nothing is
@@ -52,7 +55,7 @@ decided later: [account-trust.md](account-trust.md) and the contract's r9 append
   lease. Raw keystrokes are a live stream, never replayed. Receipts last the
   session plus 7 days (at most 4096 per session). The journal keeps no prompt
   text past acceptance (owner-only, not encrypted), and Atem keeps no
-  conversation store (the approved 30-day history was not built).
+  conversation store. **Not implemented:** the approved 30-day history.
 - **Transports.** The direct port-8080 link and the relay are thin adapters
   over one registry, lease and receipt implementation; neither grants trust.
   Remote access is bounded (24 h per r8 attachment or r9 native channel, a
@@ -162,7 +165,8 @@ atem pair / cred / list  ─┘  (same user)    └─ one authenticated Astatio
 
 ### The runtime process
 
-- `atem runtime` is a hidden subcommand of the same binary, started detached
+- `atem runtime` (bare) is the runtime process, a subcommand of the same
+  binary (`atem runtime start|check|restart` are its client commands), started detached
   by a client when no runtime answers (the `atem cred-agent` pattern: same
   binary, `setsid`, `chdir($HOME)`, output to `~/.config/atem/runtime.log`).
 - One per config directory: an exclusive `flock` on
@@ -341,10 +345,12 @@ HTTP-only commands (`atem sync`, `memory`, `skill`, `vault`) are unchanged.
 
 Everything Astation sees of sessions is atem-session: the contract is
 [protocol/atem-session-v1.md](protocol/atem-session-v1.md), and
-[protocol/README.md](protocol/README.md) gives the overview. Mark tasks go
-to a live Claude session whose working directory contains
-`.chisel/tasks/<task_id>.json`; with none, the task fails with "no Claude
-session for this project; run `atem agent launch claude` there".
+[protocol/README.md](protocol/README.md) gives the overview. Since v0.8.2,
+Chisel/mark tasks arrive as directed-work messages with uploaded screenshots
+([protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md#6-attachments-and-mark));
+an old `markTaskAssignment` fails with "Chisel/mark requires message_publish
+with a mark payload and uploaded screenshot; upgrade the Astation/Chisel
+sender".
 
 ## Failure handling
 
@@ -417,6 +423,7 @@ and controllable in Astation throughout, verification approved with Touch ID.
 
 ## Out of scope
 
-Sessions surviving a reboot; a system service; a GPUI
-desktop frontend; attaching to agent processes Atem did not start; several
-runtimes per profile; session names.
+Sessions surviving a reboot; a GPUI desktop frontend; attaching to agent
+processes Atem did not start; several runtimes per profile; session names.
+**Not implemented:** a system service (OS service installation and boot
+startup, now planned in [agent-hosting.md](agent-hosting.md)).

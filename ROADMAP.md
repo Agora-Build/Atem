@@ -6,19 +6,19 @@ Where atem is headed. This is a direction, not a contract — items shift as we 
 
 ## Upcoming
 
-### Build by Talk
+### Build by Talk (not implemented)
 
 Talking is the fastest way to get a whole project clear. Build by Talk is a voice conversation, from your phone or Mac, that brings you, the project's knowledge and its coding agents together. Ask where things stand, work through a design, decide what's next. Answers come from the project's own context: decisions, design docs, commits and session summaries, which Atem collects and, per project and opt-in, uploads for retrieval. When a decision turns into work, Build by Talk reaches the coding agents running in Atem through tool calls. It asks Claude Code or Codex for more information (live status, latest replies), or reads a task back to you and hands it over, then tells you when the work is done. Approvals stay taps on your phone, never voice. It's an Astation feature built on Atem's agent chat, approvals and r9 remote access (all shipped), and it replaces the earlier voice-coding pipeline, which was removed.
 
 → Planned; the build starts later (Astation and Atem). Design: [designs/build-by-talk.md](designs/build-by-talk.md).
 
-### Windows support (PowerShell)
+### Windows support (PowerShell) (not implemented)
 
 atem ships for Linux and macOS today. Native Windows support means `atem` runs in PowerShell — adding the `windows-msvc` build target, verifying the ConPTY/`portable-pty` path, a Windows daemon-detach pattern, and an `install.ps1`.
 
 → **[#3](https://github.com/Agora-Build/Atem/issues/3)** — best owned by someone who develops on Windows day to day.
 
-### `atem studio` — cloud agents + telephony
+### `atem studio` — cloud agents + telephony (not implemented)
 
 A new command family for managing **cloud ConvoAI agents** and bridging them to **phone calls** over a SIP trunk — the CLI/TUI counterpart of Agora's Conversational AI Studio. Distinct from `atem agent` (local Claude Code / Codex agents).
 
@@ -32,13 +32,13 @@ Built and usable today, but not yet at their best — actively being improved.
 
 ### Astation Integration
 
-[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates [Chisel](https://github.com/Agora-Build/chisel), atem, and AI agents — it receives annotation tasks from the browser, routes them to the right atem instance, and tracks task status. The integration is partially wired and maturing alongside Astation.
+[Astation](https://github.com/Agora-Build/Astation) is a macOS menubar hub that coordinates [Chisel](https://github.com/Agora-Build/chisel), atem, and AI agents — it receives annotation tasks from the browser, routes them to the right atem instance, and tracks task status. Atem's side is built: pairing and device verification, one Astation link per profile (`atem runtime`), terminals, chat and approvals over atem-session r8/r9 (v0.8.0), and Chisel/mark tasks with screenshots as directed work (v0.8.2). It keeps maturing alongside Astation's own releases.
 
 ## Under discussion
 
 Not committed yet — being shaped before they become roadmap items. Opinions welcome.
 
-### `atem serv agent <github-repo-url>`
+### `atem serv agent <github-repo-url>` (not implemented)
 
 An idea to run an agent directly from an official Agora GitHub repository — `atem serv agent <url>` would fetch and serve it. Scope, security model, and exactly what "serve an agent from a repo" means are all open.
 
@@ -50,6 +50,8 @@ Recent notable additions (see [releases](https://github.com/Agora-Build/Atem/rel
 
 - Atem Memory (`atem sync`, `atem memory`, `atem skill`) — agents share facts and skills across agents and machines, with fact history and offline search
 - `atem vault` — a shared, versioned context store for handing work between agents
+- Remote agent launch from host-approved profiles, notifications (directed work and messages to agents), Chisel/mark tasks with screenshots (`runtime.toml`, `atem runtime start|check`, v0.8.2); profiles and routes without `principals` default to the paired Astation (v0.8.3)
+- Access codes for every `atem serv` page and API (v0.8.1)
 - AI agents (`atem agent launch|attach|list|stop`, v0.8.0) — the original Claude Code and Codex CLIs in Atem terminals that outlive the runtime; Astation, your phone and approved services view, control and chat with them over atem-session r9, and answer their permission prompts
 - MCP server support in `convo.toml` — agents can call tools from MCP servers
 - `atem serv files` — serve a directory/file over HTTPS, with Markdown rendering

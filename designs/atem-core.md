@@ -1,8 +1,8 @@
 # atem-core: shared token library (Rust API + C ABI)
 
 Status: built and released (since Atem v0.6.15: the xcframework, header and
-SHA-256 sums are attached to every release); the Astation integration is a
-follow-up. Approved 2026-10-12/13 (handoff from the Astation agent, saved as the
+SHA-256 sums are attached to every release). **Not implemented:** the Astation
+integration, which is Astation's work (not tracked in this repo). Approved 2026-10-12/13 (handoff from the Astation agent, saved as the
 "Shared-library handoff" memories in project github.com/agora-build/atem;
 layout and distribution chosen by the user on 2026-10-13). This document is the
 spec the implementation plan argues from.
@@ -112,8 +112,8 @@ atem_core.h` and `atem-core-<version>-SHA256SUMS.txt`. Astation pins a
 version. Linux and Windows are built and tested in CI from source; their
 artifacts can be added later.
 
-## Out of scope (follow-ups)
+## Out of scope (follow-ups) (not implemented)
 
-Astation integration (replacing `astation_token.cpp`, a Tools > Token Tools
-Generate/Inspect UI), other Agora services (FPA, Chat, aPaaS builders),
-Linux/Windows artifacts.
+**Not implemented:** the Astation integration (Astation's work: replacing
+`astation_token.cpp`, a Tools > Token Tools Generate/Inspect UI), other Agora
+services (FPA, Chat, aPaaS builders), Linux/Windows release artifacts.

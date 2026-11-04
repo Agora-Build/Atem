@@ -8,7 +8,10 @@ projects and local filesystem paths are not credential project identities.
 An updated, unlocked Atem reports its current Git remote and project names it
 has remembered for the account. It reports after authenticated connection, right
 after `atem cred unlock` succeeds (the report on connect was skipped because the
-keys were still locked), and in response to `credentialProjectListRequest`. `atem cred projects` explicitly
+keys were still locked), and in response to `credentialProjectListRequest`. These
+reports are sent by `atem runtime`, which holds the Astation link and runs in the
+home directory, so they carry the remembered names only. `atem cred projects`
+(run in the runtime for the CLI's directory) adds the current repository and
 publishes suggestions with a bounded connection/delivery wait. Locked or unverified clients
 send no inventory and never trigger an unlock prompt just to fill this list.
 An ephemeral CLI can send its report and exit; no persistent connection or
@@ -76,5 +79,6 @@ process memory; saved credential scopes remain available after restart.
 The relay transports ciphertext only. It supplies neither authoritative device
 identity nor project permissions. Refresh requests contain no secret or
 project name; responses can only be encrypted to the locally pinned Astation.
-Manual input remains available with no connected Atem. This reporting feature
-does not implement Atem credential retrieval or the future scope-grant service.
+Manual input remains available with no connected Atem.
+**Not implemented:** Atem credential retrieval (`atem cred get`) and the
+scope-grant service; this reporting feature doesn't depend on them.

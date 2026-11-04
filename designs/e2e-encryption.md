@@ -7,7 +7,8 @@ signed account state, signed RFC 9180 HPKE grants for `K`). Build step 2a
 is built on the atem side (2026-10-10): `device_keys.sealed` under a
 storage key held by the home Astation, the cred agent (`atem cred-agent`),
 Touch ID unlock through Astation, storage-key rotation at every unlock,
-and `atem cred unlock|lock|status`. The Astation side of steps 0–2a was
+and `atem cred unlock|lock` (the key state is now shown by `atem status`;
+there is no `atem cred status`). The Astation side of steps 0–2a was
 pending then (see "Astation work for steps 0–1" and "Astation work for step
 2a"); it has since landed (devices verify, unlock and escrow live, and
 encryption is on for the account).
@@ -23,9 +24,12 @@ completion ("Migration completion lifecycle"). Everything here is in Atem
 v0.8.0. Device-signed writes (3), the recovery
 secret (4), credentials (5–6, 8) and auto-unlock (7): design approved for
 planning (2026-10-09), hardened after an independent security review the
-same day (see "Review findings"). Not built: `atem cred get` and the other
-credential commands are designed only (`atem cred unlock|lock|projects` are
-built).
+same day (see "Review findings"). The recovery secret (4) was built as r9's
+Recovery Kit (`crates/atem-client`, Atem v0.8.0; "Recovery kit").
+**Not implemented:** build steps 3, 5, 7 and 8 on the atem side: device-signed
+memory writes and bound associated data, the revocation list, credentials
+(scope and index keys, `atem cred get|list|add`), auto-unlock and ticket
+rolling (`atem cred unlock|lock|projects` are built).
 Owner: Brent G
 
 ## Goal
@@ -105,6 +109,10 @@ device key, unlock policy and recovery kit, described once below.
 | Recovery | One kit, one secret `R`, Astation's account recovery. A recovery enrollment waits **24 hours** on each host's clock unless a manager approves or vetoes it; the kit is replaceable (`set_recovery_key`). See "Recovery kit". |
 | `atem cred add` | Optional, not required for v1. |
 
+**Not implemented:** the decisions on device-signed memory writes, on
+credentials (their encryption, offline reads, grants, writers, names, fetch
+log and `atem cred add`) and on auto-unlock; see the status line.
+
 ## Keys
 
 Astation is the root of trust and holds every shared key. Astation never
@@ -124,6 +132,11 @@ holding `K` never opens a credential.
 | Unlock-auth key | Ed25519, generated on the device | Signs unlock requests while the device key is still locked | The device, **unsealed** on disk (0600); public half pinned by Astation |
 | Storage key | 256-bit random, one per device, replaced at every unlock | Seals `device_keys.sealed` on disk | Astation Keychain only; agent memory while unlocked |
 | Recovery secret `R` | 256-bit random | Root of recovery. See "Recovery kit" | The recovery kit only |
+
+**Not implemented:** scope keys and the index key (credentials, build step 5).
+The device signing key exists but signs storage-key rotations, migration
+completions and credential-project reports only, not memory, skill or vault
+writes (build step 3).
 
 How `K` is used (as built; the subkey separation an earlier draft of
 this design described was never implemented):
@@ -237,6 +250,12 @@ statement whose `sign_gen` isn't their pinned generation.
 | `atem-sign-rotate-v1` | — | — | Withdrawn: recovery is the r9 membership-log `recovery_add` with a 24-hour wait, and the kit is replaced with `set_recovery_key` ("Recovery kit"). |
 | `atem-sign-veto-v1` | current signing key | account, sign_gen, vetoed new_gen | Cancels a pending replacement from the current Mac. |
 
+**Not implemented:** `atem-scope-directory-v1`, `atem-cred-row-v1`,
+`atem-cred-manifest-v1`, `atem-revoked-v1`, `atem-mem-write-v1` and
+`atem-sign-veto-v1` (build steps 3–5; the veto went with the withdrawn
+signing-key rotation, r9 vetoes are device-list entries). atem signs or
+verifies every other statement above.
+
 ## Devices
 
 ### Verification (once per device)
@@ -275,6 +294,8 @@ for two key sets that produce the same short code: it gets one guess with a
    `atem-scope-directory-v1`, `atem-revoked-v1`, and signed grants: `K`, the
    index key, and each ticked scope key. The device seals its first storage
    key to Astation's encryption key (see "Keys on disk").
+   **Not implemented:** the scope directory, the revocation list and index or
+   scope-key grants; atem accepts only `K` grants (`src/memory/grant.rs`).
 8. **Epochs.** Astation signs the certificate at epoch `E` and then
    re-signs the current account state at a later epoch (`E+1`), so in
    `deviceVerified` the account state's epoch is always `>=` the
@@ -682,9 +703,9 @@ The unlock request is signed by the unlock-auth key and bound to its reply:
    the unlock-auth key. `storage_kid` names the key that opens the sealed
    file on disk; `ticket` is empty until auto-unlock (build step 7);
    `time` is Unix seconds. `boot_id` is Linux's
-   `/proc/sys/kernel/random/boot_id`; on macOS it is empty for now (a later
-   step can send `sysctl kern.bootsessionuuid`), so Astation can't tell a
-   Mac's reboots apart by it.
+   `/proc/sys/kernel/random/boot_id`; on macOS it is empty, so Astation
+   can't tell a Mac's reboots apart by it. **Not implemented:** sending
+   `sysctl kern.bootsessionuuid` on macOS.
 2. Astation checks the signature against the pinned unlock-auth key and
    `time` against its clock, then applies the policy below.
 3. If it releases, it seals the storage key named by `storage_kid` (current
@@ -707,6 +728,8 @@ Policy:
 - **Auto-unlock is a per-device opt-in** for unattended servers. Astation
   releases the storage key without a prompt only while every check below
   matches the approved baseline. Any change falls back to Touch ID.
+- **Not implemented:** auto-unlock, the checks below and ticket rolling
+  (build step 7). atem sends an empty `ticket`; every unlock is Touch ID.
 
 ```mermaid
 flowchart TD
@@ -793,6 +816,11 @@ flowchart LR
    the fetch log says it fetched first, so you can rotate them at the
    provider. The fetch log is kept by the relay and is best effort.
 
+**Not implemented:** on the atem side, the signed `atem-revoked-v1` list and
+dropping a revoked device's writes (build step 3), and everything about
+scope keys and the fetch log (credentials). atem records a revocation only
+from an `unlockDenied` with `revoked: true` (see "Wire messages (build step 2a)").
+
 ## Recovery kit
 
 The Recovery Kit is **Astation's account recovery**, used only when every
@@ -840,8 +868,8 @@ Rules:
    in the device list.
 3. The kit is shown behind Touch ID or the Mac password, and turning on
    memory encryption or credentials requires saving it first.
-4. Any atem that still holds `K` can also re-grant it to a new Astation
-   (`keyOffer`, approved on both sides).
+4. **Not implemented:** Any atem that still holds `K` can also re-grant it
+   to a new Astation (`keyOffer`, approved on both sides).
 
 If you lose every device and the kit, and no atem holds `K`, the data is
 gone for good. That's the point of the design.
@@ -895,11 +923,13 @@ data becomes readable on the server again):
 | Vault | entry `content`, `summary` | vault id, entry number, version, writer, timestamps |
 
 - **Format.** `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305
-  under `K` with a random 24-byte nonce. The associated data binds the
-  record id, field name, scope, project HMAC, and the version or vault
-  entry number, so the relay can't move a ciphertext to another record,
-  field, project or entry.
-- **Signed writes.** Every write, including an invalidation or replacement,
+  under `K` with a random 24-byte nonce. As built, the associated data is
+  `"<record id>\n<field>"` (`account_keys::field_aad`), so the relay can't
+  move a ciphertext to another record or field.
+- **Not implemented:** binding the scope, project HMAC and version or vault
+  entry number into the associated data (build step 3), so a ciphertext
+  can't move to another project or entry either.
+- **Not implemented:** **Signed writes** (build step 3). Every write, including an invalidation or replacement,
   carries an `atem-mem-write-v1` signature from the writer's device signing
   key over the record's plain metadata, its validity fields and the hash of
   each encrypted field. Readers check the signature, the writer's
@@ -921,8 +951,8 @@ data becomes readable on the server again):
 
 ### Moving existing data over
 
-On first sync with `enabling`, atem pushes encrypted, signed copies of every
-memory and skill it has (in chunks) and asks the relay to purge the
+On first sync with `enabling`, atem pushes encrypted copies (unsigned until
+build step 3) of every memory and skill it has (in chunks) and asks the relay to purge the
 plain-text versions, including skill history and old vault entry versions.
 This is the one place the append-only history rule bends. Database backups
 taken before the purge still hold the plain text; the purge can't reach
@@ -1054,6 +1084,11 @@ state. All failure paths retain enough durable state for safe recovery.
 
 ## Credentials (`atem cred`)
 
+**Not implemented:** this section, except the credential-project reports in
+"Projects and isolation" and `atem cred unlock|lock|projects`: atem has no
+scope or index keys, credential rows, manifests or `atem cred get|list|add`
+yet (build steps 5 and 8).
+
 Credentials store API keys and other secrets with a value that can differ
 per project: `openai` in DialF and `openai` in convo-demo are two
 different values. They are their own feature: `atem vault` stays the
@@ -1089,7 +1124,7 @@ process running as your user can read every project that device was
 granted. To keep two projects apart, give them separate devices: another
 box, VM or OS user. Each OS user has its own device keys.
 
-### Names and values
+### Names and values (not implemented)
 
 A credential is one name → value pair in a scope. Values are opaque text
 up to 64 KB, so PEM keys and JSON service-account files fit. Names keep
@@ -1099,7 +1134,7 @@ the original spelling is stored encrypted under the scope key (associated
 data: the row's `name_hmac` and `"display-name"`), with its hash in the
 signed row. Two names that differ only in case can't exist.
 
-### Writing (Astation only)
+### Writing (Astation only) (not implemented)
 
 ```mermaid
 sequenceDiagram
@@ -1131,7 +1166,7 @@ sequenceDiagram
 atem has no write path. A forged write from an atem would fail every other
 atem's signature check anyway.
 
-### Reading (`atem cred get`)
+### Reading (`atem cred get`) (not implemented)
 
 ```mermaid
 sequenceDiagram
@@ -1181,7 +1216,10 @@ controls only the first; the other two never leave your devices.
 
 ### Commands
 
-atem, read-only (tier 2, gated with `auth::require_pairing`):
+atem, read-only (tier 2, gated with `auth::require_pairing`).
+**Not implemented:** `atem cred get`, `atem cred list` and `atem cred add`
+(and the exit codes below); `atem cred unlock`, `atem cred lock` and
+`atem cred projects` are built, and `atem status` shows the key state.
 
 ```
 atem cred get <name> [--project <key|short-name> | --global]
@@ -1216,7 +1254,8 @@ Astation:
 Memory names a credential like this: "DialF's OpenAI key is cred `openai`
 (project scope)." References to `atem vault get` change to `atem cred get`
 in `designs/atem-memory.md` and in the comment and test in
-`src/memory/secrets.rs`.
+`src/memory/secrets.rs` once `atem cred get` exists. **Not implemented:**
+that change; both still say `atem vault get`.
 
 ## What each side stores
 
@@ -1233,7 +1272,7 @@ A plain credential value is never written to disk anywhere.
   unlock baselines, epochs and counters: Keychain.
 - Credential values: only in memory while writing or rotating.
 
-**atem (`~/.config/atem/cred/`, directory 0700, all files 0600; `CredPaths` in `src/memory/verification.rs` is the one definition):**
+**atem (`~/.config/atem/cred/`, directory 0700, all files 0600; `CredPaths` in `src/paths.rs` is the one definition):**
 - `device_keys.sealed`: the device key, the device signing key and the
   account keys (`K` and its previous keys, step 2b), encrypted with the
   current storage key.
@@ -1269,6 +1308,10 @@ A plain credential value is never written to disk anywhere.
   index subkeys and scope keys.
 - Credential values: never cached. `knowledge.db` holds plain memory and
   keeps refusing credentials.
+- **Not implemented:** the grants cache; in `cred/state.json`, the manifest
+  counters, `blob_version`, unlock ticket, scope directory and revocation
+  list; index subkeys and scope keys in the agent (build steps 3, 5 and 7).
+  Granted `K`s go into `device_keys.sealed`.
 
 **Relay (Postgres):**
 - Memory, skills, vault: existing tables, encrypted fields as `e1.…`, plus
@@ -1282,6 +1325,10 @@ A plain credential value is never written to disk anywhere.
 - `cred_recovery`: the versioned backup blob.
 - `cred_fetch_log`: device, `name_hmac`, version, time.
 - The account's latest signed account state and revocation list.
+- **Not implemented:** atem sends no device signature with memory rows and
+  uses none of the `cred_*` tables or a revocation list (build steps 3 and 5;
+  the relay side is Astation's and isn't checked here). r9 keeps K backups as
+  `atem-k-backup-v2` blobs versioned by the device list (§R9.5).
 
 ## Formats
 
@@ -1293,16 +1340,16 @@ project `…/a/bc` + name `d`).
 
 | Use | Format | Bound to |
 |---|---|---|
-| Memory / skill / vault field | `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 under `K` | `enc("atem-mem-field-v1", record id, field, scope, project_hmac, version or entry number)` |
-| Memory write signature | Ed25519, device signing key | `atem-mem-write-v1` |
-| Credential value | `c1.<scope_kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 | `enc("atem-cred-v1", account, scope_hmac, kid, name_hmac, version)` |
-| Credential display name | same, under the scope key | `enc("atem-cred-name-v1", account, scope_hmac, name_hmac)` |
+| Memory / skill / vault field | `e1.<kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 under `K` | as built: `"<record id>\n<field>"`; designed (not implemented): `enc("atem-mem-field-v1", record id, field, scope, project_hmac, version or entry number)` |
+| Memory write signature (not implemented) | Ed25519, device signing key | `atem-mem-write-v1` |
+| Credential value (not implemented) | `c1.<scope_kid>.<base64(nonce ‖ ciphertext)>`, XChaCha20-Poly1305 | `enc("atem-cred-v1", account, scope_hmac, kid, name_hmac, version)` |
+| Credential display name (not implemented) | same, under the scope key | `enc("atem-cred-name-v1", account, scope_hmac, name_hmac)` |
 | Key grants (`K`, index, scope) | HPKE RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD | `info = enc("atem-grant-info-v1", account, type, device_id, device_pub, kid, scope_hmac)`; the signed `atem-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
 | Unlock reply (storage key) | same HPKE to the request's `e_pub`, empty AAD | `info = enc("atem-unlock-info-v1", account, device_id, storage_kid, SHA-256(request statement bytes))`; the signed `atem-unlock-grant-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
 | Storage key to Astation (rotation) | same HPKE to the pinned `astation_enc_pub`, empty AAD | `info = enc("atem-storage-key-info-v1", account, device_id, new_storage_kid)`; the signed `atem-storage-rotate-v1` carries SHA-256(enc(encapped_key, ciphertext)) |
 | `device_keys.sealed` | JSON `{version: 1, device_id, storage_kid, nonce, ciphertext}`; XChaCha20-Poly1305 under the 32-byte storage key; plaintext is the device key, the device signing key and (step 2b) `account_keys`, per account the current kid and key and the previous keys; the payload `version` is 2 when `account_keys` is present, else 1 (the unlock-auth key lives in its own 0600 file `unlock_auth_key`) | AAD `enc("atem-device-keys-v1", device_id, storage_kid)` |
-| Credential names | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
-| Credential scopes | `HMAC-SHA256(I_scope, project_key)` | — |
+| Credential names (not implemented) | `HMAC-SHA256(I_name, enc(scope_hmac, lowercase(name)))` | — |
+| Credential scopes (not implemented) | `HMAC-SHA256(I_scope, project_key)` | — |
 | Memory projects (and service `projects` scopes) | `h1.<kid>.<hex HMAC-SHA256(K, project_key)>` | — |
 | Astation signatures | P-256 ECDSA (Secure Enclave), SHA-256, carried as fixed 64-byte `r ‖ s`; Astation converts from the Enclave's DER and normalizes to low-S; atem rejects high-S | the statement's encoding |
 | Device, unlock-auth and recovery signatures | Ed25519, 64 bytes | the statement's encoding |
@@ -1354,7 +1401,10 @@ and in the shipped #36 code; the design above includes every fix.
 Findings 1, 4 and 5 affect code already shipped in #36. At the review
 (2026-10-09) no account was encrypted in practice, because Astation's key
 manager wasn't built; they had to be fixed before it shipped (build step 0),
-and were.
+and were, except finding 5's metadata binding and device-signed writes.
+**Not implemented:** the fixes that belong to later build steps: finding 5's
+metadata binding and device-signed writes (step 3), 6 (credentials, step 5)
+and 11 (ticket rolling, step 7).
 
 ## Wire messages (build steps 0–1)
 
@@ -1771,12 +1821,16 @@ Suggested build order:
    Touch ID unlock. Split: 2a (built on atem) seals the device keys and
    opens grants in the agent; 2b (built on atem) moves `K` and `data_keys.enc` behind the
    agent.
-3. Device-signed memory writes, bound associated data, revocation list,
-   `K` subkeys; rotate `K`.
+3. **Not implemented:** Device-signed memory writes, bound associated data,
+   revocation list, `K` subkeys. (Rotating `K` works: the agent keeps the
+   previous keys, see "Rotation".)
 4. Recovery secret `R`, versioned backup blob, Secure Enclave signing key,
-   rotation with delay and veto.
-5. Credentials read path (`atem cred get/list/status`), scope directory,
-   manifests, relay tables.
-6. Astation Credentials and Devices tabs.
-7. Auto-unlock, its checks and ticket rolling.
-8. `atem cred add` (optional).
+   rotation with delay and veto. Built as r9's Recovery Kit (Atem v0.8.0):
+   `atem-k-backup-v2`, `recovery_add` with the 24-hour wait and approve/veto,
+   `set_recovery_key`; the signing-key rotation was withdrawn.
+5. **Not implemented:** Credentials read path (`atem cred get/list`), scope
+   directory, manifests, relay tables.
+6. Astation Credentials and Devices tabs (Astation's; its Credentials editor
+   today is a local Keychain store, see `docs/credentials.md`).
+7. **Not implemented:** Auto-unlock, its checks and ticket rolling.
+8. **Not implemented:** `atem cred add` (optional).

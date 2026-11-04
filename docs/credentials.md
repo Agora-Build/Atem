@@ -84,9 +84,11 @@ Run inside the repository with the verified device unlocked:
 atem cred projects
 ```
 
-An unlocked atem also reports on its own whenever it connects to Astation: the
-TUI, `atem pair`, and right after `atem cred unlock` in the repository. Run
-`atem cred projects` to send the report right away from another repository.
+An unlocked atem also reports on its own: `atem runtime`, which holds the
+Astation link, reports after each authenticated connection, when Astation asks
+and right after `atem cred unlock`. The runtime runs in your home directory, so
+those reports carry the remembered project names only; run `atem cred projects`
+inside a repository to add that repository.
 
 Open Settings > Credentials on the Mac, add a credential, select **Use project
 scope**, and choose the reported project. Refresh the list if needed. You can
@@ -138,9 +140,10 @@ by account-data encryption. See the [encryption design](../designs/e2e-encryptio
 
 ## Current availability
 
-`atem status` and `atem cred unlock`, `lock` and `projects` are implemented. The
-planned `atem cred get/list` service for retrieving values from Astation's
-Credentials editor is not implemented. Use that editor on the Mac to add,
+`atem status` and `atem cred unlock`, `lock` and `projects` are implemented.
+**Not implemented:** the planned `atem cred get/list` service for retrieving
+values from Astation's Credentials editor (design:
+[e2e-encryption.md](../designs/e2e-encryption.md), "Credentials"). Use that editor on the Mac to add,
 update, copy or delete its values with Touch ID. Memory and skills must contain
 credential names only; the shared-notes vault is separate from this local
 credential store.

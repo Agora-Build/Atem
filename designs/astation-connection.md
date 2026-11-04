@@ -1,15 +1,15 @@
 # Atem ↔ Astation connection
 
-Status: current design (Atem v0.8.0, 2026-11-01).
+Status: current design (Atem v0.8.3).
 
-How Atem reaches Astation: the link, its order, authentication, pairing, the relay, r9's relay only and routed links, re-authentication and Station changes. AGENTS.md ("Astation Integration", "Logins and the pairing", "SSO auth", "r9 remote clients") has the full detail.
+How Atem reaches Astation: the link, its order, authentication, pairing, the relay, r9's relay only and routed links, re-authentication and Station selection. AGENTS.md ("Astation Integration", "Logins and the pairing", "SSO auth", "r9 remote clients") has the full detail.
 
 ## Overview
 
 - Only `atem runtime` holds an Astation link: one per config dir, so one per machine and user. Bare `atem` and the CLI commands open none.
 - `atem pair`, `atem pair verify`, `atem cred unlock|projects` and the paired-token refresh run as operations inside the runtime, on its link. See [agent-runtime.md](agent-runtime.md).
 - Atem always dials out. It opens no port.
-- A link is one WebSocket: local (`astation_ws`) or the paired Astation's identity room on the Station (`astation_relay_url`).
+- A link is one WebSocket: local (`astation_ws`) or the paired Astation's identity room on a Station (the one Astation selected, else `astation_relay_url`; see [Station selection](#station-selection)).
 - Astation authenticates the link. The relay only routes it, except for the r9 host route proof.
 - r8 session-v1, terminal-v1 and chat-v1 run on the authenticated link. On a host with a device list, r9 clients come through `atem-ch1` channels carried on the same link. See the r9 appendix of [atem-session-v1.md](protocol/atem-session-v1.md).
 
@@ -27,15 +27,15 @@ astation_relay_url = "https://station.agora.build"  # default (production)
 # astation_relay_url = "https://station-dev.agora.build"  # dev profiles
 ```
 
-`ASTATION_WS` and `ASTATION_RELAY_URL` override them. There is no relay code setting: the room is the pairing's `astation_id`.
+`ASTATION_WS` and `ASTATION_RELAY_URL` override them. A Station that Astation selected overrides `astation_relay_url` for the runtime's link (see [Station selection](#station-selection)). There is no relay code setting: the room is the pairing's `astation_id`.
 
 ## Connection order
 
 The runtime connects when it starts and whenever it has no link (`App::spawn_astation_connect`). Each attempt re-reads config.toml and the pairing record.
 
-1. Read `pairing/pairing.enc`. An unreadable record fails closed: no local attempt, no relay, the error as the status (`app::PAIRING_UNREADABLE`), the 30 s retry.
-2. Local: connect `astation_ws` (5 s) and authenticate without pairing. Skipped while the host policy says relay only.
-3. Relay: only with a pairing record. Join the paired Astation's identity room and authenticate without pairing, or be routed (r9).
+1. Read `pairing/pairing.enc` and the Station to use (`station_route::destination`). An unreadable record fails closed: no local attempt, no relay, the error as the status (`app::PAIRING_UNREADABLE`), the 30 s retry. So does an unreadable `pairing/station_route.json` ("selected Station state unreadable; no routing fallback").
+2. Local: connect `astation_ws` (5 s) and authenticate without pairing. Skipped while the host policy says relay only, and while the selected Station blocks direct (`direct_blocked`).
+3. Relay: only with a pairing record. Join the paired Astation's identity room on the chosen Station and authenticate without pairing, or be routed (r9). A selected Station that is down never falls back to another one.
 4. Both fail: no link, and another attempt in 30 s.
 
 - A dropped authenticated link reconnects at once after it stayed up for ten seconds; shorter-lived links retry after 30 seconds to avoid flicker. Deliberate selected-Station migrations reconnect at once.
@@ -90,18 +90,12 @@ The saved session:
 
 ## Relay identity room and Stations
 
-The [selected-Station handoff](protocol/station-route-v1.md) lets Atem use
-its paired Astation's effective relay ahead of `astation_relay_url`, without
-a runtime or worker restart. Atem's receiver and the shared native sender
-helper are implemented; native integration and joint live verification remain
-pending. An authenticated dev/custom selection has no production fallback.
-
-- The Station is the relay service at `astation_relay_url`. `https://` becomes `wss://` (`http://` becomes `ws://`).
+- The Station is the relay service: the one Astation selected, else `astation_relay_url`. `https://` becomes `wss://` (`http://` becomes `ws://`).
 - Atem joins `<station>/ws?role=atem&code=<astation_id>&atem_id=<atem_id>`.
 - Astation keeps a room named by its id. The relay tells the Atems in one room apart by `atem_id`.
 - The room code authorizes nothing. A session proof, or the host route proof, is still required.
 - The production Station `https://station.agora.build` is the compiled default. Dev profiles set `https://station-dev.agora.build` in config.toml.
-- Vault, memory and skills HTTP calls use the separately configured Station with the pairing's session id (`auth::require_pairing`); the selected-Station WebSocket handoff does not change those HTTP destinations or credential audiences.
+- Vault, memory and skills HTTP calls use the Station from `ASTATION_RELAY_URL`, `astation_relay_url` or the default, with the pairing's session id (`auth::require_pairing`). They do not follow a selected Station.
 
 Transport security:
 
@@ -109,6 +103,21 @@ Transport security:
 - A direct link to a LAN or VPN address is plaintext `ws://`. The proof shows possession of the token. It doesn't encrypt the link or stop an active man-in-the-middle.
 - A session grant and `credentialSync` cross such a link in the clear.
 - r9 channel traffic (`atem-ch1`) is end-to-end encrypted on any link.
+
+## Station selection
+
+Astation can pick the Station for this Atem. This is station-route v1, released in Atem v0.8.2. The wire contract is [protocol/station-route-v1.md](protocol/station-route-v1.md).
+
+- On an authenticated Astation link the runtime asks for a selection every 30 s. Astation's offer is a Station origin plus `relay_only`, signed with an HMAC under the saved session token. The token is never sent. Atem checks the offer against its pairing, saves it and acknowledges it with a second HMAC.
+- Atem stores `pairing/station_route.json` (0600): the signed offer with its request context and revisions, and a `direct_blocked` bit. It is routing metadata only. It holds no token or other credential. `atem unpair` removes it. A selection saved under another binding, trust generation or session id is ignored.
+- For the runtime's WebSocket link the Station is chosen at each connect (`station_route::destination`): the saved selection first; with none, `ASTATION_RELAY_URL`, then `astation_relay_url` in config.toml, then `https://station.agora.build`. While a selection is saved, the env variable and config.toml do not move that link.
+- A selected Station that is down is retried every 30 s. There is no fallback to the production or configured Station. A damaged selection file stops the connect.
+- `relay_only:true` in an offer sets `direct_blocked`: no local link. Only a native manager's `host_policy_set{relay_only:false}` at a newer policy revision clears it. An offer cannot.
+- A changed selection reconnects the runtime to the new Station once any running pairing or unlock operation ends. Workers, sessions and receipts keep going. Clients open fresh channels.
+- Vault, memory and skills HTTP calls and the first relay registration of `atem pair` do not follow the selection. They use `ASTATION_RELAY_URL`, `astation_relay_url` or the default.
+- **Not implemented:** following the selected Station for those HTTP calls. It needs its own authorization and token-audience contract.
+- `atem status` shows the Station in use on the `Relay` line (`connected via relay (<host> as <atem_id>)`).
+- Without Astation's selection, switching Stations means changing `astation_relay_url` (or `ASTATION_RELAY_URL`) and running `atem runtime restart`. There is no `atem runtime reload` command.
 
 ## Relay only (§R9.8a)
 
@@ -147,5 +156,7 @@ Transport security:
 
 ## Switching Stations and pairings
 
-- Native's authenticated selected-Station handoff changes the runtime's relay without a restart. Before that integration is available, a manually configured relay still uses `astation_relay_url` (or `ASTATION_RELAY_URL`) and `atem runtime restart`; a saved authenticated selection takes priority over this fallback.
-- `atem unpair` and `atem logout` tell a running runtime (they never start one). It drops a link whose pairing changed, with its attachments. The runtime also checks the pairing every 5 s, so an unpair takes effect either way.
+- Astation's selection changes the runtime's Station without a restart (see [Station selection](#station-selection)).
+- Otherwise set `astation_relay_url` (`atem config set astation_relay_url <url>`) or `ASTATION_RELAY_URL`, then run `atem runtime restart`. config.toml is re-read at each connect attempt, but an established link keeps its Station until it drops, and the runtime reads the env variable from its own environment. `atem runtime restart` keeps the sessions.
+- A saved selection beats that setting. To leave it, Astation selects another Station, or run `atem unpair` and `atem pair`.
+- `atem unpair` and `atem logout` tell a running runtime (they never start one) to `reload`: it re-reads the config and drops a link whose pairing changed, with its attachments. The runtime also checks the pairing every 5 s, so an unpair takes effect either way. `reload` is not a CLI command and does not move a healthy link to another Station.

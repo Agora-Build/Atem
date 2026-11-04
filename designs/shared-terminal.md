@@ -6,12 +6,15 @@
 > only `atem runtime` serves sessions remotely; terminal-v1 and chat-v1 are
 > bound to session-v1 targets and leases (`control`, `list`, `lease_id`,
 > provider ids and the agent list are removed), and sessions outlive the
-> frontend in `atem worker`s. The plain TUI refuses remote session messages.
+> frontend in `atem worker`s. Bare `atem` opens no Astation connection, so it
+> never sees remote session messages.
 
 Updated: 2026-10-13. Status: implemented in Atem, released in Atem v0.8.0 (2026-10-31) (remote control
 since r6 through session-v1 leases; r8, and r9 on a host with a device list).
-The Astation terminal UI and its acceptance tests remain to be implemented by
-the Astation owner. This document is the terminal-v1 contract (frames, credit, keys).
+The Astation terminal UI and its acceptance tests are the Astation owner's
+work and are not tracked here. This document is the terminal-v1 contract
+(frames, credit, keys); the parts the status note names as removed in r6
+are kept below for history.
 
 ## What can be used now
 
@@ -46,7 +49,8 @@ stream, or additional network listener.
 - The default Atem prefix is **Ctrl+]**, then `h` or `m` (detach), `g` (take
   local control), `a` (an approval was answered in the agent's own dialog),
   `x` (stop), `r` (redraw), `[` (local history), `c` (copy), or `?` (help and
-  notices). Reopening the same menu entry resumes its PTY. Taking
+  notices). The Agent Sessions panel of bare `atem` or `atem agent attach`
+  reopens a running session (a Claude/Codex menu entry launches a new one). Taking
   local control invalidates queued remote input. Press the prefix twice to
   send it literally to the agent; unknown prefixed keys are forwarded.
 - `ATEM_TERMINAL_PREFIX=Ctrl-a` changes the prefix. Choose a prefix that does
@@ -62,31 +66,33 @@ stream, or additional network listener.
   requests the system clipboard; terminal support and nested multiplexer policy
   still determine whether it reaches that clipboard. Mouse capture stays off,
   preserving the outer terminal's selection. Multiline paste uses the agent's
-  bracketed-paste mode and is submitted as one input operation (16 KiB maximum).
+  bracketed-paste mode and is submitted as one input operation (up to 1 MiB
+  locally, as one `paste`).
 - Local agent launch works without Astation. Remote access uses the existing
   authenticated Astation connection and its pairing rules.
-- One Claude and one Codex session can live in the TUI simultaneously. Each
-  can have one remote viewer. Quitting Atem ends its owned sessions; detached
-  daemon ownership is a later phase.
+- Any number of sessions run in `atem runtime`, each in its own `atem worker`;
+  they outlive the frontend and the runtime (`atem agent attach`,
+  [agent-runtime.md](agent-runtime.md)). Quitting a frontend detaches it.
 - Paste uses bracketed mode when requested by the CLI. Arrow/function-key
   modifiers and application cursor mode are encoded as xterm input.
 
 ## Frontend and runtime direction
 
 The compact terminal frontend remains the first supported interface for tmux,
-other multiplexers and SSH. A GPUI desktop frontend is deferred until a desktop
-product is needed; it is not a dependency or part of this implementation.
+other multiplexers and SSH. **Not implemented:** a GPUI desktop frontend,
+deferred until a desktop product is needed; it is not a dependency or part of
+this implementation.
 
-Both future frontends should attach to one Atem-owned session runtime. That
+Every frontend attaches to one Atem-owned session runtime (built:
+`atem runtime`, [agent-runtime.md](agent-runtime.md)). That
 runtime would own the original PTY process, session/generation identity,
 canonical terminal state, control leases and the Astation connection. Frontends
 would render state and request launch, attach, input, resize and stop operations.
 Opening another frontend must not silently launch another Codex/Claude process
 or replace its conversation and unfinished input.
 
-Today `App` still owns sessions and quitting Atem stops them. A future extraction
-into `AgentRuntime`, followed by a background service and private local attach
-protocol if sessions must outlive frontend windows, is separate work. GPUI would
+The runtime, its workers and the private local attach protocol were built
+(Atem v0.8.0): sessions outlive frontends and the runtime. GPUI would
 need a terminal component as well as the graphical framework. Existing Astation
 pairing and remote control authorization remain the remote trust boundary.
 
@@ -155,6 +161,12 @@ not enable independent grapheme clustering. Its generated table has an
 exhaustive Rust check. Retest the proposed xterm Unicode API before upgrading.
 
 ## Wire envelope and routing
+
+Since atem-session r6, `list`, `sessions`, `control`/`controller`, `lease_id`
+and the `codex`/`claude` terminal ids below are removed: the terminal id is the
+session id, and `subscribe`, `input`, `resize` and `stop` carry a session-v1
+binding (and the lease for the last three). The rest of this section is the
+first build's form.
 
 All messages use the existing authenticated WebSocket as JSON text:
 
@@ -250,6 +262,8 @@ per provider. Sustained host overload applies bounded PTY backpressure.
 
 ## Control and lifetime
 
+Since r6 control is a session-v1 lease (`acquire`/`renew`/`release`); the
+`control` op below is the first build's form.
 `control {take:true}` grants a fresh lease without an unattended local prompt.
 The local status row then says remote; local typing is refused until
 the Atem prefix followed by `g` reclaims it. Repeating Take Control while
@@ -278,7 +292,7 @@ ownership. A local viewer
 smaller than the remote viewport currently clips the larger screen.
 
 Old `agentInput`, agent prompts, voice/control and user-command routes are
-rejected while a terminal viewer is attached, so they cannot bypass the new
+removed (r6) and answered `unsupported_version`, so they cannot bypass the
 lease. Automatic mark-task dispatch pauses while the Claude terminal is under
 remote control. After process exit, the host sends its final screen before
 `exited {terminal_id, generation, status}`, waiting for that screen's credit.
@@ -331,12 +345,12 @@ authenticated connection state; authentication is verified separately by
 the WebSocket tests. This validates the Atem host and terminal protocol,
 not the Astation UI or cross-machine LAN/relay operation.
 
-An already running session is controlled over its connected Astation link.
-There is no local CLI attach command or socket for another coding agent to
-attach by PID; these opt-in tests launch and own their test processes.
+An already running session is controlled over its connected Astation link,
+or locally with `atem agent attach <ses-…>` through the runtime's same-user
+socket; these opt-in tests launched and owned their test processes.
 
-The Astation owner still needs to implement the typed envelope, targeted
-routing, terminal chooser, bundled WKWebView/xterm view, View/Take Control/
+At this first build, the Astation owner still needed to implement the typed
+envelope, targeted routing, terminal chooser, bundled WKWebView/xterm view, View/Take Control/
 Release/Stop states, renderer credit and input-result handling. Then validate
 real provider approvals, macOS IME/selection/copy/paste, LAN and relay reconnect,
 latency under load, and scrollback/history before calling the complete remote

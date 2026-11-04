@@ -1,6 +1,7 @@
 # Vault — Shared cross-agent context store (atem ↔ relay-server ↔ Postgres)
 
-Status: v1 implemented (`atem vault new/list/read/write/set-summary`); `watch` (v1.5) not built yet
+Status: v1 implemented (`atem vault new/list/read/write/set-summary`).
+**Not implemented:** `atem vault watch` and the `vault-updated` hints (v1.5), and v2.
 Owner: Brent G
 
 ## Goal
@@ -17,8 +18,8 @@ Concretely:
   existing one with `--entry-id`).
 - `atem vault read --vault-id <id>` prints the current contents; `--history`
   shows every version ever written.
-- (planned, v1.5; not built) `atem vault watch --vault-id <id>` blocks and re-renders when another atem
-  writes.
+- **Not implemented:** `atem vault watch --vault-id <id>` (planned, v1.5)
+  blocks and re-renders when another atem writes.
 
 The store is hosted by the **relay-server (station)** and backed by **Postgres**.
 **atem mediates all access** — agents never speak to the vault directly (this is
@@ -142,7 +143,7 @@ CREATE TABLE vault_entries (
 
 - **Append** (`atem vault write --vault-id <id> --text "..."`): allocate
   `entry_no = vaults.next_entry_no++`, insert with `version = 1`.
-- **Override / edit** (`atem vault write --vault-id <id> --entry-id e3 --text "..."`):
+- **Override / edit** (`atem vault write --vault-id <id> --entry-id 3 --text "..."`, entry e3):
   keep `entry_no = 3`, insert with `version = max(version for that entry_no) + 1`.
 
 Whether a write was an append or an override is fully derivable from `version`
@@ -182,20 +183,20 @@ editing e3 never renumbers it and never reorders the view.
 | `atem vault new --summary "<text>"` | Create a vault in the caller's current work session; print the new `vault_id`. |
 | `atem vault list` | List the account's vaults, with id + summary. |
 | `atem vault read --vault-id <id> [--since <seq>] [--history] [--format human\|plain]` | Render current view (default), history, or only-new entries. |
-| `atem vault write --vault-id <id> [--entry-id <eN>] --text "<text>"` | Append (no `--entry-id`) or override entry `eN` (with `--entry-id`). Adds caller to `writer_list`. |
+| `atem vault write --vault-id <id> [--entry-id <N>] --text "<text>"` | Append (no `--entry-id`) or override entry `eN` (with `--entry-id N`, a number). Adds caller to `writer_list`. |
 | `atem vault set-summary --vault-id <id> --text "<text>"` | Update the mutable summary (read-permission only). |
-| `atem vault watch --vault-id <id>` | Subscribe to `vault-updated` on the relay room; re-render (via `--since`) on each nudge. |
+| `atem vault watch --vault-id <id>` | **Not implemented:** subscribe to `vault-updated` on the relay room; re-render (via `--since`) on each nudge. |
 
 `--format human` (default) is pretty; `--format plain` is bare text for piping
 into a prompt / agent.
 
-## Notification flow
+## Notification flow (not implemented)
 
 This section describes the planned v1.5 context-update hints; `watch` and
 these notifications are not implemented. The separate
-[agent notifications design](agent-notifications.md) proposes durable,
-directed work requests that a destination runtime can queue and deliver to
-an agent. Those requests need an authenticated execution grant, durable
+[agent hosting design](agent-hosting.md) covers directed work requests
+that a destination runtime queues and delivers to an agent (released in
+v0.8.2). Those requests need an authenticated execution grant, durable
 delivery and task deduplication beyond this best-effort hint. Ordinary vault
 writes and `watch` do not start agent turns.
 
@@ -248,14 +249,13 @@ All carry `?id=<client_id>` + session auth; all run the authz predicates above.
    them later.
 5. **`writer_list` growth / GC.** It only ever grows. Fine for small teams;
    revisit if a vault accumulates many one-off writers.
-6. **Relay-server session port.** [[session-auth]] notes the relay server still
-   needs the Rust `SessionStore` (a TODO there). The vault API depends on it —
-   confirm relay-side session validation lands first.
+6. **Relay-server session port.** ✅ Resolved — the relay validates pairing
+   sessions; `/api/vault` with session auth shipped with v1.
 
 ## Phasing
 
 | Phase | Deliverable |
 |-------|-------------|
 | **v1** | Postgres tables; relay-server `/api/vault` CRUD with session + writer-list authz; `atem vault new/list/read/write/set-summary`. Manual re-read (no watch). |
-| v1.5 | `vault-updated` relay broadcast + `atem vault watch` (re-render via `--since`). |
-| v2 | Summary history, richer list filters, optional per-entry tags; revisit transport if vaults grow large. |
+| v1.5 (not implemented) | `vault-updated` relay broadcast + `atem vault watch` (re-render via `--since`). |
+| v2 (not implemented) | Summary history, richer list filters, optional per-entry tags; revisit transport if vaults grow large. |
