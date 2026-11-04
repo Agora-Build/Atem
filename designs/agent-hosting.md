@@ -372,7 +372,8 @@ screenshots and context.
   while it is online.
 - **Not implemented:** work from an offline sender. Dispatch uses the sender's
   live channel, so its tasks wait until it reconnects. There is no origin proof
-  that would let the Station replay an envelope, and no Atem-to-Atem sender.
+  that would let the Station replay an envelope. An agent in Atem can't send;
+  [agent-collaboration.md](agent-collaboration.md) proposes how.
 - **Not implemented:** role routing and subscriptions. Senders resolve
   recipients (host, route, session, process) themselves; there are no role ids,
   routing generations or context subscriptions that create work.
@@ -389,6 +390,13 @@ screenshots and context.
   existing directories.
 - **Not implemented:** hosting state in `atem status` and `atem --version`;
   `atem runtime check` is the only report.
+
+### Sending work from Atem agents (not implemented)
+
+Proposed in [agent-collaboration.md](agent-collaboration.md): Atem-to-Atem
+messages addressed by project, tag or `atem_id`, a durable outbox,
+publish-before-notify, automatic status and results, all executed through this
+receiver and its routes.
 
 ### OS service and boot startup (not implemented)
 

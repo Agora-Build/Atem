@@ -36,6 +36,7 @@ implemented)", and a design with nothing built says so in its status line.
 
 | Document | What it covers |
 |---|---|
+| [agent-collaboration.md](agent-collaboration.md) | Proposed: Atem-to-Atem messages between coding agents, addressed by project, tag or `atem_id`; outbox, publish before notify, automatic results (for review by Astation and Auth/Portal) |
 | [agent-hosting.md](agent-hosting.md) | OS service and boot startup, launch when work arrives, durable delivery through the Station (outbox, replay, offline senders) |
 | [build-by-talk.md](build-by-talk.md) | Build by Talk: get the whole project clear by talking, with tool calls to the coding agents (Astation and Atem; nothing built) |
 | [e2e-encryption.md](e2e-encryption.md) | Credentials (`atem cred get` and the rest), device-signed writes, the recovery secret, auto-unlock |
