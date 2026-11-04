@@ -28,6 +28,7 @@ cargo run -- [command]                   # Run with CLI arguments
 cargo test                               # Run tests (1,450+; use -- --test-threads=1 if a test flakes); tests must inject a temp profile (src/test_profile.rs)
 cargo test --test runtime_fixtures_binary # Shared atem-session host fixtures against the real runtime (ATEM_FIXTURE=<name> runs one)
 cargo test --test host_work_binary -- --test-threads=1 # Opt-in remote launch + directed work over encrypted r9 channels (temp profiles/fake agents)
+cargo test --test collab_binary          # Local agent collaboration: real runtime/workers, fake agent children, temp profiles
 ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored --nocapture --test-threads=1 # Approvals with the REAL claude/codex CLIs (real API calls; export only the needed variables, e.g. OSS_API_KEY / ANTHROPIC_AUTH_TOKEN, never a whole credentials file; each agent gets only its own; Codex runs --profile oss)
 cargo test -p atem-core -p atem-core-ffi # Token library + C ABI tests (workspace members)
 ./scripts/check-atem-core-ffi.sh         # Build libatem_core_ffi.a, drive it from C (and Swift on macOS)
@@ -83,6 +84,10 @@ src/
 │   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes (no `principals`: the paired Astation's `member:<id>`; errors name the field/line or the profile and rule; `runtime check` lists who may launch), environment sources, durable launch/task/attachment SQLite records
 │   ├── host_attachments.rs # PNG chunk persistence, sender binding, verified private cache for task prompts
 │   ├── host_work_bridge.rs # host launch/query and directed-work scheduling over normal receipts; config/authority rechecks, no takeover, explicit results
+│   ├── collab.rs        #   local selectors, fixed resolutions, durable outbox/counters/status; collab_results.rs stores narrow return grants and results
+│   ├── collab_context.rs #  publish/read-back exact Memory/Vault snapshots before delivery (background jobs with durable retries)
+│   ├── collab_bridge.rs #   internal attachment, sending/replying, workflow inheritance, correlated results and automatic status reports
+│   ├── collab_launch_bridge.rs # local launch-on-message: reserve identities atomically, reuse approved worker launches, never retry uncertain spawns
 │   ├── refusal_log.rs   #   runtime.log lines for refused session-family requests (no content; rate-limited per link)
 │   ├── ops.rs           #   Astation operations on the broker's link: pair, pair verify, cred unlock/projects, paired-token refresh
 │   ├── op_client.rs     #   the CLI side of an operation: print/ask/answer/done (answers from /dev/tty)
@@ -198,6 +203,7 @@ tests/                   # binary tests on temp HOME/XDG_RUNTIME_DIR (never the 
 ├── r9_harness.rs        # headless multi-device harness (test target only): one real host, simulated phones/bots/browsers through atem-client
 ├── r9_admission_binary.rs, r9_multi_device_binary.rs, r9_push_binary.rs, r9_services_binary.rs, r9_two_hosts_binary.rs, r9_revoked_binary.rs, r9_host_route_binary.rs, membership_binary.rs # r9 in the real runtime: admission/fences, several devices, sealed push/seen, two enrolled hosts freezing on a forked list, the revoked grants quarantine across restarts and a clock set back between two damages, the host route proof with no Astation online, services (approvals, scope restrictions, live renewal/narrowing, K rotation, held host, revoke_grant), the device list's durability and faults
 ├── approvals_real_agents.rs # #[ignore], ATEM_REAL_AGENTS=1: approvals answered from a fake Astation with the real Claude Code and Codex in temp HOME/CODEX_HOME
+├── collab_binary.rs      # local tags, fan-out, fixed resolution, limits, context, results and launch-on-message through real agent-child commands
 ├── runtime_binary.rs, worker_binary.rs, agent_launch_binary.rs, terminal_ui_binary.rs, astation_op_binary.rs, cred_agent_binary.rs, runtime_build_binary.rs
 └── support/             # Sandbox: temp profile, `atem` in a PTY, cleanup of what it started; astation.rs: fake Astation peer + verified pairing profile; r9.rs/r9log.rs: a pinned, signed test device list and r9 clients
 npm/
@@ -218,6 +224,7 @@ designs/                      # Design only: current design and planned work (RE
 ├── README.md                 # Index: current design, planned work
 ├── protocol/                 # README.md (the protocols and how atem-session evolved, where the fixtures run), atem-session-v1.md (the wire contract, r9 appendix), atem-client-bindings.md (r9 binding/effect contract), atem-host-work-v1.md (remote launch, directed work, messages, attachments/mark), station-route-v1.md (the selected Station), fixtures/ (shared with Astation)
 ├── agent-runtime.md          # `atem runtime` broker + `atem worker`s: sessions, leases, receipts, the local protocol, operations through the runtime
+├── agent-collaboration.md    # local collaboration (stage 1); planned cross-instance transport, return grants and mailbox (stages 2-3)
 ├── shared-terminal.md        # Shared terminal (terminal-v1): canonical-screen frames, credit, keys, limits
 ├── agent-chat-host.md        # Agent chat (chat-v1): adapters, Claude hooks + transcript, Codex, approvals, status
 ├── agent-chat-api.md         # Developer guide for chat clients
@@ -265,6 +272,25 @@ route's notify/prompt consent. Envelope, recipient decisions and queued tasks
 commit together. Progress stays on the original message/task receipt; there is
 no `runtime inbox` command. Not implemented: a Station durable outbox,
 offline origin proofs and direct Atem host senders.
+
+**Local agent collaboration** (stage 1, unreleased; `designs/agent-collaboration.md`):
+`atem agent tag add|remove|list` and `atem message send|reply` identify the
+calling agent from the local socket peer's verified process ancestry.
+`runtime.toml` requires hosting, `[collab] send = true`, approved profiles and
+route consent for `local`; defaults keep sending, result prompts and launch
+off. Owner labels and agent-owned `self:` tags feed shared selectors; one
+message resolves once to at most 32 other sessions. The SQLite outbox, tasks,
+resolutions, counters and return grants survive runtime restart. Local work
+uses the session host's internal attachment and ordinary prompt receipts,
+FIFO, readiness, drafts, approvals, leases and control fencing. Context jobs
+publish/read back exact decrypted Memory/Vault versions before dispatch.
+Only a task/session/process/turn-bound explicit reply completes a task;
+`results = true` on its origin route permits one queued result as data.
+Automatic timeout reports remain status only. Empty routes can opt in to
+`launch = "on_message"`, using the existing approved-profile worker launcher.
+`message status [ID]`, `cancel TASK_ID` and `directory [SELECTOR]` inspect the
+local runtime. `host.select`, local `result` snapshots and the `local` sender
+are never admitted from remote channels. Cross-instance delivery is not built.
 
 **TUI State Machine** (`app.rs`): bare `atem` is a menu and a client of `atem runtime`; it opens no Astation connection (the runtime owns the machine's one link). Enum-based mode switching via `AppMode`:
 - `MainMenu` - Navigation between features

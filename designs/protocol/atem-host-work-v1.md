@@ -15,6 +15,15 @@ Types: `atem_client::session::{host_work, messages, attachments, mark}`. Host:
 Shared request vectors: `fixtures/host-work/requests-v1.json`, run by the
 client core's tests and listed in every SDK's checksum manifest.
 
+Local collaboration (stage 1, unreleased) reuses these receipts inside one
+runtime; see [../agent-collaboration.md](../agent-collaboration.md). Its shared
+types include `select`, optional message correlation fields, and locally
+stored `result` context snapshots. The host does not advertise `host.select`;
+remote host admission refuses selector destinations, the `local` sender,
+local UUIDv5 task references and `result` context snapshots. Remote admission
+still requires the contract below. Cross-instance selector/result support waits for
+the stage-2 agreement.
+
 ## 1. Features and transport
 
 | Feature | Ops |

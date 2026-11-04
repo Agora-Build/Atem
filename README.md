@@ -335,6 +335,34 @@ your own (a backup is kept as `hooks.json.atem-bak`); to turn them off later,
 set `hooks = false` under `[codex]` in `~/.config/atem/config.toml` — the next
 `atem agent launch codex` removes them. See the [session protocol](designs/protocol/atem-session-v1.md) for the details.
 
+### Agents asking agents
+
+Local collaboration lets an Atem-launched agent ask other agents in the same
+runtime to work, then receive a correlated reply. In private `runtime.toml`,
+enable hosting and `[collab] send = true`, configure approved profiles, and
+give receiving routes `principals = ["local"]` and labels such as
+`labels = ["tag:backend"]`. From inside an agent:
+
+```bash
+atem message directory tag:backend
+atem message send --to tag:backend "Review the API contract"
+atem message status MESSAGE_ID
+# From the receiving agent, using the task ID in its prompt:
+atem message reply --task TASK_ID "Contract verified"
+```
+
+Tasks use the normal per-session queue and wait for readiness, drafts,
+approvals and control leases. Only an explicit reply completes a task.
+`results = true` on the originating route also queues that reply into its
+agent; otherwise it remains visible through status. `--memory ID` and
+`--vault ID[:ENTRY]@VERSION` attach verified exact context. Routes can opt in
+to `launch = "on_message"` to start their approved profile when empty.
+Sending, result prompts and automatic launch are off by default.
+
+See the [collaboration design](designs/agent-collaboration.md) and
+[runtime sample](configs/runtime.example.toml). This stage is local and
+unreleased; cross-instance delivery is planned separately.
+
 ### Vault (shared cross-agent context)
 
 ```bash

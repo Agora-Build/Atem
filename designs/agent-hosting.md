@@ -2,7 +2,7 @@
 
 Status: implemented and released (Atem v0.8.2; principals default to the paired Astation since v0.8.3).
 **Not implemented:** OS service installation and boot startup, automatic
-launch when work arrives, and durable delivery through the Station (outbox,
+remote launch when work arrives, and durable delivery through the Station (outbox,
 replay, offline senders); section 12 lists the rest.
 
 Agent hosting lets an authorized device or service start a new Claude Code or
@@ -12,6 +12,11 @@ opt-in and uses the machine's one `atem runtime`. The wire contract is
 workers and sessions are described in [agent-runtime.md](agent-runtime.md);
 principals, scopes and the device list in [account-trust.md](account-trust.md)
 and the r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md).
+
+[Agent collaboration](agent-collaboration.md) adds opt-in messaging between
+agents in this runtime, including selectors, context publication, correlated
+results and local launch on message (stage 1, unreleased). The remote contract
+described here retains its existing admission rules.
 
 ## 1. What it does
 
@@ -253,9 +258,11 @@ The client helper `Message::publications()` builds one request per host from
 one envelope. It is an in-memory builder, not an outbox: the client keeps the
 envelope and retries each host until it accepted.
 
-**Not implemented:** nothing on the host shows or applies a stored notice, and
-the runtime fetches no memory or vault reference. It accepts only snapshots the
-publisher resolved, and checks their digests, not their publication.
+**Not implemented:** nothing on the host shows or applies a stored remote
+notice. The remote receiver accepts only snapshots the publisher resolved,
+and checks their digests, not their publication. The local collaboration
+sender publishes Memory and reads back pinned Memory/Vault versions before
+it queues their exact snapshots.
 
 ## 7. Directed work
 
@@ -379,8 +386,9 @@ screenshots and context.
 
 ## 12. Planned (not implemented)
 
-- **Not implemented:** automatic launch when work arrives. A coordinator can
-  launch, wait for readiness, then enqueue.
+- **Not implemented:** automatic launch when remote work arrives. A coordinator
+  can launch, wait for readiness, then enqueue. Local collaboration supports
+  `launch = "on_message"` on an explicitly approved route.
 - **Not implemented:** durable delivery through the Station: atomic
   write-and-notify with memory or vault, an outbox, replay with cursors across
   replicas, and delivery to an offline host. Today a sender must reach the host
@@ -388,12 +396,13 @@ screenshots and context.
 - **Not implemented:** work from an offline sender. Dispatch uses the sender's
   live channel, so its tasks wait until it reconnects. There is no origin proof
   that would let the Station replay an envelope, and no Atem-to-Atem sender.
-- **Not implemented:** role routing and subscriptions. Senders resolve
-  recipients (host, route, session, process) themselves; there are no role ids,
-  routing generations or context subscriptions that create work.
-- **Not implemented:** result routing and workflow limits. Results go back only
-  through `work_query`/`message_query`; there are no hop budgets, per-route rate
-  limits or delivery of results to the sender's agent.
+- **Not implemented:** remote selector routing and context subscriptions.
+  Remote senders resolve recipients (host, route, session, process) themselves.
+  Local collaboration expands selectors once and persists that resolution.
+- **Not implemented:** cross-instance result routing and workflow limits.
+  Remote results go back through `work_query`/`message_query`. Local
+  collaboration has durable workflow limits and one correlated reply per
+  task, with origin-route consent before prompting its agent.
 - **Not implemented:** progress push. Launch and task status are query-only.
 - **Not implemented:** resolving an `outcome_unknown` task by hand. It keeps
   holding its session's queue.

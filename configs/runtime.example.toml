@@ -5,7 +5,8 @@
 #
 # Fill in approved profiles/routes below, then explicitly set enabled = true.
 # Healthy enabled hosting keeps the runtime online with zero agent sessions.
-# This does not install a boot service or start coding agents automatically.
+# Boot startup needs a separately installed service. Local collaboration may
+# launch an agent only when its route explicitly sets launch = "on_message".
 version = 1
 enabled = false
 
@@ -85,8 +86,9 @@ enabled = false
 # A route selects an approved profile and the principals allowed to send work.
 # Work targets an existing session matching that profile's project/provider/cwd.
 # A coordinator may explicitly launch a session first, then enqueue work.
-# Automatic launch-on-notification is not implemented. Busy agents, drafts,
-# approvals and active control leases hold work until safe delivery is possible.
+# Remote launch-on-notification is not implemented. Local collaboration can
+# opt in per route (below). Busy agents, drafts, approvals and active control
+# leases hold work until safe delivery is possible.
 # Increase revision when changing a route's approvals or selected profile.
 #
 # [[routes]]
@@ -108,3 +110,9 @@ enabled = false
 # launch = "off"          # opt in with "on_message" to launch an empty route
 # results = false         # opt in to receive correlated results as agent input
 # auto_report = "status"  # "final_message" opts in to assistant-text reports
+#
+# Inside an Atem-launched agent, after enabling [collab] and route consent:
+#   atem message send --to tag:mobile "Review the mobile API contract"
+#   atem message reply --task TASK_ID "Contract verified"
+# Read progress with `atem message status MESSAGE_ID`.
+# See ../designs/agent-collaboration.md in the source tree for a full example.
