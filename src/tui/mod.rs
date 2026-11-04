@@ -342,6 +342,7 @@ mod tests {
             log: dir.path().join("log"),
             lock: dir.path().join("runtime.lock"),
             replaced: dir.path().join("runtime.replaced"),
+            config: dir.path().to_path_buf(),
         };
         let started = Instant::now();
         let look = look_at(locator, Duration::from_millis(300)).await;
@@ -362,6 +363,7 @@ mod tests {
             log: dir.path().join("log"),
             lock: dir.path().join("runtime.lock"),
             replaced: dir.path().join("runtime.replaced"),
+            config: dir.path().to_path_buf(),
         };
         let look = look_at(locator, Duration::from_secs(2)).await;
         assert_eq!(look, Ok(None));

@@ -252,10 +252,11 @@ runtime from before `restart` gets SIGTERM instead, only when `runtime.lock`
 names its pid and that pid is confirmed as this user's `atem runtime`. The
 runtime is kept, with a message saying why, when its `worker_protocol`
 differs from this build's (the message names the running sessions that block
-it), while an Astation operation runs, or within 60 s of the last replacement
+it), while an Astation operation runs, within 60 s of the last replacement
 (`runtime.replaced`), so two atem builds in use don't keep replacing each
-other. `atem runtime restart` does the same on request, without the 60 s
-guard.
+other, or while `runtime.toml` fails what `atem runtime check` checks, as the
+new build reads it (it would start without hosting). `atem runtime restart`
+does the same on request, without the 60 s guard.
 
 ### Local protocol (v1)
 

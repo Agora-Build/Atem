@@ -679,6 +679,7 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
             log: dir.path().join("runtime.log"),
             lock: dir.path().join("runtime.lock"),
             replaced: dir.path().join("runtime.replaced"),
+            config: dir.path().to_path_buf(),
         };
         let socket = locator.socket.clone();
         let root = dir.path().to_path_buf();
@@ -1612,6 +1613,45 @@ fn a_damaged_runtime_epoch_disables_remote_sessions_and_says_so() {
 /// broker on the same state dir), whose sessions it adopts; a second
 /// replacement within a minute is refused (two builds would flap); a
 /// runtime whose workers this build can't adopt is kept.
+/// Another build checks `runtime.toml` as it reads it before replacing the
+/// runtime; a file that fails keeps the running one, which goes on serving.
+#[test]
+fn a_runtime_toml_that_fails_this_builds_check_keeps_the_runtime() {
+    use super::client::{Locator, replace_other_build};
+    use std::os::unix::fs::PermissionsExt;
+    local(async {
+        let dir = std::rc::Rc::new(short_dir());
+        let first = runtime_on(dir.clone());
+        let client = first.client().await;
+        let config = dir.path().join("runtime.toml");
+        std::fs::write(&config, "version = 1\nenabled = true\nprofiles = 3\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let locator = Locator::in_dir(dir.path());
+        let start = || anyhow::bail!("not replaced");
+        let mut notes = Vec::new();
+        let pid = client.welcome.pid;
+        let mut client = replace_other_build(
+            client,
+            &locator,
+            "0.0.0+another-build",
+            &start,
+            Duration::from_secs(5),
+            |line| notes.push(line),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("runtime.toml"), "{notes:?}");
+        assert!(notes[0].contains("atem runtime restart"), "{notes:?}");
+        assert_eq!(client.welcome.pid, pid);
+        assert!(
+            list(&mut client).await.is_empty(),
+            "the old runtime still serves"
+        );
+        assert!(!locator.replaced.exists());
+    });
+}
+
 #[test]
 fn a_runtime_of_another_build_is_replaced_and_its_sessions_kept() {
     use super::client::{Kept, Locator, kept_message, replace_other_build};

@@ -31,7 +31,10 @@ pub(super) struct State {
     dir: PathBuf,
     config: Config,
     store: Option<Store>,
+    /// A receipt database fault: hosting stays off until a restart.
     error: bool,
+    /// Why `runtime.toml` didn't load: hosting is off until it does.
+    config_problem: Option<String>,
     refresh: Instant,
     scheduled: Instant,
     recovered: bool,
@@ -52,6 +55,7 @@ impl State {
             config: Config::default(),
             store: None,
             error: false,
+            config_problem: None,
             refresh: Instant::now(),
             scheduled: Instant::now(),
             recovered: false,
@@ -102,10 +106,17 @@ impl HostBridge {
         }
     }
 
+    /// A receipt database fault: a write's outcome may be unknown, so
+    /// hosting stays off until a restart (like a halted session journal).
     fn work_fail(&mut self) {
         if !self.work.error {
             eprintln!(
-                "atem runtime: agent hosting unavailable; inspect the private host configuration and receipt database"
+                "atem runtime: agent hosting stopped: its receipt database ({}) failed; run `atem runtime restart`",
+                self.dir
+                    .parent()
+                    .unwrap_or(&self.dir)
+                    .join("host-work.sqlite")
+                    .display()
             );
         }
         self.work.error = true;
@@ -123,28 +134,44 @@ impl HostBridge {
             return;
         }
         self.work.refresh = Instant::now() + Duration::from_secs(1);
-        match Config::load(&self.work.dir) {
+        // An invalid file turns hosting off only while it lasts: launches
+        // not started are fenced and requests are `busy` (`work_pass`).
+        let config = match Config::load(&self.work.dir) {
             Ok(config) => {
-                let retained: HashSet<String> =
-                    config.profiles.iter().map(Profile::scope_key).collect();
-                for profile in &self.work.config.profiles {
-                    if !retained.contains(&profile.scope_key()) {
-                        self.projects.forget(&profile.scope_key());
-                    }
+                if self.work.config_problem.take().is_some() {
+                    eprintln!(
+                        "atem runtime: runtime.toml is valid again; agent hosting follows it"
+                    );
                 }
-                self.work.config = config;
-                if self.work.config.enabled && self.work.store.is_none() && !self.work.error {
-                    match Store::open(self.dir.parent().unwrap_or(&self.dir)) {
-                        Ok(store) => self.work.store = Some(store),
-                        Err(_) => self.work_fail(),
-                    }
-                }
-                for p in &self.work.config.profiles {
-                    self.projects
-                        .session(&p.scope_key(), Some(p.project.clone()));
-                }
+                config
             }
-            Err(_) => self.work_fail(),
+            Err(error) => {
+                let problem = format!("{error:#}");
+                if self.work.config_problem.as_deref() != Some(problem.as_str()) {
+                    eprintln!(
+                        "atem runtime: runtime.toml: {problem}; agent hosting is off until it is fixed (`atem runtime check`)"
+                    );
+                }
+                self.work.config_problem = Some(problem);
+                Config::default()
+            }
+        };
+        let retained: HashSet<String> = config.profiles.iter().map(Profile::scope_key).collect();
+        for profile in &self.work.config.profiles {
+            if !retained.contains(&profile.scope_key()) {
+                self.projects.forget(&profile.scope_key());
+            }
+        }
+        self.work.config = config;
+        if self.work.config.enabled && self.work.store.is_none() && !self.work.error {
+            match Store::open(self.dir.parent().unwrap_or(&self.dir)) {
+                Ok(store) => self.work.store = Some(store),
+                Err(_) => self.work_fail(),
+            }
+        }
+        for p in &self.work.config.profiles {
+            self.projects
+                .session(&p.scope_key(), Some(p.project.clone()));
         }
         self.r9
             .enable_host_work(self.hosting_enabled() && self.work.store.is_some());

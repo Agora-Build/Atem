@@ -121,9 +121,14 @@ shell that has the values, or use `env_file`.
 removed profile fences launches that haven't started. Raise `revision` when
 approvals change: requests name the revision they were made under, a mismatch
 is `forbidden`, and work queued under an older revision stays blocked until it
-expires. A file that fails to load, or a host-work
-database that can't be opened or bound, turns hosting off until the runtime
-restarts (`runtime.log`: "agent hosting unavailable").
+expires. A file that fails to load turns hosting off while it fails:
+launches that haven't started are fenced, requests are `busy`, and
+`runtime.log` names the problem once (the parser's reason and line, or the
+profile and rule); within a second of the file being fixed hosting follows
+it again, no restart needed. A host-work database fault (it can't be opened
+or recovered, or a write failed) turns hosting off until `atem runtime
+restart`, since a failed write leaves that step's outcome unknown
+(`runtime.log` names the database).
 
 ## 3. Commands
 
@@ -131,13 +136,19 @@ restarts (`runtime.log`: "agent hosting unavailable").
 |---|---|
 | `atem runtime start` | Create the disabled `runtime.toml` if missing, then start the runtime detached or reuse the running one (another build is kept; it says so and points to `atem runtime restart`) |
 | `atem runtime check` | Validate `runtime.toml` and each profile's directory, project and env file; list who may launch; start nothing |
-| `atem runtime restart` | Replace the runtime with this build; workers are adopted |
+| `atem runtime restart` | Run the check first, then replace the runtime with this build; workers are adopted |
 | `atem runtime` | The runtime in the foreground (e.g. in tmux); exits if another one serves the profile |
 
 `start` and `check` need a pairing (`atem pair`) and refuse before any side
 effect. `start` with an invalid existing file fails and leaves the file and the
 running runtime alone. Errors name the parser's reason and line, or the
-profile or route and the broken rule.
+profile or route and the broken rule. `atem runtime restart`, and any command
+of another build that would replace the running runtime, first run what
+`atem runtime check` checks, as the new build reads the file: if it fails,
+nothing is stopped, the runtime is kept, and the message names the problem
+(fix the file, then run `atem runtime restart`). Without a `runtime.toml`
+there is nothing to check; starting a runtime when none runs is never
+refused for it.
 
 `atem runtime check` prints whether hosting is enabled, each profile (provider,
 directory, revision, who may launch), each route (profile, who may send), then

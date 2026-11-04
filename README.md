@@ -200,8 +200,10 @@ Astation operation from another atem build (an upgrade, a dev build) uses the ru
 runtime by its own build first and prints `Atem's runtime updated to … (was
 …); sessions kept.`; the new runtime adopts the sessions. It doesn't when the
 new build couldn't adopt them (it names the sessions that block it), while an
-Astation operation runs, or when the runtime was replaced less than a minute
-ago (two atem builds in use); `atem runtime restart` applies it then. `atem
+Astation operation runs, when the runtime was replaced less than a minute
+ago (two atem builds in use; `atem runtime restart` applies it then), or
+while `runtime.toml` fails `atem runtime check` (fix it first; `atem runtime
+restart` is refused too). `atem
 status` and `atem --version` only look. When an agent that
 printed something ends, its last output and a short summary are saved under
 `~/.config/atem/logs/<session id>/`.
@@ -215,8 +217,11 @@ profile or route without `principals` is open to the Astation this Atem is
 paired with; list principals only to allow other devices or services.
 `atem runtime check` names any problem (the field and line, or the profile and
 rule) and lists your device list's members and services with their IDs and
-whether each may launch. Healthy hosting with `enabled = true` keeps the runtime online with zero
-sessions; otherwise its ordinary idle timeout applies. Both commands require
+whether each may launch. The running runtime rereads the file every second:
+while it is invalid, hosting is off and `runtime.log` names the problem; once
+fixed, hosting comes back without a restart. Healthy hosting with
+`enabled = true` keeps the runtime online with zero sessions; otherwise its
+ordinary idle timeout applies. Both commands require
 pairing. Bare `atem runtime` runs in the foreground. Not implemented yet: OS
 service installation and boot startup. See
 [agent hosting](designs/agent-hosting.md) for the design and the

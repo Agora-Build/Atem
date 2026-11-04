@@ -567,6 +567,55 @@ fn hosting_binds_no_records_before_the_host_is_verified() {
     assert_eq!(bound_identity(&rig), None);
 }
 
+/// `runtime.toml` without the profile's required `project`.
+fn break_config(rig: &Rig) -> String {
+    let path = rig.sandbox.config().join("runtime.toml");
+    let good = std::fs::read_to_string(&path).unwrap();
+    let broken = good.replace("project = \"local:home\"\n", "");
+    assert_ne!(broken, good);
+    private(&path, &broken);
+    good
+}
+
+fn runtime_log(rig: &Rig) -> String {
+    std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log")).unwrap_or_default()
+}
+
+#[test]
+fn a_broken_runtime_toml_pauses_hosting_until_it_is_fixed() {
+    let rig = Rig::new("claude");
+    let pid = rig.sandbox.runtime_pid().unwrap();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let good = break_config(&rig);
+    within("the problem in runtime.log", || {
+        runtime_log(&rig).contains("missing field `project`")
+    });
+    assert_eq!(dev.launch(&mut r, &uuid())["code"], "busy");
+
+    private(&rig.sandbox.config().join("runtime.toml"), &good);
+    within("hosting resumes", || {
+        runtime_log(&rig).contains("runtime.toml is valid again")
+    });
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    assert_eq!(dev.launched(&mut r, &rid)["state"], "started");
+    assert_eq!(rig.sandbox.runtime_pid(), Some(pid), "no restart needed");
+}
+
+#[test]
+fn runtime_restart_refuses_a_runtime_toml_that_fails_its_check() {
+    let rig = Rig::new("claude");
+    let pid = rig.sandbox.runtime_pid().unwrap();
+    break_config(&rig);
+    let (out, err, ok) = rig.sandbox.atem(&["runtime", "restart"]);
+    rig.sandbox.track();
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("missing field `project`"), "{err}");
+    assert!(err.contains("atem runtime restart"), "{err}");
+    assert_eq!(rig.sandbox.runtime_pid(), Some(pid), "nothing was stopped");
+}
+
 #[test]
 fn records_left_by_another_host_identity_are_moved_aside() {
     let mut rig = Rig::prepared("claude", |_| {});
