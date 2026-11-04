@@ -483,6 +483,7 @@ struct Link {
 }
 
 pub struct HostBridge {
+    local: Option<(String, Identity)>,
     work: host_work_bridge::State,
     host: SessionHost<FileJournal>,
     dir: std::path::PathBuf,
@@ -722,6 +723,7 @@ impl HostBridge {
             None => Arc::new(NoHasher),
         };
         Ok(Self {
+            local: None,
             work: host_work_bridge::State::open(dir, profile.is_some()),
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
@@ -1481,6 +1483,7 @@ impl HostBridge {
         let mut cx = Cx { client, sessions };
         self.sync_link(app_link(app), &mut cx);
         self.sync_sessions(&mut cx);
+        self.sync_local(&mut cx);
         if !adopting && !self.recovered {
             self.recovered = true;
             let effects = self.host.recover();
@@ -1554,6 +1557,7 @@ impl HostBridge {
             self.r9_exec(effects, &mut cx);
         }
         self.test_carriage(&mut cx);
+        self.sync_local(&mut cx);
         self.work_config();
         self.project_pass(&mut cx);
         self.sync_all(&mut cx);
@@ -1873,7 +1877,71 @@ impl HostBridge {
     /// The attachment is the link's own or an r9 channel's: its messages
     /// have somewhere to go.
     fn reachable(&self, attachment: &str) -> bool {
-        self.current(attachment) || self.r9.owns(attachment)
+        self.current(attachment)
+            || self.r9.owns(attachment)
+            || (!attachment.is_empty() && attachment == self.local_attachment())
+    }
+
+    pub(super) fn local_attachment(&self) -> &str {
+        self.local.as_ref().map_or("", |(attachment, _)| attachment)
+    }
+
+    pub(super) fn local_healthy(&self) -> bool {
+        self.hosting_enabled()
+            && self.work.collaboration_enabled()
+            && self.host.context().account_id != UNPAIRED
+            && !self.host.journal_halted()
+            && self.membership_error.is_none()
+            && self
+                .membership
+                .as_ref()
+                .is_none_or(|m| !m.is_frozen() && m.faulted().is_none() && m.held().is_none())
+    }
+
+    fn sync_local(&mut self, cx: &mut Cx) {
+        let context = self.host.context();
+        let identity = Identity {
+            account_id: context.account_id.clone(),
+            atem_device_id: context.atem_device_id.clone(),
+            host_trust_gen: context.host_trust_gen,
+        };
+        let healthy = self.local_healthy();
+        let current = self.local.as_ref().is_some_and(|(att, bound)| {
+            *bound == identity && self.host.attachment_principal(att) == Some("local")
+        });
+        if healthy && current {
+            return;
+        }
+        if let Some((old, _)) = self.local.take() {
+            let effects = self.host.fence_principal("local", 0);
+            self.exec(effects, cx);
+            let effects = self.host.disconnect(&old);
+            self.exec(effects, cx);
+        }
+        if !healthy {
+            return;
+        }
+        let attachment = uuid::Uuid::new_v4().to_string();
+        let attach = Attach {
+            client: "atem-internal-local".into(),
+            principal: "local".into(),
+            attachment_gen: attachment.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: atem_client::canonical::MAX_SAFE_INTEGER
+                .saturating_sub(self.clock.now()),
+        };
+        if let Ok(effects) = self.host.connect(attach) {
+            self.local = Some((attachment.clone(), identity));
+            self.exec(effects, cx);
+            if self.host.welcome_r9(&attachment, self.clock.now()).is_err() {
+                self.local = None;
+                let effects = self.host.disconnect(&attachment);
+                self.exec(effects, cx);
+            }
+            let effects = self.host.take_effects();
+            self.exec(effects, cx);
+        }
     }
 
     // ── Messages ──
@@ -2005,6 +2073,9 @@ impl HostBridge {
     }
 
     fn send(&mut self, attachment: &str, message: &Envelope, cx: &mut Cx) {
+        if !attachment.is_empty() && attachment == self.local_attachment() {
+            return;
+        }
         if self.r9.owns(attachment) {
             let host_id = self.host.context().atem_device_id.clone();
             self.r9.deliver(
@@ -2045,6 +2116,9 @@ impl HostBridge {
     }
 
     fn send_chat(&mut self, attachment: &str, env: ChatEnvelope, cx: &mut Cx) {
+        if !attachment.is_empty() && attachment == self.local_attachment() {
+            return;
+        }
         if env.op == "error"
             && let Some(code) = env.body.get("code").and_then(Value::as_str)
         {
@@ -2100,6 +2174,10 @@ impl HostBridge {
                 // delivery as uncertain. Other attachments it closes are
                 // already gone from the link.
                 Effect::Close { attachment } => {
+                    if !attachment.is_empty() && attachment == self.local_attachment() {
+                        self.local = None;
+                        continue;
+                    }
                     if self.r9.owns(&attachment) {
                         self.r9.close_attachment(&attachment, host_now().mono_ms);
                         self.forget_r9(&attachment);
@@ -3957,15 +4035,18 @@ impl ProjectHasher for NoHasher {
 /// is authenticating an authenticated link again (a routed one keeps it).
 fn r9_app_link(app: &App) -> Option<u64> {
     // A routed link keeps its r9 carrier while Astation authenticates it.
-    (app.r9_link_up() && !app.station_direct_blocked()
+    (app.r9_link_up()
+        && !app.station_direct_blocked()
         && (app.astation_reauth.is_none() || app.astation_routed))
         .then_some(app.astation_link_gen)
 }
 
 fn app_link(app: &App) -> Option<u64> {
-    (app.astation_connected && !app.station_direct_blocked()
-        && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
-        .then_some(app.astation_link_gen)
+    (app.astation_connected
+        && !app.station_direct_blocked()
+        && app.astation_reauth.is_none()
+        && !app.astation_client.is_ws_closed())
+    .then_some(app.astation_link_gen)
 }
 
 /// §6: what a failed host write proves (`None`: it was written).

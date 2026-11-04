@@ -9,6 +9,45 @@ use atem_client::session::host_work::{
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+/// The local sender exists only on the broker's internal attachment.
+pub(crate) enum Sender {
+    Remote(Authority),
+    Local,
+}
+
+impl Sender {
+    fn remote(&self) -> Option<&Authority> {
+        match self {
+            Self::Remote(a) => Some(a),
+            Self::Local => None,
+        }
+    }
+    fn name(&self) -> String {
+        self.remote()
+            .map_or_else(|| "local".into(), Authority::name)
+    }
+    fn key_json(&self) -> Value {
+        self.remote()
+            .map_or_else(|| json!("local"), |a| a.key.to_json())
+    }
+    fn owner(&self) -> String {
+        hw::digest(
+            &serde_json::to_vec(&(self.name(), self.key_json())).expect("serializable identity"),
+        )
+    }
+    fn allows(&self, need: Need) -> bool {
+        self.remote().is_none_or(|a| a.allows(need))
+    }
+    fn is_browser(&self) -> bool {
+        self.remote()
+            .is_some_and(|a| a.client_kind == atem_client::principal::ClientKind::Browser)
+    }
+    fn in_scope(&self, host: &str, session: &str, projects: &dyn Fn(&str) -> Option<bool>) -> bool {
+        self.remote()
+            .is_none_or(|a| a.session_in_scope(host, session, projects))
+    }
+}
+
 pub struct RemoteLaunch {
     pub request_id: String,
     pub profile: Profile,
@@ -43,6 +82,9 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn collaboration_enabled(&self) -> bool {
+        self.config.collab.send
+    }
     pub(super) fn open(journal: &Path, available: bool) -> Self {
         let dir = journal
             .parent()
@@ -74,6 +116,32 @@ impl Drop for State {
 }
 
 impl HostBridge {
+    /// Local input uses the same durable receiver as an authenticated remote
+    /// message, with an attachment that never crosses a transport link.
+    fn local_publish(
+        &mut self,
+        message: &atem_client::session::messages::Message,
+        cx: &mut Cx,
+    ) -> Result<atem_client::session::messages::MessageReceipt, &'static str> {
+        if !self.local_healthy() || !message.valid_local() {
+            return Err("forbidden");
+        }
+        let host = self.work_host();
+        if !self.work_store_ready(&host) {
+            return Err("busy");
+        }
+        let request = hw::Request::Publish {
+            v: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            host,
+            message: message.clone(),
+        };
+        match self.message_request(&request, &Sender::Local, cx)? {
+            ResultBody::Message { message } => Ok(message),
+            _ => Err("invalid_request"),
+        }
+    }
+
     pub fn hosting_enabled(&self) -> bool {
         self.work.config.enabled && !self.work.error
     }
@@ -186,13 +254,17 @@ impl HostBridge {
         }
     }
 
-    fn work_authority(&mut self, attachment: &str) -> Option<Authority> {
+    fn work_authority(&mut self, attachment: &str) -> Option<Sender> {
+        if !attachment.is_empty() && attachment == self.local_attachment() {
+            return self.local_healthy().then_some(Sender::Local);
+        }
         self.r9_call(|r9, parts| r9.current_work_authority(attachment, parts))
+            .map(Sender::Remote)
     }
 
-    fn profile_allowed(&self, profile: &Profile, authority: &Authority, launch: bool) -> bool {
-        (!launch || profile.permits(authority))
-            && authority.session_in_scope(
+    fn profile_allowed(&self, profile: &Profile, authority: &Sender, launch: bool) -> bool {
+        (!launch || authority.remote().is_none_or(|a| profile.permits(a)))
+            && authority.in_scope(
                 &self.host.context().atem_device_id,
                 &profile.scope_key(),
                 &|entry| self.projects.matches(&profile.scope_key(), entry),
@@ -202,7 +274,7 @@ impl HostBridge {
     fn work_allowed(
         &self,
         record: &WorkRecord,
-        a: &Authority,
+        a: &Sender,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> bool {
         let Some(profile) = self.work.config.profile(&record.profile_id) else {
@@ -221,7 +293,7 @@ impl HostBridge {
             && self.projects.key_of(&record.task.target.session_id) == Some(record.project.as_str())
     }
 
-    fn work_route_allowed(&self, record: &WorkRecord, a: &Authority) -> bool {
+    fn work_route_allowed(&self, record: &WorkRecord, a: &Sender) -> bool {
         let Some(route) = self.work.config.route(&record.route_id) else {
             return false;
         };
@@ -239,7 +311,7 @@ impl HostBridge {
             && a.allows(Need::Op(Op::Prompt))
             && self.host.control_gen(&a.name()) == record.control_gen
             && self.work_host().contains(&record.task.target)
-            && a.session_in_scope(
+            && a.in_scope(
                 &record.task.target.atem_device_id,
                 &record.task.target.session_id,
                 &|e| self.projects.matches(&profile.scope_key(), e),
@@ -389,9 +461,9 @@ impl HostBridge {
         {
             use base64::Engine;
             if !a.allows(Need::Op(Op::Message))
-                || a.client_kind == atem_client::principal::ClientKind::Browser
-                || a.scope
-                    .as_ref()
+                || a.is_browser()
+                || a.remote()
+                    .and_then(|a| a.scope.as_ref())
                     .and_then(|s| s.hosts.as_ref())
                     .is_some_and(|hosts| !hosts.contains(&req.host().atem_device_id))
             {
@@ -633,20 +705,23 @@ impl HostBridge {
     fn message_scope(
         &self,
         recipient: &atem_client::session::messages::Recipient,
-        a: &Authority,
+        a: &Sender,
     ) -> bool {
         use atem_client::session::messages::Destination;
         match &recipient.destination {
             // Select expansion is local until the cross-instance contract is agreed.
             Destination::Select { .. } => false,
-            Destination::Host => a.scope.as_ref().is_none_or(|scope| {
-                scope.projects.is_none()
-                    && scope.sessions.is_none()
-                    && scope
-                        .hosts
-                        .as_ref()
-                        .is_none_or(|hosts| hosts.contains(&recipient.host.atem_device_id))
-            }),
+            Destination::Host => a
+                .remote()
+                .and_then(|a| a.scope.as_ref())
+                .is_none_or(|scope| {
+                    scope.projects.is_none()
+                        && scope.sessions.is_none()
+                        && scope
+                            .hosts
+                            .as_ref()
+                            .is_none_or(|hosts| hosts.contains(&recipient.host.atem_device_id))
+                }),
             Destination::Project {
                 route_id,
                 route_revision,
@@ -668,13 +743,16 @@ impl HostBridge {
                 let sid = match &recipient.destination {
                     Destination::Agent { target, .. } => target.session_id.as_str(),
                     _ => {
-                        if a.scope.as_ref().is_some_and(|s| s.sessions.is_some()) {
+                        if a.remote()
+                            .and_then(|a| a.scope.as_ref())
+                            .is_some_and(|s| s.sessions.is_some())
+                        {
                             return false;
                         }
                         &profile.scope_key()
                     }
                 };
-                a.session_in_scope(&recipient.host.atem_device_id, sid, &|entry| {
+                a.in_scope(&recipient.host.atem_device_id, sid, &|entry| {
                     self.projects.matches(&profile.scope_key(), entry)
                 })
             }
@@ -684,16 +762,14 @@ impl HostBridge {
     fn message_request(
         &self,
         req: &hw::Request,
-        a: &Authority,
+        a: &Sender,
         cx: &Cx,
     ) -> Result<ResultBody, &'static str> {
         use crate::runtime::host_work::MessageRecord;
         use atem_client::session::messages::{
             Delivery, Destination, MessageReceipt, RecipientReceipt,
         };
-        if !a.allows(Need::Op(Op::Message))
-            || a.client_kind == atem_client::principal::ClientKind::Browser
-        {
+        if !a.allows(Need::Op(Op::Message)) || a.is_browser() {
             return Err("forbidden");
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
@@ -711,7 +787,7 @@ impl HostBridge {
             _ => return Err("invalid_request"),
         };
         if let Some(old) = store.message(message_id).map_err(|_| "busy")? {
-            if old.message.sender != a.name() || old.sender_key != a.key.to_json() {
+            if old.message.sender != a.name() || old.sender_key != a.key_json() {
                 return Err("forbidden");
             }
             if let hw::Request::Publish { message, .. } = req
@@ -807,7 +883,7 @@ impl HostBridge {
             });
         }
         let record = MessageRecord {
-            sender_key: a.key.to_json(),
+            sender_key: a.key_json(),
             message: message.clone(),
             receipt: MessageReceipt {
                 message_id: message.message_id.clone(),
@@ -855,11 +931,16 @@ impl HostBridge {
                 self.work.store.as_ref().unwrap().save_work(&r)?;
                 continue;
             }
-            let attachment = self
-                .r9
-                .attachments()
+            let local = (r.principal == "local" && !self.local_attachment().is_empty())
+                .then(|| self.local_attachment().to_string());
+            let attachment = local
                 .into_iter()
-                .map(|(attachment, _)| attachment)
+                .chain(
+                    self.r9
+                        .attachments()
+                        .into_iter()
+                        .map(|(attachment, _)| attachment),
+                )
                 .find(|att| {
                     self.work_authority(att).is_some_and(|a| {
                         a.name() == r.principal && self.work_allowed(&r, &a, cx.sessions)
@@ -989,12 +1070,405 @@ impl HostBridge {
     }
 }
 
-fn attachment_owner(a: &Authority) -> String {
-    hw::digest(&serde_json::to_vec(&(a.name(), a.key.to_json())).expect("serializable identity"))
+fn attachment_owner(a: &Sender) -> String {
+    a.owner()
 }
 
-fn authority_session(a: &Authority, target: &wire::Target, projects: &ProjectScopes) -> bool {
-    a.session_in_scope(&target.atem_device_id, &target.session_id, &|e| {
+fn authority_session(a: &Sender, target: &wire::Target, projects: &ProjectScopes) -> bool {
+    a.in_scope(&target.atem_device_id, &target.session_id, &|e| {
         projects.matches(&target.session_id, e)
     })
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+    use crate::runtime::adopt::SpawnRequest;
+    use crate::runtime::broker::{InProcess, Launcher};
+    use crate::runtime::protocol::LaunchEnv;
+    use atem_client::session::messages::{Delivery, Destination, Message, Recipient};
+
+    struct LocalRig {
+        bridge: HostBridge,
+        app: App,
+        sessions: BTreeMap<SessionId, BrokerSession>,
+        sid: SessionId,
+        fake: PathBuf,
+    }
+
+    impl LocalRig {
+        async fn new(root: &Path) -> Self {
+            let app = App::new();
+            let mut bridge =
+                HostBridge::open(&root.join("runtime/journal"), None, Clock::default()).unwrap();
+            let cwd = root.join("project");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let fake = root.join("fake");
+            std::fs::create_dir_all(&fake).unwrap();
+            let config: Config = toml::from_str(&format!(
+                r#"
+version = 1
+enabled = true
+[collab]
+send = true
+[[profiles]]
+id = "p"
+revision = 1
+label = "p"
+provider = "claude"
+cwd = {cwd:?}
+project = "local:project"
+principals = ["member:owner"]
+[[routes]]
+id = "r"
+revision = 1
+profile_id = "p"
+principals = ["local"]
+"#
+            ))
+            .unwrap();
+            config.validate().unwrap();
+            bridge.work.config = config;
+            bridge.work.store = Some(Store::open(&root.join("runtime")).unwrap());
+            let launcher = Launcher::InProcess(InProcess {
+                state: root.join("runtime"),
+                socket_dir: root.join("ws"),
+                chat_root: root.join("chat"),
+            });
+            let sid = SessionId::new();
+            let request = SpawnRequest {
+                session_id: sid.clone(),
+                process_gen: uuid::Uuid::new_v4().to_string(),
+                provider: crate::session::Provider::Claude,
+                args: vec![],
+                cwd,
+                rows: 24,
+                cols: 80,
+            };
+            let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/approvals/fake-agent.py");
+            let (handle, created) = launcher
+                .spawn(
+                    request.clone(),
+                    LaunchEnv(vec![
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        ("HOME".into(), root.display().to_string()),
+                        ("CLAUDE_CLI_BIN".into(), bin.display().to_string()),
+                        ("FAKE_DIR".into(), fake.display().to_string()),
+                    ]),
+                )
+                .await
+                .unwrap();
+            let mut sessions = BTreeMap::from([(
+                sid.clone(),
+                BrokerSession::launched(handle, &request, created),
+            )]);
+            let mut cx = Cx {
+                client: &app.astation_client,
+                sessions: &mut sessions,
+            };
+            assert!(bridge.adopt_identity(
+                &Identity {
+                    account_id: "acct".into(),
+                    atem_device_id: "host".into(),
+                    host_trust_gen: 1
+                },
+                &mut cx
+            ));
+            let mut rig = Self {
+                bridge,
+                app,
+                sessions,
+                sid,
+                fake,
+            };
+            rig.until(|r| {
+                r.sessions[&r.sid].chat_v1
+                    && r.sessions[&r.sid].chat.status().state == ChatState::Ready
+            })
+            .await;
+            rig
+        }
+
+        async fn until(&mut self, mut predicate: impl FnMut(&Self) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                for s in self.sessions.values_mut() {
+                    s.pump();
+                }
+                self.bridge.tick(&mut self.app, &mut self.sessions, false);
+                if predicate(self) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "local work did not progress");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn message(&self) -> Message {
+            let host = self.bridge.work_host();
+            Message {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                workflow_id: uuid::Uuid::new_v4().to_string(),
+                sender: "local".into(),
+                kind: Default::default(),
+                reply_to: None,
+                from_session: Some(SessionId::new().to_string()),
+                created_at: host_now().wall_ms,
+                expires_at: host_now().wall_ms + 60_000,
+                text: "COLLAB_TEST_PROMPT".into(),
+                context: vec![],
+                mark: None,
+                recipients: vec![Recipient {
+                    recipient_id: uuid::Uuid::new_v4().to_string(),
+                    host: host.clone(),
+                    destination: Destination::Agent {
+                        route_id: "r".into(),
+                        route_revision: 1,
+                        target: wire::Target {
+                            account_id: host.account_id,
+                            atem_device_id: host.atem_device_id,
+                            host_trust_gen: host.host_trust_gen,
+                            session_id: self.sid.to_string(),
+                            process_gen: self.sessions[&self.sid].process_gen.clone(),
+                        },
+                    },
+                }],
+            }
+        }
+
+        fn publish(&mut self, message: &Message) -> atem_client::session::messages::MessageReceipt {
+            self.bridge
+                .local_publish(
+                    message,
+                    &mut Cx {
+                        client: &self.app.astation_client,
+                        sessions: &mut self.sessions,
+                    },
+                )
+                .unwrap()
+        }
+
+        fn work(&self, m: &Message) -> WorkRecord {
+            self.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .work(&m.recipients[0].recipient_id)
+                .unwrap()
+                .unwrap()
+        }
+    }
+
+    impl Drop for LocalRig {
+        fn drop(&mut self) {
+            for s in self.sessions.values() {
+                let _ = s.stop();
+            }
+        }
+    }
+
+    fn local_test(body: impl AsyncFnOnce(&Path)) {
+        let dir = tempfile::Builder::new()
+            .prefix("atem-cw")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let _profile = crate::test_profile::use_dir(dir.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, body(dir.path()));
+    }
+
+    #[test]
+    fn a_local_task_dispatches_as_a_prompt_with_a_receipt() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let message = rig.message();
+            assert!(matches!(
+                rig.publish(&message).recipients[0].delivery,
+                Delivery::Work { .. }
+            ));
+            rig.until(|r| {
+                r.fake.join("input").is_file()
+                    && std::fs::read_to_string(r.fake.join("input"))
+                        .unwrap()
+                        .contains("COLLAB_TEST_PROMPT")
+            })
+            .await;
+            rig.publish(&message); // immutable retry, never a second submission
+            std::fs::write(rig.fake.join("complete"), "").unwrap();
+            rig.until(|r| r.work(&message).status.state == WorkState::AwaitingResult)
+                .await;
+            let work = rig.work(&message);
+            assert_eq!(
+                rig.bridge
+                    .host
+                    .receipt(&work.status.receipt_id)
+                    .unwrap()
+                    .state,
+                wire::ReceiptState::Completed
+            );
+            assert_eq!(
+                std::fs::read_to_string(rig.fake.join("input"))
+                    .unwrap()
+                    .matches("COLLAB_TEST_PROMPT")
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn a_route_without_local_refuses_it() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            rig.bridge.work.config.routes[0].principals = vec!["member:owner".into()];
+            let message = rig.message();
+            assert!(
+                matches!(&rig.publish(&message).recipients[0].delivery, Delivery::Refused { code } if code == "forbidden")
+            );
+            assert!(
+                rig.bridge
+                    .work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .tasks()
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn a_local_task_waits_for_a_remote_lease_and_never_takes_it() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let att = uuid::Uuid::new_v4().to_string();
+            rig.bridge
+                .host
+                .connect(Attach {
+                    client: "test-controller".into(),
+                    principal: "service:holder".into(),
+                    attachment_gen: att.clone(),
+                    permissions: vec![Permission::View, Permission::Control],
+                    client_kind: ClientKind::Native,
+                    authorization_ms: 60_000,
+                })
+                .unwrap();
+            rig.bridge
+                .host
+                .welcome_r9(&att, rig.bridge.clock.now())
+                .unwrap();
+            let message = rig.message();
+            let target = message.task(&message.recipients[0]).unwrap().target;
+            let (binding, _) = rig.bridge.host.binding_for_work(&att, &target).unwrap();
+            let acquire = json!({"type":"session","data":{"v":1,"op":"acquire","id":uuid::Uuid::new_v4().to_string(),"binding":binding,"takeover":false}});
+            let effects = rig.bridge.host.receive(
+                &att,
+                acquire.to_string().as_bytes(),
+                rig.bridge.clock.now(),
+            );
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            assert_eq!(
+                rig.bridge.host.lease_holder(rig.sid.as_str()),
+                Some(att.as_str())
+            );
+            rig.publish(&message);
+            rig.until(|r| r.work(&message).status.state == WorkState::Blocked)
+                .await;
+            assert_eq!(
+                rig.work(&message).status.detail,
+                "waiting for controller to release the lease"
+            );
+            assert_eq!(
+                rig.bridge.host.lease_holder(rig.sid.as_str()),
+                Some(att.as_str())
+            );
+            let mut binding = binding;
+            binding.lease_epoch = rig.bridge.host.lease_epoch(rig.sid.as_str());
+            let release = json!({"type":"session","data":{"v":1,"op":"release","id":uuid::Uuid::new_v4().to_string(),"binding":binding}});
+            let effects = rig.bridge.host.receive(
+                &att,
+                release.to_string().as_bytes(),
+                rig.bridge.clock.now(),
+            );
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            rig.until(|r| r.work(&message).status.state == WorkState::Submitted)
+                .await;
+            assert_eq!(
+                rig.bridge.host.lease_holder(rig.sid.as_str()),
+                Some(rig.bridge.local_attachment())
+            );
+            rig.bridge
+                .local_input(
+                    &rig.sid,
+                    vec![],
+                    &rig.app.astation_client,
+                    &mut rig.sessions,
+                )
+                .unwrap();
+            assert_eq!(rig.bridge.host.lease_holder(rig.sid.as_str()), None);
+        });
+    }
+
+    #[test]
+    fn the_local_attachment_survives_a_link_drop_and_returns_after_a_rebind() {
+        let dir = tempfile::tempdir().unwrap();
+        let _profile = crate::test_profile::use_dir(dir.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let app = App::new();
+            let mut sessions = BTreeMap::new();
+            let mut cx = Cx {
+                client: &app.astation_client,
+                sessions: &mut sessions,
+            };
+            let mut bridge =
+                HostBridge::open(&dir.path().join("runtime/journal"), None, Clock::default())
+                    .unwrap();
+            let identity = Identity {
+                account_id: "acct-local".into(),
+                atem_device_id: "host-local".into(),
+                host_trust_gen: 1,
+            };
+            assert!(bridge.adopt_identity(&identity, &mut cx));
+            bridge.work.config.enabled = true;
+            bridge.work.config.collab.send = true;
+            bridge.sync_local(&mut cx);
+            let attachment = bridge.local_attachment().to_string();
+            assert!(!attachment.is_empty());
+            assert_eq!(bridge.host.attachment_principal(&attachment), Some("local"));
+            bridge.sync_link(None, &mut cx);
+            assert_eq!(bridge.local_attachment(), attachment);
+            let mut other = identity;
+            other.host_trust_gen += 1;
+            assert!(bridge.adopt_identity(&other, &mut cx));
+            bridge.sync_local(&mut cx);
+            assert_ne!(bridge.local_attachment(), attachment);
+            assert_eq!(bridge.host.attachment_principal(&attachment), None);
+            let effects = bridge.host.membership_fault(None);
+            bridge.exec(effects, &mut cx);
+            bridge.sync_local(&mut cx);
+            assert!(bridge.local_attachment().is_empty());
+        });
+    }
 }
