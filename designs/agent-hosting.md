@@ -395,7 +395,8 @@ screenshots and context.
   while it is online.
 - **Not implemented:** work from an offline sender. Dispatch uses the sender's
   live channel, so its tasks wait until it reconnects. There is no origin proof
-  that would let the Station replay an envelope, and no Atem-to-Atem sender.
+  that would let the Station replay an envelope. Cross-instance sending is
+  planned in [agent-collaboration.md](agent-collaboration.md).
 - **Not implemented:** remote selector routing and context subscriptions.
   Remote senders resolve recipients (host, route, session, process) themselves.
   Local collaboration expands selectors once and persists that resolution.
@@ -413,6 +414,15 @@ screenshots and context.
   existing directories.
 - **Not implemented:** hosting state in `atem status` and `atem --version`;
   `atem runtime check` is the only report.
+
+### Sending work from Atem agents
+
+[Agent collaboration](agent-collaboration.md) stage 1 is implemented and
+unreleased: agents in this runtime can address work by project, tag or
+`atem_id`, with a durable outbox, publish-before-notify, status reports and
+explicit correlated results. It uses this receiver and its approved routes.
+**Not implemented:** cross-instance transport, the shared Station directory
+and mailbox, and the stages 2-3 permission agreements.
 
 ### OS service and boot startup (not implemented)
 
