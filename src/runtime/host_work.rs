@@ -26,9 +26,121 @@ pub struct Config {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub instance: Instance,
+    #[serde(default)]
+    pub collab: Collab,
+    #[serde(default)]
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub routes: Vec<Route>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Instance {
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Collab {
+    pub send: bool,
+    pub per_hour: u32,
+    pub per_workflow: u32,
+    pub result_timeout: String,
+}
+
+impl Default for Collab {
+    fn default() -> Self {
+        Self {
+            send: false,
+            per_hour: 30,
+            per_workflow: 8,
+            result_timeout: "30m".into(),
+        }
+    }
+}
+
+/// Configuration and CLI durations have the same bounded seconds/minutes/hours syntax.
+pub fn duration_ms(text: &str) -> Option<u64> {
+    let (number, unit) = text.split_at_checked(text.len().checked_sub(1)?)?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        _ => return None,
+    };
+    number
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(multiplier)
+        .filter(|ms| (1_000..=86_400_000).contains(ms))
+}
+
+impl Collab {
+    pub fn result_timeout_ms(&self) -> u64 {
+        duration_ms(&self.result_timeout).expect("validated collaboration timeout")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteLaunch {
+    #[default]
+    Off,
+    OnMessage,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoReport {
+    #[default]
+    Status,
+    FinalMessage,
+}
+
+pub fn label_problem(label: &str, owner: bool) -> Option<String> {
+    let prefixes: &[&str] = if owner {
+        &["project:", "tag:"]
+    } else {
+        &["self:"]
+    };
+    let Some(name) = prefixes
+        .iter()
+        .find_map(|prefix| label.strip_prefix(prefix))
+    else {
+        return Some(
+            if owner {
+                "owner labels are project: or tag:"
+            } else {
+                "agent labels are self:"
+            }
+            .into(),
+        );
+    };
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        Some("names are 1-32 of a-z, 0-9 and -".into())
+    } else {
+        None
+    }
+}
+
+fn labels_problem(labels: &[String]) -> Option<String> {
+    if labels.len() > 64 {
+        return Some("at most 64 labels".into());
+    }
+    labels
+        .iter()
+        .find_map(|label| label_problem(label, true).map(|p| format!("label {label:?}: {p}")))
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -62,6 +174,14 @@ pub struct Route {
     /// None: the paired Astation (`Config::load`).
     #[serde(default)]
     pub principals: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub launch: RouteLaunch,
+    #[serde(default)]
+    pub results: bool,
+    #[serde(default)]
+    pub auto_report: AutoReport,
 }
 
 fn principal_ok(principal: &str) -> bool {
@@ -74,7 +194,7 @@ fn principal_ok(principal: &str) -> bool {
 
 /// What is wrong with a profile's or route's principals (after the paired
 /// Astation filled an empty list), if anything.
-fn principals_problem(principals: &[String]) -> Option<String> {
+fn principals_problem(principals: &[String], route: bool) -> Option<String> {
     if principals.is_empty() {
         return Some(
             "no principals: list them, or pair with Astation (`atem pair`) so the paired \
@@ -85,12 +205,15 @@ fn principals_problem(principals: &[String]) -> Option<String> {
     if principals.len() > 64 {
         return Some("at most 64 principals".into());
     }
-    principals.iter().find(|p| !principal_ok(p)).map(|p| {
-        format!(
-            "`{p}` is not a principal: use `member:<id>`, `service:<id>` or `browser:<id>` \
+    principals
+        .iter()
+        .find(|p| !(principal_ok(p) || route && p.as_str() == "local"))
+        .map(|p| {
+            format!(
+                "`{p}` is not a principal: use `member:<id>`, `service:<id>` or `browser:<id>` \
              (`atem runtime check` lists them)"
-        )
-    })
+            )
+        })
 }
 
 /// `member:<id>` of the Astation the profile at `dir` is paired with (its
@@ -177,6 +300,15 @@ impl Config {
         if self.version != 1 || self.profiles.len() > 64 || self.routes.len() > 64 {
             bail!("host config needs version = 1 and at most 64 profiles/routes");
         }
+        if let Some(problem) = labels_problem(&self.instance.labels) {
+            bail!("[instance]: {problem}");
+        }
+        if self.collab.per_hour == 0 || self.collab.per_workflow == 0 {
+            bail!("[collab]: per_hour and per_workflow must be at least 1");
+        }
+        if duration_ms(&self.collab.result_timeout).is_none() {
+            bail!("[collab]: result_timeout must be 1s-24h, using s, m or h");
+        }
         let mut profiles = BTreeSet::new();
         for p in &self.profiles {
             let problem = if !is_opaque_id(&p.id) {
@@ -199,7 +331,7 @@ impl Config {
                     "project must name the cwd's project (its Git remote, else `local:<folder>`)"
                         .into(),
                 )
-            } else if let Some(problem) = principals_problem(&p.principals) {
+            } else if let Some(problem) = principals_problem(&p.principals, false) {
                 Some(problem)
             } else if p.args.len() > super::protocol::MAX_ARGS
                 || p.args.iter().map(String::len).sum::<usize>() > super::protocol::MAX_ARGS_BYTES
@@ -231,8 +363,10 @@ impl Config {
                 Some("revision must be at least 1".into())
             } else if !profiles.contains(&r.profile_id) {
                 Some(format!("profile_id `{}` names no profile", r.profile_id))
+            } else if let Some(problem) = labels_problem(&r.labels) {
+                Some(problem)
             } else {
-                principals_problem(&r.principals)
+                principals_problem(&r.principals, true)
             };
             if let Some(problem) = problem {
                 bail!("route `{}`: {problem}", r.id);
@@ -728,6 +862,18 @@ pub fn validate(dir: &Path) -> Result<Config> {
 pub fn check(dir: &Path) -> Result<()> {
     let paired = paired_member(dir);
     let config = validate(dir)?;
+    println!("Instance labels: {}", config.instance.labels.join(", "));
+    println!(
+        "Collaboration: {}; per_hour = {}; per_workflow = {}; result_timeout = {}",
+        if config.collab.send {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        config.collab.per_hour,
+        config.collab.per_workflow,
+        config.collab.result_timeout
+    );
     println!(
         "Agent hosting: {}",
         if config.enabled {
@@ -765,6 +911,19 @@ pub fn check(dir: &Path) -> Result<()> {
             route.id,
             route.profile_id,
             named(&route.principals)
+        );
+        println!(
+            "    labels: {}; launch: {}; results: {}; auto_report: {}",
+            route.labels.join(", "),
+            match route.launch {
+                RouteLaunch::Off => "off",
+                RouteLaunch::OnMessage => "on_message",
+            },
+            route.results,
+            match route.auto_report {
+                AutoReport::Status => "status",
+                AutoReport::FinalMessage => "final_message",
+            }
         );
     }
     let pairing = crate::paths::ProfilePaths::in_dir(dir).pairing;
@@ -1196,6 +1355,99 @@ profile_id = "backend-codex"
         );
         let error = load_error(dir.path());
         assert_eq!(error, "route `backend`: profile_id `nope` names no profile");
+    }
+
+    #[test]
+    fn labels_and_collab_parse_with_defaults() {
+        let mut config: Config = toml::from_str(PROFILE).unwrap();
+        config.inherit(Some("member:owner".into()));
+        config.validate().unwrap();
+        assert!(!config.collab.send);
+        assert_eq!(config.collab.per_hour, 30);
+        assert_eq!(config.collab.per_workflow, 8);
+        assert_eq!(config.collab.result_timeout_ms(), 1_800_000);
+        assert!(config.instance.labels.is_empty());
+        let route = &config.routes[0];
+        assert!(route.labels.is_empty());
+        assert!(route.launch == RouteLaunch::Off);
+        assert!(!route.results);
+        assert!(route.auto_report == AutoReport::Status);
+    }
+
+    fn collaboration_error(extra: &str) -> String {
+        let mut config: Config = toml::from_str(&format!("{PROFILE}{extra}")).unwrap();
+        config.inherit(Some("member:owner".into()));
+        config.validate().err().unwrap().to_string()
+    }
+
+    #[test]
+    fn labels_say_what_and_where() {
+        assert_eq!(
+            collaboration_error("labels = [\"tag:Auth\"]"),
+            "route `backend`: label \"tag:Auth\": names are 1-32 of a-z, 0-9 and -"
+        );
+        assert!(
+            collaboration_error("labels = [\"self:x\"]")
+                .contains("owner labels are project: or tag:")
+        );
+        let labels = (0..65)
+            .map(|i| format!("\"tag:t{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            collaboration_error(&format!("labels = [{labels}]")),
+            "route `backend`: at most 64 labels"
+        );
+        assert!(
+            collaboration_error("\n[instance]\nlabels = [\"tag:Auth\"]")
+                .starts_with("[instance]: label")
+        );
+        assert!(label_problem("self:reviewer", false).is_none());
+        assert!(
+            label_problem("tag:reviewer", false)
+                .unwrap()
+                .contains("agent labels are self:")
+        );
+    }
+
+    #[test]
+    fn local_is_a_route_principal_only() {
+        let mut config: Config =
+            toml::from_str(&format!("{PROFILE}principals = [\"local\"]")).unwrap();
+        config.inherit(Some("member:owner".into()));
+        config.validate().unwrap();
+        config.profiles[0].principals = vec!["local".into()];
+        assert!(
+            config
+                .validate()
+                .err()
+                .unwrap()
+                .to_string()
+                .starts_with("profile `backend-codex`: `local` is not a principal")
+        );
+    }
+
+    #[test]
+    fn result_timeout_parses() {
+        for (value, expected) in [("30m", 1_800_000), ("90s", 90_000), ("2h", 7_200_000)] {
+            let mut config: Config =
+                toml::from_str(&format!("{PROFILE}\n[collab]\nresult_timeout = {value:?}"))
+                    .unwrap();
+            config.inherit(Some("member:owner".into()));
+            config.validate().unwrap();
+            assert_eq!(config.collab.result_timeout_ms(), expected);
+        }
+        for value in ["0s", "25h", "999999999999999999999999h", "1", "-1s"] {
+            assert!(
+                collaboration_error(&format!("\n[collab]\nresult_timeout = {value:?}"))
+                    .starts_with("[collab]: result_timeout")
+            );
+        }
+        for key in ["per_hour", "per_workflow"] {
+            assert!(
+                collaboration_error(&format!("\n[collab]\n{key} = 0")).starts_with("[collab]:")
+            );
+        }
     }
 
     /// `atem runtime check` lists the device list's members and services

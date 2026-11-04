@@ -9,6 +9,19 @@
 version = 1
 enabled = false
 
+# -- Local agent collaboration (optional, off by default) ----------------------
+# Owner labels address agents, never authorize work. Names use 1-32 lowercase
+# ASCII letters, digits or hyphens. At most 64 labels per instance or route.
+# Agents may add only their own self: labels with `atem agent tag`.
+# [instance]
+# labels = ["project:backend", "tag:workstation"]
+#
+# [collab]
+# send = false
+# per_hour = 30
+# per_workflow = 8
+# result_timeout = "30m"  # 1s-24h; automatic status never completes a task
+
 # -- Who may launch and send work ---------------------------------------------
 # A profile or route that lists no `principals` is open to the Astation this
 # Atem is paired with (`member:<its id>`, the ID `atem status` shows on its
@@ -87,3 +100,11 @@ enabled = false
 # revision = 1
 # profile_id = "mobile-claude"
 # principals = ["member:YOUR_ASTATION_ID", "service:YOUR_SERVICE_ID"]  # optional; replaces the paired Astation
+#
+# Local collaboration requires explicit route consent: add "local" to that
+# route's principals. "local" is never valid in a profile's launch principals.
+# These optional keys belong to a [[routes]] table:
+# labels = ["tag:mobile"]
+# launch = "off"          # opt in with "on_message" to launch an empty route
+# results = false         # opt in to receive correlated results as agent input
+# auto_report = "status"  # "final_message" opts in to assistant-text reports

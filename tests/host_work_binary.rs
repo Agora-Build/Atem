@@ -678,6 +678,12 @@ fn runtime_start_initializes_once_and_check_does_not_start_a_runtime() {
     assert!(ok, "{out}{err}");
     assert!(sandbox.runtime_pid().is_none());
     assert!(!sandbox.config().join("runtime.toml").exists());
+    assert!(
+        out.contains(
+            "Collaboration: disabled; per_hour = 30; per_workflow = 8; result_timeout = 30m"
+        ),
+        "{out}"
+    );
 
     let (out, err, ok) = sandbox.atem(&["runtime", "start"]);
     assert!(ok, "{out}{err}");
@@ -715,6 +721,31 @@ fn runtime_start_initializes_once_and_check_does_not_start_a_runtime() {
             .unwrap()
             .contains("invalid_setting")
     );
+}
+
+#[test]
+fn runtime_check_lists_collaboration_consent_and_labels() {
+    let rig = Rig::prepared("codex", |_| {});
+    let path = rig.sandbox.config().join("runtime.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    private(
+        &path,
+        &format!(
+            "{config}\nlabels = [\"tag:backend\"]\nlaunch = \"on_message\"\nresults = true\nauto_report = \"final_message\"\n[instance]\nlabels = [\"project:atem\"]\n[collab]\nsend = true\nper_hour = 12\nper_workflow = 4\nresult_timeout = \"90s\"\n"
+        ),
+    );
+    let (out, err, ok) = rig.sandbox.atem(&["runtime", "check"]);
+    assert!(ok, "{out}{err}");
+    for text in [
+        "Instance labels: project:atem",
+        "Collaboration: enabled; per_hour = 12; per_workflow = 4; result_timeout = 90s",
+        "labels: tag:backend; launch: on_message; results: true; auto_report: final_message",
+        "may launch:",
+        "may send:",
+    ] {
+        assert!(out.contains(text), "missing {text}: {out}");
+    }
+    assert!(rig.sandbox.runtime_pid().is_none());
 }
 
 #[test]
