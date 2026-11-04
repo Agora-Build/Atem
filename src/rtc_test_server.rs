@@ -922,6 +922,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .app-id-value {{ font-family: monospace; font-size: 13px; color: #c9d1d9; }}
 .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
 #slogan {{ font-size: 13px; font-weight: 400; color: #7d8590; }}
+.header [data-atem-copy-link] {{ margin-left: auto; }}
 {rtm_css}
 </style>
 </head>
@@ -929,6 +930,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 
 <div class="header">
   <h1>Welcome to Agora, <span id="slogan">real-time is the only time</span></h1>
+  {copy}
 </div>
 
 <!-- ── General ─────────────────────────────────────────────────── -->
@@ -1563,6 +1565,7 @@ if (!document.getElementById('fetchBtn').disabled) {{
 
 {rtm_js}
 </script>
+{copy_link}
 </body>
 </html>"##,
         app_id_display = app_id_display,
@@ -1574,6 +1577,8 @@ if (!document.getElementById('fetchBtn').disabled) {{
         rtm_section = rtm_section,
         rtm_sdk_script = rtm_sdk_script,
         rtm_js = rtm_js,
+        copy = crate::web_server::access::copy_link_button("copy-btn"),
+        copy_link = crate::web_server::access::COPY_LINK,
     )
 }
 
@@ -1764,6 +1769,8 @@ mod tests {
         // the whole thing.
         assert!(html.contains("abc123def456ghij"));
         assert!(html.contains("my-test-channel"));
+        assert!(html.contains("data-atem-copy-link"), "Copy link missing");
+        assert!(html.contains(crate::web_server::access::LINK_PATH));
     }
 
     #[test]
