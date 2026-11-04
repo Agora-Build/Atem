@@ -2163,9 +2163,7 @@ mod tests {
     fn an_agent_whose_socket_is_replaced_stops() {
         let dir = short_dir();
         let (socket, paths, agent, stopped) = watched_agent(dir.path());
-        // Another listener takes the path in one step (bound beside it, then
-        // renamed over it): removing the socket first would let the agent see
-        // it gone, not replaced, in between.
+        // Another listener takes the path in one step: it is never missing.
         let staged = socket.with_extension("new");
         let _other = std::os::unix::net::UnixListener::bind(&staged).unwrap();
         std::fs::rename(&staged, &socket).unwrap();
