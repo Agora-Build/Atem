@@ -1,6 +1,8 @@
 # Agora account grouping: merge Astations under one Agora login
 
-Status: design, for review (2026-10-01). Nothing built.
+Status: **not implemented** — proposed (design for review, 2026-10-01; it
+needs no Atem change, and nothing is built on the relay or Astation side as
+far as this repo records).
 Owner: Brent G
 
 ## Problem

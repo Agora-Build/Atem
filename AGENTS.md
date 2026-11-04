@@ -64,6 +64,7 @@ src/
 ├── app/hosted.rs        # the App inside `atem runtime`: session-family messages for the broker's host (bare `atem` opens no Astation connection)
 ├── app/op_route.rs      # a running Astation operation's handshake replies go to it only (dropped once it ended)
 ├── app/relay_only.rs    # relay only (§R9.8a): the connect loop's local check, the local link drop after a committed result
+├── app/station_route.rs # the selected Station (designs/protocol/station-route-v1.md): the stationRoute exchange and the transport switch inside `atem runtime`
 ├── runtime/             # `atem runtime` (the broker) and `atem worker` — see "Runtime" below
 │   ├── mod.rs           #   run_runtime: one per config dir (runtime.lock), socket, state dir `<config>/runtime`
 │   ├── server.rs        #   local protocol server: frontends, launch/attach/input/paste/resize/reclaim/list/stop/reload, Astation operations, the 16 ms pass
@@ -79,8 +80,8 @@ src/
 │   ├── push_queue.rs    #   push_approval/push_resolved for the relay: latest state while the link is down, bounded
 │   ├── session_log.rs   #   session.ansi + summary.md under `<config>/logs/<session_id>/`
 │   ├── host_bridge.rs   #   atem-session host in the broker: SessionHost + FileJournal over the workers (attachments, leases, receipts, approvals, terminal-v1 frames, chat-v1 and its r8 history, receipt results)
-│   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes (no `principals`: the paired Astation's `member:<id>`; errors name the field/line or the profile and rule; `runtime check` lists who may launch), environment sources, durable launch/task/attachment SQLite records (feature branch)
-│   ├── host_attachments.rs # PNG chunk persistence, sender binding, verified private cache for task prompts (feature branch)
+│   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes (no `principals`: the paired Astation's `member:<id>`; errors name the field/line or the profile and rule; `runtime check` lists who may launch), environment sources, durable launch/task/attachment SQLite records
+│   ├── host_attachments.rs # PNG chunk persistence, sender binding, verified private cache for task prompts
 │   ├── host_work_bridge.rs # host launch/query and directed-work scheduling over normal receipts; config/authority rechecks, no takeover, explicit results
 │   ├── refusal_log.rs   #   runtime.log lines for refused session-family requests (no content; rate-limited per link)
 │   ├── ops.rs           #   Astation operations on the broker's link: pair, pair verify, cred unlock/projects, paired-token refresh
@@ -148,6 +149,7 @@ src/
 ├── version.rs           # atem --version: this build and protocols, then the running runtime, cred agent and workers (same passive looks)
 ├── pairing_wire.rs      # the token-free pairing bootstrap's strict reader (4096-byte bound, exact v1 shapes)
 ├── pairing.rs           # the one pairing (`pairing/pairing.enc`: Astation id, binding, session, shared login, save/grace) + host trust generation (`pairing/trust_gen`); Captured (async Astation work applies replies only under the pairing it started under), BoundAgent
+├── station_route.rs     # the stored Station selection (`pairing/station_route.json`; wins over ASTATION_RELAY_URL/astation_relay_url)
 ├── vault_client.rs      # atem vault CLI client (relay /api/vault: request builders, renderers, executor)
 ├── memory/              # Atem Memory: shared memory + skills across agents and machines
 │   ├── model.rs         #   Memory/Skill types, hashing
@@ -214,11 +216,12 @@ scripts/
 └── test-create-agent.sh # ConvoAI agent creation (requires env vars)
 designs/                      # Design only: current design and planned work (README.md is the index); implementation plans and handoffs are in git history
 ├── README.md                 # Index: current design, planned work
-├── protocol/                 # README.md (the protocols and how atem-session evolved, where the fixtures run), atem-session-v1.md (the wire contract, r9 appendix), atem-client-bindings.md (r9 binding/effect contract), fixtures/ (shared with Astation)
+├── protocol/                 # README.md (the protocols and how atem-session evolved, where the fixtures run), atem-session-v1.md (the wire contract, r9 appendix), atem-client-bindings.md (r9 binding/effect contract), atem-host-work-v1.md (remote launch, directed work, messages, attachments/mark), station-route-v1.md (the selected Station), fixtures/ (shared with Astation)
 ├── agent-runtime.md          # `atem runtime` broker + `atem worker`s: sessions, leases, receipts, the local protocol, operations through the runtime
 ├── shared-terminal.md        # Shared terminal (terminal-v1): canonical-screen frames, credit, keys, limits
 ├── agent-chat-host.md        # Agent chat (chat-v1): adapters, Claude hooks + transcript, Codex, approvals, status
 ├── agent-chat-api.md         # Developer guide for chat clients
+├── agent-hosting.md          # Remote launch (runtime.toml profiles/routes), messages, notices, directed work, Chisel/mark; planned: OS service, durable Station delivery
 ├── astation-connection.md    # How Atem reaches Astation: local then relay, authentication, token-free pairing, relay only, routed links, Stations
 ├── account-trust.md          # r9 account trust: the signed device list, recovery, the Recovery Kit
 ├── e2e-encryption.md         # E2E encryption: memory, skills, vault (atem side built) + credentials (`atem cred get`, planned)
@@ -227,7 +230,7 @@ designs/                      # Design only: current design and planned work (RE
 ├── atem-identity.md          # instance_id + unique relay atem_id
 ├── atem-core.md              # atem-core token library + C ABI (built for a Swift/Astation integration, which is a follow-up)
 ├── convo.md                  # ConvoAI: `atem serv convo` (test page, daemon) and the `atem config convo` wizard
-├── build-by-talk.md          # Planned (Astation + Atem; not started): Build by Talk, get the whole project clear by talking (project context + tool calls to the coding agents)
+├── build-by-talk.md          # Planned (Astation + Atem; not implemented): Build by Talk, get the whole project clear by talking (project context + tool calls to the coding agents)
 ├── agora-account-grouping.md # Proposed: merge Astations under one Agora login (opt-in)
 └── fixtures/                 # Agent hook fixtures the tests read (codex-hooks, permission-hook)
 docs/
@@ -237,7 +240,7 @@ docs/
 
 ### Core Components
 
-**Host work extension** (feature branch, `designs/protocol/atem-host-work-v1.md`):
+**Host work extension** (v0.8.2; `designs/agent-hosting.md`, wire `designs/protocol/atem-host-work-v1.md`):
 `atem runtime start|check` (tier 2) manages an explicitly disabled-by-default
 private `runtime.toml`. Start creates missing configuration and starts or
 reuses the detached runtime without replacing another build; check validates
@@ -249,19 +252,19 @@ profiles and durable reserved identities. `work_enqueue`/`work_query`/
 `work_cancel`/`work_complete` use a private durable task queue, current scoped
 authority and normal session-v1 prompt receipts, blocking on drafts, busy or
 unknown readiness, approvals and leases. Turn-end waits for an explicit result.
-Boot-service installation, Station publication/replay and Astation UI remain
-separate planned work; upgrade strict membership verifiers before enrolling
-the new launch/message/notify scope ops. The default runtime idle policy is unchanged.
+Not implemented: boot-service installation and Station publication/replay.
+Strict membership verifiers must know the launch/message/notify scope ops
+before a service is enrolled with them. The default runtime idle policy is unchanged.
 `host.messages` adds `message_publish`/`message_query` with inline text and/or
 exact context snapshots, multiple resolved recipients and per-recipient progress
-(`crates/atem-client/src/session/messages.rs`, `designs/protocol/atem-messages-v1.md`).
+(`crates/atem-client/src/session/messages.rs`, `designs/protocol/atem-host-work-v1.md` §5).
 The current channel principal must equal the envelope sender; its key is pinned
 in the private receipt store. Native members can store notices without execution consent;
 scoped services need non-control `message`. Agent deliveries still need the
 route's notify/prompt consent. Envelope, recipient decisions and queued tasks
 commit together. Progress stays on the original message/task receipt; there is
-no `runtime inbox` command. Station durable outbox,
-offline origin proofs and direct Atem host sender admission remain unimplemented.
+no `runtime inbox` command. Not implemented: a Station durable outbox,
+offline origin proofs and direct Atem host senders.
 
 **TUI State Machine** (`app.rs`): bare `atem` is a menu and a client of `atem runtime`; it opens no Astation connection (the runtime owns the machine's one link). Enum-based mode switching via `AppMode`:
 - `MainMenu` - Navigation between features
@@ -282,10 +285,10 @@ only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender
 principal/key. Verified private local PNG paths are appended before dispatch;
 missing/incomplete bytes block work. Limits: 256 uploads and 128 MiB reserved
 bytes, no automatic pruning. `message.mark` carries typed annotation metadata
-and an immutable screenshot descriptor. See `designs/protocol/atem-task-attachments-v1.md`.
+and an immutable screenshot descriptor. See `designs/protocol/atem-host-work-v1.md` §6.
 Legacy ID-only `markTaskAssignment` returns failed `markTaskResult` with upgrade
-guidance, never reads local task files or injects input. Chisel/Astation must
-migrate their sender; Station offline artifact delivery is separate work.
+guidance, never reads local task files or injects input. Not implemented:
+Station offline artifact delivery (an offline host).
 
 **Astation Integration** (`websocket_client.rs`): WebSocket protocol with `AstationMessage` enum:
 - `MarkTaskAssignment { task_id, received_at_ms }` - received from Astation
@@ -330,7 +333,7 @@ migrate their sender; Station offline artifact delivery is separate work.
 
 **Files in `~/.config/atem/`:**
 
-Four user-facing TOML configuration types: general `config.toml`, feature-branch
+Four user-facing TOML configuration types: general `config.toml`,
 `runtime.toml` (approved launch profiles/routes and opt-in hosting), `convo.toml`
 and `webhooks.toml`. The remaining files below are generated state. Runtime
 configuration stays private (0600) and separate from general settings because
@@ -453,7 +456,7 @@ New cross-machine or cross-agent features are tier 2 and must gate with
 
 ```
 Chisel saves local task JSON + annotated PNG
-  -> authorized Chisel/Astation publisher reads the PNG bytes (sender migration needed)
+  -> authorized Chisel/Astation publisher reads the PNG bytes (their repositories)
   -> encrypted attachment_put chunks to the selected Atem host
   -> message_publish with mark metadata + screenshot descriptor + approved agent target
   -> shared durable task queue (FIFO per session), readiness/authority/lease checks
@@ -461,10 +464,11 @@ Chisel saves local task JSON + annotated PNG
   -> message_query/work_query progress, explicit work_complete result
 ```
 
-The Atem receiver is implemented locally. Old `markTaskAssignment` notifications
-are refused with upgrade guidance. Chisel/Astation file transfer/publication and
-Station offline artifact storage remain integration work; do not claim these
-receiver tests validate them. No user process/service is restarted for tests.
+Atem's receiver shipped in v0.8.2; the sender (reading the PNG, uploading,
+publishing) is Chisel's and Astation's, and Atem's receiver tests don't cover
+it. Old `markTaskAssignment` notifications are refused with upgrade guidance.
+Not implemented: Station offline artifact storage. No user process/service is
+restarted for tests.
 
 ## Release Process
 

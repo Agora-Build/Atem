@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Atem — one pairing, many devices (§9 proposal)</title>
+<title>Atem — one pairing, many devices (r9 account trust)</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -68,7 +68,7 @@
 <body>
 <main>
   <h1>One pairing, many devices</h1>
-  <p class="sub">§9 proposal for Atem + Astation — same account, no repeated pairing, no forwarding through the Mac, no trust in the account login.
+  <p class="sub">r9 account trust, Atem + Astation (released in Atem v0.8.0) — same account, no repeated pairing, no forwarding through the Mac, no trust in the account login.
     Full text: <a href="account-trust.md">account-trust.md</a></p>
 
   <section class="hero">
@@ -155,7 +155,7 @@ sequenceDiagram
   A->>A: head 3 made durable, entry applied (removals fenced) — before admission
   A->>A: iPhone listed, not removed, roles control+view? signature valid?
   A->>P: welcome — roles control+view, Atem's head is seq 3 (up to date)
-  Note over P,A: Step 2 of the proposal: both derive session keys from the ephemeral exchange<br/>so the relay can't read terminal or chat traffic
+  Note over P,A: atem-ch1: both derive session keys from the ephemeral exchange<br/>so the relay can't read terminal or chat traffic
     </pre></div></div>
   </section>
 
@@ -180,7 +180,7 @@ flowchart TD
     </pre></div></div>
   </section>
 
-  <footer>Atem agent · draft for review with the Astation agent · 2026-10-16, trust design updated 2026-10-19</footer>
+  <footer>Atem · r9 account trust, as signed off 2026-10-19 and released in v0.8.0; designs/account-trust.md is authoritative</footer>
 </main>
 <script type="module">
   import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';

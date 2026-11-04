@@ -1,6 +1,7 @@
 # atem-client bindings: the binding and effect contract
 
-Selected-Station addition (native integration pending):
+Selected-Station addition (the binding helpers shipped in Atem v0.8.2; the
+native sender that calls them is Astation's):
 `stationRouteOffer(requestJson:relayUrl:relayOnly:sessionToken:)` uses the
 shared strict decoder, origin normalization and domain-separated HMAC for
 [Selected Station Handoff v1](station-route-v1.md). Native must validate and
@@ -26,8 +27,8 @@ before emitting that event; apps still inspect errors and each result state.
 |---|---|---|
 | `host.launch` | `host_profiles`, `host_launch`, `host_launch_query` | [Host work](atem-host-work-v1.md) |
 | `host.work` | `work_enqueue`, `work_query`, `work_cancel`, `work_complete` | [Host work](atem-host-work-v1.md) |
-| `host.messages` | `message_publish`, `message_query` | [Messages](atem-messages-v1.md) |
-| `host.attachments` | `attachment_put` | [PNG transfer and marks](atem-task-attachments-v1.md) |
+| `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
+| `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
 
 Persist launch request IDs and immutable message/task identities before sending.
 Recover uncertain results with their query operations; a retry uses a fresh

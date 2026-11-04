@@ -1,6 +1,6 @@
 # Atem protocols
 
-Status: current (Atem v0.8.0, 2026-11-01).
+Status: current (Atem v0.8.3, 2026-11-04).
 
 This page lists the protocols Atem speaks, says how the remote protocol
 (atem-session) evolved, and where the shared fixtures run. It gives no wire
@@ -10,21 +10,9 @@ current behavior in detail.
 
 ## The protocols
 
-Selected Station transport handoff: [station-route-v1.md](station-route-v1.md).
-The Atem receiver/shared native helper are implemented; native sender
-integration and live dev/custom switching remain pending.
-
 Everything remote travels on Atem's one outbound WebSocket link, either to
 Astation on the same machine (`:8080`) or to the relay. Atem opens no port.
 The local protocols run over same-user Unix sockets.
-
-The feature-branch [host-work extension](atem-host-work-v1.md) specifies
-opt-in remote launch and directed work inside r9 channels, including the
-membership-verifier upgrade needed for its new launch/message/notify scope ops.
-The [message extension](atem-messages-v1.md) adds inline text, exact context,
-one or many resolved recipients and independent durable delivery receipts.
-[Task screenshots and Chisel/mark](atem-task-attachments-v1.md) specifies PNG
-uploads and mark tasks in the same per-session queue.
 
 | Protocol | Between | Version today | Specified in |
 |---|---|---|---|
@@ -32,6 +20,8 @@ uploads and mark tasks in the same per-session queue.
 | chat-v1 (`agentChat` messages) | the same clients ↔ an agent's chat; bound to atem-session sessions and leases | v1 | atem-session-v1.md, [../agent-chat-host.md](../agent-chat-host.md) |
 | terminal-v1 (`terminal` messages) | the same clients ↔ an agent's shared terminal: screen frames, input, resize | v1 | atem-session-v1.md, [../shared-terminal.md](../shared-terminal.md) |
 | atem-ch1 | one remote client ↔ the host: r9's end-to-end encrypted channel; atem-session runs inside it. The router (the relay or Astation's `:8080`) carries its frames in a `channel` envelope | 1 (in the name) | atem-session-v1.md §R9.7, §R9.7a; clients use atem-client ([atem-client-bindings.md](atem-client-bindings.md)) |
+| Host work (`host.launch`, `host.work`, `host.messages`, `host.attachments`) | the same clients ↔ the host, inside r9 channels: remote launch from approved profiles, directed work, messages and notices, PNG screenshots and Chisel/mark | features of r9 (v0.8.2) | [atem-host-work-v1.md](atem-host-work-v1.md); [../agent-hosting.md](../agent-hosting.md) |
+| Selected Station (`stationRoute` messages) | Astation ↔ Atem on the paired link: which Station (relay) Atem connects to | v1 (v0.8.2) | [station-route-v1.md](station-route-v1.md); [../astation-connection.md](../astation-connection.md#station-selection) |
 | Relay messages (`relay`) | the host ↔ the relay: host route proof (`host_challenge`, `host_route`), sealed push hints and seen (`push_hint`, `push_seen`, `push_ack`) | part of r9 | atem-session-v1.md §R9.7b, §R9.9 |
 | Pairing v1 (`pairing`) | Atem ↔ Astation during `atem pair`: the token-free pairing bootstrap (`hello`, `introduction`, `error`) | v1 | Astation's `designs/protocol/pairing-and-service-authorization.md`; Atem's strict reader is `src/pairing_wire.rs` |
 | Local protocol ("local v1") | `atem` commands and the terminal frontend ↔ the background `atem runtime` | v1 | [../agent-runtime.md](../agent-runtime.md) "Local protocol (v1)"; `src/runtime/protocol.rs` |
@@ -108,7 +98,9 @@ are in git history.
   (Mac, iPhone, iPad, Android), scoped services (bots) and short browser
   grants; sealed push hints and `seen`; recovery with a 24 h wait. Added
   within r9: the host route proof (the relay holds a proved host's route
-  with no Mac online) and "relay only" (feature `host.policy`). r8's
+  with no Mac online), "relay only" (feature `host.policy`) and, in v0.8.2,
+  host work (features `host.launch`, `host.work`, `host.messages`,
+  `host.attachments`). r8's
   operations run unchanged inside the channel. A host with a device list
   refuses r8. Atem and Astation passed joint live tests before the release.
 

@@ -217,25 +217,23 @@ paired with; list principals only to allow other devices or services.
 rule) and lists your device list's members and services with their IDs and
 whether each may launch. Healthy hosting with `enabled = true` keeps the runtime online with zero
 sessions; otherwise its ordinary idle timeout applies. Both commands require
-pairing. Bare `atem runtime` runs in the foreground. OS service installation
-and boot startup remain planned. See the
-[host-work contract](designs/protocol/atem-host-work-v1.md) for feature-branch
-implementation and integration status.
+pairing. Bare `atem runtime` runs in the foreground. Not implemented yet: OS
+service installation and boot startup. See
+[agent hosting](designs/agent-hosting.md) for the design and the
+[host-work contract](designs/protocol/atem-host-work-v1.md) for the wire.
 
-The feature-branch [message API](designs/protocol/atem-messages-v1.md) accepts
-ordinary text, versioned memory/vault context, or both, for one or many explicit
-recipients. Receiving a notice does not grant agent control. Agent recipients
-still use approved routes and normal prompt receipts. Station's durable
-publication/replay, direct Atem senders and app interfaces remain integration
-work; the shared client API can already send through admitted native/service
-channels. Progress stays on the original message/task receipt.
+Messages carry ordinary text, versioned memory/vault context, or both, to one or
+many explicit recipients. Receiving a notice does not grant agent control.
+Agent recipients still use approved routes and normal prompt receipts, and
+progress stays on the original message/task receipt. Clients send through
+admitted native or service channels. Not implemented yet: durable delivery
+through the Station (publication, replay, offline senders) and direct
+Atem-to-Atem senders.
 
 Chisel/mark uses this same task queue. Its annotated PNG uploads separately over
 the encrypted channel; the task names an immutable screenshot reference. Atem
 verifies the bytes and gives the coding agent a private local image path.
-See the [mark and attachment contract](designs/protocol/atem-task-attachments-v1.md).
-The old ID-only `markTaskAssignment` is refused with upgrade guidance; Chisel and
-Astation must adopt the new sender flow before mark execution works with this build.
+The old ID-only `markTaskAssignment` is refused with upgrade guidance.
 
 If you are paired and verified, Astation can view each session, take control
 of it (one controller at a time, on a lease Astation keeps renewing; typing
@@ -563,7 +561,7 @@ Optional features use their own file; not every installation needs all four.
 | File | Sample | Purpose |
 |---|---|---|
 | `config.toml` | [config.example.toml](configs/config.example.toml) | General CLI/TUI settings, Astation/relay endpoints and generated machine identity |
-| `runtime.toml` | [runtime.example.toml](configs/runtime.example.toml) | Approved remote-launch profiles, notification routes and zero-session hosting (feature branch) |
+| `runtime.toml` | [runtime.example.toml](configs/runtime.example.toml) | Approved remote-launch profiles, notification routes and zero-session hosting |
 | `convo.toml` | [convo.example.toml](configs/convo.example.toml) | `atem serv convo` agent, model, voice and RTC settings |
 | `webhooks.toml` | [webhooks.example.toml](configs/webhooks.example.toml) | `atem serv webhooks` listener, signature validation and tunnel settings |
 
@@ -589,7 +587,7 @@ Files in `~/.config/atem/`:
 | File | Contents | Encryption |
 |------|----------|------------|
 | `config.toml` | Non-sensitive settings (Astation/relay URLs, extra_hostnames, SSO/BFF overrides) and this atem's generated identity (`instance_id`, `atem_id`) | None |
-| `runtime.toml` | Approved remote-launch profiles, notification routes and opt-in hosting (feature branch; disabled by default) | None (chmod 0600) |
+| `runtime.toml` | Approved remote-launch profiles, notification routes and opt-in hosting (disabled by default) | None (chmod 0600) |
 | `convo.toml` | ConvoAI agent config (API keys, provider params) | None (chmod 0600) |
 | `webhooks.toml` | Webhook listener, HMAC validation and tunnel settings | None |
 | `login.enc` | Your own `atem login` (who issued it, your login id, its tokens) | AES-256-GCM (machine-bound) |

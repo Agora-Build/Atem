@@ -6,8 +6,8 @@ together: grounded in the project's own context, with tool calls that ask
 the coding agents in Atem for more information or hand them work. It replaces the earlier voice-coding
 pipeline (removed).
 
-Status: planned (user, 2026-10-31): it will be built; the build starts later
-(not started). Design decisions by the user, 2026-10-17. Its prerequisites
+Status: **not implemented** — planned (user, 2026-10-31): it will be built;
+the build starts later (not started). Design decisions by the user, 2026-10-17. Its prerequisites
 (chat-v1, the Codex adapter, approvals, r9 remote access) are released in
 Atem v0.8.0 (2026-10-31).
 
@@ -118,4 +118,5 @@ Coding turns take minutes: the voice agent never blocks on them. It says
   from the agent's own turn text.
 - Default allowlist of doc paths per project, and how the user edits it.
 - Which sessions the voice agent may drive: the project's sessions on all
-  machines needs account trust (`designs/account-trust.md`) first.
+  machines; account trust (`designs/account-trust.md`), which this needs, was
+  released in Atem v0.8.0.

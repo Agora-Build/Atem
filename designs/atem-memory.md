@@ -3,7 +3,8 @@
 Status: built. MVP: Atem #23, #24; relay Astation #19. Phase 1.1 (**Fact
 validity**, **Search**, **Skill history and restore**): relay side (migrations
 0004/0005) merged and deployed (Astation PR #22); atem side merged in #26
-(2026-09-30).
+(2026-09-30). **Not implemented:** Phases 2–4 ("Phasing") and the two
+"Future" sections.
 Spans two repos: **Atem** (CLI, local store, adapters, sync client) and
 **Astation** (relay-server `/api/memory`, `/api/skills` + Postgres).
 
@@ -26,20 +27,22 @@ Machines may be anywhere on the Internet. They need no public IP, no SSH or
 shared LAN, and no overlap in when they're online. They sync through the
 relay-server, and each keeps a local copy so it works offline.
 
-The planned [agent notifications design](agent-notifications.md) adds
-event-driven handoffs: an explicit work request references committed context,
-and the receiving runtime queues it for an authorized agent. Ordinary memory
+[Agent hosting](agent-hosting.md) adds directed work: an explicit work
+request, which the receiving runtime queues for an authorized agent. Ordinary memory
 adds, sync and managed-block updates do not start agent turns. Local offline
 memory must be published before another machine is notified to act on it.
-This coordination layer is not implemented.
+The receiving side (durable messages and directed work, `runtime.toml` routes)
+was released in Atem v0.8.2. **Not implemented:** an Atem-side sender and
+Station's publication and replay, so nothing in Atem Memory notifies another
+machine yet.
 
 ## Non-goals
 
 - **Credential values.** Memory and skills never carry API keys, tokens, or
-  passwords. They may **name** a credential and tell the agent to fetch it
-  from `atem vault` (see "Credential references"). Credential management is
-  a separate feature, to be built on the vault later (see "Relationship to
-  vault"). Atem blocks anything that looks like a secret value before it's
+  passwords. They may **name** a credential (see "Credential references").
+  Credential management is a separate feature, `atem cred`
+  ([e2e-encryption.md](e2e-encryption.md), "Credentials"), not the vault;
+  reading a value with it is not implemented yet. Atem blocks anything that looks like a secret value before it's
   stored (see "Security").
 - `atemd` daemon, agent hooks, and an `atem mcp` server: Phase 2.
 - Distilling session transcripts with an LLM, and merging or synthesizing
@@ -54,12 +57,14 @@ This work does not modify `atem vault`. Memory reuses the vault's code and
 patterns: the pure request-builder client module, the relay handler shape,
 Postgres migrations, and the `seq` sync cursor.
 
-In the long run the vault is where credentials are managed, as its own
-feature with its own design. The two features stay separate, and they're
-connected only by **reference**:
+Credentials are managed by their own feature, `atem cred`, with its own
+design ([e2e-encryption.md](e2e-encryption.md), "Credentials"); the vault
+gets no credential commands. Memory and the credential feature stay separate,
+and they're connected only by **reference**:
 
-- Memory and skills can say which vault credential to use, and the agent
-  fetches the value from the vault when it needs it.
+- Memory and skills can say which credential to use, and the agent
+  fetches the value when it needs it.
+- **Not implemented:** `atem cred get`, the command that fetches it.
 - When Phase 4 syncs settings or MCP definitions, it syncs them **without**
   credential values. Those fields become references that the credential
   feature resolves.
@@ -115,7 +120,8 @@ with, and approved by, your Astation.
 - This requires an Astation version with relay identity (a P-256 key
   verified to the relay). Older Astations keep relaying chat and remote
   control but can't grant memory or vault access.
-- Login-based accounts are a possible future follow-up.
+- **Not implemented:** login-based accounts, a possible follow-up (see
+  [agora-account-grouping.md](agora-account-grouping.md)).
 - atem sends `Authorization: session <session_id>` (the pairing session for
   the paired Astation, from the pairing record `pairing/pairing.enc`) plus
   `?id=<instance_id>`. Wire JSON is otherwise unchanged.
@@ -369,7 +375,7 @@ credential named in memory is always fetched from the vault, never copied.
   committed `.gitignore`.
 - **Worktrees:** a new worktree doesn't contain these local files until
   `atem sync` (or `atem memory apply`) runs in it. Phase 2's session-start
-  hook fixes this.
+  hook would fix this (not implemented).
 
 ### Apply report
 
@@ -581,10 +587,10 @@ If the detector misses a credential and it syncs:
   have been copied to other machines' disks or backups, so treat it as
   exposed.
 
-### Moving credentials to the vault (after the credential feature ships)
+### Moving credentials to the credential store (not implemented)
 
-Once the vault manages credentials, atem will offer to move a detected value
-into the vault and replace it with a reference such as `dialf/openai`,
+Once `atem cred` manages credentials, atem will offer to move a detected value
+into it and replace it with a reference such as `dialf/openai`,
 asking you to confirm first. Until then, atem only reports findings and
 tells you what to do.
 
@@ -609,8 +615,9 @@ stays in the vault and is fetched at use time.
   credential and later writes it into Claude's memory or a skill file, the
   secret check blocks it on the next harvest or `skill add`.
 
-**Dependency:** `atem vault get <name>` is a placeholder. The real command
-comes from the credential feature's design. Until that ships, a name in
+**Not implemented:** the command that fetches a value. `atem vault get <name>`
+above is a placeholder (the vault has no such command); the credential
+feature's design names it `atem cred get`. Until that ships, a name in
 memory is just text that tells the user and agent where the credential
 lives.
 
@@ -832,7 +839,8 @@ facts are dropped silently. With search:
 - The block still holds the top facts, by confidence and then newest.
 - When facts are left out, the block ends with a line saying how many and
   telling the agent to run `atem memory search "<query>"` for the rest.
-- Phase 2's `atem mcp` exposes the same search as a `memory_search` tool.
+- **Not implemented:** Phase 2's `atem mcp`, which would expose the same
+  search as a `memory_search` tool.
 
 ## Skill history and restore
 
@@ -890,7 +898,7 @@ before 0005 report as `deleted`. `version` returns a delete marker with
 The concurrent-push note has a pointer (with `--scope project` for project skills): *"… both versions are kept and v5
 is now the latest. See them with `atem skill history <name>`."*
 
-## Future: binary files in skills
+## Future: binary files in skills (not implemented)
 
 Not planned. Skills stay text-only until a real skill needs an image or
 other binary file. If that happens:
@@ -908,7 +916,7 @@ other binary file. If that happens:
 - The 1 MB-per-skill cap stays, or gets its own separate limit for binary
   files.
 
-## Future: semantic search and relationships
+## Future: semantic search and relationships (not implemented)
 
 Not planned. Build these only if an evaluation shows keyword search isn't
 enough.
@@ -952,12 +960,12 @@ test.
 |---|---|
 | **1 (MVP)** | Everything in this doc except the 1.1 items and the Future sections. Built |
 | **1.1** | Fact validity, local Search, and Skill history and restore. Built |
-| 2 | `atemd` plus session-start hooks (sync and apply automatically, which also fixes worktrees). An `atem mcp` server with `memory_add` and `memory_search` tools, so agents save and search memory directly; this matters most for Codex, whose hooks are weaker |
-| 3 | A guarded nightly clean-up pass: back up first, run the LLM, sanity-check the result, restore the backup on failure. It merges duplicates, promotes project facts that apply everywhere to global, and flags contradictions. Also harvest session transcripts into searchable history before Claude deletes them (30 days by default), and distill them into memory |
-| 4 | Settings, MCP definitions, and hooks, with portable and machine-local fields separated and credential values replaced by references to the credential feature. Gemini and OpenCode adapters |
+| 2 (not implemented) | `atemd` plus session-start hooks (sync and apply automatically, which also fixes worktrees). An `atem mcp` server with `memory_add` and `memory_search` tools, so agents save and search memory directly; this matters most for Codex, whose hooks are weaker |
+| 3 (not implemented) | A guarded nightly clean-up pass: back up first, run the LLM, sanity-check the result, restore the backup on failure. It merges duplicates, promotes project facts that apply everywhere to global, and flags contradictions. Also harvest session transcripts into searchable history before Claude deletes them (30 days by default), and distill them into memory |
+| 4 (not implemented) | Settings, MCP definitions, and hooks, with portable and machine-local fields separated and credential values replaced by references to the credential feature. Gemini and OpenCode adapters |
 
-Credential management is a separate feature on the vault, with its own
-design. It isn't a phase of this one.
+Credential management is a separate feature (`atem cred`), with its own
+design ([e2e-encryption.md](e2e-encryption.md)). It isn't a phase of this one.
 
 ## Prior art
 

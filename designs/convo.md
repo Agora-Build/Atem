@@ -1,6 +1,7 @@
 # ConvoAI: `atem serv convo` and `atem config convo`
 
-Status: current design (Atem v0.8.0, 2026-11-01).
+Status: implemented; current as of Atem v0.8.3 (2026-11-04). Access codes
+for every `atem serv` page since v0.8.1.
 
 Code: `src/convo_config.rs` (schema, `/join` body), `src/convo_test_server.rs` (server, page, daemon),
 `src/convo_wizard.rs`, `src/web_server/`, `assets/convo/`. Sample: `configs/convo.example.toml`.
@@ -137,8 +138,10 @@ atem serv convo [--channel NAME] [--rtc-user-id ID] [--agent-user-id ID] [--conf
 
 The server binds `0.0.0.0` with a self-signed certificate for loopback, the LAN address (as an
 `sslip.io` name) and `extra_hostnames` from `config.toml`, so a phone on the LAN can open it. It
-prints Local, Network and Custom URLs, each with this start's access code (`?t=…`), and opens the
-browser. Every route below needs the code (see Credentials). It does not register in `serv list`.
+starts a Cloudflared quick tunnel and an Ngrok tunnel when their executables are on `PATH`
+(`src/web_server/tunnels.rs`), prints Local, LAN, Cloudflared, Ngrok and Custom URLs (a missing tool
+is left out, a failed tunnel shows `(unavailable)`), each with this start's access code (`?t=…`),
+and opens the browser. Every route below needs the code (see Credentials). It does not register in `serv list`.
 
 | Route | Purpose |
 |---|---|
@@ -228,7 +231,7 @@ embedded in the binary. Do not edit it. `scripts/update-convoai-toolkit.sh` rebu
 upstream commit (`PINNED_SHA`, in `assets/convo/VERSION`), a committed lockfile and a pinned esbuild,
 so two runs give the same bytes (`UPDATE_LOCK=1` re-resolves dependencies). The `toolkit-freshness`
 job in `release.yml` fails the release if the committed bundle differs. Upstream has since moved to an
-npm package; adopting it is a separate step.
+npm package. **Not implemented:** adopting it (a separate step).
 
 ## `atem config convo`
 

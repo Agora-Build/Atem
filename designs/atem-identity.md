@@ -129,7 +129,8 @@ query round-trip, and that a raw non-ASCII URL is rejected.
 
 1. **Multiple atem processes on one machine.** `instance_id` is per-install
    (one `config.toml`), so two atem processes sharing a config dir share an id.
-   Fine today (one atem per host); revisit if we support concurrent atems per
-   machine.
+   Fine: one `atem runtime` per config dir owns the Astation link and every
+   other `atem` is its client ([agent-runtime.md](agent-runtime.md)); a second
+   config dir is a second install with its own id.
 2. ~~**Relay sanitizer alignment.**~~ Resolved: the relay's `sanitize_atem_id`
    (`relay-server/src/relay.rs`) keeps decoded non-ASCII and is tested.

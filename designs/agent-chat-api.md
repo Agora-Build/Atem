@@ -26,7 +26,8 @@ Atem runtime (host) ── authenticated Astation link ── relay ── your 
 ```
 
 - **Session** = one original agent process the user launched with
-  `atem agent launch`. Chat never starts another agent or session. The session
+  `atem agent launch` (or a remote launch from a host-approved profile, since
+  v0.8.2). Chat never starts another agent or session. The session
   id is `ses-` + 12 base32 characters and is also the chat `agentId`.
 - **Conversation** = a client's view of a session, named by your own
   `conversationId` (1-128 bytes). It holds no state of its own: closing it
@@ -481,7 +482,9 @@ The final card carries the reason as `reason`.
 
 ### 5.4 Notifications
 
-Over the verified link the host sends the relay (not you):
+Over the verified link an r8 host sends the relay (not you) the messages
+below; a host with a device list (r9) sends sealed `push_hint`/`push_seen`
+instead (appendix "r9", §R9.9):
 
 ```json
 {"type":"relay","data":{"v":1,"op":"push_approval","approval_id":"88888888-…","atem_device_id":"host-a",
@@ -538,7 +541,7 @@ approvals pending across a broker restart are released without
 | Chat availability | `chat-v1` once its hooks produced SessionStart (15 s wait; late one still enables) | only with `[codex] hooks = true` and hooks trusted in Codex's `/hooks` |
 | Content source | transcript JSONL | rollout JSONL |
 | `unavailable` | `["streaming","reasoning"]` | `["streaming","reasoning","error_details"]` |
-| Reply shape | whole messages; a later content block of the same reply sends the message again, whole | whole messages (commentary and final answer are separate messages; a command is a `Bash` tool part); later parts also arrive as `delta` |
+| Reply shape | whole messages; a later content block of the same reply sends the message again, whole | whole messages (commentary and final answer are separate messages; a command is a `Bash` tool part); a message that gains a part is sent again, whole |
 | Status before first prompt | `ready` after SessionStart | `unknown` until the first prompt typed in the terminal |
 | First remote prompt | allowed when `ready` | refused until a first prompt was typed locally (the "type a first prompt" text) |
 | Always allow | agent's `permission_suggestions` as `always_rules` | an Atem session rule, shell commands only (section 5.5) |
@@ -648,17 +651,23 @@ Ops: `hello`, `list`, chat `open`/`submit` or session-v1 `submit`
 
 ## 8. Limits and what's not there yet
 
-- Text-only prompts. No attachments or images, no slash commands or `!` shell
-  mode from chat (`/` and `!` are refused).
-- One native Astation link today. Several devices or browsers at once wait
-  on account trust (`designs/account-trust.md`, PR #70); compatibility mode has no
-  resume (`hello` with `resume` is `unauthorized`) and an attachment is
-  authorized for 24 h, then fenced and reconnected. Chat content is readable by the
-  relay (end-to-end encryption of chat is a follow-up).
-- No remote session launch: sessions start locally with `atem agent launch` (or the
-  bare `atem` menu). Clients only attach to what is already running. Optional
-  background hosting and remote launch are proposed in
-  [agent-hosting.md](agent-hosting.md); they are not implemented.
+- Text-only prompts: no slash commands or `!` shell mode from chat (`/` and
+  `!` are refused).
+- **Not implemented:** attachments or images in chat prompts (task screenshots
+  reach agents through directed work since v0.8.2,
+  [host work v1](protocol/atem-host-work-v1.md#6-attachments-and-mark)).
+- An r8 host has one native Astation link; compatibility mode has no resume
+  (`hello` with `resume` is `unauthorized`), an attachment is authorized for
+  24 h, then fenced and reconnected, and chat content is readable by the
+  relay. A host with a device list (r9, v0.8.0; `designs/account-trust.md`)
+  admits several devices, services and browsers at once, each in its own
+  end-to-end `atem-ch1` channel the relay can't read.
+- Remote session launch (v0.8.2) only from launch profiles the host approved
+  in `runtime.toml` (`atem runtime check` validates them; contract
+  [protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md)); otherwise
+  sessions start locally with `atem agent launch` (or the bare `atem` menu)
+  and clients attach to what is already running. **Not implemented:**
+  installing Atem as an OS service ([agent-hosting.md](agent-hosting.md)).
 - Sizes: prompt 32 768 bytes; message 131 072 bytes (≤ 2048 parts); a history
   page 50 messages / 256 KiB of content / 1 MiB serialized (older pages and
   lookups with `history`, 8 a second); `receipt.result` 32 reply ids; 8
