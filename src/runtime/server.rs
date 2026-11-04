@@ -337,6 +337,7 @@ fn waits_for_adoption(incoming: &Incoming) -> bool {
                 | ClientMsg::Stop { .. }
                 | ClientMsg::Tag { .. }
                 | ClientMsg::MessageSend { .. }
+                | ClientMsg::MessageReply { .. }
                 | ClientMsg::MessageStatus { .. }
                 | ClientMsg::MessageCancel { .. }
                 | ClientMsg::MessageDirectory { .. }
@@ -853,6 +854,7 @@ impl Server {
                 }
                 ClientMsg::Launch { .. }
                 | ClientMsg::MessageSend { .. }
+                | ClientMsg::MessageReply { .. }
                 | ClientMsg::MessageCancel { .. }
                 | ClientMsg::AstationOp { .. }
                 | ClientMsg::Attach { .. }
@@ -1142,6 +1144,20 @@ impl Server {
                 match result {
                     Ok(message_id) => self.send(id, &RuntimeMsg::MessageSent { message_id }),
                     Err(e) => self.error(id, e.to_string(), "message_send"),
+                }
+            }
+            ClientMsg::MessageReply { request } => {
+                let Some(sid) = self.calling_session(id) else {
+                    return self.error(id, "not inside an Atem session", "message_reply");
+                };
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_reply(&sid, request, &self.sessions));
+                match result {
+                    Ok(task_id) => self.send(id, &RuntimeMsg::MessageReplied { task_id }),
+                    Err(e) => self.error(id, e.to_string(), "message_reply"),
                 }
             }
             ClientMsg::MessageStatus { message_id } => {

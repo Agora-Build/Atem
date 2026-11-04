@@ -121,6 +121,9 @@ pub enum ClientMsg {
     MessageSend {
         request: super::collab::SendRequest,
     },
+    MessageReply {
+        request: super::collab::ReplyRequest,
+    },
     MessageStatus {
         message_id: Option<String>,
     },
@@ -251,6 +254,7 @@ impl ClientMsg {
             ClientMsg::List => "list",
             ClientMsg::Tag { .. } => "tag",
             ClientMsg::MessageSend { .. } => "message_send",
+            ClientMsg::MessageReply { .. } => "message_reply",
             ClientMsg::MessageStatus { .. } => "message_status",
             ClientMsg::MessageCancel { .. } => "message_cancel",
             ClientMsg::MessageDirectory { .. } => "message_directory",
@@ -483,6 +487,9 @@ pub enum RuntimeMsg {
     },
     MessageSent {
         message_id: String,
+    },
+    MessageReplied {
+        task_id: String,
     },
     MessageStatus {
         messages: Vec<super::collab::MessageView>,

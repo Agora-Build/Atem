@@ -1,9 +1,11 @@
 //! Local collaboration: immutable resolution, durable outbox and loop limits.
 
-use super::host_work::{Collab, Store, WorkRecord};
+#[path = "collab_results.rs"]
+pub mod results;
+
+use super::host_work::{Collab, Store};
 use anyhow::{Result, bail};
 use atem_client::session::{
-    host_work::WorkStatus,
     messages::Message,
     select::{AgentLabels, Label, MAX_AGENTS, Selector},
 };
@@ -22,6 +24,16 @@ pub struct SendRequest {
     #[serde(default)]
     pub launch: bool,
     pub expires_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyRequest {
+    pub task_id: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub memory: Vec<String>,
+    #[serde(default)]
+    pub vault: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,13 +195,31 @@ pub struct MessageView {
     pub workflow_id: String,
     pub delivery: String,
     pub detail: String,
-    pub tasks: Vec<WorkStatus>,
+    pub tasks: Vec<TaskView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultView {
+    pub text: String,
+    pub context: Vec<atem_client::session::messages::ContextReference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskView {
+    pub task_id: String,
+    pub receipt_id: String,
+    pub session_id: String,
+    pub route_id: String,
+    pub state: atem_client::session::host_work::WorkState,
+    pub detail: String,
+    pub result: Option<ResultView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Publication {
     pub atem_id: String,
-    pub origin_process_gen: String,
+    pub origin: results::Origin,
+    pub turn_id: Option<String>,
     pub context: Vec<super::collab_context::ContextSpec>,
 }
 
@@ -199,6 +229,17 @@ pub(super) fn reserve_context(
     message: &Message,
     publication: &Publication,
 ) -> Result<()> {
+    if let Some((envelope, record)) = store.db.query_row("SELECT o.envelope,p.record FROM outbox o JOIN publications p USING(message_id) WHERE o.message_id=?1",
+        [&message.message_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
+        let previous: Message = serde_json::from_str(&envelope)?;
+        let previous_publication: Publication = serde_json::from_str(&record)?;
+        if previous.text != message.text || previous.reply_to != message.reply_to || previous.from_session != message.from_session
+            || previous.workflow_id != message.workflow_id || previous_publication.origin.target != publication.origin.target
+            || previous_publication.turn_id != publication.turn_id || serde_json::to_value(previous_publication.context)? != serde_json::to_value(&publication.context)? {
+            bail!("request_id_reused");
+        }
+        return Ok(());
+    }
     let tx = store.db.unchecked_transaction()?;
     let count: usize = tx.query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))?;
     if count >= super::host_work::MAX_RECORDS {
@@ -294,7 +335,7 @@ pub(super) fn persist(
 }
 
 pub(super) fn views(store: &Store, id: Option<&str>) -> Result<Vec<MessageView>> {
-    let mut query = store.db.prepare("SELECT message_id,envelope,state,detail FROM outbox WHERE (?1 IS NULL OR message_id=?1) ORDER BY created_ms,rowid")?;
+    let mut query = store.db.prepare("SELECT message_id,envelope,state,detail FROM outbox WHERE (?1 IS NULL OR message_id=?1) ORDER BY created_ms DESC,rowid DESC LIMIT 32")?;
     let rows = query.query_map([id], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -303,30 +344,63 @@ pub(super) fn views(store: &Store, id: Option<&str>) -> Result<Vec<MessageView>>
             row.get::<_, String>(3)?,
         ))
     })?;
-    rows.map(|row| {
-        let (message_id, envelope, delivery, detail) = row?;
-        let message: Message = serde_json::from_str(&envelope)?;
-        let mut q = store
-            .db
-            .prepare("SELECT task_id FROM resolutions WHERE message_id=?1 ORDER BY rowid")?;
-        let tasks = q
-            .query_map([&message_id], |r| r.get::<_, String>(0))?
-            .map(|id| {
-                store
-                    .work(&id?)?
-                    .map(|r: WorkRecord| r.status)
-                    .ok_or_else(|| anyhow::anyhow!("missing resolved task"))
+    let views = rows
+        .map(|row| {
+            let (message_id, envelope, delivery, detail) = row?;
+            let message: Message = serde_json::from_str(&envelope)?;
+            let mut q = store
+                .db
+                .prepare("SELECT task_id FROM resolutions WHERE message_id=?1 ORDER BY rowid")?;
+            let tasks = q
+                .query_map([&message_id], |r| r.get::<_, String>(0))?
+                .map(|id| {
+                    let r = store
+                        .work(&id?)?
+                        .ok_or_else(|| anyhow::anyhow!("missing resolved task"))?;
+                    let result =
+                        results::accepted(store, &r.task.task_id)?.map(|result| ResultView {
+                            text: result.text,
+                            context: result
+                                .context
+                                .iter()
+                                .map(|c| atem_client::session::messages::ContextReference {
+                                    kind: c.kind,
+                                    id: c.id.clone(),
+                                    version: c.version,
+                                    digest: c.digest.clone(),
+                                })
+                                .collect(),
+                        });
+                    Ok(TaskView {
+                        task_id: r.status.task_id,
+                        receipt_id: r.status.receipt_id,
+                        session_id: r.task.target.session_id,
+                        route_id: r.route_id,
+                        state: r.status.state,
+                        detail: r.status.detail,
+                        result,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            Ok(MessageView {
+                message_id,
+                workflow_id: message.workflow_id,
+                delivery,
+                detail,
+                tasks,
             })
-            .collect::<Result<_>>()?;
-        Ok(MessageView {
-            message_id,
-            workflow_id: message.workflow_id,
-            delivery,
-            detail,
-            tasks,
         })
-    })
-    .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let mut bounded = Vec::new();
+    let mut size = 0;
+    for view in views {
+        size += serde_json::to_vec(&view)?.len();
+        if size > 1024 * 1024 {
+            break;
+        }
+        bounded.push(view);
+    }
+    Ok(bounded)
 }
 
 pub(super) fn save_tags(

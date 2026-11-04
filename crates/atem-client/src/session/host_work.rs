@@ -51,6 +51,8 @@ pub struct ContextSnapshot {
 pub enum ContextKind {
     Memory,
     Vault,
+    /// A locally stored explicit reply. Never admitted as remote context.
+    Result,
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -59,6 +61,10 @@ pub fn digest(bytes: &[u8]) -> String {
 
 impl ContextSnapshot {
     pub fn valid(&self) -> bool {
+        self.kind != ContextKind::Result && self.valid_local()
+    }
+
+    pub fn valid_local(&self) -> bool {
         is_opaque_id(&self.id)
             && self.version > 0
             && self.version <= MAX_SAFE_INTEGER

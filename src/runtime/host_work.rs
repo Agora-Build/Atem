@@ -555,6 +555,11 @@ impl Store {
             CREATE INDEX IF NOT EXISTS resolution_message ON resolutions(message_id);
             CREATE TABLE IF NOT EXISTS publications (
                 message_id TEXT PRIMARY KEY, record TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS origins (message_id TEXT PRIMARY KEY, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS return_grants (task_id TEXT PRIMARY KEY, record TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'open', awaiting_since_ms INTEGER);
+            CREATE TABLE IF NOT EXISTS results (task_id TEXT PRIMARY KEY, digest TEXT NOT NULL,
+                envelope TEXT NOT NULL, work_id TEXT);
             CREATE TABLE IF NOT EXISTS counters (
                 key TEXT NOT NULL, window_start_ms INTEGER NOT NULL, count INTEGER NOT NULL,
                 PRIMARY KEY(key,window_start_ms));

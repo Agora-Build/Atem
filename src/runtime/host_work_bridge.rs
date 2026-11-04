@@ -124,6 +124,7 @@ impl Drop for State {
 impl HostBridge {
     /// Local input uses the same durable receiver as an authenticated remote
     /// message, with an attachment that never crosses a transport link.
+    #[cfg(test)]
     fn local_publish(
         &mut self,
         message: &atem_client::session::messages::Message,
@@ -297,6 +298,12 @@ impl HostBridge {
             && session.provider == profile.provider
             && authority_session(a, &record.task.target, &self.projects)
             && self.projects.key_of(&record.task.target.session_id) == Some(record.project.as_str())
+            && self.collab_result_delivery(record).is_ok_and(|result| {
+                result.is_none_or(|(grant, _)| {
+                    grant.origin.route.as_ref().is_some_and(|r| r.results)
+                        && self.collab_origin_live(&grant.origin, sessions)
+                })
+            })
     }
 
     fn work_route_allowed(&self, record: &WorkRecord, a: &Sender) -> bool {
@@ -1006,6 +1013,11 @@ impl HostBridge {
             }
             let attachment = attachment.unwrap();
             let mut prompt = r.task.render_prompt();
+            if self.collab_result_delivery(&r)?.is_some() {
+                prompt = prompt
+                    .split_once('\n')
+                    .map_or(prompt.clone(), |(_, body)| body.to_string());
+            }
             let paths = self
                 .work
                 .store
@@ -1075,6 +1087,14 @@ impl HostBridge {
             ReceiptState::Rejected => WorkState::Failed,
             ReceiptState::OutcomeUnknown => WorkState::OutcomeUnknown,
         };
+        if receipt.state == ReceiptState::Completed
+            && let Ok(Some((_, result))) = self.collab_result_delivery(r)
+        {
+            r.status.state = WorkState::Completed;
+            r.status.result = Some(result.snapshot());
+            r.status.detail = "explicit result delivered to the originating agent".into();
+            return;
+        }
         r.status.detail =
             "agent submission receipt reconciled; task completion requires an explicit result"
                 .into();

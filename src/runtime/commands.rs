@@ -82,6 +82,19 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                     .ok_or_else(|| anyhow!("expiry must be 1s to 24h"))?,
             },
         },
+        MessageCommands::Reply {
+            task,
+            text,
+            memory,
+            vault,
+        } => ClientMsg::MessageReply {
+            request: super::collab::ReplyRequest {
+                task_id: task,
+                text,
+                memory,
+                vault,
+            },
+        },
         MessageCommands::Status { id } => ClientMsg::MessageStatus { message_id: id },
         MessageCommands::Cancel { task_id } => ClientMsg::MessageCancel { task_id },
         MessageCommands::Directory { selector } => ClientMsg::MessageDirectory { selector },
@@ -90,6 +103,7 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
     client.send(&request).await?;
     let response = reply(&mut client, op, |m| match m {
         RuntimeMsg::MessageSent { .. }
+        | RuntimeMsg::MessageReplied { .. }
         | RuntimeMsg::MessageStatus { .. }
         | RuntimeMsg::MessageCancelled { .. }
         | RuntimeMsg::MessageDirectory { .. } => Some(m),
@@ -98,6 +112,9 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
     .await?;
     match response {
         RuntimeMsg::MessageSent { message_id } => println!("{message_id}"),
+        RuntimeMsg::MessageReplied { task_id } => {
+            println!("{task_id}: result accepted for publication")
+        }
         RuntimeMsg::MessageCancelled { task_id } => println!("{task_id}: cancelled"),
         RuntimeMsg::MessageDirectory { rows } => {
             for row in rows {
@@ -124,6 +141,15 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                         serde_json::to_value(task.state)?.as_str().unwrap(),
                         task.detail
                     );
+                    if let Some(result) = task.result {
+                        println!("    result: {}", result.text);
+                        for reference in result.context {
+                            println!(
+                                "    {:?}:{}@{} sha256 {}",
+                                reference.kind, reference.id, reference.version, reference.digest
+                            );
+                        }
+                    }
                 }
             }
         }

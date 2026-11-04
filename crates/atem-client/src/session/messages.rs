@@ -109,17 +109,17 @@ impl Message {
         let sender_ok = ["member:", "service:"]
             .iter()
             .any(|prefix| self.sender.strip_prefix(prefix).is_some_and(is_opaque_id));
-        sender_ok && self.valid_body()
+        sender_ok && self.valid_body(false)
     }
 
     /// Only the runtime's internal attachment may accept this sender.
     pub fn valid_local(&self) -> bool {
         self.sender == "local"
             && self.from_session.as_deref().is_some_and(is_session_id)
-            && self.valid_body()
+            && self.valid_body(true)
     }
 
-    fn valid_body(&self) -> bool {
+    fn valid_body(&self, local: bool) -> bool {
         let mut ids = BTreeSet::new();
         let mut destinations = BTreeSet::new();
         let budget: u32 = self
@@ -135,10 +135,10 @@ impl Message {
             && is_uuid_v4(&self.workflow_id)
             && budget <= super::select::MAX_AGENTS
             && self.from_session.as_deref().is_none_or(is_session_id)
-            && self
-                .reply_to
-                .as_ref()
-                .is_none_or(|r| is_uuid_v4(&r.message_id) && is_uuid_v4(&r.task_id))
+            && self.reply_to.as_ref().is_none_or(|r| {
+                is_uuid_v4(&r.message_id)
+                    && (is_uuid_v4(&r.task_id) || local && super::wire::is_uuid_v5(&r.task_id))
+            })
             && (self.kind == MessageKind::Request || self.reply_to.is_some())
             && self.created_at <= MAX_SAFE_INTEGER
             && self.expires_at <= MAX_SAFE_INTEGER
@@ -295,7 +295,11 @@ impl From<&WorkStatus> for WorkProgress {
 
 impl WorkProgress {
     fn valid(&self) -> bool {
-        is_uuid_v4(&self.task_id)
+        self.valid_for(false)
+    }
+
+    fn valid_for(&self, local: bool) -> bool {
+        (is_uuid_v4(&self.task_id) || local && super::wire::is_uuid_v5(&self.task_id))
             && is_uuid_v4(&self.receipt_id)
             && self.detail.len() <= 1024
             && self.result.as_ref().is_none_or(|r| {
@@ -326,22 +330,41 @@ pub struct MessageReceipt {
 
 impl MessageReceipt {
     pub fn valid(&self) -> bool {
+        self.valid_for(false)
+    }
+
+    /// Internal receipts flatten a selector's fixed resolution into tasks.
+    pub fn valid_local(&self) -> bool {
+        self.valid_for(true)
+    }
+
+    fn valid_for(&self, local: bool) -> bool {
         let mut ids = BTreeSet::new();
         is_uuid_v4(&self.message_id)
             && is_digest(&self.digest)
-            && ["member:", "service:"]
-                .iter()
-                .any(|p| self.sender.strip_prefix(p).is_some_and(is_opaque_id))
-            && (1..=MAX_RECIPIENTS).contains(&self.recipients.len())
+            && (local && self.sender == "local"
+                || !local
+                    && ["member:", "service:"]
+                        .iter()
+                        .any(|p| self.sender.strip_prefix(p).is_some_and(is_opaque_id)))
+            && self.recipients.len() <= MAX_RECIPIENTS
+            && (local || !self.recipients.is_empty())
             && self.recipients.iter().all(|r| {
-                is_uuid_v4(&r.recipient_id)
+                (is_uuid_v4(&r.recipient_id) || local && super::wire::is_uuid_v5(&r.recipient_id))
                     && ids.insert(&r.recipient_id)
                     && match &r.delivery {
                         Delivery::Stored => true,
                         Delivery::Refused { code } => {
                             matches!(code.as_str(), "forbidden" | "stale_target")
                         }
-                        Delivery::Work { work } => work.task_id == r.recipient_id && work.valid(),
+                        Delivery::Work { work } => {
+                            work.task_id == r.recipient_id
+                                && if local {
+                                    work.valid_for(true)
+                                } else {
+                                    work.valid()
+                                }
+                        }
                     }
             })
     }
@@ -393,6 +416,31 @@ mod tests {
                 destination: Destination::Host,
             }],
         }
+    }
+
+    #[test]
+    fn deterministic_local_reply_ids_never_widen_remote_admission() {
+        let mut m = message();
+        m.sender = "local".into();
+        m.from_session = Some("ses-aaaaaaaaaaaa".into());
+        m.kind = MessageKind::Result;
+        m.reply_to = Some(ReplyTo {
+            message_id: new_id(),
+            task_id: "18f208d8-a1d7-5fba-8a53-7fb8f9bc5dc4".into(),
+        });
+        assert!(m.valid_local());
+        assert!(!m.valid());
+        m.sender = "service:sender".into();
+        assert!(!m.valid());
+        let snapshot = ContextSnapshot {
+            kind: ContextKind::Result,
+            id: "result:local".into(),
+            version: 1,
+            digest: host_work::digest(b"done"),
+            text: "done".into(),
+        };
+        assert!(snapshot.valid_local());
+        assert!(!snapshot.valid());
     }
 
     #[test]

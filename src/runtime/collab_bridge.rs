@@ -1,5 +1,8 @@
 //! Same-runtime collaboration, using the host's ordinary receipt scheduler.
 use super::*;
+use crate::runtime::collab::results::{
+    self, ExplicitResult, Origin, OriginRoute, ResultOutcome, ReturnGrant,
+};
 use crate::runtime::collab::{self, Candidate, DirectoryRow, MessageView, SendRequest};
 use crate::runtime::host_work::MessageRecord;
 use anyhow::{Result, anyhow, bail};
@@ -9,6 +12,479 @@ use atem_client::session::messages::{
 use atem_client::session::select::{AgentLabels, MAX_AGENTS, Selector, valid_selectors};
 
 impl HostBridge {
+    fn collab_origin(
+        &self,
+        session: &BrokerSession,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> Origin {
+        let mut candidates = self.collab_candidates(sessions);
+        candidates.retain(|c| c.session_id == session.id.as_str());
+        candidates.sort_by_key(|c| {
+            (
+                !self.work.config.route(&c.route_id).unwrap().results,
+                c.route_id.clone(),
+            )
+        });
+        let route = candidates.first().map(|c| {
+            let r = self.work.config.route(&c.route_id).unwrap();
+            let p = self.work.config.profile(&r.profile_id).unwrap();
+            OriginRoute {
+                id: r.id.clone(),
+                revision: r.revision,
+                profile_id: p.id.clone(),
+                profile_revision: p.revision,
+                project: p.project.clone(),
+                results: r.results,
+            }
+        });
+        let host = self.work_host();
+        Origin {
+            target: wire::Target {
+                account_id: host.account_id,
+                atem_device_id: host.atem_device_id,
+                host_trust_gen: host.host_trust_gen,
+                session_id: session.id.to_string(),
+                process_gen: session.process_gen.clone(),
+            },
+            control_gen: self.host.control_gen("local"),
+            route,
+        }
+    }
+
+    pub(super) fn collab_origin_live(
+        &self,
+        origin: &Origin,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> bool {
+        let Some(session) =
+            SessionId::parse(&origin.target.session_id).and_then(|s| sessions.get(&s))
+        else {
+            return false;
+        };
+        if !session.is_live()
+            || session.process_gen != origin.target.process_gen
+            || self.host.control_gen("local") != origin.control_gen
+            || !self.work_host().contains(&origin.target)
+        {
+            return false;
+        }
+        origin.route.as_ref().is_none_or(|approved| {
+            self.work.config.route(&approved.id).is_some_and(|r| {
+                r.revision == approved.revision
+                    && r.profile_id == approved.profile_id
+                    && r.results == approved.results
+                    && r.principals.iter().any(|p| p == "local")
+            }) && self
+                .work
+                .config
+                .profile(&approved.profile_id)
+                .is_some_and(|p| {
+                    p.revision == approved.profile_revision
+                        && p.project == approved.project
+                        && p.cwd == session.cwd
+                        && p.provider == session.provider
+                        && self.projects.key_of(session.id.as_str()) == Some(p.project.as_str())
+                })
+        })
+    }
+
+    fn collab_turn(&self, task: &WorkRecord, session: &BrokerSession) -> Option<String> {
+        self.host
+            .receipt(&task.status.receipt_id)
+            .and_then(|r| r.result)
+            .map(|r| r.turn_id)
+            .or_else(|| {
+                (session.chat.current_request_id() == Some(task.status.receipt_id.as_str()))
+                    .then(|| session.chat.current_turn_id().map(str::to_string))
+                    .flatten()
+            })
+    }
+
+    pub fn collab_reply(
+        &mut self,
+        from: &SessionId,
+        request: collab::ReplyRequest,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> Result<String> {
+        self.collab_ready()?;
+        let session = sessions
+            .get(from)
+            .filter(|s| s.is_live())
+            .ok_or_else(|| anyhow!("originating session ended"))?;
+        let store = self.work.store.as_ref().unwrap();
+        let task_id = match request.task_id {
+            Some(id) => id,
+            None => {
+                let tasks: Vec<_> = store
+                    .tasks()?
+                    .into_iter()
+                    .filter(|r| {
+                        r.task.target.session_id == from.as_str()
+                            && r.task.target.process_gen == session.process_gen
+                            && r.status.state == WorkState::AwaitingResult
+                    })
+                    .collect();
+                if tasks.len() != 1 {
+                    bail!("use --task: exactly one task must await a result");
+                }
+                tasks[0].task.task_id.clone()
+            }
+        };
+        let task = store.work(&task_id)?.ok_or_else(|| anyhow!("no_grant"))?;
+        let grant = results::grant(store, &task_id)?.ok_or_else(|| anyhow!("no_grant"))?;
+        if grant.recipient.session_id != from.as_str()
+            || grant.recipient.process_gen != session.process_gen
+        {
+            bail!("mismatch");
+        }
+        let turn = self
+            .collab_turn(&task, session)
+            .ok_or_else(|| anyhow!("prompt turn not yet known; retry"))?;
+        if session.chat.current_turn_id() != Some(turn.as_str()) {
+            bail!("mismatch: reply must come from the task's prompt turn");
+        }
+        let context = crate::runtime::collab_context::capture(
+            &self.work.dir,
+            &request.memory,
+            &request.vault,
+        )?;
+        if let Some(old) = results::accepted(store, &grant.task_id)? {
+            if old.text != request.text
+                || old.context.len() != context.len()
+                || !context.iter().zip(&old.context).all(|(spec, snapshot)| {
+                    crate::runtime::collab_context::matches_snapshot(spec, snapshot)
+                })
+            {
+                bail!("request_id_reused");
+            }
+            return Ok(grant.task_id);
+        }
+        let origin = self.collab_origin(session, sessions);
+        let now = host_now().wall_ms;
+        let message = Message {
+            message_id: grant.result_id.clone(),
+            workflow_id: grant.workflow_id.clone(),
+            sender: "local".into(),
+            kind: MessageKind::Result,
+            reply_to: Some(atem_client::session::messages::ReplyTo {
+                message_id: grant.message_id.clone(),
+                task_id,
+            }),
+            from_session: Some(from.to_string()),
+            created_at: now,
+            expires_at: grant.expires_at,
+            recipients: vec![Recipient {
+                recipient_id: uuid::Uuid::new_v4().to_string(),
+                host: self.work_host(),
+                destination: Destination::Host,
+            }],
+            text: request.text,
+            context: vec![],
+            mark: None,
+        };
+        let mut probe = message.clone();
+        if probe.text.trim().is_empty() && !context.is_empty() {
+            probe.text = "pending context".into();
+        }
+        if !probe.valid_local() {
+            bail!("invalid message content or expired grant");
+        }
+        if context.is_empty() {
+            self.collab_accept_result(&message, &origin, Some(&turn), sessions, true)?;
+        } else {
+            collab::reserve_context(
+                store,
+                &self.work.config.collab,
+                &message,
+                &collab::Publication {
+                    atem_id: String::new(),
+                    origin,
+                    turn_id: Some(turn),
+                    context,
+                },
+            )?;
+        }
+        Ok(grant.task_id)
+    }
+
+    fn collab_accept_result(
+        &mut self,
+        message: &Message,
+        source: &Origin,
+        turn: Option<&str>,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+        count_send: bool,
+    ) -> Result<()> {
+        if !message.valid_local() {
+            bail!("invalid message content");
+        }
+        let reference = message
+            .reply_to
+            .as_ref()
+            .ok_or_else(|| anyhow!("no_grant"))?;
+        let store = self.work.store.as_ref().unwrap();
+        let mut grant =
+            results::grant(store, &reference.task_id)?.ok_or_else(|| anyhow!("no_grant"))?;
+        let mut task = store
+            .work(&grant.task_id)?
+            .ok_or_else(|| anyhow!("no_grant"))?;
+        let session = SessionId::parse(&source.target.session_id)
+            .and_then(|s| sessions.get(&s))
+            .ok_or_else(|| anyhow!("mismatch"))?;
+        let turn = turn.ok_or_else(|| anyhow!("mismatch"))?;
+        if grant.message_id != reference.message_id
+            || grant.workflow_id != message.workflow_id
+            || source.target != grant.recipient
+            || message.from_session.as_deref() != Some(source.target.session_id.as_str())
+            || session.process_gen != source.target.process_gen
+            || session.chat.current_turn_id() != Some(turn)
+            || self.collab_turn(&task, session).as_deref() != Some(turn)
+        {
+            bail!("mismatch");
+        }
+        grant.turn_id = Some(turn.into());
+        let explicit = ExplicitResult {
+            task_id: grant.task_id.clone(),
+            session_id: source.target.session_id.clone(),
+            process_gen: source.target.process_gen.clone(),
+            turn_id: turn.into(),
+            text: message.text.clone(),
+            context: message.context.clone(),
+        };
+        if let Some(old) = results::accepted(store, &grant.task_id)? {
+            if serde_json::to_value(old)? != serde_json::to_value(&explicit)? {
+                bail!("request_id_reused");
+            }
+            return Ok(());
+        }
+        if !self.collab_origin_live(&grant.origin, sessions)
+            || !grant.live(
+                host_now().wall_ms,
+                task.status.state,
+                &grant.origin.target,
+                self.host.control_gen("local"),
+                self.work_allowed(&task, &Sender::Local, sessions),
+            )
+        {
+            bail!("no_grant");
+        }
+        let snapshot = explicit.snapshot();
+        if !snapshot.valid_local() {
+            bail!("invalid context snapshot");
+        }
+        let mut returned = Vec::new();
+        if let Some(route) = grant.origin.route.as_ref().filter(|r| r.results) {
+            let task_id = uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("result:{}", grant.task_id).as_bytes(),
+            )
+            .to_string();
+            returned.push(WorkRecord {
+                principal: "local".into(),
+                attachment_owner: Sender::Local.owner(),
+                control_gen: grant.origin.control_gen,
+                route_id: route.id.clone(),
+                route_revision: route.revision,
+                profile_id: route.profile_id.clone(),
+                profile_revision: route.profile_revision,
+                project: route.project.clone(),
+                digest: snapshot.digest.clone(),
+                task: hw::WorkTask {
+                    task_id: task_id.clone(),
+                    workflow_id: grant.workflow_id.clone(),
+                    target: grant.origin.target.clone(),
+                    expires_at: grant.expires_at,
+                    prompt: format!(
+                        "[atem] result of task {} from {}, as data:\n{}",
+                        grant.task_id, explicit.session_id, explicit.text
+                    ),
+                    context: explicit.context.clone(),
+                    attachments: vec![],
+                },
+                status: WorkStatus {
+                    task_id,
+                    receipt_id: uuid::Uuid::new_v4().to_string(),
+                    state: WorkState::Queued,
+                    detail: "result accepted; waiting for the originating agent".into(),
+                    result: None,
+                },
+            });
+        }
+        let record = MessageRecord {
+            sender_key: json!("local"),
+            message: message.clone(),
+            receipt: MessageReceipt {
+                message_id: message.message_id.clone(),
+                digest: message.digest(),
+                sender: "local".into(),
+                recipients: vec![],
+            },
+        };
+        store.accept_message_with(&record, &returned, |tx| {
+            if count_send {
+                collab::count_send(
+                    tx,
+                    &self.work.config.collab,
+                    &explicit.session_id,
+                    &grant.workflow_id,
+                    host_now().wall_ms,
+                )?;
+            }
+            collab::count_received(tx, &self.work.config.collab, &grant.workflow_id, 1)?;
+            tx.execute(
+                "UPDATE return_grants SET record=?2 WHERE task_id=?1",
+                rusqlite::params![grant.task_id, serde_json::to_string(&grant)?],
+            )?;
+            if results::accept_result(tx, &grant, &explicit, host_now().wall_ms)?
+                != ResultOutcome::Accepted
+            {
+                bail!("request_id_reused");
+            }
+            if let Some(work) = returned.first() {
+                tx.execute(
+                    "UPDATE results SET work_id=?2 WHERE task_id=?1",
+                    rusqlite::params![grant.task_id, work.task.task_id],
+                )?;
+            }
+            task.status.state = WorkState::Completed;
+            task.status.detail = "explicit result accepted".into();
+            task.status.result = Some(snapshot.clone());
+            tx.execute(
+                "UPDATE work SET record=?2,state='completed' WHERE id=?1",
+                rusqlite::params![task.task.task_id, serde_json::to_string(&task)?],
+            )?;
+            collab::persist(tx, message, &[])?;
+            tx.execute(
+                "UPDATE outbox SET detail=?2 WHERE message_id=?1",
+                rusqlite::params![
+                    message.message_id,
+                    if returned.is_empty() {
+                        "result stored; origin route has no results consent"
+                    } else {
+                        "result queued for origin"
+                    }
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn collab_result_delivery(
+        &self,
+        record: &WorkRecord,
+    ) -> Result<Option<(ReturnGrant, ExplicitResult)>> {
+        let Some(store) = self.work.store.as_ref() else {
+            return Ok(None);
+        };
+        use rusqlite::OptionalExtension;
+        let result: Option<(String,String)> = store.db.query_row("SELECT g.record,r.envelope FROM results r JOIN return_grants g USING(task_id) WHERE r.work_id=?1",
+            [&record.task.task_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        result
+            .map(|(g, r)| Ok((serde_json::from_str(&g)?, serde_json::from_str(&r)?)))
+            .transpose()
+    }
+
+    fn collab_result_pass(&mut self, sessions: &BTreeMap<SessionId, BrokerSession>) -> Result<()> {
+        let store = self.work.store.as_ref().unwrap();
+        let now = host_now().wall_ms;
+        let mut q = store.db.prepare("SELECT w.record,g.record FROM return_grants g JOIN work w ON w.id=g.task_id WHERE g.state='open'")?;
+        let pending = q
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (task, grant) in pending {
+            let mut task: WorkRecord = serde_json::from_str(&task)?;
+            let mut grant: ReturnGrant = serde_json::from_str(&grant)?;
+            let live = self.collab_origin_live(&grant.origin, sessions)
+                && grant.live(
+                    now,
+                    task.status.state,
+                    &grant.origin.target,
+                    self.host.control_gen("local"),
+                    self.work_route_allowed(&task, &Sender::Local),
+                );
+            if !live {
+                store.db.execute(
+                    "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state='open'",
+                    [&grant.task_id],
+                )?;
+                if now >= task.task.expires_at && task.status.state == WorkState::AwaitingResult {
+                    task.status.state = WorkState::Expired;
+                    task.status.detail = "task expired without an explicit result".into();
+                    store.save_work(&task)?;
+                }
+                continue;
+            }
+            if let Some(turn) = self
+                .host
+                .receipt(&task.status.receipt_id)
+                .and_then(|r| r.result)
+                .map(|r| r.turn_id)
+            {
+                grant.turn_id = Some(turn);
+                store.db.execute("UPDATE return_grants SET record=?2,awaiting_since_ms=coalesce(awaiting_since_ms,?3) WHERE task_id=?1",
+                    rusqlite::params![grant.task_id,serde_json::to_string(&grant)?,now])?;
+            }
+            if task.status.state == WorkState::AwaitingResult {
+                let since: Option<u64> = store.db.query_row(
+                    "SELECT awaiting_since_ms FROM return_grants WHERE task_id=?1",
+                    [&grant.task_id],
+                    |r| r.get(0),
+                )?;
+                if since.is_some_and(|since| {
+                    now >= since.saturating_add(self.work.config.collab.result_timeout_ms())
+                }) && !task.status.detail.starts_with("turn ended without a reply")
+                {
+                    task.status.detail = "turn ended without a reply".into();
+                    if self.work.config.route(&task.route_id).is_some_and(|r| {
+                        r.auto_report == crate::runtime::host_work::AutoReport::FinalMessage
+                    }) {
+                        if let Some(session) = SessionId::parse(&task.task.target.session_id)
+                            .and_then(|s| sessions.get(&s))
+                        {
+                            let text = session
+                                .chat
+                                .retained()
+                                .filter(|m| {
+                                    m.role == crate::chat::session::Role::Assistant
+                                        && Some(m.turn_id.as_str()) == grant.turn_id.as_deref()
+                                })
+                                .filter_map(|m| {
+                                    let text = m
+                                        .parts
+                                        .iter()
+                                        .filter_map(|p| {
+                                            if let crate::chat::adapter::Part::Text {
+                                                markdown,
+                                                ..
+                                            } = p
+                                            {
+                                                Some(markdown.as_str())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    (!text.is_empty()).then_some(text)
+                                })
+                                .last();
+                            if let Some(text) = text {
+                                task.status.detail.push_str(": ");
+                                task.status.detail.extend(
+                                    text.chars()
+                                        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                                        .take(200),
+                                );
+                            }
+                        }
+                    }
+                    store.save_work(&task)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn collab_ready(&mut self) -> Result<()> {
         self.work_config();
         if !self.work.config.collab.send {
@@ -182,6 +658,7 @@ impl HostBridge {
             .get(from)
             .filter(|s| s.is_live())
             .ok_or_else(|| anyhow!("originating session ended"))?;
+        let source = self.collab_origin(origin, sessions);
         let now = host_now().wall_ms;
         let message = Message {
             message_id: uuid::Uuid::new_v4().to_string(),
@@ -218,12 +695,13 @@ impl HostBridge {
                 &message,
                 &collab::Publication {
                     atem_id: atem_id.into(),
-                    origin_process_gen: origin.process_gen.clone(),
+                    origin: source.clone(),
+                    turn_id: None,
                     context: specs,
                 },
             )?;
         } else {
-            self.collab_accept(atem_id, &message, sessions, true)?;
+            self.collab_accept(atem_id, &message, &source, None, sessions, true)?;
         }
         Ok(message.message_id)
     }
@@ -232,9 +710,14 @@ impl HostBridge {
         &mut self,
         atem_id: &str,
         message: &Message,
+        origin: &Origin,
+        turn_id: Option<&str>,
         sessions: &BTreeMap<SessionId, BrokerSession>,
         count_send: bool,
     ) -> Result<()> {
+        if message.kind == MessageKind::Result {
+            return self.collab_accept_result(message, origin, turn_id, sessions, count_send);
+        }
         if let Some(old) = self
             .work
             .store
@@ -353,6 +836,25 @@ impl HostBridge {
                     &message.workflow_id,
                     work.len(),
                 )?;
+                tx.execute(
+                    "INSERT INTO origins(message_id,record) VALUES(?1,?2)",
+                    rusqlite::params![message.message_id, serde_json::to_string(origin)?],
+                )?;
+                for task in &work {
+                    results::save_grant(
+                        tx,
+                        &ReturnGrant {
+                            task_id: task.task.task_id.clone(),
+                            message_id: message.message_id.clone(),
+                            workflow_id: message.workflow_id.clone(),
+                            result_id: uuid::Uuid::new_v4().to_string(),
+                            origin: origin.clone(),
+                            recipient: task.task.target.clone(),
+                            turn_id: None,
+                            expires_at: message.expires_at,
+                        },
+                    )?;
+                }
                 collab::persist(tx, &message, &resolved)
             })?;
         Ok(())
@@ -362,6 +864,42 @@ impl HostBridge {
         if !self.local_healthy() {
             return Ok(());
         }
+        let local = self.local_attachment().to_string();
+        let idle: Vec<_> = cx
+            .sessions
+            .values()
+            .filter(|s| {
+                self.host.lease_holder(s.id.as_str()) == Some(local.as_str())
+                    && !self.prompts.values().any(|id| id == s.id.as_str())
+            })
+            .map(|s| s.id.to_string())
+            .collect();
+        for sid in idle {
+            let host = self.work_host();
+            let target = self.host.descriptor_of(&sid).map(|d| wire::Target {
+                account_id: host.account_id,
+                atem_device_id: host.atem_device_id,
+                host_trust_gen: host.host_trust_gen,
+                session_id: d.session_id,
+                process_gen: d.process_gen,
+            });
+            if let Some(target) = target
+                && let Some((binding, _)) = self.host.binding_for_work(&local, &target)
+            {
+                // A finished local prompt gives up its lease before the next
+                // FIFO task. Other controllers keep their leases unchanged.
+                let effects = self.host.receive(
+                    &local,
+                    json!({"type":"session","data":{"v":1,"op":"release",
+                    "id":uuid::Uuid::new_v4().to_string(),"binding":binding}})
+                    .to_string()
+                    .as_bytes(),
+                    self.clock.now(),
+                );
+                self.exec(effects, cx);
+            }
+        }
+        self.collab_result_pass(cx.sessions)?;
         let now = host_now().wall_ms;
         let store = self.work.store.as_ref().unwrap();
         store.db.execute(
@@ -379,9 +917,7 @@ impl HostBridge {
         for (mut message, publication, attempts) in pending {
             let id = message.message_id.clone();
             let store = self.work.store.as_ref().unwrap();
-            let origin_live = SessionId::parse(message.from_session.as_deref().unwrap_or(""))
-                .and_then(|s| cx.sessions.get(&s))
-                .is_some_and(|s| s.is_live() && s.process_gen == publication.origin_process_gen);
+            let origin_live = self.collab_origin_live(&publication.origin, cx.sessions);
             if !origin_live {
                 self.work.context_jobs.remove(&id);
                 collab::publication_state(store, &id, "refused", "originating session ended", 0)?;
@@ -396,7 +932,14 @@ impl HostBridge {
                 self.work.context_jobs.remove(&id);
                 let result = result.and_then(|snapshots| {
                     message.context = snapshots;
-                    self.collab_accept(&publication.atem_id, &message, cx.sessions, false)
+                    self.collab_accept(
+                        &publication.atem_id,
+                        &message,
+                        &publication.origin,
+                        publication.turn_id.as_deref(),
+                        cx.sessions,
+                        false,
+                    )
                 });
                 if let Err(error) = result {
                     let detail = error.to_string();
@@ -407,6 +950,10 @@ impl HostBridge {
                             | "context profile changed"
                             | "invalid message content"
                             | "context publication refused"
+                            | "no_grant"
+                            | "mismatch"
+                            | "expired"
+                            | "request_id_reused"
                     ) || detail.starts_with("ambiguous vault reference")
                         || detail.starts_with("limit:");
                     let store = self.work.store.as_ref().unwrap();

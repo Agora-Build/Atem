@@ -488,3 +488,236 @@ fn an_unreachable_relay_keeps_the_send_publishing() {
     assert!(status["tasks"].as_array().unwrap().is_empty());
     assert!(std::fs::read(b.join("input")).unwrap().is_empty());
 }
+
+fn await_task(rig: &Rig, message: &str, fake: &Path) -> String {
+    within("task input", || {
+        std::fs::read_to_string(fake.join("input"))
+            .unwrap_or_default()
+            .contains("[Atem task")
+    });
+    private(&fake.join("complete"), "");
+    within("task awaiting result", || {
+        rig.status(message)["tasks"][0]["state"] == "awaiting_result"
+    });
+    rig.status(message)["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+#[test]
+fn a_reply_comes_back_as_data_and_completes_the_task() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "explicit result required");
+    let task = await_task(&rig, &id, &b);
+    let reply = rig.agent(
+        &b,
+        1,
+        &["message", "reply", "--task", &task, "contract verified"],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("result as data", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("contract verified")
+    });
+    let input = std::fs::read_to_string(a.join("input")).unwrap();
+    assert!(
+        input.contains(&format!("[atem] result of task {task} from ")),
+        "{input}"
+    );
+    assert!(input.contains(", as data:\ncontract verified"));
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
+    assert_eq!(
+        rig.agent(
+            &b,
+            2,
+            &["message", "reply", "--task", &task, "contract verified"]
+        )["code"],
+        0
+    );
+    let conflict = rig.agent(
+        &b,
+        3,
+        &["message", "reply", "--task", &task, "different result"],
+    );
+    assert_ne!(conflict["code"], 0);
+    assert!(
+        conflict["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("request_id_reused"),
+        "{conflict}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(a.join("input"))
+            .unwrap()
+            .matches("contract verified")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn without_results_true_a_result_is_status_only() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "status only result");
+    let task = await_task(&rig, &id, &b);
+    let reply = rig.agent(&b, 1, &["message", "reply", "--task", &task, "stored only"]);
+    assert_eq!(reply["code"], 0, "{reply}");
+    let status = rig.status(&id);
+    assert_eq!(status["tasks"][0]["state"], "completed");
+    assert!(
+        status["tasks"][0]["result"]
+            .to_string()
+            .contains("stored only")
+    );
+    assert!(std::fs::read(a.join("input")).unwrap().is_empty());
+}
+
+#[test]
+fn reply_needs_task_when_two_are_waiting() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let first = rig.send(&a, 1, "tag:b", "first reply");
+    let _ = await_task(&rig, &first, &b);
+    let second = rig.send(&a, 2, "tag:b", "second reply");
+    within("second prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("second reply")
+    });
+    let task = await_task(&rig, &second, &b);
+    let ambiguous = rig.agent(&b, 1, &["message", "reply", "done"]);
+    assert_ne!(ambiguous["code"], 0);
+    assert!(
+        ambiguous["stderr"].as_str().unwrap().contains("use --task"),
+        "{ambiguous}"
+    );
+    assert_eq!(
+        rig.agent(&b, 2, &["message", "reply", "--task", &task, "done"])["code"],
+        0
+    );
+}
+
+#[test]
+fn a_silent_turn_gets_a_report_not_a_result() {
+    let mut rig = Rig::new();
+    rig.config = rig
+        .config
+        .replace("send = true", "send = true\nresult_timeout = \"1s\"");
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "report after a silent turn");
+    let _ = await_task(&rig, &id, &b);
+    within("silent turn report", || {
+        rig.status(&id)["tasks"][0]["detail"] == "turn ended without a reply"
+    });
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "awaiting_result");
+    assert!(std::fs::read(a.join("input")).unwrap().is_empty());
+    assert_eq!(
+        rig.agent(&b, 1, &["message", "reply", "late explicit result"])["code"],
+        0
+    );
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
+}
+
+#[test]
+fn result_context_is_frozen_and_another_session_cannot_reply() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let (_, c) = rig.launch("c", "intruder");
+    let id = rig.send(&a, 1, "tag:b", "return typed context");
+    let task = await_task(&rig, &id, &b);
+    let intruder = rig.agent(
+        &c,
+        1,
+        &["message", "reply", "--task", &task, "stolen result"],
+    );
+    assert_ne!(intruder["code"], 0);
+    assert!(
+        intruder["stderr"].as_str().unwrap().contains("mismatch"),
+        "{intruder}"
+    );
+    let text = "A committed result snapshot.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-result:1@2"));
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-result:1","version":2,"digest":digest,"text":text})
+            .to_string(),
+    );
+    let args = [
+        "message",
+        "reply",
+        "--task",
+        &task,
+        "--vault",
+        "v-result:1@2",
+        "done with context",
+    ];
+    assert_eq!(rig.agent(&b, 1, &args)["code"], 0);
+    within("result context delivered", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains(text)
+    });
+    let status = rig.status(&id);
+    assert_eq!(status["tasks"][0]["result"]["context"][0]["digest"], digest);
+    assert_eq!(rig.agent(&b, 2, &args)["code"], 0);
+    let different = rig.agent(
+        &b,
+        3,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-result:1@3",
+            "done with context",
+        ],
+    );
+    assert_ne!(different["code"], 0);
+    assert!(
+        different["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("request_id_reused"),
+        "{different}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(a.join("input"))
+            .unwrap()
+            .matches(text)
+            .count(),
+        1
+    );
+}

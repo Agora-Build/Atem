@@ -42,6 +42,25 @@ pub enum ContextSpec {
     Vault { reference: VaultRef },
 }
 
+pub fn matches_snapshot(spec: &ContextSpec, snapshot: &ContextSnapshot) -> bool {
+    match spec {
+        ContextSpec::Memory { memory } => {
+            snapshot.kind == ContextKind::Memory
+                && snapshot.id == memory.id
+                && snapshot.text == memory.content
+        }
+        ContextSpec::Vault { reference } => {
+            snapshot.kind == ContextKind::Vault
+                && snapshot.version == u64::from(reference.version)
+                && snapshot
+                    .id
+                    .strip_prefix(&format!("{}:", reference.id))
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some_and(|n| reference.entry.is_none_or(|wanted| wanted == n))
+        }
+    }
+}
+
 pub fn capture(dir: &Path, memories: &[String], vaults: &[String]) -> Result<Vec<ContextSpec>> {
     if memories.len() + vaults.len() > 8 {
         bail!("at most 8 context snapshots");
