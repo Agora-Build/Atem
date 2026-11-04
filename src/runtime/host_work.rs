@@ -709,9 +709,25 @@ pub fn ensure_config(dir: &Path) -> Result<bool> {
     Ok(created)
 }
 
+/// What `atem runtime check` checks, as this build reads it: the file, then
+/// each profile's directory, project and environment file. Prints nothing;
+/// `atem runtime restart` and a replacement by another build run it first.
+pub fn validate(dir: &Path) -> Result<Config> {
+    let config = Config::load(dir)?;
+    for profile in &config.profiles {
+        profile
+            .launch(
+                crate::session::SessionId::new().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .with_context(|| format!("checking profile `{}`", profile.id))?;
+    }
+    Ok(config)
+}
+
 pub fn check(dir: &Path) -> Result<()> {
     let paired = paired_member(dir);
-    let config = Config::load(dir)?;
+    let config = validate(dir)?;
     println!(
         "Agent hosting: {}",
         if config.enabled {
@@ -733,12 +749,6 @@ pub fn check(dir: &Path) -> Result<()> {
             .join(", ")
     };
     for profile in &config.profiles {
-        profile
-            .launch(
-                crate::session::SessionId::new().to_string(),
-                uuid::Uuid::new_v4().to_string(),
-            )
-            .with_context(|| format!("checking profile `{}`", profile.id))?;
         println!(
             "  {}: {} in {} (revision {}); may launch: {}",
             profile.id,

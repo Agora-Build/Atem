@@ -47,6 +47,9 @@ pub struct Locator {
     /// `runtime.replaced`: the last time a client replaced the runtime by
     /// its own build (the guard against two builds replacing each other).
     pub replaced: PathBuf,
+    /// The config dir, whose `runtime.toml` must pass `atem runtime check`
+    /// before the runtime is replaced.
+    pub config: PathBuf,
 }
 
 impl Locator {
@@ -68,6 +71,7 @@ impl Locator {
             log: files.log,
             lock: files.lock,
             replaced: config_dir.join("runtime.replaced"),
+            config: config_dir.to_path_buf(),
         }
     }
 
@@ -80,6 +84,7 @@ impl Locator {
             log: dir.join("runtime.log"),
             lock: dir.join("runtime.lock"),
             replaced: dir.join("runtime.replaced"),
+            config: dir.to_path_buf(),
         }
     }
 }
@@ -440,6 +445,9 @@ pub enum Kept {
     /// It doesn't know `restart` and its process can't be confirmed for a
     /// signal.
     Unconfirmed,
+    /// `runtime.toml` doesn't pass `atem runtime check` as this build reads
+    /// it: the new runtime would start without hosting.
+    HostConfig { problem: String },
 }
 
 /// What `kept` means for the user, about the runtime of build `theirs`.
@@ -463,6 +471,17 @@ pub fn kept_message(kept: &Kept, theirs: &str, own: &str) -> String {
         Kept::Unconfirmed => format!(
             "{head} and can't be restarted from here. Stop it (`atem agent list` shows its pid), then retry; its sessions keep running."
         ),
+        Kept::HostConfig { problem } => {
+            let fix =
+                "Fix it (`atem runtime check` shows the problem), then run `atem runtime restart`.";
+            if theirs == own {
+                format!("Atem's runtime wasn't restarted: runtime.toml: {problem}. {fix}")
+            } else {
+                format!(
+                    "{head}; it is kept because runtime.toml doesn't pass this build's check: {problem}. {fix}"
+                )
+            }
+        }
     }
 }
 
@@ -486,6 +505,7 @@ fn record_replacement(path: &Path, from: &str, to: &str) {
 /// Whether `client`'s runtime can be replaced by build `own` now: `Err`
 /// says why it is kept. `flap_guard`: refuse within `REPLACE_WINDOW` of
 /// the last replacement (an explicit `atem runtime restart` skips it).
+/// `runtime.toml` must pass `atem runtime check` either way.
 async fn may_replace(
     client: &mut RuntimeClient,
     locator: &Locator,
@@ -510,6 +530,11 @@ async fn may_replace(
         && now_ms().saturating_sub(at_ms) < REPLACE_WINDOW.as_millis() as u64
     {
         return Err(Kept::Flapping { build });
+    }
+    if let Err(problem) = super::host_work::validate(&locator.config) {
+        return Err(Kept::HostConfig {
+            problem: format!("{problem:#}"),
+        });
     }
     Ok(())
 }
@@ -607,7 +632,9 @@ async fn old_runtime_gone(locator: &Locator, old: u32) -> bool {
 ///   them; the running sessions that block it are named);
 /// - an Astation operation (pairing, verification, unlock) runs in it;
 /// - it was replaced less than `REPLACE_WINDOW` ago (`runtime.replaced`):
-///   two atem builds in use would otherwise keep replacing each other.
+///   two atem builds in use would otherwise keep replacing each other;
+/// - `runtime.toml` doesn't pass `atem runtime check` as this build reads
+///   it (`host_work::validate`): the new runtime would start without hosting.
 ///
 /// `atem runtime restart` (`restart_runtime`) applies it on request,
 /// without the anti-flap guard.
