@@ -113,6 +113,28 @@ pub fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     }
 }
 
+pub fn ancestors(pid: u32, limit: usize) -> Vec<u32> {
+    ancestors_with(pid, limit, |p| {
+        process_parent_and_name(p).map(|(parent, _)| parent)
+    })
+}
+
+fn ancestors_with(
+    mut pid: u32,
+    limit: usize,
+    mut parent: impl FnMut(u32) -> Option<u32>,
+) -> Vec<u32> {
+    let mut result = Vec::new();
+    while pid != 0 && result.len() < limit && !result.contains(&pid) {
+        result.push(pid);
+        let Some(next) = parent(pid) else {
+            break;
+        };
+        pid = next;
+    }
+    result
+}
+
 /// Field 4 (`ppid`) and the name (field 2, in parentheses) of a
 /// `/proc/<pid>/stat` line.
 pub fn parse_stat_parent_and_name(stat: &str) -> Option<(u32, String)> {
@@ -178,6 +200,7 @@ pub struct WorkerInfo {
     pub pid: u32,
     pub start_time: u64,
     pub agent_pid: Option<u32>,
+    pub agent_start_time: Option<u64>,
     pub offset: u64,
     pub input_epoch: u64,
     pub dropped: u64,
@@ -429,6 +452,7 @@ impl WorkerHandle {
                 pid,
                 start_time,
                 agent_pid,
+                agent_start_time,
                 offset,
                 input_epoch,
                 dropped,
@@ -441,6 +465,7 @@ impl WorkerHandle {
                 pid,
                 start_time,
                 agent_pid,
+                agent_start_time,
                 offset,
                 input_epoch,
                 dropped,

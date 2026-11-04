@@ -235,6 +235,8 @@ pub enum ProjectCommands {
 
 #[derive(Subcommand)]
 pub enum AgentCommands {
+    /// Manage this agent session's self: labels (run from inside the agent)
+    Tag { #[command(subcommand)] command: TagCommands },
     /// Start the original interactive CLI as a runtime session and open it
     /// here; detaching (prefix, then h) leaves it running
     Launch {
@@ -261,6 +263,13 @@ pub enum AgentCommands {
         /// Session id (ses-…)
         session_id: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum TagCommands {
+    Add { name: String },
+    Remove { name: String },
+    List,
 }
 
 #[derive(Subcommand)]
@@ -989,6 +998,14 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Agent { agent_command } => match agent_command {
+            AgentCommands::Tag { command } => {
+                let (action, name) = match command {
+                    TagCommands::Add { name } => (crate::runtime::protocol::TagOp::Add, Some(name)),
+                    TagCommands::Remove { name } => (crate::runtime::protocol::TagOp::Remove, Some(name)),
+                    TagCommands::List => (crate::runtime::protocol::TagOp::List, None),
+                };
+                crate::runtime::commands::tag(action, name).await
+            }
             AgentCommands::Launch {
                 agent_type,
                 agent_args,
@@ -1649,6 +1666,16 @@ mod tests {
         };
         assert_eq!(agent_type, "claude-code");
         assert!(agent_args.is_empty());
+    }
+
+    #[test]
+    fn cli_agent_tag_parses() {
+        for action in ["add", "remove"] {
+            let cli = Cli::try_parse_from(["atem", "agent", "tag", action, "self:reviewer"]).unwrap();
+            assert!(matches!(cli.command, Some(Commands::Agent { agent_command: AgentCommands::Tag { .. } })));
+        }
+        assert!(Cli::try_parse_from(["atem", "agent", "tag", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["atem", "agent", "tag", "add"]).is_err());
     }
 
     #[test]

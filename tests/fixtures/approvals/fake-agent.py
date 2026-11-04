@@ -136,6 +136,7 @@ def answered(n, ask):
         tool_result(n, message, True)
 
 transcribed = 0
+commands_run = set()
 START, END = b"\x1b[200~", b"\x1b[201~\r"
 buf = b""
 while True:
@@ -166,6 +167,20 @@ while True:
             turns.append(turn)
     if os.path.exists(os.path.join(ctl, "exit")):
         break
+    # A real child of the agent exercises the runtime's peer-pid ancestry.
+    for name in sorted(os.listdir(ctl)):
+        if name.startswith("run-") and name.endswith(".json") and name not in commands_run:
+            commands_run.add(name)
+            request = json.load(open(os.path.join(ctl, name)))
+            try:
+                result = subprocess.run(request["argv"], capture_output=True, text=True, timeout=15)
+                output = {"code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+            except Exception as error:
+                output = {"code": -1, "stdout": "", "stderr": str(error)}
+            path = os.path.join(ctl, name[:-5] + ".out")
+            with open(path + ".tmp", "w") as f:
+                json.dump(output, f)
+            os.replace(path + ".tmp", path)
     scripted = os.path.join(ctl, "transcript-%d.jsonl" % (transcribed + 1))
     if transcript and os.path.exists(scripted):
         transcribed += 1

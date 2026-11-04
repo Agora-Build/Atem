@@ -88,6 +88,7 @@ enum Outgoing {
 }
 
 struct Client {
+    peer: Option<(u32, u64)>,
     rx: mpsc::Receiver<Incoming>,
     tx: mpsc::UnboundedSender<Outgoing>,
     /// Raw output bytes queued and not yet written.
@@ -330,8 +331,12 @@ pub async fn serve(
 fn waits_for_adoption(incoming: &Incoming) -> bool {
     matches!(
         incoming,
-        Incoming::Message(ClientMsg::List | ClientMsg::Attach { .. } | ClientMsg::Stop { .. })
-            | Incoming::Bad(DecodeError::Version(_))
+        Incoming::Message(
+            ClientMsg::List
+                | ClientMsg::Attach { .. }
+                | ClientMsg::Stop { .. }
+                | ClientMsg::Tag { .. }
+        ) | Incoming::Bad(DecodeError::Version(_))
     )
 }
 
@@ -391,6 +396,14 @@ pub(crate) async fn read_line_max(
 
 impl Server {
     fn add_client(&mut self, stream: UnixStream) {
+        let peer = stream
+            .peer_cred()
+            .ok()
+            .and_then(|c| c.pid())
+            .and_then(|pid| {
+                let pid = u32::try_from(pid).ok()?;
+                Some((pid, super::adopt::process_start_time(pid)?))
+            });
         let id = self.next_client;
         self.next_client += 1;
         let (read, mut write) = stream.into_split();
@@ -452,6 +465,7 @@ impl Server {
         self.clients.insert(
             id,
             Client {
+                peer,
                 rx,
                 tx,
                 backlog,
@@ -482,6 +496,22 @@ impl Server {
         for sid in gone {
             self.detach(&sid);
         }
+    }
+
+    fn calling_session(&self, client: u64) -> Option<SessionId> {
+        let (pid, started) = self.clients.get(&client)?.peer?;
+        if super::adopt::process_start_time(pid) != Some(started) {
+            return None;
+        }
+        let ancestors = super::adopt::ancestors(pid, 64);
+        // Prefer the nearest agent, and verify its launch-time process identity.
+        ancestors.into_iter().find_map(|pid| {
+            self.sessions.iter().find_map(|(sid, session)| {
+                let (agent, start) = session.agent_pid()?;
+                (pid == agent && super::adopt::process_start_time(agent) == Some(start))
+                    .then(|| sid.clone())
+            })
+        })
     }
 
     fn detach(&mut self, sid: &SessionId) {
@@ -1051,6 +1081,29 @@ impl Server {
             ClientMsg::List => {
                 let sessions = self.order.iter().map(|sid| self.summary(sid)).collect();
                 self.send(id, &RuntimeMsg::Sessions { sessions });
+            }
+            ClientMsg::Tag { action, name } => {
+                let Some(sid) = self.calling_session(id) else {
+                    return self.error(id, "not inside an Atem session", "tag");
+                };
+                let session = self.sessions.get_mut(&sid).unwrap();
+                let result = match (action, name) {
+                    (super::protocol::TagOp::Add, Some(label)) => session.add_tag(label),
+                    (super::protocol::TagOp::Remove, Some(label)) => session.remove_tag(&label),
+                    (super::protocol::TagOp::List, None) => Ok(()),
+                    _ => Err(anyhow::anyhow!("tag add/remove needs a self: label")),
+                };
+                if let Err(error) = result {
+                    return self.error(id, error.to_string(), "tag");
+                }
+                let tags = session.self_tags().iter().cloned().collect();
+                self.send(
+                    id,
+                    &RuntimeMsg::Tags {
+                        session_id: sid.to_string(),
+                        tags,
+                    },
+                );
             }
             ClientMsg::Stop { session_id } => {
                 let Some(sid) = self.find(&session_id) else {

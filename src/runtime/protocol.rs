@@ -114,6 +114,10 @@ pub enum ClientMsg {
     },
     /// → `sessions`
     List,
+    Tag {
+        action: TagOp,
+        name: Option<String>,
+    },
     Stop {
         session_id: String,
     },
@@ -141,6 +145,14 @@ pub enum ClientMsg {
         question_id: u64,
         value: AnswerValue,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagOp {
+    Add,
+    Remove,
+    List,
 }
 
 /// The Astation operations a client may ask the runtime to run.
@@ -225,6 +237,7 @@ impl ClientMsg {
             ClientMsg::Reclaim { .. } => "reclaim",
             ClientMsg::ApprovalsAnswered { .. } => "approvals_answered",
             ClientMsg::List => "list",
+            ClientMsg::Tag { .. } => "tag",
             ClientMsg::Stop { .. } => "stop",
             ClientMsg::Reload => "reload",
             ClientMsg::Status => "status",
@@ -254,6 +267,8 @@ impl ClientMsg {
 /// One session as `list`, `launched` and `attached` describe it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_tags: Vec<String>,
     pub id: String,
     pub provider: String,
     pub cwd: PathBuf,
@@ -445,6 +460,10 @@ pub enum RuntimeMsg {
     },
     Sessions {
         sessions: Vec<SessionSummary>,
+    },
+    Tags {
+        session_id: String,
+        tags: Vec<String>,
     },
     Detached {
         session_id: String,
@@ -666,6 +685,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            self_tags: vec![],
             worker_build: None,
         }
     }

@@ -132,6 +132,7 @@ fn activity_name(activity: Activity) -> &'static str {
 }
 
 pub struct BrokerSession {
+    self_tags: std::collections::BTreeSet<String>,
     pub id: SessionId,
     pub process_gen: String,
     pub provider: String,
@@ -230,6 +231,7 @@ impl BrokerSession {
     ) -> Self {
         let chat = ChatSession::new(process_gen.clone(), now_ms());
         Self {
+            self_tags: Default::default(),
             id,
             process_gen,
             provider,
@@ -399,6 +401,35 @@ impl BrokerSession {
 
     pub fn is_live(&self) -> bool {
         self.state == SessionState::Running && self.worker.is_some()
+    }
+
+    pub fn agent_pid(&self) -> Option<(u32, u64)> {
+        let info = &self.worker.as_ref()?.info;
+        self.is_live()
+            .then_some((info.agent_pid?, info.agent_start_time?))
+    }
+
+    pub fn self_tags(&self) -> &std::collections::BTreeSet<String> {
+        &self.self_tags
+    }
+
+    pub fn add_tag(&mut self, label: String) -> anyhow::Result<()> {
+        if let Some(problem) = super::host_work::label_problem(&label, false) {
+            anyhow::bail!(problem);
+        }
+        if self.self_tags.len() >= 16 && !self.self_tags.contains(&label) {
+            anyhow::bail!("at most 16 self: tags");
+        }
+        self.self_tags.insert(label);
+        Ok(())
+    }
+
+    pub fn remove_tag(&mut self, label: &str) -> anyhow::Result<()> {
+        if let Some(problem) = super::host_work::label_problem(label, false) {
+            anyhow::bail!(problem);
+        }
+        self.self_tags.remove(label);
+        Ok(())
     }
 
     /// A screen to attach to (running, or exited with its final screen).
@@ -697,6 +728,7 @@ impl BrokerSession {
             cols,
             generation: self.process_gen.clone(),
             worker_build: self.worker.as_ref().and_then(|w| w.info.build.clone()),
+            self_tags: self.self_tags.iter().cloned().collect(),
         }
     }
 

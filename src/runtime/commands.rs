@@ -46,6 +46,19 @@ pub async fn sessions(client: &mut RuntimeClient) -> Result<Vec<SessionSummary>>
     .await
 }
 
+pub async fn tag(action: super::protocol::TagOp, name: Option<String>) -> Result<()> {
+    crate::auth::require_pairing("agent collaboration")?;
+    let mut client = RuntimeClient::connect_or_start().await?;
+    client.send(&ClientMsg::Tag { action, name }).await?;
+    let (session_id, tags) = reply(&mut client, "tag", |m| match m {
+        RuntimeMsg::Tags { session_id, tags } => Some((session_id, tags)),
+        _ => None,
+    })
+    .await?;
+    println!("{session_id}: {}", tags.join(", "));
+    Ok(())
+}
+
 /// A provider name `atem agent launch` accepts.
 pub fn check_provider(agent: &str) -> Result<()> {
     match agent {
@@ -168,6 +181,12 @@ pub fn format_list(client: &super::client::Welcome, sessions: &[SessionSummary])
             s.cwd.display()
         ));
         // Why a session isn't running, on its own line.
+        if !s.self_tags.is_empty() {
+            text.push_str(&format!(
+                "                  tags: {}\n",
+                s.self_tags.join(", ")
+            ));
+        }
         if let Some(status) = s.exited.as_ref().filter(|_| s.state != "running") {
             text.push_str(&format!("{:<16}  ({status})\n", ""));
         }
@@ -225,6 +244,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            self_tags: vec![],
             worker_build: None,
         }
     }

@@ -1112,6 +1112,7 @@ impl FakeWorker {
             pid,
             start_time,
             agent_pid: None,
+            agent_start_time: None,
             offset,
             input_epoch: 0,
             dropped: 0,
@@ -1800,6 +1801,7 @@ fn a_runtime_of_another_worker_protocol_is_kept() {
                             rows: 24,
                             cols: 80,
                             generation: "g".into(),
+                            self_tags: vec![],
                             worker_build: Some("9.9.9+1".into()),
                         }],
                     },
@@ -1944,5 +1946,28 @@ fn a_restarting_runtime_starts_nothing_new_and_tells_the_frontends() {
             .expect("the runtime exits for the restart")
             .unwrap()
             .unwrap();
+    });
+}
+#[test]
+fn a_tag_from_outside_a_session_is_refused() {
+    local(async {
+        let runtime = Runtime::start(Duration::from_secs(60), own_uid());
+        let mut client = runtime.client().await;
+        client
+            .send(&ClientMsg::Tag {
+                action: super::protocol::TagOp::List,
+                name: None,
+            })
+            .await
+            .unwrap();
+        expect(&mut client, |m| match m {
+            RuntimeMsg::Error { text, op } if op.as_deref() == Some("tag") => {
+                assert_eq!(text, "not inside an Atem session");
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        runtime.shutdown().await;
     });
 }

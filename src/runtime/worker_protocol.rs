@@ -328,6 +328,8 @@ pub enum WorkerMsg {
         pid: u32,
         start_time: u64,
         agent_pid: Option<u32>,
+        #[serde(default)]
+        agent_start_time: Option<u64>,
         /// Output bytes produced so far.
         offset: u64,
         input_epoch: u64,
@@ -687,6 +689,7 @@ mod tests {
                 pid: 7,
                 start_time: 99,
                 agent_pid: Some(8),
+                agent_start_time: Some(101),
                 offset: 3,
                 input_epoch: 2,
                 dropped: 1,

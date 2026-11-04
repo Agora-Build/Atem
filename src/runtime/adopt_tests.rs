@@ -917,3 +917,16 @@ async fn a_broker_that_goes_away_releases_the_waiting_hook() {
     .await;
     stop(running, handle).await;
 }
+#[test]
+fn ancestors_walk_to_init_and_stop_at_the_limit() {
+    let parent = |pid| match pid {
+        42 => Some(12),
+        12 => Some(1),
+        1 => Some(0),
+        _ => None,
+    };
+    assert_eq!(super::ancestors_with(42, 64, parent), [42, 12, 1]);
+    assert_eq!(super::ancestors_with(42, 2, parent), [42, 12]);
+    assert!(super::ancestors_with(42, 0, parent).is_empty());
+    assert_eq!(super::ancestors_with(42, 64, |_| Some(42)), [42]);
+}
