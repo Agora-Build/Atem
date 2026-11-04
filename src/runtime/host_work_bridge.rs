@@ -79,7 +79,11 @@ impl HostBridge {
     }
 
     pub fn remote_launched(&mut self, request_id: &str, state: LaunchState) {
-        self.work.pending.remove(request_id);
+        if self.work.pending.remove(request_id).is_none() {
+            // Fenced when the host's identity changed: its record went
+            // aside with the old database (`work_store_ready`).
+            return;
+        }
         let result = (|| -> anyhow::Result<()> {
             let store = self
                 .work
@@ -216,7 +220,9 @@ impl HostBridge {
     }
 
     pub(super) fn work_pass(&mut self, cx: &mut Cx) {
-        if !self.hosting_enabled() {
+        let identity = self.work_host();
+        // An unverified host has no identity to keep records under yet.
+        if !self.hosting_enabled() || identity.account_id == UNPAIRED {
             for request in self.r9.take_host_work() {
                 self.r9.host_work_reply(
                     &request.attachment,
@@ -228,13 +234,7 @@ impl HostBridge {
             self.work_fence_launches();
             return;
         }
-        let identity = self.work_host();
-        let ready = self
-            .work
-            .store
-            .as_ref()
-            .is_some_and(|s| s.bind(&identity).is_ok());
-        if !ready {
+        if !self.work_store_ready(&identity) {
             self.work_fail();
             return;
         }
@@ -281,6 +281,43 @@ impl HostBridge {
             if self.schedule_work(cx).is_err() {
                 self.work_fail();
             }
+        }
+    }
+
+    /// The store, bound to `identity`. One bound to another identity (this
+    /// host was verified or paired again since) is moved aside and a new one
+    /// started; launches not yet started under the old one are fenced.
+    fn work_store_ready(&mut self, identity: &HostTarget) -> bool {
+        let Some(store) = self.work.store.as_ref() else {
+            return false;
+        };
+        match store.bound() {
+            Ok(Some(bound)) if bound != *identity => {}
+            Ok(_) => return store.bind(identity).is_ok(),
+            Err(_) => return false,
+        }
+        for p in self.work.pending.drain().map(|(_, p)| p) {
+            p.permit.store(false, Ordering::SeqCst);
+        }
+        self.work.launches.clear();
+        self.work.recovered = false;
+        let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
+        let store = self.work.store.take().expect("checked above");
+        let next = store.retire(host_now().wall_ms).and_then(|aside| {
+            let store = Store::open(&state)?;
+            store.bind(identity)?;
+            Ok((store, aside))
+        });
+        match next {
+            Ok((store, aside)) => {
+                eprintln!(
+                    "atem runtime: agent hosting records of this host's previous identity moved aside to {}",
+                    aside.display()
+                );
+                self.work.store = Some(store);
+                true
+            }
+            Err(_) => false,
         }
     }
 

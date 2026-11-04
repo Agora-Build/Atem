@@ -480,7 +480,8 @@ event.
 
 `<config>/runtime/host-work.sqlite` keeps launches, tasks, messages with their
 receipts, and upload bytes, each durable before its reply, bound to one host
-triple (under another, hosting stays off). Nothing is pruned or evicted: at a
+triple (a new identity moves it aside and starts an empty one; see
+[agent hosting](../agent-hosting.md#9-durable-records)). Nothing is pruned or evicted: at a
 limit (4,096 launches, tasks or messages; 256 unfinished tasks; 256 uploads or
 128 MiB) new requests are `busy`, so an old retry never becomes new work.
 

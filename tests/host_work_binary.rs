@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use support::astation::{FakeAstation, write_verified_pairing};
+use support::astation::{ASTATION, FakeAstation, write_verified_pairing};
 use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
@@ -43,9 +43,24 @@ impl Rig {
         rig
     }
 
+    fn configured_as(provider: &str, verified: bool) -> Self {
+        let mut rig = Self::prepared_as(provider, verified, |_| {});
+        rig.start();
+        rig
+    }
+
     fn prepared(provider: &str, configure: impl FnOnce(&mut TestLog)) -> Self {
+        Self::prepared_as(provider, true, configure)
+    }
+
+    /// `verified: false` pairs the host without verifying it: no device list.
+    fn prepared_as(provider: &str, verified: bool, configure: impl FnOnce(&mut TestLog)) -> Self {
         let sandbox = Sandbox::new();
-        write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
+        if verified {
+            write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
+        } else {
+            support::profile::write_pairing(&sandbox.config(), ASTATION, 1);
+        }
         let mut log = TestLog::genesis(ACCOUNT, &secret("work astation"));
         let host_seed = secret("work host");
         log.add_host(HOST, 1, &host_seed);
@@ -62,7 +77,9 @@ impl Rig {
         log.add_native("unapproved", &["view", "control"]);
         log.add_native("messenger", &["view"]);
         configure(&mut log);
-        write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
+        if verified {
+            write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
+        }
         let fake = sandbox.dir.path().join("fake");
         std::fs::create_dir_all(&fake).unwrap();
         let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -515,6 +532,80 @@ fn a_missing_screenshot_holds_only_its_target_sessions_queue() {
             .unwrap()
             .contains("must wait for image")
     );
+}
+
+/// The host identity `runtime/host-work.sqlite` is bound to, if any.
+fn bound_identity(rig: &Rig) -> Option<Value> {
+    let db =
+        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
+    db.query_row("SELECT host FROM identity WHERE id=1", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
+    .map(|text| serde_json::from_str(&text).unwrap())
+}
+
+fn retired_databases(rig: &Rig) -> Vec<PathBuf> {
+    std::fs::read_dir(rig.sandbox.config().join("runtime"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("host-work.sqlite.retired-")
+        })
+        .collect()
+}
+
+#[test]
+fn hosting_binds_no_records_before_the_host_is_verified() {
+    let rig = Rig::configured_as("claude", false);
+    let db = rig.sandbox.config().join("runtime/host-work.sqlite");
+    within("host work database", || db.exists());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(bound_identity(&rig), None);
+}
+
+#[test]
+fn records_left_by_another_host_identity_are_moved_aside() {
+    let mut rig = Rig::prepared("claude", |_| {});
+    // What an earlier run left: hosting enabled before this host was
+    // verified, under the runtime's `unpaired` identity.
+    let runtime = rig.sandbox.config().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stale = json!({"account_id":"unpaired","atem_device_id":"unpaired","host_trust_gen":1});
+    let path = runtime.join("host-work.sqlite");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE identity (id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL);",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO identity(id,host) VALUES(1,?1)",
+        [stale.to_string()],
+    )
+    .unwrap();
+    drop(db);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    assert_eq!(dev.launched(&mut r, &rid)["state"], "started");
+    assert_eq!(bound_identity(&rig), Some(host()));
+    let retired = retired_databases(&rig);
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    let kept = rusqlite::Connection::open(&retired[0]).unwrap();
+    let identity: String = kept
+        .query_row("SELECT host FROM identity WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&identity).unwrap(), stale);
+    let log = std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log")).unwrap();
+    assert!(log.contains("moved aside"), "{log}");
 }
 
 #[test]
