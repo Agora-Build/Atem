@@ -321,10 +321,14 @@ record is committed before it is acknowledged. Values of environment variables
 are never stored.
 
 The database is bound to one account, host device id and host trust
-generation. On another identity (after a new pairing, or `atem pair verify`,
-which moves to the next trust generation) hosting fails closed and stays off.
-Moving the file aside starts an empty store and forgets every earlier request
-and task id, so an old retry would then count as new.
+generation, at the first pass after the host is verified (an unverified host
+binds nothing; hosting waits for verification). When that identity changes (a
+new pairing, or `atem pair verify`, which moves to the next trust generation),
+the runtime moves the database aside as `host-work.sqlite.retired-<ms>` (kept,
+never read again; `runtime.log` names it), fences launches that haven't
+started, and starts an empty one. Nothing it held could be honored again:
+every request names the host, trust generation included, so a retry for the
+old identity is `stale_target`.
 
 Records are never pruned; ids stay as tombstones. At a limit the runtime
 refuses new requests with `busy` instead of evicting anything. Files and the

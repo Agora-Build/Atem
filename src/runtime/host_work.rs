@@ -427,18 +427,43 @@ impl Store {
             "INSERT OR IGNORE INTO identity(id,host) VALUES(1,?1)",
             [&identity],
         )?;
-        self.check_binding(host)
-    }
-
-    pub fn check_binding(&self, host: &HostTarget) -> Result<()> {
-        let identity = serde_json::to_string(host)?;
-        let actual: String =
-            self.db
-                .query_row("SELECT host FROM identity WHERE id=1", [], |r| r.get(0))?;
-        if actual != identity {
+        if self.bound()?.as_ref() != Some(host) {
             bail!("host work database belongs to another account or trust generation");
         }
         Ok(())
+    }
+
+    /// The host these records belong to; none before the first `bind`.
+    pub fn bound(&self) -> Result<Option<HostTarget>> {
+        let text: Option<String> = self
+            .db
+            .query_row("SELECT host FROM identity WHERE id=1", [], |r| r.get(0))
+            .optional()?;
+        Ok(text.map(|t| serde_json::from_str(&t)).transpose()?)
+    }
+
+    /// Moves the database aside as `host-work.sqlite.retired-<at_ms>`,
+    /// kept and never read again, for a host whose identity changed (a
+    /// verification, a new pairing): every request names the current host,
+    /// so none of its records can be honored again. A hard link, so an
+    /// existing file is never replaced.
+    pub fn retire(self, at_ms: u64) -> Result<PathBuf> {
+        let Self { db, state } = self;
+        db.close().map_err(|(_, e)| e)?;
+        let path = state.join("host-work.sqlite");
+        let aside = state.join(format!("host-work.sqlite.retired-{at_ms}"));
+        std::fs::hard_link(&path, &aside)?;
+        std::fs::remove_file(&path)?;
+        // A hot journal belongs to the retired file, never to the next one.
+        let journal = state.join("host-work.sqlite-journal");
+        if journal.exists() {
+            std::fs::rename(
+                &journal,
+                state.join(format!("host-work.sqlite.retired-{at_ms}-journal")),
+            )?;
+        }
+        std::fs::File::open(&state)?.sync_all()?;
+        Ok(aside)
     }
 
     pub fn launch(&self, id: &str) -> Result<Option<LaunchRecord>> {
@@ -860,6 +885,42 @@ mod tests {
         let mut other = host();
         other.host_trust_gen += 1;
         assert!(store.bind(&other).is_err());
+    }
+
+    #[test]
+    fn a_database_of_another_host_identity_is_moved_aside_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.bound().unwrap(), None);
+        store.bind(&host()).unwrap();
+        assert!(store.enqueue(&task()).unwrap());
+        assert_eq!(store.bound().unwrap(), Some(host()));
+        let aside = store.retire(1).unwrap();
+        assert_eq!(aside.parent(), Some(dir.path()));
+        assert_eq!(
+            std::fs::metadata(&aside).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let mut other = host();
+        other.host_trust_gen += 1;
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.bound().unwrap(), None);
+        store.bind(&other).unwrap();
+        assert!(store.tasks().unwrap().is_empty());
+
+        let kept = Connection::open(&aside).unwrap();
+        let identity: String = kept
+            .query_row("SELECT host FROM identity WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<HostTarget>(&identity).unwrap(),
+            host()
+        );
+        let tasks: i64 = kept
+            .query_row("SELECT count(*) FROM work", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tasks, 1);
     }
 
     #[test]
