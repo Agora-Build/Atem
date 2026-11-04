@@ -9,6 +9,9 @@ use atem_client::session::host_work::{
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+#[path = "collab_bridge.rs"]
+mod collab_bridge;
+
 /// The local sender exists only on the broker's internal attachment.
 pub(crate) enum Sender {
     Remote(Authority),

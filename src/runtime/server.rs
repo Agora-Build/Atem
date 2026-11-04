@@ -336,6 +336,10 @@ fn waits_for_adoption(incoming: &Incoming) -> bool {
                 | ClientMsg::Attach { .. }
                 | ClientMsg::Stop { .. }
                 | ClientMsg::Tag { .. }
+                | ClientMsg::MessageSend { .. }
+                | ClientMsg::MessageStatus { .. }
+                | ClientMsg::MessageCancel { .. }
+                | ClientMsg::MessageDirectory { .. }
         ) | Incoming::Bad(DecodeError::Version(_))
     )
 }
@@ -686,6 +690,7 @@ impl Server {
         let Some(mut session) = BrokerSession::from_adoption(adoption) else {
             return;
         };
+        super::collab::restore_tags(self.options.launcher.state(), &mut session);
         if self.sessions.contains_key(&session.id) {
             return;
         }
@@ -847,6 +852,8 @@ impl Server {
                     return self.close(id);
                 }
                 ClientMsg::Launch { .. }
+                | ClientMsg::MessageSend { .. }
+                | ClientMsg::MessageCancel { .. }
                 | ClientMsg::AstationOp { .. }
                 | ClientMsg::Attach { .. }
                 | ClientMsg::Restart => return self.error(id, RESTARTING_NOW, message.op()),
@@ -1087,6 +1094,7 @@ impl Server {
                     return self.error(id, "not inside an Atem session", "tag");
                 };
                 let session = self.sessions.get_mut(&sid).unwrap();
+                let before = session.self_tags().clone();
                 let result = match (action, name) {
                     (super::protocol::TagOp::Add, Some(label)) => session.add_tag(label),
                     (super::protocol::TagOp::Remove, Some(label)) => session.remove_tag(&label),
@@ -1094,6 +1102,16 @@ impl Server {
                     _ => Err(anyhow::anyhow!("tag add/remove needs a self: label")),
                 };
                 if let Err(error) = result {
+                    return self.error(id, error.to_string(), "tag");
+                }
+                if let Err(error) = super::collab::save_tags(self.options.launcher.state(), session)
+                {
+                    for tag in session.self_tags().clone() {
+                        let _ = session.remove_tag(&tag);
+                    }
+                    for tag in before {
+                        let _ = session.add_tag(tag);
+                    }
                     return self.error(id, error.to_string(), "tag");
                 }
                 let tags = session.self_tags().iter().cloned().collect();
@@ -1104,6 +1122,66 @@ impl Server {
                         tags,
                     },
                 );
+            }
+            ClientMsg::MessageSend { request } => {
+                let Some(sid) = self.calling_session(id) else {
+                    return self.error(id, "not inside an Atem session", "message_send");
+                };
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| {
+                        b.collab_send(
+                            &self.app.astation_client.device_atem_id(),
+                            &sid,
+                            request,
+                            &self.sessions,
+                        )
+                    });
+                match result {
+                    Ok(message_id) => self.send(id, &RuntimeMsg::MessageSent { message_id }),
+                    Err(e) => self.error(id, e.to_string(), "message_send"),
+                }
+            }
+            ClientMsg::MessageStatus { message_id } => {
+                let result = self
+                    .bridge
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_status(message_id.as_deref()));
+                match result {
+                    Ok(messages) => self.send(id, &RuntimeMsg::MessageStatus { messages }),
+                    Err(e) => self.error(id, e.to_string(), "message_status"),
+                }
+            }
+            ClientMsg::MessageCancel { task_id } => {
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_cancel(&task_id));
+                match result {
+                    Ok(()) => self.send(id, &RuntimeMsg::MessageCancelled { task_id }),
+                    Err(e) => self.error(id, e.to_string(), "message_cancel"),
+                }
+            }
+            ClientMsg::MessageDirectory { selector } => {
+                let result = self
+                    .bridge
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| {
+                        b.collab_directory(
+                            &self.app.astation_client.device_atem_id(),
+                            selector.as_deref(),
+                            &self.sessions,
+                        )
+                    });
+                match result {
+                    Ok(rows) => self.send(id, &RuntimeMsg::MessageDirectory { rows }),
+                    Err(e) => self.error(id, e.to_string(), "message_directory"),
+                }
             }
             ClientMsg::Stop { session_id } => {
                 let Some(sid) = self.find(&session_id) else {

@@ -149,6 +149,31 @@ principals = ["local"]
         within("agent child command", || out.exists());
         serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap()
     }
+
+    fn send(&self, fake: &Path, n: u32, selector: &str, text: &str) -> String {
+        let output = self.agent(fake, n, &["message", "send", "--to", selector, text]);
+        assert_eq!(output["code"], 0, "{output}");
+        output["stdout"].as_str().unwrap().trim().to_string()
+    }
+
+    fn status(&self, id: &str) -> Value {
+        let reply = self.request(
+            json!({"op":"message_status","message_id":id}),
+            "message_status",
+        );
+        assert_eq!(reply["op"], "message_status", "{reply}");
+        reply["messages"][0].clone()
+    }
+
+    fn restart(&mut self) {
+        assert_eq!(
+            self.request(json!({"op":"restart"}), "restarting")["op"],
+            "restarting"
+        );
+        let mut child = self.runtime.take().unwrap();
+        within("runtime exit", || child.try_wait().unwrap().is_some());
+        self.start();
+    }
 }
 
 impl Drop for Rig {
@@ -205,5 +230,164 @@ fn an_agent_tags_itself_through_its_own_child() {
     assert_eq!(
         rig.agent(&fake, 19, &["agent", "tag", "remove", "self:reviewer"])["code"],
         0
+    );
+}
+
+#[test]
+fn one_message_reaches_two_agents_once_each() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b1) = rig.launch("b", "first");
+    let (_, b2) = rig.launch("b", "second");
+    let id = rig.send(&a, 1, "tag:b", "Review the API contract");
+    for fake in [&b1, &b2] {
+        within("collaboration prompt", || {
+            std::fs::read_to_string(fake.join("input"))
+                .unwrap_or_default()
+                .contains("Review the API contract")
+        });
+        private(&fake.join("complete"), "");
+    }
+    within("two turn receipts", || {
+        let status = rig.status(&id);
+        status["tasks"]
+            .as_array()
+            .is_some_and(|t| t.len() == 2 && t.iter().all(|t| t["state"] == "awaiting_result"))
+    });
+    for fake in [&b1, &b2] {
+        let input = std::fs::read_to_string(fake.join("input")).unwrap();
+        assert_eq!(
+            input.matches("Review the API contract").count(),
+            1,
+            "{input}"
+        );
+        assert!(input.contains("atem message reply --task"));
+    }
+    assert!(std::fs::read(a.join("input")).unwrap().is_empty());
+    let directory = rig.request(
+        json!({"op":"message_directory","selector":"tag:b"}),
+        "message_directory",
+    );
+    assert_eq!(directory["rows"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn sending_is_off_by_default() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace("send = true", "send = false");
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let output = rig.agent(&a, 1, &["message", "send", "--to", "tag:b", "work"]);
+    assert_ne!(output["code"], 0, "{output}");
+    assert!(
+        output["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("collaboration is off: set [collab] send = true"),
+        "{output}"
+    );
+}
+
+#[test]
+fn a_retry_returns_the_recorded_resolution() {
+    let mut rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "original");
+    let (_, c) = rig.launch("b", "new-match");
+    assert_eq!(
+        rig.agent(&b, 1, &["agent", "tag", "add", "self:chosen"])["code"],
+        0
+    );
+    let id = rig.send(&a, 1, "self:chosen", "only the original recipient");
+    within("original delivery", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("only the original recipient")
+    });
+    let before = rig.status(&id);
+    rig.restart();
+    assert_eq!(
+        rig.agent(&c, 1, &["agent", "tag", "add", "self:chosen"])["code"],
+        0
+    );
+    let after = rig.status(&id);
+    assert_eq!(before["tasks"][0]["task_id"], after["tasks"][0]["task_id"]);
+    assert_eq!(after["tasks"].as_array().unwrap().len(), 1);
+    assert!(std::fs::read(c.join("input")).unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(b.join("input"))
+            .unwrap()
+            .matches("only the original recipient")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cancel_works_while_queued_only() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let first = rig.send(&a, 1, "tag:b", "first task");
+    within("first prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("first task")
+    });
+    let second = rig.send(&a, 2, "tag:b", "cancel this task");
+    let status = rig.status(&second);
+    let task = status["tasks"][0]["task_id"].as_str().unwrap();
+    assert_eq!(
+        rig.request(
+            json!({"op":"message_cancel","task_id":task}),
+            "message_cancelled"
+        )["op"],
+        "message_cancelled"
+    );
+    let first_status = rig.status(&first);
+    let task = first_status["tasks"][0]["task_id"].as_str().unwrap();
+    assert_eq!(
+        rig.request(
+            json!({"op":"message_cancel","task_id":task}),
+            "message_cancelled"
+        )["op"],
+        "error"
+    );
+    assert_eq!(rig.status(&second)["tasks"][0]["state"], "cancelled");
+    assert!(
+        !std::fs::read_to_string(b.join("input"))
+            .unwrap()
+            .contains("cancel this task")
+    );
+}
+
+#[test]
+fn a_send_from_a_task_inherits_its_workflow_and_limit() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let _ = rig.launch("c", "third");
+    let first = rig.send(&a, 1, "tag:b", "continue this workflow");
+    within("first prompt turn", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("continue this workflow")
+    });
+    let next = rig.send(&b, 1, "tag:c", "child request");
+    assert_eq!(
+        rig.status(&first)["workflow_id"],
+        rig.status(&next)["workflow_id"]
+    );
+    for n in 2..=7 {
+        rig.send(&b, n, "tag:c", "bounded child request");
+    }
+    let output = rig.agent(&b, 8, &["message", "send", "--to", "tag:c", "must stop"]);
+    assert_ne!(output["code"], 0, "{output}");
+    assert!(
+        output["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("limit: 8 messages per workflow"),
+        "{output}"
     );
 }

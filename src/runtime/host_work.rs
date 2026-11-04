@@ -545,6 +545,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS work (id TEXT PRIMARY KEY, record TEXT NOT NULL, state TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS work_state ON work(state);
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbox (
+                message_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, state TEXT NOT NULL,
+                detail TEXT NOT NULL, next_try_ms INTEGER NOT NULL, created_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS resolutions (
+                message_id TEXT NOT NULL, recipient_id TEXT NOT NULL, task_id TEXT PRIMARY KEY,
+                route_id TEXT NOT NULL, session_id TEXT NOT NULL, process_gen TEXT NOT NULL,
+                launch_request_id TEXT, record TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS resolution_message ON resolutions(message_id);
+            CREATE TABLE IF NOT EXISTS counters (
+                key TEXT NOT NULL, window_start_ms INTEGER NOT NULL, count INTEGER NOT NULL,
+                PRIMARY KEY(key,window_start_ms));
             CREATE TABLE IF NOT EXISTS attachments (
                 owner TEXT NOT NULL, id TEXT NOT NULL, descriptor TEXT NOT NULL,
                 size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));")?;
@@ -654,6 +665,15 @@ impl Store {
     /// The immutable envelope, local recipient decisions and all executable
     /// deliveries become durable together. No acknowledgment precedes commit.
     pub fn accept_message(&self, record: &MessageRecord, work: &[WorkRecord]) -> Result<()> {
+        self.accept_message_with(record, work, |_| Ok(()))
+    }
+
+    pub(super) fn accept_message_with(
+        &self,
+        record: &MessageRecord,
+        work: &[WorkRecord],
+        extra: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
         let count: usize = tx.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
         let tasks: usize = tx.query_row("SELECT count(*) FROM work", [], |r| r.get(0))?;
@@ -674,6 +694,7 @@ impl Store {
                 params![r.task.task_id, serde_json::to_string(r)?],
             )?;
         }
+        extra(&tx)?;
         tx.commit()?;
         Ok(())
     }

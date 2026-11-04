@@ -118,6 +118,18 @@ pub enum ClientMsg {
         action: TagOp,
         name: Option<String>,
     },
+    MessageSend {
+        request: super::collab::SendRequest,
+    },
+    MessageStatus {
+        message_id: Option<String>,
+    },
+    MessageCancel {
+        task_id: String,
+    },
+    MessageDirectory {
+        selector: Option<String>,
+    },
     Stop {
         session_id: String,
     },
@@ -238,6 +250,10 @@ impl ClientMsg {
             ClientMsg::ApprovalsAnswered { .. } => "approvals_answered",
             ClientMsg::List => "list",
             ClientMsg::Tag { .. } => "tag",
+            ClientMsg::MessageSend { .. } => "message_send",
+            ClientMsg::MessageStatus { .. } => "message_status",
+            ClientMsg::MessageCancel { .. } => "message_cancel",
+            ClientMsg::MessageDirectory { .. } => "message_directory",
             ClientMsg::Stop { .. } => "stop",
             ClientMsg::Reload => "reload",
             ClientMsg::Status => "status",
@@ -464,6 +480,18 @@ pub enum RuntimeMsg {
     Tags {
         session_id: String,
         tags: Vec<String>,
+    },
+    MessageSent {
+        message_id: String,
+    },
+    MessageStatus {
+        messages: Vec<super::collab::MessageView>,
+    },
+    MessageCancelled {
+        task_id: String,
+    },
+    MessageDirectory {
+        rows: Vec<super::collab::DirectoryRow>,
     },
     Detached {
         session_id: String,

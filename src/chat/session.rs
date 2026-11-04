@@ -430,6 +430,16 @@ impl ChatSession {
 
     /// This session's state with at most `max_messages` / `max_bytes` of
     /// its newest history.
+    pub fn current_turn_id(&self) -> Option<&str> {
+        self.current_turn.as_ref().map(|(id, _)| id.as_str())
+    }
+
+    pub fn current_request_id(&self) -> Option<&str> {
+        self.current_turn
+            .as_ref()
+            .and_then(|(_, request)| request.as_deref())
+    }
+
     pub fn snapshot(&self, max_messages: usize, max_bytes: usize) -> ChatSnapshot {
         ChatSnapshot {
             started: self.started,

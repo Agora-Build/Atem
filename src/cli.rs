@@ -65,6 +65,11 @@ pub enum Commands {
         #[command(subcommand)]
         agent_command: AgentCommands,
     },
+    /// Ask other agents on this runtime to work through approved routes
+    Message {
+        #[command(subcommand)]
+        command: MessageCommands,
+    },
     /// Manage Agora dev servers
     Serv {
         #[command(subcommand)]
@@ -270,6 +275,30 @@ pub enum TagCommands {
     Add { name: String },
     Remove { name: String },
     List,
+}
+
+#[derive(Subcommand)]
+pub enum MessageCommands {
+    /// Send from the calling agent session (requires [collab] send = true)
+    Send {
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        #[arg(long)]
+        memory: Vec<String>,
+        #[arg(long)]
+        vault: Vec<String>,
+        #[arg(long)]
+        launch: bool,
+        #[arg(long, default_value = "24h")]
+        expires: String,
+        text: String,
+    },
+    /// Show durable delivery and per-task execution state
+    Status { id: Option<String> },
+    /// Cancel a task before submission
+    Cancel { task_id: String },
+    /// Show local routes, labels and live agents, optionally filtered
+    Directory { selector: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -997,6 +1026,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             reload_runtime().await;
             Ok(())
         }
+        Commands::Message { command } => crate::runtime::commands::message(command).await,
         Commands::Agent { agent_command } => match agent_command {
             AgentCommands::Tag { command } => {
                 let (action, name) = match command {

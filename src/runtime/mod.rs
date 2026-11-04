@@ -6,6 +6,7 @@
 pub mod adopt;
 pub mod broker;
 pub mod client;
+pub mod collab;
 pub mod commands;
 pub mod host_bridge;
 pub mod host_work;

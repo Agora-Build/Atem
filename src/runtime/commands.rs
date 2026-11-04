@@ -59,6 +59,79 @@ pub async fn tag(action: super::protocol::TagOp, name: Option<String>) -> Result
     Ok(())
 }
 
+pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
+    use crate::cli::MessageCommands;
+    crate::auth::require_pairing("agent collaboration")?;
+    let mut client = RuntimeClient::connect_or_start().await?;
+    let request = match command {
+        MessageCommands::Send {
+            to,
+            text,
+            memory,
+            vault,
+            launch,
+            expires,
+        } => ClientMsg::MessageSend {
+            request: super::collab::SendRequest {
+                to,
+                text,
+                memory,
+                vault,
+                launch,
+                expires_ms: super::host_work::duration_ms(&expires)
+                    .ok_or_else(|| anyhow!("expiry must be 1s to 24h"))?,
+            },
+        },
+        MessageCommands::Status { id } => ClientMsg::MessageStatus { message_id: id },
+        MessageCommands::Cancel { task_id } => ClientMsg::MessageCancel { task_id },
+        MessageCommands::Directory { selector } => ClientMsg::MessageDirectory { selector },
+    };
+    let op = request.op();
+    client.send(&request).await?;
+    let response = reply(&mut client, op, |m| match m {
+        RuntimeMsg::MessageSent { .. }
+        | RuntimeMsg::MessageStatus { .. }
+        | RuntimeMsg::MessageCancelled { .. }
+        | RuntimeMsg::MessageDirectory { .. } => Some(m),
+        _ => None,
+    })
+    .await?;
+    match response {
+        RuntimeMsg::MessageSent { message_id } => println!("{message_id}"),
+        RuntimeMsg::MessageCancelled { task_id } => println!("{task_id}: cancelled"),
+        RuntimeMsg::MessageDirectory { rows } => {
+            for row in rows {
+                println!(
+                    "atem:{}/{}  {}  {}  local={}",
+                    row.atem_id,
+                    row.route_id,
+                    row.session_id.as_deref().unwrap_or("(no live agent)"),
+                    row.labels.join(", "),
+                    row.local_consent
+                );
+            }
+        }
+        RuntimeMsg::MessageStatus { messages } => {
+            for m in messages {
+                println!(
+                    "{}  {}  {}  workflow {}",
+                    m.message_id, m.delivery, m.detail, m.workflow_id
+                );
+                for task in m.tasks {
+                    println!(
+                        "  {}  {}  {}",
+                        task.task_id,
+                        serde_json::to_value(task.state)?.as_str().unwrap(),
+                        task.detail
+                    );
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 /// A provider name `atem agent launch` accepts.
 pub fn check_provider(agent: &str) -> Result<()> {
     match agent {
