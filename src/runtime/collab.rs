@@ -186,6 +186,81 @@ pub struct MessageView {
     pub tasks: Vec<WorkStatus>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct Publication {
+    pub atem_id: String,
+    pub origin_process_gen: String,
+    pub context: Vec<super::collab_context::ContextSpec>,
+}
+
+pub(super) fn reserve_context(
+    store: &Store,
+    config: &Collab,
+    message: &Message,
+    publication: &Publication,
+) -> Result<()> {
+    let tx = store.db.unchecked_transaction()?;
+    let count: usize = tx.query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))?;
+    if count >= super::host_work::MAX_RECORDS {
+        bail!("outbox capacity reached");
+    }
+    count_send(
+        &tx,
+        config,
+        message.from_session.as_deref().unwrap(),
+        &message.workflow_id,
+        message.created_at,
+    )?;
+    tx.execute(
+        "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+        VALUES(?1,?2,'publishing','waiting for verified context publication',0,?3)",
+        params![
+            message.message_id,
+            serde_json::to_string(message)?,
+            message.created_at
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO publications(message_id,record) VALUES(?1,?2)",
+        params![message.message_id, serde_json::to_string(publication)?],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(super) fn context_due(store: &Store, now: u64) -> Result<Vec<(Message, Publication, u32)>> {
+    let mut q = store.db.prepare(
+        "SELECT o.envelope,p.record,p.attempts FROM publications p JOIN outbox o USING(message_id)
+        WHERE o.state='publishing' AND o.next_try_ms<=?1 ORDER BY o.created_ms LIMIT 16",
+    )?;
+    q.query_map([now], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u32>(2)?,
+        ))
+    })?
+    .map(|r| {
+        let (m, p, n) = r?;
+        Ok((serde_json::from_str(&m)?, serde_json::from_str(&p)?, n))
+    })
+    .collect()
+}
+
+pub(super) fn publication_state(
+    store: &Store,
+    id: &str,
+    state: &str,
+    detail: &str,
+    retry: u64,
+) -> Result<()> {
+    store.db.execute(
+        "UPDATE outbox SET state=?2,detail=?3,next_try_ms=?4 WHERE message_id=?1",
+        params![id, state, detail, retry],
+    )?;
+    Ok(())
+}
+
 pub(super) fn persist(
     tx: &Transaction<'_>,
     message: &Message,
@@ -193,7 +268,8 @@ pub(super) fn persist(
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
-        VALUES(?1,?2,'accepted',?3,0,?4)",
+        VALUES(?1,?2,'accepted',?3,0,?4)
+        ON CONFLICT(message_id) DO UPDATE SET envelope=excluded.envelope,state='accepted',detail=excluded.detail,next_try_ms=0",
         params![
             message.message_id,
             serde_json::to_string(message)?,
@@ -204,6 +280,10 @@ pub(super) fn persist(
             },
             message.created_at
         ],
+    )?;
+    tx.execute(
+        "DELETE FROM publications WHERE message_id=?1",
+        [&message.message_id],
     )?;
     for r in resolution {
         tx.execute("INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,session_id,process_gen,launch_request_id,record)

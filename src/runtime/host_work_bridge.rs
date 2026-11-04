@@ -82,6 +82,8 @@ pub(super) struct State {
     recovered: bool,
     pending: HashMap<String, PendingLaunch>,
     launches: VecDeque<RemoteLaunch>,
+    context_jobs:
+        HashMap<String, tokio::sync::oneshot::Receiver<anyhow::Result<Vec<hw::ContextSnapshot>>>>,
 }
 
 impl State {
@@ -106,6 +108,7 @@ impl State {
             recovered: false,
             pending: HashMap::new(),
             launches: VecDeque::new(),
+            context_jobs: HashMap::new(),
         }
     }
 }
@@ -380,7 +383,11 @@ impl HostBridge {
         self.work_fence_launches();
         if Instant::now() >= self.work.scheduled {
             self.work.scheduled = Instant::now() + Duration::from_millis(100);
-            if self.schedule_work(cx).is_err() {
+            if self
+                .collab_pass(cx)
+                .and_then(|_| self.schedule_work(cx))
+                .is_err()
+            {
                 self.work_fail();
             }
         }
@@ -402,6 +409,7 @@ impl HostBridge {
             p.permit.store(false, Ordering::SeqCst);
         }
         self.work.launches.clear();
+        self.work.context_jobs.clear();
         self.work.recovered = false;
         let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
         let store = self.work.store.take().expect("checked above");

@@ -26,6 +26,7 @@ struct Rig {
     astation: FakeAstation,
     runtime: Option<Child>,
     config: String,
+    context_hook: bool,
 }
 
 impl Rig {
@@ -64,6 +65,7 @@ principals = ["local"]
             astation: FakeAstation::start(),
             runtime: None,
             config,
+            context_hook: false,
         };
         rig.start();
         rig
@@ -72,12 +74,19 @@ principals = ["local"]
     fn start(&mut self) {
         private(&self.sandbox.config().join("runtime.toml"), &self.config);
         let output = std::fs::File::create(self.sandbox.dir.path().join("runtime.log")).unwrap();
+        let context = self.sandbox.dir.path().join("context");
+        std::fs::create_dir_all(&context).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
+        command.env_clear();
+        if self.context_hook {
+            command.env("ATEM_TEST_CONTEXT_DIR", context);
+        }
         self.runtime = Some(
-            Command::new(env!("CARGO_BIN_EXE_atem"))
+            command
                 .arg("runtime")
-                .env_clear()
                 .envs(self.sandbox.env())
                 .env("ASTATION_WS", &self.astation.url)
+                .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
                 .env("ATEM_TEST_NO_INIT_LIMIT", "1")
                 .stdin(Stdio::null())
                 .stdout(output.try_clone().unwrap())
@@ -390,4 +399,92 @@ fn a_send_from_a_task_inherits_its_workflow_and_limit() {
             .contains("limit: 8 messages per workflow"),
         "{output}"
     );
+}
+
+#[test]
+fn a_vault_reference_arrives_as_its_exact_text_after_publication_retries() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let output = rig.agent(
+        &a,
+        1,
+        &[
+            "message",
+            "send",
+            "--to",
+            "tag:b",
+            "--vault",
+            "v-contract:1@2",
+            "check this exact snapshot",
+        ],
+    );
+    assert_eq!(output["code"], 0, "{output}");
+    let id = output["stdout"].as_str().unwrap().trim();
+    within("publication retry", || {
+        rig.status(id)["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("relay unreachable")
+    });
+    assert_eq!(rig.status(id)["delivery"], "publishing");
+    assert!(rig.status(id)["tasks"].as_array().unwrap().is_empty());
+    assert!(std::fs::read(b.join("input")).unwrap().is_empty());
+    rig.restart();
+    let text = "Published contract  with exact spaces\nand a second line.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let reference = format!("{:x}", Sha256::digest(b"v-contract:1@2"));
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{reference}.json")),
+        &json!({"kind":"vault","id":"v-contract:1","version":2,"digest":digest,"text":text})
+            .to_string(),
+    );
+    within("verified context prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains(text)
+    });
+    let input = std::fs::read_to_string(b.join("input")).unwrap();
+    assert!(input.contains(&digest));
+    assert_eq!(input.matches(text).count(), 1);
+    assert_eq!(rig.status(id)["delivery"], "accepted");
+}
+
+#[test]
+fn an_unreachable_relay_keeps_the_send_publishing() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let output = rig.agent(
+        &a,
+        1,
+        &[
+            "message",
+            "send",
+            "--to",
+            "tag:b",
+            "--vault",
+            "v-contract:1@2",
+            "wait for publication",
+        ],
+    );
+    assert_eq!(output["code"], 0, "{output}");
+    let id = output["stdout"].as_str().unwrap().trim();
+    within("unreachable relay", || {
+        rig.status(id)["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("relay unreachable")
+    });
+    let status = rig.status(id);
+    assert_eq!(status["delivery"], "publishing");
+    assert!(status["tasks"].as_array().unwrap().is_empty());
+    assert!(std::fs::read(b.join("input")).unwrap().is_empty());
 }

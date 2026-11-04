@@ -198,6 +198,8 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
     if method == "POST" && path.starts_with("/api/memory/batch?") {
         let mut results = Vec::new();
         for op in body["ops"].as_array().unwrap() {
+            let mut canonical_id = None;
+            let mut seq = state.next_seq;
             match op["op"].as_str().unwrap() {
                 "rewrite" => {
                     let id = op["id"].as_str().unwrap();
@@ -208,13 +210,19 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
                 }
                 "add" => {
                     let mut memory: Memory = serde_json::from_value(op["memory"].clone()).unwrap();
-                    memory.seq = state.next_seq;
-                    state.next_seq += 1;
-                    state.memories.push(memory);
+                    if let Some(existing) = state.memories.iter().find(|m| m.id == memory.id ||
+                        (m.content_hash == memory.content_hash && m.scope == memory.scope && m.project == memory.project && m.machine == memory.machine)) {
+                        seq = existing.seq;
+                        canonical_id = Some(existing.id.clone());
+                    } else {
+                        memory.seq = seq;
+                        state.next_seq += 1;
+                        state.memories.push(memory);
+                    }
                 }
                 other => panic!("unexpected memory operation {other}"),
             }
-            results.push(json!({"ok": true, "seq": state.next_seq}));
+            results.push(json!({"ok": true, "seq": seq, "canonical_id": canonical_id}));
         }
         return json!({"results": results});
     }
@@ -636,4 +644,32 @@ fn a_field_too_big_for_one_agent_request_fails_before_any_request() {
     // The largest skill still fits in one request.
     let skill = vec![2u8; crate::memory::skills_fs::MAX_SKILL_BYTES];
     assert_eq!(context.seal_many(&[("v", "content", skill.as_slice())]).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_pushed_memory_reads_back_by_its_seq() {
+    use crate::memory::sync::push_memory_and_read_back;
+    let directory = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(directory.path());
+    device.state(EncryptionMode::Off, None);
+    let relay = Arc::new(Mutex::new(RelayState::seeded()));
+    let base = stub_relay(relay.clone()).await;
+    for encrypted in [false, true] {
+        if encrypted {
+            device.set_key(EncryptionMode::Enabling, OLD_KID, [7; 32]);
+            clients(&base, &device).0.migrate_encryption().await.unwrap();
+        }
+        let (client, _) = clients(&base, &device);
+        let memory = Memory { id: format!("mem_{}", if encrypted { "12345678" } else { "f00dbabe" }),
+            content: format!("Exact  bytes with a newline\n{encrypted}"), scope: Scope::Global,
+            content_hash: content_hash(&format!("Exact  bytes with a newline\n{encrypted}")), ..Default::default() };
+        let snapshot = push_memory_and_read_back(&client, &memory).await.unwrap();
+        assert_eq!(snapshot.text, memory.content);
+        assert_eq!(snapshot.digest, atem_client::session::host_work::digest(memory.content.as_bytes()));
+        let mut alias = memory.clone();
+        alias.id.push_str("abcd");
+        let canonical = push_memory_and_read_back(&client, &alias).await.unwrap();
+        assert_eq!(canonical.id, memory.id);
+        assert_eq!(canonical.version, snapshot.version);
+    }
 }

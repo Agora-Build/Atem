@@ -40,6 +40,8 @@
 //! - `ATEM_TEST_BUILD=<id>`: this process reports `<id>` as its build
 //!   (`cred_agent::build_id`), so a binary test can run a runtime that looks
 //!   like another atem build.
+//! - `ATEM_TEST_CONTEXT_DIR=<dir>`: context snapshots for isolated binary
+//!   tests, named by sha256(reference).json. Never active in release builds.
 //!
 //! For the r9 fixtures against the real runtime (`tests/r9_runner/`):
 //! - `ATEM_TEST_PTY_FAULTS=<dir>`, read by the broker too: while
@@ -333,6 +335,13 @@ pub fn project_hashes() -> Option<std::path::PathBuf> {
 pub fn state_dump() -> Option<std::path::PathBuf> {
     #[cfg(debug_assertions)]
     return imp::state_dump().cloned();
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+pub fn context_dir() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    return std::env::var_os("ATEM_TEST_CONTEXT_DIR").map(std::path::PathBuf::from);
     #[cfg(not(debug_assertions))]
     None
 }

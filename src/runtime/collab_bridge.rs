@@ -170,10 +170,11 @@ impl HostBridge {
         {
             bail!("invalid selectors or expiry (1s to 24h)");
         }
-        // Context publication is added by the next stage of the local pipeline.
-        if !request.memory.is_empty() || !request.vault.is_empty() {
-            bail!("context publication is not available yet");
-        }
+        let specs = crate::runtime::collab_context::capture(
+            &self.work.dir,
+            &request.memory,
+            &request.vault,
+        )?;
         if request.launch {
             bail!("launch on message is not available yet");
         }
@@ -203,11 +204,57 @@ impl HostBridge {
             context: vec![],
             mark: None,
         };
+        let mut probe = message.clone();
+        if probe.text.trim().is_empty() && !specs.is_empty() {
+            probe.text = "pending context".into();
+        }
+        if !probe.valid_local() {
+            bail!("invalid message content");
+        }
+        if !specs.is_empty() {
+            collab::reserve_context(
+                self.work.store.as_ref().unwrap(),
+                &self.work.config.collab,
+                &message,
+                &collab::Publication {
+                    atem_id: atem_id.into(),
+                    origin_process_gen: origin.process_gen.clone(),
+                    context: specs,
+                },
+            )?;
+        } else {
+            self.collab_accept(atem_id, &message, sessions, true)?;
+        }
+        Ok(message.message_id)
+    }
+
+    fn collab_accept(
+        &mut self,
+        atem_id: &str,
+        message: &Message,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+        count_send: bool,
+    ) -> Result<()> {
+        if let Some(old) = self
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .message(&message.message_id)?
+        {
+            if old.message != *message {
+                bail!("request_id_reused");
+            }
+            return Ok(());
+        }
         if !message.valid_local() {
             bail!("invalid message content");
         }
-        let selectors = request
-            .to
+        let from = message.from_session.as_deref().unwrap();
+        let Destination::Select { selectors, .. } = &message.recipients[0].destination else {
+            bail!("invalid local destination");
+        };
+        let selectors = selectors
             .iter()
             .map(|s| s.parse())
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -217,7 +264,7 @@ impl HostBridge {
             &self.collab_candidates(sessions),
             &selectors,
             MAX_AGENTS,
-            from.as_str(),
+            from,
             &message.message_id,
             &message.recipients[0].recipient_id,
         );
@@ -291,13 +338,15 @@ impl HostBridge {
             .as_ref()
             .unwrap()
             .accept_message_with(&record, &work, |tx| {
-                collab::count_send(
-                    tx,
-                    &self.work.config.collab,
-                    from.as_str(),
-                    &message.workflow_id,
-                    now,
-                )?;
+                if count_send {
+                    collab::count_send(
+                        tx,
+                        &self.work.config.collab,
+                        from,
+                        &message.workflow_id,
+                        message.created_at,
+                    )?;
+                }
                 collab::count_received(
                     tx,
                     &self.work.config.collab,
@@ -306,7 +355,99 @@ impl HostBridge {
                 )?;
                 collab::persist(tx, &message, &resolved)
             })?;
-        Ok(message.message_id)
+        Ok(())
+    }
+
+    pub(super) fn collab_pass(&mut self, cx: &mut Cx) -> Result<()> {
+        if !self.local_healthy() {
+            return Ok(());
+        }
+        let now = host_now().wall_ms;
+        let store = self.work.store.as_ref().unwrap();
+        store.db.execute(
+            "UPDATE outbox SET state='expired',detail='expired before context publication'
+            WHERE state='publishing' AND json_extract(envelope,'$.expires_at')<=?1",
+            [now],
+        )?;
+        let active: HashSet<String> = store
+            .db
+            .prepare("SELECT message_id FROM outbox WHERE state='publishing'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        self.work.context_jobs.retain(|id, _| active.contains(id));
+        let pending = collab::context_due(store, now)?;
+        for (mut message, publication, attempts) in pending {
+            let id = message.message_id.clone();
+            let store = self.work.store.as_ref().unwrap();
+            let origin_live = SessionId::parse(message.from_session.as_deref().unwrap_or(""))
+                .and_then(|s| cx.sessions.get(&s))
+                .is_some_and(|s| s.is_live() && s.process_gen == publication.origin_process_gen);
+            if !origin_live {
+                self.work.context_jobs.remove(&id);
+                collab::publication_state(store, &id, "refused", "originating session ended", 0)?;
+                continue;
+            }
+            if let Some(job) = self.work.context_jobs.get_mut(&id) {
+                let result = match job.try_recv() {
+                    Ok(r) => r,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
+                    Err(_) => Err(anyhow!("relay unreachable")),
+                };
+                self.work.context_jobs.remove(&id);
+                let result = result.and_then(|snapshots| {
+                    message.context = snapshots;
+                    self.collab_accept(&publication.atem_id, &message, cx.sessions, false)
+                });
+                if let Err(error) = result {
+                    let detail = error.to_string();
+                    let permanent = matches!(
+                        detail.as_str(),
+                        "context changed"
+                            | "invalid context snapshot"
+                            | "context profile changed"
+                            | "invalid message content"
+                            | "context publication refused"
+                    ) || detail.starts_with("ambiguous vault reference")
+                        || detail.starts_with("limit:");
+                    let store = self.work.store.as_ref().unwrap();
+                    if permanent {
+                        collab::publication_state(store, &id, "refused", &detail, 0)?;
+                    } else {
+                        let delay = 1_000u64
+                            .saturating_mul(1u64 << attempts.min(9))
+                            .min(300_000);
+                        store.db.execute(
+                            "UPDATE publications SET attempts=attempts+1 WHERE message_id=?1",
+                            [&id],
+                        )?;
+                        collab::publication_state(
+                            store,
+                            &id,
+                            "publishing",
+                            "relay unreachable; publication will retry",
+                            now.saturating_add(delay),
+                        )?;
+                    }
+                }
+            } else if self.work.context_jobs.len() < 2 {
+                let publisher = crate::runtime::collab_context::RelayPublisher::new(
+                    self.work.dir.clone(),
+                    self.work_host(),
+                );
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.work.context_jobs.insert(id, rx);
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        crate::runtime::collab_context::publish(&publisher, &publication.context),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("relay unreachable")));
+                    let _ = tx.send(result);
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn collab_status(&self, id: Option<&str>) -> Result<Vec<MessageView>> {
