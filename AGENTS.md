@@ -617,9 +617,18 @@ Requires `NPM_TOKEN` secret in GitHub repo settings.
   (rtc, convo, webhooks, files) write JSON entries to `~/.config/atem/servers/`.
   Convo entries use the channel name itself as the id (no kind/port
   suffix) since channels are unique per agent. `list` shows a 1-based
-  index (`#`), `ID`, `PID`, `PORT`, `STATUS` (cached from convo's 60s
-  poller, `—` until the first poll). `kill` and `attach` accept either
-  the literal id or the index from `list`.
+  index (`#`), `ID`, `PID`, `PORT`, `STATUS` (convo: cached from its 60s
+  poller, `—` until the first poll; others: `running`, plus `(no access
+  code)` for a page started before 0.8.1; dead entries are pruned) and
+  `URL` (a Custom URL first, the user's `extra_hostnames`: from `links`,
+  or for an entry from before `links`, the `Custom:` lines its log
+  printed; else LAN, else local; `—` for a convo daemon, which has no
+  page). `info <id|#>` prints one entry: kind, PID, port, status, start,
+  channel, every URL it printed (Local, LAN, then `links`: Cloudflared,
+  Ngrok, Custom, each with the access code; the background parent writes
+  `links` once the daemon's tunnels reported), the access state and the
+  log path. `kill`, `attach` and `info` accept either the literal id or
+  the index from `list`.
 - **ConvoAI Config Wizard (`atem config convo`)**: Interactive terminal wizard
   that generates `~/.config/atem/convo.toml`. Flow: Channel & User → Agent →
   Preset (empty = skip) → Add Custom override? → Pipeline (Cascaded | MLLM)

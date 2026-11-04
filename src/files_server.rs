@@ -136,7 +136,7 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
             .iter()
             .map(|h| access.url(&format!("https://{}:{}{}", h.trim(), port, target_path)))
             .collect();
-        let entry = crate::rtc_test_server::ServerEntry {
+        let mut entry = crate::rtc_test_server::ServerEntry {
             id: sid.clone(),
             pid: child.id(),
             kind: "files".to_string(),
@@ -150,11 +150,15 @@ pub async fn run_server(cfg: ServeFilesConfig) -> Result<()> {
                 .as_secs(),
             last_status: None,
             last_checked_at: None,
+            links: Vec::new(),
         };
         crate::rtc_test_server::register_server(&entry)?;
 
         println!("atem serv files");
         let report = tunnels.read(&mut child).await;
+        // Every URL it printed, for `atem serv info`.
+        entry.links = report.links(&access, &target_path, &custom_urls);
+        crate::rtc_test_server::register_server(&entry)?;
         field("DIR", root.display());
         report.print_urls(&access, &target_path, &local_url, &network_url, &custom_urls);
         field("ID", &sid);
