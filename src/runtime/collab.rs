@@ -189,7 +189,10 @@ pub(super) fn count_received(tx: &Transaction<'_>, config: &Collab, workflow: &s
 }
 
 /// Would one more message fit the sender's limits? Nothing is recorded: the
-/// counting transaction is dropped, which rolls it back.
+/// counting transaction is dropped, which rolls it back. A send with context
+/// is counted only when it is accepted, after publication, so the ones still
+/// `publishing` count here for the sender and for the workflow: a loop of
+/// them is refused at send, not left to queue up and publish.
 pub(super) fn check_send(
     store: &Store,
     config: &Collab,
@@ -198,6 +201,23 @@ pub(super) fn check_send(
     now: u64,
 ) -> Result<()> {
     let tx = store.db.unchecked_transaction()?;
+    let in_flight = |field: &str, value: &str| -> Result<u32> {
+        Ok(tx.query_row(
+            &format!(
+                "SELECT count(*) FROM outbox WHERE state='publishing'
+                AND json_extract(envelope,'$.kind') IS NULL
+                AND json_extract(envelope,'$.{field}')=?1"
+            ),
+            [value],
+            |r| r.get(0),
+        )?)
+    };
+    let (sender, flow) = (
+        in_flight("from_session", from)?,
+        in_flight("workflow_id", workflow)?,
+    );
+    count(&tx, &format!("hour:{from}"), now, sender, u32::MAX, "")?;
+    count(&tx, &format!("send:{workflow}"), 0, flow, u32::MAX, "")?;
     count_send(&tx, config, from, workflow, now)
 }
 
@@ -668,6 +688,61 @@ mod tests {
         assert_eq!(counted(&store, "hour:session"), 0);
         accept_one(&store, &config, "session").unwrap();
         assert!(check_send(&store, &config, "session", "flow", 1_000).is_err());
+    }
+
+    /// Sends with context count when they are accepted, after publication;
+    /// until then the ones still publishing bound the sender and the workflow.
+    #[test]
+    fn checking_a_send_counts_context_sends_still_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let config = Collab {
+            per_hour: 3,
+            per_workflow: 3,
+            ..Default::default()
+        };
+        let row = |id: &str, from: &str, workflow: &str, state: &str, kind: Option<&str>| {
+            let mut envelope = serde_json::json!({"workflow_id": workflow, "from_session": from});
+            if let Some(kind) = kind {
+                envelope["kind"] = kind.into();
+            }
+            store
+                .db
+                .execute(
+                    "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+                    VALUES(?1,?2,?3,'',0,0)",
+                    params![id, envelope.to_string(), state],
+                )
+                .unwrap();
+        };
+        row("m1", "session", "flow-a", "publishing", None);
+        row("m2", "session", "flow-b", "publishing", None);
+        row("m3", "other", "flow-a", "publishing", None);
+        // A result, a refused row and an accepted one (the counters hold it)
+        // are not in flight.
+        row("m4", "session", "flow-a", "publishing", Some("result"));
+        row("m5", "session", "flow-a", "refused", None);
+        row("m6", "session", "flow-a", "accepted", None);
+        check_send(&store, &config, "session", "flow-c", 1_000).unwrap();
+        check_send(&store, &config, "session", "flow-a", 1_000).unwrap();
+        check_send(&store, &config, "other", "flow-a", 1_000).unwrap();
+        row("m7", "session", "flow-c", "publishing", None);
+        assert_eq!(
+            check_send(&store, &config, "session", "flow-z", 1_000)
+                .unwrap_err()
+                .to_string(),
+            "limit: 3 messages per hour"
+        );
+        row("m8", "another", "flow-a", "publishing", None);
+        assert_eq!(
+            check_send(&store, &config, "other", "flow-a", 1_000)
+                .unwrap_err()
+                .to_string(),
+            "limit: 3 messages per workflow"
+        );
+        // Nothing was recorded by checking.
+        assert_eq!(counted(&store, "send:flow-a"), 0);
+        assert_eq!(counted(&store, "hour:session"), 0);
     }
 
     fn local_task(prompt: &str, context: Vec<ContextSnapshot>) -> WorkTask {

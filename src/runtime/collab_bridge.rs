@@ -310,6 +310,16 @@ impl HostBridge {
                 },
             });
         }
+        // The origin's task carries the reply as its prompt and context: if
+        // that could never dispatch, refuse the reply so a smaller one can
+        // be sent, instead of completing the replier's task and losing it.
+        let host = self.work_host();
+        if let Some(problem) = returned
+            .iter()
+            .find_map(|r| collab::task_problem(&r.task, &host))
+        {
+            bail!("{problem}");
+        }
         let record = MessageRecord {
             sender_key: json!("local"),
             message: message.clone(),

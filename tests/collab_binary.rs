@@ -438,6 +438,112 @@ fn a_context_over_the_task_bounds_is_refused_and_not_counted() {
     });
 }
 
+/// Context sends count when they are accepted, after publication; those still
+/// publishing bound the sender meanwhile, so a loop of them is refused at send.
+#[test]
+fn context_sends_still_publishing_count_against_the_hourly_limit() {
+    let mut rig = Rig::new();
+    rig.config = rig
+        .config
+        .replace("send = true", "send = true\nper_hour = 1");
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let vault = |n, text| {
+        rig.agent(
+            &a,
+            n,
+            &[
+                "message",
+                "send",
+                "--to",
+                "tag:b",
+                "--vault",
+                "v-wait:1@1",
+                text,
+            ],
+        )
+    };
+    let first = vault(1, "first waits for its relay");
+    assert_eq!(first["code"], 0, "{first}");
+    let second = vault(2, "second must not queue behind it");
+    assert_ne!(second["code"], 0, "{second}");
+    assert!(
+        second["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("limit: 1 messages per hour"),
+        "{second}"
+    );
+    assert!(std::fs::read(b.join("input")).unwrap().is_empty());
+}
+
+/// The result task a reply creates for the origin agent obeys the task bounds:
+/// a reply whose context could never be delivered is refused, and the replier
+/// can still answer with something smaller.
+#[test]
+fn a_reply_that_could_never_be_delivered_is_refused_and_can_be_corrected() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "answer with too much context");
+    let task = await_task(&rig, &id, &b);
+    let text = "x".repeat(40_000);
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-big:1@1"));
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-big:1","version":1,"digest":digest,"text":text}).to_string(),
+    );
+    let oversize = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-big:1@1",
+            "too much",
+        ],
+    );
+    assert_eq!(oversize["code"], 0, "{oversize}");
+    within("oversize reply refused", || {
+        let all = rig.request(json!({"op":"message_status"}), "message_status");
+        all["messages"].as_array().unwrap().iter().any(|m| {
+            m["delivery"] == "refused"
+                && m["detail"] == "the prompt with its context is over 32 KiB"
+        })
+    });
+    // The replier's task is still waiting, and the origin saw nothing.
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "awaiting_result");
+    assert!(std::fs::read(a.join("input")).unwrap().is_empty());
+    let smaller = rig.agent(
+        &b,
+        2,
+        &["message", "reply", "--task", &task, "the short answer"],
+    );
+    assert_eq!(smaller["code"], 0, "{smaller}");
+    within("the corrected result arrives", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("the short answer")
+    });
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
+}
+
 /// `build_atem_id` keeps non-ASCII characters, and the selectors that
 /// `atem message directory` prints must address the instance again.
 #[test]
