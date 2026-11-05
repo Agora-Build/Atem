@@ -210,8 +210,12 @@ fn principals_problem(principals: &[String], route: bool) -> Option<String> {
         .find(|p| !(principal_ok(p) || route && p.as_str() == "local"))
         .map(|p| {
             format!(
-                "`{p}` is not a principal: use `member:<id>`, `service:<id>` or `browser:<id>` \
-             (`atem runtime check` lists them)"
+                "`{p}` is not a principal: use {} (`atem runtime check` lists them)",
+                if route {
+                    "`member:<id>`, `service:<id>`, `browser:<id>` or `local` (this runtime's own agents)"
+                } else {
+                    "`member:<id>`, `service:<id>` or `browser:<id>`"
+                }
             )
         })
 }
@@ -893,7 +897,9 @@ pub fn check(dir: &Path) -> Result<()> {
     println!("Instance labels: {}", config.instance.labels.join(", "));
     println!(
         "Collaboration: {}; per_hour = {}; per_workflow = {}; result_timeout = {}",
-        if config.collab.send {
+        if !config.enabled {
+            "inactive (agent hosting is disabled)"
+        } else if config.collab.send {
             "enabled"
         } else {
             "disabled"
@@ -1456,6 +1462,26 @@ profile_id = "backend-codex"
                 .to_string()
                 .starts_with("profile `backend-codex`: `local` is not a principal")
         );
+    }
+
+    /// A route's principal error names `local` among the valid ones; a
+    /// profile's (which never takes `local`) does not.
+    #[test]
+    fn the_route_principal_error_lists_local() {
+        let error = collaboration_error("principals = [\"anyone\"]");
+        assert!(
+            error.starts_with("route `backend`: `anyone` is not a principal"),
+            "{error}"
+        );
+        assert!(
+            error.contains("`member:<id>`, `service:<id>`, `browser:<id>` or `local`"),
+            "{error}"
+        );
+        let mut config: Config = toml::from_str(PROFILE).unwrap();
+        config.inherit(Some("member:owner".into()));
+        config.profiles[0].principals = vec!["anyone".into()];
+        let error = config.validate().err().unwrap().to_string();
+        assert!(!error.contains("`local`"), "{error}");
     }
 
     #[test]

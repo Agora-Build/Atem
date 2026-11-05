@@ -20,7 +20,7 @@ enabled = false
 # [collab]
 # send = false
 # per_hour = 30
-# per_workflow = 8
+# per_workflow = 8        # messages per workflow, however many agents each reaches
 # result_timeout = "30m"  # 1s-24h; automatic status never completes a task
 
 # -- Who may launch and send work ---------------------------------------------
@@ -105,6 +105,8 @@ enabled = false
 #
 # Local collaboration requires explicit route consent: add "local" to that
 # route's principals. "local" is never valid in a profile's launch principals.
+# A route's own principals replaces the paired-Astation default: list
+# "member:YOUR_ASTATION_ID" beside "local" if the route should keep serving it.
 # These optional keys belong to a [[routes]] table:
 # labels = ["tag:mobile"]
 # launch = "off"          # opt in with "on_message" to launch an empty route

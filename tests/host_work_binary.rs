@@ -680,7 +680,7 @@ fn runtime_start_initializes_once_and_check_does_not_start_a_runtime() {
     assert!(!sandbox.config().join("runtime.toml").exists());
     assert!(
         out.contains(
-            "Collaboration: disabled; per_hour = 30; per_workflow = 8; result_timeout = 30m"
+            "Collaboration: inactive (agent hosting is disabled); per_hour = 30; per_workflow = 8; result_timeout = 30m"
         ),
         "{out}"
     );
@@ -1344,6 +1344,21 @@ fn messages_bind_sender_content_destinations_and_service_scope() {
     changed["message_id"] = json!(uuid());
     changed["sender"] = json!(format!("member:{MAC}"));
     assert_eq!(publish(&mut dev, &mut r, &changed)["code"], "forbidden");
+    // The sending session and the reply link are local-only: a remote sender
+    // gets them refused like any other kind that is not a request.
+    for (field, value) in [
+        ("from_session", json!("ses-abcdefghijkl")),
+        ("reply_to", json!({"message_id": uuid(), "task_id": uuid()})),
+    ] {
+        let mut local_only = notice("service:svc-message", "Ready", vec![json!({"kind":"host"})]);
+        local_only[field] = value;
+        assert_eq!(
+            publish(&mut dev, &mut r, &local_only)["code"],
+            "unsupported_version",
+            "{field}"
+        );
+        assert!(message_status(&mut dev, &mut r, &local_only).is_null());
+    }
     let mut other = Dev::new(&mut r, &rig.log, "unapproved", false);
     assert!(
         other.request(

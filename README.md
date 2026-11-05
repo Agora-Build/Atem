@@ -341,7 +341,10 @@ Local collaboration lets an Atem-launched agent ask other agents in the same
 runtime to work, then receive a correlated reply. In private `runtime.toml`,
 enable hosting and `[collab] send = true`, configure approved profiles, and
 give receiving routes `principals = ["local"]` and labels such as
-`labels = ["tag:backend"]`. From inside an agent:
+`labels = ["tag:backend"]`. A route's own `principals` replaces the default
+(the paired Astation), so list your Astation's `member:<id>` beside `"local"`
+if that route should keep serving it (`atem runtime check` shows the ID).
+From inside an agent:
 
 ```bash
 atem message directory tag:backend
@@ -352,7 +355,10 @@ atem message reply --task TASK_ID "Contract verified"
 ```
 
 Tasks use the normal per-session queue and wait for readiness, drafts,
-approvals and control leases. Only an explicit reply completes a task.
+approvals and control leases. Only an explicit reply completes a task. A
+workflow (the chain of messages one request starts) is limited to 8 messages
+(`per_workflow`); a message counts once however many agents it reaches, and
+replies count against nothing.
 `results = true` on the originating route also queues that reply into its
 agent; otherwise it remains visible through status. `--memory ID` and
 `--vault ID[:ENTRY]@VERSION` attach verified exact context. Routes can opt in

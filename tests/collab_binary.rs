@@ -30,7 +30,15 @@ struct Rig {
 }
 
 impl Rig {
+    /// A running runtime with three routes.
     fn new() -> Self {
+        let mut rig = Self::unstarted();
+        rig.start();
+        rig
+    }
+
+    /// The same sandbox before its runtime starts, to prepare its files.
+    fn unstarted() -> Self {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let mut log = TestLog::genesis(ACCOUNT, &secret("collab astation"));
@@ -60,15 +68,13 @@ principals = ["local"]
 "#
             ));
         }
-        let mut rig = Self {
+        Self {
             sandbox,
             astation: FakeAstation::start(),
             runtime: None,
             config,
             context_hook: false,
-        };
-        rig.start();
-        rig
+        }
     }
 
     fn start(&mut self) {
@@ -280,6 +286,219 @@ fn one_message_reaches_two_agents_once_each() {
     assert_eq!(directory["rows"].as_array().unwrap().len(), 2);
 }
 
+/// A message counts once against the workflow however many agents it
+/// reaches (`per_workflow` defaults to 8; this one reaches nine).
+#[test]
+fn one_message_to_nine_agents_counts_once() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let recipients: Vec<_> = (0..9)
+        .map(|n| rig.launch("b", &format!("agent-{n}")).1)
+        .collect();
+    let id = rig.send(&a, 1, "tag:b", "fan out to nine agents");
+    for fake in &recipients {
+        within("fan-out prompt", || {
+            std::fs::read_to_string(fake.join("input"))
+                .unwrap_or_default()
+                .contains("fan out to nine agents")
+        });
+    }
+    assert_eq!(rig.status(&id)["tasks"].as_array().unwrap().len(), 9);
+}
+
+/// Results count against nothing: with the workflow's three messages used up,
+/// the reply to the request still goes through, with context.
+#[test]
+fn replies_count_against_no_workflow_limit() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig
+        .config
+        .replace("send = true", "send = true\nper_workflow = 3");
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let _ = rig.launch("c", "third");
+    let first = rig.send(&a, 1, "tag:b", "request that will be answered");
+    within("first prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("request that will be answered")
+    });
+    // b's turn belongs to the workflow: its sends use the remaining two.
+    rig.send(&b, 1, "tag:c", "child one");
+    rig.send(&b, 2, "tag:c", "child two");
+    let refused = rig.agent(&b, 3, &["message", "send", "--to", "tag:c", "child three"]);
+    assert_ne!(refused["code"], 0, "{refused}");
+    assert!(
+        refused["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("limit: 3 messages per workflow"),
+        "{refused}"
+    );
+    let task = await_task(&rig, &first, &b);
+    let text = "Reply context that has to arrive.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-reply:1@1"));
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-reply:1","version":1,"digest":digest,"text":text})
+            .to_string(),
+    );
+    let reply = rig.agent(
+        &b,
+        4,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-reply:1@1",
+            "answer with context",
+        ],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("reply stored", || {
+        rig.status(&first)["tasks"][0]["state"] == "completed"
+    });
+    // The reply used none of the limit: the workflow is still exactly full.
+    let still = rig.agent(&b, 5, &["message", "send", "--to", "tag:c", "child four"]);
+    assert_ne!(still["code"], 0, "{still}");
+    assert!(
+        still["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("limit: 3 messages per workflow"),
+        "{still}"
+    );
+}
+
+/// 40 000 bytes of context plus the prompt can never be dispatched (32 KiB):
+/// the send is refused with that reason and uses none of the hourly budget.
+#[test]
+fn a_context_over_the_task_bounds_is_refused_and_not_counted() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig
+        .config
+        .replace("send = true", "send = true\nper_hour = 1");
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let text = "x".repeat(40_000);
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-big:1@1"));
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-big:1","version":1,"digest":digest,"text":text}).to_string(),
+    );
+    let output = rig.agent(
+        &a,
+        1,
+        &[
+            "message",
+            "send",
+            "--to",
+            "tag:b",
+            "--vault",
+            "v-big:1@1",
+            "too much context",
+        ],
+    );
+    assert_eq!(output["code"], 0, "{output}");
+    let id = output["stdout"].as_str().unwrap().trim();
+    within("oversize refusal", || {
+        rig.status(id)["delivery"] == "refused"
+    });
+    let status = rig.status(id);
+    assert_eq!(
+        status["detail"],
+        "the prompt with its context is over 32 KiB"
+    );
+    assert!(status["tasks"].as_array().unwrap().is_empty());
+    assert!(std::fs::read(b.join("input")).unwrap().is_empty());
+    // per_hour is 1, and the refused message did not use it.
+    rig.send(&a, 2, "tag:b", "fits");
+    within("the next send arrives", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("fits")
+    });
+}
+
+/// `build_atem_id` keeps non-ASCII characters, and the selectors that
+/// `atem message directory` prints must address the instance again.
+#[test]
+fn a_directory_selector_for_a_non_ascii_instance_id_sends_back() {
+    let mut rig = Rig::unstarted();
+    let id = "测试主机-1a2b3c4d-956631ec";
+    private(
+        &rig.sandbox.config().join("config.toml"),
+        &format!("atem_id = {id:?}\n[codex]\nhooks = false\n"),
+    );
+    rig.start();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let directory = rig.agent(&a, 1, &["message", "directory", "tag:b"]);
+    assert_eq!(directory["code"], 0, "{directory}");
+    let line = directory["stdout"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let selector = line.split_whitespace().next().unwrap();
+    assert_eq!(selector, format!("atem:{id}/b"), "{line}");
+    rig.send(&a, 2, selector, "reach a non-ASCII instance id");
+    within("non-ASCII instance prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("reach a non-ASCII instance id")
+    });
+}
+
+#[test]
+fn a_bad_selector_reports_its_own_reason() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let output = rig.agent(
+        &a,
+        1,
+        &[
+            "message",
+            "send",
+            "--to",
+            "tag:b",
+            "--to",
+            "project:ok",
+            "--to",
+            "tag:Bad",
+            "work",
+        ],
+    );
+    assert_ne!(output["code"], 0, "{output}");
+    assert!(
+        output["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("selector 3: names are 1-32 of a-z, 0-9 and -"),
+        "{output}"
+    );
+}
+
 #[test]
 fn sending_is_off_by_default() {
     let mut rig = Rig::new();
@@ -292,7 +511,7 @@ fn sending_is_off_by_default() {
         output["stderr"]
             .as_str()
             .unwrap()
-            .contains("collaboration is off: set [collab] send = true"),
+            .contains("collaboration unavailable: set `[collab] send = true` in runtime.toml"),
         "{output}"
     );
 }

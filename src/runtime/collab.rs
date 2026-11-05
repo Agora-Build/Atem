@@ -6,8 +6,10 @@ pub mod results;
 use super::host_work::{Collab, Store};
 use anyhow::{Result, bail};
 use atem_client::session::{
-    messages::Message,
+    host_work::{HostTarget, WorkTask},
+    messages::{Message, MessageKind},
     select::{AgentLabels, Label, MAX_AGENTS, Selector},
+    wire::MAX_PROMPT_BYTES,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -173,19 +175,67 @@ pub(super) fn count_send(
     )
 }
 
-pub(super) fn count_received(
-    tx: &Transaction<'_>,
-    config: &Collab,
-    workflow: &str,
-    tasks: usize,
-) -> Result<()> {
+/// A message counts once toward what a workflow may receive, however many
+/// agents it reaches. Results are not messages here and count against nothing.
+pub(super) fn count_received(tx: &Transaction<'_>, config: &Collab, workflow: &str) -> Result<()> {
     count(
         tx,
         &format!("receive:{workflow}"),
         0,
-        tasks as u32,
+        1,
         config.per_workflow,
-        "tasks per workflow",
+        "messages per workflow",
+    )
+}
+
+/// Would one more message fit the sender's limits? Nothing is recorded: the
+/// counting transaction is dropped, which rolls it back.
+pub(super) fn check_send(
+    store: &Store,
+    config: &Collab,
+    from: &str,
+    workflow: &str,
+    now: u64,
+) -> Result<()> {
+    let tx = store.db.unchecked_transaction()?;
+    count_send(&tx, config, from, workflow, now)
+}
+
+const TASK_TOO_LARGE: &str = "the prompt with its context is over 32 KiB";
+const TASK_CONTROL_CHARACTERS: &str = "context has control characters";
+const TASK_TOO_MANY_SNAPSHOTS: &str = "at most 8 context snapshots";
+const TASK_INVALID: &str = "the task is not valid";
+
+/// The reasons `task_problem` gives; each refuses a message for good.
+pub(super) const TASK_PROBLEMS: [&str; 4] = [
+    TASK_TOO_LARGE,
+    TASK_CONTROL_CHARACTERS,
+    TASK_TOO_MANY_SNAPSHOTS,
+    TASK_INVALID,
+];
+
+/// Why a local task could never be dispatched (the shared `WorkTask` bounds:
+/// prompt with context within 32 KiB, no control characters other than
+/// newline and tab), so its message is refused before anything is counted
+/// or stored.
+pub(super) fn task_problem(task: &WorkTask, host: &HostTarget) -> Option<&'static str> {
+    if task.valid_local(host) {
+        return None;
+    }
+    let rendered = task.render_prompt();
+    Some(
+        if rendered
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            TASK_CONTROL_CHARACTERS
+        } else if rendered.len() > MAX_PROMPT_BYTES {
+            TASK_TOO_LARGE
+        } else if task.context.len() > 8 {
+            TASK_TOO_MANY_SNAPSHOTS
+        } else {
+            TASK_INVALID
+        },
     )
 }
 
@@ -240,18 +290,23 @@ pub(super) fn reserve_context(
         }
         return Ok(());
     }
+    // A request is counted when it is accepted, and may still turn out to be
+    // refused then; checking now only tells the sender early. Results count
+    // against nothing.
+    if message.kind == MessageKind::Request {
+        check_send(
+            store,
+            config,
+            message.from_session.as_deref().unwrap(),
+            &message.workflow_id,
+            message.created_at,
+        )?;
+    }
     let tx = store.db.unchecked_transaction()?;
     let count: usize = tx.query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))?;
     if count >= super::host_work::MAX_RECORDS {
         bail!("outbox capacity reached");
     }
-    count_send(
-        &tx,
-        config,
-        message.from_session.as_deref().unwrap(),
-        &message.workflow_id,
-        message.created_at,
-    )?;
     tx.execute(
         "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
         VALUES(?1,?2,'publishing','waiting for verified context publication',0,?3)",
@@ -448,6 +503,10 @@ pub(super) fn restore_tags(state: &std::path::Path, session: &mut super::broker:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atem_client::session::{
+        host_work::{ContextKind, ContextSnapshot, HostTarget, WorkTask},
+        wire,
+    };
 
     #[test]
     fn resolution_is_ordered_budgeted_and_stable() {
@@ -527,6 +586,163 @@ mod tests {
                 .to_string(),
             "limit: 2 messages per hour"
         );
+    }
+
+    fn counted(store: &Store, key: &str) -> u32 {
+        store
+            .db
+            .query_row(
+                "SELECT coalesce(sum(count),0) FROM counters WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// What accepting one message does to the counters, however many agents
+    /// it reaches (`HostBridge::collab_accept`).
+    fn accept_one(store: &Store, config: &Collab, from: &str) -> Result<()> {
+        let tx = store.db.unchecked_transaction()?;
+        count_send(&tx, config, from, "flow", 1_000)?;
+        count_received(&tx, config, "flow")?;
+        Ok(tx.commit()?)
+    }
+
+    #[test]
+    fn the_workflow_limit_counts_messages_once_each_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let config = Collab::default();
+        assert_eq!(config.per_workflow, 8);
+        for n in 0..8 {
+            accept_one(&store, &config, &format!("session-{n}")).unwrap();
+        }
+        assert_eq!(counted(&store, "send:flow"), 8);
+        assert_eq!(counted(&store, "receive:flow"), 8);
+        assert_eq!(
+            accept_one(&store, &config, "session-9")
+                .unwrap_err()
+                .to_string(),
+            "limit: 8 messages per workflow"
+        );
+        // The refused ninth message changed nothing.
+        assert_eq!(counted(&store, "send:flow"), 8);
+        assert_eq!(counted(&store, "receive:flow"), 8);
+        assert_eq!(counted(&store, "hour:session-9"), 0);
+    }
+
+    #[test]
+    fn the_receive_limit_also_speaks_of_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let config = Collab {
+            per_workflow: 2,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let tx = store.db.unchecked_transaction().unwrap();
+            count_received(&tx, &config, "flow").unwrap();
+            tx.commit().unwrap();
+        }
+        let tx = store.db.unchecked_transaction().unwrap();
+        assert_eq!(
+            count_received(&tx, &config, "flow")
+                .unwrap_err()
+                .to_string(),
+            "limit: 2 messages per workflow"
+        );
+    }
+
+    #[test]
+    fn checking_a_send_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let config = Collab {
+            per_workflow: 1,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            check_send(&store, &config, "session", "flow", 1_000).unwrap();
+        }
+        assert_eq!(counted(&store, "send:flow"), 0);
+        assert_eq!(counted(&store, "hour:session"), 0);
+        accept_one(&store, &config, "session").unwrap();
+        assert!(check_send(&store, &config, "session", "flow", 1_000).is_err());
+    }
+
+    fn local_task(prompt: &str, context: Vec<ContextSnapshot>) -> WorkTask {
+        WorkTask {
+            task_id: "6ba7b810-9dad-51d1-80b4-00c04fd430c8".into(),
+            workflow_id: uuid::Uuid::new_v4().to_string(),
+            target: wire::Target {
+                account_id: "account".into(),
+                atem_device_id: "host".into(),
+                host_trust_gen: 1,
+                session_id: "ses-aaaaaaaaaaaa".into(),
+                process_gen: uuid::Uuid::new_v4().to_string(),
+            },
+            expires_at: 1,
+            prompt: prompt.into(),
+            context,
+            attachments: vec![],
+        }
+    }
+
+    fn snapshot(text: &str) -> ContextSnapshot {
+        ContextSnapshot {
+            kind: ContextKind::Vault,
+            id: "v-context:1".into(),
+            version: 1,
+            digest: atem_client::session::host_work::digest(text.as_bytes()),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_task_that_could_never_dispatch_names_its_problem() {
+        let host = HostTarget {
+            account_id: "account".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 1,
+        };
+        assert_eq!(task_problem(&local_task("work", vec![]), &host), None);
+        assert_eq!(
+            task_problem(&local_task("work", vec![snapshot("fine\n\tlines")]), &host),
+            None
+        );
+        assert_eq!(
+            task_problem(
+                &local_task("work", vec![snapshot(&"x".repeat(40_000))]),
+                &host
+            ),
+            Some("the prompt with its context is over 32 KiB")
+        );
+        assert_eq!(
+            task_problem(
+                &local_task("work", vec![snapshot("escape \u{1b}[2J")]),
+                &host
+            ),
+            Some("context has control characters")
+        );
+        let many = (0..9).map(|_| snapshot("same")).collect();
+        assert_eq!(
+            task_problem(&local_task("work", many), &host),
+            Some("at most 8 context snapshots")
+        );
+        let mut elsewhere = host.clone();
+        elsewhere.atem_device_id = "other".into();
+        assert_eq!(
+            task_problem(&local_task("work", vec![]), &elsewhere),
+            Some("the task is not valid")
+        );
+        for problem in [
+            "the prompt with its context is over 32 KiB",
+            "context has control characters",
+            "at most 8 context snapshots",
+            "the task is not valid",
+        ] {
+            assert!(TASK_PROBLEMS.contains(&problem), "{problem}");
+        }
     }
 
     #[test]

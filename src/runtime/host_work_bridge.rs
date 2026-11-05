@@ -808,7 +808,11 @@ impl HostBridge {
         let store = self.work.store.as_ref().ok_or("busy")?;
         let message_id = match req {
             hw::Request::Publish { message, .. } => {
-                if message.kind != atem_client::session::messages::MessageKind::Request {
+                // The sending session and the reply link are local-only.
+                if message.kind != atem_client::session::messages::MessageKind::Request
+                    || a.remote().is_some()
+                        && (message.from_session.is_some() || message.reply_to.is_some())
+                {
                     return Err("unsupported_version");
                 }
                 if message.sender != a.name() {
@@ -1473,6 +1477,231 @@ principals = ["local"]
                 )
                 .unwrap();
             assert_eq!(rig.bridge.host.lease_holder(rig.sid.as_str()), None);
+        });
+    }
+
+    fn send_request(to: &[&str]) -> crate::runtime::collab::SendRequest {
+        crate::runtime::collab::SendRequest {
+            to: to.iter().map(|s| s.to_string()).collect(),
+            text: "check".into(),
+            memory: vec![],
+            vault: vec![],
+            launch: false,
+            expires_ms: 60_000,
+        }
+    }
+
+    fn rows(rig: &LocalRig, table: &str) -> i64 {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn counted(rig: &LocalRig, key: &str) -> i64 {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT coalesce(sum(count),0) FROM counters WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn snapshot(text: &str) -> hw::ContextSnapshot {
+        hw::ContextSnapshot {
+            kind: hw::ContextKind::Vault,
+            id: "v-context:1".into(),
+            version: 1,
+            digest: hw::digest(text.as_bytes()),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_message_that_could_never_dispatch_is_refused_before_anything_is_counted() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let host = rig.bridge.work_host();
+            let origin = crate::runtime::collab::results::Origin {
+                target: wire::Target {
+                    account_id: host.account_id.clone(),
+                    atem_device_id: host.atem_device_id.clone(),
+                    host_trust_gen: host.host_trust_gen,
+                    session_id: rig.sid.to_string(),
+                    process_gen: rig.sessions[&rig.sid].process_gen.clone(),
+                },
+                control_gen: 0,
+                route: None,
+            };
+            let mut message = rig.message();
+            message.from_session = Some(rig.sid.to_string());
+            message.recipients[0].destination = Destination::Select {
+                selectors: vec!["tag:x".into()],
+                budget: 32,
+            };
+            // Both pass the shared message rules; only the task rules refuse.
+            for (text, problem) in [
+                (
+                    "x".repeat(40_000),
+                    "the prompt with its context is over 32 KiB",
+                ),
+                (
+                    "escape \u{1b}[2J".to_string(),
+                    "context has control characters",
+                ),
+            ] {
+                message.context = vec![snapshot(&text)];
+                assert!(message.valid_local(), "{problem}");
+                let error = rig
+                    .bridge
+                    .collab_accept("atem-host", &message, &origin, None, &rig.sessions)
+                    .unwrap_err();
+                assert_eq!(error.to_string(), problem);
+                assert_eq!(rows(&rig, "counters"), 0, "{problem}");
+                assert_eq!(rows(&rig, "outbox"), 0, "{problem}");
+            }
+            // The same message without the problem is accepted, and counts once.
+            message.context = vec![snapshot("fits")];
+            rig.bridge
+                .collab_accept("atem-host", &message, &origin, None, &rig.sessions)
+                .unwrap();
+            assert_eq!(counted(&rig, &format!("send:{}", message.workflow_id)), 1);
+            assert_eq!(
+                counted(&rig, &format!("receive:{}", message.workflow_id)),
+                1
+            );
+            assert_eq!(rows(&rig, "outbox"), 1);
+        });
+    }
+
+    #[test]
+    fn a_memory_that_could_never_dispatch_is_refused_at_send() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let memories = crate::memory::store::Store::open(&root.join("knowledge.db")).unwrap();
+            memories
+                .upsert_memory(&crate::memory::model::Memory {
+                    id: "mem_f00dbabe".into(),
+                    content: "x".repeat(40_000),
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut request = send_request(&["tag:x"]);
+            request.memory = vec!["mem_f00dbabe".into()];
+            let error = rig
+                .bridge
+                .collab_send("atem-host", &rig.sid, request, &rig.sessions)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the prompt with its context is over 32 KiB"
+            );
+            assert_eq!(rows(&rig, "outbox"), 0);
+            assert_eq!(rows(&rig, "counters"), 0);
+        });
+    }
+
+    #[test]
+    fn a_bad_selector_or_expiry_is_refused_with_its_own_reason() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let error = rig
+                .bridge
+                .collab_send(
+                    "atem-host",
+                    &rig.sid,
+                    send_request(&["tag:ok", "project:ok", "tag:Bad"]),
+                    &rig.sessions,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "selector 3: names are 1-32 of a-z, 0-9 and -"
+            );
+            let mut request = send_request(&["tag:ok"]);
+            request.expires_ms = 500;
+            let error = rig
+                .bridge
+                .collab_send("atem-host", &rig.sid, request, &rig.sessions)
+                .unwrap_err();
+            assert_eq!(error.to_string(), "expiry must be between 1s and 24h");
+            assert_eq!(rows(&rig, "counters"), 0);
+        });
+    }
+
+    #[test]
+    fn unavailable_collaboration_says_what_is_missing() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let why = |rig: &mut LocalRig| {
+                rig.bridge
+                    .collab_send(
+                        "atem-host",
+                        &rig.sid,
+                        send_request(&["tag:ok"]),
+                        &rig.sessions,
+                    )
+                    .unwrap_err()
+                    .to_string()
+            };
+            rig.bridge.work.config.collab.send = false;
+            assert_eq!(
+                why(&mut rig),
+                "collaboration unavailable: set `[collab] send = true` in runtime.toml"
+            );
+            rig.bridge.work.config.enabled = false;
+            assert_eq!(
+                why(&mut rig),
+                "collaboration unavailable: set `enabled = true` in runtime.toml; \
+                 set `[collab] send = true` in runtime.toml"
+            );
+            rig.bridge.work.config.enabled = true;
+            rig.bridge.work.config.collab.send = true;
+            rig.bridge.work.config_problem = Some("profile `p`: bad".into());
+            assert_eq!(
+                why(&mut rig),
+                "collaboration unavailable: runtime.toml is not valid (profile `p`: bad); \
+                 fix it, then see `atem runtime check`"
+            );
+        });
+    }
+
+    #[test]
+    fn collaboration_needs_a_pairing() {
+        local_test(async |root| {
+            let mut bridge =
+                HostBridge::open(&root.join("runtime/journal"), None, Clock::default()).unwrap();
+            bridge.work.config = Config {
+                version: 1,
+                enabled: true,
+                collab: crate::runtime::host_work::Collab {
+                    send: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let error = bridge
+                .collab_send(
+                    "atem-host",
+                    &SessionId::new(),
+                    send_request(&["tag:ok"]),
+                    &BTreeMap::new(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "collaboration unavailable: pair and verify this device with Astation (`atem pair`)"
+            );
         });
     }
 

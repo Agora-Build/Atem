@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4};
+use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4, is_uuid_v5};
 use crate::canonical::MAX_SAFE_INTEGER;
 
 pub const LAUNCH_FEATURE: &str = "host.launch";
@@ -90,7 +90,18 @@ pub struct WorkTask {
 
 impl WorkTask {
     pub fn valid(&self, host: &HostTarget) -> bool {
-        is_uuid_v4(&self.task_id)
+        self.valid_for(host, false)
+    }
+
+    /// A task of the runtime's own `local` sender: its ids may be the
+    /// deterministic UUIDv5 of a selector's fixed resolution. Every bound
+    /// (prompt and context size, characters, snapshots) is the remote one.
+    pub fn valid_local(&self, host: &HostTarget) -> bool {
+        self.valid_for(host, true)
+    }
+
+    fn valid_for(&self, host: &HostTarget, local: bool) -> bool {
+        (is_uuid_v4(&self.task_id) || local && is_uuid_v5(&self.task_id))
             && is_uuid_v4(&self.workflow_id)
             && host.contains(&self.target)
             && is_session_id(&self.target.session_id)
@@ -104,7 +115,13 @@ impl WorkTask {
                 .chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
             && self.context.len() <= 8
-            && self.context.iter().all(ContextSnapshot::valid)
+            && self.context.iter().all(|c| {
+                if local {
+                    c.valid_local()
+                } else {
+                    c.valid()
+                }
+            })
             && self.attachments.len() <= 4
             && self.attachments.iter().all(super::attachments::Attachment::valid)
             && self.attachments.iter().map(|a| &a.attachment_id).collect::<std::collections::BTreeSet<_>>().len() == self.attachments.len()
@@ -668,5 +685,49 @@ mod tests {
         snapshot.digest = digest(snapshot.text.as_bytes());
         snapshot.version = 0;
         assert!(!snapshot.valid());
+    }
+
+    /// The runtime's own `local` sender makes deterministic UUIDv5 task ids;
+    /// every other rule is the remote one.
+    #[test]
+    fn a_local_task_may_carry_a_derived_id_but_obeys_every_other_bound() {
+        let host = HostTarget {
+            account_id: "account".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 1,
+        };
+        let task = |prompt: &str| WorkTask {
+            task_id: "6ba7b810-9dad-51d1-80b4-00c04fd430c8".into(),
+            workflow_id: super::super::new_id(),
+            target: Target {
+                account_id: "account".into(),
+                atem_device_id: "host".into(),
+                host_trust_gen: 1,
+                session_id: "ses-aaaaaaaaaaaa".into(),
+                process_gen: super::super::new_id(),
+            },
+            expires_at: 1,
+            prompt: prompt.into(),
+            context: vec![],
+            attachments: vec![],
+        };
+        let derived = task("work");
+        assert!(!derived.valid(&host), "a remote task id is a UUIDv4");
+        assert!(derived.valid_local(&host));
+        assert!(!task("bell \u{7}").valid_local(&host));
+        assert!(!task(&"x".repeat(33_000)).valid_local(&host));
+        let mut context = task("work");
+        let text = "y".repeat(40_000);
+        context.context = vec![ContextSnapshot {
+            kind: ContextKind::Vault,
+            id: "v-big:1".into(),
+            version: 1,
+            digest: digest(text.as_bytes()),
+            text,
+        }];
+        assert!(
+            !context.valid_local(&host),
+            "prompt and context share the 32 KiB bound"
+        );
     }
 }

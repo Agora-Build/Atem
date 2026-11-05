@@ -42,6 +42,23 @@ pub enum ContextSpec {
     Vault { reference: VaultRef },
 }
 
+impl ContextSpec {
+    /// The snapshot as far as it is known before publication: a memory's own
+    /// text. A vault entry's text is only known once it is read back.
+    pub fn known_snapshot(&self) -> Option<ContextSnapshot> {
+        match self {
+            Self::Memory { memory } => Some(ContextSnapshot {
+                kind: ContextKind::Memory,
+                id: memory.id.clone(),
+                version: 1,
+                digest: hw::digest(memory.content.as_bytes()),
+                text: memory.content.clone(),
+            }),
+            Self::Vault { .. } => None,
+        }
+    }
+}
+
 pub fn matches_snapshot(spec: &ContextSpec, snapshot: &ContextSnapshot) -> bool {
     match spec {
         ContextSpec::Memory { memory } => {

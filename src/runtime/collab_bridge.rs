@@ -4,12 +4,13 @@ use crate::runtime::collab::results::{
     self, ExplicitResult, Origin, OriginRoute, ResultOutcome, ReturnGrant,
 };
 use crate::runtime::collab::{self, Candidate, DirectoryRow, MessageView, SendRequest};
+use crate::runtime::collab_context::ContextSpec;
 use crate::runtime::host_work::MessageRecord;
 use anyhow::{Result, anyhow, bail};
 use atem_client::session::messages::{
     Delivery, Destination, Message, MessageKind, MessageReceipt, Recipient, RecipientReceipt,
 };
-use atem_client::session::select::{AgentLabels, MAX_AGENTS, Selector, valid_selectors};
+use atem_client::session::select::{AgentLabels, MAX_AGENTS, Selector, selectors_problem};
 
 impl HostBridge {
     fn collab_origin(
@@ -190,7 +191,7 @@ impl HostBridge {
             bail!("invalid message content or expired grant");
         }
         if context.is_empty() {
-            self.collab_accept_result(&message, &origin, Some(&turn), sessions, true)?;
+            self.collab_accept_result(&message, &origin, Some(&turn), sessions)?;
         } else {
             collab::reserve_context(
                 store,
@@ -213,7 +214,6 @@ impl HostBridge {
         source: &Origin,
         turn: Option<&str>,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-        count_send: bool,
     ) -> Result<()> {
         if !message.valid_local() {
             bail!("invalid message content");
@@ -320,17 +320,8 @@ impl HostBridge {
                 recipients: vec![],
             },
         };
+        // A result is not a request: it counts against no workflow limit.
         store.accept_message_with(&record, &returned, |tx| {
-            if count_send {
-                collab::count_send(
-                    tx,
-                    &self.work.config.collab,
-                    &explicit.session_id,
-                    &grant.workflow_id,
-                    host_now().wall_ms,
-                )?;
-            }
-            collab::count_received(tx, &self.work.config.collab, &grant.workflow_id, 1)?;
             tx.execute(
                 "UPDATE return_grants SET record=?2 WHERE task_id=?1",
                 rusqlite::params![grant.task_id, serde_json::to_string(&grant)?],
@@ -482,18 +473,78 @@ impl HostBridge {
         Ok(())
     }
 
+    /// What keeps local collaboration from running, in the owner's words: the
+    /// `runtime.toml` switches, the pairing and the device list.
+    fn collab_unavailable(&self) -> Vec<String> {
+        if let Some(problem) = &self.work.config_problem {
+            return vec![format!(
+                "runtime.toml is not valid ({problem}); fix it, then see `atem runtime check`"
+            )];
+        }
+        let mut missing = Vec::new();
+        if !self.work.config.enabled {
+            missing.push("set `enabled = true` in runtime.toml".to_string());
+        }
+        if !self.work.config.collab.send {
+            missing.push("set `[collab] send = true` in runtime.toml".to_string());
+        }
+        if self.work.error {
+            missing
+                .push("agent hosting records are unavailable; run `atem runtime restart`".into());
+        }
+        if self.host.context().account_id == UNPAIRED {
+            missing.push("pair and verify this device with Astation (`atem pair`)".into());
+        } else if let Some(error) = &self.membership_error {
+            missing.push(format!("the device list is unusable ({error})"));
+        } else if let Some(m) = &self.membership {
+            if m.is_frozen() {
+                missing
+                    .push("the device list is frozen; a managing device must reconcile it".into());
+            } else if m.faulted().is_some() || m.held().is_some() {
+                missing.push(
+                    "the device list is held after a fault; a managing device must reconcile it (see `atem status`)"
+                        .into(),
+                );
+            }
+        }
+        if self.host.journal_halted() {
+            missing.push("the session journal halted; run `atem runtime restart`".into());
+        }
+        missing
+    }
+
     fn collab_ready(&mut self) -> Result<()> {
         self.work_config();
-        if !self.work.config.collab.send {
-            bail!("collaboration is off: set [collab] send = true");
-        }
-        if !self.hosting_enabled() || !self.local_healthy() {
-            bail!("collaboration unavailable: check pairing, membership and runtime.toml");
+        let missing = self.collab_unavailable();
+        if !missing.is_empty() || !self.local_healthy() {
+            bail!(
+                "collaboration unavailable: {}",
+                if missing.is_empty() {
+                    "see `atem runtime check` and `atem status`".to_string()
+                } else {
+                    missing.join("; ")
+                }
+            );
         }
         if !self.work_store_ready(&self.work_host()) {
             bail!("collaboration receipt store unavailable");
         }
         Ok(())
+    }
+
+    /// Why a task made from this message could never be dispatched. The
+    /// target is a placeholder: only the content decides.
+    fn collab_content_problem(&self, message: &Message) -> Option<&'static str> {
+        let host = self.work_host();
+        let target = wire::Target {
+            account_id: host.account_id.clone(),
+            atem_device_id: host.atem_device_id.clone(),
+            host_trust_gen: host.host_trust_gen,
+            session_id: SessionId::new().to_string(),
+            process_gen: uuid::Uuid::new_v4().to_string(),
+        };
+        let task = local_task(message, &uuid::Uuid::new_v4().to_string(), target);
+        collab::task_problem(&task, &host)
     }
 
     pub(super) fn collab_candidates(
@@ -642,10 +693,11 @@ impl HostBridge {
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<String> {
         self.collab_ready()?;
-        if !valid_selectors(&request.to, MAX_AGENTS)
-            || !(1_000..=hw::MAX_LIFETIME_MS).contains(&request.expires_ms)
-        {
-            bail!("invalid selectors or expiry (1s to 24h)");
+        if let Some(problem) = selectors_problem(&request.to, MAX_AGENTS) {
+            bail!("{problem}");
+        }
+        if !(1_000..=hw::MAX_LIFETIME_MS).contains(&request.expires_ms) {
+            bail!("expiry must be between 1s and 24h");
         }
         let specs = crate::runtime::collab_context::capture(
             &self.work.dir,
@@ -698,6 +750,15 @@ impl HostBridge {
         if !probe.valid_local() {
             bail!("invalid message content");
         }
+        // What is known now (a memory's text) must already fit a task; a
+        // vault entry is checked once it is read back.
+        probe.context = specs
+            .iter()
+            .filter_map(ContextSpec::known_snapshot)
+            .collect();
+        if let Some(problem) = self.collab_content_problem(&probe) {
+            bail!("{problem}");
+        }
         if !specs.is_empty() {
             collab::reserve_context(
                 self.work.store.as_ref().unwrap(),
@@ -711,22 +772,21 @@ impl HostBridge {
                 },
             )?;
         } else {
-            self.collab_accept(atem_id, &message, &source, None, sessions, true)?;
+            self.collab_accept(atem_id, &message, &source, None, sessions)?;
         }
         Ok(message.message_id)
     }
 
-    fn collab_accept(
+    pub(super) fn collab_accept(
         &mut self,
         atem_id: &str,
         message: &Message,
         origin: &Origin,
         turn_id: Option<&str>,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-        count_send: bool,
     ) -> Result<()> {
         if message.kind == MessageKind::Result {
-            return self.collab_accept_result(message, origin, turn_id, sessions, count_send);
+            return self.collab_accept_result(message, origin, turn_id, sessions);
         }
         if let Some(old) = self
             .work
@@ -743,6 +803,11 @@ impl HostBridge {
         if !message.valid_local() {
             bail!("invalid message content");
         }
+        // Every task of a message has this prompt and context, so one that
+        // could never dispatch refuses the message before it is counted.
+        if let Some(problem) = self.collab_content_problem(message) {
+            bail!("{problem}");
+        }
         let from = message.from_session.as_deref().unwrap();
         let plan = self.collab_resolve(atem_id, message, sessions)?;
         let resolved = &plan.tasks;
@@ -757,18 +822,7 @@ impl HostBridge {
                 session_id: r.session_id.clone(),
                 process_gen: r.process_gen.clone(),
             };
-            let task = hw::WorkTask {
-                task_id: r.task_id.clone(),
-                workflow_id: message.workflow_id.clone(),
-                target,
-                expires_at: message.expires_at,
-                prompt: format!(
-                    "[Message {} from local session {}]\n{}\n\nReply with: atem message reply --task {} <text>",
-                    message.message_id, from, message.text, r.task_id
-                ),
-                context: message.context.clone(),
-                attachments: vec![],
-            };
+            let task = local_task(message, &r.task_id, target);
             let record = WorkRecord {
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
@@ -819,21 +873,16 @@ impl HostBridge {
             .as_ref()
             .unwrap()
             .accept_message_with(&record, &work, |tx| {
-                if count_send {
-                    collab::count_send(
-                        tx,
-                        &self.work.config.collab,
-                        from,
-                        &message.workflow_id,
-                        message.created_at,
-                    )?;
-                }
-                collab::count_received(
+                // One message, once under `send:` and once under `receive:`,
+                // however many agents it reaches.
+                collab::count_send(
                     tx,
                     &self.work.config.collab,
+                    from,
                     &message.workflow_id,
-                    work.len(),
+                    message.created_at,
                 )?;
+                collab::count_received(tx, &self.work.config.collab, &message.workflow_id)?;
                 tx.execute(
                     "INSERT INTO origins(message_id,record) VALUES(?1,?2)",
                     rusqlite::params![message.message_id, serde_json::to_string(origin)?],
@@ -938,7 +987,6 @@ impl HostBridge {
                         &publication.origin,
                         publication.turn_id.as_deref(),
                         cx.sessions,
-                        false,
                     )
                 });
                 if let Err(error) = result {
@@ -954,7 +1002,8 @@ impl HostBridge {
                             | "mismatch"
                             | "expired"
                             | "request_id_reused"
-                    ) || detail.starts_with("ambiguous vault reference")
+                    ) || collab::TASK_PROBLEMS.contains(&detail.as_str())
+                        || detail.starts_with("ambiguous vault reference")
                         || detail.starts_with("limit:");
                     let store = self.work.store.as_ref().unwrap();
                     if permanent {
@@ -1024,5 +1073,23 @@ impl HostBridge {
         task.status.state = WorkState::Cancelled;
         task.status.detail = "cancelled locally before submission".into();
         store.save_work(&task)
+    }
+}
+
+/// The task one recipient of a local request gets: the sender's text and
+/// context, and how to answer.
+fn local_task(message: &Message, task_id: &str, target: wire::Target) -> hw::WorkTask {
+    let from = message.from_session.as_deref().unwrap_or_default();
+    hw::WorkTask {
+        task_id: task_id.into(),
+        workflow_id: message.workflow_id.clone(),
+        target,
+        expires_at: message.expires_at,
+        prompt: format!(
+            "[Message {} from local session {}]\n{}\n\nReply with: atem message reply --task {} <text>",
+            message.message_id, from, message.text, task_id
+        ),
+        context: message.context.clone(),
+        attachments: vec![],
     }
 }

@@ -32,8 +32,11 @@ JSON files referenced by the profile; the samples contain variable names
 and placeholders, never credentials.
 
 Local collaboration also requires `[collab] send = true` and `"local"` in
-each receiving route's `principals`. Give those routes owner labels such as
-`labels = ["tag:backend"]`. Inside an Atem-launched agent:
+each receiving route's `principals`. A route's own `principals` replaces the
+default, which is the Astation this Atem is paired with: a route with only
+`["local"]` no longer serves that Astation, so list its `member:<id>` too
+(`atem runtime check` shows the ID) if it should keep access. Give those routes
+owner labels such as `labels = ["tag:backend"]`. Inside an Atem-launched agent:
 
 ```bash
 atem message directory tag:backend
@@ -43,8 +46,9 @@ atem message reply --task TASK_ID "Contract verified"
 atem agent tag add self:reviewer
 ```
 
-The defaults are 30 sends per session per hour, 8 envelopes/tasks/results per
-workflow, a 30-minute status-report timeout, `launch = "off"`,
+The defaults are 30 sends per session per hour, 8 messages per workflow (a
+message counts once however many agents it reaches; results count against
+nothing), a 30-minute status-report timeout, `launch = "off"`,
 `results = false`, and `auto_report = "status"`. Set `results = true` on the
 originating route to queue replies back into its agent. Set
 `launch = "on_message"` on a receiving route to start its approved profile
