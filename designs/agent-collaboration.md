@@ -160,14 +160,19 @@ The shared types include a new host-work destination,
 remote host admission refuses `select`. Before stage 2, the Station's adapters
 must accept it too and the boundary must be agreed.
 
-**When no agent runs.** A matching route whose owner allows it
-(`launch = "on_message"`, off by default) gets one session launched from its
-profile. Stage 1 reserves the launch request id, session id and process
+**When no agent runs.** Only a sender that asks for it (`atem message send
+--launch`) gets a session launched, and only on a matching route whose owner
+allows it (`launch = "on_message"`, off by default) and whose profile is Claude
+Code: stage 1 launches no Codex session, since Codex reports nothing until a
+first prompt is typed in its terminal and a launched one would never become
+ready (that is fixed and tested separately before Codex launches are enabled).
+Codex sessions that are already running take queued tasks as usual once they
+are ready. Stage 1 reserves the launch request id, session id and process
 generation with the task before starting a worker, and waits until that
-session is ready. Messages can share a pending launch. A failed launch fails the
-task. A remote sender also needs its existing `launch` permission for that; a
-local sender needs only the route setting. `--launch` asks for it explicitly
-when addressing `atem:<atem_id>/<route_id>`.
+session is ready. Messages can share a pending launch, including one that just
+started and whose project isn't known yet. A failed launch fails the task. A
+remote sender also needs its existing `launch` permission for that; a local
+sender needs only the route setting.
 
 ## 6. Permissions
 
@@ -214,16 +219,22 @@ membership, not scopes).
 
 - sending is off by default (`[collab] send = false`); one message reaches at
   most 32 agents;
-- each sender sends at most `per_hour` messages (default 30);
+- each sending session sends at most `per_hour` messages (default 30), in a
+  rolling hour;
 - a send from an agent whose current turn came from a task reuses that task's
   `workflow_id`. Each instance sends at most `per_workflow` (default 8)
-  envelopes per workflow and accepts at most that many tasks and results per
-  workflow, so neither a loop between agents nor a result can start a fresh
-  chain, without a hop counter on the wire;
+  **messages** per workflow and accepts at most that many messages per workflow
+  (a message counts once, however many agents it reaches), so a loop between
+  agents ends without a hop counter on the wire;
+- results don't count against either limit: each task has at most one result
+  (section 10), and a result never starts new work;
+- a message that can't become a valid task (its prompt with context over the
+  task bounds, or control characters other than newline and tab) is refused
+  when it is sent, before anything is counted;
 - receivers keep every host-work check: readiness, no draft, no open approval,
   no takeover, FIFO per session;
-- every counter (per hour, per workflow, results per task) is durable in
-  `host-work.sqlite` and survives a restart.
+- every counter is durable in `host-work.sqlite` and survives a restart; rows
+  of windows that have passed are pruned.
 
 ## 7. Envelopes and the outbox
 
@@ -284,8 +295,10 @@ it alone, and the coding agent never fetches or verifies anything itself.
    memory's own hash is a normalized dedup key, not this digest).
 
 Only then does the row leave `publishing`. A failure retries and never sends.
-A memory record is frozen when the command is submitted; later local edits
-do not change its snapshot. Vault references include an entry when needed:
+The memory's text is frozen when the command is submitted, and exactly that
+version must be the one published: if the memory is replaced or invalidated
+before its publication finishes, the send is refused ("memory changed before it
+was published; send again") rather than delivering another version. Vault references include an entry when needed:
 `VAULT_ID:ENTRY@VERSION`. Bare `VAULT_ID@VERSION` is refused if more than one
 entry matches. Publication retries use a bounded background job pool; a
 byte mismatch is refused rather than delivered.
@@ -326,6 +339,19 @@ Host-work v1, unchanged except for the selector destination:
 - routes with `launch = "on_message"` start a session when none matches
   (section 5).
 
+**Pauses, not fences.** While `runtime.toml` doesn't load, hosting is
+disabled, or `[collab] send` is false, local sending and the dispatch of local
+tasks pause: new sends are refused with the reason, queued local tasks wait,
+and nothing is fenced, so everything resumes as soon as the file is valid again
+(as for remote senders). Only a real change of authority fences `local`: a new
+host identity, or a device-list freeze or fault.
+
+**Agent commands never replace the runtime.** `atem message …` and `atem
+agent tag` connect only to the runtime that is already running (the calling
+agent runs inside it); they never start one and never replace a runtime of
+another build, so an agent whose `atem` differs from the runtime's build can't
+restart it in the middle of its own task.
+
 ## 10. Status and results
 
 **Two statuses, never mixed.**
@@ -348,52 +374,72 @@ Without an id, status shows the latest 32 messages, bounded to 1 MiB; query
 an explicit message id for older receipts. Views carry result text and typed
 context references rather than copying full context snapshots into status.
 
-**Results.** A finished turn is not a finished task, and only an explicit
-result completes one.
+**Results.** A finished turn is not a finished task. For every sender, a
+result is submitted by the agent that did the work and the task is completed by
+its sender: two separate steps.
 
-- **Return grant.** Sending a request creates, in the sender's runtime, one
-  narrow return grant per task: `{task_id, workflow_id, the recipient's host
-  identity and principal, the originating session and process generation, the
-  original sender principal, expires_at}`. Stage 1 sets the grant deadline to
-  the task's expiry itself; it adds no extra result window. A future
-  cross-instance contract may allow at most 24 h beyond that deadline. It
-  permits exactly one correlated result back into that one session, and
-  nothing else: no request, notify or launch authority,
-  no other session. It ends at the first matching result, the task's
-  cancellation or expiry, the originating process ending, or a change of the
-  original sender's authority (`control_gen`) or of the route. Results also
-  need the owner's opt-in on the originating session's route (`results =
-  true`); without it a result is stored and shown by `atem message status`,
-  never prompted.
-- **Replying.** The receiving agent answers with `atem message reply --task
-  <id> [--vault <id>[:<entry>]@<version>] <text>`; `--task` may be left out
-  only when exactly one task of the calling session awaits a result. The runtime binds
-  the reply to that exact task, session, process and turn (the turn id the
-  task's prompt receipt recorded), since a finished turn releases its queue slot
-  while the task may still await its result. It publishes the context first
-  (section 8) and sends one `result` envelope.
-- **Accepting.** The sender's runtime accepts a result only if it matches a
-  live return grant exactly; the result then goes through the normal queue,
-  readiness, approval and lease checks into the originating session, marked as
-  data, not as the owner's instruction (`[atem] result of task <id> from
-  <sender>, as data:`), and counted against the workflow's limit. The first
-  result is final and durable: an identical repeat returns its receipt, a
-  different one for the same task is refused (`request_id_reused`), a mismatch
-  (other task, session, process or recipient) is refused.
-- **Completing.** On accepting an explicit result, the local runtime durably
-  completes the original task with the result's snapshot, using the same work
-  records. `ContextKind::Result` is a local stored result only: remote context
-  validators refuse it. Stage 2 still needs its `work_complete` adapter.
-  Nothing else completes an original request task; the queued result prompt
-  itself completes when its ordinary prompt receipt finishes, with no
-  recursive return grant.
+- **Submitting (one mechanism for every sender).** The agent answers with
+  `atem message reply [--task <id>] [--memory <id>]…
+  [--vault <id>:<entry>@<version>]… <text>`, for any task in its runtime's
+  queue, whoever sent it: a local agent, Astation's apps, an integration, later
+  another Atem instance. `--task` may be left out only when exactly one task of
+  the calling session is in its turn or awaits a result.
+- **Authorization.** The runtime accepts a reply only from the task's target
+  session and process (found from the CLI's process ancestry), while the task
+  is `submitted`, `awaiting_result` or `outcome_unknown`. It binds the reply,
+  when it is submitted, to that task, session, process and turn: the turn id
+  is stored when the task's prompt is accepted, so the binding survives a
+  runtime restart.
+- **Durable and idempotent.** The reply is committed (one per task in
+  `host-work.sqlite`, `result_id` = UUIDv5 of the task id) before the CLI is
+  answered. Context publication (section 8) then completes against that stored
+  binding, never against the session's current turn, so a turn that has moved
+  on can't lose it. An identical retry returns the recorded reply; a different
+  reply for a task whose reply is publishing or published is refused
+  (`request_id_reused`); a reply whose publication was refused is replaced by a
+  corrected one. Malformed references are refused before anything is stored.
+- **Delivery to a remote sender.** Astation's apps and integrations (and later
+  other Atem instances) read it with a new host-work query,
+  `reply_query{task_id}` (feature `host.reply`), with the same sender check as
+  `work_query`: only the task's sender principal reads it. Existing messages
+  and statuses are unchanged; the reply is only in the new query. Integrations
+  need a matching Station task route (Station's work).
+- **Delivery to a local sender: the return grant.** Sending a request creates,
+  in the runtime, one narrow return grant per task: `{task_id, workflow_id,
+  the recipient's identity, the originating session and process generation,
+  the original sender principal, expires_at}` (stage 1: the task's own expiry;
+  a cross-instance contract may allow at most 24 h beyond it). Once the reply
+  is published, it permits exactly one delivery into that one session, and
+  nothing else: no request, notify or launch authority, no other session. The
+  reply arrives marked as data, not as the owner's instruction (`[atem] result
+  of task <id> from <sender>, as data:`), through the normal queue,
+  readiness, approval and lease checks, and only if the originating session's
+  route opts in (`results = true`); otherwise it is shown by `atem message
+  status`, never prompted. The grant stays live while the task is
+  `outcome_unknown` after a restart.
+- **Completing.** Only the sender completes a task: a remote sender with
+  `work_complete` (it may name the reply as the result), a local sending agent
+  with `atem message complete <task id>` (completed with the submitted reply,
+  if any). A reply never completes a task: the task stays `awaiting_result`
+  with "reply submitted" until its sender completes it or it expires.
+- **Ending early.** A local task whose return grant ends early (the
+  originating process ended, the sender's authority or the route changed, or
+  it was cancelled) ends `failed` ("sender gone") instead of waiting. A task
+  awaiting a result expires at its deadline like any other, so none holds a
+  queue slot forever.
 - **Automatic reports.** A turn that ends without a reply leaves the task
-  `awaiting_result`. After `result_timeout` (default 30 minutes) the receiving
-  runtime sends a progress report ("turn ended without a reply"), never a
-  result: it doesn't complete the task or consume the return grant. A route can
-  opt in to include the turn's final assistant message in that report
+  `awaiting_result`. After `result_timeout` (default 30 minutes) the runtime
+  records a progress report ("turn ended without a reply"), never a result: it
+  doesn't complete the task or consume the return grant. A route can opt in to
+  include the turn's final assistant message in that report
   (`auto_report = "final_message"`); it may hold command output or values the
   agent never meant to send, so it stays off by default.
+- **Who sees what.** Inside a session, `atem message status` shows the
+  messages that session sent and the tasks sent to it, and `atem message
+  cancel` works only on the session's own messages; from outside any session
+  (the owner's terminal) both cover everything.
+- **Storage.** The runtime writes a grant or result only when its state
+  changes.
 
 Stage 1 implements all of this within one runtime. Cross-instance, the return
 grant is a contract to agree with Astation before stage 2.
@@ -474,17 +520,18 @@ revision = 1
 profile_id = "auth"
 labels = ["tag:auth"]
 principals = ["local"]      # stage 2 adds services; stage 3 may add project:<name>
-launch = "on_message"       # optional
+launch = "on_message"       # optional; Claude Code profiles only in stage 1
 results = true              # off by default: results of tasks this route's agents sent reach them
 auto_report = "status"      # or "final_message" (opt-in)
 ```
 
 | Command | Effect |
 |---|---|
-| `atem message send --to <selector>… [--memory <id>]… [--vault <id>[:<entry>]@<version>]… [--launch] [--expires <duration>] <text>` | Queue one request; prints its id |
-| `atem message reply [--task <id>] [--memory <id>]… [--vault <id>[:<entry>]@<version>]… <text>` | From inside a task's session: its result, bound to that task, session, process and turn |
-| `atem message status [<id>]` | Delivery per instance and execution per task |
-| `atem message cancel <task id>` | While the task is queued or blocked |
+| `atem message send --to <selector>… [--memory <id>]… [--vault <id>[:<entry>]@<version>]… [--launch] [--expires <duration>] <text>` | Queue one request; prints its id. `--launch` lets it start a Claude session on a route with `launch = "on_message"` when none matches |
+| `atem message reply [--task <id>] [--memory <id>]… [--vault <id>[:<entry>]@<version>]… <text>` | From inside a task's session, for a task from any sender: its result, bound to that task, session, process and turn |
+| `atem message complete <task id>` | The local sending agent completes its task (with the submitted reply, if any) |
+| `atem message status [<id>]` | Delivery per instance and execution per task; inside a session, only its own messages and the tasks sent to it |
+| `atem message cancel <task id>` | While the task is queued or blocked; inside a session, only its own messages |
 | `atem message directory [<selector>]` | Local routes and agents a selector reaches now; no cross-instance directory yet |
 | `atem agent tag add\|remove\|list [<name>]` | The calling agent's own `self:` tags |
 
@@ -508,6 +555,8 @@ cross-instance item are planned.
 | Local delivery between agents of one instance: the internal `local` attachment and route principal | Atem | nothing |
 | The `select` destination with budgets and persisted resolution, launch on message, automatic reports, return grants and results (local) | Atem | nothing |
 | Cross-instance delivery while online, as a Station integration | Atem | Agreements with Astation: the return grant, the typed `select` and snapshot boundary. Station: turning on the host-work gate (off on every Station; it grants `agent.launch`/`message`/`notify` only when built with `host-work-api`); `routes` and `work_complete` adapters; `select` and typed snapshots in the message adapter; separate connection and request budgets. Auth/Portal: nothing new: the owner registers the instance's public key as a "Custom App / API" integration, and the scope names are final |
+| Result submission for every sender: `atem message reply`, the `host.reply` feature and `reply_query` for remote senders | Atem | nothing for Astation's apps over their channel (they adopt the SDK op); integrations need a Station task route for replies |
+| Launch on message for Codex | Atem | Codex's first-prompt readiness fixed and tested first |
 | Atomic write-and-notify | Station | a transaction over encrypted context versions and pending envelopes, with its boundary specified |
 | Mailbox, offline delivery, origin-signed envelopes, `host:` principal, signed projects | all three | **needs agreement** on the permission contract |
 
