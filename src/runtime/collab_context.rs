@@ -59,25 +59,6 @@ impl ContextSpec {
     }
 }
 
-pub fn matches_snapshot(spec: &ContextSpec, snapshot: &ContextSnapshot) -> bool {
-    match spec {
-        ContextSpec::Memory { memory } => {
-            snapshot.kind == ContextKind::Memory
-                && snapshot.id == memory.id
-                && snapshot.text == memory.content
-        }
-        ContextSpec::Vault { reference } => {
-            snapshot.kind == ContextKind::Vault
-                && snapshot.version == u64::from(reference.version)
-                && snapshot
-                    .id
-                    .strip_prefix(&format!("{}:", reference.id))
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .is_some_and(|n| reference.entry.is_none_or(|wanted| wanted == n))
-        }
-    }
-}
-
 pub fn capture(dir: &Path, memories: &[String], vaults: &[String]) -> Result<Vec<ContextSpec>> {
     if memories.len() + vaults.len() > 8 {
         bail!("at most 8 context snapshots");
@@ -253,11 +234,19 @@ impl ContextPublisher for RelayPublisher {
     }
 }
 
+/// Debug builds (`ATEM_TEST_CONTEXT_DIR`): the snapshot published for `key`
+/// is `<sha256(key)>.json` in that directory (none: the relay is
+/// unreachable); while `<sha256(key)>.hold` exists the publication waits.
 async fn test_snapshot(key: &str) -> Option<Result<ContextSnapshot>> {
     let dir = super::test_hooks::context_dir()?;
-    let path = dir.join(format!("{}.json", hw::digest(key.as_bytes())));
+    let name = hw::digest(key.as_bytes());
+    let path = dir.join(format!("{name}.json"));
+    let hold = dir.join(format!("{name}.hold"));
     Some(
         async {
+            while tokio::fs::try_exists(&hold).await.unwrap_or(false) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
             let bytes = tokio::fs::read(path)
                 .await
                 .map_err(|_| anyhow!("relay unreachable"))?;

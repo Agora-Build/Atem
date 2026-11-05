@@ -509,6 +509,10 @@ pub struct WorkRecord {
     pub digest: String,
     pub task: WorkTask,
     pub status: WorkStatus,
+    /// The provider turn the task's prompt became, stored once the runtime
+    /// saw the prompt accepted: a reply is bound to it, after a restart too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 pub struct Store {
@@ -562,8 +566,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS origins (message_id TEXT PRIMARY KEY, record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS return_grants (task_id TEXT PRIMARY KEY, record TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'open', awaiting_since_ms INTEGER);
-            CREATE TABLE IF NOT EXISTS results (task_id TEXT PRIMARY KEY, digest TEXT NOT NULL,
-                envelope TEXT NOT NULL, work_id TEXT);
+            CREATE TABLE IF NOT EXISTS results (
+                task_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL,
+                detail TEXT NOT NULL, digest TEXT NOT NULL, created_ms INTEGER NOT NULL,
+                submitted_at INTEGER, record TEXT NOT NULL, next_try_ms INTEGER NOT NULL,
+                attempts INTEGER NOT NULL, work_id TEXT);
+            CREATE INDEX IF NOT EXISTS result_state ON results(state);
+            CREATE INDEX IF NOT EXISTS result_work ON results(work_id);
             CREATE TABLE IF NOT EXISTS counters (
                 key TEXT NOT NULL, window_start_ms INTEGER NOT NULL, count INTEGER NOT NULL,
                 PRIMARY KEY(key,window_start_ms));
@@ -769,6 +778,15 @@ impl Store {
             bail!("missing launch reservation");
         }
         Ok(())
+    }
+
+    /// Another task fits: within the record and the active queue capacity.
+    pub fn has_room(&self) -> Result<bool> {
+        let tasks: usize = self
+            .db
+            .query_row("SELECT count(*) FROM work", [], |r| r.get(0))?;
+        let active: usize = self.db.query_row("SELECT count(*) FROM work WHERE state IN ('queued','blocked','submitting','submitted','awaiting_result')", [], |r| r.get(0))?;
+        Ok(tasks < MAX_RECORDS && active < MAX_QUEUED)
     }
 
     pub fn enqueue(&self, record: &WorkRecord) -> Result<bool> {
@@ -1054,6 +1072,7 @@ mod tests {
                 detail: String::new(),
                 result: None,
             },
+            turn_id: None,
         }
     }
 

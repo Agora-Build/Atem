@@ -400,6 +400,7 @@ impl HostBridge {
             self.work.scheduled = Instant::now() + Duration::from_millis(100);
             if self
                 .collab_pass(cx)
+                .and_then(|_| self.collab_reply_pass())
                 .and_then(|_| self.schedule_work(cx))
                 .is_err()
             {
@@ -667,6 +668,7 @@ impl HostBridge {
                         detail: "waiting for a ready agent".into(),
                         result: None,
                     },
+                    turn_id: None,
                 };
                 if let Some(old) = store.work(&task.task_id).map_err(|_| "busy")? {
                     if old.principal != record.principal || old.digest != record.digest {
@@ -904,6 +906,7 @@ impl HostBridge {
                         detail: "waiting for a ready agent".into(),
                         result: None,
                     },
+                    turn_id: None,
                 };
                 if self.work_allowed(&record, a, cx.sessions) {
                     let delivery = Delivery::Work {
@@ -1010,9 +1013,14 @@ impl HostBridge {
                 r.status.state,
                 WorkState::Submitting | WorkState::Submitted | WorkState::OutcomeUnknown
             ) {
-                let before = r.status.clone();
+                let before = (r.status.clone(), r.turn_id.clone());
+                // The turn its prompt became, stored once known: a reply is
+                // bound to it, after a restart too (spec section 10).
+                if r.turn_id.is_none() {
+                    r.turn_id = self.collab_task_turn(&r, cx.sessions);
+                }
                 self.reconcile_work(&mut r);
-                if r.status != before {
+                if (&r.status, &r.turn_id) != (&before.0, &before.1) {
                     self.work.store.as_ref().unwrap().save_work(&r)?;
                 }
                 if matches!(
@@ -1193,9 +1201,15 @@ impl HostBridge {
             r.status.detail = "explicit result delivered to the originating agent".into();
             return;
         }
-        r.status.detail =
+        r.status.detail = if r.status.state == WorkState::Submitted && r.turn_id.is_some() {
+            collab_bridge::IN_TURN
+        } else {
             "agent submission receipt reconciled; task completion requires an explicit result"
-                .into();
+        }
+        .into();
+        if let Some(reply) = self.collab_reply_of(&r.task.task_id) {
+            collab_bridge::apply_reply(r, &reply);
+        }
     }
 }
 
@@ -1640,7 +1654,7 @@ principals = ["local"]
                 assert!(message.valid_local(), "{problem}");
                 let error = rig
                     .bridge
-                    .collab_accept("atem-host", &message, &origin, None, &rig.sessions)
+                    .collab_accept("atem-host", &message, &origin, &rig.sessions)
                     .unwrap_err();
                 assert_eq!(error.to_string(), problem);
                 assert_eq!(rows(&rig, "counters"), 0, "{problem}");
@@ -1649,7 +1663,7 @@ principals = ["local"]
             // The same message without the problem is accepted, and counts once.
             message.context = vec![snapshot("fits")];
             rig.bridge
-                .collab_accept("atem-host", &message, &origin, None, &rig.sessions)
+                .collab_accept("atem-host", &message, &origin, &rig.sessions)
                 .unwrap();
             assert_eq!(counted(&rig, &format!("send:{}", message.workflow_id)), 1);
             assert_eq!(

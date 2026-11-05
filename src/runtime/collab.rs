@@ -7,7 +7,7 @@ use super::host_work::{Collab, Store};
 use anyhow::{Result, bail};
 use atem_client::session::{
     host_work::{HostTarget, WorkTask},
-    messages::{Message, MessageKind},
+    messages::Message,
     select::{AgentLabels, Label, MAX_AGENTS, Selector},
     wire::MAX_PROMPT_BYTES,
 };
@@ -268,9 +268,14 @@ pub struct MessageView {
     pub tasks: Vec<TaskView>,
 }
 
+/// A task's reply: its one result row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultView {
+    pub result_id: String,
+    pub state: results::ReplyState,
+    pub detail: String,
     pub text: String,
+    /// The context it carries once published.
     pub context: Vec<atem_client::session::messages::ContextReference>,
 }
 
@@ -289,7 +294,6 @@ pub struct TaskView {
 pub(super) struct Publication {
     pub atem_id: String,
     pub origin: results::Origin,
-    pub turn_id: Option<String>,
     pub context: Vec<super::collab_context::ContextSpec>,
 }
 
@@ -305,23 +309,20 @@ pub(super) fn reserve_context(
         let previous_publication: Publication = serde_json::from_str(&record)?;
         if previous.text != message.text || previous.reply_to != message.reply_to || previous.from_session != message.from_session
             || previous.workflow_id != message.workflow_id || previous_publication.origin.target != publication.origin.target
-            || previous_publication.turn_id != publication.turn_id || serde_json::to_value(previous_publication.context)? != serde_json::to_value(&publication.context)? {
+            || serde_json::to_value(previous_publication.context)? != serde_json::to_value(&publication.context)? {
             bail!("request_id_reused");
         }
         return Ok(());
     }
     // A request is counted when it is accepted, and may still turn out to be
-    // refused then; checking now only tells the sender early. Results count
-    // against nothing.
-    if message.kind == MessageKind::Request {
-        check_send(
-            store,
-            config,
-            message.from_session.as_deref().unwrap(),
-            &message.workflow_id,
-            message.created_at,
-        )?;
-    }
+    // refused then; checking now only tells the sender early.
+    check_send(
+        store,
+        config,
+        message.from_session.as_deref().unwrap(),
+        &message.workflow_id,
+        message.created_at,
+    )?;
     let tx = store.db.unchecked_transaction()?;
     let count: usize = tx.query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))?;
     if count >= super::host_work::MAX_RECORDS {
@@ -432,20 +433,23 @@ pub(super) fn views(store: &Store, id: Option<&str>) -> Result<Vec<MessageView>>
                     let r = store
                         .work(&id?)?
                         .ok_or_else(|| anyhow::anyhow!("missing resolved task"))?;
-                    let result =
-                        results::accepted(store, &r.task.task_id)?.map(|result| ResultView {
-                            text: result.text,
-                            context: result
-                                .context
-                                .iter()
-                                .map(|c| atem_client::session::messages::ContextReference {
-                                    kind: c.kind,
-                                    id: c.id.clone(),
-                                    version: c.version,
-                                    digest: c.digest.clone(),
-                                })
-                                .collect(),
-                        });
+                    let result = results::load(&store.db, &r.task.task_id)?.map(|row| ResultView {
+                        context: row
+                            .reply
+                            .context
+                            .iter()
+                            .map(|c| atem_client::session::messages::ContextReference {
+                                kind: c.kind,
+                                id: c.id.clone(),
+                                version: c.version,
+                                digest: c.digest.clone(),
+                            })
+                            .collect(),
+                        result_id: row.result_id,
+                        state: row.state,
+                        detail: row.detail,
+                        text: row.reply.text,
+                    });
                     Ok(TaskView {
                         task_id: r.status.task_id,
                         receipt_id: r.status.receipt_id,

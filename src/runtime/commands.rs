@@ -3,6 +3,7 @@
 //! list and stop print and exit.
 
 use super::client::RuntimeClient;
+use super::collab::results::ReplyState;
 use super::protocol::{ClientMsg, LaunchEnv, RuntimeMsg, SessionSummary};
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::IsTerminal;
@@ -95,6 +96,7 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                 vault,
             },
         },
+        MessageCommands::Complete { task_id } => ClientMsg::MessageComplete { task_id },
         MessageCommands::Status { id } => ClientMsg::MessageStatus { message_id: id },
         MessageCommands::Cancel { task_id } => ClientMsg::MessageCancel { task_id },
         MessageCommands::Directory { selector } => ClientMsg::MessageDirectory { selector },
@@ -104,6 +106,7 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
     let response = reply(&mut client, op, |m| match m {
         RuntimeMsg::MessageSent { .. }
         | RuntimeMsg::MessageReplied { .. }
+        | RuntimeMsg::MessageCompleted { .. }
         | RuntimeMsg::MessageStatus { .. }
         | RuntimeMsg::MessageCancelled { .. }
         | RuntimeMsg::MessageDirectory { .. } => Some(m),
@@ -112,9 +115,21 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
     .await?;
     match response {
         RuntimeMsg::MessageSent { message_id } => println!("{message_id}"),
-        RuntimeMsg::MessageReplied { task_id } => {
-            println!("{task_id}: result accepted for publication")
-        }
+        RuntimeMsg::MessageReplied {
+            task_id,
+            result_id,
+            state,
+            detail,
+        } => match state {
+            ReplyState::Publishing => {
+                println!("{task_id}: reply publishing its context; result {result_id}")
+            }
+            ReplyState::Submitted => println!("{task_id}: reply submitted; result {result_id}"),
+            ReplyState::Refused => bail!(
+                "{task_id}: reply refused: {detail}; send a corrected reply (result {result_id})"
+            ),
+        },
+        RuntimeMsg::MessageCompleted { task_id } => println!("{task_id}: completed"),
         RuntimeMsg::MessageCancelled { task_id } => println!("{task_id}: cancelled"),
         RuntimeMsg::MessageDirectory { rows } => {
             for row in rows {
@@ -142,7 +157,15 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                         task.detail
                     );
                     if let Some(result) = task.result {
-                        println!("    result: {}", result.text);
+                        println!(
+                            "    reply {} ({}): {}",
+                            result.result_id,
+                            serde_json::to_value(result.state)?.as_str().unwrap(),
+                            result.text
+                        );
+                        if !result.detail.is_empty() {
+                            println!("    {}", result.detail);
+                        }
                         for reference in result.context {
                             println!(
                                 "    {:?}:{}@{} sha256 {}",

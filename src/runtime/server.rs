@@ -338,6 +338,7 @@ fn waits_for_adoption(incoming: &Incoming) -> bool {
                 | ClientMsg::Tag { .. }
                 | ClientMsg::MessageSend { .. }
                 | ClientMsg::MessageReply { .. }
+                | ClientMsg::MessageComplete { .. }
                 | ClientMsg::MessageStatus { .. }
                 | ClientMsg::MessageCancel { .. }
                 | ClientMsg::MessageDirectory { .. }
@@ -855,6 +856,7 @@ impl Server {
                 ClientMsg::Launch { .. }
                 | ClientMsg::MessageSend { .. }
                 | ClientMsg::MessageReply { .. }
+                | ClientMsg::MessageComplete { .. }
                 | ClientMsg::MessageCancel { .. }
                 | ClientMsg::AstationOp { .. }
                 | ClientMsg::Attach { .. }
@@ -1156,8 +1158,29 @@ impl Server {
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
                     .and_then(|b| b.collab_reply(&sid, request, &self.sessions));
                 match result {
-                    Ok(task_id) => self.send(id, &RuntimeMsg::MessageReplied { task_id }),
+                    Ok(row) => self.send(
+                        id,
+                        &RuntimeMsg::MessageReplied {
+                            task_id: row.task_id().to_string(),
+                            result_id: row.result_id,
+                            state: row.state,
+                            detail: row.detail,
+                        },
+                    ),
                     Err(e) => self.error(id, e.to_string(), "message_reply"),
+                }
+            }
+            ClientMsg::MessageComplete { task_id } => {
+                // Outside any session: the owner.
+                let caller = self.calling_session(id);
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_complete(caller.as_ref(), &task_id, &self.sessions));
+                match result {
+                    Ok(()) => self.send(id, &RuntimeMsg::MessageCompleted { task_id }),
+                    Err(e) => self.error(id, e.to_string(), "message_complete"),
                 }
             }
             ClientMsg::MessageStatus { message_id } => {

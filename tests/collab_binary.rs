@@ -389,7 +389,7 @@ fn replies_count_against_no_workflow_limit() {
     );
     assert_eq!(reply["code"], 0, "{reply}");
     within("reply stored", || {
-        rig.status(&first)["tasks"][0]["state"] == "completed"
+        rig.status(&first)["tasks"][0]["result"]["state"] == "submitted"
     });
     // The reply used none of the limit: the workflow is still exactly full.
     let still = rig.agent(&b, 5, &["message", "send", "--to", "tag:c", "child four"]);
@@ -502,8 +502,8 @@ fn context_sends_still_publishing_count_against_the_hourly_limit() {
 }
 
 /// The result task a reply creates for the origin agent obeys the task bounds:
-/// a reply whose context could never be delivered is refused, and the replier
-/// can still answer with something smaller.
+/// a reply whose context could never be delivered is refused once its context
+/// is read, and a corrected reply replaces it.
 #[test]
 fn a_reply_that_could_never_be_delivered_is_refused_and_can_be_corrected() {
     use sha2::{Digest, Sha256};
@@ -543,28 +543,64 @@ fn a_reply_that_could_never_be_delivered_is_refused_and_can_be_corrected() {
         ],
     );
     assert_eq!(oversize["code"], 0, "{oversize}");
+    assert!(
+        oversize["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("reply publishing"),
+        "{oversize}"
+    );
     within("oversize reply refused", || {
-        let all = rig.request(json!({"op":"message_status"}), "message_status");
-        all["messages"].as_array().unwrap().iter().any(|m| {
-            m["delivery"] == "refused"
-                && m["detail"] == "the prompt with its context is over 32 KiB"
-        })
+        rig.status(&id)["tasks"][0]["result"]["state"] == "refused"
     });
+    let result = &rig.status(&id)["tasks"][0]["result"];
+    assert_eq!(
+        result["detail"], "the prompt with its context is over 32 KiB",
+        "{result}"
+    );
     // The replier's task is still waiting, and the origin saw nothing.
     assert_eq!(rig.status(&id)["tasks"][0]["state"], "awaiting_result");
     assert!(std::fs::read(a.join("input")).unwrap().is_empty());
-    let smaller = rig.agent(
+    // Retrying the refused reply as it was returns the refusal.
+    let again = rig.agent(
         &b,
         2,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-big:1@1",
+            "too much",
+        ],
+    );
+    assert_ne!(again["code"], 0, "{again}");
+    assert!(
+        again["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("the prompt with its context is over 32 KiB"),
+        "{again}"
+    );
+    assert_eq!(result_id(&again), result_id(&oversize));
+    let smaller = rig.agent(
+        &b,
+        3,
         &["message", "reply", "--task", &task, "the short answer"],
     );
     assert_eq!(smaller["code"], 0, "{smaller}");
+    assert_eq!(result_id(&smaller), result_id(&oversize));
     within("the corrected result arrives", || {
         std::fs::read_to_string(a.join("input"))
             .unwrap_or_default()
             .contains("the short answer")
     });
-    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
+    let task = &rig.status(&id)["tasks"][0];
+    assert_eq!(task["state"], "awaiting_result", "{task}");
+    assert_eq!(task["detail"], "reply submitted", "{task}");
+    assert_eq!(task["result"]["state"], "submitted", "{task}");
+    assert_eq!(task["result"]["text"], "the short answer", "{task}");
 }
 
 /// `build_atem_id` keeps non-ASCII characters, and the selectors that
@@ -853,8 +889,56 @@ fn await_task(rig: &Rig, message: &str, fake: &Path) -> String {
         .into()
 }
 
+/// A submitted task's detail once the runtime saw its prompt accepted and
+/// stored the turn it became.
+const IN_TURN: &str = "in the agent's turn";
+
+/// The task of message `id` sent to `session`.
+fn task_of(rig: &Rig, id: &str, session: &str) -> Value {
+    rig.status(id)["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["session_id"] == session)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Waits until the task of message `id` sent to `session` (prompt `text`)
+/// is in that agent's turn, its turn stored; its task id. The turn stays
+/// open (nothing completes it).
+fn await_turn(rig: &Rig, id: &str, session: &str, fake: &Path, text: &str) -> String {
+    within("task prompt", || {
+        std::fs::read_to_string(fake.join("input"))
+            .unwrap_or_default()
+            .contains(text)
+    });
+    within("the task's turn", || {
+        task_of(rig, id, session)["detail"] == IN_TURN
+    });
+    task_of(rig, id, session)["task_id"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+/// The result id `atem message reply` printed (the last id it names).
+fn result_id(output: &Value) -> String {
+    let text = format!(
+        "{}{}",
+        output["stdout"].as_str().unwrap(),
+        output["stderr"].as_str().unwrap()
+    );
+    text.split_whitespace()
+        .rev()
+        .find_map(|word| uuid::Uuid::parse_str(word.trim_matches(|c| c == ';' || c == ')')).ok())
+        .expect("a result id")
+        .to_string()
+}
+
+/// The sending agent completes its task; the reply alone never does.
 #[test]
-fn a_reply_comes_back_as_data_and_completes_the_task() {
+fn a_reply_comes_back_as_data_and_its_sender_completes_the_task() {
     let mut rig = Rig::new();
     rig.config = rig.config.replace(
         "labels = [\"tag:a\"]",
@@ -871,6 +955,13 @@ fn a_reply_comes_back_as_data_and_completes_the_task() {
         &["message", "reply", "--task", &task, "contract verified"],
     );
     assert_eq!(reply["code"], 0, "{reply}");
+    assert!(
+        reply["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("reply submitted"),
+        "{reply}"
+    );
     within("result as data", || {
         std::fs::read_to_string(a.join("input"))
             .unwrap_or_default()
@@ -882,15 +973,18 @@ fn a_reply_comes_back_as_data_and_completes_the_task() {
         "{input}"
     );
     assert!(input.contains(", as data:\ncontract verified"));
-    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
-    assert_eq!(
-        rig.agent(
-            &b,
-            2,
-            &["message", "reply", "--task", &task, "contract verified"]
-        )["code"],
-        0
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "awaiting_result", "{status}");
+    assert_eq!(status["detail"], "reply submitted", "{status}");
+    assert_eq!(status["result"]["result_id"], result_id(&reply).as_str());
+    // An identical retry returns the recorded reply; another one is refused.
+    let retry = rig.agent(
+        &b,
+        2,
+        &["message", "reply", "--task", &task, "contract verified"],
     );
+    assert_eq!(retry["code"], 0, "{retry}");
+    assert_eq!(result_id(&retry), result_id(&reply));
     let conflict = rig.agent(
         &b,
         3,
@@ -911,6 +1005,47 @@ fn a_reply_comes_back_as_data_and_completes_the_task() {
             .count(),
         1
     );
+    // Only its sender completes it: not the agent that did the work.
+    let not_mine = rig.agent(&b, 4, &["message", "complete", &task]);
+    assert_ne!(not_mine["code"], 0, "{not_mine}");
+    assert!(
+        not_mine["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("only the task's sending session completes it"),
+        "{not_mine}"
+    );
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "awaiting_result");
+    let done = rig.agent(&a, 2, &["message", "complete", &task]);
+    assert_eq!(done["code"], 0, "{done}");
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "completed", "{status}");
+    assert_eq!(status["result"]["text"], "contract verified", "{status}");
+    // Completing again changes nothing.
+    assert_eq!(rig.agent(&a, 3, &["message", "complete", &task])["code"], 0);
+}
+
+/// From outside any session (the owner's terminal) any local task can be
+/// completed, with no reply too; a task that is not waiting can't.
+#[test]
+fn the_owner_completes_a_task_from_outside_any_session() {
+    let rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let first = rig.send(&a, 1, "tag:b", "never answered");
+    let task = await_task(&rig, &first, &b);
+    let second = rig.send(&a, 2, "tag:b", "still queued");
+    let queued = rig.status(&second)["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, err, ok) = rig.sandbox.atem(&["message", "complete", &queued]);
+    assert!(!ok && err.contains("awaiting"), "{err}");
+    let (out, err, ok) = rig.sandbox.atem(&["message", "complete", &task]);
+    assert!(ok, "{out}{err}");
+    let status = &rig.status(&first)["tasks"][0];
+    assert_eq!(status["state"], "completed", "{status}");
+    assert!(status["result"].is_null(), "{status}");
 }
 
 #[test]
@@ -923,13 +1058,269 @@ fn without_results_true_a_result_is_status_only() {
     let reply = rig.agent(&b, 1, &["message", "reply", "--task", &task, "stored only"]);
     assert_eq!(reply["code"], 0, "{reply}");
     let status = rig.status(&id);
-    assert_eq!(status["tasks"][0]["state"], "completed");
-    assert!(
-        status["tasks"][0]["result"]
-            .to_string()
-            .contains("stored only")
-    );
+    assert_eq!(status["tasks"][0]["state"], "awaiting_result");
+    assert_eq!(status["tasks"][0]["result"]["state"], "submitted");
+    assert_eq!(status["tasks"][0]["result"]["text"], "stored only");
+    std::thread::sleep(Duration::from_millis(500));
     assert!(std::fs::read(a.join("input")).unwrap().is_empty());
+}
+
+/// One request reaches five agents; each answers in its own turn without
+/// `--task`. All five replies are recorded and each reaches the sender once,
+/// as data.
+#[test]
+fn five_agents_reply_in_their_turns_and_every_reply_is_delivered() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let agents: Vec<_> = (0..5)
+        .map(|n| rig.launch("b", &format!("agent-{n}")))
+        .collect();
+    let id = rig.send(&a, 1, "tag:b", "review your part");
+    let mut ids = std::collections::BTreeSet::new();
+    for (n, (session, fake)) in agents.iter().enumerate() {
+        await_turn(&rig, &id, session, fake, "review your part");
+        let reply = rig.agent(
+            fake,
+            1,
+            &["message", "reply", &format!("part {n} reviewed")],
+        );
+        assert_eq!(reply["code"], 0, "{reply}");
+        assert!(ids.insert(result_id(&reply)));
+    }
+    within("five deliveries", || {
+        if !a.join("complete").exists() {
+            private(&a.join("complete"), "");
+        }
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .matches("[atem] result of task")
+            .count()
+            == 5
+    });
+    let input = std::fs::read_to_string(a.join("input")).unwrap();
+    for n in 0..5 {
+        assert_eq!(
+            input
+                .matches(&format!("as data:\npart {n} reviewed"))
+                .count(),
+            1,
+            "{input}"
+        );
+    }
+    for (_, fake) in &agents {
+        private(&fake.join("complete"), "");
+    }
+    within("five tasks with their replies", || {
+        rig.status(&id)["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| {
+                t["state"] == "awaiting_result"
+                    && t["detail"] == "reply submitted"
+                    && t["result"]["state"] == "submitted"
+            })
+    });
+}
+
+/// A reply with context stays bound to its task's turn: its publication may
+/// finish after the agent's next turn began.
+#[test]
+fn a_reply_whose_context_publishes_after_the_next_turn_began_is_kept() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let first = rig.send(&a, 1, "tag:b", "first task");
+    let task = await_turn(&rig, &first, &session, &b, "first task");
+    let text = "Context published late.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-late:1@1"));
+    let context = rig.sandbox.dir.path().join("context");
+    // Held: the publication waits until the hold is removed.
+    private(&context.join(format!("{name}.hold")), "");
+    private(
+        &context.join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-late:1","version":1,"digest":digest,"text":text})
+            .to_string(),
+    );
+    let reply = rig.agent(
+        &b,
+        1,
+        &["message", "reply", "--vault", "v-late:1@1", "first answer"],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    assert!(
+        reply["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("reply publishing"),
+        "{reply}"
+    );
+    // The turn ends and the next task's turn begins.
+    private(&b.join("complete"), "");
+    let second = rig.send(&a, 2, "tag:b", "second task");
+    await_turn(&rig, &second, &session, &b, "second task");
+    std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
+    within("the reply published", || {
+        rig.status(&first)["tasks"][0]["result"]["state"] == "submitted"
+    });
+    let status = &rig.status(&first)["tasks"][0];
+    assert_eq!(status["task_id"], task.as_str());
+    assert_eq!(status["detail"], "reply submitted", "{status}");
+    assert_eq!(status["result"]["context"][0]["digest"], digest, "{status}");
+    within("the reply delivered with its context", || {
+        if !a.join("complete").exists() {
+            private(&a.join("complete"), "");
+        }
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains(text)
+    });
+}
+
+/// A reply is the replier's once it is stored: its context still publishes,
+/// and it still reaches the sender, after the replier's session ended.
+#[test]
+fn a_reply_publishes_after_its_session_ended() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "answer, then leave");
+    let task = await_task(&rig, &id, &b);
+    let text = "Context of a session that ended.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-gone:1@1"));
+    let context = rig.sandbox.dir.path().join("context");
+    private(&context.join(format!("{name}.hold")), "");
+    private(
+        &context.join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-gone:1","version":1,"digest":digest,"text":text})
+            .to_string(),
+    );
+    let reply = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-gone:1@1",
+            "my last answer",
+        ],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    let stopped = rig.request(json!({"op":"stop","session_id":session}), "stopped");
+    assert_eq!(stopped["op"], "stopped", "{stopped}");
+    within("the replier's session ended", || {
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == session.as_str() && s["state"] != "running")
+    });
+    std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
+    within("the reply published", || {
+        rig.status(&id)["tasks"][0]["result"]["state"] == "submitted"
+    });
+    within("the reply delivered", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("my last answer")
+    });
+}
+
+/// The runtime restarts while the task's turn runs: the task's outcome is
+/// unknown, yet its stored turn binds the agent's reply, and the return
+/// grant still delivers it.
+#[test]
+fn a_reply_after_a_restart_in_the_tasks_turn_is_recorded_and_delivered() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "survive a restart");
+    await_turn(&rig, &id, &session, &b, "survive a restart");
+    rig.restart();
+    within("outcome unknown after the restart", || {
+        rig.status(&id)["tasks"][0]["state"] == "outcome_unknown"
+    });
+    let reply = rig.agent(&b, 1, &["message", "reply", "answered across the restart"]);
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("the reply delivered", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("answered across the restart")
+    });
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "awaiting_result", "{status}");
+    assert_eq!(status["detail"], "reply submitted", "{status}");
+}
+
+/// A pause refuses new sends only: a reply is stored at once, and reaches
+/// the sender when the pause is over.
+#[test]
+fn a_reply_during_a_pause_is_kept_and_delivered_after_it() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "answer while paused");
+    let task = await_task(&rig, &id, &b);
+    rig.write_config(&rig.config.replacen("send = true", "send = false", 1));
+    // A probe that reaches nobody: refused once the runtime saw the pause.
+    let mut n = 10;
+    within("the pause", || {
+        n += 1;
+        rig.agent(&a, n, &["message", "send", "--to", "tag:nobody", "probe"])["code"] != 0
+    });
+    let reply = rig.agent(
+        &b,
+        1,
+        &["message", "reply", "--task", &task, "kept during the pause"],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    assert_eq!(rig.status(&id)["tasks"][0]["result"]["state"], "submitted");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("kept during the pause")
+    );
+    rig.write_config(&rig.config);
+    within("delivered after the pause", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("kept during the pause")
+    });
 }
 
 #[test]
@@ -982,7 +1373,14 @@ fn a_silent_turn_gets_a_report_not_a_result() {
         rig.agent(&b, 1, &["message", "reply", "late explicit result"])["code"],
         0
     );
-    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
+    within("the reply delivered", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("late explicit result")
+    });
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "awaiting_result", "{status}");
+    assert_eq!(status["detail"], "reply submitted", "{status}");
 }
 
 #[test]
@@ -1013,11 +1411,14 @@ fn a_final_message_report_stays_status_only_until_an_explicit_reply() {
         rig.agent(
             &b,
             1,
-            &["message", "reply", "--task", &task, "explicit completion"]
+            &["message", "reply", "--task", &task, "explicit reply"]
         )["code"],
         0
     );
-    assert_eq!(rig.status(&id)["tasks"][0]["state"], "completed");
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "awaiting_result", "{status}");
+    assert_eq!(status["detail"], "reply submitted", "{status}");
+    assert_eq!(status["result"]["text"], "explicit reply", "{status}");
 }
 
 #[test]
@@ -1267,9 +1668,11 @@ fn a_failed_launch_fails_its_task() {
 
 /// A local task queued behind a busy agent, then `runtime.toml` changed by
 /// `pause` (its `reason` appears wherever the pause is explained): the task
-/// waits as `paused: <reason>`, new sends are refused with the reason, nothing
-/// is fenced (`local`'s control generation stays), and with the file valid
-/// again the task dispatches and its return grant still delivers the result.
+/// waits as `paused: <reason>`, new sends are refused with the reason, a
+/// reply from the busy agent's turn is stored (and delivered only after the
+/// pause), nothing is fenced (`local`'s control generation stays), and with
+/// the file valid again the task dispatches and its return grant still
+/// delivers the result.
 fn a_pause_waits_and_never_fences(pause: impl FnOnce(&str) -> String, reason: &str) {
     let mut rig = Rig::new();
     rig.config = rig.config.replace(
@@ -1316,6 +1719,23 @@ fn a_pause_waits_and_never_fences(pause: impl FnOnce(&str) -> String, reason: &s
         generation,
         "a pause fences nothing"
     );
+    // A pause refuses new sends only: the busy agent's reply from its turn
+    // (no `--task`: the one task in its turn) is stored, not yet delivered.
+    let early = rig.agent(&b, 2, &["message", "reply", "first answer, paused"]);
+    assert_eq!(early["code"], 0, "{early}");
+    assert!(
+        early["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("reply submitted"),
+        "{early}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("first answer, paused")
+    );
 
     // The file is valid again: the first turn ends and the queued task goes.
     rig.write_config(&rig.config);
@@ -1351,12 +1771,15 @@ fn a_pause_waits_and_never_fences(pause: impl FnOnce(&str) -> String, reason: &s
         ],
     );
     assert_eq!(reply["code"], 0, "{reply}");
-    within("the result under the old return grant", || {
-        std::fs::read_to_string(a.join("input"))
-            .unwrap_or_default()
-            .contains("result after the pause")
+    within("both results under their old return grants", || {
+        if !a.join("complete").exists() {
+            private(&a.join("complete"), "");
+        }
+        let input = std::fs::read_to_string(a.join("input")).unwrap_or_default();
+        input.contains("first answer, paused") && input.contains("result after the pause")
     });
-    assert_eq!(rig.status(&second)["tasks"][0]["state"], "completed");
+    assert_eq!(rig.status(&second)["tasks"][0]["state"], "awaiting_result");
+    assert_eq!(rig.status(&second)["tasks"][0]["detail"], "reply submitted");
     assert_eq!(rig.local_control_gen(), generation);
 }
 

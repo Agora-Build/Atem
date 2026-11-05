@@ -295,13 +295,16 @@ pub enum MessageCommands {
     },
     /// Show durable delivery and per-task execution state
     Status { id: Option<String> },
-    /// Return one explicit result from the task's agent and turn
+    /// Reply to a task sent to the calling agent, from any sender (bound to its turn; never completes it)
     Reply {
         #[arg(long)] task: Option<String>,
         #[arg(long)] memory: Vec<String>,
+        /// ID:ENTRY@VERSION
         #[arg(long)] vault: Vec<String>,
         text: String,
     },
+    /// Complete a task you sent, with its submitted reply as the result, if any
+    Complete { task_id: String },
     /// Cancel a task before submission
     Cancel { task_id: String },
     /// Show local routes, labels and live agents, optionally filtered

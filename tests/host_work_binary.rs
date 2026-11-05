@@ -373,6 +373,127 @@ fn upload(dev: &mut Dev, r: &mut Router, reference: &Value, offset: usize, bytes
     )
 }
 
+/// One local protocol request to the runtime; its `reply` (or `error`).
+fn local_request(rig: &Rig, mut request: Value, reply: &str) -> Value {
+    use std::io::{BufRead, BufReader, Write};
+    let path = std::fs::read_to_string(rig.sandbox.config().join("runtime.socket")).unwrap();
+    let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut write = socket.try_clone().unwrap();
+    writeln!(
+        write,
+        "{}",
+        json!({"v":1,"op":"hello","protocol":1,"build":"test"})
+    )
+    .unwrap();
+    request["v"] = json!(1);
+    writeln!(write, "{request}").unwrap();
+    for line in BufReader::new(socket).lines() {
+        let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if message["op"] == "error" || message["op"] == reply {
+            return message;
+        }
+    }
+    panic!("no {reply} response");
+}
+
+/// `argv` run by the fake agent of `fake` as its own child (`run-<n>.json`).
+fn agent_run(fake: &Path, n: u32, args: &[&str]) -> Value {
+    let argv: Vec<_> = std::iter::once(env!("CARGO_BIN_EXE_atem"))
+        .chain(args.iter().copied())
+        .collect();
+    private(
+        &fake.join(format!("run-{n}.tmp")),
+        &json!({ "argv": argv }).to_string(),
+    );
+    std::fs::rename(
+        fake.join(format!("run-{n}.tmp")),
+        fake.join(format!("run-{n}.json")),
+    )
+    .unwrap();
+    let out = fake.join(format!("run-{n}.out"));
+    within("agent child command", || out.exists());
+    serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap()
+}
+
+/// A task from a service (not a local agent) takes `atem message reply`
+/// from its target session; another session's reply is refused. The reply
+/// never completes it.
+#[test]
+fn a_service_task_takes_a_reply_from_its_target_session_only() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let first = task(&launch, "Answer with atem message reply");
+    enqueue(&mut dev, &mut r, &first);
+    within("the service's prompt", || {
+        std::fs::read_to_string(rig.fake.join("input"))
+            .unwrap_or_default()
+            .contains("Answer with atem message reply")
+    });
+    // Another agent session of the same runtime, with its own fake directory.
+    let other = rig.sandbox.dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut env = rig.sandbox.env();
+    env.push((
+        "CLAUDE_CLI_BIN".into(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/approvals/fake-agent.py")
+            .display()
+            .to_string(),
+    ));
+    env.push(("FAKE_DIR".into(), other.display().to_string()));
+    let launched = local_request(
+        &rig,
+        json!({"op":"launch","provider":"claude","cwd":rig.sandbox.home,"env":env,"rows":24,"cols":80}),
+        "launched",
+    );
+    assert_eq!(launched["op"], "launched", "{launched}");
+    within("the other agent", || other.join("events").exists());
+    let tid = first["task_id"].as_str().unwrap();
+    let intruder = agent_run(&other, 1, &["message", "reply", "--task", tid, "not mine"]);
+    assert_ne!(intruder["code"], 0, "{intruder}");
+    assert!(
+        intruder["stderr"].as_str().unwrap().contains("mismatch"),
+        "{intruder}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while work(&mut dev, &mut r, &first["task_id"])["detail"] != "in the agent's turn" {
+        assert!(
+            Instant::now() < deadline,
+            "the task's turn was never stored"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let reply = agent_run(&rig.fake, 1, &["message", "reply", "the service's answer"]);
+    assert_eq!(reply["code"], 0, "{reply}");
+    assert!(
+        reply["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("reply submitted"),
+        "{reply}"
+    );
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    let status = wait_state(&mut dev, &mut r, &first["task_id"], "awaiting_result");
+    assert_eq!(status["detail"], "reply submitted", "{status}");
+    let retry = agent_run(
+        &rig.fake,
+        2,
+        &["message", "reply", "--task", tid, "the service's answer"],
+    );
+    assert_eq!(retry["code"], 0, "{retry}");
+    assert_eq!(retry["stdout"], reply["stdout"]);
+    // Its sender completes it with work_complete, not the local command.
+    let (_, err, ok) = rig.sandbox.atem(&["message", "complete", tid]);
+    assert!(!ok && err.contains("work_complete"), "{err}");
+}
+
 #[test]
 fn mark_screenshots_and_messages_share_the_durable_session_queue() {
     let mut rig = Rig::new("claude");

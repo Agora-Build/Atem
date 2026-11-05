@@ -124,6 +124,11 @@ pub enum ClientMsg {
     MessageReply {
         request: super::collab::ReplyRequest,
     },
+    /// The sending agent (or, outside any session, the owner) completes a
+    /// local task. → `message_completed`
+    MessageComplete {
+        task_id: String,
+    },
     MessageStatus {
         message_id: Option<String>,
     },
@@ -255,6 +260,7 @@ impl ClientMsg {
             ClientMsg::Tag { .. } => "tag",
             ClientMsg::MessageSend { .. } => "message_send",
             ClientMsg::MessageReply { .. } => "message_reply",
+            ClientMsg::MessageComplete { .. } => "message_complete",
             ClientMsg::MessageStatus { .. } => "message_status",
             ClientMsg::MessageCancel { .. } => "message_cancel",
             ClientMsg::MessageDirectory { .. } => "message_directory",
@@ -488,7 +494,15 @@ pub enum RuntimeMsg {
     MessageSent {
         message_id: String,
     },
+    /// The task's one reply as recorded: `publishing`, `submitted`, or
+    /// `refused` (`detail` says why; a corrected reply replaces it).
     MessageReplied {
+        task_id: String,
+        result_id: String,
+        state: super::collab::results::ReplyState,
+        detail: String,
+    },
+    MessageCompleted {
         task_id: String,
     },
     MessageStatus {
