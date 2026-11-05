@@ -622,6 +622,7 @@ impl Server {
     fn remove_session(&mut self, sid: &SessionId) {
         self.sessions.remove(sid);
         self.order.retain(|id| id != sid);
+        super::collab::remove_tags(self.options.launcher.state(), sid.as_str());
     }
 
     /// A launch's worker started (or didn't).
@@ -1184,22 +1185,26 @@ impl Server {
                 }
             }
             ClientMsg::MessageStatus { message_id } => {
+                // Inside a session: its own messages and the tasks sent to it.
+                let caller = self.calling_session(id);
                 let result = self
                     .bridge
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
-                    .and_then(|b| b.collab_status(message_id.as_deref()));
+                    .and_then(|b| b.collab_status(caller.as_ref(), message_id.as_deref()));
                 match result {
                     Ok(messages) => self.send(id, &RuntimeMsg::MessageStatus { messages }),
                     Err(e) => self.error(id, e.to_string(), "message_status"),
                 }
             }
             ClientMsg::MessageCancel { task_id } => {
+                // Inside a session: its own messages only.
+                let caller = self.calling_session(id);
                 let result = self
                     .bridge
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
-                    .and_then(|b| b.collab_cancel(&task_id));
+                    .and_then(|b| b.collab_cancel(caller.as_ref(), &task_id));
                 match result {
                     Ok(()) => self.send(id, &RuntimeMsg::MessageCancelled { task_id }),
                     Err(e) => self.error(id, e.to_string(), "message_cancel"),

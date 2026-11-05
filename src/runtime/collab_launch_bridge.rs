@@ -190,7 +190,6 @@ impl HostBridge {
                     && host_now().wall_ms < expires_at
                     && Config::load(&dir).is_ok_and(|c| {
                         c.enabled
-                            && c.collab.send
                             && c.profile(&approved.id) == Some(&approved)
                             && c.route(&approved_route.id) == Some(&approved_route)
                     })

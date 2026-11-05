@@ -90,12 +90,11 @@ pub(super) struct State {
     launches: VecDeque<RemoteLaunch>,
     context_jobs:
         HashMap<String, tokio::sync::oneshot::Receiver<anyhow::Result<Vec<hw::ContextSnapshot>>>>,
+    /// When counter rows whose window passed are pruned next.
+    pruned: Instant,
 }
 
 impl State {
-    pub(super) fn collaboration_enabled(&self) -> bool {
-        self.config.collab.send
-    }
     pub(super) fn open(journal: &Path, available: bool) -> Self {
         let dir = journal
             .parent()
@@ -115,6 +114,7 @@ impl State {
             pending: HashMap::new(),
             launches: VecDeque::new(),
             context_jobs: HashMap::new(),
+            pruned: Instant::now(),
         }
     }
 }
@@ -1009,6 +1009,12 @@ impl HostBridge {
     }
 
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
+        // Awaiting a result past the deadline: expired, its slot freed.
+        self.work
+            .store
+            .as_ref()
+            .unwrap()
+            .expire_awaiting(host_now().wall_ms)?;
         let tasks = self.work.store.as_ref().unwrap().active_tasks()?;
         let pause = self
             .local_authorized()
@@ -1580,6 +1586,190 @@ principals = ["local"]
         });
     }
 
+    /// Counts the rows written to `return_grants` and `results` from now on
+    /// (temporary triggers: inserts, updates, deletes).
+    fn count_writes(rig: &LocalRig) {
+        let mut sql = "CREATE TEMP TABLE writes(t TEXT NOT NULL);".to_string();
+        for table in ["return_grants", "results"] {
+            for (n, event) in ["INSERT", "UPDATE", "DELETE"].iter().enumerate() {
+                sql.push_str(&format!(
+                    "CREATE TEMP TRIGGER w_{table}_{n} AFTER {event} ON main.{table}
+                    BEGIN INSERT INTO writes VALUES('{table}'); END;"
+                ));
+            }
+        }
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch(&sql)
+            .unwrap();
+    }
+
+    fn writes(rig: &LocalRig, table: &str) -> i64 {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row("SELECT count(*) FROM writes WHERE t=?1", [table], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// Passes of the runtime for `ms` (each a scheduling pass, 100 ms apart).
+    async fn idle(rig: &mut LocalRig, ms: u64) {
+        let until = Instant::now() + Duration::from_millis(ms);
+        rig.until(|_| Instant::now() >= until).await;
+    }
+
+    /// The task of `message` under a return grant whose sender is the
+    /// rig's own session (stage 1: an open grant per local request task).
+    fn grant(rig: &LocalRig, message: &Message) {
+        use crate::runtime::collab::results::{self, Origin, ReturnGrant};
+        let task = rig.work(message);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction().unwrap();
+        results::save_grant(
+            &tx,
+            &ReturnGrant {
+                task_id: task.task.task_id.clone(),
+                message_id: message.message_id.clone(),
+                workflow_id: message.workflow_id.clone(),
+                origin: Origin {
+                    target: task.task.target.clone(),
+                    control_gen: rig.bridge.host.control_gen("local"),
+                    route: None,
+                },
+                recipient: task.task.target.clone(),
+                expires_at: message.expires_at,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn reply(rig: &mut LocalRig, task: &str, text: &str, vault: &[&str]) -> Result<String, String> {
+        rig.bridge
+            .collab_reply(
+                &rig.sid,
+                crate::runtime::collab::ReplyRequest {
+                    task_id: Some(task.into()),
+                    text: text.into(),
+                    memory: vec![],
+                    vault: vault.iter().map(|v| v.to_string()).collect(),
+                },
+                &rig.sessions,
+            )
+            .map(|row| row.result_id)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Spec section 10, "Storage": a grant or result is written when its
+    /// state changes, never on a pass where nothing did. "Ending early": a
+    /// task whose sender is gone fails ("sender gone") instead of waiting.
+    #[test]
+    fn grants_are_written_on_change_only_and_a_gone_sender_fails_its_task() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let message = rig.message();
+            rig.publish(&message);
+            grant(&rig, &message);
+            count_writes(&rig);
+            let task = rig.work(&message).task.task_id;
+            rig.until(|r| r.work(&message).turn_id.is_some()).await;
+            assert_eq!(reply(&mut rig, &task, "done", &[]).map(|_| ()), Ok(()));
+            std::fs::write(rig.fake.join("complete"), "").unwrap();
+            rig.until(|r| r.work(&message).status.state == WorkState::AwaitingResult)
+                .await;
+            idle(&mut rig, 300).await;
+            let (grants, results) = (writes(&rig, "return_grants"), writes(&rig, "results"));
+            assert_eq!(results, 1, "the reply, once");
+            // Nothing changes: nothing is written, pass after pass.
+            idle(&mut rig, 800).await;
+            assert_eq!(writes(&rig, "return_grants"), grants);
+            assert_eq!(writes(&rig, "results"), results);
+            assert_eq!(rig.work(&message).status.state, WorkState::AwaitingResult);
+
+            // The sending process ends: the grant ends once, and the task
+            // waits for nobody.
+            rig.sessions[&rig.sid].stop().unwrap();
+            rig.until(|r| r.work(&message).status.state == WorkState::Failed)
+                .await;
+            assert_eq!(rig.work(&message).status.detail, "sender gone");
+            idle(&mut rig, 500).await;
+            assert_eq!(writes(&rig, "return_grants"), grants + 1);
+            assert_eq!(writes(&rig, "results"), results);
+            let state: String = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT state FROM return_grants WHERE task_id=?1",
+                    [&task],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "ended");
+        });
+    }
+
+    /// Malformed references and text out of bounds are refused before a
+    /// result row exists (spec section 10; a reply's vault reference names
+    /// its entry).
+    #[test]
+    fn a_malformed_reply_is_refused_before_a_row_exists() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let message = rig.message();
+            rig.publish(&message);
+            let task = rig.work(&message).task.task_id;
+            rig.until(|r| r.work(&message).turn_id.is_some()).await;
+            let stored = |rig: &LocalRig| {
+                crate::runtime::collab::results::load(
+                    &rig.bridge.work.store.as_ref().unwrap().db,
+                    &task,
+                )
+                .unwrap()
+                .is_some()
+            };
+            let long = "x".repeat(16 * 1024 + 1);
+            for (text, vault, error) in [
+                (
+                    "a bare reference",
+                    &["v-context@1"][..],
+                    "ambiguous vault reference v-context@1: a reply names the entry, ID:ENTRY@VERSION",
+                ),
+                (long.as_str(), &[][..], "a reply's text is at most 16 KiB"),
+                ("a bell \u{7}", &[][..], "the reply has control characters"),
+                (
+                    "clear \u{1b}[2J",
+                    &[][..],
+                    "the reply has control characters",
+                ),
+                ("over\rwritten", &[][..], "the reply has control characters"),
+            ] {
+                assert_eq!(
+                    reply(&mut rig, &task, text, vault),
+                    Err(error.to_string()),
+                    "{text:.20}"
+                );
+                assert!(!stored(&rig), "{text:.20}");
+            }
+            // At the bound, with newlines and tabs: stored.
+            let text = format!("{}\n\t", "x".repeat(16 * 1024 - 2));
+            assert!(reply(&mut rig, &task, &text, &[]).is_ok());
+            assert!(stored(&rig));
+        });
+    }
+
     fn send_request(to: &[&str]) -> crate::runtime::collab::SendRequest {
         crate::runtime::collab::SendRequest {
             to: to.iter().map(|s| s.to_string()).collect(),
@@ -1851,7 +2041,8 @@ principals = ["local"]
     }
 
     /// The switches in `runtime.toml` pause local work; they never fence it.
-    /// Only a real change of authority does.
+    /// Only a real change of authority does. `[collab] send = false` is no
+    /// pause at all: it refuses new sends, and local work goes on.
     #[test]
     fn a_pause_keeps_the_local_attachment_and_its_control_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1888,11 +2079,10 @@ principals = ["local"]
             // Each pause, then the recovery: the same attachment, the same
             // generation, nothing fenced.
             let good = bridge.work.config.clone();
-            for pause in 0..4 {
+            for pause in 0..3 {
                 match pause {
                     0 => bridge.work.config.enabled = false,
-                    1 => bridge.work.config.collab.send = false,
-                    2 => {
+                    1 => {
                         bridge.work.config = Config::default();
                         bridge.work.config_problem = Some("expected a table".into());
                     }
@@ -1914,9 +2104,18 @@ principals = ["local"]
                 assert_eq!(bridge.host.control_gen("local"), generation);
             }
 
+            // Sending switched off: local work goes on as it was.
+            bridge.work.config.collab.send = false;
+            bridge.sync_local(&mut cx);
+            assert!(bridge.local_healthy());
+            assert!(bridge.collab_paused().is_empty());
+            assert_eq!(bridge.local_attachment(), attachment);
+            assert_eq!(bridge.host.control_gen("local"), generation);
+            bridge.work.config.collab.send = true;
+
             // A pause that began before any attachment: it comes with the
             // recovery, and still nothing was fenced.
-            bridge.work.config.collab.send = false;
+            bridge.work.config.enabled = false;
             let mut other = identity;
             other.host_trust_gen += 1;
             assert!(bridge.adopt_identity(&other, &mut cx));
@@ -1926,7 +2125,10 @@ principals = ["local"]
             assert!(fenced > generation, "a new host identity fences `local`");
             bridge.sync_local(&mut cx);
             assert_eq!(bridge.host.control_gen("local"), fenced);
-            bridge.work.config.collab.send = true;
+            // Back with sending still off: the attachment the queued local
+            // work needs comes back too.
+            bridge.work.config.enabled = true;
+            bridge.work.config.collab.send = false;
             bridge.sync_local(&mut cx);
             assert!(!bridge.local_attachment().is_empty());
             assert_eq!(bridge.host.control_gen("local"), fenced);

@@ -110,6 +110,16 @@ pub fn resolve(
         .collect()
 }
 
+/// An hour row's window: the rolling hour after its message.
+const HOUR_MS: u64 = 3_600_000;
+
+/// A workflow's row lasts two days from the latest message it counted: no
+/// message lives longer than a day, and a turn one of them started may
+/// outlast it. After that, nothing can send under the workflow any more.
+const WORKFLOW_WINDOW_MS: u64 = 2 * atem_client::session::host_work::MAX_LIFETIME_MS;
+
+/// Counts `amount` messages in the row of `key` whose window starts at
+/// `window`.
 fn count(
     tx: &Transaction<'_>,
     key: &str,
@@ -137,6 +147,32 @@ fn count(
     Ok(())
 }
 
+/// Counts `amount` messages of a workflow (`key`): one row for the whole
+/// workflow, whose window starts at the latest message it counted (`now`;
+/// never moved back by a message accepted late).
+fn count_workflow(
+    tx: &Transaction<'_>,
+    key: &str,
+    now: u64,
+    amount: u32,
+    limit: u32,
+) -> Result<()> {
+    let (previous, since): (u32, u64) = tx.query_row(
+        "SELECT coalesce(sum(count),0),coalesce(max(window_start_ms),0) FROM counters WHERE key=?1",
+        [key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if previous.checked_add(amount).is_none_or(|n| n > limit) {
+        bail!("limit: {limit} messages per workflow");
+    }
+    tx.execute("DELETE FROM counters WHERE key=?1", [key])?;
+    tx.execute(
+        "INSERT INTO counters(key,window_start_ms,count) VALUES(?1,?2,?3)",
+        params![key, since.max(now), previous + amount],
+    )?;
+    Ok(())
+}
+
 pub(super) fn count_send(
     tx: &Transaction<'_>,
     config: &Collab,
@@ -144,27 +180,17 @@ pub(super) fn count_send(
     workflow: &str,
     now: u64,
 ) -> Result<()> {
+    prune_counters(tx, now)?;
     // Rolling hourly windows avoid a double burst at a clock-hour boundary.
-    tx.execute(
-        "DELETE FROM counters WHERE key LIKE 'hour:%' AND window_start_ms<=?1",
-        [now.saturating_sub(3_600_000)],
-    )?;
     let total: u32 = tx.query_row(
         "SELECT coalesce(sum(count),0) FROM counters WHERE key=?1 AND window_start_ms>?2",
-        params![format!("hour:{from}"), now.saturating_sub(3_600_000)],
+        params![format!("hour:{from}"), now.saturating_sub(HOUR_MS)],
         |r| r.get(0),
     )?;
     if total >= config.per_hour {
         bail!("limit: {} messages per hour", config.per_hour);
     }
-    count(
-        tx,
-        &format!("send:{workflow}"),
-        0,
-        1,
-        config.per_workflow,
-        "messages per workflow",
-    )?;
+    count_workflow(tx, &format!("send:{workflow}"), now, 1, config.per_workflow)?;
     count(
         tx,
         &format!("hour:{from}"),
@@ -177,15 +203,34 @@ pub(super) fn count_send(
 
 /// A message counts once toward what a workflow may receive, however many
 /// agents it reaches. Results are not messages here and count against nothing.
-pub(super) fn count_received(tx: &Transaction<'_>, config: &Collab, workflow: &str) -> Result<()> {
-    count(
+pub(super) fn count_received(
+    tx: &Transaction<'_>,
+    config: &Collab,
+    workflow: &str,
+    now: u64,
+) -> Result<()> {
+    count_workflow(
         tx,
         &format!("receive:{workflow}"),
-        0,
+        now,
         1,
         config.per_workflow,
-        "messages per workflow",
     )
+}
+
+/// Removes the counter rows whose window has passed (spec section 6): an
+/// hour row an hour after its message, a workflow's row two days after its
+/// latest message. Deletes nothing (and writes nothing) when none has.
+pub(super) fn prune_counters(db: &rusqlite::Connection, now: u64) -> Result<()> {
+    db.execute(
+        "DELETE FROM counters WHERE window_start_ms <=
+        CASE WHEN key LIKE 'hour:%' THEN ?1 ELSE ?2 END",
+        params![
+            now.saturating_sub(HOUR_MS),
+            now.saturating_sub(WORKFLOW_WINDOW_MS)
+        ],
+    )?;
+    Ok(())
 }
 
 /// Would one more message fit the sender's limits? Nothing is recorded: the
@@ -217,7 +262,7 @@ pub(super) fn check_send(
         in_flight("workflow_id", workflow)?,
     );
     count(&tx, &format!("hour:{from}"), now, sender, u32::MAX, "")?;
-    count(&tx, &format!("send:{workflow}"), 0, flow, u32::MAX, "")?;
+    count_workflow(&tx, &format!("send:{workflow}"), now, flow, u32::MAX)?;
     count_send(&tx, config, from, workflow, now)
 }
 
@@ -410,9 +455,36 @@ pub(super) fn persist(
     Ok(())
 }
 
-pub(super) fn views(store: &Store, id: Option<&str>) -> Result<Vec<MessageView>> {
-    let mut query = store.db.prepare("SELECT message_id,envelope,state,detail FROM outbox WHERE (?1 IS NULL OR message_id=?1) ORDER BY created_ms DESC,rowid DESC LIMIT 32")?;
-    let rows = query.query_map([id], |row| {
+/// The session that sent the local message of task `task_id`, if any.
+pub(super) fn sender_of(store: &Store, task_id: &str) -> Result<Option<String>> {
+    Ok(store
+        .db
+        .query_row(
+            "SELECT json_extract(o.envelope,'$.from_session') FROM resolutions r
+            JOIN outbox o USING(message_id) WHERE r.task_id=?1",
+            [task_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The latest 32 messages (or message `id`), bounded to 1 MiB. With a
+/// `scope` (the calling session): the messages it sent, with all their
+/// tasks, and the messages with a task sent to it, with that task only.
+pub(super) fn views(
+    store: &Store,
+    id: Option<&str>,
+    scope: Option<&str>,
+) -> Result<Vec<MessageView>> {
+    let mut query = store.db.prepare(
+        "SELECT message_id,envelope,state,detail FROM outbox o
+        WHERE (?1 IS NULL OR message_id=?1)
+        AND (?2 IS NULL OR json_extract(envelope,'$.from_session')=?2
+            OR EXISTS(SELECT 1 FROM resolutions r WHERE r.message_id=o.message_id AND r.session_id=?2))
+        ORDER BY created_ms DESC,rowid DESC LIMIT 32",
+    )?;
+    let rows = query.query_map(params![id, scope], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -424,11 +496,14 @@ pub(super) fn views(store: &Store, id: Option<&str>) -> Result<Vec<MessageView>>
         .map(|row| {
             let (message_id, envelope, delivery, detail) = row?;
             let message: Message = serde_json::from_str(&envelope)?;
-            let mut q = store
-                .db
-                .prepare("SELECT task_id FROM resolutions WHERE message_id=?1 ORDER BY rowid")?;
+            // Another session's message: only the task sent to `scope`.
+            let only = scope.filter(|s| message.from_session.as_deref() != Some(*s));
+            let mut q = store.db.prepare(
+                "SELECT task_id FROM resolutions WHERE message_id=?1
+                AND (?2 IS NULL OR session_id=?2) ORDER BY rowid",
+            )?;
             let tasks = q
-                .query_map([&message_id], |r| r.get::<_, String>(0))?
+                .query_map(params![&message_id, only], |r| r.get::<_, String>(0))?
                 .map(|id| {
                     let r = store
                         .work(&id?)?
@@ -491,6 +566,11 @@ pub(super) fn save_tags(
         &serde_json::to_vec(&(&session.process_gen, session.self_tags()))?,
     )?;
     Ok(())
+}
+
+/// A removed session's tags go with it.
+pub(super) fn remove_tags(state: &std::path::Path, session_id: &str) {
+    let _ = std::fs::remove_file(state.join(format!("collab-tags-{session_id}.json")));
 }
 
 pub(super) fn restore_tags(state: &std::path::Path, session: &mut super::broker::BrokerSession) {
@@ -628,7 +708,7 @@ mod tests {
     fn accept_one(store: &Store, config: &Collab, from: &str) -> Result<()> {
         let tx = store.db.unchecked_transaction()?;
         count_send(&tx, config, from, "flow", 1_000)?;
-        count_received(&tx, config, "flow")?;
+        count_received(&tx, config, "flow", 1_000)?;
         Ok(tx.commit()?)
     }
 
@@ -665,12 +745,12 @@ mod tests {
         };
         for _ in 0..2 {
             let tx = store.db.unchecked_transaction().unwrap();
-            count_received(&tx, &config, "flow").unwrap();
+            count_received(&tx, &config, "flow", 1_000).unwrap();
             tx.commit().unwrap();
         }
         let tx = store.db.unchecked_transaction().unwrap();
         assert_eq!(
-            count_received(&tx, &config, "flow")
+            count_received(&tx, &config, "flow", 1_000)
                 .unwrap_err()
                 .to_string(),
             "limit: 2 messages per workflow"
@@ -822,6 +902,77 @@ mod tests {
         ] {
             assert!(TASK_PROBLEMS.contains(&problem), "{problem}");
         }
+    }
+
+    fn rows(store: &Store) -> Vec<(String, u64, u32)> {
+        let mut q = store
+            .db
+            .prepare("SELECT key,window_start_ms,count FROM counters ORDER BY key")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// An hour row's window is its hour; a workflow's row lasts while the
+    /// workflow may still send (its latest message lives a day at most, and
+    /// a turn it started may outlast it): two days from that message.
+    #[test]
+    fn counter_rows_of_passed_windows_are_pruned() {
+        const HOUR: u64 = 3_600_000;
+        const DAY: u64 = 24 * HOUR;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let config = Collab {
+            per_workflow: 2,
+            ..Default::default()
+        };
+        let t = 10 * DAY;
+        accept_at(&store, &config, "session", "flow", t);
+        assert_eq!(
+            rows(&store),
+            vec![
+                ("hour:session".into(), t, 1),
+                ("receive:flow".into(), t, 1),
+                ("send:flow".into(), t, 1),
+            ]
+        );
+        // The hour passed: its row goes; the workflow still counts.
+        prune_counters(&store.db, t + HOUR).unwrap();
+        assert_eq!(counted(&store, "hour:session"), 0);
+        assert_eq!(counted(&store, "send:flow"), 1);
+        // A later message of the workflow moves its window: still one row.
+        accept_at(&store, &config, "other", "flow", t + DAY);
+        assert_eq!(counted(&store, "send:flow"), 2);
+        assert_eq!(counted(&store, "receive:flow"), 2);
+        let tx = store.db.unchecked_transaction().unwrap();
+        assert_eq!(
+            count_send(&tx, &config, "third", "flow", t + DAY + 1)
+                .unwrap_err()
+                .to_string(),
+            "limit: 2 messages per workflow"
+        );
+        drop(tx);
+        // Two days after the first message, the second's window remains.
+        prune_counters(&store.db, t + 2 * DAY).unwrap();
+        assert_eq!(counted(&store, "send:flow"), 2);
+        assert_eq!(counted(&store, "receive:flow"), 2);
+        // Two days after the latest: the workflow can't send any more.
+        prune_counters(&store.db, t + 3 * DAY).unwrap();
+        assert!(rows(&store).is_empty(), "{:?}", rows(&store));
+        // Counting prunes too.
+        accept_at(&store, &config, "session", "flow-b", t + 3 * DAY);
+        accept_at(&store, &config, "session", "flow-c", t + 6 * DAY);
+        assert_eq!(counted(&store, "send:flow-b"), 0);
+        assert_eq!(counted(&store, "hour:session"), 1);
+    }
+
+    fn accept_at(store: &Store, config: &Collab, from: &str, flow: &str, now: u64) {
+        let tx = store.db.unchecked_transaction().unwrap();
+        count_send(&tx, config, from, flow, now).unwrap();
+        count_received(&tx, config, flow, now).unwrap();
+        tx.commit().unwrap();
     }
 
     #[test]

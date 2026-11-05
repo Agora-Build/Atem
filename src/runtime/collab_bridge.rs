@@ -16,6 +16,14 @@ use atem_client::session::select::{AgentLabels, MAX_AGENTS, Selector, selectors_
 /// stored the turn it became.
 pub(super) const IN_TURN: &str = "in the agent's turn";
 
+/// A local task whose return grant ended early: its sender can never take
+/// its reply or complete it.
+const SENDER_GONE: &str = "sender gone";
+
+/// How often counter rows whose window passed are pruned (besides at each
+/// counted send).
+const PRUNE_EVERY: Duration = Duration::from_secs(60);
+
 /// A reply's text fits the task that carries it to its sender.
 const MAX_REPLY_TEXT: usize = atem_client::session::host_work::MAX_REPLY_TEXT_BYTES;
 
@@ -249,8 +257,14 @@ impl HostBridge {
             task.status.state,
             WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
         ) {
+            let why = match task.status.state {
+                WorkState::Failed | WorkState::Expired | WorkState::Cancelled => {
+                    format!(" ({})", task.status.detail)
+                }
+                _ => String::new(),
+            };
             bail!(
-                "task {id} is {}; a reply needs it in its turn or awaiting its result",
+                "task {id} is {}{why}; a reply needs it in its turn or awaiting its result",
                 state_name(task.status.state)
             );
         }
@@ -372,7 +386,7 @@ impl HostBridge {
             };
             if now >= task.task.expires_at {
                 self.work.context_jobs.remove(&row.result_id);
-                self.collab_reply_refused(&task_id, "expired before context publication")?;
+                self.collab_reply_refused(&task_id, results::EXPIRED)?;
                 continue;
             }
             let Some(job) = self.work.context_jobs.get_mut(&row.result_id) else {
@@ -424,7 +438,7 @@ impl HostBridge {
     }
 
     /// A reply's publication was refused for good; its task says so, and a
-    /// corrected reply may replace it.
+    /// corrected reply may replace it while the task has not expired.
     fn collab_reply_refused(&self, task_id: &str, detail: &str) -> Result<()> {
         let store = self.work.store.as_ref().unwrap();
         let tx = store.db.unchecked_transaction()?;
@@ -601,34 +615,70 @@ impl HostBridge {
         .into();
         let tx = store.db.unchecked_transaction()?;
         store.save_work(&task)?;
-        // Completed: no delivery is queued from now on.
+        // Completed: no delivery is queued, or prompted, from now on.
         tx.execute(
-            "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state='open'",
+            "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state IN ('open','consumed')",
             [task_id],
         )?;
+        let delivery = reply
+            .as_ref()
+            .and_then(|r| r.work_id.as_deref())
+            .map(|id| store.work(id))
+            .transpose()?
+            .flatten();
+        if let Some(mut delivery) = delivery
+            && matches!(
+                delivery.status.state,
+                WorkState::Queued | WorkState::Blocked
+            )
+        {
+            delivery.status.state = WorkState::Cancelled;
+            delivery.status.detail = "not delivered: its task was completed by its sender".into();
+            store.save_work(&delivery)?;
+        }
         tx.commit()?;
         Ok(())
     }
 
-    /// Each open return grant: ended once it is no longer live; otherwise
-    /// the one delivery of a submitted reply (where the origin route opts
-    /// in), or a report on a silent turn. Runs only outside a pause.
+    /// Each return grant still open or consumed (spec section 10). One that
+    /// is no longer live ends: when it ended early (its sender's process
+    /// ended, the sender's authority or the route changed) its task fails
+    /// ("sender gone") instead of waiting, with a delivery still queued for
+    /// it; one that ran out ends with its task, which expires at its deadline
+    /// (`Store::expire_awaiting`). An open, live grant permits the one
+    /// delivery of a submitted reply (where the origin route opts in), or a
+    /// report on a silent turn. A grant is written only when its state
+    /// changes. Runs only outside a pause.
     fn collab_result_pass(&mut self, sessions: &BTreeMap<SessionId, BrokerSession>) -> Result<()> {
         let store = self.work.store.as_ref().unwrap();
         let now = host_now().wall_ms;
-        let mut q = store.db.prepare("SELECT w.record,g.record,g.awaiting_since_ms FROM return_grants g JOIN work w ON w.id=g.task_id WHERE g.state='open'")?;
+        let mut q = store.db.prepare(
+            "SELECT w.record,g.record,g.state,g.awaiting_since_ms FROM return_grants g
+            JOIN work w ON w.id=g.task_id WHERE g.state IN ('open','consumed')",
+        )?;
         let pending = q
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, Option<u64>>(2)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<u64>>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (task, grant, since) in pending {
+        for (task, grant, state, since) in pending {
             let mut task: WorkRecord = serde_json::from_str(&task)?;
             let grant: ReturnGrant = serde_json::from_str(&grant)?;
+            // A broker that just started reads each session's launch record
+            // (its project) on its first passes: until the sender's is read,
+            // its route can't be checked, which is no change.
+            if grant.origin.route.is_some()
+                && self
+                    .project_unread
+                    .contains_key(&grant.origin.target.session_id)
+            {
+                continue;
+            }
             let store = self.work.store.as_ref().unwrap();
             let live = self.collab_origin_live(&grant.origin, sessions)
                 && grant.live(
@@ -639,15 +689,19 @@ impl HostBridge {
                     self.work_route_allowed(&task, &Sender::Local),
                 );
             if !live {
-                store.db.execute(
-                    "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state='open'",
+                let tx = store.db.unchecked_transaction()?;
+                tx.execute(
+                    "UPDATE return_grants SET state='ended'
+                    WHERE task_id=?1 AND state IN ('open','consumed')",
                     [&grant.task_id],
                 )?;
-                if now >= task.task.expires_at && task.status.state == WorkState::AwaitingResult {
-                    task.status.state = WorkState::Expired;
-                    task.status.detail = "task expired without an explicit result".into();
-                    store.save_work(&task)?;
+                if now < grant.expires_at {
+                    self.collab_sender_gone(&mut task)?;
                 }
+                tx.commit()?;
+                continue;
+            }
+            if state != "open" {
                 continue;
             }
             let reply = results::load(&store.db, &grant.task_id)?;
@@ -726,11 +780,41 @@ impl HostBridge {
         Ok(())
     }
 
+    /// The sender of `task` is gone for good: the task, and a delivery of
+    /// its reply still waiting to be prompted, fail instead of waiting for
+    /// it (spec section 10, "Ending early"). Settled ones stay as they are.
+    fn collab_sender_gone(&self, task: &mut WorkRecord) -> Result<()> {
+        let store = self.work.store.as_ref().unwrap();
+        if !task.status.state.terminal() || task.status.state == WorkState::OutcomeUnknown {
+            task.status.state = WorkState::Failed;
+            task.status.detail = SENDER_GONE.into();
+            store.save_work(task)?;
+        }
+        let delivery = results::load(&store.db, &task.task.task_id)?
+            .and_then(|row| row.work_id)
+            .map(|id| store.work(&id))
+            .transpose()?
+            .flatten();
+        if let Some(mut delivery) = delivery
+            && matches!(
+                delivery.status.state,
+                WorkState::Queued | WorkState::Blocked
+            )
+        {
+            delivery.status.state = WorkState::Failed;
+            delivery.status.detail = SENDER_GONE.into();
+            store.save_work(&delivery)?;
+        }
+        Ok(())
+    }
+
     /// What pauses local collaboration, in the owner's words: `runtime.toml`
-    /// not loading, hosting or `[collab] send` switched off, the receipt
-    /// database failed. A pause only waits (spec section 9): nothing is
-    /// fenced, and everything resumes once these are gone. Empty exactly when
-    /// the pause is over (`local_healthy` adds the authority checks).
+    /// not loading, hosting switched off, the receipt database failed. A
+    /// pause only waits (spec section 9): queued local tasks, replies and
+    /// their deliveries wait, nothing is fenced, and everything resumes once
+    /// these are gone. Empty exactly when the pause is over (`local_healthy`
+    /// adds the authority checks). `[collab] send = false` is no pause: the
+    /// owner's setting refuses new sends only (`collab_unavailable`).
     pub(super) fn collab_paused(&self) -> Vec<String> {
         if let Some(problem) = &self.work.config_problem {
             return vec![format!(
@@ -741,21 +825,22 @@ impl HostBridge {
         if !self.work.config.enabled {
             paused.push("set `enabled = true` in runtime.toml".to_string());
         }
-        if !self.work.config.collab.send {
-            paused.push("set `[collab] send = true` in runtime.toml".to_string());
-        }
         if self.work.error {
             paused.push("agent hosting records are unavailable; run `atem runtime restart`".into());
         }
         paused
     }
 
-    /// What keeps local collaboration from running, in the owner's words: the
-    /// pauses (`collab_paused`), the pairing and the device list.
+    /// What keeps a new send from going out, in the owner's words: the
+    /// pauses (`collab_paused`), sending switched off, the pairing and the
+    /// device list.
     fn collab_unavailable(&self) -> Vec<String> {
         let mut missing = self.collab_paused();
         if self.work.config_problem.is_some() {
             return missing;
+        }
+        if !self.work.config.collab.send {
+            missing.push("set `[collab] send = true` in runtime.toml".to_string());
         }
         missing.extend(self.collab_unauthorized());
         missing
@@ -1182,7 +1267,12 @@ impl HostBridge {
                     &message.workflow_id,
                     message.created_at,
                 )?;
-                collab::count_received(tx, &self.work.config.collab, &message.workflow_id)?;
+                collab::count_received(
+                    tx,
+                    &self.work.config.collab,
+                    &message.workflow_id,
+                    message.created_at,
+                )?;
                 tx.execute(
                     "INSERT INTO origins(message_id,record) VALUES(?1,?2)",
                     rusqlite::params![message.message_id, serde_json::to_string(origin)?],
@@ -1249,6 +1339,10 @@ impl HostBridge {
         self.collab_result_pass(cx.sessions)?;
         let now = host_now().wall_ms;
         let store = self.work.store.as_ref().unwrap();
+        if Instant::now() >= self.work.pruned {
+            self.work.pruned = Instant::now() + PRUNE_EVERY;
+            collab::prune_counters(&store.db, now)?;
+        }
         store.db.execute(
             "UPDATE outbox SET state='expired',detail='expired before context publication'
             WHERE state='publishing' AND json_extract(envelope,'$.expires_at')<=?1",
@@ -1317,7 +1411,14 @@ impl HostBridge {
         Ok(())
     }
 
-    pub fn collab_status(&mut self, id: Option<&str>) -> Result<Vec<MessageView>> {
+    /// `atem message status`: inside a session (`caller`), the messages it
+    /// sent and the tasks sent to it; from outside any session, everything
+    /// (spec section 10, "Who sees what").
+    pub fn collab_status(
+        &mut self,
+        caller: Option<&SessionId>,
+        id: Option<&str>,
+    ) -> Result<Vec<MessageView>> {
         self.work_config();
         if self.work.store.is_some() && !self.work_store_ready(&self.work_host()) {
             bail!("collaboration receipt store unavailable");
@@ -1325,10 +1426,12 @@ impl HostBridge {
         let Some(store) = self.work.store.as_ref() else {
             return Ok(vec![]);
         };
-        collab::views(store, id)
+        collab::views(store, id, caller.map(SessionId::as_str))
     }
 
-    pub fn collab_cancel(&mut self, id: &str) -> Result<()> {
+    /// `atem message cancel`: inside a session (`caller`), a task of a
+    /// message it sent; from outside any session, any local task.
+    pub fn collab_cancel(&mut self, caller: Option<&SessionId>, id: &str) -> Result<()> {
         let store = self
             .work
             .store
@@ -1338,6 +1441,13 @@ impl HostBridge {
             .work(id)?
             .filter(|r| r.principal == "local")
             .ok_or_else(|| anyhow!("no local collaboration task"))?;
+        if let Some(caller) = caller
+            && collab::sender_of(store, id)?.as_deref() != Some(caller.as_str())
+        {
+            bail!(
+                "task {id} is not one of this session's messages; only the session that sent it (or the owner, outside any session) cancels it"
+            );
+        }
         if !matches!(task.status.state, WorkState::Queued | WorkState::Blocked) {
             bail!("only queued or blocked tasks can be cancelled");
         }

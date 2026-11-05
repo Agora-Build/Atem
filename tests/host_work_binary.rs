@@ -504,6 +504,30 @@ fn a_service_task_takes_a_reply_from_its_target_session_only() {
     assert!(!ok && err.contains("work_complete"), "{err}");
 }
 
+/// A remote sender's task awaiting its result expires at its deadline like
+/// any other, so it holds no queue slot past it.
+#[test]
+fn a_service_task_awaiting_its_result_expires_at_its_deadline() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let mut short = task(&launch, "Short-lived work");
+    short["expires_at"] = json!(r9log::host_now().wall_ms + 4_000);
+    enqueue(&mut dev, &mut r, &short);
+    within("the service's prompt", || {
+        std::fs::read_to_string(rig.fake.join("input"))
+            .unwrap_or_default()
+            .contains("Short-lived work")
+    });
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    wait_state(&mut dev, &mut r, &short["task_id"], "awaiting_result");
+    let status = wait_state(&mut dev, &mut r, &short["task_id"], "expired");
+    assert_eq!(status["detail"], "expired awaiting a result", "{status}");
+}
+
 fn reply_query(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
     dev.request(r, json!({"op":"reply_query","host":host(),"task_id":tid}))
 }

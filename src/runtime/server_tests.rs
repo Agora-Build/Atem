@@ -979,6 +979,8 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
         let log = super::worker::log_path(&runtime.state(), &sid);
         std::fs::write(&lock, "").unwrap();
         std::fs::write(&log, "worker output").unwrap();
+        let tags = runtime.state().join(format!("collab-tags-{sid}.json"));
+        std::fs::write(&tags, "[]").unwrap();
         // This broker already scanned at start: another one adopts it.
         let dir = runtime.dir.clone();
         runtime.shutdown().await;
@@ -1022,8 +1024,9 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
         })
         .await;
         assert!(!record_file(&runtime, &sid).exists());
-        // Its lock and log go with it.
+        // Its lock, log and collaboration tags go with it.
         assert!(!lock.exists() && !log.exists());
+        assert!(!tags.exists());
         assert!(list(&mut client).await.is_empty());
         runtime.shutdown().await;
     });

@@ -1048,6 +1048,331 @@ fn the_owner_completes_a_task_from_outside_any_session() {
     assert!(status["result"].is_null(), "{status}");
 }
 
+/// `atem message send --expires <expires> --to <to> <text>` from the agent
+/// at `fake`; the message id.
+fn send_expiring(rig: &Rig, fake: &Path, n: u32, to: &str, expires: &str, text: &str) -> String {
+    let output = rig.agent(
+        fake,
+        n,
+        &["message", "send", "--expires", expires, "--to", to, text],
+    );
+    assert_eq!(output["code"], 0, "{output}");
+    output["stdout"].as_str().unwrap().trim().to_string()
+}
+
+/// A local task whose sender is gone (its process ended) fails ("sender
+/// gone") instead of waiting for a sender that can never complete it or
+/// take its reply; it holds no slot, and the next task goes on.
+#[test]
+fn a_task_whose_sender_is_gone_fails_instead_of_waiting() {
+    let rig = Rig::new();
+    let (sender, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "the sender leaves");
+    let task = await_task(&rig, &id, &b);
+    let stopped = rig.request(json!({"op":"stop","session_id":sender}), "stopped");
+    assert_eq!(stopped["op"], "stopped", "{stopped}");
+    within("the task failed", || {
+        rig.status(&id)["tasks"][0]["state"] == "failed"
+    });
+    assert_eq!(rig.status(&id)["tasks"][0]["detail"], "sender gone");
+    let late = rig.agent(&b, 1, &["message", "reply", "--task", &task, "too late"]);
+    assert_ne!(late["code"], 0, "{late}");
+    assert!(
+        late["stderr"].as_str().unwrap().contains("sender gone"),
+        "{late}"
+    );
+    let (_, c) = rig.launch("c", "next");
+    rig.send(&c, 1, "tag:b", "the next task");
+    within("the next task", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("the next task")
+    });
+}
+
+/// A task awaiting its result expires at its deadline like any other: one
+/// nobody answered, and one whose reply already reached its sender (its
+/// return grant used). An expired task takes no reply.
+#[test]
+fn tasks_awaiting_their_result_expire_at_their_deadline() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let silent = send_expiring(&rig, &a, 1, "tag:b", "4s", "nobody answers");
+    let task = await_task(&rig, &silent, &b);
+    let answered = send_expiring(&rig, &a, 2, "tag:b", "6s", "answer this one");
+    within("the second prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("answer this one")
+    });
+    private(&b.join("complete"), "");
+    within("the second task awaits its result", || {
+        rig.status(&answered)["tasks"][0]["state"] == "awaiting_result"
+    });
+    let second = rig.status(&answered)["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reply = rig.agent(
+        &b,
+        1,
+        &["message", "reply", "--task", &second, "the answer in time"],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("the reply delivered", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("the answer in time")
+    });
+    for id in [&silent, &answered] {
+        within("the task expired", || {
+            rig.status(id)["tasks"][0]["state"] == "expired"
+        });
+        let status = &rig.status(id)["tasks"][0];
+        assert_eq!(status["detail"], "expired awaiting a result", "{status}");
+    }
+    assert_eq!(
+        rig.status(&answered)["tasks"][0]["result"]["state"],
+        "submitted"
+    );
+    let late = rig.agent(&b, 2, &["message", "reply", "--task", &task, "too late"]);
+    assert_ne!(late["code"], 0, "{late}");
+    assert!(
+        late["stderr"].as_str().unwrap().contains("expired"),
+        "{late}"
+    );
+}
+
+/// `atem message status` as the agent at `fake` prints it.
+fn status_text(rig: &Rig, fake: &Path, n: u32, args: &[&str]) -> String {
+    let argv: Vec<&str> = ["message", "status"]
+        .into_iter()
+        .chain(args.iter().copied())
+        .collect();
+    let output = rig.agent(fake, n, &argv);
+    assert_eq!(output["code"], 0, "{output}");
+    output["stdout"].as_str().unwrap().to_string()
+}
+
+/// Inside a session, `atem message status` shows the messages it sent and
+/// the tasks sent to it, and `atem message cancel` works on its own messages
+/// only; from outside any session both cover everything.
+#[test]
+fn inside_a_session_status_and_cancel_cover_its_own_messages() {
+    let rig = Rig::new();
+    let (sa, a) = rig.launch("a", "a");
+    let (sb, b) = rig.launch("b", "b");
+    let (_, c) = rig.launch("c", "c");
+    let busy = rig.send(&a, 1, "tag:b", "keeps b busy");
+    within("b busy", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("keeps b busy")
+    });
+    let mine = rig.send(&a, 2, "tag:b", "a's queued task");
+    let both = rig.agent(
+        &c,
+        1,
+        &[
+            "message",
+            "send",
+            "--to",
+            "tag:a",
+            "--to",
+            "tag:b",
+            "c's message to both",
+        ],
+    );
+    assert_eq!(both["code"], 0, "{both}");
+    let both = both["stdout"].as_str().unwrap().trim().to_string();
+    let task_id = |id: &str, session: &str| -> String {
+        task_of(&rig, id, session)["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (busy_task, mine_task) = (task_id(&busy, &sb), task_id(&mine, &sb));
+    let (to_a, to_b) = (task_id(&both, &sa), task_id(&both, &sb));
+
+    let in_a = status_text(&rig, &a, 3, &[]);
+    for shown in [&busy, &mine, &both, &busy_task, &mine_task, &to_a] {
+        assert!(in_a.contains(shown.as_str()), "{shown}: {in_a}");
+    }
+    assert!(!in_a.contains(&to_b), "{in_a}");
+    let in_b = status_text(&rig, &b, 1, &[]);
+    for shown in [&busy, &mine, &both, &busy_task, &mine_task, &to_b] {
+        assert!(in_b.contains(shown.as_str()), "{shown}: {in_b}");
+    }
+    assert!(!in_b.contains(&to_a), "{in_b}");
+    let in_c = status_text(&rig, &c, 2, &[]);
+    for shown in [&both, &to_a, &to_b] {
+        assert!(in_c.contains(shown.as_str()), "{shown}: {in_c}");
+    }
+    for hidden in [&busy, &mine] {
+        assert!(!in_c.contains(hidden.as_str()), "{hidden}: {in_c}");
+    }
+    // Another session's message by its id: nothing.
+    assert!(!status_text(&rig, &c, 3, &[&busy]).contains(&busy));
+    // From outside any session: every message and every task.
+    let all = rig.request(json!({"op":"message_status"}), "message_status");
+    let all = all["messages"].to_string();
+    for shown in [&busy, &mine, &both, &to_a, &to_b] {
+        assert!(all.contains(shown.as_str()), "{shown}: {all}");
+    }
+
+    // Cancel: only the session that sent the message, or the owner.
+    let refused = rig.agent(&a, 4, &["message", "cancel", &to_b]);
+    assert_ne!(refused["code"], 0, "{refused}");
+    assert!(
+        refused["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("not one of this session's messages"),
+        "{refused}"
+    );
+    assert_eq!(task_of(&rig, &both, &sb)["state"], "blocked");
+    let theirs = rig.agent(&c, 4, &["message", "cancel", &to_b]);
+    assert_eq!(theirs["code"], 0, "{theirs}");
+    assert_eq!(task_of(&rig, &both, &sb)["state"], "cancelled");
+    let owner = rig.request(
+        json!({"op":"message_cancel","task_id":mine_task}),
+        "message_cancelled",
+    );
+    assert_eq!(owner["op"], "message_cancelled", "{owner}");
+    assert_eq!(task_of(&rig, &mine, &sb)["state"], "cancelled");
+}
+
+/// The sender completes its task only once the reply is submitted, and
+/// completing it stops a delivery already queued: the result is never
+/// prompted into the sender afterwards.
+#[test]
+fn completing_waits_for_publication_and_stops_a_queued_delivery() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let (_, c) = rig.launch("c", "other");
+    let id = rig.send(&a, 1, "tag:b", "answer with context");
+    let task = await_task(&rig, &id, &b);
+    let text = "Context still publishing.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-held:1@1"));
+    let context = rig.sandbox.dir.path().join("context");
+    private(&context.join(format!("{name}.hold")), "");
+    private(
+        &context.join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-held:1","version":1,"digest":digest,"text":text})
+            .to_string(),
+    );
+    let reply = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-held:1@1",
+            "the held answer",
+        ],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    let early = rig.agent(&a, 2, &["message", "complete", &task]);
+    assert_ne!(early["code"], 0, "{early}");
+    assert!(
+        early["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("still publishing"),
+        "{early}"
+    );
+    // The sender is busy with a task of its own, so the delivery queues.
+    rig.send(&c, 1, "tag:a", "keeps the sender busy");
+    within("the sender busy", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("keeps the sender busy")
+    });
+    std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
+    within("the reply submitted", || {
+        rig.status(&id)["tasks"][0]["result"]["state"] == "submitted"
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let done = rig.agent(&a, 3, &["message", "complete", &task]);
+    assert_eq!(done["code"], 0, "{done}");
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "completed", "{status}");
+    assert_eq!(status["result"]["text"], "the held answer", "{status}");
+    private(&a.join("complete"), "");
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert!(
+        !std::fs::read_to_string(a.join("input"))
+            .unwrap()
+            .contains("the held answer")
+    );
+}
+
+/// After a restart in the task's turn its outcome is unknown; the owner may
+/// still complete it, which ends its return grant: the agent's late reply is
+/// refused and nothing reaches the sender.
+#[test]
+fn a_task_whose_outcome_is_unknown_can_be_completed_and_takes_no_reply_after() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "lost in a restart");
+    let task = await_turn(&rig, &id, &session, &b, "lost in a restart");
+    rig.restart();
+    within("outcome unknown after the restart", || {
+        rig.status(&id)["tasks"][0]["state"] == "outcome_unknown"
+    });
+    let (out, err, ok) = rig.sandbox.atem(&["message", "complete", &task]);
+    assert!(ok, "{out}{err}");
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "completed", "{status}");
+    assert_eq!(
+        status["detail"], "completed by its sender without a reply",
+        "{status}"
+    );
+    let late = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "an answer after completion",
+        ],
+    );
+    assert_ne!(late["code"], 0, "{late}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("an answer after completion")
+    );
+}
+
 #[test]
 fn without_results_true_a_result_is_status_only() {
     let rig = Rig::new();
@@ -1281,8 +1606,8 @@ fn a_reply_after_a_restart_in_the_tasks_turn_is_recorded_and_delivered() {
     assert_eq!(status["detail"], "reply submitted", "{status}");
 }
 
-/// A pause refuses new sends only: a reply is stored at once, and reaches
-/// the sender when the pause is over.
+/// A pause (here `runtime.toml` that stops loading) refuses new sends only:
+/// a reply is stored at once, and reaches the sender when the pause is over.
 #[test]
 fn a_reply_during_a_pause_is_kept_and_delivered_after_it() {
     let mut rig = Rig::new();
@@ -1295,7 +1620,7 @@ fn a_reply_during_a_pause_is_kept_and_delivered_after_it() {
     let (_, b) = rig.launch("b", "recipient");
     let id = rig.send(&a, 1, "tag:b", "answer while paused");
     let task = await_task(&rig, &id, &b);
-    rig.write_config(&rig.config.replacen("send = true", "send = false", 1));
+    rig.write_config("version = 1\nenabled = true\n[collab\n");
     // A probe that reaches nobody: refused once the runtime saw the pause.
     let mut n = 10;
     within("the pause", || {
@@ -1799,12 +2124,64 @@ fn switching_hosting_off_pauses_local_work() {
     );
 }
 
+/// `[collab] send = false` while hosting runs is the owner's setting, not a
+/// pause: new sends are refused, while the local tasks already accepted
+/// keep dispatching and replies keep reaching their senders.
 #[test]
-fn switching_send_off_pauses_local_work() {
-    a_pause_waits_and_never_fences(
-        |config| config.replacen("send = true", "send = false", 1),
-        "set `[collab] send = true` in runtime.toml",
+fn switching_send_off_refuses_new_sends_only() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
     );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    rig.send(&a, 1, "tag:b", "first task keeps the agent busy");
+    within("first prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("first task keeps the agent busy")
+    });
+    let second = rig.send(&a, 2, "tag:b", "second task waits");
+    within("second task waits for the busy agent", || {
+        rig.status(&second)["tasks"][0]["state"] == "blocked"
+    });
+    let generation = rig.local_control_gen();
+    rig.write_config(&rig.config.replacen("send = true", "send = false", 1));
+    // A probe that reaches nobody: refused, with the reason, once the
+    // runtime saw the setting.
+    let mut n = 10;
+    within("sending switched off", || {
+        n += 1;
+        let probe = rig.agent(&a, n, &["message", "send", "--to", "tag:nobody", "probe"]);
+        probe["code"] != 0
+            && probe["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("set `[collab] send = true` in runtime.toml")
+    });
+    // The busy agent's reply from its turn is stored and delivered.
+    let early = rig.agent(&b, 2, &["message", "reply", "first answer, sending off"]);
+    assert_eq!(early["code"], 0, "{early}");
+    within("the reply delivered while sending is off", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("first answer, sending off")
+    });
+    // The queued task goes on once the agent is ready.
+    private(&b.join("complete"), "");
+    within("the queued task while sending is off", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("second task waits")
+    });
+    let task = rig.status(&second)["tasks"][0].clone();
+    assert!(
+        !task["detail"].as_str().unwrap().starts_with("paused"),
+        "{task}"
+    );
+    assert_eq!(rig.local_control_gen(), generation, "nothing was fenced");
 }
 
 /// Agent commands connect to the runtime they run in; they never start one or

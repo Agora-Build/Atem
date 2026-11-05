@@ -195,6 +195,10 @@ pub struct ResultRow {
 
 pub const PUBLISHING: &str = "publishing its context";
 
+/// A reply refused because its task expired before its context was
+/// published: an expired task takes no new reply.
+pub const EXPIRED: &str = "expired before context publication";
+
 impl ResultRow {
     /// A new reply: `submitted` at once, unless it has context to publish.
     pub fn new(reply: Reply, now: u64) -> Self {
@@ -265,6 +269,9 @@ impl ResultRow {
         match self.state {
             ReplyState::Publishing => "reply received; publishing its context".into(),
             ReplyState::Submitted => "reply submitted".into(),
+            ReplyState::Refused if self.detail == EXPIRED => {
+                format!("reply refused ({})", self.detail)
+            }
             ReplyState::Refused => format!(
                 "reply refused ({}); a corrected reply replaces it",
                 self.detail
@@ -566,6 +573,34 @@ mod tests {
         assert_eq!(row.reply.text, "smaller");
         assert_eq!(row.created_ms, 140);
         assert!(row.detail.is_empty());
+    }
+
+    /// An expired task takes no new reply, so a reply refused because the
+    /// task expired before its context was published invites none; any
+    /// other refusal does.
+    #[test]
+    fn a_reply_refused_for_its_expired_task_invites_no_correction() {
+        let (_dir, store) = store();
+        let row = ResultRow::new(reply("late", vec![vault(1)]), 100);
+        submit_now(&store, &row).unwrap();
+        refuse(&store.db, row.task_id(), EXPIRED).unwrap();
+        assert_eq!(
+            load(&store.db, row.task_id())
+                .unwrap()
+                .unwrap()
+                .task_detail(),
+            "reply refused (expired before context publication)"
+        );
+        let (_dir, store) = self::store();
+        submit_now(&store, &row).unwrap();
+        refuse(&store.db, row.task_id(), "context changed").unwrap();
+        assert_eq!(
+            load(&store.db, row.task_id())
+                .unwrap()
+                .unwrap()
+                .task_detail(),
+            "reply refused (context changed); a corrected reply replaces it"
+        );
     }
 
     /// The replied task, stored as sent by `principal`.

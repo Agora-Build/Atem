@@ -1901,11 +1901,11 @@ impl HostBridge {
                 .is_none_or(|m| !m.is_frozen() && m.faulted().is_none() && m.held().is_none())
     }
 
-    /// Local collaboration may send and dispatch now: authorized, and not
-    /// paused by `runtime.toml` (not loading, hosting off, `[collab] send`
-    /// off) or a failed receipt database.
+    /// Local work may dispatch now: authorized, and not paused by
+    /// `runtime.toml` (not loading, hosting off) or a failed receipt
+    /// database. `[collab] send` only governs new sends (`collab_ready`).
     pub(super) fn local_healthy(&self) -> bool {
-        self.hosting_enabled() && self.work.collaboration_enabled() && self.local_authorized()
+        self.hosting_enabled() && self.local_authorized()
     }
 
     /// Keeps the internal local attachment. A pause leaves it (and `local`'s

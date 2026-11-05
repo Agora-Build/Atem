@@ -18,6 +18,8 @@ use super::protocol::LaunchEnv;
 pub const CONFIG_FILE: &str = "runtime.toml";
 pub const MAX_RECORDS: usize = 4096;
 pub const MAX_QUEUED: usize = 256;
+/// The detail of a task that was still awaiting its result at its deadline.
+pub const EXPIRED_AWAITING: &str = "expired awaiting a result";
 
 #[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -813,6 +815,37 @@ impl Store {
         Ok(true)
     }
 
+    /// Tasks awaiting their result past their deadline expire, whoever sent
+    /// them and whatever became of their reply or return grant (spec section
+    /// 10): none holds a queue slot forever. An open grant ends with its
+    /// task. Writes only what is due; returns how many expired.
+    pub fn expire_awaiting(&self, now: u64) -> Result<usize> {
+        let due: Vec<WorkRecord> = {
+            let mut q = self.db.prepare(
+                "SELECT record FROM work WHERE state='awaiting_result'
+                AND json_extract(record,'$.task.expires_at')<=?1 ORDER BY rowid",
+            )?;
+            q.query_map([now], |r| r.get::<_, String>(0))?
+                .map(|r| Ok(serde_json::from_str(&r?)?))
+                .collect::<Result<_>>()?
+        };
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.db.unchecked_transaction()?;
+        for mut record in due.iter().cloned() {
+            record.status.state = WorkState::Expired;
+            record.status.detail = EXPIRED_AWAITING.into();
+            self.save_work(&record)?;
+            tx.execute(
+                "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state='open'",
+                [&record.task.task_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(due.len())
+    }
+
     pub fn save_work(&self, record: &WorkRecord) -> Result<()> {
         let state = serde_json::to_value(record.status.state)?;
         if self.db.execute(
@@ -1170,6 +1203,75 @@ mod tests {
             WorkState::OutcomeUnknown
         );
         assert!(!store.enqueue(&record).unwrap());
+    }
+
+    /// Every task awaiting its result expires at its deadline, whoever sent
+    /// it and whatever became of its return grant (open, consumed by a
+    /// delivery, or ended), so a full queue of them frees its slots.
+    #[test]
+    fn tasks_awaiting_a_result_expire_at_their_deadline_and_free_their_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let grants = ["open", "consumed", "ended"];
+        let mut ids = Vec::new();
+        for n in 0..MAX_QUEUED {
+            let mut r = task();
+            if n % 4 > 0 {
+                r.principal = "local".into();
+            }
+            // One waits longer than the others.
+            r.task.expires_at = if n == 7 { 2_000 } else { 1_000 };
+            assert!(store.enqueue(&r).unwrap());
+            r.status.state = WorkState::AwaitingResult;
+            r.status.detail = "reply submitted".into();
+            store.save_work(&r).unwrap();
+            if n % 4 > 0 {
+                store
+                    .db
+                    .execute(
+                        "INSERT INTO return_grants(task_id,record,state) VALUES(?1,'{}',?2)",
+                        params![r.task.task_id, grants[n % 4 - 1]],
+                    )
+                    .unwrap();
+            }
+            ids.push(r.task.task_id);
+        }
+        assert!(!store.has_room().unwrap());
+        assert!(store.enqueue(&task()).is_err());
+        assert_eq!(store.expire_awaiting(999).unwrap(), 0);
+        assert!(!store.has_room().unwrap());
+        assert_eq!(store.expire_awaiting(1_000).unwrap(), MAX_QUEUED - 1);
+        assert!(store.has_room().unwrap());
+        for (n, id) in ids.iter().enumerate() {
+            let r = store.work(id).unwrap().unwrap();
+            if n == 7 {
+                assert_eq!(r.status.state, WorkState::AwaitingResult);
+                continue;
+            }
+            assert_eq!(
+                (r.status.state, r.status.detail.as_str()),
+                (WorkState::Expired, "expired awaiting a result"),
+                "task {n}"
+            );
+        }
+        // An open grant ends with its task; the others stay as they were.
+        let grant = |id: &str| -> String {
+            store
+                .db
+                .query_row(
+                    "SELECT state FROM return_grants WHERE task_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(grant(&ids[1]), "ended");
+        assert_eq!(grant(&ids[2]), "consumed");
+        assert_eq!(grant(&ids[3]), "ended");
+        assert!(store.enqueue(&task()).unwrap());
+        // Nothing more is due: nothing is written.
+        assert_eq!(store.expire_awaiting(1_999).unwrap(), 0);
+        assert_eq!(store.expire_awaiting(2_000).unwrap(), 1);
     }
 
     #[test]
