@@ -17,7 +17,7 @@ use atem_client::session::select::{AgentLabels, MAX_AGENTS, Selector, selectors_
 pub(super) const IN_TURN: &str = "in the agent's turn";
 
 /// A reply's text fits the task that carries it to its sender.
-const MAX_REPLY_TEXT: usize = 16 * 1024;
+const MAX_REPLY_TEXT: usize = atem_client::session::host_work::MAX_REPLY_TEXT_BYTES;
 
 /// What a task's reply does to it: a submitted reply proves its prompt
 /// arrived (an unknown outcome becomes awaiting its result), and the detail

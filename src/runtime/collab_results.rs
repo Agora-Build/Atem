@@ -10,7 +10,7 @@
 use super::*;
 use crate::runtime::collab_context::ContextSpec;
 use atem_client::session::{
-    host_work::{ContextKind, ContextSnapshot, WorkState},
+    host_work::{ContextKind, ContextSnapshot, ResultReply, WorkState},
     wire::Target,
 };
 use rusqlite::Connection;
@@ -128,30 +128,10 @@ pub fn delivery_task(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReplyState {
-    Publishing,
-    Submitted,
-    Refused,
-}
+pub use atem_client::session::host_work::ReplyState;
 
-impl ReplyState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Publishing => "publishing",
-            Self::Submitted => "submitted",
-            Self::Refused => "refused",
-        }
-    }
-    fn parse(text: &str) -> Result<Self> {
-        Ok(match text {
-            "publishing" => Self::Publishing,
-            "submitted" => Self::Submitted,
-            "refused" => Self::Refused,
-            other => bail!("invalid result state {other:?}"),
-        })
-    }
+fn parse_state(text: &str) -> Result<ReplyState> {
+    ReplyState::parse(text).ok_or_else(|| anyhow::anyhow!("invalid result state {text:?}"))
 }
 
 /// What a reply answers, fixed when it is submitted: the task, the session
@@ -261,6 +241,25 @@ impl ResultRow {
         }
     }
 
+    /// The reply as its sender reads it with `reply_query`. A reply that
+    /// isn't submitted has no context yet (or none at all, if refused).
+    pub fn wire(&self) -> ResultReply {
+        ResultReply {
+            result_id: self.result_id.clone(),
+            state: self.state,
+            digest: self.digest.clone(),
+            text: self.reply.text.clone(),
+            context: if self.state == ReplyState::Submitted {
+                self.reply.context.clone()
+            } else {
+                Vec::new()
+            },
+            submitted_at: self
+                .submitted_at
+                .filter(|_| self.state == ReplyState::Submitted),
+        }
+    }
+
     /// What the replied task's detail says about its reply.
     pub fn task_detail(&self) -> String {
         match self.state {
@@ -313,7 +312,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Stored> {
 fn parse(stored: Stored) -> Result<ResultRow> {
     Ok(ResultRow {
         result_id: stored.result_id,
-        state: ReplyState::parse(&stored.state)?,
+        state: parse_state(&stored.state)?,
         detail: stored.detail,
         digest: stored.digest,
         created_ms: stored.created_ms,

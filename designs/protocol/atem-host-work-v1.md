@@ -18,7 +18,8 @@ client core's tests and listed in every SDK's checksum manifest.
 Local collaboration (stage 1, unreleased) reuses these receipts inside one
 runtime; see [../agent-collaboration.md](../agent-collaboration.md). Its shared
 types include `select`, optional message correlation fields, and locally
-stored `result` context snapshots. The host does not advertise `host.select`;
+stored `result` context snapshots. The host advertises `host.reply` (§4,
+`reply_query`) but not `host.select`;
 remote host admission refuses selector destinations, the `local` sender,
 local UUIDv5 task references and `result` context snapshots. Remote admission
 still requires the contract below. Cross-instance selector/result support waits for
@@ -30,10 +31,11 @@ the stage-2 agreement.
 |---|---|
 | `host.launch` | `host_profiles`, `host_launch`, `host_launch_query` |
 | `host.work` | `work_enqueue`, `work_query`, `work_cancel`, `work_complete` |
+| `host.reply` | `reply_query` |
 | `host.messages` | `message_publish`, `message_query` |
 | `host.attachments` | `attachment_put` |
 
-A host lists all four in r9 `welcome.features` when hosting is enabled and
+A host lists all five in r9 `welcome.features` when hosting is enabled and
 healthy and its work database is open, else none; an r8 host never does.
 Clients check the feature before sending. When hosting turns off under an open
 channel, or 64 host-work requests already wait for the host's next pass, a
@@ -66,7 +68,7 @@ R9.6 gains three ops for service `scope.ops` and browser grant `ops`:
 | Op | Requests | Control op |
 |---|---|---|
 | `launch` | `host_profiles`, `host_launch`, `host_launch_query` | yes |
-| `notify` | `work_enqueue`, `work_query`, `work_cancel`, `work_complete` | yes |
+| `notify` | `work_enqueue`, `work_query`, `reply_query`, `work_cancel`, `work_complete` | yes |
 | `message` | `message_publish`, `message_query`, `attachment_put` | no |
 
 A native member needs the `control` role for the `launch` and `notify`
@@ -161,6 +163,7 @@ receipts once its activity is `ready`.
 | `work_query` | `task_id` | `work` |
 | `work_cancel` | `task_id` | `work` |
 | `work_complete` | `task_id`, `result` | `work` |
+| `reply_query` | `task_id` | `reply` (feature `host.reply`) |
 
 ### Task
 
@@ -273,6 +276,57 @@ receipt first.
 - `work_complete` carries `result`, a context snapshot. From
   `awaiting_result` it moves to `completed`. The same result again returns the
   status; another result is `request_id_reused`; other states are `busy`.
+
+### Reply
+
+The agent working on a task submits one reply with `atem message reply`, for a
+task of any sender (see
+[../agent-collaboration.md](../agent-collaboration.md), section 10). The
+sender reads it with `reply_query` (feature `host.reply`). A reply is
+read-only data: it never completes the task (`work_complete` does, whether or
+not the sender read the reply), and no existing message or status changes.
+
+```json
+{"type":"session","data":{"v":1,"op":"reply_query","id":"11111111-1111-4111-8111-111111111111",
+  "host":{"account_id":"account","atem_device_id":"host","host_trust_gen":1},
+  "task_id":"22222222-2222-4222-8222-222222222222"}}
+```
+
+`task_id` is a UUID v4: a task's id, or the `recipient_id` of an agent
+recipient (§5). The result is `{"kind":"reply","reply":null}` while the task
+has no reply, else:
+
+```json
+{"kind":"reply","reply":{"result_id":"6ba7b810-9dad-51d1-80b4-00c04fd430c8","state":"submitted",
+  "digest":"<SHA-256 hex>","text":"Done: /v2/orders is live",
+  "context":[{"kind":"vault","id":"api-contract:3","version":1,"digest":"…","text":"…"}],
+  "submitted_at":1793620800000}}
+```
+
+| Field | Meaning |
+|---|---|
+| `result_id` | UUID v5 of the task id: the same for every reply to the task, a corrected one included |
+| `state` | `publishing`, `submitted` or `refused` (below) |
+| `digest` | SHA-256 (hex) identifying the reply's content: the same for an identical retry, another for a corrected reply. Compare it; don't recompute it |
+| `text` | the reply text: at most 16 KiB, no control characters other than newline and tab |
+| `context` | 0–8 published context snapshots (§4), exact bytes; empty unless `submitted` |
+| `submitted_at` | Unix ms on the host's clock when the reply became `submitted`; `null` before |
+
+| State | Meaning |
+|---|---|
+| `publishing` | the reply is recorded and its context is still being published; `context` is empty, `submitted_at` is `null`. Query again |
+| `submitted` | final: the text and the published context. The reply is not changed afterwards, and an identical retry returns it |
+| `refused` | the host refused the reply (for example its context can't be delivered within the task bounds); `context` is empty. The task's `detail` (`work_query`) says why, and the agent's corrected reply replaces this one under the same `result_id` |
+
+The host checks exactly what `work_query` checks, in the same order: only the
+principal and key that enqueued the task (or sent the message), under a route
+that still allows it, may read its reply. Anyone else, an unknown task, a
+task of the host's own `local` sender and a caller without the `notify` op
+get the answer `work_query` gives them for that task, `forbidden`. An
+`outcome_unknown` task is reconciled from its receipt first. Storage failure
+is `busy`. A reply may exist while the task is still `submitted` (the agent
+replies in its turn), and a task can end with no reply (a silent turn): poll
+`reply_query` for the reply and `work_query` for the task.
 
 ## 5. Messages
 
@@ -453,7 +507,7 @@ Every success is a `host_work_result`:
 ```json
 {"type":"session","data":{"v":1,"op":"host_work_result","id":"<fresh UUID v4>","re":"<request id>",
   "host":{…},"attachment_gen":"<the channel's>","channel_id":"<the channel's>",
-  "result":{"kind":"profiles|launch|work|message|attachment",…}}}
+  "result":{"kind":"profiles|launch|work|reply|message|attachment",…}}}
 ```
 
 A failure is the ordinary encrypted session `error` with `re` set to the
@@ -468,7 +522,7 @@ request's `id`:
 | `request_id_reused` | the same id with other content |
 | `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state |
 
-After a lost reply, query (`host_launch_query`, `work_query`,
+After a lost reply, query (`host_launch_query`, `work_query`, `reply_query`,
 `message_query`) or resend the same content with a fresh `id`. Never mint a
 new `request_id`, `task_id` or `message_id` for the same intent.
 
@@ -478,7 +532,8 @@ new `request_id`, `task_id` or `message_id` for the same intent.
 triple and the feature against `welcome`, refuses a duplicate exchange `id`
 and keeps at most 64 exchanges outstanding. A `host_work_result` is accepted
 only on the channel's `attachment_gen` and `channel_id`, for an outstanding
-exchange it answers (same host and ids; for a message the digest, sender and
+exchange it answers (same host and ids; for a `reply_query` a `reply` result,
+bounded as above; for a message the digest, sender and
 this host's recipient ids in order; for an upload the descriptor and progress
 past the chunk; for `work_complete` the same result), and is emitted as
 `Event::Family` (family `session`). A session `error` with `re` ends the

@@ -700,6 +700,7 @@ impl Attached {
                         | "host_launch_query"
                         | "work_enqueue"
                         | "work_query"
+                        | "reply_query"
                         | "work_cancel"
                         | "work_complete"
                         | "message_publish"

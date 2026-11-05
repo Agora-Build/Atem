@@ -30,6 +30,9 @@ struct Rig {
     log: TestLog,
     runtime: Option<Child>,
     fake: PathBuf,
+    /// Debug-build context snapshots (`ATEM_TEST_CONTEXT_DIR`) for replies
+    /// that carry context; set before `start`.
+    context_hook: bool,
 }
 
 impl Rig {
@@ -128,15 +131,22 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
             log,
             runtime: None,
             fake,
+            context_hook: false,
         }
     }
 
     fn start(&mut self) {
         let output = std::fs::File::create(self.sandbox.dir.path().join("runtime.log")).unwrap();
+        let context = self.sandbox.dir.path().join("context");
+        std::fs::create_dir_all(&context).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
+        command.env_clear();
+        if self.context_hook {
+            command.env("ATEM_TEST_CONTEXT_DIR", &context);
+        }
         self.runtime = Some(
-            Command::new(env!("CARGO_BIN_EXE_atem"))
+            command
                 .arg("runtime")
-                .env_clear()
                 .env("HOME", &self.sandbox.home)
                 .env("XDG_RUNTIME_DIR", &self.sandbox.run)
                 .env("PATH", "/usr/bin:/bin")
@@ -492,6 +502,319 @@ fn a_service_task_takes_a_reply_from_its_target_session_only() {
     // Its sender completes it with work_complete, not the local command.
     let (_, err, ok) = rig.sandbox.atem(&["message", "complete", tid]);
     assert!(!ok && err.contains("work_complete"), "{err}");
+}
+
+fn reply_query(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
+    dev.request(r, json!({"op":"reply_query","host":host(),"task_id":tid}))
+}
+
+/// A service's task whose agent is in its turn: launched, enqueued and
+/// waiting for the reply. Returns the task.
+fn task_in_its_turn(rig: &Rig, r: &mut Router, dev: &mut Dev, text: &str) -> Value {
+    let rid = uuid();
+    dev.launch(r, &rid);
+    let launch = dev.launched(r, &rid);
+    let t = task(&launch, text);
+    enqueue(dev, r, &t);
+    within("the service's prompt", || {
+        std::fs::read_to_string(rig.fake.join("input"))
+            .unwrap_or_default()
+            .contains(text)
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while work(dev, r, &t["task_id"])["detail"] != "in the agent's turn" {
+        assert!(
+            Instant::now() < deadline,
+            "the task's turn was never stored"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    t
+}
+
+/// The `result <id>` the CLI printed for a reply.
+fn result_id_of(run: &Value) -> String {
+    run["stdout"]
+        .as_str()
+        .unwrap()
+        .rsplit("result ")
+        .next()
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// The sender of a task reads the reply its agent submitted with
+/// `reply_query` (feature `host.reply`), with the authority `work_query`
+/// needs and nobody else's; reading it never completes the task.
+#[test]
+fn a_service_reads_its_tasks_reply_with_reply_query() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    assert!(dev.a.welcome().features.iter().any(|f| f == "host.reply"));
+    assert!(!dev.a.welcome().features.iter().any(|f| f == "host.select"));
+    let first = task_in_its_turn(&rig, &mut r, &mut dev, "Answer with atem message reply");
+    let tid = &first["task_id"];
+    // No reply yet: an answer, not an error.
+    let none = reply_query(&mut dev, &mut r, tid);
+    assert_eq!(none["op"], "host_work_result", "{none}");
+    assert_eq!(
+        none["result"],
+        json!({"kind":"reply","reply":null}),
+        "{none}"
+    );
+    // The agent replies in its turn.
+    let run = agent_run(&rig.fake, 1, &["message", "reply", "the service's answer"]);
+    assert_eq!(run["code"], 0, "{run}");
+    let result_id = result_id_of(&run);
+    let response = reply_query(&mut dev, &mut r, tid);
+    assert_eq!(response["result"]["kind"], "reply", "{response}");
+    let reply = &response["result"]["reply"];
+    assert_eq!(reply["result_id"], result_id.as_str(), "{reply}");
+    assert_eq!(reply["state"], "submitted", "{reply}");
+    assert_eq!(reply["text"], "the service's answer", "{reply}");
+    assert_eq!(reply["context"], json!([]), "{reply}");
+    assert!(reply["submitted_at"].as_u64().unwrap() > 0, "{reply}");
+    assert_eq!(reply["digest"].as_str().unwrap().len(), 64, "{reply}");
+    // A reply is not a completion: the task awaits its sender.
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    let status = wait_state(&mut dev, &mut r, tid, "awaiting_result");
+    assert_eq!(status["detail"], "reply submitted", "{status}");
+    assert_eq!(status["result"], Value::Null, "{status}");
+    // The same reply, every time it is asked for.
+    assert_eq!(
+        reply_query(&mut dev, &mut r, tid)["result"]["reply"],
+        *reply
+    );
+    // Anyone else is answered as work_query answers them: a task that isn't
+    // theirs, one that doesn't exist, and a caller without the notify op.
+    let mut others = [
+        Dev::new(&mut r, &rig.log, MAC, false),
+        Dev::new(&mut r, &rig.log, "svc-view", true),
+    ];
+    let unknown = json!(uuid());
+    for (who, name, task_id) in [
+        (0, "another sender", tid),
+        (0, "an unknown task", &unknown),
+        (1, "a caller without notify", tid),
+    ] {
+        let who = &mut others[who];
+        let mut asked = reply_query(who, &mut r, task_id);
+        let mut worked = who.request(
+            &mut r,
+            json!({"op":"work_query","host":host(),"task_id":task_id}),
+        );
+        assert_eq!(asked["code"], "forbidden", "{name}: {asked}");
+        for answer in [&mut asked, &mut worked] {
+            let object = answer.as_object_mut().unwrap();
+            object.remove("id");
+            object.remove("re");
+        }
+        assert_eq!(asked, worked, "{name}");
+    }
+    // Its sender completes the task separately, and still reads the reply.
+    let result = json!({"kind":"vault","id":"result","version":1,"text":"implemented",
+        "digest":atem_client::session::host_work::digest(b"implemented")});
+    let done = dev.request(
+        &mut r,
+        json!({"op":"work_complete","host":host(),"task_id":tid,"result":result}),
+    );
+    assert_eq!(done["result"]["work"]["state"], "completed", "{done}");
+    assert_eq!(done["result"]["work"]["result"], result, "{done}");
+    assert_eq!(
+        reply_query(&mut dev, &mut r, tid)["result"]["reply"],
+        *reply
+    );
+}
+
+/// A reply with context is `publishing` (no context, no time) until the
+/// context is published, then `submitted` with it; it survives a restart.
+#[test]
+fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart() {
+    let mut rig = Rig::prepared("claude", |_| {});
+    rig.context_hook = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let first = task_in_its_turn(&rig, &mut r, &mut dev, "Reply with context");
+    let tid = &first["task_id"];
+    let text = "Context published late.";
+    let digest = atem_client::session::host_work::digest(text.as_bytes());
+    let name = atem_client::session::host_work::digest(b"v-late:1@1");
+    let context = rig.sandbox.dir.path().join("context");
+    private(&context.join(format!("{name}.hold")), "");
+    private(
+        &context.join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-late:1","version":1,"digest":digest,"text":text})
+            .to_string(),
+    );
+    let run = agent_run(
+        &rig.fake,
+        1,
+        &["message", "reply", "--vault", "v-late:1@1", "the answer"],
+    );
+    assert_eq!(run["code"], 0, "{run}");
+    assert!(
+        run["stdout"].as_str().unwrap().contains("reply publishing"),
+        "{run}"
+    );
+    let result_id = result_id_of(&run);
+    let publishing = reply_query(&mut dev, &mut r, tid)["result"]["reply"].clone();
+    assert_eq!(publishing["state"], "publishing", "{publishing}");
+    assert_eq!(publishing["result_id"], result_id.as_str(), "{publishing}");
+    assert_eq!(publishing["text"], "the answer", "{publishing}");
+    assert_eq!(publishing["context"], json!([]), "{publishing}");
+    assert_eq!(publishing["submitted_at"], Value::Null, "{publishing}");
+    assert_eq!(
+        work(&mut dev, &mut r, tid)["detail"],
+        "reply received; publishing its context"
+    );
+    std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let submitted = loop {
+        let reply = reply_query(&mut dev, &mut r, tid)["result"]["reply"].clone();
+        if reply["state"] == "submitted" {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "never published: {reply}");
+        std::thread::sleep(Duration::from_millis(40));
+    };
+    assert_eq!(submitted["result_id"], result_id.as_str(), "{submitted}");
+    assert_eq!(
+        submitted["context"],
+        json!([{"kind":"vault","id":"v-late:1","version":1,"digest":digest,"text":text}]),
+        "{submitted}"
+    );
+    assert!(
+        submitted["submitted_at"].as_u64().unwrap() > 0,
+        "{submitted}"
+    );
+    // The row is durable: the same reply after the runtime restarts.
+    drop(r);
+    rig.restart();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    assert_eq!(
+        reply_query(&mut dev, &mut r, tid)["result"]["reply"],
+        submitted
+    );
+}
+
+/// A refused reply is read as refused (its reason is the task's detail),
+/// and the corrected reply that replaces it keeps the result id.
+#[test]
+fn a_refused_reply_reads_refused_until_a_corrected_one_replaces_it() {
+    let mut rig = Rig::prepared("claude", |_| {});
+    rig.context_hook = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let first = task_in_its_turn(&rig, &mut r, &mut dev, "Reply with too much context");
+    let tid = first["task_id"].as_str().unwrap();
+    let text = "x".repeat(40_000);
+    let name = atem_client::session::host_work::digest(b"v-big:1@1");
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-big:1","version":1,
+            "digest":atem_client::session::host_work::digest(text.as_bytes()),"text":text})
+        .to_string(),
+    );
+    let run = agent_run(
+        &rig.fake,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            tid,
+            "--vault",
+            "v-big:1@1",
+            "too much",
+        ],
+    );
+    assert_eq!(run["code"], 0, "{run}");
+    let result_id = result_id_of(&run);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let refused = loop {
+        let reply = reply_query(&mut dev, &mut r, &json!(tid))["result"]["reply"].clone();
+        if reply["state"] == "refused" {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "never refused: {reply}");
+        std::thread::sleep(Duration::from_millis(40));
+    };
+    assert_eq!(refused["result_id"], result_id.as_str(), "{refused}");
+    assert_eq!(refused["text"], "too much", "{refused}");
+    assert_eq!(refused["context"], json!([]), "{refused}");
+    assert_eq!(refused["submitted_at"], Value::Null, "{refused}");
+    let detail = work(&mut dev, &mut r, &json!(tid))["detail"].clone();
+    assert!(
+        detail.as_str().unwrap().contains("over 32 KiB")
+            && detail.as_str().unwrap().contains("corrected reply"),
+        "{detail}"
+    );
+    let corrected = agent_run(
+        &rig.fake,
+        2,
+        &["message", "reply", "--task", tid, "a short answer"],
+    );
+    assert_eq!(corrected["code"], 0, "{corrected}");
+    let reply = reply_query(&mut dev, &mut r, &json!(tid))["result"]["reply"].clone();
+    assert_eq!(reply["state"], "submitted", "{reply}");
+    assert_eq!(reply["result_id"], result_id.as_str(), "{reply}");
+    assert_eq!(reply["text"], "a short answer", "{reply}");
+    assert_ne!(reply["digest"], refused["digest"], "{reply}");
+}
+
+/// A message to an agent is a task named by its recipient id: its sender
+/// reads the agent's reply with that id, and nobody else does.
+#[test]
+fn a_message_sender_reads_the_reply_to_its_message_by_recipient_id() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, MAC, false);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let target = task(&launch, "unused")["target"].clone();
+    let message = notice(
+        &format!("member:{MAC}"),
+        "Review the backend contract",
+        vec![json!({"kind":"agent","route_id":"backend","route_revision":1,"target":target})],
+    );
+    publish(&mut dev, &mut r, &message);
+    let recipient = message["recipients"][0]["recipient_id"].clone();
+    within("the message prompt", || {
+        std::fs::read_to_string(rig.fake.join("input"))
+            .unwrap_or_default()
+            .contains("Review the backend contract")
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while work(&mut dev, &mut r, &recipient)["detail"] != "in the agent's turn" {
+        assert!(Instant::now() < deadline, "the turn was never stored");
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let id = recipient.as_str().unwrap();
+    let run = agent_run(
+        &rig.fake,
+        1,
+        &["message", "reply", "--task", id, "looks good"],
+    );
+    assert_eq!(run["code"], 0, "{run}");
+    let reply = reply_query(&mut dev, &mut r, &recipient)["result"]["reply"].clone();
+    assert_eq!(reply["state"], "submitted", "{reply}");
+    assert_eq!(reply["text"], "looks good", "{reply}");
+    assert_eq!(reply["result_id"], result_id_of(&run).as_str(), "{reply}");
+    let mut service = Dev::new(&mut r, &rig.log, "svc-work", true);
+    assert_eq!(
+        reply_query(&mut service, &mut r, &recipient)["code"],
+        "forbidden"
+    );
 }
 
 #[test]

@@ -693,6 +693,7 @@ impl HostBridge {
                 })
             }
             Request::WorkQuery { task_id, .. }
+            | Request::ReplyQuery { task_id, .. }
             | Request::Cancel { task_id, .. }
             | Request::Complete { task_id, .. } => {
                 let mut r = store
@@ -707,6 +708,15 @@ impl HostBridge {
                     store.save_work(&r).map_err(|_| "busy")?;
                 }
                 match req {
+                    // The reply its agent submitted, to the sender that asked
+                    // for the task: the check above is `work_query`'s.
+                    Request::ReplyQuery { .. } => {
+                        let reply = crate::runtime::collab::results::load(&store.db, task_id)
+                            .map_err(|_| "busy")?;
+                        return Ok(ResultBody::Reply {
+                            reply: reply.map(|row| row.wire()),
+                        });
+                    }
                     Request::Cancel { .. } => {
                         if !matches!(
                             r.status.state,
