@@ -9,6 +9,9 @@ use atem_client::session::host_work::{
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+/// The longest `paused: <reason>` detail a waiting local task carries.
+const MAX_PAUSE_DETAIL: usize = 240;
+
 #[path = "collab_bridge.rs"]
 mod collab_bridge;
 #[path = "collab_launch_bridge.rs"]
@@ -213,7 +216,8 @@ impl HostBridge {
         }
         self.work.refresh = Instant::now() + Duration::from_secs(1);
         // An invalid file turns hosting off only while it lasts: launches
-        // not started are fenced and requests are `busy` (`work_pass`).
+        // not started are fenced, requests are `busy` and queued local tasks
+        // wait as `paused` (`work_pass`); nothing else is fenced.
         let config = match Config::load(&self.work.dir) {
             Ok(config) => {
                 if self.work.config_problem.take().is_some() {
@@ -347,6 +351,7 @@ impl HostBridge {
                 );
             }
             self.work_fence_launches();
+            self.pause_local_tasks();
             return;
         }
         if !self.work_store_ready(&identity) {
@@ -935,8 +940,67 @@ impl HostBridge {
         })
     }
 
+    /// While local collaboration is paused (`collab_paused`) queued and
+    /// blocked local tasks wait with the reason as their detail. They keep
+    /// their place and their return grants, and nothing is fenced: they go on
+    /// as soon as the pause is over (spec section 9). Remote tasks are not
+    /// touched (their senders' authority is rechecked as before).
+    fn pause_local_tasks(&mut self) {
+        if Instant::now() < self.work.scheduled {
+            return;
+        }
+        self.work.scheduled = Instant::now() + Duration::from_millis(100);
+        if self.work.error || !self.local_authorized() {
+            return;
+        }
+        let Some(detail) = self.local_pause_detail() else {
+            return;
+        };
+        let Some(store) = self.work.store.as_ref() else {
+            return;
+        };
+        let saved = store.active_tasks().and_then(|tasks| {
+            for mut r in tasks {
+                if r.principal == "local"
+                    && matches!(r.status.state, WorkState::Queued | WorkState::Blocked)
+                    && r.status.detail != detail
+                {
+                    r.status.detail = detail.clone();
+                    store.save_work(&r)?;
+                }
+            }
+            Ok(())
+        });
+        if saved.is_err() {
+            self.work_fail();
+        }
+    }
+
+    /// `paused: <reason>` for a local task while `runtime.toml` or a failed
+    /// receipt database pauses local collaboration; one line, bounded.
+    fn local_pause_detail(&self) -> Option<String> {
+        let paused = self.collab_paused();
+        if paused.is_empty() {
+            return None;
+        }
+        let reason = paused
+            .join("; ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail = format!("paused: {reason}");
+        Some(match detail.char_indices().nth(MAX_PAUSE_DETAIL) {
+            Some((end, _)) => format!("{}…", &detail[..end]),
+            None => detail,
+        })
+    }
+
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
         let tasks = self.work.store.as_ref().unwrap().active_tasks()?;
+        let pause = self
+            .local_authorized()
+            .then(|| self.local_pause_detail())
+            .flatten();
         let mut occupied = HashSet::new();
         for mut r in tasks {
             if r.status.state.terminal() && r.status.state != WorkState::OutcomeUnknown {
@@ -969,6 +1033,18 @@ impl HostBridge {
                 continue;
             }
             if self.collab_wait_for_launch(&mut r)? {
+                continue;
+            }
+            if r.principal == "local"
+                && let Some(detail) = &pause
+            {
+                // Waiting, not fenced: it keeps its place in the session's
+                // queue, and resumes with the same authority.
+                occupied.insert(r.task.target.session_id.clone());
+                if r.status.detail != *detail {
+                    r.status.detail = detail.clone();
+                    self.work.store.as_ref().unwrap().save_work(&r)?;
+                }
                 continue;
             }
             let local = (r.principal == "local" && !self.local_attachment().is_empty())
@@ -1747,6 +1823,89 @@ principals = ["local"]
             bridge.exec(effects, &mut cx);
             bridge.sync_local(&mut cx);
             assert!(bridge.local_attachment().is_empty());
+        });
+    }
+
+    /// The switches in `runtime.toml` pause local work; they never fence it.
+    /// Only a real change of authority does.
+    #[test]
+    fn a_pause_keeps_the_local_attachment_and_its_control_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let _profile = crate::test_profile::use_dir(dir.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let app = App::new();
+            let mut sessions = BTreeMap::new();
+            let mut cx = Cx {
+                client: &app.astation_client,
+                sessions: &mut sessions,
+            };
+            let mut bridge =
+                HostBridge::open(&dir.path().join("runtime/journal"), None, Clock::default())
+                    .unwrap();
+            let identity = Identity {
+                account_id: "acct-local".into(),
+                atem_device_id: "host-local".into(),
+                host_trust_gen: 1,
+            };
+            assert!(bridge.adopt_identity(&identity, &mut cx));
+            bridge.work.config.enabled = true;
+            bridge.work.config.collab.send = true;
+            bridge.sync_local(&mut cx);
+            let attachment = bridge.local_attachment().to_string();
+            assert!(!attachment.is_empty());
+            assert!(bridge.local_healthy());
+            assert!(bridge.collab_paused().is_empty());
+            let generation = bridge.host.control_gen("local");
+
+            // Each pause, then the recovery: the same attachment, the same
+            // generation, nothing fenced.
+            let good = bridge.work.config.clone();
+            for pause in 0..4 {
+                match pause {
+                    0 => bridge.work.config.enabled = false,
+                    1 => bridge.work.config.collab.send = false,
+                    2 => {
+                        bridge.work.config = Config::default();
+                        bridge.work.config_problem = Some("expected a table".into());
+                    }
+                    _ => bridge.work.error = true,
+                }
+                bridge.sync_local(&mut cx);
+                assert!(!bridge.local_healthy(), "pause {pause}");
+                assert!(!bridge.collab_paused().is_empty(), "pause {pause}");
+                assert_eq!(bridge.local_attachment(), attachment, "pause {pause}");
+                assert_eq!(bridge.host.control_gen("local"), generation);
+                assert_eq!(bridge.host.attachment_principal(&attachment), Some("local"));
+                bridge.work.config = good.clone();
+                bridge.work.config_problem = None;
+                bridge.work.error = false;
+                bridge.sync_local(&mut cx);
+                assert!(bridge.local_healthy(), "pause {pause}");
+                assert!(bridge.collab_paused().is_empty(), "pause {pause}");
+                assert_eq!(bridge.local_attachment(), attachment, "pause {pause}");
+                assert_eq!(bridge.host.control_gen("local"), generation);
+            }
+
+            // A pause that began before any attachment: it comes with the
+            // recovery, and still nothing was fenced.
+            bridge.work.config.collab.send = false;
+            let mut other = identity;
+            other.host_trust_gen += 1;
+            assert!(bridge.adopt_identity(&other, &mut cx));
+            bridge.sync_local(&mut cx);
+            assert!(bridge.local_attachment().is_empty());
+            let fenced = bridge.host.control_gen("local");
+            assert!(fenced > generation, "a new host identity fences `local`");
+            bridge.sync_local(&mut cx);
+            assert_eq!(bridge.host.control_gen("local"), fenced);
+            bridge.work.config.collab.send = true;
+            bridge.sync_local(&mut cx);
+            assert!(!bridge.local_attachment().is_empty());
+            assert_eq!(bridge.host.control_gen("local"), fenced);
         });
     }
 }

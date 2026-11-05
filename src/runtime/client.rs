@@ -161,6 +161,30 @@ impl RuntimeClient {
         .await
     }
 
+    /// The runtime already running, for commands an agent runs inside it
+    /// (`atem message …`, `atem agent tag …`): never starts one and never
+    /// replaces a runtime of another build, which would restart it in the
+    /// middle of the agent's own task. Another build of the same protocol is
+    /// used as it is.
+    pub async fn connect_existing() -> Result<Self> {
+        Self::connect_existing_at(&Locator::default_paths()).await
+    }
+
+    pub(crate) async fn connect_existing_at(locator: &Locator) -> Result<Self> {
+        match Self::connect(locator).await {
+            Ok(client) if client.welcome.protocol != PROTOCOL => bail!(
+                "the Atem runtime speaks protocol {}, this atem speaks protocol {PROTOCOL}; use the atem that started the runtime",
+                client.welcome.protocol
+            ),
+            Ok(client) => Ok(client),
+            Err(Failure::Absent) => bail!("no Atem runtime is running; agents run inside one"),
+            Err(Failure::Restarting) => {
+                bail!("the Atem runtime is restarting; try again in a moment")
+            }
+            Err(Failure::Other(error)) => Err(error),
+        }
+    }
+
     /// A frontend's way back after its runtime restarted: the next runtime
     /// (started by the client that asked for the restart; this build's when
     /// none comes up), never replacing it.

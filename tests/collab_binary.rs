@@ -148,9 +148,12 @@ principals = ["local"]
     }
 
     fn agent(&self, fake: &Path, number: u32, args: &[&str]) -> Value {
-        let argv: Vec<_> = std::iter::once(env!("CARGO_BIN_EXE_atem"))
-            .chain(args.iter().copied())
-            .collect();
+        self.agent_with(env!("CARGO_BIN_EXE_atem"), fake, number, args)
+    }
+
+    /// A command run by the agent's own child with the `atem` at `bin`.
+    fn agent_with(&self, bin: &str, fake: &Path, number: u32, args: &[&str]) -> Value {
+        let argv: Vec<_> = std::iter::once(bin).chain(args.iter().copied()).collect();
         private(
             &fake.join(format!("run-{number}.tmp")),
             &json!({"argv":argv}).to_string(),
@@ -178,6 +181,26 @@ principals = ["local"]
         );
         assert_eq!(reply["op"], "message_status", "{reply}");
         reply["messages"][0].clone()
+    }
+
+    /// `local`'s durable control generation (the session journal's
+    /// `principals` file, `<len> <crc> <json>`): a fence raises it.
+    fn local_control_gen(&self) -> u64 {
+        let path = self.sandbox.config().join("runtime/journal/principals");
+        let text = std::fs::read_to_string(path).unwrap();
+        let json = text
+            .splitn(3, ' ')
+            .nth(2)
+            .expect("a framed principals file");
+        let file: Value = serde_json::from_str(json.trim_end()).unwrap();
+        file["principals"]["local"]["control_gen"].as_u64().unwrap()
+    }
+
+    /// Replaces `runtime.toml` (the runtime re-reads it about once a second).
+    fn write_config(&self, text: &str) {
+        let config = self.sandbox.config();
+        private(&config.join("runtime.toml.tmp"), text);
+        std::fs::rename(config.join("runtime.toml.tmp"), config.join("runtime.toml")).unwrap();
     }
 
     fn restart(&mut self) {
@@ -1240,4 +1263,189 @@ fn a_failed_launch_fails_its_task() {
             .len(),
         1
     );
+}
+
+/// A local task queued behind a busy agent, then `runtime.toml` changed by
+/// `pause` (its `reason` appears wherever the pause is explained): the task
+/// waits as `paused: <reason>`, new sends are refused with the reason, nothing
+/// is fenced (`local`'s control generation stays), and with the file valid
+/// again the task dispatches and its return grant still delivers the result.
+fn a_pause_waits_and_never_fences(pause: impl FnOnce(&str) -> String, reason: &str) {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    rig.send(&a, 1, "tag:b", "first task keeps the agent busy");
+    within("first prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("first task keeps the agent busy")
+    });
+    let second = rig.send(&a, 2, "tag:b", "second task waits");
+    within("second task waits for the busy agent", || {
+        rig.status(&second)["tasks"][0]["state"] == "blocked"
+    });
+    let generation = rig.local_control_gen();
+
+    rig.write_config(&pause(&rig.config));
+    within("the pause is reported", || {
+        rig.status(&second)["tasks"][0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("paused: "))
+    });
+    let task = rig.status(&second)["tasks"][0].clone();
+    let detail = task["detail"].as_str().unwrap();
+    assert!(detail.contains(reason), "{detail}");
+    assert!(!detail.contains('\n') && detail.len() < 400, "{detail}");
+    assert!(
+        matches!(task["state"].as_str(), Some("queued" | "blocked")),
+        "{task}"
+    );
+    let refused = rig.agent(&a, 3, &["message", "send", "--to", "tag:b", "while paused"]);
+    assert_ne!(refused["code"], 0, "{refused}");
+    assert!(
+        refused["stderr"].as_str().unwrap().contains(reason),
+        "{refused}"
+    );
+    assert_eq!(
+        rig.local_control_gen(),
+        generation,
+        "a pause fences nothing"
+    );
+
+    // The file is valid again: the first turn ends and the queued task goes.
+    rig.write_config(&rig.config);
+    private(&b.join("complete"), "");
+    within("the queued task after the pause", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("second task waits")
+    });
+    assert_eq!(rig.local_control_gen(), generation, "nothing was fenced");
+    assert!(
+        !std::fs::read_to_string(b.join("input"))
+            .unwrap()
+            .contains("while paused")
+    );
+    private(&b.join("complete"), "");
+    within("second task awaiting its result", || {
+        rig.status(&second)["tasks"][0]["state"] == "awaiting_result"
+    });
+    let task = rig.status(&second)["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reply = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "result after the pause",
+        ],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("the result under the old return grant", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("result after the pause")
+    });
+    assert_eq!(rig.status(&second)["tasks"][0]["state"], "completed");
+    assert_eq!(rig.local_control_gen(), generation);
+}
+
+#[test]
+fn a_runtime_toml_that_stops_loading_pauses_local_work() {
+    a_pause_waits_and_never_fences(
+        |_| "version = 1\nenabled = true\n[collab\n".to_string(),
+        "runtime.toml is not valid",
+    );
+}
+
+#[test]
+fn switching_hosting_off_pauses_local_work() {
+    a_pause_waits_and_never_fences(
+        |config| config.replacen("enabled = true", "enabled = false", 1),
+        "set `enabled = true` in runtime.toml",
+    );
+}
+
+#[test]
+fn switching_send_off_pauses_local_work() {
+    a_pause_waits_and_never_fences(
+        |config| config.replacen("send = true", "send = false", 1),
+        "set `[collab] send = true` in runtime.toml",
+    );
+}
+
+/// Agent commands connect to the runtime they run in; they never start one or
+/// replace another build's (which would restart it in the middle of the
+/// agent's own task).
+#[test]
+fn agent_commands_never_replace_the_runtime_of_another_build() {
+    let rig = Rig::new();
+    let (a, fake) = rig.launch("a", "caller");
+    let (_, other_fake) = rig.launch("b", "other");
+    let runtime = rig.sandbox.runtime_pid().unwrap();
+    // A copy has another mtime: another build as far as the runtime can tell.
+    let dir = rig.sandbox.dir.path().join("other-build");
+    std::fs::create_dir_all(&dir).unwrap();
+    let other = dir.join("atem");
+    std::fs::copy(env!("CARGO_BIN_EXE_atem"), &other).unwrap();
+    let other = other.to_str().unwrap();
+    let commands: [&[&str]; 5] = [
+        &["agent", "tag", "add", "self:reviewer"],
+        &["message", "directory"],
+        &["message", "send", "--to", "tag:b", "from another build"],
+        &["message", "status"],
+        &["agent", "tag", "list"],
+    ];
+    for (n, args) in commands.into_iter().enumerate() {
+        let output = rig.agent_with(other, &fake, n as u32 + 1, args);
+        assert_eq!(output["code"], 0, "{args:?}: {output}");
+        let stderr = output["stderr"].as_str().unwrap();
+        assert!(!stderr.contains("runtime updated"), "{args:?}: {stderr}");
+        assert_eq!(rig.sandbox.runtime_pid(), Some(runtime), "{args:?}");
+    }
+    within("the message reaches the other agent", || {
+        std::fs::read_to_string(other_fake.join("input"))
+            .unwrap_or_default()
+            .contains("from another build")
+    });
+    let sessions = rig.request(json!({"op":"list"}), "sessions");
+    assert!(
+        sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == a && s["self_tags"] == json!(["self:reviewer"]))
+    );
+    assert_eq!(rig.sandbox.runtime_pid(), Some(runtime));
+}
+
+/// With no runtime there is nothing to run in: an error, and none is started.
+#[test]
+fn agent_commands_start_no_runtime() {
+    let rig = Rig::unstarted();
+    for args in [
+        &["message", "directory"][..],
+        &["message", "status"],
+        &["message", "send", "--to", "tag:b", "nobody listens"],
+        &["agent", "tag", "list"],
+    ] {
+        let (out, err, ok) = rig.sandbox.atem(args);
+        assert!(!ok, "{args:?}: {out}{err}");
+        assert!(
+            err.contains("no Atem runtime is running; agents run inside one"),
+            "{args:?}: {err}"
+        );
+        assert_eq!(rig.sandbox.runtime_pid(), None, "{args:?}");
+        assert!(!rig.sandbox.config().join("runtime.socket").exists());
+    }
 }

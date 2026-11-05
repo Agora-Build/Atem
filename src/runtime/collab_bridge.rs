@@ -483,24 +483,36 @@ impl HostBridge {
         Ok(())
     }
 
-    /// What keeps local collaboration from running, in the owner's words: the
-    /// `runtime.toml` switches, the pairing and the device list.
-    fn collab_unavailable(&self) -> Vec<String> {
+    /// What pauses local collaboration, in the owner's words: `runtime.toml`
+    /// not loading, hosting or `[collab] send` switched off, the receipt
+    /// database failed. A pause only waits (spec section 9): nothing is
+    /// fenced, and everything resumes once these are gone. Empty exactly when
+    /// the pause is over (`local_healthy` adds the authority checks).
+    pub(super) fn collab_paused(&self) -> Vec<String> {
         if let Some(problem) = &self.work.config_problem {
             return vec![format!(
                 "runtime.toml is not valid ({problem}); fix it, then see `atem runtime check`"
             )];
         }
-        let mut missing = Vec::new();
+        let mut paused = Vec::new();
         if !self.work.config.enabled {
-            missing.push("set `enabled = true` in runtime.toml".to_string());
+            paused.push("set `enabled = true` in runtime.toml".to_string());
         }
         if !self.work.config.collab.send {
-            missing.push("set `[collab] send = true` in runtime.toml".to_string());
+            paused.push("set `[collab] send = true` in runtime.toml".to_string());
         }
         if self.work.error {
-            missing
-                .push("agent hosting records are unavailable; run `atem runtime restart`".into());
+            paused.push("agent hosting records are unavailable; run `atem runtime restart`".into());
+        }
+        paused
+    }
+
+    /// What keeps local collaboration from running, in the owner's words: the
+    /// pauses (`collab_paused`), the pairing and the device list.
+    fn collab_unavailable(&self) -> Vec<String> {
+        let mut missing = self.collab_paused();
+        if self.work.config_problem.is_some() {
+            return missing;
         }
         if self.host.context().account_id == UNPAIRED {
             missing.push("pair and verify this device with Astation (`atem pair`)".into());

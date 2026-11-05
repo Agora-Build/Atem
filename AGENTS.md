@@ -282,7 +282,14 @@ off. Owner labels and agent-owned `self:` tags feed shared selectors; one
 message resolves once to at most 32 other sessions. The SQLite outbox, tasks,
 resolutions, counters and return grants survive runtime restart. Local work
 uses the session host's internal attachment and ordinary prompt receipts,
-FIFO, readiness, drafts, approvals, leases and control fencing. Context jobs
+FIFO, readiness, drafts, approvals, leases and control fencing. A
+`runtime.toml` that doesn't load, hosting off or `[collab] send = false`
+pauses local work, never fences it: new sends are refused with the reason,
+queued local tasks wait as `paused: <reason>` and return grants stay;
+`local` is fenced only by a new host identity or a device-list freeze or
+fault. The agent commands connect only to the running runtime (none:
+"no Atem runtime is running; agents run inside one"; never started or
+replaced, whatever its build). Context jobs
 publish/read back exact decrypted Memory/Vault versions before dispatch.
 Only a task/session/process/turn-bound explicit reply completes a task;
 `results = true` on its origin route permits one queued result as data.

@@ -1886,10 +1886,13 @@ impl HostBridge {
         self.local.as_ref().map_or("", |(attachment, _)| attachment)
     }
 
-    pub(super) fn local_healthy(&self) -> bool {
-        self.hosting_enabled()
-            && self.work.collaboration_enabled()
-            && self.host.context().account_id != UNPAIRED
+    /// `local` still has the authority of a verified host: paired, a usable
+    /// session journal, a device list that is neither frozen nor faulted.
+    /// Losing it (and a new host identity) is a real change of authority:
+    /// `sync_local` fences `local`. The switches in `runtime.toml` are not
+    /// part of it (`collab_paused`).
+    pub(super) fn local_authorized(&self) -> bool {
+        self.host.context().account_id != UNPAIRED
             && !self.host.journal_halted()
             && self.membership_error.is_none()
             && self
@@ -1898,6 +1901,17 @@ impl HostBridge {
                 .is_none_or(|m| !m.is_frozen() && m.faulted().is_none() && m.held().is_none())
     }
 
+    /// Local collaboration may send and dispatch now: authorized, and not
+    /// paused by `runtime.toml` (not loading, hosting off, `[collab] send`
+    /// off) or a failed receipt database.
+    pub(super) fn local_healthy(&self) -> bool {
+        self.hosting_enabled() && self.work.collaboration_enabled() && self.local_authorized()
+    }
+
+    /// Keeps the internal local attachment. A pause leaves it (and `local`'s
+    /// control generation) alone, so queued local work and return grants
+    /// resume as they were; only a lost authority or a new host identity
+    /// fences `local` and ends the attachment.
     fn sync_local(&mut self, cx: &mut Cx) {
         let context = self.host.context();
         let identity = Identity {
@@ -1905,11 +1919,10 @@ impl HostBridge {
             atem_device_id: context.atem_device_id.clone(),
             host_trust_gen: context.host_trust_gen,
         };
-        let healthy = self.local_healthy();
         let current = self.local.as_ref().is_some_and(|(att, bound)| {
             *bound == identity && self.host.attachment_principal(att) == Some("local")
         });
-        if healthy && current {
+        if current && self.local_authorized() {
             return;
         }
         if let Some((old, _)) = self.local.take() {
@@ -1918,7 +1931,7 @@ impl HostBridge {
             let effects = self.host.disconnect(&old);
             self.exec(effects, cx);
         }
-        if !healthy {
+        if !self.local_healthy() {
             return;
         }
         let attachment = uuid::Uuid::new_v4().to_string();

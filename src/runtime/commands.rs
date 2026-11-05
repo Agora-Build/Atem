@@ -48,7 +48,7 @@ pub async fn sessions(client: &mut RuntimeClient) -> Result<Vec<SessionSummary>>
 
 pub async fn tag(action: super::protocol::TagOp, name: Option<String>) -> Result<()> {
     crate::auth::require_pairing("agent collaboration")?;
-    let mut client = RuntimeClient::connect_or_start().await?;
+    let mut client = RuntimeClient::connect_existing().await?;
     client.send(&ClientMsg::Tag { action, name }).await?;
     let (session_id, tags) = reply(&mut client, "tag", |m| match m {
         RuntimeMsg::Tags { session_id, tags } => Some((session_id, tags)),
@@ -62,7 +62,7 @@ pub async fn tag(action: super::protocol::TagOp, name: Option<String>) -> Result
 pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
     use crate::cli::MessageCommands;
     crate::auth::require_pairing("agent collaboration")?;
-    let mut client = RuntimeClient::connect_or_start().await?;
+    let mut client = RuntimeClient::connect_existing().await?;
     let request = match command {
         MessageCommands::Send {
             to,

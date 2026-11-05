@@ -1832,6 +1832,102 @@ fn a_runtime_of_another_worker_protocol_is_kept() {
     });
 }
 
+/// A fake runtime on `locator`'s socket: it welcomes with `protocol`, `build`
+/// and `pid`, answers nothing else and records every op it received.
+fn fake_runtime(
+    locator: &super::client::Locator,
+    protocol: u32,
+    build: &str,
+) -> std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let listener = tokio::net::UnixListener::bind(&locator.socket).unwrap();
+    let (log, build) = (seen.clone(), build.to_string());
+    tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (log, build) = (log.clone(), build.clone());
+            tokio::task::spawn_local(async move {
+                let (read, mut write) = stream.into_split();
+                let mut reader = BufReader::new(read);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let message = super::protocol::decode_client(&line).unwrap();
+                    log.borrow_mut().push(message.op());
+                    if matches!(message, ClientMsg::Hello { .. }) {
+                        let welcome = RuntimeMsg::Welcome {
+                            protocol,
+                            build: build.clone(),
+                            pid: 1,
+                            astation: false,
+                            host_error: None,
+                            worker_protocol: Some(9),
+                            device_list: None,
+                        };
+                        let text = super::protocol::encode_runtime(&welcome);
+                        write.write_all(text.as_bytes()).await.unwrap();
+                    }
+                    line.clear();
+                }
+            });
+        }
+    });
+    seen
+}
+
+/// `atem message …` and `atem agent tag` run inside the runtime: they connect
+/// to the one that is running and never start or replace one.
+#[test]
+fn agent_commands_connect_only_to_the_running_runtime() {
+    use super::client::Locator;
+    local(async {
+        let dir = short_dir();
+        let locator = Locator::in_dir(dir.path());
+        let error = RuntimeClient::connect_existing_at(&locator)
+            .await
+            .err()
+            .expect("nothing runs");
+        assert_eq!(
+            error.to_string(),
+            "no Atem runtime is running; agents run inside one"
+        );
+        assert!(!locator.socket.exists(), "nothing was started");
+
+        // Another build of the same protocol (and another worker protocol, so
+        // that a replacement would have been refused too): used as it is,
+        // and nothing but the greeting is sent.
+        let seen = fake_runtime(&locator, PROTOCOL, "9.9.9+other-build");
+        let client = RuntimeClient::connect_existing_at(&locator).await.unwrap();
+        assert_eq!(client.welcome.build, "9.9.9+other-build");
+        assert_ne!(
+            client.welcome.build,
+            crate::memory::cred_agent::build_id(),
+            "another build"
+        );
+        assert_eq!(*seen.borrow(), vec!["hello"], "never asked to restart");
+    });
+}
+
+#[test]
+fn agent_commands_name_both_protocols_when_the_runtime_speaks_another() {
+    use super::client::Locator;
+    local(async {
+        let dir = short_dir();
+        let locator = Locator::in_dir(dir.path());
+        let seen = fake_runtime(&locator, PROTOCOL + 6, "9.9.9+future");
+        let error = RuntimeClient::connect_existing_at(&locator)
+            .await
+            .err()
+            .expect("another protocol");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("speaks protocol {}", PROTOCOL + 6))
+                && text.contains(&format!("this atem speaks protocol {PROTOCOL}")),
+            "{text}"
+        );
+        assert_eq!(*seen.borrow(), vec!["hello"]);
+    });
+}
+
 /// Two clients of this build replace the same old runtime: the slower one
 /// finds the new runtime already serving (another pid) and connects to it
 /// instead of waiting for the socket to go quiet or starting a second one.
