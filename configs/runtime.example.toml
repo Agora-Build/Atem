@@ -6,7 +6,8 @@
 # Fill in approved profiles/routes below, then explicitly set enabled = true.
 # Healthy enabled hosting keeps the runtime online with zero agent sessions.
 # Boot startup needs a separately installed service. Local collaboration may
-# launch an agent only when its route explicitly sets launch = "on_message".
+# launch an agent only when its route explicitly sets launch = "on_message"
+# (a Claude Code profile) and the sender asks with `atem message send --launch`.
 version = 1
 enabled = false
 
@@ -109,7 +110,9 @@ enabled = false
 # "member:YOUR_ASTATION_ID" beside "local" if the route should keep serving it.
 # These optional keys belong to a [[routes]] table:
 # labels = ["tag:mobile"]
-# launch = "off"          # opt in with "on_message" to launch an empty route
+# launch = "off"          # "on_message": `atem message send --launch` may start
+#                         # this route's profile when no agent runs; Claude Code
+#                         # profiles only for now (a Codex route is refused)
 # results = false         # opt in to receive correlated results as agent input
 # auto_report = "status"  # "final_message" opts in to assistant-text reports
 #

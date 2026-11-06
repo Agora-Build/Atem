@@ -1193,7 +1193,8 @@ fn runtime_start_initializes_once_and_check_does_not_start_a_runtime() {
 
 #[test]
 fn runtime_check_lists_collaboration_consent_and_labels() {
-    let rig = Rig::prepared("codex", |_| {});
+    // Launch on message is for Claude Code profiles only (stage 1).
+    let rig = Rig::prepared("claude", |_| {});
     let path = rig.sandbox.config().join("runtime.toml");
     let config = std::fs::read_to_string(&path).unwrap();
     private(

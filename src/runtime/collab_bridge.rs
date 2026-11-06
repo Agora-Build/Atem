@@ -1171,20 +1171,26 @@ impl HostBridge {
                 &collab::Publication {
                     atem_id: atem_id.into(),
                     origin: source.clone(),
+                    launch: request.launch,
                     context: specs,
                 },
             )?;
         } else {
-            self.collab_accept(atem_id, &message, &source, sessions)?;
+            self.collab_accept(atem_id, &message, &source, request.launch, sessions)?;
         }
         Ok(message.message_id)
     }
 
+    /// Accepts `message`: resolves its selectors once, then writes the
+    /// message, its tasks, grants and reserved launches in one transaction.
+    /// `launch` is the sender's `--launch`: only then may a route with
+    /// `launch = "on_message"` and no agent start one (spec section 5).
     pub(super) fn collab_accept(
         &mut self,
         atem_id: &str,
         message: &Message,
         origin: &Origin,
+        launch: bool,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<()> {
         // Replies are result rows (`collab_reply`), never messages.
@@ -1212,7 +1218,7 @@ impl HostBridge {
             bail!("{problem}");
         }
         let from = message.from_session.as_deref().unwrap();
-        let plan = self.collab_resolve(atem_id, message, sessions)?;
+        let plan = self.collab_resolve(atem_id, message, launch, sessions)?;
         let resolved = &plan.tasks;
         let mut work = Vec::new();
         for r in resolved {
@@ -1398,6 +1404,7 @@ impl HostBridge {
                         &publication.atem_id,
                         &message,
                         &publication.origin,
+                        publication.launch,
                         cx.sessions,
                     )
                 });

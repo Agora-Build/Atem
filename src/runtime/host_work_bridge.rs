@@ -159,8 +159,34 @@ impl HostBridge {
         self.work.config.enabled && !self.work.error
     }
 
+    /// The launches to start now. A local launch that has not started waits
+    /// out a pause (spec section 9: `runtime.toml` not loading, hosting off,
+    /// the receipt database failed) and starts when it is over; fences are
+    /// evaluated first, so what changed while it waited is not started on
+    /// the old approval (a fenced one is handed out to fail at its guard).
     pub fn take_remote_launches(&mut self) -> Vec<RemoteLaunch> {
-        self.work.launches.drain(..).collect()
+        if self.work.launches.is_empty() {
+            return Vec::new();
+        }
+        self.work_fence_launches();
+        let paused = !self.collab_paused().is_empty();
+        let pending = &self.work.pending;
+        let waits = |id: &str| {
+            paused
+                && pending
+                    .get(id)
+                    .is_some_and(|p| p.local_route.is_some() && p.permit.load(Ordering::SeqCst))
+        };
+        let (mut ready, mut waiting) = (Vec::new(), VecDeque::new());
+        for launch in self.work.launches.drain(..) {
+            if waits(&launch.request_id) {
+                waiting.push_back(launch);
+            } else {
+                ready.push(launch);
+            }
+        }
+        self.work.launches = waiting;
+        ready
     }
 
     pub fn remote_launched(&mut self, request_id: &str, state: LaunchState) {
@@ -202,8 +228,12 @@ impl HostBridge {
         }
         self.work.error = true;
         self.r9.enable_host_work(false);
+        // A local launch only waits (the failure is a pause, until a
+        // restart); a remote one is fenced.
         for p in self.work.pending.values() {
-            p.permit.store(false, Ordering::SeqCst);
+            if p.local_route.is_none() {
+                p.permit.store(false, Ordering::SeqCst);
+            }
         }
     }
 
@@ -448,29 +478,45 @@ impl HostBridge {
     }
 
     fn work_fence_launches(&mut self) {
+        let paused = !self.collab_paused().is_empty();
         let ids: Vec<String> = self.work.pending.keys().cloned().collect();
         for id in ids {
             let attachment = self.work.pending[&id].attachment.clone();
-            let authority = self.work_authority(&attachment);
+            let remote = self.work.pending[&id].local_route.is_none();
+            let authority = if remote {
+                self.work_authority(&attachment)
+            } else {
+                None
+            };
             let p = &self.work.pending[&id];
-            let allowed = self.hosting_enabled()
-                && host_now().wall_ms < p.expires_at
-                && self.work.config.profile(&p.profile.id) == Some(&p.profile)
+            let allowed = host_now().wall_ms < p.expires_at
                 && self.host.control_gen(&p.principal) == p.control_gen
-                && authority.as_ref().is_some_and(|a| {
-                    a.name() == p.principal
-                        && match &p.local_route {
-                            Some(route) => {
-                                matches!(a, Sender::Local)
-                                    && self.local_healthy()
+                && match &p.local_route {
+                    // Only a real change of authority fences a local launch:
+                    // a new host identity, a lost device list, a changed
+                    // approval. A pause waits (`take_remote_launches`); while
+                    // it lasts the approval can't be compared (the file may
+                    // not load), which is no change: it is compared again
+                    // when the pause ends. `[collab] send` never matters.
+                    Some(route) => {
+                        !p.attachment.is_empty()
+                            && p.attachment == self.local_attachment()
+                            && self.local_authorized()
+                            && (paused
+                                || self.work.config.profile(&p.profile.id) == Some(&p.profile)
                                     && self.work.config.route(&route.id) == Some(route)
                                     && route.principals.iter().any(|p| p == "local")
                                     && route.launch
-                                        == crate::runtime::host_work::RouteLaunch::OnMessage
-                            }
-                            None => self.profile_allowed(&p.profile, a, true),
-                        }
-                });
+                                        == crate::runtime::host_work::RouteLaunch::OnMessage)
+                    }
+                    None => {
+                        self.hosting_enabled()
+                            && self.work.config.profile(&p.profile.id) == Some(&p.profile)
+                            && authority.as_ref().is_some_and(|a| {
+                                a.name() == p.principal && self.profile_allowed(&p.profile, a, true)
+                            })
+                    }
+                };
             if !allowed {
                 p.permit.store(false, Ordering::SeqCst);
             }
@@ -1854,7 +1900,7 @@ principals = ["local"]
                 assert!(message.valid_local(), "{problem}");
                 let error = rig
                     .bridge
-                    .collab_accept("atem-host", &message, &origin, &rig.sessions)
+                    .collab_accept("atem-host", &message, &origin, false, &rig.sessions)
                     .unwrap_err();
                 assert_eq!(error.to_string(), problem);
                 assert_eq!(rows(&rig, "counters"), 0, "{problem}");
@@ -1863,7 +1909,7 @@ principals = ["local"]
             // The same message without the problem is accepted, and counts once.
             message.context = vec![snapshot("fits")];
             rig.bridge
-                .collab_accept("atem-host", &message, &origin, &rig.sessions)
+                .collab_accept("atem-host", &message, &origin, false, &rig.sessions)
                 .unwrap();
             assert_eq!(counted(&rig, &format!("send:{}", message.workflow_id)), 1);
             assert_eq!(
@@ -1992,6 +2038,418 @@ principals = ["local"]
                 error.to_string(),
                 "collaboration unavailable: pair and verify this device with Astation (`atem pair`)"
             );
+        });
+    }
+
+    /// `runtime.toml` text of a launch route `q` (Claude, `tag:q`,
+    /// `launch = "on_message"`) whose directory runs no session.
+    fn launch_toml(cwd: &Path, route_revision: u64) -> String {
+        format!(
+            r#"
+version = 1
+enabled = true
+[[profiles]]
+id = "q"
+revision = 1
+label = "q"
+provider = "claude"
+cwd = {cwd:?}
+project = "local:launch-project"
+principals = ["member:owner"]
+[[routes]]
+id = "q"
+revision = {route_revision}
+profile_id = "q"
+labels = ["tag:q"]
+principals = ["local"]
+launch = "on_message"
+"#
+        )
+    }
+
+    /// The rig's configuration plus the launch route `q`.
+    fn launch_route(rig: &mut LocalRig, root: &Path) -> PathBuf {
+        let cwd = root.join("launch-project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let extra: Config = toml::from_str(&launch_toml(&cwd, 1)).unwrap();
+        let mut config = rig.bridge.work.config.clone();
+        config.profiles.extend(extra.profiles);
+        config.routes.extend(extra.routes);
+        config.validate().unwrap();
+        rig.bridge.work.config = config;
+        cwd
+    }
+
+    /// A message of the rig's own session to the agents `selector` names.
+    fn select_message(rig: &LocalRig, selector: &str) -> Message {
+        let mut message = rig.message();
+        message.from_session = Some(rig.sid.to_string());
+        message.recipients[0].destination = Destination::Select {
+            selectors: vec![selector.into()],
+            budget: 32,
+        };
+        message
+    }
+
+    fn origin_of(rig: &LocalRig) -> crate::runtime::collab::results::Origin {
+        let host = rig.bridge.work_host();
+        crate::runtime::collab::results::Origin {
+            target: wire::Target {
+                account_id: host.account_id,
+                atem_device_id: host.atem_device_id,
+                host_trust_gen: host.host_trust_gen,
+                session_id: rig.sid.to_string(),
+                process_gen: rig.sessions[&rig.sid].process_gen.clone(),
+            },
+            control_gen: rig.bridge.host.control_gen("local"),
+            route: None,
+        }
+    }
+
+    fn accept(rig: &mut LocalRig, message: &Message, launch: bool) {
+        let origin = origin_of(rig);
+        rig.bridge
+            .collab_accept("atem-host", message, &origin, launch, &rig.sessions)
+            .unwrap();
+    }
+
+    /// Accepts a message to `tag:q`, with or without `--launch`.
+    fn send_q(rig: &mut LocalRig, launch: bool) -> Message {
+        let message = select_message(rig, "tag:q");
+        accept(rig, &message, launch);
+        message
+    }
+
+    fn outbox_detail(rig: &LocalRig, message: &Message) -> String {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT detail FROM outbox WHERE message_id=?1",
+                [&message.message_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn launch_records(rig: &LocalRig) -> Vec<LaunchRecord> {
+        rig.bridge.work.store.as_ref().unwrap().launches().unwrap()
+    }
+
+    fn task_targets(rig: &LocalRig) -> Vec<(String, Option<String>)> {
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        store
+            .tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| {
+                let launch: Option<String> = store
+                    .db
+                    .query_row(
+                        "SELECT launch_request_id FROM resolutions WHERE task_id=?1",
+                        [&t.task.task_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                (t.task.target.session_id, launch)
+            })
+            .collect()
+    }
+
+    /// The worker the launcher would start for the launch `record` reserved.
+    async fn start_reserved(rig: &mut LocalRig, root: &Path, record: &LaunchRecord, cwd: &Path) {
+        let launcher = Launcher::InProcess(InProcess {
+            state: root.join("runtime"),
+            socket_dir: root.join("ws"),
+            chat_root: root.join("chat"),
+        });
+        let request = SpawnRequest {
+            session_id: SessionId::parse(&record.status.session_id).unwrap(),
+            process_gen: record.status.process_gen.clone(),
+            provider: crate::session::Provider::Claude,
+            args: vec![],
+            cwd: cwd.into(),
+            rows: 24,
+            cols: 80,
+        };
+        let fake = root.join("fake-q");
+        std::fs::create_dir_all(&fake).unwrap();
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/approvals/fake-agent.py");
+        let (handle, created) = launcher
+            .spawn(
+                request.clone(),
+                LaunchEnv(vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    ("HOME".into(), root.display().to_string()),
+                    ("CLAUDE_CLI_BIN".into(), bin.display().to_string()),
+                    ("FAKE_DIR".into(), fake.display().to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+        rig.sessions.insert(
+            request.session_id.clone(),
+            BrokerSession::launched(handle, &request, created),
+        );
+    }
+
+    /// Spec section 5: only a send that asks (`--launch`) starts a session,
+    /// and only on a route whose owner allows it; without it the route has
+    /// no match.
+    #[test]
+    fn a_route_launches_only_for_a_message_that_asks() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            let quiet = select_message(&rig, "tag:q");
+            accept(&mut rig, &quiet, false);
+            assert_eq!(rows(&rig, "launches"), 0);
+            assert_eq!(rows(&rig, "resolutions"), 0);
+            assert_eq!(rows(&rig, "work"), 0);
+            assert!(rig.bridge.work.launches.is_empty());
+            assert!(rig.bridge.work.pending.is_empty());
+            assert_eq!(outbox_detail(&rig, &quiet), "no_match");
+
+            let asked = select_message(&rig, "tag:q");
+            accept(&mut rig, &asked, true);
+            assert_eq!(rows(&rig, "launches"), 1);
+            assert_eq!(rows(&rig, "work"), 1);
+            assert_eq!(rig.bridge.work.launches.len(), 1);
+            assert_eq!(rig.bridge.work.pending.len(), 1);
+            assert_eq!(outbox_detail(&rig, &asked), "delivered to local queue");
+        });
+    }
+
+    /// Spec section 5: messages share a pending launch, including one that
+    /// just started and whose project isn't known yet (no second session in
+    /// that window), and a later one reaches the session by its project.
+    #[test]
+    fn a_pending_launch_is_shared_until_its_project_is_known() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let cwd = launch_route(&mut rig, root);
+            let first = select_message(&rig, "tag:q");
+            accept(&mut rig, &first, true);
+            let record = launch_records(&rig).remove(0);
+            let (session, request) = (
+                record.status.session_id.clone(),
+                record.status.request_id.clone(),
+            );
+            // Still starting: shared.
+            send_q(&mut rig, true);
+            assert_eq!(rows(&rig, "launches"), 1);
+            // The launcher has started the worker; no pass has read its
+            // launch project yet.
+            start_reserved(&mut rig, root, &record, &cwd).await;
+            rig.bridge.remote_launched(&request, LaunchState::Started);
+            assert!(rig.bridge.work.pending.is_empty());
+            assert!(rig.bridge.projects.key_of(&session).is_none());
+            send_q(&mut rig, true);
+            assert_eq!(rows(&rig, "launches"), 1, "no second launch in the window");
+            // Even a message that didn't ask reaches it: the agent is there.
+            send_q(&mut rig, false);
+            // The project becomes known: the session is found as any other.
+            rig.until(|r| r.bridge.projects.key_of(&session) == Some("local:launch-project"))
+                .await;
+            send_q(&mut rig, true);
+            assert_eq!(rows(&rig, "launches"), 1);
+            let targets = task_targets(&rig);
+            assert_eq!(targets.len(), 5);
+            assert!(targets.iter().all(|(s, _)| *s == session), "{targets:?}");
+            assert_eq!(
+                targets.iter().filter(|(_, l)| l.is_some()).count(),
+                4,
+                "{targets:?}"
+            );
+        });
+    }
+
+    /// Spec section 9, "Pauses, not fences": a local launch that has not
+    /// started when a pause begins (an invalid `runtime.toml`, hosting off, a
+    /// receipt database fault) waits for the pause to end, then starts. Its
+    /// task is not failed meanwhile.
+    #[test]
+    fn a_launch_that_has_not_started_waits_out_a_pause() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            let message = select_message(&rig, "tag:q");
+            accept(&mut rig, &message, true);
+            let request = launch_records(&rig)[0].status.request_id.clone();
+            let good = rig.bridge.work.config.clone();
+            for pause in 0..3 {
+                match pause {
+                    0 => rig.bridge.work.config.enabled = false,
+                    1 => {
+                        rig.bridge.work.config = Config::default();
+                        rig.bridge.work.config_problem = Some("expected a table".into());
+                    }
+                    _ => rig.bridge.work.error = true,
+                }
+                idle(&mut rig, 350).await;
+                assert!(
+                    rig.bridge.take_remote_launches().is_empty(),
+                    "pause {pause}: held"
+                );
+                assert!(
+                    rig.bridge.work.pending[&request]
+                        .permit
+                        .load(Ordering::SeqCst),
+                    "pause {pause}: not fenced"
+                );
+                assert_eq!(launch_records(&rig)[0].status.state, LaunchState::Starting);
+                let task = rig
+                    .bridge
+                    .work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .tasks()
+                    .unwrap()
+                    .remove(0);
+                assert!(
+                    !task.status.state.terminal(),
+                    "pause {pause}: {:?}",
+                    task.status
+                );
+                rig.bridge.work.config = good.clone();
+                rig.bridge.work.config_problem = None;
+                rig.bridge.work.error = false;
+            }
+            idle(&mut rig, 350).await;
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(launches[0].request_id, request);
+            assert!(
+                rig.bridge.work.pending[&request]
+                    .permit
+                    .load(Ordering::SeqCst)
+            );
+            let task = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .tasks()
+                .unwrap()
+                .remove(0);
+            assert_eq!(task.status.state, WorkState::Blocked);
+            assert_eq!(task.status.detail, "launching the approved route");
+        });
+    }
+
+    /// `[collab] send = false` is no pause: it refuses new sends and never
+    /// stops a launch already accepted.
+    #[test]
+    fn turning_sending_off_does_not_stop_an_accepted_launch() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            rig.bridge.work.config.collab.send = false;
+            idle(&mut rig, 350).await;
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1);
+            assert!(
+                rig.bridge.work.pending[&launches[0].request_id]
+                    .permit
+                    .load(Ordering::SeqCst)
+            );
+        });
+    }
+
+    /// A real change still fences: a route changed while paused fences the
+    /// launch the moment the pause ends, before it can start.
+    #[test]
+    fn a_route_changed_during_a_pause_fences_the_waiting_launch() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            let request = launch_records(&rig)[0].status.request_id.clone();
+            let good = rig.bridge.work.config.clone();
+            rig.bridge.work.config = Config::default();
+            rig.bridge.work.config_problem = Some("expected a table".into());
+            idle(&mut rig, 350).await;
+            assert!(rig.bridge.take_remote_launches().is_empty());
+            // The owner fixes the file, and the route has a new revision.
+            let mut changed = good.clone();
+            changed
+                .routes
+                .iter_mut()
+                .find(|r| r.id == "q")
+                .unwrap()
+                .revision = 2;
+            rig.bridge.work.config = changed;
+            rig.bridge.work.config_problem = None;
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1, "released to fail, never to start");
+            assert!(
+                !rig.bridge.work.pending[&request]
+                    .permit
+                    .load(Ordering::SeqCst)
+            );
+            assert!(!(launches[0].guard)());
+        });
+    }
+
+    /// A launch that waits out a pause does not wait past its message: once
+    /// that expired it is handed out to fail at its guard, not held for good.
+    #[test]
+    fn a_waiting_launch_whose_message_expired_is_released() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            let request = launch_records(&rig)[0].status.request_id.clone();
+            rig.bridge.work.config = Config::default();
+            rig.bridge.work.config_problem = Some("expected a table".into());
+            idle(&mut rig, 350).await;
+            assert!(rig.bridge.take_remote_launches().is_empty());
+            rig.bridge
+                .work
+                .pending
+                .get_mut(&request)
+                .unwrap()
+                .expires_at = 0;
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1);
+            assert!(!(launches[0].guard)());
+        });
+    }
+
+    /// A launch the spawner already holds is not failed by a pause (an
+    /// invalid file, hosting off), but a changed approval still stops it.
+    #[test]
+    fn a_launch_under_way_survives_a_pause_but_not_a_change() {
+        use std::os::unix::fs::PermissionsExt;
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let cwd = launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1);
+            let guard = &launches[0].guard;
+            let write = |text: &str| {
+                let path = root.join("runtime.toml");
+                std::fs::write(&path, text).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            };
+            write(&launch_toml(&cwd, 1));
+            assert!(guard(), "the approved file");
+            write("not = [valid");
+            assert!(guard(), "an invalid file is a pause");
+            write(&launch_toml(&cwd, 1).replace("enabled = true", "enabled = false"));
+            assert!(guard(), "hosting off is a pause");
+            write(&launch_toml(&cwd, 2));
+            assert!(!guard(), "a changed route is a change");
+            write(&launch_toml(&cwd, 1).replace("launch = \"on_message\"", "launch = \"off\""));
+            assert!(!guard(), "a route that no longer launches");
         });
     }
 

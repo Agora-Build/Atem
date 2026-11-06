@@ -339,6 +339,8 @@ pub struct TaskView {
 pub(super) struct Publication {
     pub atem_id: String,
     pub origin: results::Origin,
+    /// The sender's `--launch`, kept until the message is accepted.
+    pub launch: bool,
     pub context: Vec<super::collab_context::ContextSpec>,
 }
 
@@ -453,6 +455,22 @@ pub(super) fn persist(
             r.task_id, r.route_id, r.session_id, r.process_gen, r.launch_request_id, serde_json::to_string(r)?])?;
     }
     Ok(())
+}
+
+/// The reservation that made `session_id` a launched session: the task's
+/// resolution carrying the launch request id, if a local message started it.
+pub(super) fn launched_by(store: &Store, session_id: &str) -> Result<Option<ResolvedTask>> {
+    store
+        .db
+        .query_row(
+            "SELECT record FROM resolutions WHERE session_id=?1 AND launch_request_id IS NOT NULL
+            LIMIT 1",
+            [session_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|record| Ok(serde_json::from_str(&record)?))
+        .transpose()
 }
 
 /// The session that sent the local message of task `task_id`, if any.

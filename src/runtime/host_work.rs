@@ -369,6 +369,14 @@ impl Config {
                 Some("revision must be at least 1".into())
             } else if !profiles.contains(&r.profile_id) {
                 Some(format!("profile_id `{}` names no profile", r.profile_id))
+            } else if r.launch == RouteLaunch::OnMessage
+                && self
+                    .profile(&r.profile_id)
+                    .is_some_and(|p| p.provider != "claude")
+            {
+                // Codex reports nothing until a first prompt is typed in its
+                // terminal, so a launched one would never become ready.
+                Some("launch on message supports Claude Code profiles only for now".into())
             } else if let Some(problem) = labels_problem(&r.labels) {
                 Some(problem)
             } else {
@@ -1566,6 +1574,29 @@ profile_id = "backend-codex"
                 .unwrap()
                 .contains("agent labels are self:")
         );
+    }
+
+    /// Spec section 5: stage 1 launches only Claude Code sessions. Codex
+    /// reports nothing before a first prompt is typed, so a launched one
+    /// would never become ready; a route that asks for it is refused at
+    /// load (and a Codex route that doesn't is fine).
+    #[test]
+    fn launch_on_message_supports_claude_profiles_only() {
+        assert_eq!(
+            collaboration_error("launch = \"on_message\""),
+            "route `backend`: launch on message supports Claude Code profiles only for now"
+        );
+        let mut config: Config = toml::from_str(&format!(
+            "{}launch = \"on_message\"",
+            PROFILE.replace("provider = \"codex\"", "provider = \"claude\"")
+        ))
+        .unwrap();
+        config.inherit(Some("member:owner".into()));
+        config.validate().unwrap();
+        assert!(config.routes[0].launch == RouteLaunch::OnMessage);
+        let mut config: Config = toml::from_str(&format!("{PROFILE}launch = \"off\"")).unwrap();
+        config.inherit(Some("member:owner".into()));
+        config.validate().unwrap();
     }
 
     #[test]

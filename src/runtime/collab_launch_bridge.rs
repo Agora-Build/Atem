@@ -25,6 +25,7 @@ impl HostBridge {
         &self,
         atem_id: &str,
         message: &Message,
+        launch: bool,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<Resolution> {
         let Destination::Select { selectors, budget } = &message.recipients[0].destination else {
@@ -53,11 +54,68 @@ impl HostBridge {
             profiles.insert(pending.profile.id.clone());
             pending_ids.insert(record.status.session_id.clone(), id.clone());
         }
+        // A session this runtime started for a route stays that route's
+        // candidate until its launch project is known (its worker's record
+        // is read a pass after it starts): a message in that window must not
+        // start a second one.
+        let store = self.work.store.as_ref().unwrap();
+        for session in sessions
+            .values()
+            .filter(|s| s.is_live() && self.projects.key_of(s.id.as_str()).is_none())
+        {
+            let Some(reserved) = collab::launched_by(store, session.id.as_str())? else {
+                continue;
+            };
+            let Some(launch_id) = reserved.launch_request_id.clone() else {
+                continue;
+            };
+            let Some(route) = self.work.config.route(&reserved.route_id).filter(|route| {
+                route.revision == reserved.route_revision
+                    && route.principals.iter().any(|p| p == "local")
+            }) else {
+                continue;
+            };
+            let Some(profile) = self.work.config.profile(&route.profile_id) else {
+                continue;
+            };
+            if session.process_gen != reserved.process_gen
+                || session.cwd != profile.cwd
+                || session.provider != profile.provider
+                || !store
+                    .launch(&launch_id)?
+                    .is_some_and(|l| l.status.state == LaunchState::Started)
+            {
+                continue;
+            }
+            let labels = self
+                .work
+                .config
+                .instance
+                .labels
+                .iter()
+                .chain(&route.labels)
+                .chain(session.self_tags())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            candidates.push(Candidate {
+                route_id: route.id.clone(),
+                route_revision: route.revision,
+                session_id: session.id.to_string(),
+                process_gen: session.process_gen.clone(),
+                started_ms: session.created_at_ms,
+                labels,
+            });
+            profiles.insert(profile.id.clone());
+            pending_ids.insert(session.id.to_string(), launch_id);
+        }
         let mut launches = Vec::new();
         let mut routes: Vec<_> = self.work.config.routes.iter().collect();
         routes.sort_by(|a, b| a.id.cmp(&b.id));
         for route in routes {
-            if route.launch != RouteLaunch::OnMessage
+            // Only a send that asked for it starts a session (spec section
+            // 5); the route's own `launch` setting says it may.
+            if !launch
+                || route.launch != RouteLaunch::OnMessage
                 || !route.principals.iter().any(|p| p == "local")
                 || candidates.iter().any(|c| c.route_id == route.id)
             {
@@ -188,11 +246,17 @@ impl HostBridge {
             let guard = Arc::new(move || {
                 flag.load(Ordering::SeqCst)
                     && host_now().wall_ms < expires_at
-                    && Config::load(&dir).is_ok_and(|c| {
-                        c.enabled
-                            && c.profile(&approved.id) == Some(&approved)
-                            && c.route(&approved_route.id) == Some(&approved_route)
-                    })
+                    // A pause (a file that doesn't load, hosting off) is no
+                    // change: a launch that is already under way isn't
+                    // failed by it (`take_remote_launches` holds the ones
+                    // not started). A changed approval is.
+                    && match Config::load(&dir) {
+                        Ok(c) if c.enabled => {
+                            c.profile(&approved.id) == Some(&approved)
+                                && c.route(&approved_route.id) == Some(&approved_route)
+                        }
+                        _ => true,
+                    }
                     && crate::memory::project::project_key_for(&approved.cwd) == approved.project
             });
             let status = launch.record.status;

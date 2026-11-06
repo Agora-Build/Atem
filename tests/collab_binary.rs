@@ -153,6 +153,13 @@ principals = ["local"]
 
     /// A command run by the agent's own child with the `atem` at `bin`.
     fn agent_with(&self, bin: &str, fake: &Path, number: u32, args: &[&str]) -> Value {
+        self.agent_begin(bin, fake, number, args);
+        self.agent_end(fake, number)
+    }
+
+    /// Hands the agent's child a command without waiting for it, so two
+    /// agents can run theirs at the same time.
+    fn agent_begin(&self, bin: &str, fake: &Path, number: u32, args: &[&str]) {
         let argv: Vec<_> = std::iter::once(bin).chain(args.iter().copied()).collect();
         private(
             &fake.join(format!("run-{number}.tmp")),
@@ -163,6 +170,10 @@ principals = ["local"]
             fake.join(format!("run-{number}.json")),
         )
         .unwrap();
+    }
+
+    /// What the command begun as `number` printed.
+    fn agent_end(&self, fake: &Path, number: u32) -> Value {
         let out = fake.join(format!("run-{number}.out"));
         within("agent child command", || out.exists());
         serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap()
@@ -172,6 +183,45 @@ principals = ["local"]
         let output = self.agent(fake, n, &["message", "send", "--to", selector, text]);
         assert_eq!(output["code"], 0, "{output}");
         output["stdout"].as_str().unwrap().trim().to_string()
+    }
+
+    /// A send that asks for a launch (`--launch`); the route is named by its
+    /// instance address, which `--launch` requires.
+    fn send_launch(&self, fake: &Path, n: u32, route: &str, text: &str) -> String {
+        let output = self.agent(
+            fake,
+            n,
+            &[
+                "message",
+                "send",
+                "--to",
+                &self.address(route),
+                "--launch",
+                text,
+            ],
+        );
+        assert_eq!(output["code"], 0, "{output}");
+        output["stdout"].as_str().unwrap().trim().to_string()
+    }
+
+    /// `atem:<atem_id>/<route>`, as `atem message directory` prints it.
+    fn address(&self, route: &str) -> String {
+        let directory = self.request(
+            json!({"op":"message_directory","selector":format!("tag:{route}")}),
+            "message_directory",
+        );
+        format!(
+            "atem:{}/{route}",
+            directory["rows"][0]["atem_id"].as_str().unwrap()
+        )
+    }
+
+    /// How many sessions the runtime lists.
+    fn sessions(&self) -> usize {
+        self.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .len()
     }
 
     fn status(&self, id: &str) -> Value {
@@ -1974,7 +2024,7 @@ fn a_message_to_an_empty_route_launches_one_agent() {
     let mut rig = Rig::new();
     let fake = configure_launch(&mut rig);
     let (_, a) = rig.launch("a", "sender");
-    let id = rig.send(&a, 1, "tag:c", "start the approved route");
+    let id = rig.send_launch(&a, 1, "c", "start the approved route");
     within("launched agent prompt", || {
         std::fs::read_to_string(fake.join("input"))
             .unwrap_or_default()
@@ -2068,6 +2118,187 @@ fn explicit_launch_uses_the_instance_address_and_keeps_route_consent() {
     );
 }
 
+/// Spec section 5: a route that allows launching starts nothing for a send
+/// that doesn't ask, however it is addressed; the route has no match.
+#[test]
+fn a_route_that_allows_launch_still_needs_the_flag() {
+    let mut rig = Rig::new();
+    let fake = configure_launch(&mut rig);
+    let (_, a) = rig.launch("a", "sender");
+    let address = rig.address("c");
+    for (n, selector) in [(1, "tag:c"), (2, address.as_str())] {
+        let id = rig.send(&a, n, selector, "no flag, no launch");
+        let status = rig.status(&id);
+        assert_eq!(status["detail"], "no_match", "{selector}: {status}");
+        assert!(status["tasks"].as_array().unwrap().is_empty(), "{status}");
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(rig.sessions(), 1);
+    assert!(!fake.join("events").exists(), "nothing was started");
+}
+
+/// Two senders ask for the same empty route at the same moment: one
+/// session starts and both tasks go to it.
+#[test]
+fn sends_in_quick_succession_share_one_launch() {
+    let mut rig = Rig::new();
+    let fake = configure_launch(&mut rig);
+    let (_, a) = rig.launch("a", "first-sender");
+    let (_, b) = rig.launch("b", "second-sender");
+    let address = rig.address("c");
+    let send = |agent: &Path, text: &str| {
+        rig.agent_begin(
+            env!("CARGO_BIN_EXE_atem"),
+            agent,
+            1,
+            &["message", "send", "--to", &address, "--launch", text],
+        );
+    };
+    send(&a, "first shared launch");
+    send(&b, "second shared launch");
+    let ids: Vec<String> = [&a, &b]
+        .iter()
+        .map(|agent| {
+            let output = rig.agent_end(agent, 1);
+            assert_eq!(output["code"], 0, "{output}");
+            output["stdout"].as_str().unwrap().trim().to_string()
+        })
+        .collect();
+    // Tasks of one session go in order: the second waits for the first turn.
+    let input = || std::fs::read_to_string(fake.join("input")).unwrap_or_default();
+    within("the first prompt in the launched agent", || {
+        input().contains("shared launch")
+    });
+    std::fs::write(fake.join("complete"), "").unwrap();
+    within("both prompts in the one launched agent", || {
+        input().contains("first shared launch") && input().contains("second shared launch")
+    });
+    assert_eq!(rig.sessions(), 3);
+    assert_eq!(
+        std::fs::read_to_string(fake.join("events"))
+            .unwrap()
+            .lines()
+            .filter(|s| *s == "started")
+            .count(),
+        1
+    );
+    let sessions: Vec<_> = ids
+        .iter()
+        .map(|id| rig.status(id)["tasks"][0]["session_id"].clone())
+        .collect();
+    assert_eq!(sessions[0], sessions[1], "{sessions:?}");
+}
+
+/// Stage 1 launches no Codex session (Codex is not ready until a first
+/// prompt is typed, so a launched one never would be), and a route that
+/// asks for it is refused at load; a Codex session that already runs and is
+/// ready takes queued local tasks as before.
+#[test]
+fn a_ready_codex_session_still_receives_local_tasks() {
+    let mut rig = Rig::unstarted();
+    private(
+        &rig.sandbox.config().join("config.toml"),
+        "[codex]\nhooks = true\n",
+    );
+    let cwd = rig.sandbox.home.join("d");
+    std::fs::create_dir_all(&cwd).unwrap();
+    rig.config.push_str(&format!(
+        r#"
+[[profiles]]
+id = "d"
+revision = 1
+label = "d"
+provider = "codex"
+cwd = {cwd:?}
+project = "local:d"
+principals = ["member:astation"]
+[[routes]]
+id = "d"
+revision = 1
+profile_id = "d"
+labels = ["tag:d"]
+principals = ["local"]
+"#
+    ));
+    rig.start();
+    let (_, a) = rig.launch("a", "sender");
+    let fake = rig.sandbox.dir.path().join("codex-agent");
+    std::fs::create_dir_all(&fake).unwrap();
+    let mut env = rig.sandbox.env();
+    env.push((
+        "CODEX_CLI_BIN".into(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chat/fake-codex.py")
+            .display()
+            .to_string(),
+    ));
+    env.push((
+        "CODEX_HOME".into(),
+        rig.sandbox
+            .dir
+            .path()
+            .join("codex-home")
+            .display()
+            .to_string(),
+    ));
+    env.push(("FAKE_DIR".into(), fake.display().to_string()));
+    let reply = rig.request(
+        json!({"op":"launch","provider":"codex","cwd":cwd,"env":env,"rows":24,"cols":80}),
+        "launched",
+    );
+    assert_eq!(reply["op"], "launched", "{reply}");
+    let codex = reply["session"]["id"].as_str().unwrap().to_string();
+    let events = |text: &str| {
+        std::fs::read_to_string(fake.join("events"))
+            .unwrap_or_default()
+            .contains(text)
+    };
+    within("fake codex started", || events("started"));
+    // Codex reports nothing before its first prompt, typed in its terminal.
+    let mut terminal = rig
+        .sandbox
+        .spawn(&["agent", "attach", &codex], &rig.sandbox.home, &[]);
+    terminal.shows("READY");
+    terminal.send(b"first prompt typed by the owner\r");
+    within("the first prompt", || events("prompt turn-1 first prompt"));
+    std::fs::write(fake.join("complete"), "").unwrap();
+    within("the first turn ends", || events("completed turn-1"));
+    within("codex is ready", || {
+        rig.request(json!({"op":"list"}), "sessions")["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == codex.as_str() && s["status"] == "ready")
+    });
+    terminal.detach();
+    let id = rig.send(&a, 1, "tag:d", "queued for the ready codex");
+    within("the task reaches codex", || {
+        events("queued for the ready codex")
+    });
+    let task = &rig.status(&id)["tasks"][0];
+    assert_eq!(task["session_id"], codex.as_str(), "{task}");
+}
+
+#[test]
+fn runtime_check_refuses_launch_on_message_for_codex() {
+    let mut rig = Rig::unstarted();
+    rig.config = rig
+        .config
+        .replace("provider = \"claude\"", "provider = \"codex\"");
+    rig.config = rig.config.replace(
+        "labels = [\"tag:c\"]",
+        "labels = [\"tag:c\"]\nlaunch = \"on_message\"",
+    );
+    private(&rig.sandbox.config().join("runtime.toml"), &rig.config);
+    let (out, err, ok) = rig.sandbox.atem(&["runtime", "check"]);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        format!("{out}{err}")
+            .contains("route `c`: launch on message supports Claude Code profiles only for now"),
+        "{out}{err}"
+    );
+}
+
 #[test]
 fn launch_stays_off_by_default() {
     let rig = Rig::new();
@@ -2091,7 +2322,7 @@ fn a_failed_launch_fails_its_task() {
     let _ = configure_launch(&mut rig);
     std::fs::remove_dir(rig.sandbox.home.join("c")).unwrap();
     let (_, a) = rig.launch("a", "sender");
-    let id = rig.send(&a, 1, "tag:c", "missing approved cwd");
+    let id = rig.send_launch(&a, 1, "c", "missing approved cwd");
     within("failed launch task", || {
         rig.status(&id)["tasks"][0]["state"] == "failed"
     });
