@@ -517,7 +517,8 @@ its sender: two separate steps.
   works only on the session's own messages; from outside any session (the
   owner's terminal) both cover everything.
 - **Storage.** The runtime writes a grant or result only when its state
-  changes.
+  changes, and prunes it with its task once the task settled a day past its
+  deadline ([agent-hosting.md](agent-hosting.md) section 9).
 
 Stage 1 implements all of this within one runtime. Cross-instance, the return
 grant is a contract to agree with Astation before stage 2.

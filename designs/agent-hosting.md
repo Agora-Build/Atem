@@ -361,10 +361,20 @@ started, and starts an empty one. Nothing it held could be honored again:
 every request names the host, trust generation included, so a retry for the
 old identity is `stale_target`.
 
-Records are never pruned; ids stay as tombstones. At a limit the runtime
-refuses new requests with `busy` instead of evicting anything. Files and the
-database are owner-private but not encrypted at rest; keep secrets out of
-screenshots and context.
+About once a minute the runtime prunes what settled a day past its deadline:
+tasks completed, failed, cancelled or expired (with their reply, return grant
+and resolution), messages whose tasks all go (with their local outbox and
+origin rows), local sends never accepted, launches that are no longer starting
+and that no remaining task waits for, and uploads that no remaining task names
+(with their cached PNG). A live task is never removed, nor what it needs: its
+message and that message's other tasks, its launch, its uploads, the reply its
+delivery carries. A retry of a pruned request names a deadline that passed, so
+it is refused (`invalid_request`) and never becomes work again; a query for a
+pruned id gets the answer for an unknown one (`forbidden`). An upload that no
+task ever named is not pruned (the upload limits hold it). At a limit the
+runtime refuses new requests with `busy` instead of evicting anything. Files
+and the database are owner-private but not encrypted at rest; keep secrets out
+of screenshots and context.
 
 ## 10. Limits
 
@@ -427,8 +437,9 @@ screenshots and context.
   outcome unknown"; nothing is resubmitted), unless its agent submits a reply
   first (the task becomes `awaiting_result`) or, for a local task, its sender
   completes it.
-- **Not implemented:** retention, compaction or pruning of `host-work.sqlite`
-  and uploads.
+- **Not implemented:** archival or compaction of `host-work.sqlite`, and
+  pruning an upload that no task ever named (records settled a day past their
+  deadline are pruned, section 9).
 - **Not implemented:** `atem cred get` as an environment source for profiles.
 - **Not implemented:** launching into a new clone or Git worktree; profiles name
   existing directories.

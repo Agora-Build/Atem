@@ -559,9 +559,16 @@ event.
 `<config>/runtime/host-work.sqlite` keeps launches, tasks, messages with their
 receipts, and upload bytes, each durable before its reply, bound to one host
 triple (a new identity moves it aside and starts an empty one; see
-[agent hosting](../agent-hosting.md#9-durable-records)). Nothing is pruned or evicted: at a
-limit (4,096 launches, tasks or messages; 256 unfinished tasks; 256 uploads or
-128 MiB) new requests are `busy`, so an old retry never becomes new work.
+[agent hosting](../agent-hosting.md#9-durable-records)). Records are pruned a
+day after their `expires_at` once settled: a task completed, failed, cancelled
+or expired (with its reply), a message whose tasks all go, a launch no longer
+`starting`, an upload no remaining task names. A live task, and its message,
+launch and uploads, is never pruned. A retry of a pruned request names an
+`expires_at` that passed, so it is `invalid_request` and never becomes work; a
+query for a pruned id is `forbidden`, as for an unknown one. Nothing is
+evicted: at a limit (4,096 launches, tasks or messages; 256 unfinished tasks,
+that is queued, blocked, submitting or submitted; 256 uploads or 128 MiB) new
+requests are `busy`.
 
 ## 10. Planned (not implemented)
 

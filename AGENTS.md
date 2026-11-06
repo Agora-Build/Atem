@@ -350,7 +350,10 @@ No separate mark queue, model triage or background `claude -p` remains.
 only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender
 principal/key. Verified private local PNG paths are appended before dispatch;
 missing/incomplete bytes block work. Limits: 256 uploads and 128 MiB reserved
-bytes, no automatic pruning. `message.mark` carries typed annotation metadata
+bytes. About once a minute `Store::prune` removes host-work records settled a
+day past their deadline (tasks with their reply/grant, messages whose tasks all
+go, launches, uploads no remaining task names); live tasks and what they need
+stay, and a pruned request's retry is refused as expired. `message.mark` carries typed annotation metadata
 and an immutable screenshot descriptor. See `designs/protocol/atem-host-work-v1.md` §6.
 Legacy ID-only `markTaskAssignment` returns failed `markTaskResult` with upgrade
 guidance, never reads local task files or injects input. Not implemented:

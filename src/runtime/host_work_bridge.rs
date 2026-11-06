@@ -12,6 +12,10 @@ use std::sync::atomic::AtomicBool;
 /// The longest `paused: <reason>` detail a waiting local task carries.
 const MAX_PAUSE_DETAIL: usize = 240;
 
+/// How often settled host-work records and collaboration counters whose
+/// windows passed are pruned (counters also at each counted send).
+const PRUNE_EVERY: Duration = Duration::from_secs(60);
+
 #[path = "collab_bridge.rs"]
 mod collab_bridge;
 #[path = "collab_launch_bridge.rs"]
@@ -90,7 +94,7 @@ pub(super) struct State {
     launches: VecDeque<RemoteLaunch>,
     context_jobs:
         HashMap<String, tokio::sync::oneshot::Receiver<anyhow::Result<Vec<hw::ContextSnapshot>>>>,
-    /// When counter rows whose window passed are pruned next.
+    /// When settled records and passed counter windows are pruned next.
     pruned: Instant,
 }
 
@@ -432,6 +436,7 @@ impl HostBridge {
                 .collab_pass(cx)
                 .and_then(|_| self.collab_reply_pass())
                 .and_then(|_| self.schedule_work(cx))
+                .and_then(|_| self.work_prune())
                 .is_err()
             {
                 self.work_fail();
@@ -1052,6 +1057,20 @@ impl HostBridge {
             Some((end, _)) => format!("{}…", &detail[..end]),
             None => detail,
         })
+    }
+
+    /// About once a minute, after a scheduling pass: host-work records
+    /// settled a day past their deadline (`Store::prune`, remote and local
+    /// alike), and collaboration counters whose windows passed.
+    fn work_prune(&mut self) -> anyhow::Result<()> {
+        if Instant::now() < self.work.pruned {
+            return Ok(());
+        }
+        self.work.pruned = Instant::now() + PRUNE_EVERY;
+        let store = self.work.store.as_ref().unwrap();
+        let now = host_now().wall_ms;
+        store.prune(now)?;
+        crate::runtime::collab::prune_counters(&store.db, now)
     }
 
     /// One scheduling pass. It runs only while hosting runs, so no pause
@@ -1802,6 +1821,71 @@ principals = ["local"]
                     .contains("UNDER_THE_NEW_REVISION")
             })
             .await;
+        });
+    }
+
+    /// The work pass prunes, about once a minute, what settled a day past
+    /// its deadline; a task still in its turn stays whatever its deadline.
+    #[test]
+    fn the_work_pass_prunes_settled_records_past_the_margin() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let old = host_now().wall_ms - crate::runtime::host_work::PRUNE_MARGIN_MS - 1;
+            let mut ids = Vec::new();
+            for state in [WorkState::Completed, WorkState::Submitted] {
+                let message = rig.message();
+                let mut task = message.task(&message.recipients[0]).unwrap();
+                task.expires_at = old;
+                let record = WorkRecord {
+                    principal: "member:owner".into(),
+                    attachment_owner: String::new(),
+                    control_gen: 0,
+                    route_id: "r".into(),
+                    route_revision: 1,
+                    profile_id: "p".into(),
+                    profile_revision: 1,
+                    project: "local:project".into(),
+                    digest: hw::digest(b"task"),
+                    status: WorkStatus {
+                        task_id: task.task_id.clone(),
+                        receipt_id: uuid::Uuid::new_v4().to_string(),
+                        state,
+                        detail: String::new(),
+                        result: None,
+                    },
+                    task,
+                    turn_id: None,
+                };
+                store
+                    .db
+                    .execute(
+                        "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+                        rusqlite::params![
+                            record.task.task_id,
+                            serde_json::to_string(&record).unwrap(),
+                            serde_json::to_value(state).unwrap().as_str().unwrap()
+                        ],
+                    )
+                    .unwrap();
+                ids.push(record.task.task_id);
+            }
+            let present = |rig: &LocalRig, id: &str| {
+                rig.bridge
+                    .work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .work(id)
+                    .unwrap()
+                    .is_some()
+            };
+            idle(&mut rig, 300).await;
+            assert!(present(&rig, &ids[0]), "not before the next prune");
+            rig.bridge.work.pruned = Instant::now();
+            idle(&mut rig, 300).await;
+            assert!(!present(&rig, &ids[0]), "settled and past the margin");
+            assert!(present(&rig, &ids[1]), "still in its turn");
         });
     }
 

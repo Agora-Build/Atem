@@ -532,6 +532,20 @@ pub struct WorkRecord {
     pub turn_id: Option<String>,
 }
 
+/// How long a settled record is kept past its deadline. A retry of a pruned
+/// request names a deadline that passed, so it is refused, never new work;
+/// the day covers a host clock that was set back.
+pub const PRUNE_MARGIN_MS: u64 = 86_400_000;
+
+/// What `Store::prune` removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    pub tasks: usize,
+    pub messages: usize,
+    pub launches: usize,
+    pub attachments: usize,
+}
+
 pub struct Store {
     pub(super) db: Connection,
     pub(super) state: PathBuf,
@@ -867,6 +881,157 @@ impl Store {
         Ok(due.len())
     }
 
+    /// Removes what is settled and a day past its deadline
+    /// (`PRUNE_MARGIN_MS`): tasks completed, failed, cancelled or expired,
+    /// with their reply, return grant and resolution; messages whose tasks
+    /// all go, with their outbox, origin and resolution rows; local sends
+    /// never accepted (refused or expired); launches no longer starting that
+    /// no remaining task waits for; uploads no remaining task names. A live
+    /// task is never removed, nor what it needs: its message (and so the
+    /// message's other tasks), its launch, its uploads, a result its delivery
+    /// still carries. An upload no task ever named stays (its own bound
+    /// holds it). Every task of a message has the message's deadline
+    /// (`Message::task`, the local `local_task`), so only messages past the
+    /// margin are read. Returns what it removed.
+    pub fn prune(&self, now: u64) -> Result<Pruned> {
+        let cutoff = now.saturating_sub(PRUNE_MARGIN_MS);
+        let tx = self.db.unchecked_transaction()?;
+        let mut tasks: BTreeMap<String, WorkRecord> = {
+            let mut q = tx.prepare(
+                "SELECT id,record FROM work WHERE state IN ('completed','failed','cancelled','expired')
+                AND json_extract(record,'$.task.expires_at')<=?1",
+            )?;
+            q.query_map([cutoff], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .map(|r| {
+                let (id, record) = r?;
+                Ok((id, serde_json::from_str(&record)?))
+            })
+            .collect::<Result<_>>()?
+        };
+        // A reply stays while the task delivering it stays.
+        let carried: Vec<(String, String)> = {
+            let mut q = tx.prepare(
+                "SELECT r.task_id,r.work_id FROM results r JOIN work d ON d.id=r.work_id",
+            )?;
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (task, delivery) in carried {
+            if !tasks.contains_key(&delivery) {
+                tasks.remove(&task);
+            }
+        }
+        // A message goes with all of its tasks, or stays with all of them.
+        let expired: Vec<(String, String)> = {
+            let mut q = tx.prepare(
+                "SELECT id,record FROM messages WHERE json_extract(record,'$.message.expires_at')<=?1",
+            )?;
+            q.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut messages = Vec::new();
+        for (id, record) in expired {
+            let record: serde_json::Value = serde_json::from_str(&record)?;
+            let work: Vec<String> = record["receipt"]["recipients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| r["delivery"]["state"] == "work")
+                .filter_map(|r| r["recipient_id"].as_str().map(str::to_string))
+                .collect();
+            let mut stays = false;
+            for task in &work {
+                stays |= !tasks.contains_key(task) && self.work(task)?.is_some();
+            }
+            if stays {
+                for task in &work {
+                    tasks.remove(task);
+                }
+            } else {
+                messages.push(id);
+            }
+        }
+        let mut uploads = BTreeSet::new();
+        for (id, record) in &tasks {
+            for table in [
+                "work WHERE id",
+                "results WHERE task_id",
+                "return_grants WHERE task_id",
+                "resolutions WHERE task_id",
+            ] {
+                tx.execute(&format!("DELETE FROM {table}=?1"), [id])?;
+            }
+            for a in &record.task.attachments {
+                uploads.insert((record.attachment_owner.clone(), a.attachment_id.clone()));
+            }
+        }
+        for id in &messages {
+            for table in [
+                "messages WHERE id",
+                "outbox WHERE message_id",
+                "origins WHERE message_id",
+                "publications WHERE message_id",
+                "resolutions WHERE message_id",
+            ] {
+                tx.execute(&format!("DELETE FROM {table}=?1"), [id])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM outbox WHERE state!='publishing' AND message_id NOT IN (SELECT id FROM messages)
+            AND json_extract(envelope,'$.expires_at')<=?1",
+            [cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM publications WHERE message_id NOT IN (SELECT message_id FROM outbox)",
+            [],
+        )?;
+        let launches = tx.execute(
+            "DELETE FROM launches WHERE json_extract(record,'$.status.state')!='starting'
+            AND json_extract(record,'$.expires_at')<=?1 AND id NOT IN
+            (SELECT launch_request_id FROM resolutions WHERE launch_request_id IS NOT NULL)",
+            [cutoff],
+        )?;
+        let mut removed = Vec::new();
+        for (owner, id) in uploads {
+            let named: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work w, json_each(w.record,'$.task.attachments') a
+                WHERE json_extract(w.record,'$.attachment_owner')=?1
+                AND json_extract(a.value,'$.attachment_id')=?2)",
+                params![owner, id],
+                |r| r.get(0),
+            )?;
+            if !named
+                && tx.execute(
+                    "DELETE FROM attachments WHERE owner=?1 AND id=?2",
+                    params![owner, id],
+                )? == 1
+            {
+                removed.push((owner, id));
+            }
+        }
+        tx.commit()?;
+        // The verified cache files of removed uploads (rebuilt from the
+        // database whenever a prompt needs one).
+        for (owner, id) in &removed {
+            if valid_owner(owner) && atem_client::session::wire::is_uuid_v4(id) {
+                let _ = std::fs::remove_file(
+                    self.state
+                        .join("attachments")
+                        .join(owner)
+                        .join(format!("{id}.png")),
+                );
+            }
+        }
+        Ok(Pruned {
+            tasks: tasks.len(),
+            messages: messages.len(),
+            launches,
+            attachments: removed.len(),
+        })
+    }
+
     pub fn save_work(&self, record: &WorkRecord) -> Result<()> {
         let state = serde_json::to_value(record.status.state)?;
         if self.db.execute(
@@ -883,8 +1048,11 @@ impl Store {
         Ok(())
     }
 
-    /// No retention pruning: identities remain tombstones at a bounded
-    /// capacity. Deleting a result must never turn an old retry into work.
+    /// At a start: a launch still starting is started (its worker is
+    /// live) or of unknown outcome, and a task found submitting is of unknown
+    /// outcome; neither is ever retried. Identities stay until `prune`
+    /// removes them a day past their deadline, when a retry is refused
+    /// anyway: deleting a record never turns an old retry into work.
     pub fn recover(
         &self,
         sessions: &BTreeMap<crate::session::SessionId, super::broker::BrokerSession>,
@@ -1396,6 +1564,260 @@ mod tests {
             )
             .unwrap();
         assert_eq!(grant, "ended");
+    }
+
+    /// Rows a day past their deadline go once settled, with what belongs to
+    /// them; rows inside the margin, live tasks and whatever a live task
+    /// needs (its message, launch, upload, the result its delivery carries)
+    /// stay.
+    #[test]
+    fn settled_records_are_pruned_a_day_past_their_deadline() {
+        use atem_client::session::attachments::Attachment;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.bind(&host()).unwrap();
+        let now = 10 * PRUNE_MARGIN_MS;
+        let (old, recent) = (now - PRUNE_MARGIN_MS, now - PRUNE_MARGIN_MS + 1);
+        let owner = digest(b"sender");
+        let upload = |name: &[u8]| Attachment {
+            attachment_id: uuid::Uuid::new_v4().to_string(),
+            digest: digest(name),
+            size: 68,
+            media_type: "image/png".into(),
+        };
+        let put = |task: WorkRecord, state: WorkState| -> WorkRecord {
+            let mut r = task;
+            r.attachment_owner = owner.clone();
+            r.status.state = state;
+            let text = serde_json::to_value(state).unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+                    params![
+                        r.task.task_id,
+                        serde_json::to_string(&r).unwrap(),
+                        text.as_str().unwrap()
+                    ],
+                )
+                .unwrap();
+            for a in &r.task.attachments {
+                store
+                    .db
+                    .execute(
+                        "INSERT OR IGNORE INTO attachments(owner,id,descriptor,size,bytes)
+                        VALUES(?1,?2,?3,68,x'00')",
+                        params![owner, a.attachment_id, serde_json::to_string(a).unwrap()],
+                    )
+                    .unwrap();
+            }
+            r
+        };
+        let due = |expires_at: u64, attachments: Vec<Attachment>| {
+            let mut r = task();
+            r.task.expires_at = expires_at;
+            r.task.attachments = attachments;
+            r
+        };
+        let rows = |table: &str, column: &str, id: &str| -> i64 {
+            store
+                .db
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE {column}=?1"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let (gone_upload, kept_upload, unnamed_upload) =
+            (upload(b"gone"), upload(b"kept"), upload(b"unnamed"));
+        store
+            .db
+            .execute(
+                "INSERT INTO attachments(owner,id,descriptor,size,bytes) VALUES(?1,?2,?3,68,x'00')",
+                params![
+                    owner,
+                    unnamed_upload.attachment_id,
+                    serde_json::to_string(&unnamed_upload).unwrap()
+                ],
+            )
+            .unwrap();
+        // Settled, a day past its deadline: goes, with its reply, grant,
+        // resolution and its upload.
+        let settled = put(due(old, vec![gone_upload.clone()]), WorkState::Completed);
+        let id = settled.task.task_id.clone();
+        for sql in [
+            "INSERT INTO results(task_id,result_id,state,detail,digest,created_ms,record,next_try_ms,attempts)
+            VALUES(?1,?1,'submitted','','d',0,'{}',0,0)",
+            "INSERT INTO return_grants(task_id,record,state) VALUES(?1,'{}','ended')",
+            "INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,session_id,process_gen,record)
+            VALUES('none','none',?1,'r','s','p','{}')",
+        ] {
+            store.db.execute(sql, [&id]).unwrap();
+        }
+        // Inside the margin, or live: stay. A live task keeps its upload.
+        let inside = put(due(recent, vec![]), WorkState::Failed);
+        let live = put(due(old, vec![kept_upload.clone()]), WorkState::Submitted);
+        // A settled task whose result is carried by a delivery still queued.
+        let carried = put(due(old, vec![]), WorkState::Expired);
+        let delivery = put(due(old, vec![]), WorkState::Queued);
+        store
+            .db
+            .execute(
+                "INSERT INTO results(task_id,result_id,state,detail,digest,created_ms,record,next_try_ms,attempts,work_id)
+                VALUES(?1,?1,'submitted','','d',0,'{}',0,0,?2)",
+                params![carried.task.task_id, delivery.task.task_id],
+            )
+            .unwrap();
+        // Messages: one whose tasks are all settled goes with its outbox,
+        // origin and resolutions; one with a live task keeps every task.
+        let message = |tasks: &[&WorkRecord]| -> String {
+            let id = uuid::Uuid::new_v4().to_string();
+            let record = serde_json::json!({
+                "sender_key": "local",
+                "message": {"expires_at": old},
+                "receipt": {"recipients": tasks.iter().map(|t| serde_json::json!({
+                    "recipient_id": t.task.task_id, "delivery": {"state": "work"}
+                })).chain([serde_json::json!({"recipient_id": "x", "delivery": {"state": "stored"}})])
+                .collect::<Vec<_>>()},
+            });
+            store
+                .db
+                .execute(
+                    "INSERT INTO messages(id,record) VALUES(?1,?2)",
+                    params![id, record.to_string()],
+                )
+                .unwrap();
+            for sql in [
+                "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+                VALUES(?1,'{}','accepted','',0,0)",
+                "INSERT INTO origins(message_id,record) VALUES(?1,'{}')",
+            ] {
+                store.db.execute(sql, [&id]).unwrap();
+            }
+            for t in tasks {
+                store
+                    .db
+                    .execute(
+                        "INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,session_id,process_gen,record)
+                        VALUES(?1,'r',?2,'r','s','p','{}')",
+                        params![id, t.task.task_id],
+                    )
+                    .unwrap();
+            }
+            id
+        };
+        let finished = [
+            put(due(old, vec![]), WorkState::Completed),
+            put(due(old, vec![]), WorkState::Cancelled),
+        ];
+        let done = message(&[&finished[0], &finished[1]]);
+        let held = [
+            put(due(old, vec![]), WorkState::Expired),
+            put(due(old, vec![]), WorkState::AwaitingResult),
+        ];
+        let waiting = message(&[&held[0], &held[1]]);
+        // Local sends never accepted: a refused one goes, one still
+        // publishing stays.
+        for (state, id) in [("refused", "unsent"), ("publishing", "sending")] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+                    VALUES(?1,?2,?3,'',0,0)",
+                    params![
+                        id,
+                        serde_json::json!({"expires_at": old}).to_string(),
+                        state
+                    ],
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO publications(message_id,record) VALUES(?1,'{}')",
+                    [id],
+                )
+                .unwrap();
+        }
+        // Launches: a settled one goes; one still starting, one inside the
+        // margin and one a remaining task waits for stay.
+        let mut launches = Vec::new();
+        for (state, expires_at) in [
+            (LaunchState::Started, old),
+            (LaunchState::Starting, old),
+            (LaunchState::Failed, recent),
+            (LaunchState::OutcomeUnknown, old),
+        ] {
+            let mut l = launch();
+            l.expires_at = expires_at;
+            l.status.state = state;
+            assert!(store.reserve_launch(&l).unwrap());
+            launches.push(l.status.request_id);
+        }
+        store
+            .db
+            .execute(
+                "UPDATE resolutions SET launch_request_id=?2 WHERE task_id=?1",
+                params![held[1].task.task_id, launches[3]],
+            )
+            .unwrap();
+
+        // The verified cache files of the uploads.
+        let cache = |a: &Attachment| {
+            let dir = dir.path().join("attachments").join(&owner);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.join(format!("{}.png", a.attachment_id))
+        };
+        for a in [&gone_upload, &kept_upload] {
+            std::fs::write(cache(a), b"png").unwrap();
+        }
+        // Nothing is due a millisecond earlier.
+        let pruned = store.prune(now - 1).unwrap();
+        assert_eq!(pruned, Pruned::default());
+        let pruned = store.prune(now).unwrap();
+        assert_eq!(
+            pruned,
+            Pruned {
+                tasks: 3,
+                messages: 1,
+                launches: 1,
+                attachments: 1,
+            }
+        );
+        for gone in [&settled, &finished[0], &finished[1]] {
+            assert!(store.work(&gone.task.task_id).unwrap().is_none());
+        }
+        for table in ["results", "return_grants", "resolutions"] {
+            assert_eq!(rows(table, "task_id", &id), 0, "{table}");
+        }
+        for kept in [&inside, &live, &carried, &delivery, &held[0], &held[1]] {
+            assert!(store.work(&kept.task.task_id).unwrap().is_some());
+        }
+        assert_eq!(rows("results", "task_id", &carried.task.task_id), 1);
+        assert_eq!(rows("messages", "id", &done), 0);
+        for (table, count) in [("outbox", 1), ("origins", 1), ("resolutions", 2)] {
+            assert_eq!(rows(table, "message_id", &done), 0, "{table}");
+            assert_eq!(rows(table, "message_id", &waiting), count, "{table}");
+        }
+        assert_eq!(rows("messages", "id", &waiting), 1);
+        for (id, kept) in [("unsent", 0), ("sending", 1)] {
+            assert_eq!(rows("outbox", "message_id", id), kept, "{id}");
+            assert_eq!(rows("publications", "message_id", id), kept, "{id}");
+        }
+        let kept: Vec<bool> = launches
+            .iter()
+            .map(|id| store.launch(id).unwrap().is_some())
+            .collect();
+        assert_eq!(kept, [false, true, true, true]);
+        let uploads = |a: &Attachment| rows("attachments", "id", &a.attachment_id);
+        assert_eq!(uploads(&gone_upload), 0);
+        assert_eq!(uploads(&kept_upload), 1);
+        assert_eq!(uploads(&unnamed_upload), 1);
+        assert!(!cache(&gone_upload).exists());
+        assert!(cache(&kept_upload).exists());
+        // Again: nothing more.
+        assert_eq!(store.prune(now).unwrap(), Pruned::default());
     }
 
     #[test]

@@ -24,10 +24,6 @@ const SENDER_GONE: &str = "sender gone";
 /// accepted: it can never be dispatched, or its result delivered, under it.
 pub(super) const ROUTE_CHANGED: &str = "route changed";
 
-/// How often counter rows whose window passed are pruned (besides at each
-/// counted send).
-const PRUNE_EVERY: Duration = Duration::from_secs(60);
-
 /// A reply's text fits the task that carries it to its sender.
 const MAX_REPLY_TEXT: usize = atem_client::session::host_work::MAX_REPLY_TEXT_BYTES;
 
@@ -1401,10 +1397,6 @@ impl HostBridge {
         self.collab_result_pass(cx.sessions)?;
         let now = host_now().wall_ms;
         let store = self.work.store.as_ref().unwrap();
-        if Instant::now() >= self.work.pruned {
-            self.work.pruned = Instant::now() + PRUNE_EVERY;
-            collab::prune_counters(&store.db, now)?;
-        }
         store.db.execute(
             "UPDATE outbox SET state='expired',detail='expired before context publication'
             WHERE state='publishing' AND json_extract(envelope,'$.expires_at')<=?1",
