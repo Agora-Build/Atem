@@ -655,6 +655,7 @@ fn a_service_reads_its_tasks_reply_with_reply_query() {
 /// A reply with context is `publishing` (no context, no time) until the
 /// context is published, then `submitted` with it; it survives a restart.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart() {
     let mut rig = Rig::prepared("claude", |_| {});
     rig.context_hook = true;
@@ -728,6 +729,7 @@ fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart()
 /// A refused reply is read as refused (its reason is the task's detail),
 /// and the corrected reply that replaces it keeps the result id.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn a_refused_reply_reads_refused_until_a_corrected_one_replaces_it() {
     let mut rig = Rig::prepared("claude", |_| {});
     rig.context_hook = true;

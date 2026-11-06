@@ -382,6 +382,7 @@ fn one_message_to_nine_agents_counts_once() {
 /// Results count against nothing: with the workflow's three messages used up,
 /// the reply to the request still goes through, with context.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn replies_count_against_no_workflow_limit() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -456,6 +457,7 @@ fn replies_count_against_no_workflow_limit() {
 /// 40 000 bytes of context plus the prompt can never be dispatched (32 KiB):
 /// the send is refused with that reason and uses none of the hourly budget.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn a_context_over_the_task_bounds_is_refused_and_not_counted() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -555,6 +557,7 @@ fn context_sends_still_publishing_count_against_the_hourly_limit() {
 /// a reply whose context could never be delivered is refused once its context
 /// is read, and a corrected reply replaces it.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn a_reply_that_could_never_be_delivered_is_refused_and_can_be_corrected() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -836,6 +839,7 @@ fn a_send_from_a_task_inherits_its_workflow_and_limit() {
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn a_vault_reference_arrives_as_its_exact_text_after_publication_retries() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -1487,6 +1491,7 @@ fn inside_a_session_status_and_cancel_cover_its_own_messages() {
 /// completing it stops a delivery already queued: the result is never
 /// prompted into the sender afterwards.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn completing_waits_for_publication_and_stops_a_queued_delivery() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -1690,6 +1695,7 @@ fn five_agents_reply_in_their_turns_and_every_reply_is_delivered() {
 /// A reply with context stays bound to its task's turn: its publication may
 /// finish after the agent's next turn began.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn a_reply_whose_context_publishes_after_the_next_turn_began_is_kept() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -1752,6 +1758,7 @@ fn a_reply_whose_context_publishes_after_the_next_turn_began_is_kept() {
 /// A reply is the replier's once it is stored: its context still publishes,
 /// and it still reaches the sender, after the replier's session ended.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn a_reply_publishes_after_its_session_ended() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
@@ -1981,6 +1988,7 @@ fn a_final_message_report_stays_status_only_until_an_explicit_reply() {
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
 fn result_context_is_frozen_and_another_session_cannot_reply() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::new();
