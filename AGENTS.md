@@ -299,8 +299,10 @@ FIFO, readiness, drafts, approvals, leases and control fencing. A
 `runtime.toml` that doesn't load, hosting off or a receipt-database fault
 pauses local work, never fences it: new sends are refused with the reason,
 queued local tasks wait as `paused: <reason>`, replies are stored while their
-publication and delivery wait, and a local launch not yet started waits (one
-already handed to the spawner completes). `[collab] send = false` is no pause:
+publication and delivery wait (a receipt-database fault instead refuses a reply
+and a completion until `atem runtime restart`), and a local launch not yet
+started waits (one already handed to the spawner completes). `[collab] send =
+false` is no pause:
 it only refuses new sends, and accepted tasks, replies and deliveries go on.
 `local` is fenced only by a new host identity or a device-list freeze or fault.
 The agent commands connect only to the running runtime (none: "no Atem runtime

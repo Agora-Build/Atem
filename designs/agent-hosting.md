@@ -444,10 +444,11 @@ sending agent completes its own task with `atem message complete`, a remote
 sender with `work_complete`. `atem message` and `atem agent tag` connect only
 to the running runtime (they never start or replace one). A `runtime.toml`
 that doesn't load, hosting off or a database fault pauses local work without
-fencing it (sends are refused, queued tasks wait, replies are stored);
-`[collab] send = false` only refuses new sends. A session is launched only for
-`atem message send --launch` on a route with `launch = "on_message"`, and only
-for a Claude Code profile. **Not implemented:** cross-instance transport, the
+fencing it (sends are refused, queued tasks wait, replies are stored, except
+that a database fault refuses a reply and a completion until `atem runtime
+restart`); `[collab] send = false` only refuses new sends. A session is
+launched only for `atem message send --launch` on a route with
+`launch = "on_message"`, and only for a Claude Code profile. **Not implemented:** cross-instance transport, the
 shared Station directory and mailbox, and the stages 2-3 permission
 agreements.
 

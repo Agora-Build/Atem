@@ -361,16 +361,18 @@ doesn't load, hosting disabled, and a receipt-database fault. While one lasts,
 new local sends are refused with the reason, queued local tasks wait (their
 detail reads `paused: <reason>`), and the publication of replies and the
 delivery of results wait. Nothing is fenced, so everything resumes as soon as
-the file is valid again (as for remote senders). A reply is accepted and stored
-during a pause, so an agent that finishes then loses nothing. A local launch
-not yet started waits out the pause and then starts; a launch already handed to
-the worker spawner completes. (After a database fault the pause lasts until
-`atem runtime restart`, which ends the wait of a launch that had not started:
-it becomes `outcome_unknown` and is never started.) `[collab] send = false` is
-not a pause: it only refuses new local sends. Local tasks already accepted keep
-dispatching, and replies and result deliveries are not held back. Only a real
-change of authority fences `local`: a new host identity, or a device-list
-freeze or fault.
+the file is valid again (as for remote senders). A reply (and a completion) is
+accepted and stored during a pause, so an agent that finishes then loses
+nothing; the exception is a receipt-database fault, which refuses both
+("agent hosting records are unavailable") until `atem runtime restart`. A local
+launch not yet started waits out the pause and then starts; a launch already
+handed to the worker spawner completes. (After a database fault the pause lasts
+until `atem runtime restart`, which ends the wait of a launch that had not
+started: it becomes `outcome_unknown` and is never started.) `[collab] send =
+false` is not a pause: it only refuses new local sends. Local tasks already
+accepted keep dispatching, and replies and result deliveries are not held back.
+Only a real change of authority fences `local`: a new host identity, or a
+device-list freeze or fault.
 
 **Agent commands never replace the runtime.** `atem message …` and `atem
 agent tag` connect only to the runtime that is already running (the calling
@@ -426,9 +428,11 @@ its sender: two separate steps.
   complete it, and it no longer holds its session's queue.
 - **Durable and idempotent.** The reply is committed (one per task in
   `host-work.sqlite`, `result_id` = UUIDv5 of the task id) before the CLI is
-  answered, also during a pause (section 9). Context publication (section 8)
-  then completes against that stored binding, never against the session's
-  current turn, so a turn that has moved on can't lose it. A reply is
+  answered, also during a pause (section 9; not during a receipt-database
+  fault, which refuses a reply until `atem runtime restart`). Context
+  publication (section 8) then completes against that stored binding, never
+  against the session's current turn, so a turn that has moved on can't lose
+  it. A reply is
   `publishing` while its context is published, `submitted` once final (a
   text-only reply at once) and `refused` when it can't be delivered (its
   context over the task bounds or changed, or the task expired first). An
