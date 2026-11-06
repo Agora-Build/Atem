@@ -15,8 +15,9 @@ and the r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md
 
 [Agent collaboration](agent-collaboration.md) adds opt-in messaging between
 agents in this runtime, including selectors, context publication, correlated
-results and local launch on message (stage 1, unreleased). The remote contract
-described here retains its existing admission rules.
+replies and local launch on message (stage 1, unreleased). It adds one
+read-only remote op, `reply_query` (section 7); the remote contract described
+here otherwise retains its existing admission rules.
 
 ## 1. What it does
 
@@ -301,9 +302,20 @@ from its receipt; it is never sent again.
 work produced); the task becomes `completed`. A task awaiting its result no
 longer holds the session.
 
+**Replies.** The agent working on a task can answer it with `atem message
+reply`, for a task of any sender. The reply is durable, bound to the task, its
+session, process and turn, and never completes the task. The sender reads it
+with `reply_query{task_id}` (feature `host.reply`, op `notify`): the same
+authorization as `work_query`, answered `{kind:"reply", reply}` with `reply`
+`null` until one exists, else `{result_id, state, digest, text, context,
+submitted_at}` and a state of `publishing`, `submitted` or `refused`
+([protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md#reply)). The
+reply isn't pushed: poll it, and complete the task with `work_complete`.
+
 **Cancel and expiry.** `work_cancel` works only while a task is `queued` or
 `blocked`; it never interrupts a turn (use session-v1 `interrupt`). A task not
-submitted by its `expires_at` becomes `expired`.
+submitted by its `expires_at`, or still awaiting its result at it, becomes
+`expired`.
 
 ## 8. Screenshots and Chisel/mark
 
@@ -361,6 +373,7 @@ screenshots and context.
 | Launch identities | 4,096 |
 | Work identities, messages | 4,096 each |
 | Unfinished tasks (queued, blocked, submitting, submitted, awaiting a result) | 256 |
+| Local collaboration (`[collab]`) | 32 agents per message; 30 messages per session per hour and 8 per workflow by default (a message counts once, however many agents it reaches) |
 | Uploads | 256 identities, 128 MiB declared bytes (partial uploads included) |
 | Live sessions | 16 (remote launches included) |
 | Request size | 256 KiB; message envelope 240 KiB |
@@ -401,12 +414,17 @@ screenshots and context.
   Remote senders resolve recipients (host, route, session, process) themselves.
   Local collaboration expands selectors once and persists that resolution.
 - **Not implemented:** cross-instance result routing and workflow limits.
-  Remote results go back through `work_query`/`message_query`. Local
-  collaboration has durable workflow limits and one correlated reply per
-  task, with origin-route consent before prompting its agent.
+  A remote sender reads an agent's reply with `reply_query` (feature
+  `host.reply`) and completes the task with `work_complete`; progress goes back
+  through `work_query`/`message_query`. Local collaboration has durable workflow
+  limits counted in messages and one correlated reply per task for every
+  sender, delivered into a local sender's agent only with origin-route
+  consent.
 - **Not implemented:** progress push. Launch and task status are query-only.
 - **Not implemented:** resolving an `outcome_unknown` task by hand. It keeps
-  holding its session's queue.
+  holding its session's queue and never expires, unless its agent submits a
+  reply (the task becomes `awaiting_result`) or, for a local task, its sender
+  completes it.
 - **Not implemented:** retention, compaction or pruning of `host-work.sqlite`
   and uploads.
 - **Not implemented:** `atem cred get` as an environment source for profiles.
@@ -421,8 +439,17 @@ screenshots and context.
 unreleased: agents in this runtime can address work by project, tag or
 `atem_id`, with a durable outbox, publish-before-notify, status reports and
 explicit correlated results. It uses this receiver and its approved routes.
-**Not implemented:** cross-instance transport, the shared Station directory
-and mailbox, and the stages 2-3 permission agreements.
+The agent answers any task, whoever sent it, with `atem message reply`; the
+sending agent completes its own task with `atem message complete`, a remote
+sender with `work_complete`. `atem message` and `atem agent tag` connect only
+to the running runtime (they never start or replace one). A `runtime.toml`
+that doesn't load, hosting off or a database fault pauses local work without
+fencing it (sends are refused, queued tasks wait, replies are stored);
+`[collab] send = false` only refuses new sends. A session is launched only for
+`atem message send --launch` on a route with `launch = "on_message"`, and only
+for a Claude Code profile. **Not implemented:** cross-instance transport, the
+shared Station directory and mailbox, and the stages 2-3 permission
+agreements.
 
 ### OS service and boot startup (not implemented)
 
@@ -451,7 +478,8 @@ design:
 fake CLIs in temp profiles: `runtime start`/`check` and pairing, concurrent
 starts, approved exports, launch deduplication and adoption after restart,
 scoped and local consent, drafts, leases, approvals, cancel and expiry, sender
-fencing, message fanout, uploads and mark tasks. Shared request vectors are
+fencing, message fanout, uploads, mark tasks, and replies read with
+`reply_query`. Shared request vectors are
 `protocol/fixtures/host-work/requests-v1.json`. Real provider APIs, OS services
 and Station delivery are not exercised.
 

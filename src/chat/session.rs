@@ -436,18 +436,21 @@ impl ChatSession {
         &self.generation
     }
 
-    /// This session's state with at most `max_messages` / `max_bytes` of
-    /// its newest history.
+    /// The provider turn the session is in, if any.
     pub fn current_turn_id(&self) -> Option<&str> {
         self.current_turn.as_ref().map(|(id, _)| id.as_str())
     }
 
+    /// The request id of the remote prompt that began the current turn
+    /// (none for one typed in the terminal).
     pub fn current_request_id(&self) -> Option<&str> {
         self.current_turn
             .as_ref()
             .and_then(|(_, request)| request.as_deref())
     }
 
+    /// This session's state with at most `max_messages` / `max_bytes` of
+    /// its newest history.
     pub fn snapshot(&self, max_messages: usize, max_bytes: usize) -> ChatSnapshot {
         ChatSnapshot {
             started: self.started,

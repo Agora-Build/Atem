@@ -232,7 +232,7 @@ capacity limit or on a storage failure). The reply follows the durable
 | `completed` | `work_complete` stored the result |
 | `failed` | the prompt was rejected, or couldn't be built |
 | `cancelled` | cancelled before submission |
-| `expired` | not submitted by `expires_at` |
+| `expired` | not submitted by `expires_at`, or still `awaiting_result` at it (detail `expired awaiting a result`) |
 | `outcome_unknown` | the submission is uncertain; never resubmitted |
 
 `receipt_id` (UUID v4, fixed at enqueue) is the session-v1 `request_id` of the
@@ -284,7 +284,11 @@ task of any sender (see
 [../agent-collaboration.md](../agent-collaboration.md), section 10). The
 sender reads it with `reply_query` (feature `host.reply`). A reply is
 read-only data: it never completes the task (`work_complete` does, whether or
-not the sender read the reply), and no existing message or status changes.
+not the sender read the reply, and with the sender's own result snapshot), and
+no existing message or status changes. While a reply exists the task's
+`detail` says how it stands ("reply submitted", "reply received; publishing its
+context", "reply refused (…)"). A submitted reply proves the prompt's turn ran,
+so it moves an `outcome_unknown` task to `awaiting_result`.
 
 ```json
 {"type":"session","data":{"v":1,"op":"reply_query","id":"11111111-1111-4111-8111-111111111111",
@@ -320,13 +324,15 @@ has no reply, else:
 
 The host checks exactly what `work_query` checks, in the same order: only the
 principal and key that enqueued the task (or sent the message), under a route
-that still allows it, may read its reply. Anyone else, an unknown task, a
-task of the host's own `local` sender and a caller without the `notify` op
-get the answer `work_query` gives them for that task, `forbidden`. An
-`outcome_unknown` task is reconciled from its receipt first. Storage failure
-is `busy`. A reply may exist while the task is still `submitted` (the agent
-replies in its turn), and a task can end with no reply (a silent turn): poll
-`reply_query` for the reply and `work_query` for the task.
+that still allows it, may read its reply. Anyone else, an unknown task and a
+caller without the `notify` op get the answer `work_query` gives them for that
+task, `forbidden`. A task of the host's own `local` sender can't be asked at
+all: its id is a UUID v5, which `reply_query` (like `work_query`) refuses at
+decode as `invalid_request`. An `outcome_unknown` task is reconciled from its
+receipt first. Storage failure is `busy`. A reply may exist while the task is
+still `submitted` (the agent replies in its turn), and a task can end with no
+reply (a silent turn): poll `reply_query` for the reply and `work_query` for
+the task.
 
 ## 5. Messages
 
@@ -355,6 +361,13 @@ replies in its turn), and a task can end with no reply (a silent turn): poll
 | `text` | at most 16 KiB, no control characters other than newline and tab |
 | `context` | 0–8 context snapshots (§4) |
 | `mark` | optional (§6); omitted when absent |
+
+The envelope's optional `kind`, `reply_to` and `from_session` belong to local
+collaboration ([../agent-collaboration.md](../agent-collaboration.md), section
+7): a remote `message_publish` carrying `from_session` or `reply_to`, or a
+`kind` other than `request`, is refused: `unsupported_version`, or
+`invalid_request` when the envelope doesn't decode (a `kind` other than
+`request` needs a `reply_to`).
 
 A message has text that isn't blank, context or a mark, and serializes to at
 most 240 KiB. At first acceptance `created_at` is at most 60 s ahead of the
@@ -559,5 +572,6 @@ limit (4,096 launches, tasks or messages; 256 unfinished tasks; 256 uploads or
   a new channel, so a Station can't deliver a stored envelope for its sender,
   and dispatch needs the sender's live channel. There is no origin proof and no
   host-to-host sender.
-- **Not implemented:** resolving an `outcome_unknown` task, and archival or
-  compaction of the host's records.
+- **Not implemented:** resolving an `outcome_unknown` task by hand (a reply
+  its agent submits moves it to `awaiting_result`; nothing else does), and
+  archival or compaction of the host's records.

@@ -43,6 +43,7 @@ atem message directory tag:backend
 atem message send --to tag:backend "Review the API contract"
 atem message status MESSAGE_ID
 atem message reply --task TASK_ID "Contract verified"
+atem message complete TASK_ID
 atem agent tag add self:reviewer
 ```
 
@@ -51,12 +52,14 @@ message counts once however many agents it reaches; results count against
 nothing), a 30-minute status-report timeout, `launch = "off"`,
 `results = false`, and `auto_report = "status"`. Set `results = true` on the
 originating route to queue replies back into its agent. Set
-`launch = "on_message"` on a receiving route to start its approved profile
-when no matching session exists. `local` belongs only in route principals;
-profile principals continue to control remote launch.
+`launch = "on_message"` on a receiving route (a Claude Code profile only) so
+that `atem message send --launch --to atem:<atem_id>/<route_id>` starts its
+approved profile when no matching session exists. `local` belongs only in route
+principals; profile principals continue to control remote launch.
 
 `--memory ID` and `--vault ID[:ENTRY]@VERSION` publish or verify the exact
 context before delivery. A bare vault ID/version is accepted only when it
-identifies one entry; include `:ENTRY` when ambiguous. These commands currently
+identifies one entry; include `:ENTRY` when ambiguous (`atem message reply`
+always needs it). These commands currently
 reach agents in the same runtime. Cross-instance delivery is planned in the
 [collaboration design](../designs/agent-collaboration.md).

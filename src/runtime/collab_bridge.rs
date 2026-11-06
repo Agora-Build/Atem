@@ -307,7 +307,9 @@ impl HostBridge {
 
     /// The one task of the calling session a reply without `--task` is for:
     /// in its turn or awaiting its result, with no reply yet (or a refused
-    /// one). With none, an identical retry finds the task it answered.
+    /// one). With none, an identical retry finds the task it answered, and
+    /// a different reply finds the one task whose reply is publishing or
+    /// submitted, so it is refused as with `--task` (`request_id_reused`).
     fn collab_reply_task(
         &self,
         from: &SessionId,
@@ -315,7 +317,7 @@ impl HostBridge {
         digest: &str,
     ) -> Result<WorkRecord> {
         let store = self.work.store.as_ref().unwrap();
-        let (mut open, mut identical) = (Vec::new(), Vec::new());
+        let (mut open, mut identical, mut held) = (Vec::new(), Vec::new(), Vec::new());
         for task in store.tasks()? {
             if task.task.target.session_id != from.as_str()
                 || task.task.target.process_gen != session.process_gen
@@ -329,18 +331,25 @@ impl HostBridge {
             } else if matches!(
                 task.status.state,
                 WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
-            ) && reply.is_none_or(|r| r.state == ReplyState::Refused)
-            {
-                open.push(task);
+            ) {
+                match reply {
+                    Some(r) if r.state != ReplyState::Refused => held.push(task),
+                    _ => open.push(task),
+                }
             }
         }
-        match (open.len(), identical.len()) {
-            (1, _) => Ok(open.remove(0)),
-            (0, 1) => Ok(identical.remove(0)),
-            (0, 0) => {
+        match (open.len(), identical.len(), held.len()) {
+            (1, _, _) => Ok(open.remove(0)),
+            (0, 1, _) => Ok(identical.remove(0)),
+            (0, 0, 1) => Ok(held.remove(0)),
+            (0, 0, 0) => {
                 bail!("no task of this session is in its turn or awaits a reply; use --task <id>")
             }
-            (n, _) => bail!("{n} tasks of this session await a reply; use --task <id>"),
+            (0, i, h) => bail!(
+                "{} tasks of this session already have a reply; use --task <id>",
+                i + h
+            ),
+            (n, _, _) => bail!("{n} tasks of this session await a reply; use --task <id>"),
         }
     }
 

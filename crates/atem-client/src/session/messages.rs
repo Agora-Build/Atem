@@ -295,11 +295,7 @@ impl From<&WorkStatus> for WorkProgress {
 
 impl WorkProgress {
     fn valid(&self) -> bool {
-        self.valid_for(false)
-    }
-
-    fn valid_for(&self, local: bool) -> bool {
-        (is_uuid_v4(&self.task_id) || local && super::wire::is_uuid_v5(&self.task_id))
+        is_uuid_v4(&self.task_id)
             && is_uuid_v4(&self.receipt_id)
             && self.detail.len() <= 1024
             && self.result.as_ref().is_none_or(|r| {
@@ -330,41 +326,23 @@ pub struct MessageReceipt {
 
 impl MessageReceipt {
     pub fn valid(&self) -> bool {
-        self.valid_for(false)
-    }
-
-    /// Internal receipts flatten a selector's fixed resolution into tasks.
-    pub fn valid_local(&self) -> bool {
-        self.valid_for(true)
-    }
-
-    fn valid_for(&self, local: bool) -> bool {
         let mut ids = BTreeSet::new();
         is_uuid_v4(&self.message_id)
             && is_digest(&self.digest)
-            && (local && self.sender == "local"
-                || !local
-                    && ["member:", "service:"]
-                        .iter()
-                        .any(|p| self.sender.strip_prefix(p).is_some_and(is_opaque_id)))
+            && ["member:", "service:"]
+                .iter()
+                .any(|p| self.sender.strip_prefix(p).is_some_and(is_opaque_id))
             && self.recipients.len() <= MAX_RECIPIENTS
-            && (local || !self.recipients.is_empty())
+            && !self.recipients.is_empty()
             && self.recipients.iter().all(|r| {
-                (is_uuid_v4(&r.recipient_id) || local && super::wire::is_uuid_v5(&r.recipient_id))
+                is_uuid_v4(&r.recipient_id)
                     && ids.insert(&r.recipient_id)
                     && match &r.delivery {
                         Delivery::Stored => true,
                         Delivery::Refused { code } => {
                             matches!(code.as_str(), "forbidden" | "stale_target")
                         }
-                        Delivery::Work { work } => {
-                            work.task_id == r.recipient_id
-                                && if local {
-                                    work.valid_for(true)
-                                } else {
-                                    work.valid()
-                                }
-                        }
+                        Delivery::Work { work } => work.task_id == r.recipient_id && work.valid(),
                     }
             })
     }

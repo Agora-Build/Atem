@@ -352,18 +352,30 @@ atem message send --to tag:backend "Review the API contract"
 atem message status MESSAGE_ID
 # From the receiving agent, using the task ID in its prompt:
 atem message reply --task TASK_ID "Contract verified"
+# From the sending agent, to finish the task:
+atem message complete TASK_ID
 ```
 
 Tasks use the normal per-session queue and wait for readiness, drafts,
-approvals and control leases. Only an explicit reply completes a task. A
-workflow (the chain of messages one request starts) is limited to 8 messages
-(`per_workflow`); a message counts once however many agents it reaches, and
-replies count against nothing.
-`results = true` on the originating route also queues that reply into its
-agent; otherwise it remains visible through status. `--memory ID` and
-`--vault ID[:ENTRY]@VERSION` attach verified exact context. Routes can opt in
-to `launch = "on_message"` to start their approved profile when empty.
-Sending, result prompts and automatic launch are off by default.
+approvals and control leases. `atem message reply` answers a task from any
+sender (a local agent, Astation's apps, an integration) and never completes
+it: the sender does, with `atem message complete TASK_ID` (or, for a remote
+sender, `work_complete`), and a task nobody completes expires at its deadline.
+Remote senders read the reply with `reply_query`. A workflow (the chain of
+messages one request starts) is limited to 8 messages (`per_workflow`); a
+message counts once however many agents it reaches, and replies count against
+nothing. `results = true` on the originating route also queues the reply into
+its agent; otherwise it remains visible through status. `--memory ID` and
+`--vault ID[:ENTRY]@VERSION` attach verified exact context to a message (a
+reply names its vault entry: `ID:ENTRY@VERSION`). The `atem message` and `atem
+agent tag` commands only connect to the running runtime: they never start or
+replace one. A `runtime.toml` that doesn't load or hosting turned off pauses
+local work (new sends are refused, queued tasks wait) and never fences it;
+`send = false` only refuses new sends. A route can opt in to
+`launch = "on_message"`, but only for a Claude Code profile, and only
+`atem message send --launch --to atem:ATEM_ID/ROUTE_ID …` then starts its
+approved profile when no agent runs. Sending, result prompts and automatic
+launch are off by default.
 
 See the [collaboration design](designs/agent-collaboration.md) and
 [runtime sample](configs/runtime.example.toml). This stage is local and

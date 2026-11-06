@@ -1048,6 +1048,16 @@ fn a_reply_comes_back_as_data_and_its_sender_completes_the_task() {
             .contains("request_id_reused"),
         "{conflict}"
     );
+    // The same without `--task`: the session's one task that holds a reply.
+    let conflict = rig.agent(&b, 5, &["message", "reply", "different result"]);
+    assert_ne!(conflict["code"], 0);
+    assert!(
+        conflict["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("request_id_reused"),
+        "{conflict}"
+    );
     assert_eq!(
         std::fs::read_to_string(a.join("input"))
             .unwrap()
