@@ -161,11 +161,7 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                             "    reply {} ({}): {}",
                             result.result_id,
                             serde_json::to_value(result.state)?.as_str().unwrap(),
-                            if result.dropped {
-                                "(text no longer kept)"
-                            } else {
-                                result.text.as_str()
-                            }
+                            reply_text(&result)
                         );
                         if !result.detail.is_empty() {
                             println!("    {}", result.detail);
@@ -183,6 +179,15 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
         _ => unreachable!(),
     }
     Ok(())
+}
+
+/// A reply's text as `atem message status` shows it.
+fn reply_text(result: &super::collab::ResultView) -> &str {
+    if result.dropped {
+        "(text no longer kept)"
+    } else {
+        &result.text
+    }
 }
 
 /// A provider name `atem agent launch` accepts.
@@ -355,6 +360,24 @@ pub async fn stop(sid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply whose text the runtime dropped (a day after its task
+    /// settled past its deadline) says so rather than show nothing.
+    #[test]
+    fn a_dropped_reply_says_its_text_is_no_longer_kept() {
+        let mut result = super::super::collab::ResultView {
+            result_id: uuid::Uuid::new_v4().to_string(),
+            state: ReplyState::Submitted,
+            detail: String::new(),
+            text: "done".into(),
+            context: vec![],
+            dropped: false,
+        };
+        assert_eq!(reply_text(&result), "done");
+        result.text.clear();
+        result.dropped = true;
+        assert_eq!(reply_text(&result), "(text no longer kept)");
+    }
 
     fn summary(id: &str, state: &str, exited: Option<&str>) -> SessionSummary {
         SessionSummary {

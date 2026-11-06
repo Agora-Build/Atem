@@ -442,11 +442,9 @@ impl HostBridge {
             }
             let reconciled = (|| -> anyhow::Result<()> {
                 let store = self.work.store.as_ref().unwrap();
-                for mut record in store.tasks()? {
-                    if record.status.state == WorkState::OutcomeUnknown {
-                        self.reconcile_work(&mut record)?;
-                        store.save_work(&record)?;
-                    }
+                for mut record in store.tasks_in(WorkState::OutcomeUnknown)? {
+                    self.reconcile_work(&mut record)?;
+                    store.save_work(&record)?;
                 }
                 Ok(())
             })();
@@ -496,6 +494,7 @@ impl HostBridge {
             p.permit.store(false, Ordering::SeqCst);
         }
         self.work.launches.clear();
+        self.work.halted_launches.clear();
         self.work.context_jobs.clear();
         self.work.recovered = false;
         let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
@@ -1595,7 +1594,9 @@ principals = ["local"]
                 sid,
                 fake,
             };
-            rig.until(|r| {
+            // The first agent on a cold machine (CI's x86_64 macOS job under
+            // Rosetta) can take minutes to start; this only bounds a failure.
+            rig.until_within(Duration::from_secs(300), |r| {
                 r.sessions[&r.sid].chat_v1
                     && r.sessions[&r.sid].chat.status().state == ChatState::Ready
             })
@@ -1605,8 +1606,17 @@ principals = ["local"]
 
         /// Passes until `predicate` holds; the deadline only bounds a
         /// failure (slow CI hosts take several times longer).
-        async fn until(&mut self, mut predicate: impl FnMut(&Self) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(60);
+        async fn until(&mut self, predicate: impl FnMut(&Self) -> bool) {
+            self.until_within(Duration::from_secs(60), predicate).await;
+        }
+
+        /// `until`, failing after `limit`.
+        async fn until_within(
+            &mut self,
+            limit: Duration,
+            mut predicate: impl FnMut(&Self) -> bool,
+        ) {
+            let deadline = Instant::now() + limit;
             loop {
                 for s in self.sessions.values_mut() {
                     s.pump();
@@ -1751,7 +1761,7 @@ principals = ["local"]
                     .store
                     .as_ref()
                     .unwrap()
-                    .tasks()
+                    .open_tasks()
                     .unwrap()
                     .is_empty()
             );
@@ -2419,7 +2429,7 @@ principals = ["local"]
                 .store
                 .as_ref()
                 .unwrap()
-                .tasks()
+                .open_tasks()
                 .unwrap()
                 .remove(0);
             let id = task.task.task_id.clone();
@@ -3143,13 +3153,19 @@ launch = "on_message"
     }
 
     fn launch_records(rig: &LocalRig) -> Vec<LaunchRecord> {
-        rig.bridge.work.store.as_ref().unwrap().launches().unwrap()
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .open_launches()
+            .unwrap()
     }
 
     fn task_targets(rig: &LocalRig) -> Vec<(String, Option<String>)> {
         let store = rig.bridge.work.store.as_ref().unwrap();
         store
-            .tasks()
+            .open_tasks()
             .unwrap()
             .into_iter()
             .map(|t| {
@@ -3405,7 +3421,7 @@ launch = "on_message"
                     .store
                     .as_ref()
                     .unwrap()
-                    .tasks()
+                    .open_tasks()
                     .unwrap()
                     .remove(0);
                 assert!(
@@ -3431,7 +3447,7 @@ launch = "on_message"
                 .store
                 .as_ref()
                 .unwrap()
-                .tasks()
+                .open_tasks()
                 .unwrap()
                 .remove(0);
             assert_eq!(task.status.state, WorkState::Blocked);
@@ -3496,7 +3512,7 @@ launch = "on_message"
                 .store
                 .as_ref()
                 .unwrap()
-                .tasks()
+                .open_tasks()
                 .unwrap()
                 .remove(0);
             assert_eq!(
@@ -3505,6 +3521,350 @@ launch = "on_message"
                     WorkState::Failed,
                     "launch not started: the session journal halted; run `atem runtime restart`"
                 )
+            );
+            // A new host identity starts a new store: the set goes with it.
+            assert!(!rig.bridge.work.halted_launches.is_empty());
+            let mut other = rig.bridge.work_host();
+            other.host_trust_gen += 1;
+            assert!(rig.bridge.work_store_ready(&other));
+            assert!(rig.bridge.work.halted_launches.is_empty());
+        });
+    }
+
+    /// Every statement traced (`plans_scan_no_kept_table`).
+    static TRACED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn traced(sql: &str) {
+        TRACED.lock().unwrap().push(sql.to_string());
+    }
+
+    /// Every statement a start (recovery, the reconcile of unknown
+    /// outcomes), the 100 ms passes, the payload pass, a send (one that
+    /// launches, one while that session's project is unknown) and a reply
+    /// (with `--task`, and an identical one without) run on the work store
+    /// reads the tables that keep closed records only through an index
+    /// that leaves them out: no plan scans one, and beside 3000 closed
+    /// records no statement takes more VM steps than beside 1000.
+    #[test]
+    fn a_start_a_pass_a_send_and_a_reply_scan_no_kept_table() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let cwd = launch_route(&mut rig, root);
+            TRACED.lock().unwrap().clear();
+            rig.bridge
+                .work
+                .store
+                .as_mut()
+                .unwrap()
+                .db
+                .trace(Some(traced));
+            rig.bridge.work.recovered = false;
+            rig.bridge.work.cleanup = Instant::now();
+            idle(&mut rig, 300).await;
+            let mut launching = send_request(&["atem:atem-host/q"]);
+            launching.launch = true;
+            rig.bridge
+                .collab_send("atem-host", &rig.sid, launching, &rig.sessions)
+                .unwrap();
+            let record = launch_records(&rig).remove(0);
+            start_reserved(&mut rig, root, &record, &cwd).await;
+            rig.bridge
+                .remote_launched(&record.status.request_id, LaunchState::Started);
+            rig.bridge
+                .collab_send(
+                    "atem-host",
+                    &rig.sid,
+                    send_request(&["atem:atem-host/q"]),
+                    &rig.sessions,
+                )
+                .unwrap();
+            let message = rig.message();
+            rig.publish(&message);
+            rig.until(|r| r.work(&message).turn_id.is_some()).await;
+            let task = message.recipients[0].recipient_id.clone();
+            let first = reply(&mut rig, &task, "the answer", &[]).unwrap();
+            let again = rig
+                .bridge
+                .collab_reply(
+                    &rig.sid,
+                    crate::runtime::collab::ReplyRequest {
+                        task_id: None,
+                        text: "the answer".into(),
+                        memory: vec![],
+                        vault: vec![],
+                    },
+                    &rig.sessions,
+                )
+                .unwrap();
+            assert_eq!(again.result_id, first);
+            idle(&mut rig, 300).await;
+            rig.bridge.work.store.as_mut().unwrap().db.trace(None);
+            let statements: std::collections::BTreeSet<String> = TRACED
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|sql| {
+                    let head = sql.trim_start().to_ascii_uppercase();
+                    ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH"]
+                        .iter()
+                        .any(|verb| head.starts_with(verb))
+                })
+                .cloned()
+                .collect();
+            // What each of those runs is among them.
+            for seen in [
+                "WHERE state='submitting'",
+                "WHERE state='outcome_unknown'",
+                "CROSS JOIN launches l",
+                "FROM return_grants g",
+                "FROM outbox WHERE state='publishing'",
+                "CROSS JOIN publications p",
+                "FROM resolutions WHERE session_id",
+                "FROM results WHERE digest",
+                "CROSS JOIN work w ON w.id=o.id WHERE o.kind='work' ORDER BY",
+                "FROM open_records o CROSS JOIN work w ON w.id=o.id\n    WHERE o.kind='work' AND",
+            ] {
+                assert!(
+                    statements.iter().any(|sql| sql.contains(seen)),
+                    "never ran: {seen}"
+                );
+            }
+            let db = &rig.bridge.work.store.as_ref().unwrap().db;
+            let scans: Vec<(String, Vec<String>)> = statements
+                .iter()
+                .map(|sql| {
+                    (
+                        sql.clone(),
+                        crate::runtime::host_work::kept_table_scans(db, sql),
+                    )
+                })
+                .filter(|(_, (_, scans))| !scans.is_empty())
+                .map(|(sql, (steps, _))| (sql, steps))
+                .collect();
+            assert!(scans.is_empty(), "{scans:#?}");
+            // Nor does any step through an index over closed records: run
+            // again (and rolled back) beside 1000, then 3000 of them, each
+            // statement takes as many VM steps.
+            let steps = |db: &rusqlite::Connection| -> Vec<i32> {
+                statements
+                    .iter()
+                    .map(|sql| {
+                        db.execute_batch("SAVEPOINT measure").unwrap();
+                        let steps = db.prepare(sql).map_or(0, |mut q| {
+                            let n = q.parameter_count();
+                            if let Ok(mut rows) =
+                                q.query(rusqlite::params_from_iter(std::iter::repeat_n("x", n)))
+                            {
+                                while let Ok(Some(_)) = rows.next() {}
+                            }
+                            q.get_status(rusqlite::StatementStatus::VmStep)
+                        });
+                        db.execute_batch("ROLLBACK TO measure; RELEASE measure")
+                            .unwrap();
+                        steps
+                    })
+                    .collect()
+            };
+            add_closed_records(db, 0..1000);
+            let fewer = steps(db);
+            add_closed_records(db, 1000..3000);
+            let more = steps(db);
+            let grown: Vec<_> = statements
+                .iter()
+                .zip(fewer.iter().zip(&more))
+                .filter(|(_, (a, b))| a != b)
+                .collect();
+            assert!(grown.is_empty(), "{grown:#?}");
+        });
+    }
+
+    /// Records closed long ago, numbered `n` (`closed-<n>`), in every table
+    /// that keeps them: settled tasks, ended grants, replies, messages,
+    /// accepted, refused and expired sends with their publications,
+    /// launches and resolutions. None is open (`open_records`).
+    fn add_closed_records(db: &rusqlite::Connection, n: std::ops::Range<usize>) {
+        let tx = db.unchecked_transaction().unwrap();
+        for i in n {
+            let id = format!("closed-{i}");
+            let settled = ["completed", "failed", "cancelled", "expired"][i % 4];
+            let sent = ["accepted", "refused", "expired"][i % 3];
+            let replied = ["submitted", "refused"][i % 2];
+            for (sql, state) in [
+                (
+                    "INSERT INTO work(id,record,state) VALUES(?1,'{}',?2)",
+                    settled,
+                ),
+                (
+                    "INSERT INTO return_grants(task_id,record,state) VALUES(?1,'{}',?2)",
+                    "ended",
+                ),
+                (
+                    "INSERT INTO results(task_id,result_id,state,detail,digest,created_ms,record,
+                    next_try_ms,attempts) VALUES(?1,?1,?2,'',?1,0,'{}',0,0)",
+                    replied,
+                ),
+                ("INSERT INTO messages(id,record) VALUES(?1,?2)", "{}"),
+                (
+                    "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+                    VALUES(?1,'{}',?2,'',0,0)",
+                    sent,
+                ),
+                (
+                    "INSERT INTO publications(message_id,record) VALUES(?1,?2)",
+                    "{}",
+                ),
+                ("INSERT INTO origins(message_id,record) VALUES(?1,?2)", "{}"),
+                ("INSERT INTO launches(id,record) VALUES(?1,?2)", "{}"),
+                (
+                    "INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,session_id,
+                    process_gen,record) VALUES(?1,?1,?1,'r',?2,'p','{}')",
+                    "ses-closedclosed",
+                ),
+                (
+                    "INSERT INTO closed_records(kind,id,at_ms) VALUES('work',?1,0)",
+                    "",
+                ),
+            ] {
+                let params: &[&dyn rusqlite::ToSql] = if sql.contains("?2") {
+                    &[&id, &state]
+                } else {
+                    &[&id]
+                };
+                tx.execute(sql, params).unwrap();
+            }
+        }
+        tx.execute("DELETE FROM open_records WHERE id LIKE 'closed-%'", [])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// The local launch-on-message cap counts open launches only: with
+    /// `MAX_RECORDS` launches settled a day past their deadline, a send
+    /// that would launch is refused until the pass closes them.
+    #[test]
+    fn a_local_launch_counts_only_open_launches() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            {
+                let store = rig.bridge.work.store.as_ref().unwrap();
+                let tx = store.db.unchecked_transaction().unwrap();
+                for _ in 0..crate::runtime::host_work::MAX_RECORDS {
+                    let record = LaunchRecord {
+                        principal: "local".into(),
+                        profile_id: "q".into(),
+                        profile_revision: 1,
+                        expires_at: 1,
+                        digest: hw::digest(b"launch"),
+                        status: LaunchStatus {
+                            request_id: uuid::Uuid::new_v4().to_string(),
+                            session_id: SessionId::new().to_string(),
+                            process_gen: uuid::Uuid::new_v4().to_string(),
+                            state: LaunchState::Failed,
+                        },
+                    };
+                    tx.execute(
+                        "INSERT INTO launches(id,record) VALUES(?1,?2)",
+                        rusqlite::params![
+                            record.status.request_id,
+                            serde_json::to_string(&record).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+            let message = select_message(&rig, "atem:atem-host/q");
+            let origin = origin_of(&rig);
+            let refused = rig
+                .bridge
+                .collab_accept("atem-host", &message, &origin, true, &rig.sessions)
+                .unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("launch receipt capacity reached"),
+                "{refused}"
+            );
+            assert_eq!(rows(&rig, "work"), 0);
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .drop_payloads(host_now().wall_ms)
+                .unwrap();
+            send_q(&mut rig, true);
+            assert_eq!(rows(&rig, "work"), 1);
+            assert_eq!(
+                crate::runtime::host_work::open_records(
+                    &rig.bridge.work.store.as_ref().unwrap().db,
+                    "launches"
+                )
+                .unwrap(),
+                1
+            );
+        });
+    }
+
+    /// A return grant records why it ended only for an early end, its task
+    /// going on: a grant whose task was cancelled records none, its sender
+    /// gone or not; one whose sender left while its task waits records it.
+    #[test]
+    fn a_grant_records_why_it_ended_only_when_it_ended_early() {
+        use crate::runtime::collab::results::{self, EarlyEnd, Origin, ReturnGrant};
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let (cancelled, waiting) = (rig.message(), rig.message());
+            for message in [&cancelled, &waiting] {
+                rig.publish(message);
+                let task = rig.work(message);
+                let mut gone = task.task.target.clone();
+                gone.session_id = SessionId::new().to_string();
+                let store = rig.bridge.work.store.as_ref().unwrap();
+                let tx = store.db.unchecked_transaction().unwrap();
+                results::save_grant(
+                    &tx,
+                    &ReturnGrant {
+                        task_id: task.task.task_id.clone(),
+                        message_id: message.message_id.clone(),
+                        workflow_id: message.workflow_id.clone(),
+                        origin: Origin {
+                            target: gone,
+                            control_gen: rig.bridge.host.control_gen("local"),
+                            route: None,
+                        },
+                        recipient: task.task.target.clone(),
+                        expires_at: message.expires_at,
+                        ended: None,
+                    },
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            rig.bridge
+                .collab_cancel(None, &cancelled.recipients[0].recipient_id)
+                .unwrap();
+            idle(&mut rig, 300).await;
+            let ended = |message: &Message| -> (String, Option<EarlyEnd>) {
+                let store = rig.bridge.work.store.as_ref().unwrap();
+                let state = store
+                    .db
+                    .query_row(
+                        "SELECT state FROM return_grants WHERE task_id=?1",
+                        [&message.recipients[0].recipient_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let grant = results::grant(store, &message.recipients[0].recipient_id)
+                    .unwrap()
+                    .unwrap();
+                (state, grant.ended)
+            };
+            assert_eq!(ended(&cancelled), ("ended".to_string(), None));
+            assert_eq!(
+                ended(&waiting),
+                ("ended".to_string(), Some(EarlyEnd::SenderGone))
             );
         });
     }

@@ -683,11 +683,79 @@ const DUE_LAUNCHES: &str = "SELECT l.id FROM open_records o CROSS JOIN launches 
     AND json_extract(l.record,'$.expires_at')<=?1
     ORDER BY l.rowid";
 
+/// The open launches and tasks (`Store::open_launches`, `open_tasks`).
+const OPEN_LAUNCHES: &str = "SELECT l.record FROM open_records o
+    CROSS JOIN launches l ON l.id=o.id WHERE o.kind='launches' ORDER BY l.rowid";
+const OPEN_TASKS: &str = "SELECT w.record FROM open_records o
+    CROSS JOIN work w ON w.id=o.id WHERE o.kind='work' ORDER BY w.rowid";
+
+/// The tasks in one state (`Store::tasks_in`).
+const TASKS_IN: &str = "SELECT record FROM work WHERE state=?1 ORDER BY rowid";
+
+/// The principals of unsettled tasks (`Store::named_principals_at`).
+const NAMED_PRINCIPALS: &str = "SELECT DISTINCT json_extract(record,'$.principal') FROM work
+    WHERE state IN ('queued','blocked','submitting','submitted','awaiting_result','outcome_unknown')";
+
 /// An open task names upload `?2` of owner `?1`.
 const NAMED_UPLOAD: &str = "SELECT EXISTS(SELECT 1 FROM open_records o
     CROSS JOIN work w ON w.id=o.id CROSS JOIN json_each(w.record,'$.task.attachments') a
     WHERE o.kind='work' AND json_extract(w.record,'$.attachment_owner')=?1
     AND json_extract(a.value,'$.attachment_id')=?2)";
+
+/// The tables whose rows are kept for good (the records and what belongs
+/// to them): no recurring or per-request query may scan one.
+#[cfg(test)]
+const KEPT: [&str; 10] = [
+    "work",
+    "messages",
+    "outbox",
+    "launches",
+    "results",
+    "return_grants",
+    "resolutions",
+    "origins",
+    "publications",
+    "closed_records",
+];
+
+/// The query plan of `sql` on `db` (any parameter bound to `'x'`), and
+/// those of its steps that scan a `KEPT` table, by its name or an alias.
+#[cfg(test)]
+pub(super) fn kept_table_scans(db: &Connection, sql: &str) -> (Vec<String>, Vec<String>) {
+    let mut q = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let n = q.parameter_count();
+    let steps: Vec<String> = q
+        .query_map(
+            rusqlite::params_from_iter(std::iter::repeat_n("x", n)),
+            |r| r.get(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    // A kept table's name, and the word after it unless a keyword (an
+    // alias: `FROM work w`).
+    let words: Vec<&str> = sql
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut names: HashSet<&str> = KEPT.into_iter().collect();
+    for pair in words.windows(2) {
+        if KEPT.contains(&pair[0]) && pair[1].chars().any(|c| c.is_ascii_lowercase()) {
+            names.insert(pair[1]);
+        }
+    }
+    let scans = steps
+        .iter()
+        .filter(|step| {
+            step.strip_prefix("SCAN ")
+                .and_then(|rest| rest.split(' ').next())
+                .is_some_and(|name| names.contains(name))
+                && !step.contains("VIRTUAL TABLE")
+        })
+        .cloned()
+        .collect();
+    (steps, scans)
+}
 
 pub struct Store {
     pub(super) db: Connection,
@@ -710,7 +778,8 @@ pub struct MessageRecord {
 /// neither steps over a closed record. An insert trigger on each table
 /// adds every record, whoever inserts it (a v0.8.2 binary too: triggers
 /// and the table change no v0.8.2 table, and its statements run as
-/// before). A database without the table (v0.8.2's, or a new one) gets it,
+/// before), and a delete trigger takes out a record deleted (none is
+/// today). A database without the table (v0.8.2's, or a new one) gets it,
 /// filled once with what it holds and has not closed.
 fn track_open_records(db: &Connection) -> Result<()> {
     let tracked: bool = db.query_row(
@@ -729,9 +798,12 @@ fn track_open_records(db: &Connection) -> Result<()> {
     for (table, id) in TRACKED {
         tx.execute_batch(&format!(
             "INSERT INTO open_records(kind,id) SELECT '{table}',t.{id} FROM {table} t
-            WHERE NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='{table}' AND d.id=t.{id});
+            WHERE NOT EXISTS(SELECT 1 FROM closed_records c WHERE c.kind='{table}' AND c.id=t.{id});
             CREATE TRIGGER {table}_opened AFTER INSERT ON {table} BEGIN
                 INSERT OR IGNORE INTO open_records(kind,id) VALUES('{table}',NEW.{id});
+            END;
+            CREATE TRIGGER {table}_deleted AFTER DELETE ON {table} BEGIN
+                DELETE FROM open_records WHERE kind='{table}' AND id=OLD.{id};
             END;"
         ))?;
     }
@@ -764,16 +836,20 @@ impl Store {
             CREATE TABLE IF NOT EXISTS outbox (
                 message_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, state TEXT NOT NULL,
                 detail TEXT NOT NULL, next_try_ms INTEGER NOT NULL, created_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS outbox_state ON outbox(state);
+            CREATE INDEX IF NOT EXISTS outbox_created ON outbox(created_ms);
             CREATE TABLE IF NOT EXISTS resolutions (
                 message_id TEXT NOT NULL, recipient_id TEXT NOT NULL, task_id TEXT PRIMARY KEY,
                 route_id TEXT NOT NULL, session_id TEXT NOT NULL, process_gen TEXT NOT NULL,
                 launch_request_id TEXT, record TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS resolution_message ON resolutions(message_id);
+            CREATE INDEX IF NOT EXISTS resolution_session ON resolutions(session_id);
             CREATE TABLE IF NOT EXISTS publications (
                 message_id TEXT PRIMARY KEY, record TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS origins (message_id TEXT PRIMARY KEY, record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS return_grants (task_id TEXT PRIMARY KEY, record TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'open', awaiting_since_ms INTEGER);
+            CREATE INDEX IF NOT EXISTS grant_state ON return_grants(state);
             CREATE TABLE IF NOT EXISTS results (
                 task_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL,
                 detail TEXT NOT NULL, digest TEXT NOT NULL, created_ms INTEGER NOT NULL,
@@ -781,13 +857,14 @@ impl Store {
                 attempts INTEGER NOT NULL, work_id TEXT);
             CREATE INDEX IF NOT EXISTS result_state ON results(state);
             CREATE INDEX IF NOT EXISTS result_work ON results(work_id);
+            CREATE INDEX IF NOT EXISTS result_digest ON results(digest);
             CREATE TABLE IF NOT EXISTS counters (
                 key TEXT NOT NULL, window_start_ms INTEGER NOT NULL, count INTEGER NOT NULL,
                 PRIMARY KEY(key,window_start_ms));
             CREATE TABLE IF NOT EXISTS attachments (
                 owner TEXT NOT NULL, id TEXT NOT NULL, descriptor TEXT NOT NULL,
                 size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));
-            CREATE TABLE IF NOT EXISTS dropped_payloads (
+            CREATE TABLE IF NOT EXISTS closed_records (
                 kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
                 PRIMARY KEY(kind,id)) WITHOUT ROWID;")?;
         track_open_records(&db)?;
@@ -931,20 +1008,34 @@ impl Store {
         Ok(())
     }
 
-    pub fn launches(&self) -> Result<Vec<LaunchRecord>> {
-        let mut q = self
-            .db
-            .prepare("SELECT record FROM launches ORDER BY rowid")?;
-        q.query_map([], |r| r.get::<_, String>(0))?
+    /// The records `sql` reads (one `record` column; `params`).
+    fn records<T: serde::de::DeserializeOwned>(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<T>> {
+        let mut q = self.db.prepare(sql)?;
+        q.query_map(params, |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect()
     }
 
-    pub fn tasks(&self) -> Result<Vec<WorkRecord>> {
-        let mut q = self.db.prepare("SELECT record FROM work ORDER BY rowid")?;
-        q.query_map([], |r| r.get::<_, String>(0))?
-            .map(|r| Ok(serde_json::from_str(&r?)?))
-            .collect()
+    /// The launches still open (`open_records`), oldest first: every one
+    /// still starting among them.
+    pub fn open_launches(&self) -> Result<Vec<LaunchRecord>> {
+        self.records(OPEN_LAUNCHES, [])
+    }
+
+    /// The tasks still open (`open_records`), oldest first: every one not
+    /// settled, and those settled less than a day past their deadline.
+    pub fn open_tasks(&self) -> Result<Vec<WorkRecord>> {
+        self.records(OPEN_TASKS, [])
+    }
+
+    /// The tasks in `state`, oldest first, through the `work_state` index.
+    pub fn tasks_in(&self, state: WorkState) -> Result<Vec<WorkRecord>> {
+        let state = serde_json::to_value(state)?;
+        self.records(TASKS_IN, [state.as_str()])
     }
 
     pub fn active_tasks(&self) -> Result<Vec<WorkRecord>> {
@@ -1113,10 +1204,7 @@ impl Store {
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let mut q = db.prepare(
-            "SELECT DISTINCT json_extract(record,'$.principal') FROM work WHERE state IN
-            ('queued','blocked','submitting','submitted','awaiting_result','outcome_unknown')",
-        )?;
+        let mut q = db.prepare(NAMED_PRINCIPALS)?;
         q.query_map([], |r| r.get::<_, String>(0))?
             .map(|r| Ok(r?))
             .collect()
@@ -1156,7 +1244,7 @@ impl Store {
     /// of its local outbox envelope and publication; the uploads that only
     /// closed tasks name (their bytes and cached PNG; the tasks keep their
     /// descriptors). A launch carries none. Each record leaves
-    /// `open_records` and gets its `dropped_payloads` marker in the same
+    /// `open_records` and gets its `closed_records` marker in the same
     /// transaction. A live task is never touched, nor what it needs; an
     /// upload no task ever named stays (its own bound holds it). Returns
     /// whose payloads it dropped.
@@ -1165,6 +1253,8 @@ impl Store {
         if due == Due::default() {
             return Ok(Dropped::default());
         }
+        // `self.work`, `self.save_work` and `self.message` run on the same
+        // connection, inside this transaction.
         let tx = self.db.unchecked_transaction()?;
         let text = |sql: &str, id: &str| -> Result<Option<String>> {
             Ok(tx.query_row(sql, [id], |r| r.get(0)).optional()?)
@@ -1175,7 +1265,7 @@ impl Store {
                 params![table, id],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO dropped_payloads(kind,id,at_ms) VALUES(?1,?2,?3)",
+                "INSERT OR IGNORE INTO closed_records(kind,id,at_ms) VALUES(?1,?2,?3)",
                 params![table, id, now],
             )?;
             Ok(())
@@ -1246,9 +1336,9 @@ impl Store {
                 removed.push((owner, id));
             }
         }
-        tx.commit()?;
-        // The verified cache files of removed uploads (rebuilt from the
-        // database whenever a prompt needs one).
+        // The verified cache files of removed uploads go first, so no crash
+        // leaves one behind (a prompt that needs one rebuilds it from the
+        // database).
         for (owner, id) in &removed {
             if valid_owner(owner) && atem_client::session::wire::is_uuid_v4(id) {
                 let _ = std::fs::remove_file(
@@ -1259,6 +1349,7 @@ impl Store {
                 );
             }
         }
+        tx.commit()?;
         Ok(Dropped {
             tasks: due.tasks.len(),
             messages: due.messages.len(),
@@ -1291,7 +1382,8 @@ impl Store {
         &self,
         sessions: &BTreeMap<crate::session::SessionId, super::broker::BrokerSession>,
     ) -> Result<()> {
-        for mut record in self.launches()? {
+        // A launch still starting is open (it closes only once settled).
+        for mut record in self.open_launches()? {
             if record.status.state != LaunchState::Starting {
                 continue;
             }
@@ -1306,13 +1398,11 @@ impl Store {
             };
             self.save_launch(&record)?;
         }
-        for mut record in self.tasks()? {
-            if record.status.state == WorkState::Submitting {
-                record.status.state = WorkState::OutcomeUnknown;
-                record.status.detail =
-                    "submission interrupted; recover its receipt before any further action".into();
-                self.save_work(&record)?;
-            }
+        for mut record in self.tasks_in(WorkState::Submitting)? {
+            record.status.state = WorkState::OutcomeUnknown;
+            record.status.detail =
+                "submission interrupted; recover its receipt before any further action".into();
+            self.save_work(&record)?;
         }
         Ok(())
     }
@@ -1586,7 +1676,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.bound().unwrap(), None);
         store.bind(&other).unwrap();
-        assert!(store.tasks().unwrap().is_empty());
+        assert!(store.open_tasks().unwrap().is_empty());
 
         let kept = Connection::open(&aside).unwrap();
         let identity: String = kept
@@ -2475,13 +2565,24 @@ mod tests {
         assert_eq!(open(), [1; 4]);
     }
 
-    /// The payload pass and the cap counts read `open_records` first and
-    /// the record tables only by their primary key: a closed record is
-    /// never stepped over or parsed again, however many there are.
+    /// The payload pass, the cap counts and the open-record readers read
+    /// `open_records` first and the record tables only by their primary
+    /// key: a closed record is never stepped over or parsed again, however
+    /// many there are. The readers of one state go through `work_state`.
     #[test]
     fn closed_records_are_never_stepped_over() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
+        for sql in [TASKS_IN, NAMED_PRINCIPALS] {
+            let (steps, scans) = kept_table_scans(&store.db, sql);
+            assert!(scans.is_empty(), "{sql}: {steps:?}");
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| s == "SEARCH work USING INDEX work_state (state=?)"),
+                "{sql}: {steps:?}"
+            );
+        }
         for sql in [
             DUE_TASKS,
             DUE_MESSAGES,
@@ -2489,20 +2590,11 @@ mod tests {
             DUE_LAUNCHES,
             NAMED_UPLOAD,
             OPEN_COUNT,
+            OPEN_LAUNCHES,
+            OPEN_TASKS,
         ] {
-            let mut q = store
-                .db
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .unwrap();
-            let n = q.parameter_count();
-            let steps: Vec<String> = q
-                .query_map(
-                    rusqlite::params_from_iter(std::iter::repeat_n("x", n)),
-                    |r| r.get(3),
-                )
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
+            let (steps, scans) = kept_table_scans(&store.db, sql);
+            assert!(scans.is_empty(), "{sql}: {steps:?}");
             let first = steps
                 .iter()
                 .find(|s| s.starts_with("SEARCH"))

@@ -326,6 +326,8 @@ impl HostBridge {
     /// one). With none, an identical retry finds the task it answered, and
     /// a different reply finds the one task whose reply is publishing or
     /// submitted, so it is refused as with `--task` (`request_id_reused`).
+    /// It reads the open tasks (a task in its turn or awaiting its result is
+    /// open) and the tasks whose reply has this digest, closed or not.
     fn collab_reply_task(
         &self,
         from: &SessionId,
@@ -333,8 +335,16 @@ impl HostBridge {
         digest: &str,
     ) -> Result<WorkRecord> {
         let store = self.work.store.as_ref().unwrap();
+        let mut tasks = store.open_tasks()?;
+        for id in results::replied_with(&store.db, digest)? {
+            if !tasks.iter().any(|t| t.task.task_id == id)
+                && let Some(task) = store.work(&id)?
+            {
+                tasks.push(task);
+            }
+        }
         let (mut open, mut identical, mut held) = (Vec::new(), Vec::new(), Vec::new());
-        for task in store.tasks()? {
+        for task in tasks {
             if task.task.target.session_id != from.as_str()
                 || task.task.target.process_gen != session.process_gen
                 || results::delivered_by(&store.db, &task.task.task_id)?.is_some()
@@ -696,10 +706,15 @@ impl HostBridge {
     fn collab_result_pass(&mut self, sessions: &BTreeMap<SessionId, BrokerSession>) -> Result<()> {
         let store = self.work.store.as_ref().unwrap();
         let now = host_now().wall_ms;
+        // Each part through an index: open and consumed grants by their
+        // state, ended ones by their task's (`grant_state`, `work_state`).
         let mut q = store.db.prepare(
             "SELECT w.record,g.record,g.state,g.awaiting_since_ms FROM return_grants g
-            JOIN work w ON w.id=g.task_id WHERE g.state IN ('open','consumed')
-            OR (g.state='ended' AND w.state IN ('awaiting_result','outcome_unknown'))",
+            CROSS JOIN work w ON w.id=g.task_id WHERE g.state IN ('open','consumed')
+            UNION ALL
+            SELECT w.record,g.record,g.state,g.awaiting_since_ms FROM work w
+            CROSS JOIN return_grants g ON g.task_id=w.id
+            WHERE w.state IN ('awaiting_result','outcome_unknown') AND g.state='ended'",
         )?;
         let pending = q
             .query_map([], |r| {
@@ -1174,9 +1189,12 @@ impl HostBridge {
         Ok(rows)
     }
 
+    /// The workflow of the task `from` is working on, if any; else a new
+    /// one. Only open tasks are read: one closed (a day past its deadline)
+    /// is in no running turn.
     fn collab_workflow(&self, from: &BrokerSession) -> Result<String> {
         let turn = from.chat.current_turn_id();
-        for task in self.work.store.as_ref().unwrap().tasks()? {
+        for task in self.work.store.as_ref().unwrap().open_tasks()? {
             if task.task.target.session_id != from.id.as_str()
                 || task.task.target.process_gen != from.process_gen
             {

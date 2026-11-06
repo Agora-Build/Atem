@@ -393,6 +393,15 @@ pub fn delivered_by(db: &Connection, work_id: &str) -> Result<Option<ResultRow>>
     .transpose()
 }
 
+/// The tasks whose reply has `digest` (an identical retry's), through the
+/// `result_digest` index.
+pub fn replied_with(db: &Connection, digest: &str) -> Result<Vec<String>> {
+    let mut q = db.prepare("SELECT task_id FROM results WHERE digest=?1 ORDER BY rowid")?;
+    q.query_map([digest], |r| r.get(0))?
+        .map(|r| Ok(r?))
+        .collect()
+}
+
 /// Replies whose context is due for a publication attempt, oldest first,
 /// with their attempts so far; without replies to local tasks unless
 /// `local` (those wait out a local pause).
@@ -403,7 +412,7 @@ pub fn publishing_due(db: &Connection, now: u64, local: bool) -> Result<Vec<(Res
         .collect::<Vec<_>>()
         .join(",");
     let mut q = db.prepare(&format!(
-        "SELECT {columns},r.attempts FROM results r JOIN work w ON w.id=r.task_id
+        "SELECT {columns},r.attempts FROM results r CROSS JOIN work w ON w.id=r.task_id
         WHERE r.state='publishing' AND r.next_try_ms<=?1
         AND (?2 OR json_extract(w.record,'$.principal')!='local')
         ORDER BY r.created_ms LIMIT 16"

@@ -57,6 +57,9 @@ zeroize = { version = "1", features = ["serde"] }
 # Tests only: the host fixture runner seals hellos a fixture overrides
 # (`Signed::finish`); never part of atem's build.
 atem-client = { path = "crates/atem-client", features = ["software-keys", "test-vectors"] }
+# Tests only: a unit test sees every statement the host-work passes run
+# (`Connection::trace`) to check their query plans.
+rusqlite = { version = "0.32", features = ["bundled", "trace"] }
 
 [features]
 real_rtm = []

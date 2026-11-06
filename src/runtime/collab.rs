@@ -407,7 +407,8 @@ pub(super) fn reserve_context(
 
 pub(super) fn context_due(store: &Store, now: u64) -> Result<Vec<(Message, Publication, u32)>> {
     let mut q = store.db.prepare(
-        "SELECT o.envelope,p.record,p.attempts FROM publications p JOIN outbox o USING(message_id)
+        "SELECT o.envelope,p.record,p.attempts FROM outbox o
+        CROSS JOIN publications p ON p.message_id=o.message_id
         WHERE o.state='publishing' AND o.next_try_ms<=?1 ORDER BY o.created_ms LIMIT 16",
     )?;
     q.query_map([now], |r| {
