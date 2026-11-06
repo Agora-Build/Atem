@@ -260,15 +260,15 @@ attachment:
   "kind":"prompt","payload":{"text":"<rendered prompt>"},"acquire":true}}
 ```
 
-The receipt sets the task's state: `accepted` or `executing` →
-`submitted`, `completed` → `awaiting_result`, `rejected` → `failed` (the
-receipt's own detail becomes the task's: `control revoked`, `host trust
-changed`, `session closed`), `outcome_unknown` → `outcome_unknown`. No receipt
-after the submit, or a task found `submitting` at a restart, is
-`outcome_unknown`; it is reconciled from the receipt journal when a receipt
-exists, and a `submitted` task whose receipt the session host no longer has
-becomes `outcome_unknown` (`receipt no longer available`). A task is never
-submitted twice. The host never renews or takes over a lease for it.
+The receipt sets the task's state: `accepted` or `executing` → `submitted`,
+`completed` → `awaiting_result`, `rejected` → `failed` (the receipt's own detail
+becomes the task's, for example `control revoked`, `host trust changed` or
+`session closed`), `outcome_unknown` → `outcome_unknown`. No receipt after the
+submit, or a task found `submitting` at a restart, is `outcome_unknown`; it is
+reconciled from the receipt journal when a receipt exists, and a `submitted`
+task whose receipt the session host no longer has becomes `outcome_unknown`
+(`receipt no longer available`). A task is never submitted twice. The host never
+renews or takes over a lease for it.
 
 ### Query, cancel, complete
 
@@ -385,12 +385,16 @@ exact. The lifecycle of local tasks is in
   for a task in the same states and for every sender. An edit that keeps those
   (a profile's `cwd` or `provider`) is no change: the task stays `blocked`
   until it expires.
-- A rejected prompt receipt's own detail reaches the task (`control revoked`,
-  `host trust changed`, `session closed`, …) in place of "agent submission
-  receipt reconciled; task completion requires an explicit result".
+- A rejected prompt receipt's own detail reaches the task (for example
+  `control revoked`, `host trust changed`, `session closed`) in place of "agent
+  submission receipt reconciled; task completion requires an explicit
+  result".
 - `awaiting_result`, `turn interrupted`: the turn ended interrupted
   (session-v1 `interrupt`, Esc in the terminal). Nothing else changes: the next
-  task of the session goes on, and `work_complete` works.
+  task of the session goes on, and `work_complete` works. A local sender's task
+  whose agent stays silent after the interrupt gets `turn interrupted without a
+  reply` after `result_timeout`; a task of a remote sender gets no such
+  report.
 - `outcome_unknown`, `receipt no longer available`: a `submitted` task's
   receipt is gone (evicted or lost). It then follows the `outcome_unknown`
   rules.
@@ -408,9 +412,9 @@ only as later work no longer waiting behind it.
 `runtime.toml`, `enabled = false`) waits and starts once the pause ends, while
 the sender's channel, `control_gen` and the profile approval hold and
 `expires_at` hasn't passed; requests, `host_launch_query` included, are `busy`
-meanwhile. Hosts of v0.8.2 fenced it. A receipt-database fault or a halted
-session journal fences a launch not yet started: it never starts and ends
-`outcome_unknown`.
+meanwhile. A v0.8.2 host fences such a launch instead. A receipt-database fault
+or a halted session journal fences a launch not yet started: it never starts and
+ends `outcome_unknown`.
 
 **Records.** A launch, task or message record is kept for the life of the
 database; a day after it settled past `expires_at` only its payloads are

@@ -307,15 +307,15 @@ other sessions go on. A task is blocked while:
 - its screenshots aren't fully uploaded and verified.
 
 **Dispatch.** When nothing blocks it, the runtime records `submitting` with a
-fixed receipt id, then submits a session-v1 `prompt` with `acquire: true` on
-the sender's channel. It is remote input under the sender's principal: no
-takeover, no local-input exception, no typing into a running tool or approval
-dialog. The scheduler never renews or takes over a lease. The prompt receipt
-decides the task's state: `submitted`, then `awaiting_result` when the turn
-ends (detail `turn interrupted` when it ended interrupted), `failed` when
-rejected (with the receipt's own detail: `control revoked`, `host trust
-changed`, `session closed`), `outcome_unknown` when uncertain. A submitted task
-whose receipt the session host no longer has becomes `outcome_unknown` (detail
+fixed receipt id, then submits a session-v1 `prompt` with `acquire: true` on the
+sender's channel. It is remote input under the sender's principal: no takeover,
+no local-input exception, no typing into a running tool or approval dialog. The
+scheduler never renews or takes over a lease. The prompt receipt decides the
+task's state: `submitted`, then `awaiting_result` when the turn ends (detail
+`turn interrupted` when it ended interrupted), `failed` when rejected (with the
+receipt's own detail, for example `control revoked`, `host trust changed` or
+`session closed`), `outcome_unknown` when uncertain. A submitted task whose
+receipt the session host no longer has becomes `outcome_unknown` (detail
 `receipt no longer available`). After a restart, a task left `submitting`
 becomes `outcome_unknown` and is reconciled from its receipt; it is never sent
 again.

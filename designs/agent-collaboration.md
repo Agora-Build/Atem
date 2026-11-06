@@ -1,13 +1,12 @@
 # Agent collaboration: Atem-to-Atem messaging
 
 Status (2026-11-06): **stage 1 implemented, unreleased**, on
-`feat/agent-collaboration`, after a fix round and a lifecycle round (sections
-10 and 17). Agents in one Atem
-runtime can send work and reply through the existing host queue. **Not
-implemented:** stages 2 and 3, cross-instance delivery, directory publication,
-the Station mailbox and signed projects. This changes no part of the remote
-permission contract: every part that would is marked **Needs agreement** and
-waits until all three projects agree.
+`feat/agent-collaboration`; sections 10 and 17 give its lifecycle, retention and
+known limits. Agents in one Atem runtime can send work and reply through the
+existing host queue. **Not implemented:** stages 2 and 3, cross-instance
+delivery, directory publication, the Station mailbox and signed projects. This
+changes no part of the remote permission contract: every part that would is
+marked **Needs agreement** and waits until all three projects agree.
 
 Reviews (2026-11-04): Auth/Portal's answers and changes are folded in; so are
 Astation's ([#120](https://github.com/Agora-Build/Atem/issues/120)): a narrow
@@ -544,7 +543,7 @@ its sender: two separate steps.
   senders aren't listed there; they reach the agent with their task id in the
   prompt, and it replies with `--task`. `atem message cancel` works only on the
   session's own messages; from outside any session (the owner's terminal) both
-  cover everything. The calling session is the nearest agent of this runtime in
+  cover every local message. The calling session is the nearest agent of this runtime in
   the command's process ancestry, checked against the process that connected; a
   process with no agent there is the owner, and one that can't be verified (it
   ended or was replaced since it connected) is refused, never taken for the
@@ -563,8 +562,14 @@ grant is a contract to agree with Astation before stage 2.
 
 What each event does, by where a task is: queued or blocked until it is
 submitted, running while its turn runs, awaiting once the turn ended and until
-its result, unknown when its outcome is uncertain. Details are display text
-that clients don't parse; the texts below are exact.
+its result, unknown when its outcome is uncertain. A fence is the session host's
+step when a principal's authority changes (see
+[atem-session-v1.md](protocol/atem-session-v1.md)): it raises the principal's
+control generation, the counter the host keeps per principal and each task
+records at acceptance, closes the principal's channels, revokes its leases and
+rejects its prompts that were accepted but not started; a running turn is left
+alone. Details are display text that clients don't parse; the texts below are
+exact.
 
 | Event | Queued or blocked | Running turn | Awaiting its result, or outcome unknown | Return grant and reply | Lease | Resumes? |
 |---|---|---|---|---|---|---|
@@ -572,10 +577,10 @@ that clients don't parse; the texts below are exact.
 | Pause: an invalid `runtime.toml`, or hosting disabled | Wait, nothing dispatches. A local task's detail reads `paused: <reason>`; a remote task keeps its own | Runs on; its receipt is read when the pause ends | Wait; nothing expires, a deadline included. A local reply or `atem message complete` is accepted and stored; a remote request is `busy` | Kept; a reply's context publication and its delivery wait | Untouched | By itself, within a second of a valid file with `enabled = true`; a launch not started waits too |
 | Pause: a receipt-database fault | Wait as above; no detail is written | Runs on | Wait; replies and completions are refused ("agent hosting records are unavailable; run `atem runtime restart`") | Kept; nothing is published or delivered | Untouched | Only after `atem runtime restart`; a launch not started is fenced at once (`outcome_unknown`) |
 | Pause: a plain session-journal halt | Local tasks wait with "waiting for the sender's authorized channel and current route"; `local` is fenced in memory only, so none fails. Remote requests are `unauthorized`, and remote tasks wait the same way | Runs on; no remote input is written. A local prompt accepted but not yet written is rejected, and its task fails `control revoked` | Wait; replies and completions are refused ("the session journal halted; run `atem runtime restart`") | Kept; nothing is delivered | Can't be renewed (every session request is `busy`) and lapses after 15 s | Only after `atem runtime restart`, under the authority the tasks were accepted with; a launch not started is fenced at once (`outcome_unknown`) |
-| Sender offline (remote sender) | `blocked`, "waiting for the sender's authorized channel and current route", holding their session's queue until their deadline (`expired before submission`); raising the route's revision frees it | Finishes | Wait for `work_complete` until the deadline (`expired awaiting a result`); an unknown outcome holds its session's queue until then (`expired with its outcome unknown`) | A remote sender has no return grant; the reply is stored and read with `reply_query` once the sender is back | Lapses 15 s after its last renewal | When the sender reconnects under the same authority |
+| Sender offline (remote sender) | `blocked`, "waiting for the sender's authorized channel and current route", holding its target session's queue until its deadline (`expired before submission`); raising the route's revision frees it | Finishes | Wait for `work_complete` until the deadline (`expired awaiting a result`); an unknown outcome holds its session's queue until then (`expired with its outcome unknown`) | A remote sender has no return grant; the reply is stored and read with `reply_query` once the sender is back | Lapses 15 s after its last renewal | When the sender reconnects under the same authority |
 | Sender's session ended (local sender) | Still dispatch | Finishes | Stay; detail `sender gone; reply kept, not delivered`; expire at the deadline | The grant ends. A reply is accepted and stored (readable in `atem message status`), never delivered | Not involved | Nothing is delivered later; the owner completes the task with `atem message complete <task>` from outside a session |
 | Sender's route changed while its session runs (local origin) | Still dispatch | Finishes | Stay; detail `sender's route changed; reply kept, not delivered`; expire at the deadline | The grant ends; replies are stored, never delivered; the sending session or the owner completes the task | Not involved | No: restoring the route doesn't reopen the grant |
-| Revocation: the sender's control generation changed (a removal, a demotion, a change of a service's roles, scope or expiry, today a routine renewal too, a revoked browser grant, a device-list freeze or fault), or the authorization it was accepted under expired | `failed` at once, before the task takes its session's place: `sender's authority changed`, or `sender's authorization expired` (checked first); the session's queue goes on | Never interrupted. A prompt the session host had accepted but not started is rejected by the fence, and its task takes the receipt's detail (`control revoked`, `host trust changed`, `session closed`); a task whose turn ends under a lost authority fails as in the next column | `failed` at once with the same detail, before its deadline | The grant ends; once the task failed no reply is accepted. A remote sender's `work_query`, `work_complete`, `work_cancel` and `reply_query` are `forbidden` | Revoked at once by the fence | Never: a renewal, a regrant or a reconnect doesn't revive the task; the sender sends again |
+| Revocation: the sender's control generation changed (a removal, a demotion, a change of a service's roles, scope or expiry, today a routine renewal too, a revoked browser grant, a device-list freeze or fault), or the authorization it was accepted under expired | `failed` at once, before the task takes its session's place: `sender's authority changed`, or `sender's authorization expired` (checked first); the session's queue goes on | Never interrupted. A prompt the session host had accepted but not started is rejected by the fence, and its task takes the receipt's detail (`control revoked`); a task whose turn ends under a lost authority fails as in the next column | `failed` at once with the same detail, before its deadline | The grant ends; once the task failed no reply is accepted. A remote sender's `work_query`, `work_complete`, `work_cancel` and `reply_query` are `forbidden` | Revoked at once by the fence | Never: a renewal, a regrant or a reconnect doesn't revive the task; the sender sends again |
 | New host identity (a re-pair, `atem pair verify`) | Left in the retired database, never dispatched; a remote sender's retry names the old host (`stale_target`) | Continues in its session; no record follows it | Left in the retired database; nobody can complete or answer them | Left behind; `atem message reply` finds no task | Every lease is revoked | No: the new database starts empty, the old file is kept and never read; a launch not started is fenced |
 | Target route or profile approval changed | `failed`, `route changed`, at once, before the task takes its session's place | Never interrupted; the task fails `route changed` once its turn ends | `failed`, `route changed`, at once | The grant ends; a remote sender's reads are `forbidden` | Untouched | Never: the sender sends again under the new revision |
 | Cancel (`atem message cancel`, `work_cancel`) | `cancelled` ("cancelled locally before submission", "cancelled before submission"); the session's queue goes on | Not reached: refused (`busy`; locally "only queued or blocked tasks can be cancelled") | Not reached: the same refusal | The grant ends | Untouched | Final; a repeated cancel returns the same status |
@@ -586,7 +591,8 @@ A pause never changes anyone's authority: it holds work where it is, and it
 resumes by itself (or, for a receipt-database fault or a journal halt, after
 `atem runtime restart`). A departed sender never cancels accepted work: queued
 tasks still run, an awaiting task stays and takes its reply (kept, not
-delivered), and only a lost authority ends a task. A revocation or a route
+delivered), and only a lost authority or a changed route approval ends a task
+early. A revocation or a route
 change ends unstarted and awaiting work at once, with a detail of its own and
 before the task takes its session's place, and never interrupts a running
 turn. Cancel reaches only work that hasn't started, and interrupt ends the
@@ -610,8 +616,8 @@ turn, not the task. A task past its deadline expires first.
   once the task's authority or route approval changed.
 - A routine renewal of a service's grant counts as a change of authority today
   (it raises the service's control generation): its queued and awaiting tasks
-  fail, and it sends them again. Whether a renewal should fence is a question
-  for Astation and Portal.
+  fail, and it sends them again. Whether a renewal should fence is an open
+  question (section 15, question 9).
 
 ### Records and retention
 
@@ -680,7 +686,7 @@ That loses no host-work history: a task's record keeps its own state, detail,
 receipt id and turn id. Only a task still `submitted` when its receipt is gone
 ends `outcome_unknown` (`receipt no longer available`).
 
-The file only grows. Nothing is deleted automatically; a closed local send
+The file only grows. No record is deleted automatically; a closed local send
 costs a few KB (synthetic rows of that shape came to 270 to 670 MB at 200,000
 sends), and moving the file aside, as an identity change does, is the only
 reset. A v0.8.x binary opens and writes the file, but it counts every row
@@ -857,6 +863,12 @@ Still open (all three, before stage 2 and stage 3):
    principal yet.)
 8. Signed projects: in the device list or a separate signed log? Signed by a
    native `manage` device only? Which ops may a project grant? (Stage 3.)
+9. Should a renewal that only extends a service's expiry keep the service's
+   control generation? In r9 today any service `set_roles`, including a routine
+   renewal with unchanged scopes, raises it, so the service's unstarted and
+   awaiting tasks fail `sender's authority changed` and it must send them again
+   (section 10). A permission-contract question for Astation, Auth and Portal;
+   stage 1 doesn't change it.
 
 ## 16. Out of scope
 
@@ -866,21 +878,20 @@ permissions; agents editing projects; message content leaving the account.
 ## 17. Stage 1 implementation
 
 Stage 1 is implemented in local commits on `feat/agent-collaboration`
-(unreleased) and was revised in a fix round and a lifecycle round: limits
-counted in messages and checked at send, pauses instead of fences, agent
-commands that only connect, one reply for every sender with `reply_query` for
-remote ones, tasks that expire at their deadline, a defined lifecycle for
-revocation, departed senders, route changes, interrupts and lost receipts
-(section 10), records kept with only their payloads dropped, scoped status,
-and launch on request for Claude only. It requires no Station, Astation or
-Auth/Portal change and enables no remote API gate. It changes no existing
-remote wire shape: the additions are the `reply_query` request, its `reply`
-result (with `dropped`) and the `host.reply` feature. A remote sender can
-observe changed behaviour with the same shapes (task `detail` texts,
+(unreleased) and has: limits counted in messages and checked at send, pauses
+instead of fences, agent commands that only connect, one reply for every sender
+with `reply_query` for remote ones, tasks that expire at their deadline, a
+defined lifecycle for revocation, departed senders, route changes, interrupts
+and lost receipts (section 10), records kept with only their payloads dropped,
+scoped status, and launch on request for Claude only. It requires no Station,
+Astation or Auth/Portal change and enables no remote API gate. It changes no
+existing remote wire shape: the additions are the `reply_query` request, its
+`reply` result (with `dropped`) and the `host.reply` feature. A remote sender
+can observe changed behaviour with the same shapes (task `detail` texts,
 `outcome_unknown` → `awaiting_result` on a reply, `awaiting_result` and
 `outcome_unknown` tasks that expire, no queue slot for a task awaiting its
-result, tasks that fail when their sender's authority or route approval
-changed, records kept with their payloads dropped), listed in
+result, tasks that fail when their sender's authority or route approval changed,
+records kept with their payloads dropped), listed in
 [atem-host-work-v1.md](protocol/atem-host-work-v1.md#observable-behaviour).
 Sending and automatic actions remain opt-in.
 
@@ -971,10 +982,10 @@ Stage 1 ships with these limits.
   the cap of 4,096 open records) and runs a few queries for each submitted or
   unknown-outcome task; every 60 s the payload pass reads each open record,
   settled ones inside their day included. No recurring or per-request path
-  reads a closed record: they run through indexes. `atem message status`
+  steps over closed records: they run through indexes. `atem message status`
   scoped to a session with fewer than 32 matching messages reads every local
   send once, and a send reads the resolutions of each live session whose
-  project is still unknown; both are on demand and linear. Rows are never
+  project is still unknown; both are on demand and linear. Records are never
   removed, so `host-work.sqlite` grows by a compact row set per task (the
   estimate is under "Records and retention"), and retired database files are
   kept.
@@ -1001,7 +1012,7 @@ Stage 1 ships with these limits.
   (`tests/host_work_binary.rs`) failed about 1 run in 25: the fake agent writes
   `asked 1` as soon as it spawns its hook, before the hook files the request and
   the broker registers the approval, so a task enqueued meanwhile could be
-  dispatched first. The test now waits for the broker's approval before it
+  dispatched first. The test waits for the broker's approval before it
   enqueues (40 of 40 runs passed). `a_pending_recovery_waits_on_the_host_clock_across_a_reboot`
   (`tests/membership_binary.rs`) failed once on CI's Linux debug-hook step and
   passed on a re-run (15 of 15 locally); it moves a test host clock and waits
