@@ -2070,3 +2070,50 @@ fn a_tag_from_outside_a_session_is_refused() {
         runtime.shutdown().await;
     });
 }
+
+/// Spec section 10, "Who sees what": an agent's command acts for the
+/// nearest agent in its verified process ancestry; a verified process with
+/// no agent there is the owner. A peer that can't be verified (no
+/// credentials, or it ended or was replaced since it connected) is refused,
+/// never taken for the owner.
+#[test]
+fn an_unverified_peer_is_refused_and_one_without_an_agent_is_the_owner() {
+    use super::server::{Caller, caller_of};
+    use crate::session::SessionId;
+    let sid = SessionId::new();
+    let agents = [(sid.clone(), (200, 7))];
+    let start = |pid: u32| match pid {
+        100 => Some(5),
+        200 => Some(7),
+        300 => Some(9),
+        _ => None,
+    };
+    let tree = |pid: u32| match pid {
+        100 => vec![100, 150, 200, 1],
+        _ => vec![pid, 1],
+    };
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &agents),
+        Caller::Session(sid.clone())
+    );
+    assert_eq!(
+        caller_of(Some((300, 9)), start, tree, &agents),
+        Caller::Owner
+    );
+    // An agent's pid now used by another process is no agent.
+    let reused = [(sid, (200, 8))];
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &reused),
+        Caller::Owner
+    );
+    // The peer was replaced, or ended, since it connected; no credentials.
+    assert_eq!(
+        caller_of(Some((100, 4)), start, tree, &agents),
+        Caller::Unverified
+    );
+    assert_eq!(
+        caller_of(Some((400, 1)), start, tree, &agents),
+        Caller::Unverified
+    );
+    assert_eq!(caller_of(None, start, tree, &agents), Caller::Unverified);
+}

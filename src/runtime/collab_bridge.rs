@@ -482,7 +482,10 @@ impl HostBridge {
 
     /// The one delivery a return grant permits: the submitted reply, queued
     /// as data into the originating session (spec section 10). Deliveries
-    /// count against no limit; a full queue only delays one.
+    /// count against no limit; a full queue only delays one. A reply that
+    /// can't be carried (checked when it was submitted and published, so
+    /// this shouldn't happen) uses up the grant with a trace: the reply's
+    /// and the task's detail say why it wasn't delivered.
     fn collab_deliver(
         &self,
         grant: &ReturnGrant,
@@ -499,9 +502,20 @@ impl HostBridge {
             row.reply.context.clone(),
         );
         let tx = store.db.unchecked_transaction()?;
-        // Checked when the reply was submitted and published; never queued
-        // if it could not be dispatched.
-        if collab::task_problem(&task, &self.work_host()).is_none() {
+        if let Some(problem) = collab::task_problem(&task, &self.work_host()) {
+            let trace = format!("{}{problem}", results::UNDELIVERED);
+            tx.execute(
+                "UPDATE results SET detail=?2 WHERE task_id=?1",
+                rusqlite::params![grant.task_id, trace],
+            )?;
+            if let (Some(mut original), Some(row)) = (
+                store.work(&grant.task_id)?,
+                results::load(&tx, &grant.task_id)?,
+            ) {
+                apply_reply(&mut original, &row);
+                store.save_work(&original)?;
+            }
+        } else {
             if !store.has_room()? {
                 return Ok(());
             }
@@ -863,8 +877,9 @@ impl HostBridge {
     /// What pauses local collaboration, in the owner's words: `runtime.toml`
     /// not loading, hosting switched off, the receipt database failed. A
     /// pause only waits (spec section 9): queued local tasks, replies and
-    /// their deliveries wait, nothing is fenced, and everything resumes once
-    /// these are gone. Empty exactly when the pause is over (`local_healthy`
+    /// their deliveries wait, nothing is fenced (but a launch not yet started
+    /// when the database fails, `work_fail`: that lasts until a restart), and
+    /// everything resumes once these are gone. Empty exactly when the pause is over (`local_healthy`
     /// adds the authority checks). `[collab] send = false` is no pause: the
     /// owner's setting refuses new sends only (`collab_unavailable`).
     pub(super) fn collab_paused(&self) -> Vec<String> {

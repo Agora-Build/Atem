@@ -281,7 +281,9 @@ offline origin proofs and direct Atem host senders.
 `atem agent tag add|remove|list` and `atem message send|reply` identify the
 calling agent from the local socket peer's verified process ancestry
 (`message status|cancel|complete` also run from the owner's terminal, outside
-any session). `runtime.toml` requires hosting, `[collab] send = true`, approved
+any session: a verified process with no agent in its ancestry; one that can't
+be verified is refused, and under the same-user model this owner fallback is
+no security boundary). `runtime.toml` requires hosting, `[collab] send = true`, approved
 profiles and route consent for `local` (a route's own `principals` replaces the
 paired-Astation default); defaults keep sending, result prompts and launch off.
 Owner labels and agent-owned `self:` tags feed shared selectors; one message
@@ -301,7 +303,8 @@ pauses local work, never fences it: new sends are refused with the reason,
 queued local tasks wait as `paused: <reason>`, replies are stored while their
 publication and delivery wait (a receipt-database fault instead refuses a reply
 and a completion until `atem runtime restart`), and a local launch not yet
-started waits (one already handed to the spawner completes). `[collab] send =
+started waits out a file or hosting pause (one already handed to the spawner
+completes; a receipt-database fault, which lasts until a restart, fences it). `[collab] send =
 false` is no pause:
 it only refuses new sends, and accepted tasks, replies and deliveries go on.
 `local` is fenced only by a new host identity or a device-list freeze or fault.
@@ -323,8 +326,8 @@ its result; a queued local task whose route or profile approval changed fails
 `route changed` at once. Every task awaiting a result or of unknown outcome
 expires at its deadline, and one awaiting its result holds no queue slot. Automatic timeout reports remain status only. Empty
 routes can opt in to `launch = "on_message"` (Claude Code profiles only; a Codex
-route is refused when the file loads): only `message send --launch` with an
-`atem:<id>/<route>` selector starts one, using the existing approved-profile
+route is refused when the file loads): only `message send --launch` starts
+one, and only on a route an `atem:<id>/<route>` selector of that send names, using the existing approved-profile
 worker launcher; a send without it can share a pending launch but never starts
 one. `message status [ID]` (inside a session: its own messages and the local
 tasks sent to it), `cancel TASK_ID` (inside a session: its own messages) and

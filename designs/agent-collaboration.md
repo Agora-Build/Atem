@@ -162,7 +162,9 @@ must accept it too and the boundary must be agreed.
 
 **When no agent runs.** Only a sender that asks for it (`atem message send
 --launch`, with an `atem:<atem_id>/<route_id>` selector) gets a session
-launched, and only on a matching route whose owner allows it
+launched, and only on a route such a selector of the same send names (a route
+that only a label or the bare `atem:<atem_id>` matches is never launched) and
+whose owner allows it
 (`launch = "on_message"`, off by default) and whose profile is Claude Code: a
 route with `launch = "on_message"` on a Codex profile is refused when
 `runtime.toml` loads. Stage 1 launches no Codex session, since Codex reports
@@ -174,7 +176,8 @@ and process generation with the task before starting a worker, and waits until
 that session is ready. A send without `--launch` never starts a session, but it
 can share a pending launch, including one that just started and whose project
 isn't known yet: that session is the route's agent. A failed launch fails the
-task; a launch not yet started waits out a pause (section 9). A remote sender
+task; a launch not yet started waits out a pause of `runtime.toml` or of
+hosting, and a receipt-database fault fences it (section 9). A remote sender
 also needs its existing `launch` permission for that; a local sender needs only
 the route setting.
 
@@ -365,11 +368,12 @@ the file is valid again (as for remote senders). A reply (and a completion) is
 accepted and stored during a pause, so an agent that finishes then loses
 nothing; the exception is a receipt-database fault, which refuses both
 ("agent hosting records are unavailable") until `atem runtime restart`. A local
-launch not yet started waits out the pause and then starts; a launch already
-handed to the worker spawner completes. (After a database fault the pause lasts
-until `atem runtime restart`, which ends the wait of a launch that had not
-started: it becomes `outcome_unknown` and is never started.) `[collab] send =
-false` is not a pause: it only refuses new local sends. Local tasks already
+launch not yet started waits out a pause of the file or of hosting and then
+starts; a launch already handed to the worker spawner completes. A
+receipt-database fault can't end without a restart, so it fences a local launch
+not yet started at once, as it does a remote one: the launch is never started
+(`outcome_unknown`), and its task's outcome is unknown until its deadline.
+`[collab] send = false` is not a pause: it only refuses new local sends. Local tasks already
 accepted keep dispatching, and replies and result deliveries are not held back.
 Only a real change of authority fences `local`: a new host identity, or a
 device-list freeze or fault.
@@ -468,7 +472,9 @@ its sender: two separate steps.
   (`Complete it with: atem message complete <task id>`), through the normal
   queue, readiness, approval and lease checks, and only if the originating
   session's route opts in (`results = true`); otherwise it is shown by `atem
-  message status`, never prompted. The grant stays live while the task is
+  message status`, never prompted. A reply the grant can't carry (checked
+  when it is submitted and published, so this shouldn't happen) uses up the
+  grant, and its status says why ("result could not be delivered: <reason>"). The grant stays live while the task is
   `outcome_unknown` after a restart.
 - **Completing.** Only the sender completes a task: a remote sender with
   `work_complete` and its own result snapshot (naming the reply as the result
@@ -515,7 +521,14 @@ its sender: two separate steps.
   from remote senders aren't listed there; they reach the agent with their
   task id in the prompt, and it replies with `--task`. `atem message cancel`
   works only on the session's own messages; from outside any session (the
-  owner's terminal) both cover everything.
+  owner's terminal) both cover everything. The calling session is the
+  nearest agent of this runtime in the command's process ancestry, checked
+  against the process that connected; a process with no agent there is the
+  owner, and one that can't be verified (it ended or was replaced since it
+  connected) is refused, never taken for the owner. Under the same-user
+  model the owner fallback is not a security boundary (a same-user process
+  can leave an agent's process tree): it keeps an agent's commands to its own
+  session.
 - **Storage.** The runtime writes a grant or result only when its state
   changes, and prunes it with its task once the task settled a day past its
   deadline ([agent-hosting.md](agent-hosting.md) section 9).

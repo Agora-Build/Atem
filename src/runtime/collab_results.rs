@@ -201,6 +201,10 @@ pub const PUBLISHING: &str = "publishing its context";
 /// published: an expired task takes no new reply.
 pub const EXPIRED: &str = "expired before context publication";
 
+/// The detail of a submitted reply its return grant could not carry to its
+/// sender (the reason follows); the only detail a submitted reply has.
+pub const UNDELIVERED: &str = "result could not be delivered: ";
+
 impl ResultRow {
     /// A new reply: `submitted` at once, unless it has context to publish.
     pub fn new(reply: Reply, now: u64) -> Self {
@@ -270,6 +274,7 @@ impl ResultRow {
     pub fn task_detail(&self) -> String {
         match self.state {
             ReplyState::Publishing => "reply received; publishing its context".into(),
+            ReplyState::Submitted if self.detail.starts_with(UNDELIVERED) => self.detail.clone(),
             ReplyState::Submitted => "reply submitted".into(),
             ReplyState::Refused if self.detail == EXPIRED => {
                 format!("reply refused ({})", self.detail)
@@ -416,7 +421,9 @@ pub fn submit(tx: &Transaction<'_>, reply: &ResultRow) -> Result<Submission> {
     Ok(Submission::Stored(reply.clone()))
 }
 
-/// Its context was published and read back: the reply is submitted.
+/// Its context was published and read back: the reply is submitted. A
+/// reply no longer publishing (refused or replaced meanwhile) is left as it
+/// is, and returned as it is.
 pub fn published(
     db: &Connection,
     task_id: &str,
@@ -428,11 +435,14 @@ pub fn published(
     row.state = ReplyState::Submitted;
     row.detail = String::new();
     row.submitted_at = Some(now);
-    db.execute(
+    let changed = db.execute(
         "UPDATE results SET state='submitted',detail='',submitted_at=?2,record=?3
         WHERE task_id=?1 AND state='publishing'",
         params![task_id, now, serde_json::to_string(&row.reply)?],
     )?;
+    if changed == 0 {
+        return load(db, task_id)?.ok_or_else(|| anyhow::anyhow!("missing reply"));
+    }
     Ok(row)
 }
 
@@ -626,6 +636,22 @@ mod tests {
                  \n\nComplete it with: atem message complete {task}"
             )
         );
+    }
+
+    /// A late publication of a reply that is no longer publishing (refused
+    /// meanwhile) changes nothing, and says what the reply actually is.
+    #[test]
+    fn a_late_publication_reports_the_reply_as_it_is() {
+        let (_dir, store) = store();
+        let row = ResultRow::new(reply("context", vec![vault(1)]), 100);
+        submit_now(&store, &row).unwrap();
+        refuse(&store.db, row.task_id(), "context changed").unwrap();
+        let late = published(&store.db, row.task_id(), vec![], 200).unwrap();
+        assert_eq!(late.state, ReplyState::Refused);
+        assert_eq!(late.detail, "context changed");
+        assert_eq!(late.submitted_at, None);
+        let stored = load(&store.db, row.task_id()).unwrap().unwrap();
+        assert_eq!(stored.state, ReplyState::Refused);
     }
 
     /// The replied task, stored as sent by `principal`.

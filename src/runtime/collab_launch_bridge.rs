@@ -7,7 +7,7 @@ use crate::runtime::{
 use anyhow::{Result, anyhow, bail};
 use atem_client::session::{
     messages::{Destination, Message},
-    select::{AgentLabels, MAX_AGENTS, Selector},
+    select::{MAX_AGENTS, Selector},
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 
@@ -112,9 +112,16 @@ impl HostBridge {
         let mut routes: Vec<_> = self.work.config.routes.iter().collect();
         routes.sort_by(|a, b| a.id.cmp(&b.id));
         for route in routes {
-            // Only a send that asked for it starts a session (spec section
-            // 5); the route's own `launch` setting says it may.
+            // Only a send that asked for it starts a session, and only on a
+            // route one of its `atem:<atem_id>/<route_id>` selectors names
+            // (spec section 5): never one that a label or the bare instance
+            // matches. The route's own `launch` setting says it may.
+            let named = selectors.iter().any(|s| {
+                matches!(s, Selector::Instance { atem_id: id, route_id: Some(r) }
+                    if id == atem_id && *r == route.id)
+            });
             if !launch
+                || !named
                 || route.launch != RouteLaunch::OnMessage
                 || !route.principals.iter().any(|p| p == "local")
                 || candidates.iter().any(|c| c.route_id == route.id)
@@ -126,23 +133,7 @@ impl HostBridge {
                 .config
                 .profile(&route.profile_id)
                 .ok_or_else(|| anyhow!("missing profile"))?;
-            let labels = self
-                .work
-                .config
-                .instance
-                .labels
-                .iter()
-                .chain(&route.labels)
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            if !selectors.iter().any(|s| {
-                s.matches(&AgentLabels {
-                    atem_id,
-                    route_id: &route.id,
-                    labels: &labels,
-                })
-            }) || !profiles.insert(profile.id.clone())
-            {
+            if !profiles.insert(profile.id.clone()) {
                 continue;
             }
             let record = LaunchRecord {

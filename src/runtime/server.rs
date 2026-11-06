@@ -328,6 +328,52 @@ pub async fn serve(
 
 /// Waits until the workers found at start are adopted, so its answer
 /// includes them.
+/// Refuses a peer whose process can't be verified.
+const UNVERIFIED: &str =
+    "the calling process could not be verified (it ended or was replaced); run the command again";
+
+/// Who calls over the local socket.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Caller {
+    /// An agent of this runtime: the nearest session agent in the caller's
+    /// process ancestry.
+    Session(SessionId),
+    /// A verified process with no agent of this runtime in its ancestry: the
+    /// owner, at a terminal outside any session.
+    Owner,
+    /// No process to verify: no peer credentials, or the peer ended or was
+    /// replaced (another start time) since it connected.
+    Unverified,
+}
+
+/// Classifies a socket peer `(pid, start time when it connected)` against the
+/// live agents `(session, (pid, start time))`. A peer that can't be verified
+/// is never taken for the owner. Same-user model: the owner fallback is not
+/// a security boundary (a same-user process can leave an agent's process
+/// tree); it only keeps an agent's commands scoped to its own session.
+pub(super) fn caller_of(
+    peer: Option<(u32, u64)>,
+    start_time: impl Fn(u32) -> Option<u64>,
+    ancestors: impl Fn(u32) -> Vec<u32>,
+    agents: &[(SessionId, (u32, u64))],
+) -> Caller {
+    let Some((pid, started)) = peer else {
+        return Caller::Unverified;
+    };
+    if start_time(pid) != Some(started) {
+        return Caller::Unverified;
+    }
+    // Prefer the nearest agent, and verify its launch-time process identity.
+    ancestors(pid)
+        .into_iter()
+        .find_map(|pid| {
+            agents.iter().find_map(|(sid, (agent, start))| {
+                (pid == *agent && start_time(*agent) == Some(*start)).then(|| sid.clone())
+            })
+        })
+        .map_or(Caller::Owner, Caller::Session)
+}
+
 fn waits_for_adoption(incoming: &Incoming) -> bool {
     matches!(
         incoming,
@@ -504,20 +550,47 @@ impl Server {
         }
     }
 
-    fn calling_session(&self, client: u64) -> Option<SessionId> {
-        let (pid, started) = self.clients.get(&client)?.peer?;
-        if super::adopt::process_start_time(pid) != Some(started) {
-            return None;
+    /// Who sent `client`'s request (`caller_of`).
+    fn caller(&self, client: u64) -> Caller {
+        let agents: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(sid, session)| Some((sid.clone(), session.agent_pid()?)))
+            .collect();
+        caller_of(
+            self.clients.get(&client).and_then(|c| c.peer),
+            super::adopt::process_start_time,
+            |pid| super::adopt::ancestors(pid, 64),
+            &agents,
+        )
+    }
+
+    /// The calling session, for a command only an agent runs.
+    fn calling_session(&self, client: u64, op: &str) -> Option<SessionId> {
+        match self.caller(client) {
+            Caller::Session(sid) => Some(sid),
+            Caller::Owner => {
+                self.error(client, "not inside an Atem session", op);
+                None
+            }
+            Caller::Unverified => {
+                self.error(client, UNVERIFIED, op);
+                None
+            }
         }
-        let ancestors = super::adopt::ancestors(pid, 64);
-        // Prefer the nearest agent, and verify its launch-time process identity.
-        ancestors.into_iter().find_map(|pid| {
-            self.sessions.iter().find_map(|(sid, session)| {
-                let (agent, start) = session.agent_pid()?;
-                (pid == agent && super::adopt::process_start_time(agent) == Some(start))
-                    .then(|| sid.clone())
-            })
-        })
+    }
+
+    /// The calling session, or none for the owner outside any session; an
+    /// unverified peer is refused.
+    fn session_or_owner(&self, client: u64, op: &str) -> Result<Option<SessionId>, ()> {
+        match self.caller(client) {
+            Caller::Session(sid) => Ok(Some(sid)),
+            Caller::Owner => Ok(None),
+            Caller::Unverified => {
+                self.error(client, UNVERIFIED, op);
+                Err(())
+            }
+        }
     }
 
     fn detach(&mut self, sid: &SessionId) {
@@ -1095,8 +1168,8 @@ impl Server {
                 self.send(id, &RuntimeMsg::Sessions { sessions });
             }
             ClientMsg::Tag { action, name } => {
-                let Some(sid) = self.calling_session(id) else {
-                    return self.error(id, "not inside an Atem session", "tag");
+                let Some(sid) = self.calling_session(id, "tag") else {
+                    return;
                 };
                 let session = self.sessions.get_mut(&sid).unwrap();
                 let before = session.self_tags().clone();
@@ -1129,8 +1202,8 @@ impl Server {
                 );
             }
             ClientMsg::MessageSend { request } => {
-                let Some(sid) = self.calling_session(id) else {
-                    return self.error(id, "not inside an Atem session", "message_send");
+                let Some(sid) = self.calling_session(id, "message_send") else {
+                    return;
                 };
                 let result = self
                     .bridge
@@ -1150,8 +1223,8 @@ impl Server {
                 }
             }
             ClientMsg::MessageReply { request } => {
-                let Some(sid) = self.calling_session(id) else {
-                    return self.error(id, "not inside an Atem session", "message_reply");
+                let Some(sid) = self.calling_session(id, "message_reply") else {
+                    return;
                 };
                 let result = self
                     .bridge
@@ -1173,7 +1246,9 @@ impl Server {
             }
             ClientMsg::MessageComplete { task_id } => {
                 // Outside any session: the owner.
-                let caller = self.calling_session(id);
+                let Ok(caller) = self.session_or_owner(id, "message_complete") else {
+                    return;
+                };
                 let result = self
                     .bridge
                     .as_mut()
@@ -1186,7 +1261,9 @@ impl Server {
             }
             ClientMsg::MessageStatus { message_id } => {
                 // Inside a session: its own messages and the tasks sent to it.
-                let caller = self.calling_session(id);
+                let Ok(caller) = self.session_or_owner(id, "message_status") else {
+                    return;
+                };
                 let result = self
                     .bridge
                     .as_mut()
@@ -1199,7 +1276,9 @@ impl Server {
             }
             ClientMsg::MessageCancel { task_id } => {
                 // Inside a session: its own messages only.
-                let caller = self.calling_session(id);
+                let Ok(caller) = self.session_or_owner(id, "message_cancel") else {
+                    return;
+                };
                 let result = self
                     .bridge
                     .as_mut()

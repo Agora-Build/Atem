@@ -164,10 +164,11 @@ impl HostBridge {
     }
 
     /// The launches to start now. A local launch that has not started waits
-    /// out a pause (spec section 9: `runtime.toml` not loading, hosting off,
-    /// the receipt database failed) and starts when it is over; fences are
-    /// evaluated first, so what changed while it waited is not started on
-    /// the old approval (a fenced one is handed out to fail at its guard).
+    /// out a pause (spec section 9: `runtime.toml` not loading, hosting off)
+    /// and starts when it is over; a receipt database fault, which lasts
+    /// until a restart, fences it instead (`work_fail`). Fences are evaluated
+    /// first, so what changed while it waited is not started on the old
+    /// approval (a fenced one is handed out to fail at its guard).
     pub fn take_remote_launches(&mut self) -> Vec<RemoteLaunch> {
         if self.work.launches.is_empty() {
             return Vec::new();
@@ -232,12 +233,10 @@ impl HostBridge {
         }
         self.work.error = true;
         self.r9.enable_host_work(false);
-        // A local launch only waits (the failure is a pause, until a
-        // restart); a remote one is fenced.
+        // Launches that haven't started are fenced, local ones too: this
+        // pause lasts until a restart, so a local launch can't wait it out.
         for p in self.work.pending.values() {
-            if p.local_route.is_none() {
-                p.permit.store(false, Ordering::SeqCst);
-            }
+            p.permit.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1889,6 +1888,88 @@ principals = ["local"]
         });
     }
 
+    /// A submitted reply that can't be carried to its sender (here its text
+    /// was damaged after it was checked) uses up its one delivery with a
+    /// trace in status, never silently.
+    #[test]
+    fn an_undeliverable_result_leaves_a_trace() {
+        use crate::runtime::collab::results::{self, Origin, OriginRoute, ReturnGrant};
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            // The rig's session sends to itself, through a route that takes
+            // results.
+            rig.bridge.work.config.routes[0].results = true;
+            let message = rig.message();
+            rig.publish(&message);
+            let task = rig.work(&message);
+            {
+                let store = rig.bridge.work.store.as_ref().unwrap();
+                let tx = store.db.unchecked_transaction().unwrap();
+                results::save_grant(
+                    &tx,
+                    &ReturnGrant {
+                        task_id: task.task.task_id.clone(),
+                        message_id: message.message_id.clone(),
+                        workflow_id: message.workflow_id.clone(),
+                        origin: Origin {
+                            target: task.task.target.clone(),
+                            control_gen: rig.bridge.host.control_gen("local"),
+                            route: Some(OriginRoute {
+                                id: "r".into(),
+                                revision: 1,
+                                profile_id: "p".into(),
+                                profile_revision: 1,
+                                project: "local:project".into(),
+                                results: true,
+                            }),
+                        },
+                        recipient: task.task.target.clone(),
+                        expires_at: message.expires_at,
+                    },
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            let id = task.task.task_id.clone();
+            rig.until(|r| r.work(&message).turn_id.is_some()).await;
+            assert!(reply(&mut rig, &id, "a fine reply", &[]).is_ok());
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute(
+                    "UPDATE results SET record=json_set(record,'$.text',?2) WHERE task_id=?1",
+                    rusqlite::params![id, "bell \u{7}"],
+                )
+                .unwrap();
+            let grant_state = |rig: &LocalRig| -> String {
+                rig.bridge
+                    .work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .query_row(
+                        "SELECT state FROM return_grants WHERE task_id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            rig.until(|r| grant_state(r) != "open").await;
+            let trace = "result could not be delivered: context has control characters";
+            rig.until(|r| r.work(&message).status.detail == trace).await;
+            let row = results::load(&rig.bridge.work.store.as_ref().unwrap().db, &id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.detail, trace);
+            assert!(row.work_id.is_none(), "nothing was queued");
+            assert_eq!(grant_state(&rig), "consumed");
+        });
+    }
+
     /// Malformed references and text out of bounds are refused before a
     /// result row exists (spec section 10; a reply's vault reference names
     /// its entry).
@@ -2235,9 +2316,10 @@ launch = "on_message"
             .unwrap();
     }
 
-    /// Accepts a message to `tag:q`, with or without `--launch`.
+    /// Accepts a message to the launch route `q` by its instance address
+    /// (`--launch` needs one), with or without `--launch`.
     fn send_q(rig: &mut LocalRig, launch: bool) -> Message {
-        let message = select_message(rig, "tag:q");
+        let message = select_message(rig, "atem:atem-host/q");
         accept(rig, &message, launch);
         message
     }
@@ -2327,7 +2409,7 @@ launch = "on_message"
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
             launch_route(&mut rig, root);
-            let quiet = select_message(&rig, "tag:q");
+            let quiet = select_message(&rig, "atem:atem-host/q");
             accept(&mut rig, &quiet, false);
             assert_eq!(rows(&rig, "launches"), 0);
             assert_eq!(rows(&rig, "resolutions"), 0);
@@ -2336,13 +2418,104 @@ launch = "on_message"
             assert!(rig.bridge.work.pending.is_empty());
             assert_eq!(outbox_detail(&rig, &quiet), "no_match");
 
-            let asked = select_message(&rig, "tag:q");
+            let asked = select_message(&rig, "atem:atem-host/q");
             accept(&mut rig, &asked, true);
             assert_eq!(rows(&rig, "launches"), 1);
             assert_eq!(rows(&rig, "work"), 1);
             assert_eq!(rig.bridge.work.launches.len(), 1);
             assert_eq!(rig.bridge.work.pending.len(), 1);
             assert_eq!(outbox_detail(&rig, &asked), "delivered to local queue");
+        });
+    }
+
+    /// Spec section 5: `--launch` starts only a route that an
+    /// `atem:<atem_id>/<route_id>` selector of the same send names; a route
+    /// that another selector (a label, the bare instance) matches gets none.
+    #[test]
+    fn launch_starts_only_a_route_its_send_names() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            let mut message = select_message(&rig, "tag:q");
+            message.recipients[0].destination = Destination::Select {
+                selectors: vec![
+                    "atem:atem-host/r".into(),
+                    "tag:q".into(),
+                    "atem:atem-host".into(),
+                ],
+                budget: 32,
+            };
+            accept(&mut rig, &message, true);
+            assert_eq!(rows(&rig, "launches"), 0);
+            assert_eq!(outbox_detail(&rig, &message), "no_match");
+            let named = select_message(&rig, "atem:atem-host/q");
+            accept(&mut rig, &named, true);
+            assert_eq!(rows(&rig, "launches"), 1);
+            assert_eq!(outbox_detail(&rig, &named), "delivered to local queue");
+        });
+    }
+
+    /// A send with context is accepted once its context is published, after
+    /// any retries: with `--launch` that is when its route launches, and
+    /// without it no session is started (spec sections 5 and 8). The first
+    /// attempt finds no relay (no pairing here); the retry gets the
+    /// publication's result as the publisher's job would hand it over.
+    #[test]
+    fn a_context_send_launches_once_published_and_only_with_the_flag() {
+        use crate::runtime::collab::Publication;
+        use crate::runtime::collab_context::{ContextSpec, VaultRef};
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            for launch in [false, true] {
+                let message = select_message(&rig, "atem:atem-host/q");
+                crate::runtime::collab::reserve_context(
+                    rig.bridge.work.store.as_ref().unwrap(),
+                    &rig.bridge.work.config.collab,
+                    &message,
+                    &Publication {
+                        atem_id: "atem-host".into(),
+                        origin: origin_of(&rig),
+                        launch,
+                        context: vec![ContextSpec::Vault {
+                            reference: VaultRef::parse("v-context:1@1").unwrap(),
+                        }],
+                    },
+                )
+                .unwrap();
+                rig.until(|r| {
+                    outbox_detail(r, &message) == "relay unreachable; publication will retry"
+                })
+                .await;
+                assert_eq!(
+                    rows(&rig, "launches"),
+                    0,
+                    "{launch}: not before publication"
+                );
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tx.send(Ok(vec![snapshot("the published context")]))
+                    .unwrap();
+                rig.bridge
+                    .work
+                    .context_jobs
+                    .insert(message.message_id.clone(), rx);
+                rig.until(|r| {
+                    outbox_detail(r, &message) != "relay unreachable; publication will retry"
+                })
+                .await;
+                assert_eq!(
+                    (
+                        outbox_detail(&rig, &message).as_str(),
+                        rows(&rig, "launches")
+                    ),
+                    if launch {
+                        ("delivered to local queue", 1)
+                    } else {
+                        ("no_match", 0)
+                    },
+                    "{launch}"
+                );
+            }
         });
     }
 
@@ -2354,7 +2527,7 @@ launch = "on_message"
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
             let cwd = launch_route(&mut rig, root);
-            let first = select_message(&rig, "tag:q");
+            let first = select_message(&rig, "atem:atem-host/q");
             accept(&mut rig, &first, true);
             let record = launch_records(&rig).remove(0);
             let (session, request) = (
@@ -2391,26 +2564,25 @@ launch = "on_message"
     }
 
     /// Spec section 9, "Pauses, not fences": a local launch that has not
-    /// started when a pause begins (an invalid `runtime.toml`, hosting off, a
-    /// receipt database fault) waits for the pause to end, then starts. Its
-    /// task is not failed meanwhile.
+    /// started when a pause begins (an invalid `runtime.toml`, hosting off)
+    /// waits for the pause to end, then starts. Its task is not failed
+    /// meanwhile.
     #[test]
     fn a_launch_that_has_not_started_waits_out_a_pause() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
             launch_route(&mut rig, root);
-            let message = select_message(&rig, "tag:q");
+            let message = select_message(&rig, "atem:atem-host/q");
             accept(&mut rig, &message, true);
             let request = launch_records(&rig)[0].status.request_id.clone();
             let good = rig.bridge.work.config.clone();
-            for pause in 0..3 {
+            for pause in 0..2 {
                 match pause {
                     0 => rig.bridge.work.config.enabled = false,
-                    1 => {
+                    _ => {
                         rig.bridge.work.config = Config::default();
                         rig.bridge.work.config_problem = Some("expected a table".into());
                     }
-                    _ => rig.bridge.work.error = true,
                 }
                 idle(&mut rig, 350).await;
                 assert!(
@@ -2440,7 +2612,6 @@ launch = "on_message"
                 );
                 rig.bridge.work.config = good.clone();
                 rig.bridge.work.config_problem = None;
-                rig.bridge.work.error = false;
             }
             idle(&mut rig, 350).await;
             let launches = rig.bridge.take_remote_launches();
@@ -2462,6 +2633,29 @@ launch = "on_message"
                 .remove(0);
             assert_eq!(task.status.state, WorkState::Blocked);
             assert_eq!(task.status.detail, "launching the approved route");
+        });
+    }
+
+    /// A receipt database fault can't end without a restart, so a local
+    /// launch that has not started is fenced at once, like a remote one: it
+    /// is handed out to fail at its guard, never held.
+    #[test]
+    fn a_receipt_database_fault_fences_a_waiting_local_launch() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            let request = launch_records(&rig)[0].status.request_id.clone();
+            rig.bridge.work_fail();
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1, "released to fail, never held");
+            assert_eq!(launches[0].request_id, request);
+            assert!(
+                !rig.bridge.work.pending[&request]
+                    .permit
+                    .load(Ordering::SeqCst)
+            );
+            assert!(!(launches[0].guard)());
         });
     }
 
