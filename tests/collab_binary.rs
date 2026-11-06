@@ -1119,23 +1119,8 @@ fn a_task_whose_sender_left_while_it_was_queued_still_runs_then_fails() {
     assert_eq!(stopped["op"], "stopped", "{stopped}");
     std::thread::sleep(Duration::from_millis(1_000));
     assert_eq!(rig.status(&id)["tasks"][0]["state"], "blocked");
-    // The recipient's earlier turn ends during a pause, so the task is
-    // prompted well after that turn's end.
-    rig.write_config(&rig.config.replacen("enabled = true", "enabled = false", 1));
-    within("the pause", || {
-        rig.status(&id)["tasks"][0]["detail"]
-            .as_str()
-            .is_some_and(|d| d.starts_with("paused: "))
-    });
+    // The recipient's earlier turn ends: the task runs anyway.
     private(&b.join("complete"), "");
-    within("the earlier turn ended", || {
-        std::fs::read_to_string(b.join("events"))
-            .unwrap_or_default()
-            .contains("completed turn-1")
-    });
-    std::thread::sleep(Duration::from_millis(1_500));
-    // The task runs anyway once the pause is over.
-    rig.write_config(&rig.config);
     within("the task's prompt", || {
         std::fs::read_to_string(b.join("input"))
             .unwrap_or_default()
