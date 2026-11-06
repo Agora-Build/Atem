@@ -212,7 +212,7 @@ impl HostBridge {
         tx: &Transaction<'_>,
         plan: &Resolution,
     ) -> Result<()> {
-        let count: usize = tx.query_row("SELECT count(*) FROM launches", [], |r| r.get(0))?;
+        let count = crate::runtime::host_work::open_records(tx, "launches")?;
         if count + plan.launches.len() > crate::runtime::host_work::MAX_RECORDS {
             bail!("launch receipt capacity reached");
         }

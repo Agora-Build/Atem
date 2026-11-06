@@ -385,8 +385,7 @@ pub(super) fn reserve_context(
         message.created_at,
     )?;
     let tx = store.db.unchecked_transaction()?;
-    let count: usize = tx.query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))?;
-    if count >= super::host_work::MAX_RECORDS {
+    if super::host_work::open_records(&tx, "outbox")? >= super::host_work::MAX_RECORDS {
         bail!("outbox capacity reached");
     }
     tx.execute(

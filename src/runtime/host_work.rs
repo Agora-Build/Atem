@@ -17,6 +17,9 @@ use super::adopt::SpawnRequest;
 use super::protocol::LaunchEnv;
 
 pub const CONFIG_FILE: &str = "runtime.toml";
+/// The records of each table (`TRACKED`) open at once (`open_records`): a
+/// record closed a day after it settled past its deadline
+/// (`Store::drop_payloads`) is kept but no longer counts.
 pub const MAX_RECORDS: usize = 4096;
 /// Unfinished tasks (`UNFINISHED`): those that hold, or wait for, a place in
 /// their session's queue. A task awaiting its result or with an unknown
@@ -614,17 +617,77 @@ pub struct Dropped {
     pub uploads: usize,
 }
 
-/// The records whose payloads are due to go (`Store::payloads_due`): ids
-/// of tasks and of messages (remote or local; a local send never accepted
-/// has only its outbox row).
+/// The records due to close (`Store::payloads_due`): ids of tasks, of
+/// messages (remote or local; a local send never accepted has only its
+/// outbox row) and of launches.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Due {
     tasks: Vec<String>,
     messages: Vec<String>,
+    launches: Vec<String>,
 }
 
-/// The states of a settled task.
-const SETTLED: &str = "('completed','failed','cancelled','expired')";
+/// The tables whose records count toward `MAX_RECORDS` while open, with
+/// their id column.
+const TRACKED: [(&str, &str); 4] = [
+    ("work", "id"),
+    ("messages", "id"),
+    ("outbox", "message_id"),
+    ("launches", "id"),
+];
+
+/// The records of `table` (`TRACKED`) that count toward `MAX_RECORDS`:
+/// those not closed yet. Read from `open_records` by its key, so closed
+/// records are never stepped over.
+pub(super) fn open_records(db: &Connection, table: &str) -> Result<usize> {
+    Ok(db.query_row(OPEN_COUNT, [table], |r| r.get(0))?)
+}
+
+const OPEN_COUNT: &str = "SELECT count(*) FROM open_records WHERE kind=?1";
+
+// The queries of `Store::payloads_due`. Each reads `open_records` first
+// (`CROSS JOIN` keeps that order) and the record tables only by their
+// primary key, so what is closed is never read again.
+
+/// Settled tasks past the cutoff whose reply is no longer publishing and
+/// whose reply's carrier (the task delivering it to its local sender), if
+/// any, settled too.
+const DUE_TASKS: &str = "SELECT w.id FROM open_records o CROSS JOIN work w ON w.id=o.id
+    WHERE o.kind='work' AND w.state IN ('completed','failed','cancelled','expired')
+    AND json_extract(w.record,'$.task.expires_at')<=?1
+    AND NOT EXISTS(SELECT 1 FROM results r LEFT JOIN work c ON c.id=r.work_id
+        WHERE r.task_id=w.id AND (r.state='publishing'
+        OR c.state NOT IN ('completed','failed','cancelled','expired')))
+    ORDER BY w.rowid";
+
+/// Messages past the cutoff whose tasks all settled.
+const DUE_MESSAGES: &str = "SELECT m.id FROM open_records o CROSS JOIN messages m ON m.id=o.id
+    WHERE o.kind='messages' AND json_extract(m.record,'$.message.expires_at')<=?1
+    AND NOT EXISTS(SELECT 1 FROM json_each(m.record,'$.receipt.recipients') r
+        JOIN work w ON w.id=json_extract(r.value,'$.recipient_id')
+        WHERE json_extract(r.value,'$.delivery.state')='work'
+        AND w.state NOT IN ('completed','failed','cancelled','expired'))
+    ORDER BY m.rowid";
+
+/// Local sends never accepted (refused or expired) past the cutoff.
+const DUE_SENDS: &str = "SELECT x.message_id FROM open_records o
+    CROSS JOIN outbox x ON x.message_id=o.id
+    WHERE o.kind='outbox' AND x.state!='publishing'
+    AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=x.message_id)
+    AND json_extract(x.envelope,'$.expires_at')<=?1
+    ORDER BY x.rowid";
+
+/// Launches no longer starting past the cutoff.
+const DUE_LAUNCHES: &str = "SELECT l.id FROM open_records o CROSS JOIN launches l ON l.id=o.id
+    WHERE o.kind='launches' AND json_extract(l.record,'$.status.state')!='starting'
+    AND json_extract(l.record,'$.expires_at')<=?1
+    ORDER BY l.rowid";
+
+/// An open task names upload `?2` of owner `?1`.
+const NAMED_UPLOAD: &str = "SELECT EXISTS(SELECT 1 FROM open_records o
+    CROSS JOIN work w ON w.id=o.id CROSS JOIN json_each(w.record,'$.task.attachments') a
+    WHERE o.kind='work' AND json_extract(w.record,'$.attachment_owner')=?1
+    AND json_extract(a.value,'$.attachment_id')=?2)";
 
 pub struct Store {
     pub(super) db: Connection,
@@ -640,6 +703,40 @@ pub struct MessageRecord {
     pub sender_key: serde_json::Value,
     pub message: Message,
     pub receipt: MessageReceipt,
+}
+
+/// `open_records` holds one row per record of a `TRACKED` table not closed
+/// yet: what the record caps count and what the payload pass reads, so
+/// neither steps over a closed record. An insert trigger on each table
+/// adds every record, whoever inserts it (a v0.8.2 binary too: triggers
+/// and the table change no v0.8.2 table, and its statements run as
+/// before). A database without the table (v0.8.2's, or a new one) gets it,
+/// filled once with what it holds and has not closed.
+fn track_open_records(db: &Connection) -> Result<()> {
+    let tracked: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='open_records')",
+        [],
+        |r| r.get(0),
+    )?;
+    if tracked {
+        return Ok(());
+    }
+    let tx = db.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE open_records (kind TEXT NOT NULL, id TEXT NOT NULL,
+        PRIMARY KEY(kind,id)) WITHOUT ROWID;",
+    )?;
+    for (table, id) in TRACKED {
+        tx.execute_batch(&format!(
+            "INSERT INTO open_records(kind,id) SELECT '{table}',t.{id} FROM {table} t
+            WHERE NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='{table}' AND d.id=t.{id});
+            CREATE TRIGGER {table}_opened AFTER INSERT ON {table} BEGIN
+                INSERT OR IGNORE INTO open_records(kind,id) VALUES('{table}',NEW.{id});
+            END;"
+        ))?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 impl Store {
@@ -693,6 +790,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS dropped_payloads (
                 kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
                 PRIMARY KEY(kind,id)) WITHOUT ROWID;")?;
+        track_open_records(&db)?;
         std::fs::File::open(state)?.sync_all()?;
         Ok(Self {
             db,
@@ -809,8 +907,8 @@ impl Store {
         extra: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
     ) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        let count: usize = tx.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
-        let tasks: usize = tx.query_row("SELECT count(*) FROM work", [], |r| r.get(0))?;
+        let count = open_records(&tx, "messages")?;
+        let tasks = open_records(&tx, "work")?;
         let active: usize = tx.query_row(UNFINISHED, [], |r| r.get(0))?;
         if count >= MAX_RECORDS
             || tasks + work.len() > MAX_RECORDS
@@ -857,12 +955,7 @@ impl Store {
     }
 
     fn capacity(&self, table: &str) -> Result<()> {
-        let sql = match table {
-            "launches" => "SELECT count(*) FROM launches",
-            _ => "SELECT count(*) FROM work",
-        };
-        let count: usize = self.db.query_row(sql, [], |r| r.get(0))?;
-        if count >= MAX_RECORDS {
+        if open_records(&self.db, table)? >= MAX_RECORDS {
             bail!("host work receipt capacity reached");
         }
         Ok(())
@@ -896,9 +989,7 @@ impl Store {
 
     /// Another task fits: within the record and the active queue capacity.
     pub fn has_room(&self) -> Result<bool> {
-        let tasks: usize = self
-            .db
-            .query_row("SELECT count(*) FROM work", [], |r| r.get(0))?;
+        let tasks = open_records(&self.db, "work")?;
         let active: usize = self.db.query_row(UNFINISHED, [], |r| r.get(0))?;
         Ok(tasks < MAX_RECORDS && active < MAX_QUEUED)
     }
@@ -1031,13 +1122,13 @@ impl Store {
             .collect()
     }
 
-    /// What settled a day before `cutoff` and still has its payloads
-    /// (no row in `dropped_payloads`; nothing dropped is read again): tasks
-    /// completed, failed, cancelled or expired whose reply is no longer
-    /// publishing and whose reply's carrier (the task delivering it to its
-    /// local sender) settled too; messages whose tasks all settled; local
-    /// sends never accepted (refused or expired). Every task of a message
-    /// has the message's deadline (`Message::task`, the local
+    /// The open records due to close at `cutoff` (`open_records`; a closed
+    /// one is never read again): tasks completed, failed, cancelled or
+    /// expired whose reply is no longer publishing and whose reply's
+    /// carrier (the task delivering it to its local sender) settled too;
+    /// messages whose tasks all settled; local sends never accepted
+    /// (refused or expired); launches no longer starting. Every task of a
+    /// message has the message's deadline (`Message::task`, the local
     /// `local_task`), and a reply's carrier its task's.
     fn payloads_due(&self, cutoff: u64) -> Result<Due> {
         let ids = |sql: &str| -> Result<Vec<String>> {
@@ -1047,53 +1138,47 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?;
             Ok(ids)
         };
-        let tasks = ids(&format!(
-            "SELECT w.id FROM work w WHERE w.state IN {SETTLED}
-            AND NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='task' AND d.id=w.id)
-            AND json_extract(w.record,'$.task.expires_at')<=?1
-            AND NOT EXISTS(SELECT 1 FROM results r LEFT JOIN work c ON c.id=r.work_id
-                WHERE r.task_id=w.id AND (r.state='publishing' OR c.state NOT IN {SETTLED}))
-            ORDER BY w.rowid"
-        ))?;
-        let mut messages = ids(&format!(
-            "SELECT m.id FROM messages m
-            WHERE NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='message' AND d.id=m.id)
-            AND json_extract(m.record,'$.message.expires_at')<=?1
-            AND NOT EXISTS(SELECT 1 FROM json_each(m.record,'$.receipt.recipients') r
-                JOIN work w ON w.id=json_extract(r.value,'$.recipient_id')
-                WHERE json_extract(r.value,'$.delivery.state')='work' AND w.state NOT IN {SETTLED})
-            ORDER BY m.rowid"
-        ))?;
-        messages.extend(ids(
-            "SELECT o.message_id FROM outbox o WHERE o.state!='publishing'
-            AND NOT EXISTS(SELECT 1 FROM dropped_payloads d
-                WHERE d.kind='message' AND d.id=o.message_id)
-            AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=o.message_id)
-            AND json_extract(o.envelope,'$.expires_at')<=?1
-            ORDER BY o.rowid",
-        )?);
-        Ok(Due { tasks, messages })
+        let mut messages = ids(DUE_MESSAGES)?;
+        messages.extend(ids(DUE_SENDS)?);
+        Ok(Due {
+            tasks: ids(DUE_TASKS)?,
+            messages,
+            launches: ids(DUE_LAUNCHES)?,
+        })
     }
 
-    /// Drops the payloads of what settled a day past its deadline
-    /// (`PAYLOAD_RETENTION_MS`, `payloads_due`) and keeps every record, so
-    /// every query and retry is answered as before: a task's prompt and
-    /// context text (`WorkRecord::drop_payload`) with its reply's text and
-    /// context (`Reply::drop_payload`); a message's text and context text,
-    /// and those of its local outbox envelope and publication; the uploads
-    /// that only tasks whose payloads went name (their bytes and cached
-    /// PNG; the tasks keep their descriptors). Each record is marked in
-    /// `dropped_payloads` in the same transaction. A live task is never
-    /// touched, nor what it needs; an upload no task ever named stays (its
-    /// own bound holds it). Returns what it dropped.
+    /// Closes what settled a day past its deadline (`PAYLOAD_RETENTION_MS`,
+    /// `payloads_due`): its payloads go and every record stays, so every
+    /// query and retry is answered as before, but it no longer counts
+    /// toward `MAX_RECORDS`. Payloads: a task's prompt and context text
+    /// (`WorkRecord::drop_payload`) with its reply's text and context
+    /// (`Reply::drop_payload`); a message's text and context text, and those
+    /// of its local outbox envelope and publication; the uploads that only
+    /// closed tasks name (their bytes and cached PNG; the tasks keep their
+    /// descriptors). A launch carries none. Each record leaves
+    /// `open_records` and gets its `dropped_payloads` marker in the same
+    /// transaction. A live task is never touched, nor what it needs; an
+    /// upload no task ever named stays (its own bound holds it). Returns
+    /// whose payloads it dropped.
     pub fn drop_payloads(&self, now: u64) -> Result<Dropped> {
         let due = self.payloads_due(now.saturating_sub(PAYLOAD_RETENTION_MS))?;
-        if due.tasks.is_empty() && due.messages.is_empty() {
+        if due == Due::default() {
             return Ok(Dropped::default());
         }
         let tx = self.db.unchecked_transaction()?;
         let text = |sql: &str, id: &str| -> Result<Option<String>> {
             Ok(tx.query_row(sql, [id], |r| r.get(0)).optional()?)
+        };
+        let close = |table: &str, id: &str| -> Result<()> {
+            tx.execute(
+                "DELETE FROM open_records WHERE kind=?1 AND id=?2",
+                params![table, id],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO dropped_payloads(kind,id,at_ms) VALUES(?1,?2,?3)",
+                params![table, id, now],
+            )?;
+            Ok(())
         };
         let mut uploads = BTreeSet::new();
         for id in &due.tasks {
@@ -1113,10 +1198,7 @@ impl Store {
             for a in &record.task.attachments {
                 uploads.insert((record.attachment_owner.clone(), a.attachment_id.clone()));
             }
-            tx.execute(
-                "INSERT INTO dropped_payloads(kind,id,at_ms) VALUES('task',?1,?2)",
-                params![id, now],
-            )?;
+            close("work", id)?;
         }
         for id in &due.messages {
             if let Some(mut record) = self.message(id)? {
@@ -1125,6 +1207,7 @@ impl Store {
                     "UPDATE messages SET record=?2 WHERE id=?1",
                     params![id, serde_json::to_string(&record)?],
                 )?;
+                close("messages", id)?;
             }
             if let Some(envelope) = text("SELECT envelope FROM outbox WHERE message_id=?1", id)? {
                 let mut envelope: Message = serde_json::from_str(&envelope)?;
@@ -1133,6 +1216,7 @@ impl Store {
                     "UPDATE outbox SET envelope=?2 WHERE message_id=?1",
                     params![id, serde_json::to_string(&envelope)?],
                 )?;
+                close("outbox", id)?;
             }
             if let Some(publication) =
                 text("SELECT record FROM publications WHERE message_id=?1", id)?
@@ -1145,22 +1229,14 @@ impl Store {
                     params![id, serde_json::to_string(&publication)?],
                 )?;
             }
-            tx.execute(
-                "INSERT INTO dropped_payloads(kind,id,at_ms) VALUES('message',?1,?2)",
-                params![id, now],
-            )?;
         }
-        // An upload goes once no task that keeps its payload names it.
+        for id in &due.launches {
+            close("launches", id)?;
+        }
+        // An upload goes once no open task names it.
         let mut removed = Vec::new();
         for (owner, id) in uploads {
-            let named: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM work w, json_each(w.record,'$.task.attachments') a
-                WHERE NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='task' AND d.id=w.id)
-                AND json_extract(w.record,'$.attachment_owner')=?1
-                AND json_extract(a.value,'$.attachment_id')=?2)",
-                params![owner, id],
-                |r| r.get(0),
-            )?;
+            let named: bool = tx.query_row(NAMED_UPLOAD, params![owner, id], |r| r.get(0))?;
             if !named
                 && tx.execute(
                     "DELETE FROM attachments WHERE owner=?1 AND id=?2",
@@ -2265,6 +2341,7 @@ mod tests {
                     delivery.task.task_id.clone()
                 ],
                 messages: vec![],
+                launches: vec![],
             }
         );
         assert_eq!(
@@ -2278,6 +2355,175 @@ mod tests {
         assert!(stored_reply(&carried).reply.dropped);
         assert!(!cache(&kept_upload).exists());
         assert_eq!(rows, tables.iter().map(|t| count(t)).collect::<Vec<_>>());
+    }
+
+    /// A send never accepted, with its publication.
+    fn publication() -> crate::runtime::collab::Publication {
+        crate::runtime::collab::Publication {
+            atem_id: "atem-host".into(),
+            origin: crate::runtime::collab::results::Origin {
+                target: task().task.target,
+                control_gen: 1,
+                route: None,
+            },
+            launch: false,
+            context: vec![crate::runtime::collab_context::ContextSpec::Memory {
+                memory: Box::new(memory()),
+            }],
+        }
+    }
+
+    /// The record caps count open records only: a store holding
+    /// `MAX_RECORDS` tasks, messages, local sends and launches settled a
+    /// day past their deadline refuses each new one until the pass closes
+    /// them, then takes it again (and counts it while it is open).
+    #[test]
+    fn the_record_caps_count_open_records_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.bind(&host()).unwrap();
+        let now = 10 * PAYLOAD_RETENTION_MS;
+        let old = now - PAYLOAD_RETENTION_MS;
+        let receipt = |message: &Message| MessageRecord {
+            sender_key: serde_json::json!("local"),
+            receipt: MessageReceipt {
+                message_id: message.message_id.clone(),
+                digest: digest(b"message"),
+                sender: "local".into(),
+                recipients: vec![],
+            },
+            message: message.clone(),
+        };
+        let tx = store.db.unchecked_transaction().unwrap();
+        for _ in 0..MAX_RECORDS {
+            let mut t = task();
+            t.task.expires_at = old;
+            t.status.state = WorkState::Completed;
+            let m = envelope(old);
+            let send = envelope(old);
+            let mut l = launch();
+            l.expires_at = old;
+            l.status.state = LaunchState::Failed;
+            for (sql, id, record) in [
+                (
+                    "INSERT INTO work(id,record,state) VALUES(?1,?2,'completed')",
+                    &t.task.task_id,
+                    serde_json::to_string(&t).unwrap(),
+                ),
+                (
+                    "INSERT INTO messages(id,record) VALUES(?1,?2)",
+                    &m.message_id,
+                    serde_json::to_string(&receipt(&m)).unwrap(),
+                ),
+                (
+                    "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+                    VALUES(?1,?2,'refused','',0,0)",
+                    &send.message_id,
+                    serde_json::to_string(&send).unwrap(),
+                ),
+                (
+                    "INSERT INTO launches(id,record) VALUES(?1,?2)",
+                    &l.status.request_id,
+                    serde_json::to_string(&l).unwrap(),
+                ),
+            ] {
+                tx.execute(sql, params![id, record]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let config = Collab::default();
+        let open = || -> Vec<usize> {
+            ["work", "messages", "outbox", "launches"]
+                .iter()
+                .map(|t| open_records(&store.db, t).unwrap())
+                .collect()
+        };
+        let take = || -> Vec<Result<()>> {
+            let m = envelope(now + 60_000);
+            let send = envelope(now + 60_000);
+            vec![
+                store.enqueue(&task()).map(drop),
+                store.accept_message(&receipt(&m), &[]),
+                crate::runtime::collab::reserve_context(&store, &config, &send, &publication()),
+                store.reserve_launch(&launch()).map(drop),
+            ]
+        };
+        assert_eq!(open(), [MAX_RECORDS; 4]);
+        assert!(!store.has_room().unwrap());
+        for refused in take() {
+            assert!(
+                refused
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity reached"),
+                "full"
+            );
+        }
+        assert_eq!(
+            store.drop_payloads(now).unwrap(),
+            Dropped {
+                tasks: MAX_RECORDS,
+                messages: 2 * MAX_RECORDS,
+                uploads: 0,
+            }
+        );
+        assert_eq!(open(), [0; 4]);
+        assert!(store.has_room().unwrap());
+        for taken in take() {
+            taken.unwrap();
+        }
+        assert_eq!(open(), [1; 4]);
+    }
+
+    /// The payload pass and the cap counts read `open_records` first and
+    /// the record tables only by their primary key: a closed record is
+    /// never stepped over or parsed again, however many there are.
+    #[test]
+    fn closed_records_are_never_stepped_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for sql in [
+            DUE_TASKS,
+            DUE_MESSAGES,
+            DUE_SENDS,
+            DUE_LAUNCHES,
+            NAMED_UPLOAD,
+            OPEN_COUNT,
+        ] {
+            let mut q = store
+                .db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let n = q.parameter_count();
+            let steps: Vec<String> = q
+                .query_map(
+                    rusqlite::params_from_iter(std::iter::repeat_n("x", n)),
+                    |r| r.get(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let first = steps
+                .iter()
+                .find(|s| s.starts_with("SEARCH"))
+                .unwrap_or_else(|| panic!("{sql}: {steps:?}"));
+            assert!(
+                first == "SEARCH o USING PRIMARY KEY (kind=?)"
+                    || first == "SEARCH open_records USING PRIMARY KEY (kind=?)",
+                "{sql}: {steps:?}"
+            );
+            for step in &steps {
+                assert!(
+                    step.starts_with("SEARCH")
+                        || step == "SCAN CONSTANT ROW"
+                        || step.contains("VIRTUAL TABLE")
+                        || step.contains("SUBQUERY")
+                        || step.starts_with("USE TEMP B-TREE"),
+                    "{sql}: {step}"
+                );
+                assert!(!step.contains("work_state"), "{sql}: {step}");
+            }
+        }
     }
 
     /// A v0.8.2 `host-work.sqlite` (its five tables and rows as v0.8.2
@@ -2294,8 +2540,8 @@ mod tests {
             .mode(0o600)
             .open(&path)
             .unwrap();
-        let v082 = Connection::open(&path).unwrap();
-        v082.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
+        // v0.8.2's `Store::open`, statement for statement.
+        const V082_OPEN: &str = "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS launches (id TEXT PRIMARY KEY, record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS work (id TEXT PRIMARY KEY, record TEXT NOT NULL, state TEXT NOT NULL);
@@ -2303,7 +2549,9 @@ mod tests {
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS attachments (
                 owner TEXT NOT NULL, id TEXT NOT NULL, descriptor TEXT NOT NULL,
-                size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));").unwrap();
+                size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));";
+        let v082 = Connection::open(&path).unwrap();
+        v082.execute_batch(V082_OPEN).unwrap();
         let (task, message, launch, upload) = (
             "11111111-1111-4111-8111-111111111111",
             "22222222-2222-4222-8222-222222222222",
@@ -2387,6 +2635,14 @@ mod tests {
 
         let store = Store::open(dir.path()).unwrap();
         store.bind(&host()).unwrap();
+        // What it holds counts toward the caps until it is closed.
+        let open = |db: &Connection| -> Vec<usize> {
+            ["work", "messages", "outbox", "launches"]
+                .iter()
+                .map(|t| open_records(db, t).unwrap())
+                .collect()
+        };
+        assert_eq!(open(&store.db), [1, 1, 0, 1]);
         let stored = store.work(task).unwrap().unwrap();
         assert_eq!(stored.task.prompt, "build the API");
         let receipt = store
@@ -2437,7 +2693,65 @@ mod tests {
         );
         assert!(!store.enqueue(&stored).unwrap());
         assert!(store.enqueue(&other).is_err());
+        assert_eq!(open(&store.db), [0, 0, 0, 0], "closed");
         assert_eq!(schema(&store.db), before);
+        drop(store);
+        // v0.8.2 still opens, reads and writes it with its own statements,
+        // and what it writes is counted (the insert triggers).
+        let v082 = Connection::open(&path).unwrap();
+        v082.execute_batch(V082_OPEN).unwrap();
+        let mut later = work.clone();
+        later["task"]["task_id"] = "88888888-8888-4888-8888-888888888888".into();
+        later["status"]["task_id"] = later["task"]["task_id"].clone();
+        let id = later["task"]["task_id"].as_str().unwrap();
+        let writes: [(&str, &[&dyn rusqlite::ToSql]); 6] = [
+            (
+                "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+                params![id, later.to_string(), "queued"],
+            ),
+            (
+                "UPDATE work SET record=?2,state=?3 WHERE id=?1",
+                params![id, later.to_string(), "completed"],
+            ),
+            (
+                "INSERT INTO messages(id,record) VALUES(?1,?2)",
+                params!["99999999-9999-4999-8999-999999999999", record.to_string()],
+            ),
+            (
+                "INSERT INTO launches(id,record) VALUES(?1,?2)",
+                params!["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", launched.to_string()],
+            ),
+            (
+                "UPDATE launches SET record=?2 WHERE id=?1",
+                params!["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", launched.to_string()],
+            ),
+            (
+                "INSERT INTO attachments(owner,id,descriptor,size,bytes) VALUES(?1,?2,?3,68,x'00')",
+                params![owner, upload, attachment.to_string()],
+            ),
+        ];
+        for (sql, params) in writes {
+            assert_eq!(v082.execute(sql, params).unwrap(), 1, "{sql}");
+        }
+        let read: String = v082
+            .query_row("SELECT record FROM work WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&read).unwrap(),
+            later
+        );
+        let check: String = v082
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        assert_eq!(schema(&v082), before);
+        drop(v082);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(open(&store.db), [1, 1, 0, 1]);
+        assert_eq!(
+            store.work(id).unwrap().unwrap().task.prompt,
+            "build the API"
+        );
     }
 
     #[test]
