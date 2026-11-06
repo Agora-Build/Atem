@@ -1900,9 +1900,12 @@ impl HostBridge {
 
     /// `local` still has the authority of a verified host: paired, a usable
     /// session journal, a device list that is neither frozen nor faulted.
-    /// Losing it (and a new host identity) is a real change of authority:
-    /// `sync_local` fences `local`. The switches in `runtime.toml` are not
-    /// part of it (`collab_paused`).
+    /// Without it `sync_local` fences `local`. A new host identity, an
+    /// unpairing or a device list that went unusable is a real change of
+    /// authority; a plain session-journal halt fences `local` in memory
+    /// only, a pause for its tasks (`local_halted`: they wait, and the
+    /// restart that ends the halt brings back its durable control state).
+    /// The switches in `runtime.toml` are not part of it (`collab_paused`).
     pub(super) fn local_authorized(&self) -> bool {
         self.host.context().account_id != UNPAIRED
             && !self.host.journal_halted()
@@ -1922,8 +1925,10 @@ impl HostBridge {
 
     /// Keeps the internal local attachment. A pause leaves it (and `local`'s
     /// control generation) alone, so queued local work and return grants
-    /// resume as they were; only a lost authority or a new host identity
-    /// fences `local` and ends the attachment.
+    /// resume as they were; a lost authority or a new host identity fences
+    /// `local` and ends the attachment. A plain session-journal halt does
+    /// too, in memory only: `local`'s tasks take it as a pause
+    /// (`local_halted`) and wait for the restart.
     fn sync_local(&mut self, cx: &mut Cx) {
         let context = self.host.context();
         let identity = Identity {

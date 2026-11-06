@@ -496,12 +496,17 @@ pub struct ResultReply {
     pub context: Vec<ContextSnapshot>,
     /// Unix ms on the host's wall clock; exactly when `submitted`.
     pub submitted_at: Option<u64>,
+    /// The host no longer keeps the reply's text and context (a day after
+    /// its task settled past its deadline): `text` is empty, `context` too,
+    /// and `digest` still identifies the reply.
+    pub dropped: bool,
 }
 
 impl ResultReply {
     pub fn valid(&self) -> bool {
         is_uuid_v5(&self.result_id)
             && is_digest(&self.digest)
+            && (!self.dropped || self.text.is_empty() && self.context.is_empty())
             && self.text.len() <= MAX_REPLY_TEXT_BYTES
             && !self
                 .text
@@ -691,6 +696,29 @@ mod tests {
         }
     }
 
+    /// The shared result vectors: `reply` results, a dropped reply among them.
+    #[test]
+    fn shared_host_work_fixture_results() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../../designs/protocol/fixtures/host-work/requests-v1.json"
+        ))
+        .unwrap();
+        let cases = fixtures["results"].as_array().unwrap();
+        assert!(
+            cases
+                .iter()
+                .any(|c| c["result"]["result"]["reply"]["dropped"] == true)
+        );
+        for case in cases {
+            assert_eq!(
+                Response::from_data(&case["result"]).is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
     #[test]
     fn result_correlation_distinguishes_task_and_message_identities() {
         let request = Request::LaunchQuery {
@@ -775,6 +803,7 @@ mod tests {
             text: "Done: /v2/orders is live".into(),
             context: vec![context],
             submitted_at: Some(1_793_620_800_000),
+            dropped: false,
         }
     }
 
@@ -829,6 +858,20 @@ mod tests {
             serde_json::from_value::<ResultBody>(wire).unwrap(),
             submitted.result
         );
+        // Dropped once its task settled a day past its deadline: the same
+        // reply, without its text and context.
+        let mut dropped = submitted_reply();
+        dropped.text.clear();
+        dropped.context.clear();
+        dropped.dropped = true;
+        let answer = reply_answer(&request, Some(dropped.clone()));
+        assert!(answer.answers(&request));
+        let wire = serde_json::to_value(&answer.result).unwrap();
+        assert_eq!(wire["reply"]["dropped"], true);
+        assert_eq!(wire["reply"]["text"], "");
+        assert_eq!(wire["reply"]["context"], json!([]));
+        assert_eq!(wire["reply"]["digest"], json!(reply.digest));
+        assert_eq!(wire["reply"]["submitted_at"], 1_793_620_800_000u64);
         // Not yet submitted: no time and no context.
         for state in [ReplyState::Publishing, ReplyState::Refused] {
             reply.state = state;
@@ -864,7 +907,7 @@ mod tests {
             Response::from_data(&json["data"])
         };
         assert!(build(&|_| {}).is_ok());
-        let cases: [(&str, &dyn Fn(&mut ResultReply)); 10] = [
+        let cases: [(&str, &dyn Fn(&mut ResultReply)); 12] = [
             ("result id is not a UUID", &|r| r.result_id = "x".into()),
             ("result id is a v4", &|r| {
                 r.result_id = super::super::new_id()
@@ -886,6 +929,14 @@ mod tests {
                 r.state = ReplyState::Publishing;
                 r.context = vec![];
             }),
+            ("dropped, with its text", &|r| {
+                r.dropped = true;
+                r.context = vec![];
+            }),
+            ("dropped, with its context", &|r| {
+                r.dropped = true;
+                r.text.clear();
+            }),
         ];
         for (name, edit) in cases {
             assert!(build(edit).is_err(), "{name}");
@@ -897,6 +948,14 @@ mod tests {
                 r.submitted_at = None;
             })
             .is_err()
+        );
+        assert!(
+            build(&|r| {
+                r.dropped = true;
+                r.text.clear();
+                r.context = vec![];
+            })
+            .is_ok()
         );
         // The longest text the host accepts, and tabs and newlines.
         assert!(build(&|r| r.text = "a\tb\nc".repeat(2_000)).is_ok());

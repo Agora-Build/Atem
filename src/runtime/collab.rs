@@ -322,6 +322,10 @@ pub struct ResultView {
     pub text: String,
     /// The context it carries once published.
     pub context: Vec<atem_client::session::messages::ContextReference>,
+    /// Its text is no longer kept (a day after its task settled past its
+    /// deadline); its context references still are.
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +346,16 @@ pub(super) struct Publication {
     /// The sender's `--launch`, kept until the message is accepted.
     pub launch: bool,
     pub context: Vec<super::collab_context::ContextSpec>,
+}
+
+impl Publication {
+    /// Drops the text of the memories it was to publish
+    /// (`Store::drop_payloads`, a send never accepted).
+    pub(super) fn drop_payload(&mut self) {
+        for spec in &mut self.context {
+            spec.drop_payload();
+        }
+    }
 }
 
 pub(super) fn reserve_context(
@@ -542,6 +556,7 @@ pub(super) fn views(
                         state: row.state,
                         detail: row.detail,
                         text: row.reply.text,
+                        dropped: row.reply.dropped,
                     });
                     Ok(TaskView {
                         task_id: r.status.task_id,

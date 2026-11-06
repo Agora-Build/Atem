@@ -11,6 +11,11 @@ use atem_client::session::{
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 
+/// The detail of a local task whose launch a plain session-journal halt
+/// fenced before it started (`halted_launches`).
+const HALTED_LAUNCH: &str =
+    "launch not started: the session journal halted; run `atem runtime restart`";
+
 pub(super) struct LocalLaunch {
     record: LaunchRecord,
     route: Route,
@@ -293,6 +298,9 @@ impl HostBridge {
         let (state, detail) = match record.status.state {
             LaunchState::Started => return Ok(false),
             LaunchState::Starting => (WorkState::Blocked, "launching the approved route"),
+            LaunchState::Failed if self.work.halted_launches.contains(&id) => {
+                (WorkState::Failed, HALTED_LAUNCH)
+            }
             LaunchState::Failed => (
                 WorkState::Failed,
                 "approved route launch failed; check its cwd and environment",

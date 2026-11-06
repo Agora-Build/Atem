@@ -57,6 +57,14 @@ impl ContextSpec {
             Self::Vault { .. } => None,
         }
     }
+
+    /// Drops a memory's text (`Store::drop_payloads`); its id, hash and
+    /// times stay. A vault reference carries no text.
+    pub fn drop_payload(&mut self) {
+        if let Self::Memory { memory } = self {
+            memory.content.clear();
+        }
+    }
 }
 
 pub fn capture(dir: &Path, memories: &[String], vaults: &[String]) -> Result<Vec<ContextSpec>> {

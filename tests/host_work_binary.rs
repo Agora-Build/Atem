@@ -39,6 +39,9 @@ struct Rig {
     /// Debug-build project-hash table in place of the cred agent
     /// (`ATEM_TEST_PROJECT_HASHES`); set before `start`.
     projects: Option<PathBuf>,
+    /// Debug-build host clock (`ATEM_TEST_HOST_CLOCK`, `host_clock_at`);
+    /// set before `start`.
+    clock: Option<PathBuf>,
 }
 
 impl Rig {
@@ -140,6 +143,7 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
             context_hook: false,
             faults_hook: false,
             projects: None,
+            clock: None,
         }
     }
 
@@ -163,6 +167,9 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
         }
         if let Some(projects) = &self.projects {
             command.env("ATEM_TEST_PROJECT_HASHES", projects);
+        }
+        if let Some(clock) = &self.clock {
+            command.env("ATEM_TEST_HOST_CLOCK", clock);
         }
         self.runtime = Some(
             command
@@ -235,7 +242,12 @@ impl Dev {
             backlog: Vec::new(),
         }
     }
-    fn request(&mut self, r: &mut Router, mut data: Value) -> Value {
+    fn request(&mut self, r: &mut Router, data: Value) -> Value {
+        let id = self.send(r, data);
+        self.wait(r, |v| v["re"] == id.as_str())
+    }
+    /// Sends a session request; its id.
+    fn send(&mut self, r: &mut Router, mut data: Value) -> String {
         let id = uuid();
         data["v"] = json!(1);
         data["id"] = json!(id);
@@ -244,14 +256,18 @@ impl Dev {
             .send(&json!({"type":"session","data":data}), client_ms())
             .unwrap();
         r.frame(&self.handle, &frame);
+        id
+    }
+    /// The first message (in the backlog, or arriving) `matches` takes.
+    fn wait(&mut self, r: &mut Router, matches: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(at) = self.backlog.iter().position(|v| v["re"] == id) {
+            if let Some(at) = self.backlog.iter().position(&matches) {
                 return self.backlog.remove(at);
             }
             assert!(
                 Instant::now() < deadline,
-                "request timed out: {:?}",
+                "nothing matched in time: {:?}",
                 self.backlog
             );
             match r.next(&self.handle) {
@@ -711,6 +727,115 @@ fn a_service_reads_its_tasks_reply_with_reply_query() {
         reply_query(&mut dev, &mut r, tid)["result"]["reply"],
         *reply
     );
+}
+
+/// The host clock (`ATEM_TEST_HOST_CLOCK`, debug builds) at wall time
+/// `wall_ms`, on this boot and its monotonic clock as they are now.
+fn host_clock_at(path: &Path, wall_ms: u64) {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec for the call to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    std::fs::write(path, format!("{wall_ms} {mono} {}", boot.trim())).unwrap();
+}
+
+/// A day past its deadline, a completed task and its message keep their
+/// records and lose only their payloads: their sender still reads the
+/// task's final state, the message's receipt and the reply (`dropped`,
+/// with the same result id, state and digest), and a retry is answered
+/// from the record as before. runtime.log says what was dropped.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_HOST_CLOCK hook")]
+fn a_settled_task_keeps_its_records_when_its_payloads_go() {
+    let mut rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, MAC, false);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let target = task(&launch, "unused")["target"].clone();
+    let message = notice(
+        &format!("member:{MAC}"),
+        "Review the payload contract",
+        vec![json!({"kind":"agent","route_id":"backend","route_revision":1,"target":target})],
+    );
+    publish(&mut dev, &mut r, &message);
+    let tid = message["recipients"][0]["recipient_id"].clone();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while work(&mut dev, &mut r, &tid)["detail"] != "in the agent's turn" {
+        assert!(
+            Instant::now() < deadline,
+            "the task's turn was never stored"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let run = agent_run(&rig.fake, 1, &["message", "reply", "the payload reply"]);
+    assert_eq!(run["code"], 0, "{run}");
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    wait_state(&mut dev, &mut r, &tid, "awaiting_result");
+    let result = json!({"kind":"vault","id":"review-result","version":1,"text":"reviewed",
+        "digest":atem_client::session::host_work::digest(b"reviewed")});
+    let complete = json!({"op":"work_complete","host":host(),"task_id":tid,"result":result});
+    let completed = dev.request(&mut r, complete.clone())["result"]["work"].clone();
+    assert_eq!(completed["state"], "completed", "{completed}");
+    let receipt = message_status(&mut dev, &mut r, &message);
+    let reply = reply_query(&mut dev, &mut r, &tid)["result"]["reply"].clone();
+    assert_eq!(reply["text"], "the payload reply", "{reply}");
+    assert_eq!(reply["dropped"], false, "{reply}");
+
+    // A day past its deadline.
+    let clock = rig.sandbox.dir.path().join("host-clock");
+    let expires_at = message["expires_at"].as_u64().unwrap();
+    host_clock_at(&clock, expires_at + 86_400_000 + 60_000);
+    rig.clock = Some(clock);
+    drop(r);
+    rig.restart();
+    within("the payloads dropped", || {
+        runtime_log(&rig).contains(
+            "host work: dropped the payloads of 1 task, 1 message, 0 uploads (records kept)",
+        )
+    });
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, MAC, false);
+    assert_eq!(work(&mut dev, &mut r, &tid), completed);
+    assert_eq!(message_status(&mut dev, &mut r, &message), receipt);
+    let dropped = reply_query(&mut dev, &mut r, &tid)["result"]["reply"].clone();
+    for field in ["result_id", "state", "digest", "submitted_at"] {
+        assert_eq!(dropped[field], reply[field], "{field}: {dropped}");
+    }
+    assert_eq!(
+        (&dropped["text"], &dropped["context"], &dropped["dropped"]),
+        (&json!(""), &json!([]), &json!(true)),
+        "{dropped}"
+    );
+    // Retries are answered from the records.
+    let replay = publish(&mut dev, &mut r, &message);
+    assert_eq!(replay["result"]["message"], receipt, "{replay}");
+    let mut changed = message.clone();
+    changed["text"] = json!("Review another contract");
+    assert_eq!(
+        publish(&mut dev, &mut r, &changed)["code"],
+        "request_id_reused"
+    );
+    assert_eq!(dev.request(&mut r, complete)["result"]["work"], completed);
+    // The stored task kept everything but its prompt and context text.
+    let db =
+        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let record: Value = db
+        .query_row(
+            "SELECT record FROM work WHERE id=?1",
+            [tid.as_str().unwrap()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|text| serde_json::from_str(&text).unwrap())
+        .unwrap();
+    assert_eq!(record["task"]["prompt"], "", "{record}");
+    assert_eq!(record["status"], completed, "{record}");
 }
 
 /// A reply with context is `publishing` (no context, no time) until the
@@ -1593,16 +1718,16 @@ fn notification_waits_for_approval_without_answering_or_typing_into_it() {
     let rid = uuid();
     dev.launch(&mut r, &rid);
     let launch = dev.launched(&mut r, &rid);
+    // A client with control that listed the sessions gets each approval
+    // the broker opens: only then does the broker hold this one (the fake
+    // agent says `asked 1` before its hook has filed the request).
+    dev.send(&mut r, json!({"op":"list"}));
     std::fs::write(
         rig.fake.join("ask-1.json"),
         json!({"tool_name":"Bash","tool_input":{"command":"true"}}).to_string(),
     )
     .unwrap();
-    within("approval asked", || {
-        std::fs::read_to_string(rig.fake.join("events"))
-            .unwrap_or_default()
-            .contains("asked 1")
-    });
+    dev.wait(&mut r, |v| v["op"] == "approval_request");
     let t = task(&launch, "do not answer approval");
     enqueue(&mut dev, &mut r, &t);
     wait_state(&mut dev, &mut r, &t["task_id"], "blocked");

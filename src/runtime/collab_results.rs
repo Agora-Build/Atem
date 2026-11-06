@@ -169,9 +169,25 @@ pub struct Reply {
     pub references: Vec<ContextSpec>,
     /// The exact snapshots, once published.
     pub context: Vec<ContextSnapshot>,
+    /// Its text and context are no longer kept (`drop_payload`).
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 impl Reply {
+    /// Drops its text and context a day after its task settled past its
+    /// deadline (`Store::drop_payloads`): its binding and the ids, versions
+    /// and digests of its references and snapshots stay, and its row's
+    /// digest still identifies it.
+    pub fn drop_payload(&mut self) {
+        self.text.clear();
+        for reference in &mut self.references {
+            reference.drop_payload();
+        }
+        crate::runtime::host_work::drop_context(&mut self.context);
+        self.dropped = true;
+    }
+
     /// Identifies a reply: its text and references. An identical retry
     /// has the same digest; a corrected reply another.
     pub fn digest(&self) -> String {
@@ -267,14 +283,15 @@ impl ResultRow {
     }
 
     /// The reply as its sender reads it with `reply_query`. A reply that
-    /// isn't submitted has no context yet (or none at all, if refused).
+    /// isn't submitted has no context yet (or none at all, if refused); one
+    /// whose payload was dropped has neither text nor context.
     pub fn wire(&self) -> ResultReply {
         ResultReply {
             result_id: self.result_id.clone(),
             state: self.state,
             digest: self.digest.clone(),
             text: self.reply.text.clone(),
-            context: if self.state == ReplyState::Submitted {
+            context: if self.state == ReplyState::Submitted && !self.reply.dropped {
                 self.reply.context.clone()
             } else {
                 Vec::new()
@@ -282,6 +299,7 @@ impl ResultRow {
             submitted_at: self
                 .submitted_at
                 .filter(|_| self.state == ReplyState::Submitted),
+            dropped: self.reply.dropped,
         }
     }
 
@@ -501,6 +519,7 @@ mod tests {
             text: text.into(),
             references,
             context: vec![],
+            dropped: false,
         }
     }
 

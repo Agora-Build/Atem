@@ -2,7 +2,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::{
-    HostTarget, LaunchState, LaunchStatus, ProfileInfo, WorkState, WorkStatus, WorkTask,
+    ContextKind, ContextSnapshot, HostTarget, LaunchState, LaunchStatus, ProfileInfo, WorkState,
+    WorkStatus, WorkTask,
 };
 use atem_client::session::messages::{Delivery, Message, MessageReceipt, RecipientReceipt};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -567,21 +568,63 @@ impl WorkRecord {
             project: self.project.clone(),
         }
     }
+
+    /// Drops what the task carried (`Store::drop_payloads`): its prompt,
+    /// its context's text, and the copy of a reply its result is (a local
+    /// task's). Every id, digest, state and detail stays, the attachment
+    /// descriptors too, and a remote sender's explicit result
+    /// (`work_complete`), which `work_query` answers whole.
+    fn drop_payload(&mut self) {
+        self.task.prompt.clear();
+        drop_context(&mut self.task.context);
+        if let Some(result) = self
+            .status
+            .result
+            .as_mut()
+            .filter(|r| r.kind == ContextKind::Result)
+        {
+            result.text.clear();
+        }
+    }
 }
 
-/// How long a settled record is kept past its deadline. A retry of a pruned
-/// request names a deadline that passed, so it is refused, never new work;
-/// the day covers a host clock that was set back.
-pub const PRUNE_MARGIN_MS: u64 = 86_400_000;
+/// The text of each snapshot goes; its kind, id, version and digest stay.
+pub(super) fn drop_context(context: &mut [ContextSnapshot]) {
+    for snapshot in context {
+        snapshot.text.clear();
+    }
+}
 
-/// What `Store::prune` removed.
+/// A message's inline text and its context's text go; its ids, sender,
+/// recipients, times and mark stay.
+fn drop_message_payload(message: &mut Message) {
+    message.text.clear();
+    drop_context(&mut message.context);
+}
+
+/// How long a settled record keeps its payloads past its deadline
+/// (`Store::drop_payloads`); the record itself is never removed.
+pub const PAYLOAD_RETENTION_MS: u64 = 86_400_000;
+
+/// Whose payloads `Store::drop_payloads` dropped (their records stay).
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Pruned {
+pub struct Dropped {
     pub tasks: usize,
     pub messages: usize,
-    pub launches: usize,
-    pub attachments: usize,
+    pub uploads: usize,
 }
+
+/// The records whose payloads are due to go (`Store::payloads_due`): ids
+/// of tasks and of messages (remote or local; a local send never accepted
+/// has only its outbox row).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Due {
+    tasks: Vec<String>,
+    messages: Vec<String>,
+}
+
+/// The states of a settled task.
+const SETTLED: &str = "('completed','failed','cancelled','expired')";
 
 pub struct Store {
     pub(super) db: Connection,
@@ -646,7 +689,10 @@ impl Store {
                 PRIMARY KEY(key,window_start_ms));
             CREATE TABLE IF NOT EXISTS attachments (
                 owner TEXT NOT NULL, id TEXT NOT NULL, descriptor TEXT NOT NULL,
-                size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));")?;
+                size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));
+            CREATE TABLE IF NOT EXISTS dropped_payloads (
+                kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
+                PRIMARY KEY(kind,id)) WITHOUT ROWID;")?;
         std::fs::File::open(state)?.sync_all()?;
         Ok(Self {
             db,
@@ -985,123 +1031,132 @@ impl Store {
             .collect()
     }
 
-    /// Removes what is settled and a day past its deadline
-    /// (`PRUNE_MARGIN_MS`): tasks completed, failed, cancelled or expired,
-    /// with their reply, return grant and resolution; messages whose tasks
-    /// all go, with their outbox, origin and resolution rows; local sends
-    /// never accepted (refused or expired); launches no longer starting that
-    /// no remaining task waits for; uploads no remaining task names. A live
-    /// task is never removed, nor what it needs: its message (and so the
-    /// message's other tasks), its launch, its uploads, a result its delivery
-    /// still carries. An upload no task ever named stays (its own bound
-    /// holds it). Every task of a message has the message's deadline
-    /// (`Message::task`, the local `local_task`), so only messages past the
-    /// margin are read. Returns what it removed.
-    pub fn prune(&self, now: u64) -> Result<Pruned> {
-        let cutoff = now.saturating_sub(PRUNE_MARGIN_MS);
+    /// What settled a day before `cutoff` and still has its payloads
+    /// (no row in `dropped_payloads`; nothing dropped is read again): tasks
+    /// completed, failed, cancelled or expired whose reply is no longer
+    /// publishing and whose reply's carrier (the task delivering it to its
+    /// local sender) settled too; messages whose tasks all settled; local
+    /// sends never accepted (refused or expired). Every task of a message
+    /// has the message's deadline (`Message::task`, the local
+    /// `local_task`), and a reply's carrier its task's.
+    fn payloads_due(&self, cutoff: u64) -> Result<Due> {
+        let ids = |sql: &str| -> Result<Vec<String>> {
+            let mut q = self.db.prepare(sql)?;
+            let ids = q
+                .query_map([cutoff], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(ids)
+        };
+        let tasks = ids(&format!(
+            "SELECT w.id FROM work w WHERE w.state IN {SETTLED}
+            AND NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='task' AND d.id=w.id)
+            AND json_extract(w.record,'$.task.expires_at')<=?1
+            AND NOT EXISTS(SELECT 1 FROM results r LEFT JOIN work c ON c.id=r.work_id
+                WHERE r.task_id=w.id AND (r.state='publishing' OR c.state NOT IN {SETTLED}))
+            ORDER BY w.rowid"
+        ))?;
+        let mut messages = ids(&format!(
+            "SELECT m.id FROM messages m
+            WHERE NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='message' AND d.id=m.id)
+            AND json_extract(m.record,'$.message.expires_at')<=?1
+            AND NOT EXISTS(SELECT 1 FROM json_each(m.record,'$.receipt.recipients') r
+                JOIN work w ON w.id=json_extract(r.value,'$.recipient_id')
+                WHERE json_extract(r.value,'$.delivery.state')='work' AND w.state NOT IN {SETTLED})
+            ORDER BY m.rowid"
+        ))?;
+        messages.extend(ids(
+            "SELECT o.message_id FROM outbox o WHERE o.state!='publishing'
+            AND NOT EXISTS(SELECT 1 FROM dropped_payloads d
+                WHERE d.kind='message' AND d.id=o.message_id)
+            AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=o.message_id)
+            AND json_extract(o.envelope,'$.expires_at')<=?1
+            ORDER BY o.rowid",
+        )?);
+        Ok(Due { tasks, messages })
+    }
+
+    /// Drops the payloads of what settled a day past its deadline
+    /// (`PAYLOAD_RETENTION_MS`, `payloads_due`) and keeps every record, so
+    /// every query and retry is answered as before: a task's prompt and
+    /// context text (`WorkRecord::drop_payload`) with its reply's text and
+    /// context (`Reply::drop_payload`); a message's text and context text,
+    /// and those of its local outbox envelope and publication; the uploads
+    /// that only tasks whose payloads went name (their bytes and cached
+    /// PNG; the tasks keep their descriptors). Each record is marked in
+    /// `dropped_payloads` in the same transaction. A live task is never
+    /// touched, nor what it needs; an upload no task ever named stays (its
+    /// own bound holds it). Returns what it dropped.
+    pub fn drop_payloads(&self, now: u64) -> Result<Dropped> {
+        let due = self.payloads_due(now.saturating_sub(PAYLOAD_RETENTION_MS))?;
+        if due.tasks.is_empty() && due.messages.is_empty() {
+            return Ok(Dropped::default());
+        }
         let tx = self.db.unchecked_transaction()?;
-        let mut tasks: BTreeMap<String, WorkRecord> = {
-            let mut q = tx.prepare(
-                "SELECT id,record FROM work WHERE state IN ('completed','failed','cancelled','expired')
-                AND json_extract(record,'$.task.expires_at')<=?1",
-            )?;
-            q.query_map([cutoff], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .map(|r| {
-                let (id, record) = r?;
-                Ok((id, serde_json::from_str(&record)?))
-            })
-            .collect::<Result<_>>()?
+        let text = |sql: &str, id: &str| -> Result<Option<String>> {
+            Ok(tx.query_row(sql, [id], |r| r.get(0)).optional()?)
         };
-        // A reply stays while the task delivering it stays.
-        let carried: Vec<(String, String)> = {
-            let mut q = tx.prepare(
-                "SELECT r.task_id,r.work_id FROM results r JOIN work d ON d.id=r.work_id",
-            )?;
-            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for (task, delivery) in carried {
-            if !tasks.contains_key(&delivery) {
-                tasks.remove(&task);
-            }
-        }
-        // A message goes with all of its tasks, or stays with all of them.
-        let expired: Vec<(String, String)> = {
-            let mut q = tx.prepare(
-                "SELECT id,record FROM messages WHERE json_extract(record,'$.message.expires_at')<=?1",
-            )?;
-            q.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        let mut messages = Vec::new();
-        for (id, record) in expired {
-            let record: serde_json::Value = serde_json::from_str(&record)?;
-            let work: Vec<String> = record["receipt"]["recipients"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|r| r["delivery"]["state"] == "work")
-                .filter_map(|r| r["recipient_id"].as_str().map(str::to_string))
-                .collect();
-            let mut stays = false;
-            for task in &work {
-                stays |= !tasks.contains_key(task) && self.work(task)?.is_some();
-            }
-            if stays {
-                for task in &work {
-                    tasks.remove(task);
-                }
-            } else {
-                messages.push(id);
-            }
-        }
         let mut uploads = BTreeSet::new();
-        for (id, record) in &tasks {
-            for table in [
-                "work WHERE id",
-                "results WHERE task_id",
-                "return_grants WHERE task_id",
-                "resolutions WHERE task_id",
-            ] {
-                tx.execute(&format!("DELETE FROM {table}=?1"), [id])?;
+        for id in &due.tasks {
+            let mut record = self
+                .work(id)?
+                .ok_or_else(|| anyhow!("missing work record"))?;
+            record.drop_payload();
+            self.save_work(&record)?;
+            if let Some(reply) = text("SELECT record FROM results WHERE task_id=?1", id)? {
+                let mut reply: super::collab::results::Reply = serde_json::from_str(&reply)?;
+                reply.drop_payload();
+                tx.execute(
+                    "UPDATE results SET record=?2 WHERE task_id=?1",
+                    params![id, serde_json::to_string(&reply)?],
+                )?;
             }
             for a in &record.task.attachments {
                 uploads.insert((record.attachment_owner.clone(), a.attachment_id.clone()));
             }
+            tx.execute(
+                "INSERT INTO dropped_payloads(kind,id,at_ms) VALUES('task',?1,?2)",
+                params![id, now],
+            )?;
         }
-        for id in &messages {
-            for table in [
-                "messages WHERE id",
-                "outbox WHERE message_id",
-                "origins WHERE message_id",
-                "publications WHERE message_id",
-                "resolutions WHERE message_id",
-            ] {
-                tx.execute(&format!("DELETE FROM {table}=?1"), [id])?;
+        for id in &due.messages {
+            if let Some(mut record) = self.message(id)? {
+                drop_message_payload(&mut record.message);
+                tx.execute(
+                    "UPDATE messages SET record=?2 WHERE id=?1",
+                    params![id, serde_json::to_string(&record)?],
+                )?;
             }
+            if let Some(envelope) = text("SELECT envelope FROM outbox WHERE message_id=?1", id)? {
+                let mut envelope: Message = serde_json::from_str(&envelope)?;
+                drop_message_payload(&mut envelope);
+                tx.execute(
+                    "UPDATE outbox SET envelope=?2 WHERE message_id=?1",
+                    params![id, serde_json::to_string(&envelope)?],
+                )?;
+            }
+            if let Some(publication) =
+                text("SELECT record FROM publications WHERE message_id=?1", id)?
+            {
+                let mut publication: super::collab::Publication =
+                    serde_json::from_str(&publication)?;
+                publication.drop_payload();
+                tx.execute(
+                    "UPDATE publications SET record=?2 WHERE message_id=?1",
+                    params![id, serde_json::to_string(&publication)?],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO dropped_payloads(kind,id,at_ms) VALUES('message',?1,?2)",
+                params![id, now],
+            )?;
         }
-        tx.execute(
-            "DELETE FROM outbox WHERE state!='publishing' AND message_id NOT IN (SELECT id FROM messages)
-            AND json_extract(envelope,'$.expires_at')<=?1",
-            [cutoff],
-        )?;
-        tx.execute(
-            "DELETE FROM publications WHERE message_id NOT IN (SELECT message_id FROM outbox)",
-            [],
-        )?;
-        let launches = tx.execute(
-            "DELETE FROM launches WHERE json_extract(record,'$.status.state')!='starting'
-            AND json_extract(record,'$.expires_at')<=?1 AND id NOT IN
-            (SELECT launch_request_id FROM resolutions WHERE launch_request_id IS NOT NULL)",
-            [cutoff],
-        )?;
+        // An upload goes once no task that keeps its payload names it.
         let mut removed = Vec::new();
         for (owner, id) in uploads {
             let named: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM work w, json_each(w.record,'$.task.attachments') a
-                WHERE json_extract(w.record,'$.attachment_owner')=?1
+                WHERE NOT EXISTS(SELECT 1 FROM dropped_payloads d WHERE d.kind='task' AND d.id=w.id)
+                AND json_extract(w.record,'$.attachment_owner')=?1
                 AND json_extract(a.value,'$.attachment_id')=?2)",
                 params![owner, id],
                 |r| r.get(0),
@@ -1128,11 +1183,10 @@ impl Store {
                 );
             }
         }
-        Ok(Pruned {
-            tasks: tasks.len(),
-            messages: messages.len(),
-            launches,
-            attachments: removed.len(),
+        Ok(Dropped {
+            tasks: due.tasks.len(),
+            messages: due.messages.len(),
+            uploads: removed.len(),
         })
     }
 
@@ -1154,9 +1208,9 @@ impl Store {
 
     /// At a start: a launch still starting is started (its worker is
     /// live) or of unknown outcome, and a task found submitting is of unknown
-    /// outcome; neither is ever retried. Identities stay until `prune`
-    /// removes them a day past their deadline, when a retry is refused
-    /// anyway: deleting a record never turns an old retry into work.
+    /// outcome; neither is ever retried. Identities stay for the life of
+    /// the database (`drop_payloads` drops payloads only), so a retry is
+    /// always answered from its record, never turned into new work.
     pub fn recover(
         &self,
         sessions: &BTreeMap<crate::session::SessionId, super::broker::BrokerSession>,
@@ -1332,7 +1386,7 @@ pub fn check(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atem_client::session::host_work::{ContextKind, ContextSnapshot, digest};
+    use atem_client::session::host_work::digest;
     use atem_client::session::wire::Target;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -1741,18 +1795,61 @@ mod tests {
         );
     }
 
-    /// Rows a day past their deadline go once settled, with what belongs to
-    /// them; rows inside the margin, live tasks and whatever a live task
-    /// needs (its message, launch, upload, the result its delivery carries)
-    /// stay.
+    fn snapshot(text: &str) -> ContextSnapshot {
+        ContextSnapshot {
+            kind: ContextKind::Vault,
+            id: "contract".into(),
+            version: 1,
+            digest: digest(text.as_bytes()),
+            text: text.into(),
+        }
+    }
+
+    fn memory() -> crate::memory::model::Memory {
+        crate::memory::model::Memory {
+            id: "mem_f00dbabe".into(),
+            content: "a remembered fact".into(),
+            content_hash: digest(b"a remembered fact"),
+            ..Default::default()
+        }
+    }
+
+    /// A message from `local`, to nobody in particular.
+    fn envelope(expires_at: u64) -> Message {
+        Message {
+            kind: Default::default(),
+            reply_to: None,
+            from_session: Some(crate::session::SessionId::new().to_string()),
+            mark: None,
+            message_id: uuid::Uuid::new_v4().to_string(),
+            workflow_id: uuid::Uuid::new_v4().to_string(),
+            sender: "local".into(),
+            created_at: 1,
+            expires_at,
+            text: "the message's text".into(),
+            context: vec![snapshot("the message's context")],
+            recipients: vec![],
+        }
+    }
+
+    /// Rows a day past their deadline keep everything but their payloads
+    /// once settled: a task's prompt and context text with its reply's
+    /// text and context, a message's text and context text with its outbox
+    /// envelope's and publication's, and the uploads that only such tasks
+    /// name (bytes and cached PNG). Rows inside the margin, live tasks and
+    /// what a live task needs (an upload, the reply its delivery carries) keep
+    /// theirs. Nothing is deleted but upload bytes, and a second pass reads
+    /// nothing it already dropped.
     #[test]
-    fn settled_records_are_pruned_a_day_past_their_deadline() {
+    fn settled_records_keep_everything_but_their_payloads_a_day_past_their_deadline() {
+        use crate::runtime::collab::results::{self, Binding, Origin, Reply};
+        use crate::runtime::collab_context::ContextSpec;
         use atem_client::session::attachments::Attachment;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store.bind(&host()).unwrap();
-        let now = 10 * PRUNE_MARGIN_MS;
-        let (old, recent) = (now - PRUNE_MARGIN_MS, now - PRUNE_MARGIN_MS + 1);
+        let now = 10 * PAYLOAD_RETENTION_MS;
+        let (old, recent) = (now - PAYLOAD_RETENTION_MS, now - PAYLOAD_RETENTION_MS + 1);
         let owner = digest(b"sender");
         let upload = |name: &[u8]| Attachment {
             attachment_id: uuid::Uuid::new_v4().to_string(),
@@ -1794,14 +1891,44 @@ mod tests {
             r.task.attachments = attachments;
             r
         };
-        let rows = |table: &str, column: &str, id: &str| -> i64 {
+        // A task's reply, as `atem message reply` commits it; its digest.
+        let reply = |task: &WorkRecord, state: &str, carrier: Option<&str>| -> String {
+            let reply = Reply {
+                binding: Binding {
+                    task_id: task.task.task_id.clone(),
+                    session_id: task.task.target.session_id.clone(),
+                    process_gen: task.task.target.process_gen.clone(),
+                    turn_id: "turn-1".into(),
+                },
+                text: "the reply".into(),
+                references: vec![ContextSpec::Memory {
+                    memory: Box::new(memory()),
+                }],
+                context: vec![snapshot("the reply's context")],
+                dropped: false,
+            };
             store
                 .db
-                .query_row(
-                    &format!("SELECT count(*) FROM {table} WHERE {column}=?1"),
-                    [id],
-                    |r| r.get(0),
+                .execute(
+                    "INSERT INTO results(task_id,result_id,state,detail,digest,created_ms,
+                    submitted_at,record,next_try_ms,attempts,work_id)
+                    VALUES(?1,?2,?3,'',?4,0,iif(?3='submitted',1,NULL),?5,0,0,?6)",
+                    params![
+                        task.task.task_id,
+                        results::result_id(&task.task.task_id),
+                        state,
+                        reply.digest(),
+                        serde_json::to_string(&reply).unwrap(),
+                        carrier
+                    ],
                 )
+                .unwrap();
+            reply.digest()
+        };
+        let count = |table: &str| -> i64 {
+            store
+                .db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
         };
         let (gone_upload, kept_upload, unnamed_upload) =
@@ -1817,66 +1944,96 @@ mod tests {
                 ],
             )
             .unwrap();
-        // Settled, a day past its deadline: goes, with its reply, grant,
-        // resolution and its upload.
-        let settled = put(due(old, vec![gone_upload.clone()]), WorkState::Completed);
+        // Settled, a day past its deadline: its payloads go, its reply's
+        // too, and the upload only it names.
+        let settled = put(
+            due(old, vec![gone_upload.clone(), kept_upload.clone()]),
+            WorkState::Completed,
+        );
         let id = settled.task.task_id.clone();
+        let replied = reply(&settled, "submitted", None);
         for sql in [
-            "INSERT INTO results(task_id,result_id,state,detail,digest,created_ms,record,next_try_ms,attempts)
-            VALUES(?1,?1,'submitted','','d',0,'{}',0,0)",
             "INSERT INTO return_grants(task_id,record,state) VALUES(?1,'{}','ended')",
             "INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,session_id,process_gen,record)
             VALUES('none','none',?1,'r','s','p','{}')",
         ] {
             store.db.execute(sql, [&id]).unwrap();
         }
-        // Inside the margin, or live: stay. A live task keeps its upload.
+        // Inside the margin, or live: kept. A live task keeps its upload.
         let inside = put(due(recent, vec![]), WorkState::Failed);
         let live = put(due(old, vec![kept_upload.clone()]), WorkState::Submitted);
-        // A settled task whose result is carried by a delivery still queued.
+        // Settled, but its reply still publishing, or carried by a delivery
+        // still queued: kept.
+        let publishing = put(due(old, vec![]), WorkState::Expired);
+        reply(&publishing, "publishing", None);
         let carried = put(due(old, vec![]), WorkState::Expired);
         let delivery = put(due(old, vec![]), WorkState::Queued);
-        store
-            .db
-            .execute(
-                "INSERT INTO results(task_id,result_id,state,detail,digest,created_ms,record,next_try_ms,attempts,work_id)
-                VALUES(?1,?1,'submitted','','d',0,'{}',0,0,?2)",
-                params![carried.task.task_id, delivery.task.task_id],
-            )
-            .unwrap();
-        // Messages: one whose tasks are all settled goes with its outbox,
-        // origin and resolutions; one with a live task keeps every task.
+        reply(&carried, "submitted", Some(&delivery.task.task_id));
+        // Messages: one whose tasks all settled loses its payload (its
+        // outbox envelope's too); one with a live task keeps it. Their
+        // settled tasks lose theirs either way.
         let message = |tasks: &[&WorkRecord]| -> String {
-            let id = uuid::Uuid::new_v4().to_string();
-            let record = serde_json::json!({
-                "sender_key": "local",
-                "message": {"expires_at": old},
-                "receipt": {"recipients": tasks.iter().map(|t| serde_json::json!({
-                    "recipient_id": t.task.task_id, "delivery": {"state": "work"}
-                })).chain([serde_json::json!({"recipient_id": "x", "delivery": {"state": "stored"}})])
-                .collect::<Vec<_>>()},
-            });
+            let mut message = envelope(old);
+            message.recipients = tasks
+                .iter()
+                .map(|t| atem_client::session::messages::Recipient {
+                    recipient_id: t.task.task_id.clone(),
+                    host: host(),
+                    destination: atem_client::session::messages::Destination::Agent {
+                        route_id: "backend".into(),
+                        route_revision: 1,
+                        target: t.task.target.clone(),
+                    },
+                })
+                .collect();
+            let record = MessageRecord {
+                sender_key: serde_json::json!("local"),
+                receipt: MessageReceipt {
+                    message_id: message.message_id.clone(),
+                    digest: message.digest(),
+                    sender: "local".into(),
+                    recipients: tasks
+                        .iter()
+                        .map(|t| RecipientReceipt {
+                            recipient_id: t.task.task_id.clone(),
+                            delivery: Delivery::Work {
+                                work: (&t.status).into(),
+                            },
+                        })
+                        .collect(),
+                },
+                message,
+            };
+            let id = record.message.message_id.clone();
             store
                 .db
                 .execute(
                     "INSERT INTO messages(id,record) VALUES(?1,?2)",
-                    params![id, record.to_string()],
+                    params![id, serde_json::to_string(&record).unwrap()],
                 )
                 .unwrap();
-            for sql in [
-                "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
-                VALUES(?1,'{}','accepted','',0,0)",
-                "INSERT INTO origins(message_id,record) VALUES(?1,'{}')",
-            ] {
-                store.db.execute(sql, [&id]).unwrap();
-            }
+            store
+                .db
+                .execute(
+                    "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+                    VALUES(?1,?2,'accepted','',0,0)",
+                    params![id, serde_json::to_string(&record.message).unwrap()],
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO origins(message_id,record) VALUES(?1,'{}')",
+                    [&id],
+                )
+                .unwrap();
             for t in tasks {
                 store
                     .db
                     .execute(
-                        "INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,session_id,process_gen,record)
-                        VALUES(?1,'r',?2,'r','s','p','{}')",
-                        params![id, t.task.task_id],
+                        "INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,
+                        session_id,process_gen,record) VALUES(?1,'r',?2,'backend',?3,'p','{}')",
+                        params![id, t.task.task_id, t.task.target.session_id],
                     )
                     .unwrap();
             }
@@ -1886,23 +2043,38 @@ mod tests {
             put(due(old, vec![]), WorkState::Completed),
             put(due(old, vec![]), WorkState::Cancelled),
         ];
+        reply(&finished[0], "submitted", None);
         let done = message(&[&finished[0], &finished[1]]);
         let held = [
             put(due(old, vec![]), WorkState::Expired),
             put(due(old, vec![]), WorkState::AwaitingResult),
         ];
         let waiting = message(&[&held[0], &held[1]]);
-        // Local sends never accepted: a refused one goes, one still
-        // publishing stays.
-        for (state, id) in [("refused", "unsent"), ("publishing", "sending")] {
+        // Local sends never accepted: a refused one loses its payload (its
+        // publication's memory text too), one still publishing keeps it.
+        let mut sends = Vec::new();
+        for state in ["refused", "publishing"] {
+            let message = envelope(old);
+            let publication = crate::runtime::collab::Publication {
+                atem_id: "atem-host".into(),
+                origin: Origin {
+                    target: settled.task.target.clone(),
+                    control_gen: 1,
+                    route: None,
+                },
+                launch: false,
+                context: vec![ContextSpec::Memory {
+                    memory: Box::new(memory()),
+                }],
+            };
             store
                 .db
                 .execute(
                     "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
                     VALUES(?1,?2,?3,'',0,0)",
                     params![
-                        id,
-                        serde_json::json!({"expires_at": old}).to_string(),
+                        message.message_id,
+                        serde_json::to_string(&message).unwrap(),
                         state
                     ],
                 )
@@ -1910,34 +2082,21 @@ mod tests {
             store
                 .db
                 .execute(
-                    "INSERT INTO publications(message_id,record) VALUES(?1,'{}')",
-                    [id],
+                    "INSERT INTO publications(message_id,record) VALUES(?1,?2)",
+                    params![
+                        message.message_id,
+                        serde_json::to_string(&publication).unwrap()
+                    ],
                 )
                 .unwrap();
+            sends.push(message.message_id);
         }
-        // Launches: a settled one goes; one still starting, one inside the
-        // margin and one a remaining task waits for stay.
-        let mut launches = Vec::new();
-        for (state, expires_at) in [
-            (LaunchState::Started, old),
-            (LaunchState::Starting, old),
-            (LaunchState::Failed, recent),
-            (LaunchState::OutcomeUnknown, old),
-        ] {
-            let mut l = launch();
-            l.expires_at = expires_at;
-            l.status.state = state;
-            assert!(store.reserve_launch(&l).unwrap());
-            launches.push(l.status.request_id);
-        }
-        store
-            .db
-            .execute(
-                "UPDATE resolutions SET launch_request_id=?2 WHERE task_id=?1",
-                params![held[1].task.task_id, launches[3]],
-            )
-            .unwrap();
+        let mut l = launch();
+        l.expires_at = old;
+        l.status.state = LaunchState::Failed;
+        assert!(store.reserve_launch(&l).unwrap());
 
+        let receipt = store.message(&done).unwrap().unwrap().receipt;
         // The verified cache files of the uploads.
         let cache = |a: &Attachment| {
             let dir = dir.path().join("attachments").join(&owner);
@@ -1947,52 +2106,338 @@ mod tests {
         for a in [&gone_upload, &kept_upload] {
             std::fs::write(cache(a), b"png").unwrap();
         }
+        let tables = [
+            "work",
+            "results",
+            "return_grants",
+            "resolutions",
+            "messages",
+            "outbox",
+            "origins",
+            "publications",
+            "launches",
+        ];
+        let rows: Vec<i64> = tables.iter().map(|t| count(t)).collect();
         // Nothing is due a millisecond earlier.
-        let pruned = store.prune(now - 1).unwrap();
-        assert_eq!(pruned, Pruned::default());
-        let pruned = store.prune(now).unwrap();
+        assert_eq!(store.drop_payloads(now - 1).unwrap(), Dropped::default());
         assert_eq!(
-            pruned,
-            Pruned {
-                tasks: 3,
-                messages: 1,
-                launches: 1,
-                attachments: 1,
+            store.drop_payloads(now).unwrap(),
+            Dropped {
+                tasks: 4,
+                messages: 2,
+                uploads: 1,
             }
         );
-        for gone in [&settled, &finished[0], &finished[1]] {
-            assert!(store.work(&gone.task.task_id).unwrap().is_none());
+        // Every record stays.
+        assert_eq!(rows, tables.iter().map(|t| count(t)).collect::<Vec<_>>());
+        let work = |r: &WorkRecord| store.work(&r.task.task_id).unwrap().unwrap();
+        for gone in [&settled, &finished[0], &finished[1], &held[0]] {
+            let kept = work(gone);
+            assert_eq!(kept.task.prompt, "", "{}", gone.task.task_id);
+            assert_eq!(kept.task.context[0].text, "");
+            assert_eq!(kept.task.context[0].digest, gone.task.context[0].digest);
+            assert_eq!(kept.task.attachments, gone.task.attachments);
+            assert_eq!(kept.status, gone.status);
+            assert_eq!(kept.digest, gone.digest);
         }
-        for table in ["results", "return_grants", "resolutions"] {
-            assert_eq!(rows(table, "task_id", &id), 0, "{table}");
+        for kept in [&inside, &live, &publishing, &carried, &delivery, &held[1]] {
+            assert_eq!(work(kept).task, kept.task, "{}", kept.task.task_id);
         }
-        for kept in [&inside, &live, &carried, &delivery, &held[0], &held[1]] {
-            assert!(store.work(&kept.task.task_id).unwrap().is_some());
+        let stored_reply =
+            |r: &WorkRecord| results::load(&store.db, &r.task.task_id).unwrap().unwrap();
+        let row = stored_reply(&settled);
+        assert!(row.reply.dropped);
+        assert_eq!(
+            (row.reply.text.as_str(), row.digest.as_str(), row.state),
+            ("", replied.as_str(), results::ReplyState::Submitted)
+        );
+        assert_eq!(row.reply.context[0].text, "");
+        assert_eq!(row.reply.context[0].digest, digest(b"the reply's context"));
+        let ContextSpec::Memory { memory: m } = &row.reply.references[0] else {
+            panic!("a memory reference");
+        };
+        assert_eq!(
+            (m.content.as_str(), m.content_hash.as_str()),
+            ("", memory().content_hash.as_str())
+        );
+        let wire = row.wire();
+        assert!(wire.dropped && wire.text.is_empty() && wire.context.is_empty());
+        assert!(wire.valid());
+        for kept in [&publishing, &carried] {
+            let row = stored_reply(kept);
+            assert!(!row.reply.dropped);
+            assert_eq!(row.reply.text, "the reply");
         }
-        assert_eq!(rows("results", "task_id", &carried.task.task_id), 1);
-        assert_eq!(rows("messages", "id", &done), 0);
-        for (table, count) in [("outbox", 1), ("origins", 1), ("resolutions", 2)] {
-            assert_eq!(rows(table, "message_id", &done), 0, "{table}");
-            assert_eq!(rows(table, "message_id", &waiting), count, "{table}");
+        let message_text = |id: &str| {
+            let record = store.message(id).unwrap().unwrap();
+            (record.message.text, record.message.context[0].text.clone())
+        };
+        assert_eq!(message_text(&done), (String::new(), String::new()));
+        assert_eq!(store.message(&done).unwrap().unwrap().receipt, receipt);
+        // `atem message status` says so, and still lists the context.
+        let view = &crate::runtime::collab::views(&store, Some(&done), None).unwrap()[0];
+        let result = view.tasks[0].result.as_ref().unwrap();
+        assert!(result.dropped && result.text.is_empty());
+        assert_eq!(result.context[0].digest, digest(b"the reply's context"));
+        assert_eq!(
+            message_text(&waiting),
+            ("the message's text".into(), "the message's context".into())
+        );
+        let outbox = |id: &str| -> Message {
+            serde_json::from_str(
+                &store
+                    .db
+                    .query_row(
+                        "SELECT envelope FROM outbox WHERE message_id=?1",
+                        [id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let publication = |id: &str| -> crate::runtime::collab::Publication {
+            serde_json::from_str(
+                &store
+                    .db
+                    .query_row(
+                        "SELECT record FROM publications WHERE message_id=?1",
+                        [id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let memory_text = |id: &str| match &publication(id).context[0] {
+            ContextSpec::Memory { memory } => memory.content.clone(),
+            ContextSpec::Vault { .. } => unreachable!(),
+        };
+        for (id, text, memory) in [
+            (&done, "", None),
+            (&waiting, "the message's text", None),
+            (&sends[0], "", Some("")),
+            (&sends[1], "the message's text", Some("a remembered fact")),
+        ] {
+            assert_eq!(outbox(id).text, text, "{id}");
+            if let Some(memory) = memory {
+                assert_eq!(memory_text(id), memory, "{id}");
+            }
         }
-        assert_eq!(rows("messages", "id", &waiting), 1);
-        for (id, kept) in [("unsent", 0), ("sending", 1)] {
-            assert_eq!(rows("outbox", "message_id", id), kept, "{id}");
-            assert_eq!(rows("publications", "message_id", id), kept, "{id}");
-        }
-        let kept: Vec<bool> = launches
-            .iter()
-            .map(|id| store.launch(id).unwrap().is_some())
-            .collect();
-        assert_eq!(kept, [false, true, true, true]);
-        let uploads = |a: &Attachment| rows("attachments", "id", &a.attachment_id);
+        let uploads = |a: &Attachment| -> i64 {
+            store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM attachments WHERE id=?1",
+                    [&a.attachment_id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
         assert_eq!(uploads(&gone_upload), 0);
         assert_eq!(uploads(&kept_upload), 1);
         assert_eq!(uploads(&unnamed_upload), 1);
         assert!(!cache(&gone_upload).exists());
         assert!(cache(&kept_upload).exists());
-        // Again: nothing more.
-        assert_eq!(store.prune(now).unwrap(), Pruned::default());
+        // A second pass reads nothing it already dropped, and drops nothing.
+        assert_eq!(
+            store.payloads_due(now - PAYLOAD_RETENTION_MS).unwrap(),
+            Due::default()
+        );
+        assert_eq!(store.drop_payloads(now).unwrap(), Dropped::default());
+        // Once the live task and the delivery settled, theirs go too (and
+        // with the delivery, the reply it carried), and the last upload.
+        for (r, state) in [(&live, "failed"), (&delivery, "cancelled")] {
+            store
+                .db
+                .execute(
+                    "UPDATE work SET state=?2 WHERE id=?1",
+                    params![r.task.task_id, state],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.payloads_due(now - PAYLOAD_RETENTION_MS).unwrap(),
+            Due {
+                tasks: vec![
+                    live.task.task_id.clone(),
+                    carried.task.task_id.clone(),
+                    delivery.task.task_id.clone()
+                ],
+                messages: vec![],
+            }
+        );
+        assert_eq!(
+            store.drop_payloads(now).unwrap(),
+            Dropped {
+                tasks: 3,
+                messages: 0,
+                uploads: 1,
+            }
+        );
+        assert!(stored_reply(&carried).reply.dropped);
+        assert!(!cache(&kept_upload).exists());
+        assert_eq!(rows, tables.iter().map(|t| count(t)).collect::<Vec<_>>());
+    }
+
+    /// A v0.8.2 `host-work.sqlite` (its five tables and rows as v0.8.2
+    /// wrote them) opens and works unchanged: its records load and answer,
+    /// a retry is deduplicated, their payloads go a day past their deadline
+    /// with every key of each record kept, and no v0.8.2 table changes.
+    #[test]
+    fn a_v082_database_opens_and_works_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host-work.sqlite");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let v082 = Connection::open(&path).unwrap();
+        v082.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS launches (id TEXT PRIMARY KEY, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS work (id TEXT PRIMARY KEY, record TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS work_state ON work(state);
+            CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS attachments (
+                owner TEXT NOT NULL, id TEXT NOT NULL, descriptor TEXT NOT NULL,
+                size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));").unwrap();
+        let (task, message, launch, upload) = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "44444444-4444-4444-8444-444444444444",
+        );
+        let owner = digest(b"sender");
+        let target = serde_json::json!({"account_id":"account","atem_device_id":"host",
+            "host_trust_gen":1,"session_id":"ses-aaaaaaaaaaaa",
+            "process_gen":"55555555-5555-4555-8555-555555555555"});
+        let attachment = serde_json::json!({"attachment_id":upload,"digest":digest(b"png"),
+            "size":68,"media_type":"image/png"});
+        let status = serde_json::json!({"task_id":task,"receipt_id":"66666666-6666-4666-8666-666666666666",
+            "state":"completed","detail":"explicit correlated result published",
+            "result":{"kind":"vault","id":"result","version":1,"digest":digest(b"done"),"text":"done"}});
+        let work = serde_json::json!({"principal":"member:phone","attachment_owner":owner,
+            "control_gen":1,"route_id":"backend","route_revision":1,"profile_id":"backend",
+            "profile_revision":1,"project":"local:home","digest":digest(b"task"),
+            "task":{"task_id":task,"workflow_id":"77777777-7777-4777-8777-777777777777",
+                "target":target,"expires_at":100,"prompt":"build the API",
+                "context":[{"kind":"vault","id":"contract","version":1,"digest":digest(b"API"),"text":"API"}],
+                "attachments":[attachment]},
+            "status":status});
+        let sent = serde_json::json!({"message_id":message,"workflow_id":"77777777-7777-4777-8777-777777777777",
+            "sender":"member:phone","created_at":1,"expires_at":100,
+            "recipients":[{"recipient_id":task,"host":host(),
+                "destination":{"kind":"agent","route_id":"backend","route_revision":1,"target":target}}],
+            "text":"build the API","context":[]});
+        let record = serde_json::json!({"sender_key":{"kty":"test"},"message":sent,
+            "receipt":{"message_id":message,"digest":digest(b"message"),"sender":"member:phone",
+                "recipients":[{"recipient_id":task,"delivery":{"state":"work","work":{
+                    "task_id":task,"receipt_id":status["receipt_id"],"state":"queued",
+                    "detail":"waiting for a ready agent","result":null}}}]}});
+        let launched = serde_json::json!({"principal":"member:phone","profile_id":"backend",
+            "profile_revision":1,"expires_at":100,"digest":digest(b"launch"),
+            "status":{"request_id":launch,"session_id":"ses-aaaaaaaaaaaa",
+                "process_gen":target["process_gen"],"state":"started"}});
+        v082.execute(
+            "INSERT INTO identity(id,host) VALUES(1,?1)",
+            [serde_json::to_string(&host()).unwrap()],
+        )
+        .unwrap();
+        for (sql, id, value) in [
+            (
+                "INSERT INTO work(id,record,state) VALUES(?1,?2,'completed')",
+                task,
+                &work,
+            ),
+            (
+                "INSERT INTO messages(id,record) VALUES(?1,?2)",
+                message,
+                &record,
+            ),
+            (
+                "INSERT INTO launches(id,record) VALUES(?1,?2)",
+                launch,
+                &launched,
+            ),
+        ] {
+            v082.execute(sql, params![id, value.to_string()]).unwrap();
+        }
+        v082.execute(
+            "INSERT INTO attachments(owner,id,descriptor,size,bytes) VALUES(?1,?2,?3,68,x'00')",
+            params![owner, upload, attachment.to_string()],
+        )
+        .unwrap();
+        let schema = |db: &Connection| -> Vec<(String, String)> {
+            db.prepare(
+                "SELECT name,sql FROM sqlite_master WHERE name IN
+                ('identity','launches','work','work_state','messages','attachments') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let before = schema(&v082);
+        assert_eq!(before.len(), 6);
+        drop(v082);
+
+        let store = Store::open(dir.path()).unwrap();
+        store.bind(&host()).unwrap();
+        let stored = store.work(task).unwrap().unwrap();
+        assert_eq!(stored.task.prompt, "build the API");
+        let receipt = store
+            .message_receipt(&store.message(message).unwrap().unwrap())
+            .unwrap();
+        assert!(matches!(&receipt.recipients[0].delivery,
+            Delivery::Work { work } if work.state == WorkState::Completed));
+        assert_eq!(
+            store.launch(launch).unwrap().unwrap().status.state,
+            LaunchState::Started
+        );
+        // A retry: the same task is the recorded one; another is refused.
+        assert!(!store.enqueue(&stored).unwrap());
+        let mut other = stored.clone();
+        other.digest = digest(b"another task");
+        assert!(store.enqueue(&other).is_err());
+        assert_eq!(
+            store.drop_payloads(100 + PAYLOAD_RETENTION_MS).unwrap(),
+            Dropped {
+                tasks: 1,
+                messages: 1,
+                uploads: 1,
+            }
+        );
+        // Each record keeps every key it had; only the payloads are empty.
+        let raw = |sql: &str, id: &str| -> serde_json::Value {
+            serde_json::from_str(
+                &store
+                    .db
+                    .query_row(sql, [id], |r| r.get::<_, String>(0))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut expected = work.clone();
+        expected["task"]["prompt"] = "".into();
+        expected["task"]["context"][0]["text"] = "".into();
+        assert_eq!(raw("SELECT record FROM work WHERE id=?1", task), expected);
+        let mut expected = record.clone();
+        expected["message"]["text"] = "".into();
+        assert_eq!(
+            raw("SELECT record FROM messages WHERE id=?1", message),
+            expected
+        );
+        assert_eq!(
+            raw("SELECT record FROM launches WHERE id=?1", launch),
+            launched
+        );
+        assert!(!store.enqueue(&stored).unwrap());
+        assert!(store.enqueue(&other).is_err());
+        assert_eq!(schema(&store.db), before);
     }
 
     #[test]

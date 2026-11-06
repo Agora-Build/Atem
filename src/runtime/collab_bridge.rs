@@ -243,6 +243,7 @@ impl HostBridge {
             text: request.text,
             references,
             context: vec![],
+            dropped: false,
         };
         let digest = reply.digest();
         let store = self.work.store.as_ref().unwrap();
@@ -732,17 +733,29 @@ impl HostBridge {
                 continue;
             }
             let store = self.work.store.as_ref().unwrap();
+            let route_valid = self.work_route_allowed(&task, &Sender::Local);
             let live = self.collab_origin_live(&grant.origin, sessions)
                 && grant.live(
                     now,
                     task.status.state,
                     &grant.origin.target,
                     self.host.control_gen("local"),
-                    self.work_route_allowed(&task, &Sender::Local),
+                    route_valid,
                 );
             if !live {
+                // Why is recorded for an early end only: before the grant's
+                // deadline, its task going on (not settled, its own route
+                // and authority unchanged).
+                let goes_on = now < grant.expires_at
+                    && route_valid
+                    && !matches!(
+                        task.status.state,
+                        WorkState::Cancelled | WorkState::Expired | WorkState::Failed
+                    );
                 let ended = ReturnGrant {
-                    ended: self.collab_origin_end(&grant.origin, sessions),
+                    ended: goes_on
+                        .then(|| self.collab_origin_end(&grant.origin, sessions))
+                        .flatten(),
                     ..grant.clone()
                 };
                 let tx = store.db.unchecked_transaction()?;
@@ -1313,7 +1326,8 @@ impl HostBridge {
             .unwrap()
             .message(&message.message_id)?
         {
-            if old.message != *message {
+            // The digest stays when the message's text is dropped.
+            if old.receipt.digest != message.digest() {
                 bail!("request_id_reused");
             }
             return Ok(());

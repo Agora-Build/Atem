@@ -161,7 +161,11 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                             "    reply {} ({}): {}",
                             result.result_id,
                             serde_json::to_value(result.state)?.as_str().unwrap(),
-                            result.text
+                            if result.dropped {
+                                "(text no longer kept)"
+                            } else {
+                                result.text.as_str()
+                            }
                         );
                         if !result.detail.is_empty() {
                             println!("    {}", result.detail);

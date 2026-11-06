@@ -12,9 +12,10 @@ use std::sync::atomic::AtomicBool;
 /// The longest `paused: <reason>` detail a waiting local task carries.
 const MAX_PAUSE_DETAIL: usize = 240;
 
-/// How often settled host-work records and collaboration counters whose
-/// windows passed are pruned (counters also at each counted send).
-const PRUNE_EVERY: Duration = Duration::from_secs(60);
+/// How often the payloads of host-work records settled a day past their
+/// deadline are dropped, and collaboration counters whose windows passed
+/// are pruned (counters also at each counted send).
+const CLEANUP_EVERY: Duration = Duration::from_secs(60);
 
 /// A task whose sender's authority changed since it was accepted: its
 /// principal's control generation moved on (a fence: a removal, any change
@@ -113,11 +114,14 @@ pub(super) struct State {
     scheduled: Instant,
     recovered: bool,
     pending: HashMap<String, PendingLaunch>,
+    /// Local launches fenced by a plain session-journal halt
+    /// (`local_halted`), so their tasks say so if they fail.
+    halted_launches: HashSet<String>,
     launches: VecDeque<RemoteLaunch>,
     context_jobs:
         HashMap<String, tokio::sync::oneshot::Receiver<anyhow::Result<Vec<hw::ContextSnapshot>>>>,
-    /// When settled records and passed counter windows are pruned next.
-    pruned: Instant,
+    /// When the next cleanup (`work_cleanup`) runs.
+    cleanup: Instant,
 }
 
 impl State {
@@ -139,9 +143,10 @@ impl State {
             scheduled: Instant::now(),
             recovered: false,
             pending: HashMap::new(),
+            halted_launches: HashSet::new(),
             launches: VecDeque::new(),
             context_jobs: HashMap::new(),
-            pruned: Instant::now(),
+            cleanup: Instant::now(),
         }
     }
 }
@@ -467,7 +472,7 @@ impl HostBridge {
                 .collab_pass(cx)
                 .and_then(|_| self.collab_reply_pass())
                 .and_then(|_| self.schedule_work(cx))
-                .and_then(|_| self.work_prune())
+                .and_then(|_| self.work_cleanup())
                 .is_err()
             {
                 self.work_fail();
@@ -528,12 +533,16 @@ impl HostBridge {
             let allowed = host_now().wall_ms < p.expires_at
                 && self.host.control_gen(&p.principal) == p.control_gen
                 && match &p.local_route {
-                    // Only a real change of authority fences a local launch:
-                    // a new host identity, a lost device list, a changed
-                    // approval. A pause waits (`take_remote_launches`); while
-                    // it lasts the approval can't be compared (the file may
-                    // not load), which is no change: it is compared again
-                    // when the pause ends. `[collab] send` never matters.
+                    // A change of authority fences a local launch: a new host
+                    // identity, a lost device list, a changed approval. So
+                    // does a plain session-journal halt (`local` is fenced in
+                    // memory): only a restart ends it, and the restart drops
+                    // a launch not started anyway; its task says why
+                    // (`halted_launches`). A pause waits
+                    // (`take_remote_launches`); while it lasts the approval
+                    // can't be compared (the file may not load), which is no
+                    // change: it is compared again when the pause ends.
+                    // `[collab] send` never matters.
                     Some(route) => {
                         !p.attachment.is_empty()
                             && p.attachment == self.local_attachment()
@@ -559,6 +568,9 @@ impl HostBridge {
                 };
             if !allowed {
                 p.permit.store(false, Ordering::SeqCst);
+                if !remote && self.local_halted() {
+                    self.work.halted_launches.insert(id);
+                }
             }
         }
     }
@@ -937,8 +949,10 @@ impl HostBridge {
             if old.message.sender != a.name() || old.sender_key != a.key_json() {
                 return Err("forbidden");
             }
+            // By the digest recorded at acceptance, which stays when the
+            // message's text is dropped (`Store::drop_payloads`).
             if let hw::Request::Publish { message, .. } = req
-                && old.message != *message
+                && old.receipt.digest != message.digest()
             {
                 return Err("request_id_reused");
             }
@@ -1102,17 +1116,29 @@ impl HostBridge {
         })
     }
 
-    /// About once a minute, after a scheduling pass: host-work records
-    /// settled a day past their deadline (`Store::prune`, remote and local
-    /// alike), and collaboration counters whose windows passed.
-    fn work_prune(&mut self) -> anyhow::Result<()> {
-        if Instant::now() < self.work.pruned {
+    /// About once a minute, after a scheduling pass: the payloads of
+    /// host-work records settled a day past their deadline go, remote and
+    /// local alike (`Store::drop_payloads`; every record stays, one
+    /// runtime.log line says how many), and collaboration counters whose
+    /// windows passed.
+    fn work_cleanup(&mut self) -> anyhow::Result<()> {
+        if Instant::now() < self.work.cleanup {
             return Ok(());
         }
-        self.work.pruned = Instant::now() + PRUNE_EVERY;
+        self.work.cleanup = Instant::now() + CLEANUP_EVERY;
         let store = self.work.store.as_ref().unwrap();
         let now = host_now().wall_ms;
-        store.prune(now)?;
+        let dropped = store.drop_payloads(now)?;
+        if dropped != Default::default() {
+            let count =
+                |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+            eprintln!(
+                "atem runtime: host work: dropped the payloads of {}, {}, {} (records kept)",
+                count(dropped.tasks, "task"),
+                count(dropped.messages, "message"),
+                count(dropped.uploads, "upload")
+            );
+        }
         crate::runtime::collab::prune_counters(&store.db, now)
     }
 
@@ -2506,13 +2532,14 @@ principals = ["local"]
         });
     }
 
-    /// The work pass prunes, about once a minute, what settled a day past
-    /// its deadline; a task still in its turn stays whatever its deadline.
+    /// The work pass drops, about once a minute, the payloads of what
+    /// settled a day past its deadline and keeps the record; a task still
+    /// in its turn keeps its payload whatever its deadline.
     #[test]
-    fn the_work_pass_prunes_settled_records_past_the_margin() {
+    fn the_work_pass_drops_the_payloads_of_settled_records_past_the_retention() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
-            let old = host_now().wall_ms - crate::runtime::host_work::PRUNE_MARGIN_MS - 1;
+            let old = host_now().wall_ms - crate::runtime::host_work::PAYLOAD_RETENTION_MS - 1;
             // A task in its turn, its deadline (as stored) a day past.
             let running = rig.message();
             rig.publish(&running);
@@ -2561,7 +2588,7 @@ principals = ["local"]
                 record.task.task_id,
                 running.recipients[0].recipient_id.clone(),
             ];
-            let present = |rig: &LocalRig, id: &str| {
+            let prompt = |rig: &LocalRig, id: &str| {
                 rig.bridge
                     .work
                     .store
@@ -2569,14 +2596,97 @@ principals = ["local"]
                     .unwrap()
                     .work(id)
                     .unwrap()
-                    .is_some()
+                    .unwrap()
+                    .task
+                    .prompt
             };
             idle(&mut rig, 300).await;
-            assert!(present(&rig, &ids[0]), "not before the next prune");
-            rig.bridge.work.pruned = Instant::now();
+            assert!(
+                !prompt(&rig, &ids[0]).is_empty(),
+                "not before the next pass"
+            );
+            rig.bridge.work.cleanup = Instant::now();
             idle(&mut rig, 300).await;
-            assert!(!present(&rig, &ids[0]), "settled and past the margin");
-            assert!(present(&rig, &ids[1]), "still in its turn");
+            assert_eq!(prompt(&rig, &ids[0]), "", "settled and past the retention");
+            assert!(!prompt(&rig, &ids[1]).is_empty(), "still in its turn");
+        });
+    }
+
+    /// A retry of a request whose payload was dropped is answered from its
+    /// record by its digest, as before the drop: the same `work_enqueue` or
+    /// `message_publish` gets the receipt recorded, another content
+    /// `request_id_reused`.
+    #[test]
+    fn a_retry_after_its_payload_was_dropped_is_deduplicated_by_its_digest() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let local = rig.bridge.local_attachment().to_string();
+            let host = rig.bridge.work_host();
+            let message = rig.message();
+            rig.publish(&message);
+            let mut task = message.task(&message.recipients[0]).unwrap();
+            task.task_id = uuid::Uuid::new_v4().to_string();
+            let enqueue = |task: &hw::WorkTask| hw::Request::Enqueue {
+                v: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                host: host.clone(),
+                route_id: "r".into(),
+                route_revision: 1,
+                task: task.clone(),
+            };
+            let request = |rig: &mut LocalRig, req: &hw::Request| {
+                rig.bridge.work_request(
+                    &local,
+                    req,
+                    &mut Cx {
+                        client: &rig.app.astation_client,
+                        sessions: &mut rig.sessions,
+                    },
+                )
+            };
+            assert!(request(&mut rig, &enqueue(&task)).is_ok());
+            // Both settle before they are dispatched.
+            for task_id in [&task.task_id, &message.recipients[0].recipient_id] {
+                let cancel = hw::Request::Cancel {
+                    v: 1,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    host: host.clone(),
+                    task_id: task_id.clone(),
+                };
+                assert!(request(&mut rig, &cancel).is_ok());
+            }
+            let recorded = request(&mut rig, &enqueue(&task)).unwrap();
+            let published = rig.publish(&message);
+            let dropped = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .drop_payloads(message.expires_at + crate::runtime::host_work::PAYLOAD_RETENTION_MS)
+                .unwrap();
+            assert_eq!((dropped.tasks, dropped.messages), (2, 1));
+            assert_eq!(rig.work(&message).task.prompt, "");
+            assert_eq!(request(&mut rig, &enqueue(&task)), Ok(recorded));
+            assert_eq!(rig.publish(&message), published);
+            let mut other = task.clone();
+            other.prompt.push('!');
+            assert_eq!(
+                request(&mut rig, &enqueue(&other)),
+                Err("request_id_reused")
+            );
+            let mut other = message.clone();
+            other.text.push('!');
+            assert_eq!(
+                rig.bridge.local_publish(
+                    &other,
+                    &mut Cx {
+                        client: &rig.app.astation_client,
+                        sessions: &mut rig.sessions,
+                    },
+                ),
+                Err("request_id_reused")
+            );
         });
     }
 
@@ -3349,6 +3459,53 @@ launch = "on_message"
                     .load(Ordering::SeqCst)
             );
             assert!(!(launches[0].guard)());
+        });
+    }
+
+    /// A plain session-journal halt fences a local launch that has not
+    /// started (only a restart ends the halt, and the restart drops the
+    /// launch anyway): its task says so, never that the route's launch
+    /// failed.
+    #[test]
+    fn a_launch_fenced_by_a_halted_journal_says_so() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            let request = launch_records(&rig)[0].status.request_id.clone();
+            rig.bridge.host.journal_mut().fail_append_of(1, false);
+            let effects = rig.bridge.host.fence_principal("service:other", 0);
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            assert!(rig.bridge.host.journal_halted());
+            idle(&mut rig, 350).await;
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1);
+            assert!(!(launches[0].guard)());
+            // What the launcher reports when the guard refuses.
+            rig.bridge.remote_launched(&request, LaunchState::Failed);
+            idle(&mut rig, 350).await;
+            let task = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .tasks()
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                (task.status.state, task.status.detail.as_str()),
+                (
+                    WorkState::Failed,
+                    "launch not started: the session journal halted; run `atem runtime restart`"
+                )
+            );
         });
     }
 
