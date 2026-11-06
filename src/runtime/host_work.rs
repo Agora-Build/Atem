@@ -539,6 +539,36 @@ pub struct WorkRecord {
     pub authorization_expires_at: Option<u64>,
 }
 
+/// What a task was accepted under: its sender's principal, control
+/// generation and authorization expiry, and the route and profile approval.
+/// A task under any other is never dispatched, completed or answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Accepted {
+    pub principal: String,
+    pub control_gen: u64,
+    pub authorization_expires_at: Option<u64>,
+    pub route_id: String,
+    pub route_revision: u64,
+    pub profile_id: String,
+    pub profile_revision: u64,
+    pub project: String,
+}
+
+impl WorkRecord {
+    pub fn accepted(&self) -> Accepted {
+        Accepted {
+            principal: self.principal.clone(),
+            control_gen: self.control_gen,
+            authorization_expires_at: self.authorization_expires_at,
+            route_id: self.route_id.clone(),
+            route_revision: self.route_revision,
+            profile_id: self.profile_id.clone(),
+            profile_revision: self.profile_revision,
+            project: self.project.clone(),
+        }
+    }
+}
+
 /// How long a settled record is kept past its deadline. A retry of a pruned
 /// request names a deadline that passed, so it is refused, never new work;
 /// the day covers a host clock that was set back.
@@ -854,39 +884,49 @@ impl Store {
     /// Tasks awaiting their result or whose outcome is unknown expire at
     /// their deadline, whoever sent them and whatever became of their reply
     /// or return grant (spec section 10), so none waits, or holds its
-    /// session's queue, forever. Before it, one whose sender's authority
-    /// `revoked` names a reason for (its principal, the control generation
-    /// and authorization expiry it was accepted under) fails with it, and
-    /// its return grant ends: its sender can't complete it, nor its agent
-    /// answer it. Nothing is resubmitted. An open grant ends with an expired
-    /// task. Writes only what is due; returns how many settled.
+    /// session's queue, forever. Before it, one that `lost` names a reason
+    /// for (from what it was accepted under: its sender's authority, its
+    /// route and profile approval) fails with it, and its return grant
+    /// ends: its sender can't complete it, nor its agent answer it. Nothing
+    /// is resubmitted. An open grant ends with an expired task. Writes only
+    /// what is due; returns how many settled.
     pub fn settle_overdue(
         &self,
         now: u64,
-        mut revoked: impl FnMut(&str, u64, Option<u64>) -> Option<&'static str>,
+        mut lost: impl FnMut(&Accepted) -> Option<&'static str>,
     ) -> Result<usize> {
         let mut due = Vec::new();
         {
             let mut q = self.db.prepare(
                 "SELECT id,json_extract(record,'$.task.expires_at'),
                 json_extract(record,'$.principal'),json_extract(record,'$.control_gen'),
-                json_extract(record,'$.authorization_expires_at')
+                json_extract(record,'$.authorization_expires_at'),
+                json_extract(record,'$.route_id'),json_extract(record,'$.route_revision'),
+                json_extract(record,'$.profile_id'),json_extract(record,'$.profile_revision'),
+                json_extract(record,'$.project')
                 FROM work WHERE state IN ('awaiting_result','outcome_unknown') ORDER BY rowid",
             )?;
             let rows = q.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, u64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, u64>(3)?,
-                    r.get::<_, Option<u64>>(4)?,
+                    Accepted {
+                        principal: r.get(2)?,
+                        control_gen: r.get(3)?,
+                        authorization_expires_at: r.get(4)?,
+                        route_id: r.get(5)?,
+                        route_revision: r.get(6)?,
+                        profile_id: r.get(7)?,
+                        profile_revision: r.get(8)?,
+                        project: r.get(9)?,
+                    },
                 ))
             })?;
             for row in rows {
-                let (id, deadline, principal, control_gen, expires) = row?;
+                let (id, deadline, accepted) = row?;
                 if now >= deadline {
                     due.push((id, None));
-                } else if let Some(why) = revoked(&principal, control_gen, expires) {
+                } else if let Some(why) = lost(&accepted) {
                     due.push((id, Some(why)));
                 }
             }
@@ -1555,9 +1595,9 @@ mod tests {
             }
             ids.push(r.task.task_id);
         }
-        assert_eq!(store.settle_overdue(999, |_, _, _| None).unwrap(), 0);
+        assert_eq!(store.settle_overdue(999, |_| None).unwrap(), 0);
         assert_eq!(
-            store.settle_overdue(1_000, |_, _, _| None).unwrap(),
+            store.settle_overdue(1_000, |_| None).unwrap(),
             MAX_QUEUED - 1
         );
         for (n, id) in ids.iter().enumerate() {
@@ -1588,8 +1628,8 @@ mod tests {
         assert_eq!(grant(&ids[3]), "ended");
         assert!(store.enqueue(&task()).unwrap());
         // Nothing more is due: nothing is written.
-        assert_eq!(store.settle_overdue(1_999, |_, _, _| None).unwrap(), 0);
-        assert_eq!(store.settle_overdue(2_000, |_, _, _| None).unwrap(), 1);
+        assert_eq!(store.settle_overdue(1_999, |_| None).unwrap(), 0);
+        assert_eq!(store.settle_overdue(2_000, |_| None).unwrap(), 1);
     }
 
     /// A task whose outcome is unknown (a restart in its turn, a launch of
@@ -1614,9 +1654,9 @@ mod tests {
                 [&r.task.task_id],
             )
             .unwrap();
-        assert_eq!(store.settle_overdue(999, |_, _, _| None).unwrap(), 0);
+        assert_eq!(store.settle_overdue(999, |_| None).unwrap(), 0);
         assert_eq!(store.active_tasks().unwrap().len(), 1);
-        assert_eq!(store.settle_overdue(1_000, |_, _, _| None).unwrap(), 1);
+        assert_eq!(store.settle_overdue(1_000, |_| None).unwrap(), 1);
         let expired = store.work(&r.task.task_id).unwrap().unwrap();
         assert_eq!(
             (expired.status.state, expired.status.detail.as_str()),
@@ -1666,14 +1706,14 @@ mod tests {
         }
         let mut asked = Vec::new();
         let settled = store
-            .settle_overdue(99, |principal, control_gen, expires| {
-                asked.push((principal.to_string(), control_gen, expires));
-                (principal == "service:gone").then_some("gone")
+            .settle_overdue(99, |accepted| {
+                asked.push(accepted.clone());
+                (accepted.principal == "service:gone").then_some("gone")
             })
             .unwrap();
         assert_eq!(settled, 2);
         assert_eq!(asked.len(), 3);
-        assert!(asked.iter().all(|(_, g, e)| *g == 1 && e.is_none()));
+        assert_eq!(asked[2], store.work(&ids[2]).unwrap().unwrap().accepted());
         for (n, id) in ids.iter().enumerate() {
             let r = store.work(id).unwrap().unwrap();
             let grant: String = store

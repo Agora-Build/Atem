@@ -1,7 +1,8 @@
 //! Same-runtime collaboration, using the host's ordinary receipt scheduler.
 use super::*;
 use crate::runtime::collab::results::{
-    self, Binding, Origin, OriginRoute, Reply, ReplyState, ResultRow, ReturnGrant, Submission,
+    self, Binding, EarlyEnd, Origin, OriginRoute, Reply, ReplyState, ResultRow, ReturnGrant,
+    Submission,
 };
 use crate::runtime::collab::{self, Candidate, DirectoryRow, MessageView, SendRequest};
 use crate::runtime::collab_context::{self, ContextSpec, VaultRef};
@@ -22,6 +23,17 @@ pub(super) const IN_TURN: &str = "in the agent's turn";
 /// never delivered, and the owner may complete it; it expires at its
 /// deadline otherwise.
 pub(super) const SENDER_GONE: &str = "sender gone; reply kept, not delivered";
+
+/// The same, its sending session still running but its route no longer
+/// taking the result: that session may complete it too.
+pub(super) const SENDER_ROUTE_CHANGED: &str = "sender's route changed; reply kept, not delivered";
+
+/// The silent-turn report: the turn ended and no reply came within the
+/// result timeout.
+const SILENT: &str = "turn ended without a reply";
+
+/// The silent-turn report of a turn that ended interrupted: both facts.
+const SILENT_INTERRUPTED: &str = "turn interrupted without a reply";
 
 /// A task whose target route or profile approval changed since it was
 /// accepted: it can never be dispatched, or its result delivered, under it.
@@ -670,11 +682,12 @@ impl HostBridge {
     /// Each return grant still open or consumed (spec section 10). One that
     /// is no longer live ends, and nothing is delivered under it any more
     /// (a delivery still queued is cancelled). An early end (its sender's
-    /// process ended, the sender's route or the task's route changed) ends
-    /// only the grant: the task goes on through the queue and its agent may
+    /// process ended, the sender's route changed) ends only the grant, its
+    /// reason recorded: the task goes on through the queue and its agent may
     /// still reply, stored and readable, never delivered
-    /// (`collab_sender_gone`). The sender's lost authority fails the task
-    /// (`work_revoked`). A grant that ran out ends with its task, which
+    /// (`collab_early_end`). The sender's lost authority, or a change of the
+    /// task's own route, fails the task (`work_lost`, in `schedule_work`). A
+    /// grant that ran out ends with its task, which
     /// expires at its deadline (`Store::settle_overdue`). An open, live grant
     /// permits the one delivery of a submitted reply (where the origin route
     /// opts in), or a report on a silent turn. A grant is written only when
@@ -703,8 +716,8 @@ impl HostBridge {
             if state == "ended" {
                 // Ended before its deadline, and now awaiting a result (or of
                 // unknown outcome).
-                if now < grant.expires_at {
-                    self.collab_sender_gone(&mut task)?;
+                if now < grant.expires_at && self.collab_early_end(&mut task)? {
+                    store.save_work(&task)?;
                 }
                 continue;
             }
@@ -728,15 +741,19 @@ impl HostBridge {
                     self.work_route_allowed(&task, &Sender::Local),
                 );
             if !live {
+                let ended = ReturnGrant {
+                    ended: self.collab_origin_end(&grant.origin, sessions),
+                    ..grant.clone()
+                };
                 let tx = store.db.unchecked_transaction()?;
                 tx.execute(
-                    "UPDATE return_grants SET state='ended'
+                    "UPDATE return_grants SET state='ended',record=?2
                     WHERE task_id=?1 AND state IN ('open','consumed')",
-                    [&grant.task_id],
+                    rusqlite::params![grant.task_id, serde_json::to_string(&ended)?],
                 )?;
                 self.collab_undelivered(&task.task.task_id)?;
-                if now < grant.expires_at {
-                    self.collab_sender_gone(&mut task)?;
+                if now < grant.expires_at && self.collab_early_end(&mut task)? {
+                    store.save_work(&task)?;
                 }
                 tx.commit()?;
                 continue;
@@ -772,11 +789,18 @@ impl HostBridge {
                 }
                 None => continue,
             };
+            // A turn that ended interrupted keeps saying so.
             if task.status.state == WorkState::AwaitingResult
                 && now >= since.saturating_add(self.work.config.collab.result_timeout_ms())
-                && !task.status.detail.starts_with("turn ended without a reply")
+                && !task.status.detail.starts_with(SILENT)
+                && !task.status.detail.starts_with(SILENT_INTERRUPTED)
             {
-                task.status.detail = "turn ended without a reply".into();
+                task.status.detail = if self.work_interrupted(&task) {
+                    SILENT_INTERRUPTED
+                } else {
+                    SILENT
+                }
+                .into();
                 if self.work.config.route(&task.route_id).is_some_and(|r| {
                     r.auto_report == crate::runtime::host_work::AutoReport::FinalMessage
                 }) && let Some(session) =
@@ -820,42 +844,47 @@ impl HostBridge {
         Ok(())
     }
 
-    /// A task awaiting its result (or of unknown outcome) whose return grant
-    /// ended early (spec section 10, "Ending early"). Its sender leaving is
-    /// no cancellation: the task stays as it is ("sender gone; reply kept,
-    /// not delivered"), takes a reply, kept and never delivered, and the
-    /// owner may complete it; it expires at its deadline. A sender whose
-    /// authority is gone fails it (`work_revoked`), and so does a change of
-    /// the task's own route or profile approval once it awaits its result
-    /// ("route changed"). Written only when it changes.
-    fn collab_sender_gone(&self, task: &mut WorkRecord) -> Result<()> {
-        let awaiting = task.status.state == WorkState::AwaitingResult;
-        if !awaiting && task.status.state != WorkState::OutcomeUnknown {
-            return Ok(());
+    /// Why `origin` no longer takes the result of a task it sent, recorded
+    /// when its return grant ends early: its session is gone (ended, or its
+    /// process replaced), or it runs but its route no longer takes results.
+    /// None while it takes them, and when `local`'s authority changed (the
+    /// task then fails, `work_lost`).
+    fn collab_origin_end(
+        &self,
+        origin: &Origin,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> Option<EarlyEnd> {
+        if self.collab_origin_live(origin, sessions)
+            || self.host.control_gen("local") != origin.control_gen
+        {
+            return None;
         }
-        let (state, detail) = if let Some(lost) = self.work_revoked(task) {
-            (WorkState::Failed, lost)
-        } else if self.work_route_changed(task) {
-            if !awaiting {
-                return Ok(());
-            }
-            (WorkState::Failed, ROUTE_CHANGED)
+        let runs = SessionId::parse(&origin.target.session_id)
+            .and_then(|s| sessions.get(&s))
+            .is_some_and(|s| s.is_live() && s.process_gen == origin.target.process_gen);
+        Some(if runs {
+            EarlyEnd::SenderRouteChanged
         } else {
-            (task.status.state, SENDER_GONE)
-        };
-        if (task.status.state, task.status.detail.as_str()) != (state, detail) {
-            task.status.state = state;
-            task.status.detail = detail.into();
-            self.work.store.as_ref().unwrap().save_work(task)?;
-        }
-        Ok(())
+            EarlyEnd::SenderGone
+        })
     }
 
-    /// A local task's return grant ended before its deadline while its own
-    /// route stands: its sender left (`collab_sender_gone`).
-    pub(super) fn collab_sender_left(&self, task: &WorkRecord) -> bool {
+    /// A local task awaiting its result (or of unknown outcome) whose return
+    /// grant ended early says why (spec section 10, "Ending early"; the
+    /// reason recorded when the grant ended): its sender gone, or its
+    /// sender's route changed. Neither is a cancellation: the task stays as
+    /// it is, takes a reply, kept and never delivered, and the owner (or the
+    /// sending session, while it runs) may complete it; it expires at its
+    /// deadline. Whether its detail changed.
+    pub(super) fn collab_early_end(&self, task: &mut WorkRecord) -> Result<bool> {
+        if !matches!(
+            task.status.state,
+            WorkState::AwaitingResult | WorkState::OutcomeUnknown
+        ) {
+            return Ok(false);
+        }
         let Some(store) = self.work.store.as_ref() else {
-            return false;
+            return Ok(false);
         };
         let grant: Option<String> = store
             .db
@@ -864,13 +893,21 @@ impl HostBridge {
                 [&task.task.task_id],
                 |r| r.get(0),
             )
-            .optional()
-            .ok()
-            .flatten();
-        grant
-            .and_then(|g| serde_json::from_str::<ReturnGrant>(&g).ok())
-            .is_some_and(|g| host_now().wall_ms < g.expires_at)
-            && !self.work_route_changed(task)
+            .optional()?;
+        let ended = grant
+            .map(|g| serde_json::from_str::<ReturnGrant>(&g))
+            .transpose()?
+            .and_then(|g| g.ended);
+        let detail = match ended {
+            None => return Ok(false),
+            Some(EarlyEnd::SenderGone) => SENDER_GONE,
+            Some(EarlyEnd::SenderRouteChanged) => SENDER_ROUTE_CHANGED,
+        };
+        if task.status.detail == detail {
+            return Ok(false);
+        }
+        task.status.detail = detail.into();
+        Ok(true)
     }
 
     /// The return grant of `task_id` ended: a delivery of its reply still
@@ -1290,7 +1327,7 @@ impl HostBridge {
             bail!("{problem}");
         }
         let from = message.from_session.as_deref().unwrap();
-        let origin_live = self.collab_origin_live(origin, sessions);
+        let early = self.collab_origin_end(origin, sessions);
         let plan = self.collab_resolve(atem_id, message, launch, sessions)?;
         let resolved = &plan.tasks;
         let mut work = Vec::new();
@@ -1386,9 +1423,10 @@ impl HostBridge {
                             origin: origin.clone(),
                             recipient: task.task.target.clone(),
                             expires_at: message.expires_at,
+                            ended: early,
                         },
                     )?;
-                    if !origin_live {
+                    if early.is_some() {
                         tx.execute(
                             "UPDATE return_grants SET state='ended' WHERE task_id=?1",
                             [&task.task.task_id],
@@ -1466,7 +1504,7 @@ impl HostBridge {
             // under an authority `local` no longer has.
             if self.host.control_gen("local") != publication.origin.control_gen {
                 self.work.context_jobs.remove(&id);
-                collab::publication_state(store, &id, "refused", AUTHORITY_REVOKED, 0)?;
+                collab::publication_state(store, &id, "refused", AUTHORITY_CHANGED, 0)?;
                 continue;
             }
             if let Some(job) = self.work.context_jobs.get_mut(&id) {

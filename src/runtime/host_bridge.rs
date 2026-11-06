@@ -637,10 +637,14 @@ impl HostBridge {
         // the first control write on (the device list's start fences below
         // may be one): a task compares its sender's control generation with
         // the one it was accepted under. Each scheduling pass renews the set.
-        host.keep_principals(
-            crate::runtime::host_work::Store::named_principals_at(dir.parent().unwrap_or(dir))
-                .unwrap_or_default(),
-        );
+        match crate::runtime::host_work::Store::named_principals_at(dir.parent().unwrap_or(dir)) {
+            Ok(named) => host.keep_principals(named),
+            // The store won't open for hosting either: nothing of it
+            // dispatches until it does.
+            Err(error) => eprintln!(
+                "atem runtime: agent hosting records can't be read ({error:#}); the principals their tasks name are kept once hosting runs"
+            ),
+        }
         // r9 §R9.3: the device list is opened before any remote admission
         // and before recovered work is resolved; its start fences go
         // through the host's §H fence now (only durable generations: no

@@ -36,6 +36,9 @@ struct Rig {
     /// Debug-build broker faults (`ATEM_TEST_PTY_FAULTS`, the `faults`
     /// directory); set before `start`.
     faults_hook: bool,
+    /// Debug-build project-hash table in place of the cred agent
+    /// (`ATEM_TEST_PROJECT_HASHES`); set before `start`.
+    projects: Option<PathBuf>,
 }
 
 impl Rig {
@@ -136,6 +139,7 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
             fake,
             context_hook: false,
             faults_hook: false,
+            projects: None,
         }
     }
 
@@ -156,6 +160,9 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
         if self.faults_hook {
             std::fs::create_dir_all(self.faults()).unwrap();
             command.env("ATEM_TEST_PTY_FAULTS", self.faults());
+        }
+        if let Some(projects) = &self.projects {
+            command.env("ATEM_TEST_PROJECT_HASHES", projects);
         }
         self.runtime = Some(
             command
@@ -1628,7 +1635,7 @@ fn narrower_service_scopes_cannot_create_sessions_outside_their_scope() {
 }
 
 /// A service narrowed while its task waits loses its authority over the
-/// task: it fails ("sender's authority revoked") and a later grant doesn't
+/// task: it fails ("sender's authority changed") and a later grant doesn't
 /// revive it (its sender can't read it either).
 #[test]
 fn pending_work_fails_once_a_service_is_narrowed_and_stays_failed_after_a_regrant() {
@@ -1657,7 +1664,7 @@ fn pending_work_fails_once_a_service_is_narrowed_and_stays_failed_after_a_regran
         .log
         .narrow_service("svc-work", &ServiceScope::new([HOST]).ops(["view"]), None);
     owner.carry(&mut r, narrow);
-    wait_stored(&rig, &t["task_id"], "failed", "sender's authority revoked");
+    wait_stored(&rig, &t["task_id"], "failed", "sender's authority changed");
     let grant = rig.log.set_service(
         "svc-work",
         &ServiceScope::new([HOST]).ops(["launch", "notify", "prompt", "view"]),
@@ -1982,7 +1989,7 @@ fn message_work_waits_for_drafts_and_fails_once_its_senders_authority_changes() 
     within("message work failed, not revived by the regrant", || {
         let status = message_status(&mut service, &mut r, &message);
         status["recipients"][0]["delivery"]["work"]["state"] == "failed"
-            && status["recipients"][0]["delivery"]["work"]["detail"] == "sender's authority revoked"
+            && status["recipients"][0]["delivery"]["work"]["detail"] == "sender's authority changed"
     });
     assert_eq!(service.request(&mut r,
         json!({"op":"work_query","host":host(),"task_id":message["recipients"][0]["recipient_id"]}))["code"], "forbidden");
@@ -1995,7 +2002,7 @@ fn message_work_waits_for_drafts_and_fails_once_its_senders_authority_changes() 
 }
 
 /// A service narrowed while its task is queued behind another turn: the
-/// task fails at once ("sender's authority revoked"), holding no place, and
+/// task fails at once ("sender's authority changed"), holding no place, and
 /// the session's next task is dispatched when that turn ends.
 #[test]
 fn a_service_narrowed_while_its_task_is_queued_frees_the_session() {
@@ -2022,7 +2029,7 @@ fn a_service_narrowed_while_its_task_is_queued_frees_the_session() {
         &rig,
         &queued["task_id"],
         "failed",
-        "sender's authority revoked",
+        "sender's authority changed",
     );
     std::fs::write(rig.fake.join("complete"), "").unwrap();
     wait_state(&mut owner, &mut r, &first["task_id"], "awaiting_result");
@@ -2040,14 +2047,7 @@ fn a_service_narrowed_while_its_task_is_queued_frees_the_session() {
 /// authorization expired"), and renewing the grant doesn't revive it.
 #[test]
 fn a_task_whose_senders_grant_expired_offline_stays_failed_after_a_renewal() {
-    let expires = r9log::host_now().wall_ms + 12_000;
-    let mut rig = Rig::configured("claude", |log| {
-        log.enroll_service(
-            "svc-restricted",
-            &ServiceScope::new([HOST]).ops(["notify", "prompt", "view"]),
-            expires,
-        );
-    });
+    let mut rig = Rig::new("claude");
     let mut r = Router::new(&rig.astation);
     let mut owner = Dev::new(&mut r, &rig.log, MAC, false);
     let rid = uuid();
@@ -2058,7 +2058,15 @@ fn a_task_whose_senders_grant_expired_offline_stays_failed_after_a_renewal() {
     within("the owner's prompt", || {
         input(&rig).contains("the owner's long turn")
     });
-    let mut service = Dev::new(&mut r, &rig.log, "svc-restricted", true);
+    // Everything set up: the service's grant now runs out in 3 s.
+    let expires = r9log::host_now().wall_ms + 3_000;
+    let short = rig.log.set_service(
+        "svc-work",
+        &ServiceScope::new([HOST]).ops(["launch", "message", "notify", "prompt", "view"]),
+        expires,
+    );
+    owner.carry(&mut r, short);
+    let mut service = Dev::new(&mut r, &rig.log, "svc-work", true);
     let queued = task(&launch, "queued by a short grant");
     assert_eq!(
         enqueue(&mut service, &mut r, &queued)["result"]["work"]["state"],
@@ -2078,9 +2086,9 @@ fn a_task_whose_senders_grant_expired_offline_stays_failed_after_a_renewal() {
     );
     let renewal = rig
         .log
-        .renew_service("svc-restricted", r9log::host_now().wall_ms + 3_600_000);
+        .renew_service("svc-work", r9log::host_now().wall_ms + 3_600_000);
     owner.carry(&mut r, renewal);
-    let mut service = Dev::new(&mut r, &rig.log, "svc-restricted", true);
+    let mut service = Dev::new(&mut r, &rig.log, "svc-work", true);
     let response = service.request(
         &mut r,
         json!({"op":"work_query","host":host(),"task_id":queued["task_id"]}),
@@ -2130,10 +2138,10 @@ fn a_remote_task_whose_route_changed_fails_and_frees_its_session() {
         &text.replace(route, "[[routes]]\nid = \"backend\"\nrevision = 2"),
     );
     wait_stored(&rig, &queued["task_id"], "failed", "route changed");
+    // The turn in its way runs to its end; then that task can't await a
+    // result under the old revision either.
     std::fs::write(rig.fake.join("complete"), "").unwrap();
-    within("the first turn's end", || {
-        stored(&rig, &first["task_id"])["state"] == "awaiting_result"
-    });
+    wait_stored(&rig, &first["task_id"], "failed", "route changed");
     release_lease(&mut dev, &mut r, &launch);
     let next = task(&launch, "under revision two");
     let accepted = dev.request(
@@ -2148,35 +2156,196 @@ fn a_remote_task_whose_route_changed_fails_and_frees_its_session() {
     assert!(!input(&rig).contains("queued under revision one"));
 }
 
-/// A remote launch that has not started when a pause begins (here
-/// `runtime.toml` stops loading) waits for it to end, then starts: a pause
-/// is no fence.
+/// `sender`'s launch, held (`hold_launches`) while `runtime.toml` becomes
+/// `paused`, then released while the pause lasts (nothing starts), and the
+/// file then becomes `resumed`: the launch's state once it was decided (as
+/// stored: its sender can't read a launch whose profile changed).
+fn launch_through_a_pause(
+    rig: &Rig,
+    r: &mut Router,
+    sender: &str,
+    paused: &str,
+    resumed: &str,
+) -> String {
+    let held = rig.faults().join("hold_launches");
+    private(&held, "");
+    let mut dev = Dev::new(r, &rig.log, sender, true);
+    // In scope (a `projects` scope once its hashes are known).
+    within("the profile in scope", || {
+        dev.request(r, json!({"op":"host_profiles","host":host()}))["result"]["profiles"]
+            .as_array()
+            .is_some_and(|p| !p.is_empty())
+    });
+    let started = rig.sandbox.records().len();
+    let rid = uuid();
+    assert_eq!(dev.launch(r, &rid)["result"]["launch"]["state"], "starting");
+    private(&rig.sandbox.config().join("runtime.toml"), paused);
+    within("the pause", || {
+        dev.request(r, json!({"op":"host_profiles","host":host()}))["code"] == "busy"
+    });
+    std::fs::remove_file(&held).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        rig.sandbox.records().len(),
+        started,
+        "nothing started in the pause"
+    );
+    private(&rig.sandbox.config().join("runtime.toml"), resumed);
+    let state = || {
+        let db = rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite"))
+            .unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        let record: String = db
+            .query_row("SELECT record FROM launches WHERE id=?1", [&rid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        serde_json::from_str::<Value>(&record).unwrap()["status"]["state"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    within("the launch decided", || state() != "starting");
+    state()
+}
+
+fn hooked_rig(configure: impl FnOnce(&mut TestLog)) -> (Rig, String) {
+    let mut rig = Rig::prepared("claude", configure);
+    rig.faults_hook = true;
+    let good = std::fs::read_to_string(rig.sandbox.config().join("runtime.toml")).unwrap();
+    (rig, good)
+}
+
+/// A remote launch that has not started when a pause begins (an invalid
+/// `runtime.toml`, hosting switched off) waits for it to end, then starts:
+/// a pause is no fence.
 #[test]
 #[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook")]
 fn a_remote_launch_waits_out_a_pause() {
-    let mut rig = Rig::prepared("claude", |_| {});
-    rig.faults_hook = true;
+    let (mut rig, good) = hooked_rig(|_| {});
     rig.start();
-    let held = rig.faults().join("hold_launches");
-    private(&held, "");
+    let mut r = Router::new(&rig.astation);
+    let invalid = good.replace("project = \"local:home\"\n", "");
+    let state = launch_through_a_pause(&rig, &mut r, "svc-work", &invalid, &good);
+    assert_eq!(state, "started");
+    let off = good.replace("enabled = true", "enabled = false");
+    let state = launch_through_a_pause(&rig, &mut r, "svc-work", &off, &good);
+    assert_eq!(state, "started");
+}
+
+/// The approval is compared when the pause ends: a launch whose profile
+/// changed meanwhile never starts.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook")]
+fn a_remote_launch_whose_profile_changed_in_a_pause_never_starts() {
+    let (mut rig, good) = hooked_rig(|_| {});
+    rig.start();
+    let invalid = good.replace("project = \"local:home\"\n", "");
+    let profile = "[[profiles]]\nid = \"backend\"\nrevision = 1";
+    assert!(good.contains(profile));
+    let changed = good.replace(profile, "[[profiles]]\nid = \"backend\"\nrevision = 2");
+    let mut r = Router::new(&rig.astation);
+    let state = launch_through_a_pause(&rig, &mut r, "svc-work", &invalid, &changed);
+    assert_ne!(state, "started");
+    assert!(rig.sandbox.records().is_empty());
+}
+
+/// A sender whose grant is scoped to projects (keyed hashes, here from the
+/// debug table) keeps its in-scope profile through an invalid
+/// `runtime.toml`: its launch, held through the pause, starts when it ends.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_PTY_FAULTS and ATEM_TEST_PROJECT_HASHES hooks")]
+fn a_project_scoped_launch_waits_out_an_invalid_runtime_toml() {
+    let hash = atem_client::project::project_hash_from_mac("aaaa0001", &[7; 32]).unwrap();
+    let scope = ServiceScope::new([HOST])
+        .ops(["launch", "view"])
+        .projects(Some([hash.clone()]));
+    let (mut rig, good) = hooked_rig(|log| {
+        log.enroll_service(
+            "svc-restricted",
+            &scope,
+            r9log::host_now().wall_ms + 3_600_000,
+        );
+    });
+    let table = rig.sandbox.dir.path().join("projects.json");
+    private(
+        &table,
+        &json!({"local:home": {"aaaa0001": hash}}).to_string(),
+    );
+    rig.projects = Some(table);
+    rig.start();
+    let invalid = good.replace("project = \"local:home\"\n", "");
+    let mut r = Router::new(&rig.astation);
+    let state = launch_through_a_pause(&rig, &mut r, "svc-restricted", &invalid, &good);
+    assert_eq!(state, "started");
+}
+
+/// A remote sender's task queued behind another turn whose route no longer
+/// names it (the revision unchanged) fails at once ("route changed"), and
+/// the session's next task is dispatched when that turn ends.
+#[test]
+fn a_remote_task_whose_route_dropped_its_sender_fails_and_frees_its_session() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut owner = Dev::new(&mut r, &rig.log, MAC, false);
+    let rid = uuid();
+    owner.launch(&mut r, &rid);
+    let launch = owner.launched(&mut r, &rid);
+    let first = task(&launch, "the owner's turn");
+    enqueue(&mut owner, &mut r, &first);
+    within("the owner's prompt", || {
+        input(&rig).contains("the owner's turn")
+    });
+    let mut service = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let queued = task(&launch, "queued before the route dropped it");
+    enqueue(&mut service, &mut r, &queued);
+    wait_detail(&mut service, &mut r, &queued["task_id"], "earlier task");
+    // The owner takes the service off the route (the profile still names
+    // it; the revision stays).
+    let path = rig.sandbox.config().join("runtime.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (profiles, routes) = text.split_once("[[routes]]").unwrap();
+    let listed = "\"service:svc-work\", ";
+    assert!(routes.contains(listed));
+    private(
+        &path,
+        &format!("{profiles}[[routes]]{}", routes.replace(listed, "")),
+    );
+    wait_stored(&rig, &queued["task_id"], "failed", "route changed");
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    wait_state(&mut owner, &mut r, &first["task_id"], "awaiting_result");
+    release_lease(&mut owner, &mut r, &launch);
+    let next = task(&launch, "the owner's next task");
+    enqueue(&mut owner, &mut r, &next);
+    within("the next prompt", || {
+        input(&rig).contains("the owner's next task")
+    });
+    assert!(!input(&rig).contains("queued before the route dropped it"));
+}
+
+/// A remote sender's task awaiting its result whose route changed fails
+/// ("route changed"), as a local one does: it can't be completed under the
+/// old approval.
+#[test]
+fn a_remote_task_awaiting_its_result_fails_when_its_route_changes() {
+    let rig = Rig::new("claude");
     let mut r = Router::new(&rig.astation);
     let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
     let rid = uuid();
-    assert_eq!(
-        dev.launch(&mut r, &rid)["result"]["launch"]["state"],
-        "starting"
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let t = task(&launch, "awaits its result");
+    enqueue(&mut dev, &mut r, &t);
+    within("the prompt", || input(&rig).contains("awaits its result"));
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    wait_state(&mut dev, &mut r, &t["task_id"], "awaiting_result");
+    let path = rig.sandbox.config().join("runtime.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let route = "[[routes]]\nid = \"backend\"\nrevision = 1";
+    assert!(text.contains(route));
+    private(
+        &path,
+        &text.replace(route, "[[routes]]\nid = \"backend\"\nrevision = 2"),
     );
-    let good = break_config(&rig);
-    within("the pause", || {
-        runtime_log(&rig).contains("missing field `project`")
-    });
-    // Released while the pause lasts: still not started.
-    std::fs::remove_file(&held).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        rig.sandbox.records().is_empty(),
-        "nothing started in the pause"
-    );
-    private(&rig.sandbox.config().join("runtime.toml"), &good);
-    assert_eq!(dev.launched(&mut r, &rid)["state"], "started");
+    wait_stored(&rig, &t["task_id"], "failed", "route changed");
 }

@@ -1,6 +1,6 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
-use crate::runtime::host_work::{Config, LaunchRecord, Profile, Store, WorkRecord};
+use crate::runtime::host_work::{Accepted, Config, LaunchRecord, Profile, Store, WorkRecord};
 use crate::session_protocol::r9::ProjectScope;
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::{
@@ -17,11 +17,11 @@ const MAX_PAUSE_DETAIL: usize = 240;
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
 
 /// A task whose sender's authority changed since it was accepted: its
-/// principal's control generation moved on (a fence: a removal, a
-/// narrowing or renewal, a revoked grant, a device-list freeze or fault,
-/// `local` losing the host's authority). Nothing of it goes on under the
-/// new authority, and no later grant revives it.
-const AUTHORITY_REVOKED: &str = "sender's authority revoked";
+/// principal's control generation moved on (a fence: a removal, any change
+/// of a service's grant, a renewal too, a revoked grant, a device-list
+/// freeze or fault, `local` losing the host's authority). Nothing of it
+/// goes on under the new authority, and no later grant revives it.
+const AUTHORITY_CHANGED: &str = "sender's authority changed";
 
 /// A task whose sender's authorization (a service or browser grant) expired
 /// since it was accepted: a renewal or a new grant never revives it.
@@ -31,8 +31,8 @@ const AUTHORIZATION_EXPIRED: &str = "sender's authorization expired";
 /// (evicted or lost): its outcome can't be known any more.
 const RECEIPT_GONE: &str = "receipt no longer available";
 
-/// A task whose turn ended interrupted (its receipt completed with the
-/// outcome `interrupted`): it awaits its result like any other.
+/// A task whose turn ended interrupted (its prompt receipt completed with
+/// the outcome `interrupted`): it awaits its result like any other.
 const TURN_INTERRUPTED: &str = "turn interrupted";
 
 #[path = "collab_bridge.rs"]
@@ -106,6 +106,9 @@ pub(super) struct State {
     error: bool,
     /// Why `runtime.toml` didn't load: hosting is off until it does.
     config_problem: Option<String>,
+    /// The project scopes (`Profile::scope_key`) of the profiles of the
+    /// last `runtime.toml` that loaded.
+    scoped: HashSet<String>,
     refresh: Instant,
     scheduled: Instant,
     recovered: bool,
@@ -131,6 +134,7 @@ impl State {
             store: None,
             error: false,
             config_problem: None,
+            scoped: HashSet::new(),
             refresh: Instant::now(),
             scheduled: Instant::now(),
             recovered: false,
@@ -282,6 +286,16 @@ impl HostBridge {
                         "atem runtime: runtime.toml is valid again; agent hosting follows it"
                     );
                 }
+                // Only a file that loads drops the project scopes of the
+                // profiles it no longer names: their hashes stay through an
+                // invalid file's pause, so what waited out the pause is
+                // compared with them at once when it ends.
+                let retained: HashSet<String> =
+                    config.profiles.iter().map(Profile::scope_key).collect();
+                for key in self.work.scoped.difference(&retained) {
+                    self.projects.forget(key);
+                }
+                self.work.scoped = retained;
                 config
             }
             Err(error) => {
@@ -295,12 +309,6 @@ impl HostBridge {
                 Config::default()
             }
         };
-        let retained: HashSet<String> = config.profiles.iter().map(Profile::scope_key).collect();
-        for profile in &self.work.config.profiles {
-            if !retained.contains(&profile.scope_key()) {
-                self.projects.forget(&profile.scope_key());
-            }
-        }
         self.work.config = config;
         if self.work.config.enabled && self.work.store.is_none() && !self.work.error {
             match Store::open(self.dir.parent().unwrap_or(&self.dir)) {
@@ -431,7 +439,7 @@ impl HostBridge {
                 let store = self.work.store.as_ref().unwrap();
                 for mut record in store.tasks()? {
                     if record.status.state == WorkState::OutcomeUnknown {
-                        self.reconcile_work(&mut record);
+                        self.reconcile_work(&mut record)?;
                         store.save_work(&record)?;
                     }
                 }
@@ -787,7 +795,7 @@ impl HostBridge {
                     return Err("forbidden");
                 }
                 if r.status.state == WorkState::OutcomeUnknown {
-                    self.reconcile_work(&mut r);
+                    self.reconcile_work(&mut r).map_err(|_| "busy")?;
                     store.save_work(&r).map_err(|_| "busy")?;
                 }
                 match req {
@@ -1113,20 +1121,21 @@ impl HostBridge {
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
         let now = host_now().wall_ms;
         // Awaiting a result, or of unknown outcome: past the deadline,
-        // expired; under a sender's authority that is gone, failed. Either
-        // frees an unknown outcome's session queue.
+        // expired; under a sender's authority, a route or a profile approval
+        // that is gone, failed. Either frees an unknown outcome's session
+        // queue.
         let mut named = HashSet::new();
-        let host = &self.host;
-        self.work.store.as_ref().unwrap().settle_overdue(
-            now,
-            |principal, control_gen, expires| {
-                let lost = authority_lost(host, principal, control_gen, expires, now);
+        self.work
+            .store
+            .as_ref()
+            .unwrap()
+            .settle_overdue(now, |accepted| {
+                let lost = self.work_lost(accepted, now);
                 if lost.is_none() {
-                    named.insert(principal.to_string());
+                    named.insert(accepted.principal.clone());
                 }
                 lost
-            },
-        )?;
+            })?;
         let tasks = self.work.store.as_ref().unwrap().active_tasks()?;
         named.extend(tasks.iter().map(|r| r.principal.clone()));
         // Their control states stay known while a task names them.
@@ -1146,16 +1155,17 @@ impl HostBridge {
                 if r.turn_id.is_none() {
                     r.turn_id = self.collab_task_turn(&r, cx.sessions);
                 }
-                self.reconcile_work(&mut r);
+                self.reconcile_work(&mut r)?;
                 // A turn that ended (or an outcome no longer known) under a
-                // sender's authority that is gone: the task fails. A turn
-                // that runs is left to its end, never interrupted.
+                // sender's authority, a route or a profile approval that is
+                // gone: the task fails. A turn that runs is left to its end,
+                // never interrupted.
                 if matches!(
                     r.status.state,
                     WorkState::AwaitingResult | WorkState::OutcomeUnknown
-                ) && let Some(lost) = self.work_revoked(&r)
+                ) && let Some(lost) = self.work_lost(&r.accepted(), now)
                 {
-                    self.work_fail_revoked(&mut r, lost)?;
+                    self.work_fail_lost(&mut r, lost)?;
                     continue;
                 }
                 if (&r.status, &r.turn_id) != (&before.0, &before.1) {
@@ -1182,14 +1192,8 @@ impl HostBridge {
             // is gone, nor under a route or profile approval that changed:
             // it fails at once, before it takes its session's place, rather
             // than hold the session's queue until it expires.
-            if let Some(lost) = self.work_revoked(&r) {
-                self.work_fail_revoked(&mut r, lost)?;
-                continue;
-            }
-            if self.work_route_changed(&r) {
-                r.status.state = WorkState::Failed;
-                r.status.detail = collab_bridge::ROUTE_CHANGED.into();
-                self.work.store.as_ref().unwrap().save_work(&r)?;
+            if let Some(lost) = self.work_lost(&r.accepted(), now) {
+                self.work_fail_lost(&mut r, lost)?;
                 continue;
             }
             if self.collab_wait_for_launch(&mut r)? {
@@ -1322,7 +1326,7 @@ impl HostBridge {
         Ok(())
     }
 
-    fn reconcile_work(&self, r: &mut WorkRecord) {
+    fn reconcile_work(&self, r: &mut WorkRecord) -> anyhow::Result<()> {
         use crate::session_protocol::wire::ReceiptState;
         let Some(receipt) = self.host.receipt(&r.status.receipt_id) else {
             // Submitted, and its receipt gone (evicted or lost): what became
@@ -1331,7 +1335,7 @@ impl HostBridge {
                 r.status.state = WorkState::OutcomeUnknown;
                 r.status.detail = RECEIPT_GONE.into();
             }
-            return;
+            return Ok(());
         };
         r.status.state = match receipt.state {
             ReceiptState::Accepted | ReceiptState::Executing => WorkState::Submitted,
@@ -1345,21 +1349,17 @@ impl HostBridge {
             r.status.state = WorkState::Completed;
             r.status.result = Some(result.snapshot());
             r.status.detail = "explicit result delivered to the originating agent".into();
-            return;
+            return Ok(());
         }
         // A rejected receipt says why (`control revoked`, `host trust
         // changed`, `session closed`, …).
         if let (ReceiptState::Rejected, Some(detail)) = (receipt.state, &receipt.detail) {
             r.status.detail = detail.clone();
-            return;
+            return Ok(());
         }
         r.status.detail = if r.status.state == WorkState::Submitted && r.turn_id.is_some() {
             collab_bridge::IN_TURN
-        } else if receipt
-            .result
-            .as_ref()
-            .is_some_and(|result| result.outcome == "interrupted")
-        {
+        } else if turn_interrupted(&receipt) {
             TURN_INTERRUPTED
         } else {
             "agent submission receipt reconciled; task completion requires an explicit result"
@@ -1368,30 +1368,55 @@ impl HostBridge {
         if let Some(reply) = self.collab_reply_of(&r.task.task_id) {
             collab_bridge::apply_reply(r, &reply);
         }
-        if matches!(
-            r.status.state,
-            WorkState::AwaitingResult | WorkState::OutcomeUnknown
-        ) && self.collab_sender_left(r)
-        {
-            r.status.detail = collab_bridge::SENDER_GONE.into();
+        self.collab_early_end(r)?;
+        Ok(())
+    }
+
+    /// The task's prompt turn ended interrupted (its receipt's journaled
+    /// outcome).
+    pub(super) fn work_interrupted(&self, r: &WorkRecord) -> bool {
+        self.host
+            .receipt(&r.status.receipt_id)
+            .is_some_and(|receipt| turn_interrupted(&receipt))
+    }
+
+    /// Why a task accepted under `a` can no longer go on at wall time
+    /// `now`, if it can't: its sender's authorization expired, its
+    /// principal's control generation moved on (a fence), or its route or
+    /// profile approval changed (`work_route_changed`). The host keeps the
+    /// control state of every principal a task names
+    /// (`SessionHost::keep_principals`), so forgetting one is no change. A
+    /// halted session journal is a pause of `local`, no change of its
+    /// authority (`local_halted`): its tasks wait for the restart.
+    pub(super) fn work_lost(&self, a: &Accepted, now: u64) -> Option<&'static str> {
+        if a.authorization_expires_at.is_some_and(|at| now >= at) {
+            return Some(AUTHORIZATION_EXPIRED);
         }
+        if (a.principal != "local" || !self.local_halted())
+            && self.host.control_gen(&a.principal) != a.control_gen
+        {
+            return Some(AUTHORITY_CHANGED);
+        }
+        self.work_route_changed(a)
+            .then_some(collab_bridge::ROUTE_CHANGED)
     }
 
-    /// Why `r`'s sender no longer has authority over it, if it doesn't
-    /// (`authority_lost`).
-    fn work_revoked(&self, r: &WorkRecord) -> Option<&'static str> {
-        authority_lost(
-            &self.host,
-            &r.principal,
-            r.control_gen,
-            r.authorization_expires_at,
-            host_now().wall_ms,
-        )
+    /// The session journal halted while the device list stays usable (not
+    /// faulted, frozen or held): `local` is fenced in memory only, until the
+    /// restart brings back its durable control state. Nothing local
+    /// dispatches meanwhile (`local_healthy`).
+    fn local_halted(&self) -> bool {
+        self.host.journal_halted()
+            && self.membership_error.is_none()
+            && self
+                .membership
+                .as_ref()
+                .is_none_or(|m| !m.is_frozen() && m.faulted().is_none() && m.held().is_none())
     }
 
-    /// `r` fails under its sender's lost authority (`work_revoked`), and its
-    /// return grant ends with it: no delivery, no completion, no reply.
-    fn work_fail_revoked(&self, r: &mut WorkRecord, lost: &'static str) -> anyhow::Result<()> {
+    /// `r` fails for the reason `work_lost` named, and its return grant ends
+    /// with it: no delivery, no completion, no reply.
+    fn work_fail_lost(&self, r: &mut WorkRecord, lost: &'static str) -> anyhow::Result<()> {
         let store = self.work.store.as_ref().unwrap();
         r.status.state = WorkState::Failed;
         r.status.detail = lost.into();
@@ -1409,38 +1434,27 @@ impl HostBridge {
     /// longer the one in `runtime.toml`: the route is gone or has another
     /// revision or profile, no longer names the task's principal, or its
     /// profile has another revision or project.
-    pub(super) fn work_route_changed(&self, task: &WorkRecord) -> bool {
-        let Some(route) = self.work.config.route(&task.route_id) else {
+    fn work_route_changed(&self, a: &Accepted) -> bool {
+        let Some(route) = self.work.config.route(&a.route_id) else {
             return true;
         };
         let Some(profile) = self.work.config.profile(&route.profile_id) else {
             return true;
         };
-        route.revision != task.route_revision
-            || !route.principals.contains(&task.principal)
-            || profile.id != task.profile_id
-            || profile.revision != task.profile_revision
-            || profile.project != task.project
+        route.revision != a.route_revision
+            || !route.principals.contains(&a.principal)
+            || profile.id != a.profile_id
+            || profile.revision != a.profile_revision
+            || profile.project != a.project
     }
 }
 
-/// Why a task of `principal`, accepted at its control generation
-/// `control_gen` under an authorization expiring at `expires` (none: it
-/// doesn't), is no longer its sender's at wall time `now`: the
-/// authorization expired, or the principal's control generation moved on
-/// (a fence). The host keeps the control state of every principal a task
-/// names (`SessionHost::keep_principals`), so forgetting one is no change.
-fn authority_lost(
-    host: &SessionHost<FileJournal>,
-    principal: &str,
-    control_gen: u64,
-    expires: Option<u64>,
-    now: u64,
-) -> Option<&'static str> {
-    if expires.is_some_and(|at| now >= at) {
-        return Some(AUTHORIZATION_EXPIRED);
-    }
-    (host.control_gen(principal) != control_gen).then_some(AUTHORITY_REVOKED)
+/// A prompt receipt completed with the outcome `interrupted` (journaled as
+/// its detail).
+fn turn_interrupted(receipt: &wire::Receipt) -> bool {
+    receipt.state == wire::ReceiptState::Completed
+        && receipt.kind == wire::ReceiptKind::Prompt
+        && receipt.detail.as_deref() == Some("interrupted")
 }
 
 fn attachment_owner(a: &Sender) -> String {
@@ -1563,8 +1577,10 @@ principals = ["local"]
             rig
         }
 
+        /// Passes until `predicate` holds; the deadline only bounds a
+        /// failure (slow CI hosts take several times longer).
         async fn until(&mut self, mut predicate: impl FnMut(&Self) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 for s in self.sessions.values_mut() {
                     s.pump();
@@ -1861,6 +1877,7 @@ principals = ["local"]
                 },
                 recipient: task.task.target.clone(),
                 expires_at: message.expires_at,
+                ended: None,
             },
         )
         .unwrap();
@@ -1940,7 +1957,8 @@ principals = ["local"]
 
     /// A queued local task whose target route or profile approval changed
     /// fails at once ("route changed") instead of holding its session's
-    /// queue until it expires; the session's next task goes on.
+    /// queue until it expires, the one in its turn once that ends; the
+    /// session's next task goes on.
     #[test]
     fn a_queued_local_task_whose_route_changed_fails_and_frees_its_session() {
         local_test(async |root| {
@@ -1959,11 +1977,13 @@ principals = ["local"]
             rig.until(|r| r.work(&queued).status.state == WorkState::Failed)
                 .await;
             assert_eq!(rig.work(&queued).status.detail, "route changed");
-            // The turn in progress is not touched.
+            // The turn in progress is not touched; once it ends, its task
+            // fails too: it can't await a result under the old route.
             assert_eq!(rig.work(&first).status.state, WorkState::Submitted);
             std::fs::write(rig.fake.join("complete"), "").unwrap();
-            rig.until(|r| r.work(&first).status.state == WorkState::AwaitingResult)
+            rig.until(|r| r.work(&first).status.state == WorkState::Failed)
                 .await;
+            assert_eq!(rig.work(&first).status.detail, "route changed");
             let mut next = rig.message();
             next.text = "UNDER_THE_NEW_REVISION".into();
             if let Destination::Agent { route_revision, .. } = &mut next.recipients[0].destination {
@@ -2098,42 +2118,74 @@ principals = ["local"]
         });
     }
 
-    /// A device-list fault fences `local` (the journal halts): its tasks
-    /// that are not in a turn fail as revoked, never "sender gone", the
-    /// one awaiting its result with its return grant ended.
+    /// Two local tasks of the rig's session: one awaiting its result under
+    /// a return grant, one blocked behind a remote controller's lease.
+    async fn awaiting_and_blocked(rig: &mut LocalRig) -> (Message, Message) {
+        let done = rig.message();
+        rig.publish(&done);
+        grant(rig, &done);
+        rig.until(|r| r.work(&done).turn_id.is_some()).await;
+        std::fs::write(rig.fake.join("complete"), "").unwrap();
+        rig.until(|r| r.work(&done).status.state == WorkState::AwaitingResult)
+            .await;
+        let att = controller(rig);
+        let queued = rig.message();
+        let target = queued.task(&queued.recipients[0]).unwrap().target;
+        let (binding, _) = rig.bridge.host.binding_for_work(&att, &target).unwrap();
+        let acquire = json!({"type":"session","data":{"v":1,"op":"acquire","id":uuid::Uuid::new_v4().to_string(),"binding":binding,"takeover":false}});
+        let effects =
+            rig.bridge
+                .host
+                .receive(&att, acquire.to_string().as_bytes(), rig.bridge.clock.now());
+        rig.bridge.exec(
+            effects,
+            &mut Cx {
+                client: &rig.app.astation_client,
+                sessions: &mut rig.sessions,
+            },
+        );
+        rig.publish(&queued);
+        rig.until(|r| r.work(&queued).status.state == WorkState::Blocked)
+            .await;
+        (done, queued)
+    }
+
+    /// A device-list write fault (§R9.3) holds the list, fences every
+    /// remote principal and `local` in memory, and halts the session
+    /// journal: `local`'s tasks that are not in a turn fail ("sender's
+    /// authority changed"), never "sender gone", the one awaiting its result
+    /// with its return grant ended.
     #[test]
-    fn a_local_fence_fails_local_tasks_as_revoked() {
+    fn a_device_list_fault_fails_local_tasks() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::membership::{HostFences, HostPin, MembershipHost};
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
-            let done = rig.message();
-            rig.publish(&done);
-            grant(&rig, &done);
-            rig.until(|r| r.work(&done).turn_id.is_some()).await;
-            std::fs::write(rig.fake.join("complete"), "").unwrap();
-            rig.until(|r| r.work(&done).status.state == WorkState::AwaitingResult)
-                .await;
-            // The next one waits for a remote controller's lease.
-            let att = controller(&mut rig);
-            let queued = rig.message();
-            let target = queued.task(&queued.recipients[0]).unwrap().target;
-            let (binding, _) = rig.bridge.host.binding_for_work(&att, &target).unwrap();
-            let acquire = json!({"type":"session","data":{"v":1,"op":"acquire","id":uuid::Uuid::new_v4().to_string(),"binding":binding,"takeover":false}});
-            let effects = rig.bridge.host.receive(
-                &att,
-                acquire.to_string().as_bytes(),
-                rig.bridge.clock.now(),
-            );
-            rig.bridge.exec(
-                effects,
-                &mut Cx {
-                    client: &rig.app.astation_client,
-                    sessions: &mut rig.sessions,
-                },
-            );
-            rig.publish(&queued);
-            rig.until(|r| r.work(&queued).status.state == WorkState::Blocked)
-                .await;
-            let effects = rig.bridge.host.membership_fault(None);
+            let (done, queued) = awaiting_and_blocked(&mut rig).await;
+            // The list as a write fault leaves it: its fault record, so it
+            // opens held.
+            let pairing = crate::paths::ProfilePaths::in_dir(root).pairing;
+            let journal = root.join("runtime/journal");
+            let mut log = TestLog::genesis("acct", &secret("rig astation"));
+            log.add_host("host", 1, &secret("rig host"));
+            let pin = HostPin {
+                host_id: "host".into(),
+                host_trust_gen: 1,
+            };
+            MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret("rig host")).unwrap();
+            std::fs::write(
+                root.join("pairing/membership.fault"),
+                br#"{"v":1,"runtime_epoch":1,"file":"membership.json","at":1}"#,
+            )
+            .unwrap();
+            let mut fences = HostFences::new(&mut rig.bridge.host);
+            let (m, _) = MembershipHost::open(&pairing, &journal, 1, &host_now(), &mut fences)
+                .unwrap()
+                .unwrap();
+            let mut effects = fences.effects;
+            assert!(m.held().is_some() || m.faulted().is_some());
+            rig.bridge.membership = Some(m);
+            effects.extend(rig.bridge.host.membership_fault(None));
             rig.bridge.exec(
                 effects,
                 &mut Cx {
@@ -2146,7 +2198,7 @@ principals = ["local"]
                     .await;
                 assert_eq!(
                     rig.work(message).status.detail,
-                    "sender's authority revoked"
+                    "sender's authority changed"
                 );
             }
             let grant: String = rig
@@ -2163,6 +2215,46 @@ principals = ["local"]
                 )
                 .unwrap();
             assert_eq!(grant, "ended");
+        });
+    }
+
+    /// A session journal halted by a failed write, the device list usable,
+    /// is a pause, not a change of `local`'s authority: `local` is fenced in
+    /// memory only, its tasks wait (none is failed) and its durable control
+    /// generation, the one they were accepted under, is what the restart
+    /// brings back.
+    #[test]
+    fn a_halted_session_journal_pauses_local_tasks() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let (done, queued) = awaiting_and_blocked(&mut rig).await;
+            let accepted = rig.work(&queued).control_gen;
+            rig.bridge.host.journal_mut().fail_append_of(1, false);
+            let effects = rig.bridge.host.fence_principal("service:other", 0);
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            assert!(rig.bridge.host.journal_halted());
+            idle(&mut rig, 500).await;
+            assert_ne!(
+                rig.bridge.host.control_gen("local"),
+                accepted,
+                "fenced in memory"
+            );
+            assert_eq!(rig.work(&done).status.state, WorkState::AwaitingResult);
+            assert!(!rig.work(&queued).status.state.terminal());
+            // The durable control state, read as the restart reads it.
+            let text = std::fs::read_to_string(root.join("runtime/journal/principals")).unwrap();
+            let file: Value =
+                serde_json::from_str(text.splitn(3, ' ').nth(2).unwrap().trim_end()).unwrap();
+            assert_eq!(
+                file["principals"]["local"]["control_gen"].as_u64(),
+                Some(accepted)
+            );
         });
     }
 
@@ -2204,7 +2296,7 @@ principals = ["local"]
             assert_eq!(rig.bridge.host.control_gen("browser:b"), 2);
             rig.until(|r| stored(r, &a).state == WorkState::Failed)
                 .await;
-            assert_eq!(stored(&rig, &a).detail, "sender's authority revoked");
+            assert_eq!(stored(&rig, &a).detail, "sender's authority changed");
             idle(&mut rig, 300).await;
             assert_eq!(stored(&rig, &b).state, WorkState::Blocked);
         });
@@ -2335,9 +2427,9 @@ principals = ["local"]
 
     /// A send whose context was still publishing when `local` lost the
     /// authority it was accepted under makes no task: its publication is
-    /// refused ("sender's authority revoked").
+    /// refused ("sender's authority changed").
     #[test]
-    fn a_context_send_under_a_revoked_authority_is_refused() {
+    fn a_context_send_under_a_changed_authority_is_refused() {
         use crate::runtime::collab::Publication;
         use crate::runtime::collab_context::{ContextSpec, VaultRef};
         local_test(async |root| {
@@ -2363,7 +2455,7 @@ principals = ["local"]
                 },
             )
             .unwrap();
-            rig.until(|r| outbox_detail(r, &message) == "sender's authority revoked")
+            rig.until(|r| outbox_detail(r, &message) == "sender's authority changed")
                 .await;
             assert_eq!(rows(&rig, "work"), 0);
         });
@@ -2525,6 +2617,7 @@ principals = ["local"]
                         },
                         recipient: task.task.target.clone(),
                         expires_at: message.expires_at,
+                        ended: None,
                     },
                 )
                 .unwrap();
@@ -3367,6 +3460,175 @@ launch = "on_message"
             write(&launch_toml(&cwd, 1).replace("launch = \"on_message\"", "launch = \"off\""));
             assert!(!guard(), "a route that no longer launches");
         });
+    }
+
+    /// The principals a store's unfinished tasks name are kept from the
+    /// bridge's open on (`HostBridge::open`), before any control write: a
+    /// browser principal fenced before the restart keeps its control state
+    /// through another principal's control write, so its task, accepted at
+    /// that generation, isn't failed.
+    #[test]
+    fn principals_named_by_tasks_are_kept_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let _profile = crate::test_profile::use_dir(dir.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let journal = dir.path().join("runtime/journal");
+            let state = dir.path().join("runtime");
+            let host = HostTarget {
+                account_id: "acct".into(),
+                atem_device_id: "host".into(),
+                host_trust_gen: 1,
+            };
+            let task_id = uuid::Uuid::new_v4().to_string();
+            {
+                let mut bridge = HostBridge::open(&journal, None, Clock::default()).unwrap();
+                // `browser:b` was fenced once; its task came after.
+                let _ = bridge.host.fence_principal("browser:b", 0);
+                assert_eq!(bridge.host.control_gen("browser:b"), 2);
+                let store = Store::open(&state).unwrap();
+                store.bind(&host).unwrap();
+                store
+                    .enqueue(&WorkRecord {
+                        principal: "browser:b".into(),
+                        attachment_owner: String::new(),
+                        control_gen: 2,
+                        route_id: "r".into(),
+                        route_revision: 1,
+                        profile_id: "p".into(),
+                        profile_revision: 1,
+                        project: "local:project".into(),
+                        digest: hw::digest(b"task"),
+                        task: hw::WorkTask {
+                            task_id: task_id.clone(),
+                            workflow_id: uuid::Uuid::new_v4().to_string(),
+                            target: wire::Target {
+                                account_id: host.account_id.clone(),
+                                atem_device_id: host.atem_device_id.clone(),
+                                host_trust_gen: host.host_trust_gen,
+                                session_id: SessionId::new().to_string(),
+                                process_gen: uuid::Uuid::new_v4().to_string(),
+                            },
+                            expires_at: host_now().wall_ms + 60_000,
+                            prompt: "kept".into(),
+                            context: vec![],
+                            attachments: vec![],
+                        },
+                        status: WorkStatus {
+                            task_id: task_id.clone(),
+                            receipt_id: uuid::Uuid::new_v4().to_string(),
+                            state: WorkState::Queued,
+                            detail: String::new(),
+                            result: None,
+                        },
+                        turn_id: None,
+                        authorization_expires_at: None,
+                    })
+                    .unwrap();
+            }
+            let app = App::new();
+            let mut sessions = BTreeMap::new();
+            let mut cx = Cx {
+                client: &app.astation_client,
+                sessions: &mut sessions,
+            };
+            let mut bridge = HostBridge::open(&journal, None, Clock::default()).unwrap();
+            // Another principal's control write, which forgets the browser
+            // principals nothing names.
+            let effects = bridge.host.fence_principal("service:other", 0);
+            bridge.exec(effects, &mut cx);
+            assert_eq!(bridge.host.control_gen("browser:b"), 2);
+            assert!(bridge.adopt_identity(
+                &Identity {
+                    account_id: host.account_id.clone(),
+                    atem_device_id: host.atem_device_id.clone(),
+                    host_trust_gen: host.host_trust_gen,
+                },
+                &mut cx
+            ));
+            let cwd = dir.path().join("project");
+            let config: Config = toml::from_str(&format!(
+                r#"
+version = 1
+enabled = true
+[[profiles]]
+id = "p"
+revision = 1
+label = "p"
+provider = "claude"
+cwd = {cwd:?}
+project = "local:project"
+principals = ["browser:b"]
+[[routes]]
+id = "r"
+revision = 1
+profile_id = "p"
+principals = ["browser:b"]
+"#
+            ))
+            .unwrap();
+            bridge.work.config = config;
+            bridge.work.store = Some(Store::open(&state).unwrap());
+            for _ in 0..3 {
+                bridge.work.scheduled = Instant::now();
+                bridge.work_pass(&mut cx);
+            }
+            let task = bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .work(&task_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.status.state, WorkState::Blocked, "{:?}", task.status);
+        });
+    }
+
+    /// An interrupted turn is read from its prompt receipt's journaled
+    /// outcome (its detail), whether or not the receipt names its turn.
+    #[test]
+    fn an_interrupted_turn_is_its_completed_prompt_receipts_outcome() {
+        let receipt = |kind, state, detail: &str| wire::Receipt {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            target: wire::Target {
+                account_id: "acct".into(),
+                atem_device_id: "host".into(),
+                host_trust_gen: 1,
+                session_id: SessionId::new().to_string(),
+                process_gen: uuid::Uuid::new_v4().to_string(),
+            },
+            kind,
+            state,
+            detail: Some(detail.into()),
+            updated_at: 1,
+            lease: None,
+            result: None,
+        };
+        use wire::{ReceiptKind, ReceiptState};
+        assert!(turn_interrupted(&receipt(
+            ReceiptKind::Prompt,
+            ReceiptState::Completed,
+            "interrupted"
+        )));
+        assert!(!turn_interrupted(&receipt(
+            ReceiptKind::Prompt,
+            ReceiptState::Completed,
+            "done"
+        )));
+        assert!(!turn_interrupted(&receipt(
+            ReceiptKind::Interrupt,
+            ReceiptState::Completed,
+            "interrupted"
+        )));
+        assert!(!turn_interrupted(&receipt(
+            ReceiptKind::Prompt,
+            ReceiptState::Rejected,
+            "interrupted"
+        )));
     }
 
     #[test]

@@ -40,6 +40,21 @@ pub struct ReturnGrant {
     pub origin: Origin,
     pub recipient: Target,
     pub expires_at: u64,
+    /// Why it ended before its deadline while its task went on, recorded
+    /// when it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<EarlyEnd>,
+}
+
+/// Why a return grant ended early while its task goes on: its result is
+/// kept, never delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EarlyEnd {
+    /// The sending session ended, or its process was replaced.
+    SenderGone,
+    /// The sending session runs, but its route no longer takes the result.
+    SenderRouteChanged,
 }
 
 impl ReturnGrant {
@@ -768,6 +783,7 @@ mod tests {
             origin,
             recipient: target("ses-bbbbbbbbbbbb"),
             expires_at: 10_000,
+            ended: None,
         }
     }
     fn target(session: &str) -> Target {

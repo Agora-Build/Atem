@@ -1132,6 +1132,25 @@ fn send_expiring(rig: &Rig, fake: &Path, n: u32, to: &str, expires: &str, text: 
 /// The detail of a task awaiting its result whose sender is gone.
 const SENDER_GONE: &str = "sender gone; reply kept, not delivered";
 
+/// The same, its sending session running with a changed route.
+const SENDER_ROUTE_CHANGED: &str = "sender's route changed; reply kept, not delivered";
+
+/// The user interrupts the agent's turn `turn` (Esc): Claude writes the
+/// marker entry into the transcript (`transcript-<n>.jsonl`).
+fn interrupt(fake: &Path, n: u32, turn: &str) {
+    let entry = json!({"type":"user","uuid":format!("interrupt-{n}"),"promptId":turn,
+        "message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}});
+    private(
+        &fake.join(format!("transcript-{n}.tmp")),
+        &entry.to_string(),
+    );
+    std::fs::rename(
+        fake.join(format!("transcript-{n}.tmp")),
+        fake.join(format!("transcript-{n}.jsonl")),
+    )
+    .unwrap();
+}
+
 /// A local task awaiting its result whose sender is gone (its process
 /// ended) is not cancelled: it keeps waiting ("sender gone; reply kept, not
 /// delivered"), takes its agent's reply, stored and never delivered, and
@@ -1266,11 +1285,7 @@ fn an_interrupted_turn_awaits_its_result_and_takes_a_reply() {
     let (session, b) = rig.launch("b", "recipient");
     let id = rig.send(&a, 1, "tag:b", "interrupt this turn");
     let task = await_turn(&rig, &id, &session, &b, "interrupt this turn");
-    // Claude's own record of the interruption, in the turn's transcript.
-    let entry = json!({"type":"user","uuid":"interrupt-1","promptId":"turn-1",
-        "message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}});
-    private(&b.join("transcript-1.tmp"), &entry.to_string());
-    std::fs::rename(b.join("transcript-1.tmp"), b.join("transcript-1.jsonl")).unwrap();
+    interrupt(&b, 1, "turn-1");
     within("the task awaits its result", || {
         rig.status(&id)["tasks"][0]["state"] == "awaiting_result"
     });
@@ -1297,6 +1312,92 @@ fn an_interrupted_turn_awaits_its_result_and_takes_a_reply() {
         1,
         "never resubmitted"
     );
+}
+
+/// An interrupted turn that also gets no reply within the result timeout
+/// says both: "turn interrupted without a reply".
+#[test]
+fn an_interrupted_silent_turn_says_both() {
+    let mut rig = Rig::new();
+    rig.config = rig
+        .config
+        .replace("send = true", "send = true\nresult_timeout = \"1s\"");
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "interrupted and silent");
+    await_turn(&rig, &id, &session, &b, "interrupted and silent");
+    interrupt(&b, 1, "turn-1");
+    within("the report", || {
+        rig.status(&id)["tasks"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("turn interrupted without a reply")
+    });
+    // Written once: neither fact replaces the other afterwards.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "awaiting_result", "{status}");
+    assert!(
+        status["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("turn interrupted without a reply"),
+        "{status}"
+    );
+}
+
+/// The sending session's route changes while the task it sent awaits its
+/// result: the task stays ("sender's route changed; reply kept, not
+/// delivered"), its reply is kept, never delivered, and the sending
+/// session, still running, completes it.
+#[test]
+fn a_task_whose_senders_route_changed_keeps_waiting_for_its_sender() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "the sender's route changes");
+    let task = await_task(&rig, &id, &b);
+    let route = "[[routes]]\nid = \"a\"\nrevision = 1";
+    assert!(rig.config.contains(route));
+    rig.write_config(
+        &rig.config
+            .replace(route, "[[routes]]\nid = \"a\"\nrevision = 2"),
+    );
+    within("the sender's route changed", || {
+        rig.status(&id)["tasks"][0]["detail"] == SENDER_ROUTE_CHANGED
+    });
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "awaiting_result");
+    let reply = rig.agent(
+        &b,
+        1,
+        &["message", "reply", "--task", &task, "kept for its sender"],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("the reply kept", || {
+        let status = &rig.status(&id)["tasks"][0];
+        status["result"]["state"] == "submitted" && status["detail"] == SENDER_ROUTE_CHANGED
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("kept for its sender")
+    );
+    let done = rig.agent(&a, 2, &["message", "complete", &task]);
+    assert_eq!(done["code"], 0, "{done}");
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "completed", "{status}");
+    assert_eq!(status["result"]["text"], "kept for its sender", "{status}");
 }
 
 /// The task's route changes (a new revision) while its turn runs: only the
