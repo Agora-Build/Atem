@@ -1129,11 +1129,16 @@ fn send_expiring(rig: &Rig, fake: &Path, n: u32, to: &str, expires: &str, text: 
     output["stdout"].as_str().unwrap().trim().to_string()
 }
 
+/// The detail of a task awaiting its result whose sender is gone.
+const SENDER_GONE: &str = "sender gone; reply kept, not delivered";
+
 /// A local task awaiting its result whose sender is gone (its process
-/// ended) fails ("sender gone") instead of waiting for a sender that can
-/// never complete it; it holds no slot, and the next task goes on.
+/// ended) is not cancelled: it keeps waiting ("sender gone; reply kept, not
+/// delivered"), takes its agent's reply, stored and never delivered, and
+/// the owner completes it from outside any session. It holds no slot: the
+/// next task goes on.
 #[test]
-fn a_task_whose_sender_is_gone_fails_instead_of_waiting() {
+fn a_task_whose_sender_is_gone_keeps_waiting_and_takes_a_reply() {
     let rig = Rig::new();
     let (sender, a) = rig.launch("a", "sender");
     let (_, b) = rig.launch("b", "recipient");
@@ -1141,16 +1146,17 @@ fn a_task_whose_sender_is_gone_fails_instead_of_waiting() {
     let task = await_task(&rig, &id, &b);
     let stopped = rig.request(json!({"op":"stop","session_id":sender}), "stopped");
     assert_eq!(stopped["op"], "stopped", "{stopped}");
-    within("the task failed", || {
-        rig.status(&id)["tasks"][0]["state"] == "failed"
+    within("the sender gone", || {
+        rig.status(&id)["tasks"][0]["detail"] == SENDER_GONE
     });
-    assert_eq!(rig.status(&id)["tasks"][0]["detail"], "sender gone");
-    let late = rig.agent(&b, 1, &["message", "reply", "--task", &task, "too late"]);
-    assert_ne!(late["code"], 0, "{late}");
-    assert!(
-        late["stderr"].as_str().unwrap().contains("sender gone"),
-        "{late}"
-    );
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "awaiting_result");
+    let late = rig.agent(&b, 1, &["message", "reply", "--task", &task, "kept anyway"]);
+    assert_eq!(late["code"], 0, "{late}");
+    within("the reply kept", || {
+        let status = &rig.status(&id)["tasks"][0];
+        status["result"]["state"] == "submitted" && status["detail"] == SENDER_GONE
+    });
+    assert_eq!(rig.status(&id)["tasks"][0]["result"]["text"], "kept anyway");
     let (_, c) = rig.launch("c", "next");
     rig.send(&c, 1, "tag:b", "the next task");
     within("the next task", || {
@@ -1158,14 +1164,20 @@ fn a_task_whose_sender_is_gone_fails_instead_of_waiting() {
             .unwrap_or_default()
             .contains("the next task")
     });
+    let (out, err, ok) = rig.sandbox.atem(&["message", "complete", &task]);
+    assert!(ok, "{out}{err}");
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "completed", "{status}");
+    assert_eq!(status["result"]["text"], "kept anyway", "{status}");
 }
 
 /// The sender leaves while its task is still queued: only the return grant
 /// ends. The task still runs, its agent's reply is stored (readable in
-/// status, never delivered), and once it awaits a result nobody can
-/// complete, it fails ("sender gone") and frees its slot.
+/// status, never delivered), and once its turn ended it awaits its result
+/// ("sender gone; reply kept, not delivered") until the owner completes it
+/// from outside any session; it holds no slot meanwhile.
 #[test]
-fn a_task_whose_sender_left_while_it_was_queued_still_runs_then_fails() {
+fn a_task_whose_sender_left_while_it_was_queued_still_runs_and_keeps_its_reply() {
     let rig = Rig::new();
     let (sender, a) = rig.launch("a", "sender");
     let (_, b) = rig.launch("b", "recipient");
@@ -1211,11 +1223,11 @@ fn a_task_whose_sender_left_while_it_was_queued_still_runs_then_fails() {
     );
     assert_eq!(reply["code"], 0, "{reply}");
     private(&b.join("complete"), "");
-    within("the task failed", || {
-        rig.status(&id)["tasks"][0]["state"] == "failed"
+    within("the task awaits its result", || {
+        rig.status(&id)["tasks"][0]["detail"] == SENDER_GONE
     });
     let status = &rig.status(&id)["tasks"][0];
-    assert_eq!(status["detail"], "sender gone", "{status}");
+    assert_eq!(status["state"], "awaiting_result", "{status}");
     assert_eq!(status["result"]["state"], "submitted", "{status}");
     assert_eq!(
         status["result"]["text"], "an answer nobody takes",
@@ -1232,6 +1244,59 @@ fn a_task_whose_sender_left_while_it_was_queued_still_runs_then_fails() {
             .unwrap_or_default()
             .contains("the next task")
     });
+    let (out, err, ok) = rig.sandbox.atem(&["message", "complete", &task]);
+    assert!(ok, "{out}{err}");
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["state"], "completed", "{status}");
+    assert_eq!(status["result"]["text"], "an answer nobody takes");
+}
+
+/// A turn that ends interrupted (the user's Esc) leaves its task awaiting
+/// its result ("turn interrupted"): it still takes a reply, delivered as
+/// usual, and the session's next task goes on. Nothing is resubmitted.
+#[test]
+fn an_interrupted_turn_awaits_its_result_and_takes_a_reply() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "interrupt this turn");
+    let task = await_turn(&rig, &id, &session, &b, "interrupt this turn");
+    // Claude's own record of the interruption, in the turn's transcript.
+    let entry = json!({"type":"user","uuid":"interrupt-1","promptId":"turn-1",
+        "message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}});
+    private(&b.join("transcript-1.tmp"), &entry.to_string());
+    std::fs::rename(b.join("transcript-1.tmp"), b.join("transcript-1.jsonl")).unwrap();
+    within("the task awaits its result", || {
+        rig.status(&id)["tasks"][0]["state"] == "awaiting_result"
+    });
+    assert_eq!(rig.status(&id)["tasks"][0]["detail"], "turn interrupted");
+    let reply = rig.agent(&b, 1, &["message", "reply", "--task", &task, "half done"]);
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("the reply delivered", || {
+        std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("half done")
+    });
+    let (_, c) = rig.launch("c", "next");
+    rig.send(&c, 1, "tag:b", "the next task");
+    within("the next task", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("the next task")
+    });
+    assert_eq!(
+        std::fs::read_to_string(b.join("input"))
+            .unwrap()
+            .matches("interrupt this turn")
+            .count(),
+        1,
+        "never resubmitted"
+    );
 }
 
 /// The task's route changes (a new revision) while its turn runs: only the

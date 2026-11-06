@@ -33,6 +33,9 @@ struct Rig {
     /// Debug-build context snapshots (`ATEM_TEST_CONTEXT_DIR`) for replies
     /// that carry context; set before `start`.
     context_hook: bool,
+    /// Debug-build broker faults (`ATEM_TEST_PTY_FAULTS`, the `faults`
+    /// directory); set before `start`.
+    faults_hook: bool,
 }
 
 impl Rig {
@@ -132,7 +135,13 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
             runtime: None,
             fake,
             context_hook: false,
+            faults_hook: false,
         }
+    }
+
+    /// The directory of the debug broker fault markers (`faults_hook`).
+    fn faults(&self) -> PathBuf {
+        self.sandbox.dir.path().join("faults")
     }
 
     fn start(&mut self) {
@@ -143,6 +152,10 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
         command.env_clear();
         if self.context_hook {
             command.env("ATEM_TEST_CONTEXT_DIR", &context);
+        }
+        if self.faults_hook {
+            std::fs::create_dir_all(self.faults()).unwrap();
+            command.env("ATEM_TEST_PTY_FAULTS", self.faults());
         }
         self.runtime = Some(
             command
@@ -365,6 +378,47 @@ fn wait_detail(dev: &mut Dev, r: &mut Router, tid: &Value, expected: &str) {
         );
         std::thread::sleep(Duration::from_millis(40));
     }
+}
+
+/// Task `tid`'s status as `runtime/host-work.sqlite` stores it (whether
+/// or not its sender may still read it).
+fn stored(rig: &Rig, tid: &Value) -> Value {
+    let db =
+        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let record: String = db
+        .query_row(
+            "SELECT record FROM work WHERE id=?1",
+            [tid.as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    serde_json::from_str::<Value>(&record).unwrap()["status"].clone()
+}
+
+fn wait_stored(rig: &Rig, tid: &Value, state: &str, detail: &str) {
+    within("the stored task", || {
+        let status = stored(rig, tid);
+        status["state"] == state && status["detail"] == detail
+    });
+}
+
+/// The sender gives back the session lease its dispatched task took
+/// (between turns, as a client does).
+fn release_lease(dev: &mut Dev, r: &mut Router, launch: &Value) {
+    let binding = json!({"target":task(launch, "unused")["target"],
+        "attachment_gen":dev.a.welcome().attachment_gen});
+    let lease = dev.request(
+        r,
+        json!({"op":"acquire","binding":binding,"takeover":false}),
+    );
+    assert_eq!(lease["op"], "lease", "{lease}");
+    let released = dev.request(r, json!({"op":"release","binding":lease["binding"]}));
+    assert_eq!(released["op"], "lease_released");
+}
+
+fn input(rig: &Rig) -> String {
+    std::fs::read_to_string(rig.fake.join("input")).unwrap_or_default()
 }
 
 fn screenshot() -> Vec<u8> {
@@ -1573,8 +1627,11 @@ fn narrower_service_scopes_cannot_create_sessions_outside_their_scope() {
     assert!(rig.sandbox.records().is_empty());
 }
 
+/// A service narrowed while its task waits loses its authority over the
+/// task: it fails ("sender's authority revoked") and a later grant doesn't
+/// revive it (its sender can't read it either).
 #[test]
-fn pending_work_is_fenced_after_a_service_is_narrowed_and_regranted() {
+fn pending_work_fails_once_a_service_is_narrowed_and_stays_failed_after_a_regrant() {
     let mut rig = Rig::new("claude");
     let mut r = Router::new(&rig.astation);
     let mut owner = Dev::new(&mut r, &rig.log, MAC, false);
@@ -1600,6 +1657,7 @@ fn pending_work_is_fenced_after_a_service_is_narrowed_and_regranted() {
         .log
         .narrow_service("svc-work", &ServiceScope::new([HOST]).ops(["view"]), None);
     owner.carry(&mut r, narrow);
+    wait_stored(&rig, &t["task_id"], "failed", "sender's authority revoked");
     let grant = rig.log.set_service(
         "svc-work",
         &ServiceScope::new([HOST]).ops(["launch", "notify", "prompt", "view"]),
@@ -1612,6 +1670,8 @@ fn pending_work_is_fenced_after_a_service_is_narrowed_and_regranted() {
         json!({"op":"work_query","host":host(),"task_id":t["task_id"]}),
     );
     assert_eq!(response["code"], "forbidden");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(stored(&rig, &t["task_id"])["state"], "failed");
     assert!(
         !std::fs::read_to_string(rig.fake.join("input"))
             .unwrap_or_default()
@@ -1875,7 +1935,7 @@ fn messages_bind_sender_content_destinations_and_service_scope() {
 }
 
 #[test]
-fn message_work_waits_for_drafts_and_stays_fenced_after_sender_authority_changes() {
+fn message_work_waits_for_drafts_and_fails_once_its_senders_authority_changes() {
     let mut rig = Rig::new("claude");
     let mut r = Router::new(&rig.astation);
     let mut owner = Dev::new(&mut r, &rig.log, MAC, false);
@@ -1919,13 +1979,10 @@ fn message_work_waits_for_drafts_and_stays_fenced_after_sender_authority_changes
     );
     owner.carry(&mut r, grant);
     let mut service = Dev::new(&mut r, &rig.log, "svc-work", true);
-    within("message remains fenced after regrant", || {
+    within("message work failed, not revived by the regrant", || {
         let status = message_status(&mut service, &mut r, &message);
-        status["recipients"][0]["delivery"]["work"]["state"] == "blocked"
-            && status["recipients"][0]["delivery"]["work"]["detail"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("authorized channel")
+        status["recipients"][0]["delivery"]["work"]["state"] == "failed"
+            && status["recipients"][0]["delivery"]["work"]["detail"] == "sender's authority revoked"
     });
     assert_eq!(service.request(&mut r,
         json!({"op":"work_query","host":host(),"task_id":message["recipients"][0]["recipient_id"]}))["code"], "forbidden");
@@ -1935,4 +1992,191 @@ fn message_work_waits_for_drafts_and_stays_fenced_after_sender_authority_changes
             .contains("Must remain queued")
     );
     assert_eq!(frontend.detach(), sid);
+}
+
+/// A service narrowed while its task is queued behind another turn: the
+/// task fails at once ("sender's authority revoked"), holding no place, and
+/// the session's next task is dispatched when that turn ends.
+#[test]
+fn a_service_narrowed_while_its_task_is_queued_frees_the_session() {
+    let mut rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut owner = Dev::new(&mut r, &rig.log, MAC, false);
+    let rid = uuid();
+    owner.launch(&mut r, &rid);
+    let launch = owner.launched(&mut r, &rid);
+    let first = task(&launch, "the owner's turn");
+    enqueue(&mut owner, &mut r, &first);
+    within("the owner's prompt", || {
+        input(&rig).contains("the owner's turn")
+    });
+    let mut service = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let queued = task(&launch, "queued before the narrowing");
+    enqueue(&mut service, &mut r, &queued);
+    wait_detail(&mut service, &mut r, &queued["task_id"], "earlier task");
+    let narrow = rig
+        .log
+        .narrow_service("svc-work", &ServiceScope::new([HOST]).ops(["view"]), None);
+    owner.carry(&mut r, narrow);
+    wait_stored(
+        &rig,
+        &queued["task_id"],
+        "failed",
+        "sender's authority revoked",
+    );
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    wait_state(&mut owner, &mut r, &first["task_id"], "awaiting_result");
+    release_lease(&mut owner, &mut r, &launch);
+    let next = task(&launch, "the owner's next task");
+    enqueue(&mut owner, &mut r, &next);
+    within("the next prompt", || {
+        input(&rig).contains("the owner's next task")
+    });
+    assert!(!input(&rig).contains("queued before the narrowing"));
+}
+
+/// A service grant that expires while its sender is offline ends the
+/// sender's authority over its queued task: it fails ("sender's
+/// authorization expired"), and renewing the grant doesn't revive it.
+#[test]
+fn a_task_whose_senders_grant_expired_offline_stays_failed_after_a_renewal() {
+    let expires = r9log::host_now().wall_ms + 12_000;
+    let mut rig = Rig::configured("claude", |log| {
+        log.enroll_service(
+            "svc-restricted",
+            &ServiceScope::new([HOST]).ops(["notify", "prompt", "view"]),
+            expires,
+        );
+    });
+    let mut r = Router::new(&rig.astation);
+    let mut owner = Dev::new(&mut r, &rig.log, MAC, false);
+    let rid = uuid();
+    owner.launch(&mut r, &rid);
+    let launch = owner.launched(&mut r, &rid);
+    let first = task(&launch, "the owner's long turn");
+    enqueue(&mut owner, &mut r, &first);
+    within("the owner's prompt", || {
+        input(&rig).contains("the owner's long turn")
+    });
+    let mut service = Dev::new(&mut r, &rig.log, "svc-restricted", true);
+    let queued = task(&launch, "queued by a short grant");
+    assert_eq!(
+        enqueue(&mut service, &mut r, &queued)["result"]["work"]["state"],
+        "queued"
+    );
+    wait_detail(&mut service, &mut r, &queued["task_id"], "earlier task");
+    // The sender goes offline; its grant runs out meanwhile.
+    r.close(&service.handle);
+    drop(service);
+    let left = expires.saturating_sub(r9log::host_now().wall_ms);
+    std::thread::sleep(Duration::from_millis(left));
+    wait_stored(
+        &rig,
+        &queued["task_id"],
+        "failed",
+        "sender's authorization expired",
+    );
+    let renewal = rig
+        .log
+        .renew_service("svc-restricted", r9log::host_now().wall_ms + 3_600_000);
+    owner.carry(&mut r, renewal);
+    let mut service = Dev::new(&mut r, &rig.log, "svc-restricted", true);
+    let response = service.request(
+        &mut r,
+        json!({"op":"work_query","host":host(),"task_id":queued["task_id"]}),
+    );
+    assert_eq!(response["code"], "forbidden", "{response}");
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    wait_state(&mut owner, &mut r, &first["task_id"], "awaiting_result");
+    release_lease(&mut owner, &mut r, &launch);
+    let next = task(&launch, "the owner's next task");
+    enqueue(&mut owner, &mut r, &next);
+    within("the next prompt", || {
+        input(&rig).contains("the owner's next task")
+    });
+    assert!(!input(&rig).contains("queued by a short grant"));
+    assert_eq!(
+        stored(&rig, &queued["task_id"])["detail"],
+        "sender's authorization expired"
+    );
+}
+
+/// A remote sender's task queued under a route revision the owner then
+/// replaces fails at once ("route changed"), freeing its session: the next
+/// task, under the new revision, is dispatched once the earlier turn ends.
+#[test]
+fn a_remote_task_whose_route_changed_fails_and_frees_its_session() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let first = task(&launch, "keeps the agent busy");
+    enqueue(&mut dev, &mut r, &first);
+    within("the first prompt", || {
+        input(&rig).contains("keeps the agent busy")
+    });
+    let queued = task(&launch, "queued under revision one");
+    enqueue(&mut dev, &mut r, &queued);
+    wait_detail(&mut dev, &mut r, &queued["task_id"], "earlier task");
+    // The owner approves a new revision of the route.
+    let path = rig.sandbox.config().join("runtime.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let route = "[[routes]]\nid = \"backend\"\nrevision = 1";
+    assert!(text.contains(route));
+    private(
+        &path,
+        &text.replace(route, "[[routes]]\nid = \"backend\"\nrevision = 2"),
+    );
+    wait_stored(&rig, &queued["task_id"], "failed", "route changed");
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    within("the first turn's end", || {
+        stored(&rig, &first["task_id"])["state"] == "awaiting_result"
+    });
+    release_lease(&mut dev, &mut r, &launch);
+    let next = task(&launch, "under revision two");
+    let accepted = dev.request(
+        &mut r,
+        json!({"op":"work_enqueue","host":host(),
+        "route_id":"backend","route_revision":2,"task":next}),
+    );
+    assert_eq!(accepted["result"]["work"]["state"], "queued", "{accepted}");
+    within("the next prompt", || {
+        input(&rig).contains("under revision two")
+    });
+    assert!(!input(&rig).contains("queued under revision one"));
+}
+
+/// A remote launch that has not started when a pause begins (here
+/// `runtime.toml` stops loading) waits for it to end, then starts: a pause
+/// is no fence.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook")]
+fn a_remote_launch_waits_out_a_pause() {
+    let mut rig = Rig::prepared("claude", |_| {});
+    rig.faults_hook = true;
+    rig.start();
+    let held = rig.faults().join("hold_launches");
+    private(&held, "");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    assert_eq!(
+        dev.launch(&mut r, &rid)["result"]["launch"]["state"],
+        "starting"
+    );
+    let good = break_config(&rig);
+    within("the pause", || {
+        runtime_log(&rig).contains("missing field `project`")
+    });
+    // Released while the pause lasts: still not started.
+    std::fs::remove_file(&held).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        rig.sandbox.records().is_empty(),
+        "nothing started in the pause"
+    );
+    private(&rig.sandbox.config().join("runtime.toml"), &good);
+    assert_eq!(dev.launched(&mut r, &rid)["state"], "started");
 }

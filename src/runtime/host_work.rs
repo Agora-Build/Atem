@@ -7,7 +7,7 @@ use atem_client::session::host_work::{
 use atem_client::session::messages::{Delivery, Message, MessageReceipt, RecipientReceipt};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -530,6 +530,13 @@ pub struct WorkRecord {
     /// saw the prompt accepted: a reply is bound to it, after a restart too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// When the authorization the task was accepted under expires (a
+    /// service or browser grant's expiry); none for a native member and
+    /// `local`, whose authority doesn't expire, and in records written
+    /// before it was kept. Past it the task's sender has no authority over
+    /// it, whatever renews the grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_expires_at: Option<u64>,
 }
 
 /// How long a settled record is kept past its deadline. A retry of a pruned
@@ -847,38 +854,95 @@ impl Store {
     /// Tasks awaiting their result or whose outcome is unknown expire at
     /// their deadline, whoever sent them and whatever became of their reply
     /// or return grant (spec section 10), so none waits, or holds its
-    /// session's queue, forever. Nothing is resubmitted. An open grant ends
-    /// with its task. Writes only what is due; returns how many expired.
-    pub fn expire_overdue(&self, now: u64) -> Result<usize> {
-        let due: Vec<WorkRecord> = {
+    /// session's queue, forever. Before it, one whose sender's authority
+    /// `revoked` names a reason for (its principal, the control generation
+    /// and authorization expiry it was accepted under) fails with it, and
+    /// its return grant ends: its sender can't complete it, nor its agent
+    /// answer it. Nothing is resubmitted. An open grant ends with an expired
+    /// task. Writes only what is due; returns how many settled.
+    pub fn settle_overdue(
+        &self,
+        now: u64,
+        mut revoked: impl FnMut(&str, u64, Option<u64>) -> Option<&'static str>,
+    ) -> Result<usize> {
+        let mut due = Vec::new();
+        {
             let mut q = self.db.prepare(
-                "SELECT record FROM work WHERE state IN ('awaiting_result','outcome_unknown')
-                AND json_extract(record,'$.task.expires_at')<=?1 ORDER BY rowid",
+                "SELECT id,json_extract(record,'$.task.expires_at'),
+                json_extract(record,'$.principal'),json_extract(record,'$.control_gen'),
+                json_extract(record,'$.authorization_expires_at')
+                FROM work WHERE state IN ('awaiting_result','outcome_unknown') ORDER BY rowid",
             )?;
-            q.query_map([now], |r| r.get::<_, String>(0))?
-                .map(|r| Ok(serde_json::from_str(&r?)?))
-                .collect::<Result<_>>()?
-        };
+            let rows = q.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u64>(3)?,
+                    r.get::<_, Option<u64>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, deadline, principal, control_gen, expires) = row?;
+                if now >= deadline {
+                    due.push((id, None));
+                } else if let Some(why) = revoked(&principal, control_gen, expires) {
+                    due.push((id, Some(why)));
+                }
+            }
+        }
         if due.is_empty() {
             return Ok(0);
         }
         let tx = self.db.unchecked_transaction()?;
-        for mut record in due.iter().cloned() {
-            record.status.detail = if record.status.state == WorkState::OutcomeUnknown {
-                EXPIRED_UNKNOWN
-            } else {
-                EXPIRED_AWAITING
-            }
-            .into();
-            record.status.state = WorkState::Expired;
+        for (id, why) in &due {
+            let mut record = self
+                .work(id)?
+                .ok_or_else(|| anyhow!("missing work reservation"))?;
+            let end = match why {
+                Some(why) => {
+                    record.status.state = WorkState::Failed;
+                    record.status.detail = (*why).into();
+                    "UPDATE return_grants SET state='ended'
+                    WHERE task_id=?1 AND state IN ('open','consumed')"
+                }
+                None => {
+                    record.status.detail = if record.status.state == WorkState::OutcomeUnknown {
+                        EXPIRED_UNKNOWN
+                    } else {
+                        EXPIRED_AWAITING
+                    }
+                    .into();
+                    record.status.state = WorkState::Expired;
+                    "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state='open'"
+                }
+            };
             self.save_work(&record)?;
-            tx.execute(
-                "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state='open'",
-                [&record.task.task_id],
-            )?;
+            tx.execute(end, [id])?;
         }
         tx.commit()?;
         Ok(due.len())
+    }
+
+    /// The principals of every task in the store in `state` not settled yet
+    /// (its sender's authority over it still matters), read without opening
+    /// it for writing; none when there is no store yet.
+    pub fn named_principals_at(state: &Path) -> Result<HashSet<String>> {
+        let path = state.join("host-work.sqlite");
+        if !path.exists() {
+            return Ok(HashSet::new());
+        }
+        let db = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut q = db.prepare(
+            "SELECT DISTINCT json_extract(record,'$.principal') FROM work WHERE state IN
+            ('queued','blocked','submitting','submitted','awaiting_result','outcome_unknown')",
+        )?;
+        q.query_map([], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(r?))
+            .collect()
     }
 
     /// Removes what is settled and a day past its deadline
@@ -1260,6 +1324,7 @@ mod tests {
             principal: "member:phone".into(),
             attachment_owner: String::new(),
             control_gen: 1,
+            authorization_expires_at: None,
             route_id: "backend".into(),
             route_revision: 1,
             profile_id: "backend".into(),
@@ -1490,8 +1555,11 @@ mod tests {
             }
             ids.push(r.task.task_id);
         }
-        assert_eq!(store.expire_overdue(999).unwrap(), 0);
-        assert_eq!(store.expire_overdue(1_000).unwrap(), MAX_QUEUED - 1);
+        assert_eq!(store.settle_overdue(999, |_, _, _| None).unwrap(), 0);
+        assert_eq!(
+            store.settle_overdue(1_000, |_, _, _| None).unwrap(),
+            MAX_QUEUED - 1
+        );
         for (n, id) in ids.iter().enumerate() {
             let r = store.work(id).unwrap().unwrap();
             if n == 7 {
@@ -1520,8 +1588,8 @@ mod tests {
         assert_eq!(grant(&ids[3]), "ended");
         assert!(store.enqueue(&task()).unwrap());
         // Nothing more is due: nothing is written.
-        assert_eq!(store.expire_overdue(1_999).unwrap(), 0);
-        assert_eq!(store.expire_overdue(2_000).unwrap(), 1);
+        assert_eq!(store.settle_overdue(1_999, |_, _, _| None).unwrap(), 0);
+        assert_eq!(store.settle_overdue(2_000, |_, _, _| None).unwrap(), 1);
     }
 
     /// A task whose outcome is unknown (a restart in its turn, a launch of
@@ -1546,9 +1614,9 @@ mod tests {
                 [&r.task.task_id],
             )
             .unwrap();
-        assert_eq!(store.expire_overdue(999).unwrap(), 0);
+        assert_eq!(store.settle_overdue(999, |_, _, _| None).unwrap(), 0);
         assert_eq!(store.active_tasks().unwrap().len(), 1);
-        assert_eq!(store.expire_overdue(1_000).unwrap(), 1);
+        assert_eq!(store.settle_overdue(1_000, |_, _, _| None).unwrap(), 1);
         let expired = store.work(&r.task.task_id).unwrap().unwrap();
         assert_eq!(
             (expired.status.state, expired.status.detail.as_str()),
@@ -1564,6 +1632,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(grant, "ended");
+    }
+
+    /// Before its deadline, a task awaiting its result or of unknown outcome
+    /// whose sender's authority is gone fails with the reason given, its
+    /// return grant ended whether open or consumed; the others stay. What
+    /// the unsettled tasks name is read without opening the store for
+    /// writing.
+    #[test]
+    fn tasks_whose_senders_authority_is_gone_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Store::named_principals_at(dir.path()).unwrap().is_empty());
+        let store = Store::open(dir.path()).unwrap();
+        let mut ids = Vec::new();
+        for (principal, state, grant) in [
+            ("service:gone", WorkState::AwaitingResult, "consumed"),
+            ("service:gone", WorkState::OutcomeUnknown, "open"),
+            ("member:kept", WorkState::AwaitingResult, "open"),
+        ] {
+            let mut r = task();
+            r.principal = principal.into();
+            assert!(store.enqueue(&r).unwrap());
+            r.status.state = state;
+            store.save_work(&r).unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO return_grants(task_id,record,state) VALUES(?1,'{}',?2)",
+                    params![r.task.task_id, grant],
+                )
+                .unwrap();
+            ids.push(r.task.task_id);
+        }
+        let mut asked = Vec::new();
+        let settled = store
+            .settle_overdue(99, |principal, control_gen, expires| {
+                asked.push((principal.to_string(), control_gen, expires));
+                (principal == "service:gone").then_some("gone")
+            })
+            .unwrap();
+        assert_eq!(settled, 2);
+        assert_eq!(asked.len(), 3);
+        assert!(asked.iter().all(|(_, g, e)| *g == 1 && e.is_none()));
+        for (n, id) in ids.iter().enumerate() {
+            let r = store.work(id).unwrap().unwrap();
+            let grant: String = store
+                .db
+                .query_row(
+                    "SELECT state FROM return_grants WHERE task_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if n < 2 {
+                assert_eq!(
+                    (r.status.state, r.status.detail.as_str()),
+                    (WorkState::Failed, "gone")
+                );
+                assert_eq!(grant, "ended");
+            } else {
+                assert_eq!(r.status.state, WorkState::AwaitingResult);
+                assert_eq!(grant, "open");
+            }
+        }
+        assert_eq!(
+            Store::named_principals_at(dir.path()).unwrap(),
+            HashSet::from(["member:kept".to_string()])
+        );
     }
 
     /// Rows a day past their deadline go once settled, with what belongs to

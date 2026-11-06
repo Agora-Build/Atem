@@ -584,6 +584,10 @@ pub struct SessionHost<J: Journal> {
     next_order: u64,
     /// principal → its control state (r8 §H).
     principals: BTreeMap<String, PrincipalState>,
+    /// Principals the runtime's own records outside this journal still
+    /// name (unfinished host-work tasks): their control states are never
+    /// forgotten (`prune_principals`), so a fence stays visible to them.
+    kept: HashSet<String>,
     /// A journal write failed in this run (r8 §I): no more writes, no
     /// welcome, no dispatch, no remote byte, until the restart.
     journal_halted: bool,
@@ -659,6 +663,7 @@ impl<J: Journal> SessionHost<J> {
             rules: BTreeMap::new(),
             next_order: 0,
             principals: BTreeMap::new(),
+            kept: HashSet::new(),
             journal_halted: false,
             previous_clean,
             resolved: false,
@@ -746,7 +751,9 @@ impl<J: Journal> SessionHost<J> {
     /// `control` at admission, an expired grant by its expiry. If the same
     /// grant connects again it starts a new control state, which no earlier
     /// work can use. Members and Astation principals are bounded by the
-    /// device list and the pairing and are kept.
+    /// device list and the pairing and are kept, and so is every principal
+    /// the runtime keeps (`keep_principals`): a task it holds compares its
+    /// control generation with the one it was accepted under.
     fn prune_principals(&mut self, writing: &str) {
         if !self
             .principals
@@ -771,6 +778,7 @@ impl<J: Journal> SessionHost<J> {
                 .filter(|e| !journal::is_final(e.stored.state))
                 .map(|e| e.stored.principal.as_str()),
         );
+        live.extend(self.kept.iter().map(String::as_str));
         let gone: Vec<String> = self
             .principals
             .keys()
@@ -1099,6 +1107,17 @@ impl<J: Journal> SessionHost<J> {
     /// The durable `control_gen` of `principal` (1 for one never seen).
     pub fn control_gen(&self, principal: &str) -> u64 {
         self.principal(principal).control_gen
+    }
+
+    /// The principals the runtime's records outside this journal name, in
+    /// place of the previous set: their control states are kept.
+    pub fn keep_principals(&mut self, principals: HashSet<String>) {
+        self.kept = principals;
+    }
+
+    /// One more principal the runtime's records name (`keep_principals`).
+    pub fn keep_principal(&mut self, principal: &str) {
+        self.kept.insert(principal.to_string());
     }
 
     /// r9 §R9.3 step 4: membership entry `seq` (a removal, `set_roles`,

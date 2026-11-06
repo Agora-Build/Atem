@@ -46,7 +46,8 @@
 //! For the r9 fixtures against the real runtime (`tests/r9_runner/`):
 //! - `ATEM_TEST_PTY_FAULTS=<dir>`, read by the broker too: while
 //!   `<dir>/hold_dispatch` exists, accepted work stays queued (the
-//!   fixtures' `hold_dispatch`).
+//!   fixtures' `hold_dispatch`); while `<dir>/hold_launches` exists, no
+//!   reserved launch is handed to the launcher (it stays pending).
 //! - `ATEM_TEST_NO_INIT_LIMIT=1`: `init`s aren't limited to one a second
 //!   per link (the fixtures connect clients back to back on a host clock
 //!   that only they move; the envelope fixtures, which check the limit,
@@ -161,6 +162,10 @@ mod imp {
 
     pub fn hold_dispatch() -> Option<bool> {
         faults_dir().map(|dir| dir.join("hold_dispatch").exists())
+    }
+
+    pub fn launches_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_launches").exists())
     }
 
     pub fn no_init_limit() -> bool {
@@ -308,6 +313,12 @@ pub fn hold_dispatch() -> Option<bool> {
     return imp::hold_dispatch();
     #[cfg(not(debug_assertions))]
     None
+}
+
+/// Reserved launches stay pending (`<pty faults>/hold_launches`).
+#[cfg(debug_assertions)]
+pub fn launches_held() -> bool {
+    imp::launches_held()
 }
 
 /// `init`s aren't rate-limited per link (`ATEM_TEST_NO_INIT_LIMIT`).

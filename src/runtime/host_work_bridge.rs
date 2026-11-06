@@ -16,6 +16,25 @@ const MAX_PAUSE_DETAIL: usize = 240;
 /// windows passed are pruned (counters also at each counted send).
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
 
+/// A task whose sender's authority changed since it was accepted: its
+/// principal's control generation moved on (a fence: a removal, a
+/// narrowing or renewal, a revoked grant, a device-list freeze or fault,
+/// `local` losing the host's authority). Nothing of it goes on under the
+/// new authority, and no later grant revives it.
+const AUTHORITY_REVOKED: &str = "sender's authority revoked";
+
+/// A task whose sender's authorization (a service or browser grant) expired
+/// since it was accepted: a renewal or a new grant never revives it.
+const AUTHORIZATION_EXPIRED: &str = "sender's authorization expired";
+
+/// A submitted task whose session receipt the session host no longer has
+/// (evicted or lost): its outcome can't be known any more.
+const RECEIPT_GONE: &str = "receipt no longer available";
+
+/// A task whose turn ended interrupted (its receipt completed with the
+/// outcome `interrupted`): it awaits its result like any other.
+const TURN_INTERRUPTED: &str = "turn interrupted";
+
 #[path = "collab_bridge.rs"]
 mod collab_bridge;
 #[path = "collab_launch_bridge.rs"]
@@ -163,14 +182,19 @@ impl HostBridge {
         self.work.config.enabled && !self.work.error
     }
 
-    /// The launches to start now. A local launch that has not started waits
-    /// out a pause (spec section 9: `runtime.toml` not loading, hosting off)
-    /// and starts when it is over; a receipt database fault, which lasts
-    /// until a restart, fences it instead (`work_fail`). Fences are evaluated
-    /// first, so what changed while it waited is not started on the old
-    /// approval (a fenced one is handed out to fail at its guard).
+    /// The launches to start now. A launch that has not started, local or
+    /// remote, waits out a pause (spec section 9: `runtime.toml` not
+    /// loading, hosting off) and starts when it is over; a receipt database
+    /// fault, which lasts until a restart, fences it instead (`work_fail`).
+    /// Fences are evaluated first, so what changed while it waited is not
+    /// started on the old approval (a fenced one is handed out to fail at its
+    /// guard).
     pub fn take_remote_launches(&mut self) -> Vec<RemoteLaunch> {
         if self.work.launches.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(debug_assertions)]
+        if crate::runtime::test_hooks::launches_held() {
             return Vec::new();
         }
         self.work_fence_launches();
@@ -180,7 +204,7 @@ impl HostBridge {
             paused
                 && pending
                     .get(id)
-                    .is_some_and(|p| p.local_route.is_some() && p.permit.load(Ordering::SeqCst))
+                    .is_some_and(|p| p.permit.load(Ordering::SeqCst))
         };
         let (mut ready, mut waiting) = (Vec::new(), VecDeque::new());
         for launch in self.work.launches.drain(..) {
@@ -233,8 +257,8 @@ impl HostBridge {
         }
         self.work.error = true;
         self.r9.enable_host_work(false);
-        // Launches that haven't started are fenced, local ones too: this
-        // pause lasts until a restart, so a local launch can't wait it out.
+        // Launches that haven't started are fenced, remote and local: this
+        // pause lasts until a restart, so none can wait it out.
         for p in self.work.pending.values() {
             p.permit.store(false, Ordering::SeqCst);
         }
@@ -249,8 +273,8 @@ impl HostBridge {
         }
         self.work.refresh = Instant::now() + Duration::from_secs(1);
         // An invalid file turns hosting off only while it lasts: launches
-        // not started are fenced, requests are `busy` and queued local tasks
-        // wait as `paused` (`work_pass`); nothing else is fenced.
+        // not started wait, requests are `busy` and queued local tasks wait
+        // as `paused` (`work_pass`); nothing is fenced.
         let config = match Config::load(&self.work.dir) {
             Ok(config) => {
                 if self.work.config_problem.take().is_some() {
@@ -513,13 +537,17 @@ impl HostBridge {
                                     && route.launch
                                         == crate::runtime::host_work::RouteLaunch::OnMessage)
                     }
-                    None => {
-                        self.hosting_enabled()
-                            && self.work.config.profile(&p.profile.id) == Some(&p.profile)
-                            && authority.as_ref().is_some_and(|a| {
-                                a.name() == p.principal && self.profile_allowed(&p.profile, a, true)
-                            })
-                    }
+                    // A remote launch waits out a pause the same way while
+                    // its sender's authority holds (the same attachment and
+                    // principal, the control generation checked above); its
+                    // approval is compared again when the pause ends.
+                    None => authority.as_ref().is_some_and(|a| {
+                        a.name() == p.principal
+                            && (paused
+                                || self.hosting_enabled()
+                                    && self.work.config.profile(&p.profile.id) == Some(&p.profile)
+                                    && self.profile_allowed(&p.profile, a, true))
+                    }),
                 };
             if !allowed {
                 p.permit.store(false, Ordering::SeqCst);
@@ -569,6 +597,9 @@ impl HostBridge {
             return Ok(ResultBody::Attachment { upload });
         }
         if matches!(req, Request::Publish { .. } | Request::MessageQuery { .. }) {
+            // Its tasks compare their sender's control generation with this
+            // one: it is kept from now on (`schedule_work` renews the set).
+            self.host.keep_principal(&principal);
             return self.message_request(req, &a, cx);
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
@@ -704,6 +735,7 @@ impl HostBridge {
                     attachment_owner: attachment_owner(&a),
                     principal,
                     control_gen: self.host.control_gen(&a.name()),
+                    authorization_expires_at: a.remote().and_then(|a| a.expires_at),
                     route_id: route_id.clone(),
                     route_revision: *route_revision,
                     profile_id: profile.id.clone(),
@@ -738,6 +770,7 @@ impl HostBridge {
                     return Err("invalid_request");
                 }
                 store.enqueue(&record).map_err(|_| "busy")?;
+                self.host.keep_principal(&record.principal);
                 Ok(ResultBody::Work {
                     work: record.status,
                 })
@@ -951,6 +984,7 @@ impl HostBridge {
                     attachment_owner: attachment_owner(a),
                     principal: a.name(),
                     control_gen: self.host.control_gen(&a.name()),
+                    authorization_expires_at: a.remote().and_then(|a| a.expires_at),
                     route_id: route_id.clone(),
                     route_revision: *route_revision,
                     profile_id: profile.id.clone(),
@@ -1077,14 +1111,26 @@ impl HostBridge {
     /// One scheduling pass. It runs only while hosting runs, so no pause
     /// applies here (`pause_local_tasks` marks local tasks during one).
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
-        // Awaiting a result, or of unknown outcome, past the deadline:
-        // expired, and an unknown outcome frees its session's queue.
-        self.work
-            .store
-            .as_ref()
-            .unwrap()
-            .expire_overdue(host_now().wall_ms)?;
+        let now = host_now().wall_ms;
+        // Awaiting a result, or of unknown outcome: past the deadline,
+        // expired; under a sender's authority that is gone, failed. Either
+        // frees an unknown outcome's session queue.
+        let mut named = HashSet::new();
+        let host = &self.host;
+        self.work.store.as_ref().unwrap().settle_overdue(
+            now,
+            |principal, control_gen, expires| {
+                let lost = authority_lost(host, principal, control_gen, expires, now);
+                if lost.is_none() {
+                    named.insert(principal.to_string());
+                }
+                lost
+            },
+        )?;
         let tasks = self.work.store.as_ref().unwrap().active_tasks()?;
+        named.extend(tasks.iter().map(|r| r.principal.clone()));
+        // Their control states stay known while a task names them.
+        self.host.keep_principals(named);
         let mut occupied = HashSet::new();
         for mut r in tasks {
             if r.status.state.terminal() && r.status.state != WorkState::OutcomeUnknown {
@@ -1101,6 +1147,17 @@ impl HostBridge {
                     r.turn_id = self.collab_task_turn(&r, cx.sessions);
                 }
                 self.reconcile_work(&mut r);
+                // A turn that ended (or an outcome no longer known) under a
+                // sender's authority that is gone: the task fails. A turn
+                // that runs is left to its end, never interrupted.
+                if matches!(
+                    r.status.state,
+                    WorkState::AwaitingResult | WorkState::OutcomeUnknown
+                ) && let Some(lost) = self.work_revoked(&r)
+                {
+                    self.work_fail_revoked(&mut r, lost)?;
+                    continue;
+                }
                 if (&r.status, &r.turn_id) != (&before.0, &before.1) {
                     self.work.store.as_ref().unwrap().save_work(&r)?;
                 }
@@ -1115,17 +1172,21 @@ impl HostBridge {
             if r.status.state == WorkState::AwaitingResult {
                 continue;
             }
-            if host_now().wall_ms >= r.task.expires_at {
+            if now >= r.task.expires_at {
                 r.status.state = WorkState::Expired;
                 r.status.detail = "expired before submission".into();
                 self.work.store.as_ref().unwrap().save_work(&r)?;
                 continue;
             }
-            // A local task whose route or profile approval changed can never
-            // be dispatched under it: it fails at once rather than hold its
-            // session's queue until it expires. A remote sender's task stays
-            // blocked until then (work queued under an older revision).
-            if r.principal == "local" && self.collab_route_changed(&r) {
+            // A task can never be dispatched under a sender's authority that
+            // is gone, nor under a route or profile approval that changed:
+            // it fails at once, before it takes its session's place, rather
+            // than hold the session's queue until it expires.
+            if let Some(lost) = self.work_revoked(&r) {
+                self.work_fail_revoked(&mut r, lost)?;
+                continue;
+            }
+            if self.work_route_changed(&r) {
                 r.status.state = WorkState::Failed;
                 r.status.detail = collab_bridge::ROUTE_CHANGED.into();
                 self.work.store.as_ref().unwrap().save_work(&r)?;
@@ -1264,6 +1325,12 @@ impl HostBridge {
     fn reconcile_work(&self, r: &mut WorkRecord) {
         use crate::session_protocol::wire::ReceiptState;
         let Some(receipt) = self.host.receipt(&r.status.receipt_id) else {
+            // Submitted, and its receipt gone (evicted or lost): what became
+            // of it can't be known any more.
+            if r.status.state == WorkState::Submitted {
+                r.status.state = WorkState::OutcomeUnknown;
+                r.status.detail = RECEIPT_GONE.into();
+            }
             return;
         };
         r.status.state = match receipt.state {
@@ -1280,8 +1347,20 @@ impl HostBridge {
             r.status.detail = "explicit result delivered to the originating agent".into();
             return;
         }
+        // A rejected receipt says why (`control revoked`, `host trust
+        // changed`, `session closed`, …).
+        if let (ReceiptState::Rejected, Some(detail)) = (receipt.state, &receipt.detail) {
+            r.status.detail = detail.clone();
+            return;
+        }
         r.status.detail = if r.status.state == WorkState::Submitted && r.turn_id.is_some() {
             collab_bridge::IN_TURN
+        } else if receipt
+            .result
+            .as_ref()
+            .is_some_and(|result| result.outcome == "interrupted")
+        {
+            TURN_INTERRUPTED
         } else {
             "agent submission receipt reconciled; task completion requires an explicit result"
         }
@@ -1289,7 +1368,79 @@ impl HostBridge {
         if let Some(reply) = self.collab_reply_of(&r.task.task_id) {
             collab_bridge::apply_reply(r, &reply);
         }
+        if matches!(
+            r.status.state,
+            WorkState::AwaitingResult | WorkState::OutcomeUnknown
+        ) && self.collab_sender_left(r)
+        {
+            r.status.detail = collab_bridge::SENDER_GONE.into();
+        }
     }
+
+    /// Why `r`'s sender no longer has authority over it, if it doesn't
+    /// (`authority_lost`).
+    fn work_revoked(&self, r: &WorkRecord) -> Option<&'static str> {
+        authority_lost(
+            &self.host,
+            &r.principal,
+            r.control_gen,
+            r.authorization_expires_at,
+            host_now().wall_ms,
+        )
+    }
+
+    /// `r` fails under its sender's lost authority (`work_revoked`), and its
+    /// return grant ends with it: no delivery, no completion, no reply.
+    fn work_fail_revoked(&self, r: &mut WorkRecord, lost: &'static str) -> anyhow::Result<()> {
+        let store = self.work.store.as_ref().unwrap();
+        r.status.state = WorkState::Failed;
+        r.status.detail = lost.into();
+        let tx = store.db.unchecked_transaction()?;
+        store.save_work(r)?;
+        tx.execute(
+            "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state IN ('open','consumed')",
+            [&r.task.task_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The route or profile approval a task was accepted under is no
+    /// longer the one in `runtime.toml`: the route is gone or has another
+    /// revision or profile, no longer names the task's principal, or its
+    /// profile has another revision or project.
+    pub(super) fn work_route_changed(&self, task: &WorkRecord) -> bool {
+        let Some(route) = self.work.config.route(&task.route_id) else {
+            return true;
+        };
+        let Some(profile) = self.work.config.profile(&route.profile_id) else {
+            return true;
+        };
+        route.revision != task.route_revision
+            || !route.principals.contains(&task.principal)
+            || profile.id != task.profile_id
+            || profile.revision != task.profile_revision
+            || profile.project != task.project
+    }
+}
+
+/// Why a task of `principal`, accepted at its control generation
+/// `control_gen` under an authorization expiring at `expires` (none: it
+/// doesn't), is no longer its sender's at wall time `now`: the
+/// authorization expired, or the principal's control generation moved on
+/// (a fence). The host keeps the control state of every principal a task
+/// names (`SessionHost::keep_principals`), so forgetting one is no change.
+fn authority_lost(
+    host: &SessionHost<FileJournal>,
+    principal: &str,
+    control_gen: u64,
+    expires: Option<u64>,
+    now: u64,
+) -> Option<&'static str> {
+    if expires.is_some_and(|at| now >= at) {
+        return Some(AUTHORIZATION_EXPIRED);
+    }
+    (host.control_gen(principal) != control_gen).then_some(AUTHORITY_REVOKED)
 }
 
 fn attachment_owner(a: &Sender) -> String {
@@ -1649,11 +1800,11 @@ principals = ["local"]
         });
     }
 
-    /// Counts the rows written to `return_grants` and `results` from now on
-    /// (temporary triggers: inserts, updates, deletes).
+    /// Counts the rows written to `return_grants`, `results` and `work` from
+    /// now on (temporary triggers: inserts, updates, deletes).
     fn count_writes(rig: &LocalRig) {
         let mut sql = "CREATE TEMP TABLE writes(t TEXT NOT NULL);".to_string();
-        for table in ["return_grants", "results"] {
+        for table in ["return_grants", "results", "work"] {
             for (n, event) in ["INSERT", "UPDATE", "DELETE"].iter().enumerate() {
                 sql.push_str(&format!(
                     "CREATE TEMP TRIGGER w_{table}_{n} AFTER {event} ON main.{table}
@@ -1734,9 +1885,10 @@ principals = ["local"]
 
     /// Spec section 10, "Storage": a grant or result is written when its
     /// state changes, never on a pass where nothing did. "Ending early": a
-    /// task whose sender is gone fails ("sender gone") instead of waiting.
+    /// sender that is gone cancels nothing: its task keeps awaiting its
+    /// result, its detail written once.
     #[test]
-    fn grants_are_written_on_change_only_and_a_gone_sender_fails_its_task() {
+    fn grants_are_written_on_change_only_and_a_gone_sender_keeps_its_task() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
             let message = rig.message();
@@ -1759,14 +1911,16 @@ principals = ["local"]
             assert_eq!(rig.work(&message).status.state, WorkState::AwaitingResult);
 
             // The sending process ends: the grant ends once, and the task
-            // waits for nobody.
+            // keeps awaiting its result, its detail written once.
+            let tasks = writes(&rig, "work");
             rig.sessions[&rig.sid].stop().unwrap();
-            rig.until(|r| r.work(&message).status.state == WorkState::Failed)
+            rig.until(|r| r.work(&message).status.detail == collab_bridge::SENDER_GONE)
                 .await;
-            assert_eq!(rig.work(&message).status.detail, "sender gone");
+            assert_eq!(rig.work(&message).status.state, WorkState::AwaitingResult);
             idle(&mut rig, 500).await;
             assert_eq!(writes(&rig, "return_grants"), grants + 1);
             assert_eq!(writes(&rig, "results"), results);
+            assert_eq!(writes(&rig, "work"), tasks + 1);
             let state: String = rig
                 .bridge
                 .work
@@ -1825,52 +1979,496 @@ principals = ["local"]
         });
     }
 
+    /// A task of `principal` (accepted at `control_gen`) to the rig's
+    /// session, written as it is in `state` with a receipt no host has; its
+    /// id.
+    fn insert_task(
+        rig: &LocalRig,
+        principal: &str,
+        control_gen: u64,
+        state: WorkState,
+        expires_at: u64,
+    ) -> String {
+        let message = rig.message();
+        let mut task = message.task(&message.recipients[0]).unwrap();
+        task.expires_at = expires_at;
+        let record = WorkRecord {
+            principal: principal.into(),
+            attachment_owner: String::new(),
+            control_gen,
+            route_id: "r".into(),
+            route_revision: 1,
+            profile_id: "p".into(),
+            profile_revision: 1,
+            project: "local:project".into(),
+            digest: hw::digest(b"task"),
+            status: WorkStatus {
+                task_id: task.task_id.clone(),
+                receipt_id: uuid::Uuid::new_v4().to_string(),
+                state,
+                detail: String::new(),
+                result: None,
+            },
+            task,
+            turn_id: None,
+            authorization_expires_at: None,
+        };
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+                rusqlite::params![
+                    record.task.task_id,
+                    serde_json::to_string(&record).unwrap(),
+                    serde_json::to_value(state).unwrap().as_str().unwrap()
+                ],
+            )
+            .unwrap();
+        record.task.task_id
+    }
+
+    fn stored(rig: &LocalRig, id: &str) -> WorkStatus {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .work(id)
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    /// A remote controller (`service:holder`) attached with `control`; its
+    /// attachment.
+    fn controller(rig: &mut LocalRig) -> String {
+        let att = uuid::Uuid::new_v4().to_string();
+        rig.bridge
+            .host
+            .connect(Attach {
+                client: "test-controller".into(),
+                principal: "service:holder".into(),
+                attachment_gen: att.clone(),
+                permissions: vec![Permission::View, Permission::Control],
+                client_kind: ClientKind::Native,
+                authorization_ms: 60_000,
+            })
+            .unwrap();
+        rig.bridge
+            .host
+            .welcome_r9(&att, rig.bridge.clock.now())
+            .unwrap();
+        att
+    }
+
+    /// A submitted task whose receipt was rejected names the receipt's own
+    /// reason: here its sender's control was revoked before the held prompt
+    /// was dispatched.
+    #[test]
+    fn a_rejected_receipt_gives_the_task_its_reason() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            rig.bridge.host.hold_dispatch(true);
+            let message = rig.message();
+            rig.publish(&message);
+            rig.until(|r| r.work(&message).status.state == WorkState::Submitted)
+                .await;
+            let effects = rig.bridge.host.fence_principal("local", 0);
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            rig.until(|r| r.work(&message).status.state == WorkState::Failed)
+                .await;
+            assert_eq!(rig.work(&message).status.detail, "control revoked");
+            assert!(
+                !rig.fake.join("input").is_file() || {
+                    !std::fs::read_to_string(rig.fake.join("input"))
+                        .unwrap()
+                        .contains("COLLAB_TEST_PROMPT")
+                }
+            );
+        });
+    }
+
+    /// A device-list fault fences `local` (the journal halts): its tasks
+    /// that are not in a turn fail as revoked, never "sender gone", the
+    /// one awaiting its result with its return grant ended.
+    #[test]
+    fn a_local_fence_fails_local_tasks_as_revoked() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let done = rig.message();
+            rig.publish(&done);
+            grant(&rig, &done);
+            rig.until(|r| r.work(&done).turn_id.is_some()).await;
+            std::fs::write(rig.fake.join("complete"), "").unwrap();
+            rig.until(|r| r.work(&done).status.state == WorkState::AwaitingResult)
+                .await;
+            // The next one waits for a remote controller's lease.
+            let att = controller(&mut rig);
+            let queued = rig.message();
+            let target = queued.task(&queued.recipients[0]).unwrap().target;
+            let (binding, _) = rig.bridge.host.binding_for_work(&att, &target).unwrap();
+            let acquire = json!({"type":"session","data":{"v":1,"op":"acquire","id":uuid::Uuid::new_v4().to_string(),"binding":binding,"takeover":false}});
+            let effects = rig.bridge.host.receive(
+                &att,
+                acquire.to_string().as_bytes(),
+                rig.bridge.clock.now(),
+            );
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            rig.publish(&queued);
+            rig.until(|r| r.work(&queued).status.state == WorkState::Blocked)
+                .await;
+            let effects = rig.bridge.host.membership_fault(None);
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            for message in [&done, &queued] {
+                rig.until(|r| r.work(message).status.state == WorkState::Failed)
+                    .await;
+                assert_eq!(
+                    rig.work(message).status.detail,
+                    "sender's authority revoked"
+                );
+            }
+            let grant: String = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT state FROM return_grants WHERE task_id=?1",
+                    [&done.recipients[0].recipient_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(grant, "ended");
+        });
+    }
+
+    /// Forgetting a principal's control state is no revocation, and can't
+    /// hide one: the host keeps the control state of every principal a task
+    /// names (browser principals are forgotten otherwise once nothing of
+    /// theirs is live).
+    #[test]
+    fn principals_named_by_tasks_keep_their_control_state() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            rig.bridge.work.config.routes[0].principals =
+                vec!["local".into(), "browser:a".into(), "browser:b".into()];
+            let now = host_now().wall_ms;
+            // `b` was fenced once before its task was accepted.
+            let effects = rig.bridge.host.fence_principal("browser:b", 0);
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            let a = insert_task(&rig, "browser:a", 1, WorkState::Blocked, now + 60_000);
+            let b = insert_task(&rig, "browser:b", 2, WorkState::Blocked, now + 60_000);
+            idle(&mut rig, 300).await;
+            // `a` is fenced; then another principal's control write, which
+            // forgets browser principals nothing names.
+            let effects = rig.bridge.host.fence_principal("browser:a", 0);
+            rig.bridge.exec(
+                effects,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            );
+            controller(&mut rig);
+            assert_eq!(rig.bridge.host.control_gen("browser:a"), 2);
+            assert_eq!(rig.bridge.host.control_gen("browser:b"), 2);
+            rig.until(|r| stored(r, &a).state == WorkState::Failed)
+                .await;
+            assert_eq!(stored(&rig, &a).detail, "sender's authority revoked");
+            idle(&mut rig, 300).await;
+            assert_eq!(stored(&rig, &b).state, WorkState::Blocked);
+        });
+    }
+
+    /// A submitted task whose receipt the session host no longer has is of
+    /// unknown outcome, and then expires at its deadline, freeing its
+    /// session for the next task.
+    #[test]
+    fn a_submitted_task_whose_receipt_is_gone_ends() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let control = rig.bridge.host.control_gen("local");
+            let lost = insert_task(
+                &rig,
+                "local",
+                control,
+                WorkState::Submitted,
+                host_now().wall_ms + 1_500,
+            );
+            rig.until(|r| stored(r, &lost).state == WorkState::OutcomeUnknown)
+                .await;
+            assert_eq!(stored(&rig, &lost).detail, "receipt no longer available");
+            let next = rig.message();
+            rig.publish(&next);
+            rig.until(|r| {
+                r.work(&next).status.detail == "waiting for an earlier task on this session"
+            })
+            .await;
+            rig.until(|r| stored(r, &lost).state == WorkState::Expired)
+                .await;
+            assert_eq!(
+                stored(&rig, &lost).detail,
+                crate::runtime::host_work::EXPIRED_UNKNOWN
+            );
+            rig.until(|r| {
+                std::fs::read_to_string(r.fake.join("input"))
+                    .unwrap_or_default()
+                    .contains("COLLAB_TEST_PROMPT")
+            })
+            .await;
+        });
+    }
+
+    /// A send accepted while its context was still publishing goes on when
+    /// its session ends meanwhile: its tasks are made and run, with their
+    /// return grants ended from the start, and the task then awaits its
+    /// result (the reply kept, never delivered).
+    #[test]
+    fn a_context_send_whose_session_ended_still_makes_its_tasks() {
+        use crate::runtime::collab::Publication;
+        use crate::runtime::collab_context::{ContextSpec, VaultRef};
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let mut message = rig.message();
+            message.recipients[0].destination = Destination::Select {
+                selectors: vec!["atem:atem-host/r".into()],
+                budget: 32,
+            };
+            // The sending session is no longer there.
+            let mut origin = origin_of(&rig);
+            origin.target.session_id = message.from_session.clone().unwrap();
+            origin.target.process_gen = uuid::Uuid::new_v4().to_string();
+            crate::runtime::collab::reserve_context(
+                rig.bridge.work.store.as_ref().unwrap(),
+                &rig.bridge.work.config.collab,
+                &message,
+                &Publication {
+                    atem_id: "atem-host".into(),
+                    origin,
+                    launch: false,
+                    context: vec![ContextSpec::Vault {
+                        reference: VaultRef::parse("v-context:1@1").unwrap(),
+                    }],
+                },
+            )
+            .unwrap();
+            rig.until(|r| {
+                outbox_detail(r, &message) == "relay unreachable; publication will retry"
+            })
+            .await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(Ok(vec![snapshot("the published context")]))
+                .unwrap();
+            rig.bridge
+                .work
+                .context_jobs
+                .insert(message.message_id.clone(), rx);
+            rig.until(|r| outbox_detail(r, &message) == "delivered to local queue")
+                .await;
+            let task = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .tasks()
+                .unwrap()
+                .remove(0);
+            let id = task.task.task_id.clone();
+            let grant: String = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT state FROM return_grants WHERE task_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(grant, "ended", "ended from the start");
+            rig.until(|r| {
+                std::fs::read_to_string(r.fake.join("input"))
+                    .unwrap_or_default()
+                    .contains("the published context")
+            })
+            .await;
+            std::fs::write(rig.fake.join("complete"), "").unwrap();
+            rig.until(|r| stored(r, &id).state == WorkState::AwaitingResult)
+                .await;
+            rig.until(|r| stored(r, &id).detail == collab_bridge::SENDER_GONE)
+                .await;
+        });
+    }
+
+    /// A send whose context was still publishing when `local` lost the
+    /// authority it was accepted under makes no task: its publication is
+    /// refused ("sender's authority revoked").
+    #[test]
+    fn a_context_send_under_a_revoked_authority_is_refused() {
+        use crate::runtime::collab::Publication;
+        use crate::runtime::collab_context::{ContextSpec, VaultRef};
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let mut message = rig.message();
+            message.recipients[0].destination = Destination::Select {
+                selectors: vec!["atem:atem-host/r".into()],
+                budget: 32,
+            };
+            let mut origin = origin_of(&rig);
+            origin.control_gen -= 1;
+            crate::runtime::collab::reserve_context(
+                rig.bridge.work.store.as_ref().unwrap(),
+                &rig.bridge.work.config.collab,
+                &message,
+                &Publication {
+                    atem_id: "atem-host".into(),
+                    origin,
+                    launch: false,
+                    context: vec![ContextSpec::Vault {
+                        reference: VaultRef::parse("v-context:1@1").unwrap(),
+                    }],
+                },
+            )
+            .unwrap();
+            rig.until(|r| outbox_detail(r, &message) == "sender's authority revoked")
+                .await;
+            assert_eq!(rows(&rig, "work"), 0);
+        });
+    }
+
+    /// `[collab] send = false` refuses new sends only: a send accepted while
+    /// its context was publishing still completes.
+    #[test]
+    fn a_context_send_completes_after_sending_is_switched_off() {
+        use crate::runtime::collab::Publication;
+        use crate::runtime::collab_context::{ContextSpec, VaultRef};
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let mut message = rig.message();
+            message.recipients[0].destination = Destination::Select {
+                selectors: vec!["atem:atem-host/r".into()],
+                budget: 32,
+            };
+            crate::runtime::collab::reserve_context(
+                rig.bridge.work.store.as_ref().unwrap(),
+                &rig.bridge.work.config.collab,
+                &message,
+                &Publication {
+                    atem_id: "atem-host".into(),
+                    origin: origin_of(&rig),
+                    launch: false,
+                    context: vec![ContextSpec::Vault {
+                        reference: VaultRef::parse("v-context:1@1").unwrap(),
+                    }],
+                },
+            )
+            .unwrap();
+            rig.until(|r| {
+                outbox_detail(r, &message) == "relay unreachable; publication will retry"
+            })
+            .await;
+            rig.bridge.work.config.collab.send = false;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(Ok(vec![snapshot("published after send = false")]))
+                .unwrap();
+            rig.bridge
+                .work
+                .context_jobs
+                .insert(message.message_id.clone(), rx);
+            rig.until(|r| outbox_detail(r, &message) == "delivered to local queue")
+                .await;
+            assert_eq!(rows(&rig, "work"), 1);
+        });
+    }
+
     /// The work pass prunes, about once a minute, what settled a day past
     /// its deadline; a task still in its turn stays whatever its deadline.
     #[test]
     fn the_work_pass_prunes_settled_records_past_the_margin() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
-            let store = rig.bridge.work.store.as_ref().unwrap();
             let old = host_now().wall_ms - crate::runtime::host_work::PRUNE_MARGIN_MS - 1;
-            let mut ids = Vec::new();
-            for state in [WorkState::Completed, WorkState::Submitted] {
-                let message = rig.message();
-                let mut task = message.task(&message.recipients[0]).unwrap();
-                task.expires_at = old;
-                let record = WorkRecord {
-                    principal: "member:owner".into(),
-                    attachment_owner: String::new(),
-                    control_gen: 0,
-                    route_id: "r".into(),
-                    route_revision: 1,
-                    profile_id: "p".into(),
-                    profile_revision: 1,
-                    project: "local:project".into(),
-                    digest: hw::digest(b"task"),
-                    status: WorkStatus {
-                        task_id: task.task_id.clone(),
-                        receipt_id: uuid::Uuid::new_v4().to_string(),
-                        state,
-                        detail: String::new(),
-                        result: None,
-                    },
-                    task,
-                    turn_id: None,
-                };
-                store
-                    .db
-                    .execute(
-                        "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
-                        rusqlite::params![
-                            record.task.task_id,
-                            serde_json::to_string(&record).unwrap(),
-                            serde_json::to_value(state).unwrap().as_str().unwrap()
-                        ],
-                    )
-                    .unwrap();
-                ids.push(record.task.task_id);
-            }
+            // A task in its turn, its deadline (as stored) a day past.
+            let running = rig.message();
+            rig.publish(&running);
+            rig.until(|r| r.work(&running).turn_id.is_some()).await;
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE work SET record=json_set(record,'$.task.expires_at',?2) WHERE id=?1",
+                    rusqlite::params![running.recipients[0].recipient_id, old],
+                )
+                .unwrap();
+            // A completed one, as old.
+            let message = rig.message();
+            let mut task = message.task(&message.recipients[0]).unwrap();
+            task.expires_at = old;
+            let record = WorkRecord {
+                principal: "member:owner".into(),
+                attachment_owner: String::new(),
+                control_gen: 0,
+                route_id: "r".into(),
+                route_revision: 1,
+                profile_id: "p".into(),
+                profile_revision: 1,
+                project: "local:project".into(),
+                digest: hw::digest(b"task"),
+                status: WorkStatus {
+                    task_id: task.task_id.clone(),
+                    receipt_id: uuid::Uuid::new_v4().to_string(),
+                    state: WorkState::Completed,
+                    detail: String::new(),
+                    result: None,
+                },
+                task,
+                turn_id: None,
+                authorization_expires_at: None,
+            };
+            store
+                .db
+                .execute(
+                    "INSERT INTO work(id,record,state) VALUES(?1,?2,'completed')",
+                    rusqlite::params![record.task.task_id, serde_json::to_string(&record).unwrap()],
+                )
+                .unwrap();
+            let ids = [
+                record.task.task_id,
+                running.recipients[0].recipient_id.clone(),
+            ];
             let present = |rig: &LocalRig, id: &str| {
                 rig.bridge
                     .work
