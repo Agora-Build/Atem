@@ -6,7 +6,10 @@
 //! `TurnEnded`, so the normal case is log-then-hook and "the log's outcome wins"
 //! (the log is in hand first). A hook `TurnEnded` that arrives alone is still
 //! authoritative: it emits `Complete { Done }` and marks the turn completed; a later
-//! log `TurnEnded` for that turn is ignored, so a turn never completes twice.
+//! log `TurnEnded` for that turn is ignored, so a turn never completes twice. A
+//! hook `TurnEnded` recorded before the transcript entry that began the current
+//! turn is an earlier turn's, read late (its log end made the session ready and
+//! the next prompt went in): it ends nothing (`ends_an_earlier_turn`).
 use crate::chat::adapter::{AgentEvent, ApprovalCard, LogItem, Outcome, Part};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -274,6 +277,10 @@ pub struct ChatSession {
     wait_held: bool,
     /// The turn ended while `wait_held`.
     held_past_turn: bool,
+    /// A turn the log ended (done) whose turn-end hook isn't read yet: a
+    /// hook turn end from the same second as the current turn's start (a
+    /// filesystem keeping whole seconds) is that turn's.
+    hook_end_owed: Option<String>,
 }
 
 /// Redact credential values (names are kept). See `memory::secrets::redact_secrets`.
@@ -421,6 +428,7 @@ impl ChatSession {
             last_outcome: None,
             wait_held: false,
             held_past_turn: false,
+            hook_end_owed: None,
         }
     }
 
@@ -892,7 +900,16 @@ impl ChatSession {
                 }
             }
             AgentEvent::TurnEnded { .. } if !self.started => {}
-            AgentEvent::TurnEnded { .. } => {
+            AgentEvent::TurnEnded { at_ms } => {
+                let earlier = at_ms.is_some_and(|at| self.ends_an_earlier_turn(at));
+                // Whichever turn it ended, its hook is read now.
+                self.hook_end_owed = None;
+                if earlier {
+                    // An earlier turn's end read only now (its log entry
+                    // made the session ready, and the next prompt went in
+                    // meanwhile): it ends nothing of the current turn.
+                    return out;
+                }
                 self.expired = None;
                 let turn = self.current_turn.as_ref().map(|(t, _)| t.clone());
                 if let Some(turn) = turn
@@ -905,6 +922,43 @@ impl ChatSession {
             }
         }
         out
+    }
+
+    /// A hook turn end recorded at `at` (unix ms, its event file's time;
+    /// the reader counts a time with no sub-second part to the end of its
+    /// second) belongs to an earlier turn than the current, still open one:
+    /// it was recorded before the transcript entry that began the current
+    /// turn. Within the same second (a filesystem or log keeping whole
+    /// seconds) it is an earlier turn's only while that turn's own hook is
+    /// still unread (its log ended it); otherwise it is the current turn's,
+    /// so a turn's own end is never dropped.
+    fn ends_an_earlier_turn(&self, at: i64) -> bool {
+        let Some((turn, _)) = &self.current_turn else {
+            return false;
+        };
+        if self.last_completed.as_deref() == Some(turn.as_str()) {
+            return false;
+        }
+        let Some(start) = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && m.turn_id == *turn)
+            .map(|m| m.created_at_ms)
+            .filter(|&t| t > 0)
+        else {
+            return false;
+        };
+        if at < start {
+            return true;
+        }
+        let end_earliest = if at % 1000 == 999 { at - 999 } else { at };
+        let start_latest = if start % 1000 == 0 {
+            start + 999
+        } else {
+            start
+        };
+        end_earliest < start_latest && self.hook_end_owed.is_some()
     }
 
     /// The turn ended: ready, unless a permission wait that outlasts it
@@ -1044,6 +1098,9 @@ impl ChatSession {
                     self.wait_held = false;
                 }
                 if self.last_completed.as_deref() != Some(turn_id.as_str()) {
+                    // Its turn-end hook (a turn done, not interrupted) is
+                    // still to be read.
+                    self.hook_end_owed = (outcome == Outcome::Done).then(|| turn_id.clone());
                     self.complete(turn_id, outcome, &mut out);
                 }
                 self.input_mark = input_count;
@@ -1964,6 +2021,162 @@ mod tests {
 
     fn submit_ok(s: &mut ChatSession, rid: &str, text: &str) {
         assert_eq!(s.submit(rid, "g1", text, 0, false).unwrap(), text);
+    }
+
+    /// One pass as the worker and the broker feed it: the hook events but
+    /// turn ends, then the log, then the hook turn ends.
+    fn pass(s: &mut ChatSession, events: Vec<AgentEvent>, log: Vec<LogItem>, now: i64) -> Vec<Out> {
+        let (ends, others): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|e| matches!(e, AgentEvent::TurnEnded { .. }));
+        let mut out = Vec::new();
+        for e in others {
+            out.extend(s.on_event(e, now, 0));
+        }
+        for item in log {
+            out.extend(s.on_log(item, now, 0));
+        }
+        for e in ends {
+            out.extend(s.on_event(e, now, 0));
+        }
+        out
+    }
+
+    fn stop_at(at: i64) -> AgentEvent {
+        AgentEvent::TurnEnded { at_ms: Some(at) }
+    }
+
+    fn prompt_hook_at(text: &str, at: i64) -> AgentEvent {
+        AgentEvent::PromptSubmitted {
+            text: text.into(),
+            turn_id: None,
+            at_ms: Some(at),
+        }
+    }
+
+    fn user_at(id: &str, turn: &str, text: &str, at: i64) -> LogItem {
+        LogItem::UserMessage {
+            id: id.into(),
+            turn_id: turn.into(),
+            text: text.into(),
+            created_at_ms: at,
+        }
+    }
+
+    fn end_at(turn: &str, at: i64) -> LogItem {
+        LogItem::TurnEnded {
+            turn_id: turn.into(),
+            outcome: Outcome::Done,
+            at_ms: at,
+        }
+    }
+
+    /// Turn 1's transcript end makes the session ready before its Stop
+    /// hook is read; the next prompt goes in; the next pass reads turn 1's
+    /// Stop with turn 2's prompt hook and transcript entry. That Stop ends
+    /// nothing of turn 2, nor makes it ready: turn 2 completes at its own
+    /// end. Also on a filesystem keeping whole seconds (the reader counts
+    /// an event's time to the end of its second), where turn 1's Stop and
+    /// turn 2's entry share a second.
+    #[test]
+    fn a_stop_read_after_the_next_prompt_began_ends_nothing_of_it() {
+        for whole_seconds in [false, true] {
+            let file = |at: i64| {
+                if whole_seconds {
+                    at / 1000 * 1000 + 999
+                } else {
+                    at
+                }
+            };
+            let mut s = ready();
+            submit_ok(&mut s, "r1", "first");
+            s.mark_pasted("r1", Instant::now(), 1_000);
+            let o = pass(
+                &mut s,
+                vec![prompt_hook_at("first", file(1_010))],
+                vec![user_at("u1", "t1", "first", 1_020)],
+                1,
+            );
+            assert!(o.contains(&Out::Accepted {
+                request_id: "r1".into()
+            }));
+            // Pass 1: the transcript's end of turn 1, its Stop not read yet.
+            let o = pass(&mut s, vec![], vec![end_at("t1", 1_500)], 2);
+            assert_eq!(completes(&o).len(), 1, "{o:?}");
+            assert_eq!(s.status().state, State::Ready);
+            submit_ok(&mut s, "r2", "second");
+            s.mark_pasted("r2", Instant::now(), 1_600);
+            // Pass 2: turn 1's Stop, turn 2's prompt hook and entry.
+            let o = pass(
+                &mut s,
+                vec![stop_at(file(1_550)), prompt_hook_at("second", file(1_650))],
+                vec![user_at("u2", "t2", "second", 1_700)],
+                3,
+            );
+            assert!(
+                o.contains(&Out::Accepted {
+                    request_id: "r2".into()
+                }),
+                "{o:?}"
+            );
+            assert!(
+                completes(&o).is_empty(),
+                "whole seconds {whole_seconds}: {o:?}"
+            );
+            assert_eq!(
+                s.status().state,
+                State::Working,
+                "whole seconds {whole_seconds}"
+            );
+            // Turn 2's own end completes it, once.
+            let o = pass(
+                &mut s,
+                vec![stop_at(file(4_010))],
+                vec![end_at("t2", 4_000)],
+                4,
+            );
+            assert_eq!(
+                completes(&o),
+                vec![&Out::Complete {
+                    turn_id: "t2".into(),
+                    request_id: Some("r2".into()),
+                    outcome: Outcome::Done
+                }]
+            );
+            assert_eq!(s.status().state, State::Ready);
+        }
+    }
+
+    /// A turn's own Stop is never dropped: in the same second as its
+    /// prompt on a filesystem keeping whole seconds (no earlier turn's Stop
+    /// is unread), and without any transcript end.
+    #[test]
+    fn a_turns_own_stop_in_the_same_second_still_completes_it() {
+        let mut s = ready();
+        submit_ok(&mut s, "r1", "quick");
+        s.mark_pasted("r1", Instant::now(), 1_000);
+        pass(
+            &mut s,
+            vec![prompt_hook_at("quick", 1_999)],
+            vec![user_at("u1", "t1", "quick", 1_100)],
+            1,
+        );
+        let o = pass(&mut s, vec![stop_at(1_999)], vec![], 2);
+        assert_eq!(
+            completes(&o),
+            vec![&Out::Complete {
+                turn_id: "t1".into(),
+                request_id: Some("r1".into()),
+                outcome: Outcome::Done
+            }]
+        );
+        assert_eq!(s.status().state, State::Ready);
+        // Its transcript end, read later, completes nothing more; a Stop
+        // after the turn's start completes the next turn at once.
+        assert!(completes(&pass(&mut s, vec![], vec![end_at("t1", 1_200)], 3)).is_empty());
+        pass(&mut s, vec![], vec![user_at("u2", "t2", "next", 2_500)], 4);
+        let o = pass(&mut s, vec![stop_at(2_600)], vec![], 5);
+        assert_eq!(completes(&o).len(), 1, "{o:?}");
     }
 
     #[test]
