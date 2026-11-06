@@ -1023,6 +1023,11 @@ fn a_reply_comes_back_as_data_and_its_sender_completes_the_task() {
         "{input}"
     );
     assert!(input.contains(", as data:\ncontract verified"));
+    // The result says how to finish the task: the reply alone doesn't.
+    assert!(
+        input.contains(&format!("Complete it with: atem message complete {task}")),
+        "{input}"
+    );
     let status = &rig.status(&id)["tasks"][0];
     assert_eq!(status["state"], "awaiting_result", "{status}");
     assert_eq!(status["detail"], "reply submitted", "{status}");
@@ -1227,7 +1232,7 @@ fn a_task_whose_sender_left_while_it_was_queued_still_runs_then_fails() {
 
 /// The task's route changes (a new revision) while its turn runs: only the
 /// return grant ends. The turn finishes, the reply is stored and never
-/// delivered, and the task then fails ("sender gone").
+/// delivered, and the task then fails ("route changed").
 #[test]
 fn a_route_change_mid_turn_ends_only_the_return_grant() {
     let mut rig = Rig::new();
@@ -1260,7 +1265,7 @@ fn a_route_change_mid_turn_ends_only_the_return_grant() {
         rig.status(&id)["tasks"][0]["state"] == "failed"
     });
     let status = &rig.status(&id)["tasks"][0];
-    assert_eq!(status["detail"], "sender gone", "{status}");
+    assert_eq!(status["detail"], "route changed", "{status}");
     assert_eq!(status["result"]["state"], "submitted", "{status}");
     std::thread::sleep(Duration::from_millis(500));
     assert!(
@@ -1326,6 +1331,56 @@ fn tasks_awaiting_their_result_expire_at_their_deadline() {
     assert!(
         late["stderr"].as_str().unwrap().contains("expired"),
         "{late}"
+    );
+}
+
+/// A restart in the task's turn leaves its outcome unknown, and with no
+/// reply it holds its session's queue only until its deadline: then it
+/// expires (nothing is resubmitted) and the session takes the next task.
+#[test]
+fn a_task_whose_outcome_is_unknown_expires_and_frees_its_session() {
+    let mut rig = Rig::new();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let id = send_expiring(&rig, &a, 1, "tag:b", "12s", "lost in a restart");
+    await_turn(&rig, &id, &session, &b, "lost in a restart");
+    rig.restart();
+    within("outcome unknown after the restart", || {
+        rig.status(&id)["tasks"][0]["state"] == "outcome_unknown"
+    });
+    // The interrupted turn ends; the session is ready, yet the next task
+    // waits behind the one whose outcome is unknown.
+    private(&b.join("complete"), "");
+    let next = rig.send(&a, 2, "tag:b", "the next task");
+    within("the next task waits", || {
+        rig.status(&next)["tasks"][0]["detail"] == "waiting for an earlier task on this session"
+    });
+    // Its deadline is up to 12 s after the send.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while rig.status(&id)["tasks"][0]["state"] != "expired" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the task to expire"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(
+        status["detail"], "expired with its outcome unknown",
+        "{status}"
+    );
+    within("the next task", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("the next task")
+    });
+    assert_eq!(
+        std::fs::read_to_string(b.join("input"))
+            .unwrap()
+            .matches("lost in a restart")
+            .count(),
+        1,
+        "never resubmitted"
     );
 }
 

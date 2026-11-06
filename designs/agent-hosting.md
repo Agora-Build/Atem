@@ -127,7 +127,8 @@ shell that has the values, or use `env_file`.
 removed profile fences launches that haven't started. Raise `revision` when
 approvals change: requests name the revision they were made under, a mismatch
 is `forbidden`, and work queued under an older revision stays blocked until it
-expires. A file that fails to load turns hosting off while it fails:
+expires (a local agent's task fails at once, "route changed";
+[agent collaboration](agent-collaboration.md) section 10). A file that fails to load turns hosting off while it fails:
 launches that haven't started are fenced, requests are `busy`, and
 `runtime.log` names the problem once (the parser's reason and line, or the
 profile and rule); within a second of the file being fixed hosting follows
@@ -372,7 +373,7 @@ screenshots and context.
 | Profiles, routes | 64 each; 64 principals each |
 | Launch identities | 4,096 |
 | Work identities, messages | 4,096 each |
-| Unfinished tasks (queued, blocked, submitting, submitted, awaiting a result) | 256 |
+| Unfinished tasks (queued, blocked, submitting, submitted; not those awaiting a result or of unknown outcome) | 256 |
 | Local collaboration (`[collab]`) | 32 agents per message; 30 messages per session per hour and 8 per workflow by default (a message counts once, however many agents it reaches) |
 | Uploads | 256 identities, 128 MiB declared bytes (partial uploads included) |
 | Live sessions | 16 (remote launches included) |
@@ -421,9 +422,10 @@ screenshots and context.
   sender, delivered into a local sender's agent only with origin-route
   consent.
 - **Not implemented:** progress push. Launch and task status are query-only.
-- **Not implemented:** resolving an `outcome_unknown` task by hand. It keeps
-  holding its session's queue and never expires, unless its agent submits a
-  reply (the task becomes `awaiting_result`) or, for a local task, its sender
+- **Not implemented:** resolving an `outcome_unknown` task by hand. It holds
+  its session's queue until it expires at its deadline ("expired with its
+  outcome unknown"; nothing is resubmitted), unless its agent submits a reply
+  first (the task becomes `awaiting_result`) or, for a local task, its sender
   completes it.
 - **Not implemented:** retention, compaction or pruning of `host-work.sqlite`
   and uploads.

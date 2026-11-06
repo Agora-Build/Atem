@@ -1054,18 +1054,17 @@ impl HostBridge {
         })
     }
 
+    /// One scheduling pass. It runs only while hosting runs, so no pause
+    /// applies here (`pause_local_tasks` marks local tasks during one).
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
-        // Awaiting a result past the deadline: expired, its slot freed.
+        // Awaiting a result, or of unknown outcome, past the deadline:
+        // expired, and an unknown outcome frees its session's queue.
         self.work
             .store
             .as_ref()
             .unwrap()
-            .expire_awaiting(host_now().wall_ms)?;
+            .expire_overdue(host_now().wall_ms)?;
         let tasks = self.work.store.as_ref().unwrap().active_tasks()?;
-        let pause = self
-            .local_authorized()
-            .then(|| self.local_pause_detail())
-            .flatten();
         let mut occupied = HashSet::new();
         for mut r in tasks {
             if r.status.state.terminal() && r.status.state != WorkState::OutcomeUnknown {
@@ -1102,19 +1101,17 @@ impl HostBridge {
                 self.work.store.as_ref().unwrap().save_work(&r)?;
                 continue;
             }
-            if self.collab_wait_for_launch(&mut r)? {
+            // A local task whose route or profile approval changed can never
+            // be dispatched under it: it fails at once rather than hold its
+            // session's queue until it expires. A remote sender's task stays
+            // blocked until then (work queued under an older revision).
+            if r.principal == "local" && self.collab_route_changed(&r) {
+                r.status.state = WorkState::Failed;
+                r.status.detail = collab_bridge::ROUTE_CHANGED.into();
+                self.work.store.as_ref().unwrap().save_work(&r)?;
                 continue;
             }
-            if r.principal == "local"
-                && let Some(detail) = &pause
-            {
-                // Waiting, not fenced: it keeps its place in the session's
-                // queue, and resumes with the same authority.
-                occupied.insert(r.task.target.session_id.clone());
-                if r.status.detail != *detail {
-                    r.status.detail = detail.clone();
-                    self.work.store.as_ref().unwrap().save_work(&r)?;
-                }
+            if self.collab_wait_for_launch(&mut r)? {
                 continue;
             }
             let local = (r.principal == "local" && !self.local_attachment().is_empty())
@@ -1764,6 +1761,47 @@ principals = ["local"]
                 )
                 .unwrap();
             assert_eq!(state, "ended");
+        });
+    }
+
+    /// A queued local task whose target route or profile approval changed
+    /// fails at once ("route changed") instead of holding its session's
+    /// queue until it expires; the session's next task goes on.
+    #[test]
+    fn a_queued_local_task_whose_route_changed_fails_and_frees_its_session() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let first = rig.message();
+            rig.publish(&first);
+            rig.until(|r| r.work(&first).turn_id.is_some()).await;
+            let queued = rig.message();
+            rig.publish(&queued);
+            rig.until(|r| {
+                r.work(&queued).status.detail == "waiting for an earlier task on this session"
+            })
+            .await;
+            // The owner approves a new revision of the route.
+            rig.bridge.work.config.routes[0].revision = 2;
+            rig.until(|r| r.work(&queued).status.state == WorkState::Failed)
+                .await;
+            assert_eq!(rig.work(&queued).status.detail, "route changed");
+            // The turn in progress is not touched.
+            assert_eq!(rig.work(&first).status.state, WorkState::Submitted);
+            std::fs::write(rig.fake.join("complete"), "").unwrap();
+            rig.until(|r| r.work(&first).status.state == WorkState::AwaitingResult)
+                .await;
+            let mut next = rig.message();
+            next.text = "UNDER_THE_NEW_REVISION".into();
+            if let Destination::Agent { route_revision, .. } = &mut next.recipients[0].destination {
+                *route_revision = 2;
+            }
+            rig.publish(&next);
+            rig.until(|r| {
+                std::fs::read_to_string(r.fake.join("input"))
+                    .unwrap_or_default()
+                    .contains("UNDER_THE_NEW_REVISION")
+            })
+            .await;
         });
     }
 

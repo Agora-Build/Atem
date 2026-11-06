@@ -464,10 +464,11 @@ its sender: two separate steps.
   is published, it permits exactly one delivery into that one session, and
   nothing else: no request, notify or launch authority, no other session. The
   reply arrives marked as data, not as the owner's instruction (`[atem] result
-  of task <id> from <sender>, as data:`), through the normal queue,
-  readiness, approval and lease checks, and only if the originating session's
-  route opts in (`results = true`); otherwise it is shown by `atem message
-  status`, never prompted. The grant stays live while the task is
+  of task <id> from <sender>, as data:`), followed by how to finish the task
+  (`Complete it with: atem message complete <task id>`), through the normal
+  queue, readiness, approval and lease checks, and only if the originating
+  session's route opts in (`results = true`); otherwise it is shown by `atem
+  message status`, never prompted. The grant stays live while the task is
   `outcome_unknown` after a restart.
 - **Completing.** Only the sender completes a task: a remote sender with
   `work_complete` and its own result snapshot (naming the reply as the result
@@ -483,15 +484,24 @@ its sender: two separate steps.
   ended, the sender's authority changed, or a route or profile approval the
   task depends on changed (its origin or target). That ends only the grant:
   nothing is delivered afterwards. Queued and in-turn tasks keep running
-  through the normal queue, and their agents may still reply; the reply is
-  stored and readable in `atem message status`, never delivered. Once such a
-  task awaits its result nobody can complete it, so it ends `failed` ("sender
+  through the normal queue (except a queued local task whose own route
+  changed, below), and their agents may still reply; the reply is stored and
+  readable in `atem message status`, never delivered. Once such a
+  task awaits its result nobody can complete it, so it ends `failed` ("route
+  changed" when its own route or profile approval changed, else "sender
   gone"), its reply kept readable. A cancelled task ends cancelled. A queued
-  task whose route revision changed stays blocked until it expires (the
-  host-work rule for work queued under an older revision). Every task awaiting
-  its result, for any sender and whether its grant is open, consumed or ended,
-  expires at its deadline ("expired awaiting a result"), so none holds a queue
-  slot forever.
+  or blocked local task whose route or profile approval changed (a new route
+  or profile revision or project, or the route no longer names `local`) fails
+  at once ("route changed") instead of holding its session's queue; a remote
+  sender's task stays blocked until it expires (the host-work rule for work
+  queued under an older revision).
+- **Expiry.** Every task awaiting its result, for any sender and whether its
+  grant is open, consumed or ended, expires at its deadline ("expired awaiting
+  a result"), and so does a task whose outcome is unknown ("expired with its
+  outcome unknown"; nothing is resubmitted), so none waits, or holds its
+  session's queue, forever. A task awaiting its result holds no place in the
+  queue: only queued, blocked, submitting and submitted tasks count toward the
+  256 unfinished tasks.
 - **Automatic reports.** A turn that ends without a reply leaves the task
   `awaiting_result`. After `result_timeout` (default 30 minutes) the runtime
   records a progress report ("turn ended without a reply"), never a result: it

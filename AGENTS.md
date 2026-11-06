@@ -315,10 +315,13 @@ reply's vault reference must name its entry. Remote senders read it with
 `reply_query`. Only the sender completes a task: `message complete TASK_ID`
 (its sending session, or the owner outside any session; it stops a queued
 delivery) or `work_complete`. `results = true` on its origin route permits one
-queued result as data. A task whose return grant ends early (origin process
-gone, sender authority or a route changed) keeps running but delivers nothing,
-and fails `sender gone` once it awaits its result; every task awaiting a result
-expires at its deadline. Automatic timeout reports remain status only. Empty
+queued result as data, ending with `Complete it with: atem message complete
+TASK_ID`. A task whose return grant ends early (origin process gone, sender
+authority or a route changed) keeps running but delivers nothing, and fails
+`sender gone` (`route changed` for its own route or profile) once it awaits
+its result; a queued local task whose route or profile approval changed fails
+`route changed` at once. Every task awaiting a result or of unknown outcome
+expires at its deadline, and one awaiting its result holds no queue slot. Automatic timeout reports remain status only. Empty
 routes can opt in to `launch = "on_message"` (Claude Code profiles only; a Codex
 route is refused when the file loads): only `message send --launch` with an
 `atem:<id>/<route>` selector starts one, using the existing approved-profile
@@ -337,8 +340,8 @@ never admitted from remote channels. Cross-instance delivery is not built.
 
 **Shared Task Queue / Chisel/mark** (`runtime/host_work.rs`, `runtime/host_work_bridge.rs`):
 Executable messages and mark tasks share durable work records and FIFO order per
-session. Blocked/submitted/uncertain work holds later work on that session;
-independent sessions can proceed. All use current r9 sender authority,
+session. Blocked/submitted/uncertain work holds later work on that session
+(uncertain work until it expires); independent sessions can proceed. All use current r9 sender authority,
 notify/prompt route consent, readiness/draft/approval/lease checks and normal
 session-v1 prompt receipts. Turn-end is `awaiting_result`; completion is explicit.
 No separate mark queue, model triage or background `claude -p` remains.

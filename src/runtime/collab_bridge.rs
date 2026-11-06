@@ -20,6 +20,10 @@ pub(super) const IN_TURN: &str = "in the agent's turn";
 /// can complete it any more.
 const SENDER_GONE: &str = "sender gone";
 
+/// A local task whose target route or profile approval changed since it was
+/// accepted: it can never be dispatched, or its result delivered, under it.
+pub(super) const ROUTE_CHANGED: &str = "route changed";
+
 /// How often counter rows whose window passed are pruned (besides at each
 /// counted send).
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
@@ -657,7 +661,7 @@ impl HostBridge {
     /// reply, stored and readable, never delivered. Once such a task awaits
     /// its result, nobody can complete it: it fails ("sender gone"). A grant
     /// that ran out ends with its task, which expires at its deadline
-    /// (`Store::expire_awaiting`). An open, live grant permits the one
+    /// (`Store::expire_overdue`). An open, live grant permits the one
     /// delivery of a submitted reply (where the origin route opts in), or a
     /// report on a silent turn. A grant is written only when its state
     /// changes. Runs only outside a pause.
@@ -802,16 +806,40 @@ impl HostBridge {
     }
 
     /// A task awaiting its result whose return grant ended early: nobody
-    /// can complete it any more, so it fails ("sender gone") instead of
-    /// waiting (spec section 10, "Ending early"); its reply, if any, stays
+    /// can complete it any more, so it fails instead of waiting (spec
+    /// section 10, "Ending early"): "route changed" when its own route or
+    /// profile approval changed, else "sender gone". Its reply, if any, stays
     /// readable. A task in any other state is left as it is.
     fn collab_sender_gone(&self, task: &mut WorkRecord) -> Result<()> {
         if task.status.state == WorkState::AwaitingResult {
             task.status.state = WorkState::Failed;
-            task.status.detail = SENDER_GONE.into();
+            task.status.detail = if self.collab_route_changed(task) {
+                ROUTE_CHANGED
+            } else {
+                SENDER_GONE
+            }
+            .into();
             self.work.store.as_ref().unwrap().save_work(task)?;
         }
         Ok(())
+    }
+
+    /// The route or profile approval a local task was accepted under is no
+    /// longer the one in `runtime.toml`: the route is gone or has another
+    /// revision or profile, no longer names `local`, or its profile has
+    /// another revision or project.
+    pub(super) fn collab_route_changed(&self, task: &WorkRecord) -> bool {
+        let Some(route) = self.work.config.route(&task.route_id) else {
+            return true;
+        };
+        let Some(profile) = self.work.config.profile(&route.profile_id) else {
+            return true;
+        };
+        route.revision != task.route_revision
+            || !route.principals.iter().any(|p| p == "local")
+            || profile.id != task.profile_id
+            || profile.revision != task.profile_revision
+            || profile.project != task.project
     }
 
     /// The return grant of `task_id` ended: a delivery of its reply still

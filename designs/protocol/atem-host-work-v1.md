@@ -232,8 +232,8 @@ capacity limit or on a storage failure). The reply follows the durable
 | `completed` | `work_complete` stored the result |
 | `failed` | the prompt was rejected, or couldn't be built |
 | `cancelled` | cancelled before submission |
-| `expired` | not submitted by `expires_at`, or still `awaiting_result` at it (detail `expired awaiting a result`) |
-| `outcome_unknown` | the submission is uncertain; never resubmitted |
+| `expired` | not submitted by `expires_at`, or still `awaiting_result` at it (detail `expired awaiting a result`) or `outcome_unknown` (detail `expired with its outcome unknown`) |
+| `outcome_unknown` | the submission is uncertain; never resubmitted; `expired` at `expires_at` |
 
 `receipt_id` (UUID v4, fixed at enqueue) is the session-v1 `request_id` of the
 prompt. `detail` is display text of at most 1024 bytes; clients don't parse
@@ -244,7 +244,8 @@ it. `result` is a context snapshot exactly when the state is `completed`, else
 
 Tasks of one session run in enqueue order. A task that is queued, blocked,
 submitting, submitted or `outcome_unknown` holds the later tasks of its
-session; one awaiting its result doesn't. A task is dispatched when the
+session (an `outcome_unknown` one until it expires at `expires_at`); one
+awaiting its result doesn't. A task is dispatched when the
 sender has an authorized channel open that passes the work checks, the session
 is live with chat and `ready`, the terminal has no unsent input, nobody holds
 the lease, no approval is open on the session, and its attachments are
@@ -573,5 +574,5 @@ limit (4,096 launches, tasks or messages; 256 unfinished tasks; 256 uploads or
   and dispatch needs the sender's live channel. There is no origin proof and no
   host-to-host sender.
 - **Not implemented:** resolving an `outcome_unknown` task by hand (a reply
-  its agent submits moves it to `awaiting_result`; nothing else does), and
-  archival or compaction of the host's records.
+  its agent submits moves it to `awaiting_result`; otherwise it expires at
+  `expires_at`), and archival or compaction of the host's records.
