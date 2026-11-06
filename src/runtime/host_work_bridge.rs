@@ -114,9 +114,6 @@ pub(super) struct State {
     scheduled: Instant,
     recovered: bool,
     pending: HashMap<String, PendingLaunch>,
-    /// Local launches fenced by a plain session-journal halt
-    /// (`local_halted`), so their tasks say so if they fail.
-    halted_launches: HashSet<String>,
     launches: VecDeque<RemoteLaunch>,
     context_jobs:
         HashMap<String, tokio::sync::oneshot::Receiver<anyhow::Result<Vec<hw::ContextSnapshot>>>>,
@@ -143,7 +140,6 @@ impl State {
             scheduled: Instant::now(),
             recovered: false,
             pending: HashMap::new(),
-            halted_launches: HashSet::new(),
             launches: VecDeque::new(),
             context_jobs: HashMap::new(),
             cleanup: Instant::now(),
@@ -494,7 +490,6 @@ impl HostBridge {
             p.permit.store(false, Ordering::SeqCst);
         }
         self.work.launches.clear();
-        self.work.halted_launches.clear();
         self.work.context_jobs.clear();
         self.work.recovered = false;
         let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
@@ -536,8 +531,7 @@ impl HostBridge {
                     // identity, a lost device list, a changed approval. So
                     // does a plain session-journal halt (`local` is fenced in
                     // memory): only a restart ends it, and the restart drops
-                    // a launch not started anyway; its task says why
-                    // (`halted_launches`). A pause waits
+                    // a launch not started anyway. A pause waits
                     // (`take_remote_launches`); while it lasts the approval
                     // can't be compared (the file may not load), which is no
                     // change: it is compared again when the pause ends.
@@ -567,9 +561,6 @@ impl HostBridge {
                 };
             if !allowed {
                 p.permit.store(false, Ordering::SeqCst);
-                if !remote && self.local_halted() {
-                    self.work.halted_launches.insert(id);
-                }
             }
         }
     }
@@ -3480,10 +3471,10 @@ launch = "on_message"
 
     /// A plain session-journal halt fences a local launch that has not
     /// started (only a restart ends the halt, and the restart drops the
-    /// launch anyway): its task says so, never that the route's launch
-    /// failed.
+    /// launch anyway): it is handed out to be refused at its guard, like
+    /// every fenced launch.
     #[test]
-    fn a_launch_fenced_by_a_halted_journal_says_so() {
+    fn a_halted_journal_fences_a_local_launch_not_started() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
             launch_route(&mut rig, root);
@@ -3501,33 +3492,14 @@ launch = "on_message"
             assert!(rig.bridge.host.journal_halted());
             idle(&mut rig, 350).await;
             let launches = rig.bridge.take_remote_launches();
-            assert_eq!(launches.len(), 1);
-            assert!(!(launches[0].guard)());
-            // What the launcher reports when the guard refuses.
-            rig.bridge.remote_launched(&request, LaunchState::Failed);
-            idle(&mut rig, 350).await;
-            let task = rig
-                .bridge
-                .work
-                .store
-                .as_ref()
-                .unwrap()
-                .open_tasks()
-                .unwrap()
-                .remove(0);
-            assert_eq!(
-                (task.status.state, task.status.detail.as_str()),
-                (
-                    WorkState::Failed,
-                    "launch not started: the session journal halted; run `atem runtime restart`"
-                )
+            assert_eq!(launches.len(), 1, "released to fail, never held");
+            assert_eq!(launches[0].request_id, request);
+            assert!(
+                !rig.bridge.work.pending[&request]
+                    .permit
+                    .load(Ordering::SeqCst)
             );
-            // A new host identity starts a new store: the set goes with it.
-            assert!(!rig.bridge.work.halted_launches.is_empty());
-            let mut other = rig.bridge.work_host();
-            other.host_trust_gen += 1;
-            assert!(rig.bridge.work_store_ready(&other));
-            assert!(rig.bridge.work.halted_launches.is_empty());
+            assert!(!(launches[0].guard)());
         });
     }
 
