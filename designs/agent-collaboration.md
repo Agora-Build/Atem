@@ -267,9 +267,10 @@ digest), plus:
   their way back to it. A local envelope's `sender` is `local`, valid only on
   the internal attachment (today a sender must be `member:` or `service:`,
   equal to the channel's principal; that rule stays for every channel).
-  `from_session` and `reply_to` are local-only: a remote `message_publish`
-  carrying either, or a `kind` other than `request`, is refused. Stage 1 sends
-  only requests; a task's result is its reply (section 10), not an envelope;
+  `from_session` and `reply_to` are local-only: a remote envelope carrying
+  either, or a `kind` other than `request`, is invalid (the shared SDK's
+  `Message::valid`), so an SDK sender never sends one and the host refuses it
+  at decode (`invalid_request`). Stage 1 sends only requests; a task's result is its reply (section 10), not an envelope;
 - stage 3: `origin`, the sender's signature over the canonical envelope
   (**needs agreement**).
 

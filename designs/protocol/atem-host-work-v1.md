@@ -365,10 +365,10 @@ the task.
 
 The envelope's optional `kind`, `reply_to` and `from_session` belong to local
 collaboration ([../agent-collaboration.md](../agent-collaboration.md), section
-7): a remote `message_publish` carrying `from_session` or `reply_to`, or a
-`kind` other than `request`, is refused: `unsupported_version`, or
-`invalid_request` when the envelope doesn't decode (a `kind` other than
-`request` needs a `reply_to`).
+7): a remote envelope carrying `from_session` or `reply_to`, or a `kind` other
+than `request`, is invalid (`Message::valid`). The SDK refuses to send one, and
+the host refuses it at decode with `invalid_request`, as hosts did before these
+fields existed (the shared vectors have the cases).
 
 A message has text that isn't blank, context or a mark, and serializes to at
 most 240 KiB. At first acceptance `created_at` is at most 60 s ahead of the

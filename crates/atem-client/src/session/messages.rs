@@ -105,11 +105,18 @@ pub struct Message {
 }
 
 impl Message {
+    /// A remote sender's envelope. The sending session, the reply link and
+    /// kinds other than `request` belong to the runtime's own `local` sender
+    /// (`valid_local`): a remote envelope carrying one is invalid.
     pub fn valid(&self) -> bool {
         let sender_ok = ["member:", "service:"]
             .iter()
             .any(|prefix| self.sender.strip_prefix(prefix).is_some_and(is_opaque_id));
-        sender_ok && self.valid_body(false)
+        sender_ok
+            && self.kind == MessageKind::Request
+            && self.reply_to.is_none()
+            && self.from_session.is_none()
+            && self.valid_body(false)
     }
 
     /// Only the runtime's internal attachment may accept this sender.
@@ -421,6 +428,39 @@ mod tests {
         assert!(!snapshot.valid());
     }
 
+    /// The sending session, the reply link and kinds other than `request`
+    /// belong to the runtime's own sender: a remote envelope carrying one is
+    /// invalid (so the host refuses it at decode, and an SDK sender never
+    /// builds one), while `valid_local` keeps accepting them.
+    #[test]
+    fn a_remote_message_refuses_the_local_only_fields() {
+        let base = message();
+        assert!(base.valid());
+        let reply_to = ReplyTo {
+            message_id: new_id(),
+            task_id: new_id(),
+        };
+        let mut from_session = base.clone();
+        from_session.from_session = Some("ses-abcdefghijkl".into());
+        let mut replying = base.clone();
+        replying.reply_to = Some(reply_to.clone());
+        let mut results = Vec::new();
+        for kind in [MessageKind::Status, MessageKind::Result] {
+            let mut m = base.clone();
+            m.kind = kind;
+            m.reply_to = Some(reply_to.clone());
+            results.push(m);
+        }
+        for m in [from_session, replying].iter().chain(&results) {
+            assert!(!m.valid(), "{m:?}");
+            assert!(m.publications().is_err());
+            let mut local = m.clone();
+            local.sender = "local".into();
+            local.from_session = Some("ses-abcdefghijkl".into());
+            assert!(local.valid_local(), "{local:?}");
+        }
+    }
+
     #[test]
     fn select_budgets_total_at_most_32() {
         let mut m = message();
@@ -477,12 +517,10 @@ mod tests {
         assert!(decoded.kind == MessageKind::Request);
         assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
         decoded.kind = MessageKind::Result;
-        assert!(!decoded.valid());
         decoded.reply_to = Some(ReplyTo {
             message_id: new_id(),
             task_id: new_id(),
         });
-        assert!(decoded.valid());
         assert_eq!(
             serde_json::from_value::<Message>(serde_json::to_value(&decoded).unwrap()).unwrap(),
             decoded

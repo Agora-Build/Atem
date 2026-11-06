@@ -1813,18 +1813,32 @@ fn messages_bind_sender_content_destinations_and_service_scope() {
     changed["message_id"] = json!(uuid());
     changed["sender"] = json!(format!("member:{MAC}"));
     assert_eq!(publish(&mut dev, &mut r, &changed)["code"], "forbidden");
-    // The sending session and the reply link are local-only: a remote sender
-    // gets them refused like any other kind that is not a request.
-    for (field, value) in [
-        ("from_session", json!("ses-abcdefghijkl")),
-        ("reply_to", json!({"message_id": uuid(), "task_id": uuid()})),
+    // The sending session, the reply link and kinds other than a request are
+    // local-only: a remote envelope with one is invalid. The SDK refuses to
+    // send it (the host refuses it at decode, `invalid_request`; the shared
+    // vectors cover that), and nothing is recorded.
+    let reply_to = json!({"message_id": uuid(), "task_id": uuid()});
+    for (field, value, extra) in [
+        ("from_session", json!("ses-abcdefghijkl"), None),
+        ("reply_to", reply_to.clone(), None),
+        ("kind", json!("result"), Some(("reply_to", reply_to))),
     ] {
         let mut local_only = notice("service:svc-message", "Ready", vec![json!({"kind":"host"})]);
         local_only[field] = value;
-        assert_eq!(
-            publish(&mut dev, &mut r, &local_only)["code"],
-            "unsupported_version",
-            "{field}"
+        if let Some((name, value)) = extra {
+            local_only[name] = value;
+        }
+        let refused = dev
+            .a
+            .send(
+                &json!({"type":"session","data":{"v":1,"id":uuid(),"op":"message_publish",
+                    "host":host(),"message":local_only}}),
+                client_ms(),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("invalid_request"),
+            "{field}: {refused:?}"
         );
         assert!(message_status(&mut dev, &mut r, &local_only).is_null());
     }

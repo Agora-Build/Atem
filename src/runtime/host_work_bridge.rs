@@ -875,7 +875,9 @@ impl HostBridge {
         let store = self.work.store.as_ref().ok_or("busy")?;
         let message_id = match req {
             hw::Request::Publish { message, .. } => {
-                // The sending session and the reply link are local-only.
+                // The sending session and the reply link are local-only. A
+                // remote envelope with one doesn't decode (`Message::valid`);
+                // this check stays as the last line.
                 if message.kind != atem_client::session::messages::MessageKind::Request
                     || a.remote().is_some()
                         && (message.from_session.is_some() || message.reply_to.is_some())
