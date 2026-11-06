@@ -126,16 +126,20 @@ shell that has the values, or use `env_file`.
 **Reloads.** The runtime rereads `runtime.toml` every second. A changed or
 removed profile fences launches that haven't started. Raise `revision` when
 approvals change: requests name the revision they were made under, a mismatch
-is `forbidden`, and work queued under an older revision stays blocked until it
-expires (a local agent's task fails at once, "route changed"; [agent
-collaboration](agent-collaboration.md) section 10). A file that fails to load
-turns hosting off while it fails: launches that haven't started are fenced,
-requests are `busy`, and `runtime.log` names the problem once (the parser's
-reason and line, or the profile and rule); within a second of the file being
-fixed hosting follows it again, no restart needed. A host-work database fault
-(it can't be opened or recovered, or a write failed) turns hosting off until
-`atem runtime restart`, since a failed write leaves that step's outcome unknown
-(`runtime.log` names the database).
+is `forbidden`, and work queued under an older revision, or under a route that
+no longer lists its sender, fails at once for every sender (`route changed`;
+[agent collaboration](agent-collaboration.md) section 10, "Lifecycle"). A
+profile edit that keeps its id, revision and project (a changed `cwd` or
+`provider`) is no change of approval: its queued work stays blocked until it
+expires. A file that fails to load turns hosting off while it fails: launches
+that haven't started wait, requests are `busy`, queued work waits (nothing
+dispatches, fails or expires), and `runtime.log` names the problem once (the
+parser's reason and line, or the profile and rule); within a second of the
+file being fixed hosting follows it again, no restart needed. A host-work
+database fault (it can't be opened or recovered, or a write failed) turns
+hosting off until `atem runtime restart`, since a failed write leaves that
+step's outcome unknown (`runtime.log` names the database), and fences launches
+that haven't started.
 
 ## 3. Commands
 
@@ -193,8 +197,13 @@ owner's local consent in `runtime.toml`.
 - Before launch and before each dispatch the runtime checks again: membership
   not held, frozen or faulted, journal healthy, channel not expired, the
   caller's key unchanged, its `control_gen` unchanged, scope and local consent
-  still in place. Work fenced this way stays blocked until it expires; a new
-  grant doesn't revive it.
+  still in place. A task whose sender's `control_gen` moved on (a fence) or
+  whose authorization expired fails at once (`sender's authority changed`,
+  `sender's authorization expired`), whether it is queued, blocked, awaiting
+  its result or of unknown outcome; a running turn is never interrupted. A new
+  grant doesn't revive it, and its sender can no longer read it (`forbidden`).
+  A sender that merely has no authorized channel open waits, and its task holds
+  its session's queue until the task's deadline.
 - Memory or vault access gives no execution right. Vault `writer_id` and relay
   room names are labels, not authority.
 
@@ -229,6 +238,13 @@ request id returns the recorded status; the same id with other content or from
 another principal is `request_id_reused`. After a runtime restart a `starting`
 launch becomes `started` when its worker was adopted with the reserved process
 generation, else `outcome_unknown`.
+
+A launch that hasn't started when hosting pauses (an invalid `runtime.toml`,
+`enabled = false`) waits and starts once the pause ends, while its sender's
+channel, `control_gen` and the profile approval hold and its expiry hasn't
+passed; requests are `busy` meanwhile. A receipt-database fault fences it, and
+so does a halted session journal: it is never started and ends
+`outcome_unknown`.
 
 A remote session is an ordinary session: `atem agent list` shows it, `atem
 agent attach` opens it locally, and remote terminal and chat work as for any
@@ -277,10 +293,12 @@ context snapshot (version and digest), and adds verified screenshot paths.
 **Scheduling.** The runtime checks the queue every 100 ms; no model call or
 agent polling is involved. Tasks run FIFO per session, mark tasks included. An
 earlier task that is blocked, being submitted, submitted or uncertain holds
-later tasks for its session; other sessions go on. A task is blocked while:
+later tasks for its session (an offline sender's task, until its deadline);
+other sessions go on. A task is blocked while:
 
 - an earlier task holds the session;
-- the sender has no authorized channel open, or its route consent changed;
+- the sender has no authorized channel open (its route consent changing fails
+  the task instead: `route changed`);
 - the target session is gone, not live, has no chat, or isn't `ready`
   (working, waiting or unknown);
 - the terminal has unsent input (a draft);
@@ -294,9 +312,13 @@ the sender's channel. It is remote input under the sender's principal: no
 takeover, no local-input exception, no typing into a running tool or approval
 dialog. The scheduler never renews or takes over a lease. The prompt receipt
 decides the task's state: `submitted`, then `awaiting_result` when the turn
-ends, `failed` when rejected, `outcome_unknown` when uncertain. After a
-restart, a task left `submitting` becomes `outcome_unknown` and is reconciled
-from its receipt; it is never sent again.
+ends (detail `turn interrupted` when it ended interrupted), `failed` when
+rejected (with the receipt's own detail: `control revoked`, `host trust
+changed`, `session closed`), `outcome_unknown` when uncertain. A submitted task
+whose receipt the session host no longer has becomes `outcome_unknown` (detail
+`receipt no longer available`). After a restart, a task left `submitting`
+becomes `outcome_unknown` and is reconciled from its receipt; it is never sent
+again.
 
 **Results.** A finished turn is not a finished task. The sender calls
 `work_complete` with an immutable result snapshot (e.g. the vault entry the
@@ -309,14 +331,17 @@ session, process and turn, and never completes the task. The sender reads it
 with `reply_query{task_id}` (feature `host.reply`, ops `notify` and `prompt`):
 the same authorization as `work_query`, answered `{kind:"reply", reply}` with
 `reply` `null` until one exists, else `{result_id, state, digest, text,
-context, submitted_at}` and a state of `publishing`, `submitted` or `refused`
+context, submitted_at, dropped}` and a state of `publishing`, `submitted` or
+`refused`
 ([protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md#reply)). The
 reply isn't pushed: poll it, and complete the task with `work_complete`.
 
 **Cancel and expiry.** `work_cancel` works only while a task is `queued` or
-`blocked`; it never interrupts a turn (use session-v1 `interrupt`). A task not
-submitted by its `expires_at`, or still awaiting its result or of unknown
-outcome at it, becomes `expired`; nothing is resubmitted.
+`blocked`; it never interrupts a turn (use session-v1 `interrupt`, which ends
+the turn and leaves the task awaiting its result). A task not submitted by its
+`expires_at`, or still awaiting its result or of unknown outcome at it,
+becomes `expired`; nothing is resubmitted. A task whose sender's authority or
+whose route approval changed fails before its deadline (section 4, section 2).
 
 ## 8. Screenshots and Chisel/mark
 
@@ -361,28 +386,33 @@ started, and starts an empty one. Nothing it held could be honored again:
 every request names the host, trust generation included, so a retry for the
 old identity is `stale_target`.
 
-About once a minute the runtime prunes what settled a day past its deadline:
-tasks completed, failed, cancelled or expired (with their reply, return grant
-and resolution), messages whose tasks all go (with their local outbox and
-origin rows), local sends never accepted, launches that are no longer starting
-and that no remaining task waits for, and uploads that no remaining task names
-(with their cached PNG). A live task is never removed, nor what it needs: its
-message and that message's other tasks, its launch, its uploads, the reply its
-delivery carries. A retry of a pruned request names a deadline that passed, so
-it is refused (`invalid_request`, or `forbidden` if the route no longer allows
-it) and never becomes work again; a query for a pruned id gets the answer for
-an unknown one (`forbidden`). An upload that no task ever named is not pruned
-(the upload limits hold it). At a limit the runtime refuses new requests with
-`busy` instead of evicting anything. Files and the database are owner-private
-but not encrypted at rest; keep secrets out of screenshots and context.
+Records are never deleted. Every launch, task, message and reply row stays for
+the life of the database, so a query or a retry is always answered from its
+record. A day after a record settled past its deadline, the runtime (about once
+a minute) drops its payloads only: a task's prompt and context text, a
+message's inline text and context text, a reply's text, and the bytes of an
+upload (with its cached PNG) that no open task names. Ids, principals,
+revisions, session ids, states, details, digests, sizes, timestamps and a
+task's attachment descriptors stay, and so do a `work_complete` result and a
+message's `mark`. The queries keep answering (`reply_query` says `dropped:
+true`), and a retry is deduplicated by the digest stored at acceptance: the
+identical request returns the recorded receipt, other content is
+`request_id_reused`. The 4,096-record limits count records not yet closed this
+way, so a closed record frees its slot; at a limit the runtime refuses new
+requests with `busy` instead of evicting anything. An upload no task ever named
+is not dropped (the upload limits hold it). The file grows by a compact row set
+per task and is never trimmed: moving it aside is the only reset. [Agent
+collaboration](agent-collaboration.md) section 10 ("Records and retention") has
+the details. Files and the database are owner-private but not encrypted at
+rest; keep secrets out of screenshots and context.
 
 ## 10. Limits
 
 | Item | Limit |
 |---|---|
 | Profiles, routes | 64 each; 64 principals each |
-| Launch identities | 4,096 |
-| Work identities, messages | 4,096 each |
+| Open launch records | 4,096 (a record closes when its payloads are dropped; none is deleted) |
+| Open work records, messages, local sends | 4,096 each (same) |
 | Unfinished tasks (queued, blocked, submitting, submitted; not those awaiting a result or of unknown outcome) | 256 |
 | Local collaboration (`[collab]`) | 32 agents per message; 30 messages per session per hour and 8 per workflow by default (a message counts once, however many agents it reaches) |
 | Uploads | 256 identities, 128 MiB declared bytes (partial uploads included) |
@@ -437,9 +467,9 @@ but not encrypted at rest; keep secrets out of screenshots and context.
   outcome unknown"; nothing is resubmitted), unless its agent submits a reply
   first (the task becomes `awaiting_result`) or, for a local task, its sender
   completes it.
-- **Not implemented:** archival or compaction of `host-work.sqlite`, and
-  pruning an upload that no task ever named (records settled a day past their
-  deadline are pruned, section 9).
+- **Not implemented:** deleting, archiving or compacting records in
+  `host-work.sqlite` (every receipt is kept and only payloads go, section 9),
+  and dropping an upload that no task ever named.
 - **Not implemented:** `atem cred get` as an environment source for profiles.
 - **Not implemented:** launching into a new clone or Git worktree; profiles name
   existing directories.
@@ -459,7 +489,8 @@ to the running runtime (they never start or replace one). A `runtime.toml`
 that doesn't load, hosting off or a database fault pauses local work without
 fencing it (sends are refused, queued tasks wait, replies are stored, except
 that a database fault refuses a reply and a completion until `atem runtime
-restart`); `[collab] send = false` only refuses new sends. A session is
+restart`); a halted session journal holds local tasks the same way until that
+restart; `[collab] send = false` only refuses new sends. A session is
 launched only for `atem message send --launch` on a route with
 `launch = "on_message"`, and only for a Claude Code profile. **Not implemented:** cross-instance transport, the
 shared Station directory and mailbox, and the stages 2-3 permission
@@ -492,8 +523,9 @@ design:
 fake CLIs in temp profiles: `runtime start`/`check` and pairing, concurrent
 starts, approved exports, launch deduplication and adoption after restart,
 scoped and local consent, drafts, leases, approvals, cancel and expiry, sender
-fencing, message fanout, uploads, mark tasks, and replies read with
-`reply_query`. Shared request vectors are
+fencing and the failures it causes, route changes, launches that wait out a
+pause, message fanout, uploads, mark tasks, replies read with `reply_query`,
+and records kept with their payloads dropped. Shared request vectors are
 `protocol/fixtures/host-work/requests-v1.json`. Real provider APIs, OS services
 and Station delivery are not exercised.
 

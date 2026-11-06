@@ -81,9 +81,9 @@ src/
 │   ├── push_queue.rs    #   push_approval/push_resolved for the relay: latest state while the link is down, bounded
 │   ├── session_log.rs   #   session.ansi + summary.md under `<config>/logs/<session_id>/`
 │   ├── host_bridge.rs   #   atem-session host in the broker: SessionHost + FileJournal over the workers (attachments, leases, receipts, approvals, terminal-v1 frames, chat-v1 and its r8 history, receipt results)
-│   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes (no `principals`: the paired Astation's `member:<id>`; errors name the field/line or the profile and rule; `runtime check` lists who may launch), environment sources, durable launch/task/attachment SQLite records
+│   ├── host_work.rs     #   opt-in private runtime.toml profiles/routes (no `principals`: the paired Astation's `member:<id>`; errors name the field/line or the profile and rule; `runtime check` lists who may launch), environment sources, durable launch/task/attachment SQLite records (kept for good; only payloads are dropped a day after a settled record's deadline)
 │   ├── host_attachments.rs # PNG chunk persistence, sender binding, verified private cache for task prompts
-│   ├── host_work_bridge.rs # host launch/query and directed-work scheduling over normal receipts; config/authority rechecks, no takeover, explicit results
+│   ├── host_work_bridge.rs # host launch/query and directed-work scheduling over normal receipts; config/authority rechecks (a changed authority or route approval fails the task), no takeover, explicit results
 │   ├── collab.rs        #   local selectors, fixed resolutions, durable outbox/message counters/scoped status; collab_results.rs stores narrow return grants and one reply per task (`reply_query` reads it)
 │   ├── collab_context.rs #  publish/read-back exact Memory/Vault snapshots before delivery (background jobs with durable retries)
 │   ├── collab_bridge.rs #   internal attachment, sending/replying/completing, workflow inheritance, pauses, correlated results, tasks that end with their grant and automatic status reports
@@ -92,7 +92,7 @@ src/
 │   ├── ops.rs           #   Astation operations on the broker's link: pair, pair verify, cred unlock/projects, paired-token refresh
 │   ├── op_client.rs     #   the CLI side of an operation: print/ask/answer/done (answers from /dev/tty)
 │   ├── project_scope.rs #   r9 service `projects` scopes: keyed hashes of each session's launch project key from the cred agent, cached; pending = out of scope
-│   ├── test_hooks.rs    #   debug builds only: the fixture clock and PTY write faults (ATEM_TEST_CLOCK_FILE, ATEM_TEST_PTY_FAULTS), r9: host clock, membership faults/carriage, state dump, project hashes (ATEM_TEST_HOST_CLOCK, _MEMBERSHIP_FAULTS, _STATE_DUMP, _PROJECT_HASHES, _NO_INIT_LIMIT)
+│   ├── test_hooks.rs    #   debug builds only: the fixture clock and PTY write faults (ATEM_TEST_CLOCK_FILE, ATEM_TEST_PTY_FAULTS), r9: host clock, membership faults/carriage, state dump, project hashes (ATEM_TEST_HOST_CLOCK, _MEMBERSHIP_FAULTS, _STATE_DUMP, _PROJECT_HASHES, _NO_INIT_LIMIT); `<ATEM_TEST_PTY_FAULTS dir>/hold_dispatch` and `hold_launches` keep accepted work queued and reserved launches unstarted
 │   └── *_tests.rs       #   (test-only) server, ops, adoption, broker and host bridge (in-process workers, fake Astation peer)
 ├── session_protocol/    # atem-session v1 (r8; r9 host side), transport-independent (designs/protocol/atem-session-v1.md)
 │   ├── revision.rs      #   re-exports atem_client::session::revision: r8 revision (8), the nine feature names, FEATURES, R8_FIXTURE_NEEDS, R9_NOT_RUN
@@ -203,7 +203,7 @@ tests/                   # binary tests on temp HOME/XDG_RUNTIME_DIR (never the 
 ├── r9_harness.rs        # headless multi-device harness (test target only): one real host, simulated phones/bots/browsers through atem-client
 ├── r9_admission_binary.rs, r9_multi_device_binary.rs, r9_push_binary.rs, r9_services_binary.rs, r9_two_hosts_binary.rs, r9_revoked_binary.rs, r9_host_route_binary.rs, membership_binary.rs # r9 in the real runtime: admission/fences, several devices, sealed push/seen, two enrolled hosts freezing on a forked list, the revoked grants quarantine across restarts and a clock set back between two damages, the host route proof with no Astation online, services (approvals, scope restrictions, live renewal/narrowing, K rotation, held host, revoke_grant), the device list's durability and faults
 ├── approvals_real_agents.rs # #[ignore], ATEM_REAL_AGENTS=1: approvals answered from a fake Astation with the real Claude Code and Codex in temp HOME/CODEX_HOME
-├── collab_binary.rs      # local tags, fan-out, fixed resolution, limits, context, replies and completion, pauses, ended/expired tasks and launch-on-message through real agent-child commands
+├── collab_binary.rs      # local tags, fan-out, fixed resolution, limits, context, replies and completion, pauses, departed senders, interrupted/expired tasks and launch-on-message through real agent-child commands
 ├── runtime_binary.rs, worker_binary.rs, agent_launch_binary.rs, terminal_ui_binary.rs, astation_op_binary.rs, cred_agent_binary.rs, runtime_build_binary.rs
 └── support/             # Sandbox: temp profile, `atem` in a PTY, cleanup of what it started; astation.rs: fake Astation peer + verified pairing profile; r9.rs/r9log.rs: a pinned, signed test device list and r9 clients
 npm/
@@ -259,11 +259,17 @@ and durable reserved identities. `work_enqueue`/`work_query`/
 `work_cancel`/`work_complete` use a private durable task queue, current scoped
 authority and normal session-v1 prompt receipts, blocking on drafts, busy or
 unknown readiness, approvals and leases. Turn-end waits for an explicit result;
-a task still awaiting it, or of unknown outcome, at its deadline expires.
+a task still awaiting it, or of unknown outcome, at its deadline expires. A
+task whose sender's authority, authorization or route approval changed fails
+at once with its own detail (`sender's authority changed`, `sender's
+authorization expired`, `route changed`), a running turn never interrupted, and
+its sender then gets `forbidden` reading it; an interrupted turn leaves it
+awaiting its result (`turn interrupted`).
 `reply_query` (feature `host.reply`, `notify` and `prompt` ops: `work_query`'s
 authorization, returning `{kind:"reply", reply}`) reads the reply the task's
 agent submitted with `atem message reply` (state
-`publishing`/`submitted`/`refused`; it never completes the task). Not
+`publishing`/`submitted`/`refused`, `dropped` once the host no longer keeps
+its text; it never completes the task). Not
 implemented: boot-service installation and Station publication/replay. Strict
 membership verifiers must know the launch/message/notify scope ops before a
 service is enrolled with them. The default runtime idle policy is unchanged.
@@ -293,7 +299,7 @@ selectors; one message resolves once to at most 32 other sessions. Limits count
 messages: `per_hour` per sending session and `per_workflow` per workflow, for
 sends and again for receives (a message counts once however many agents it
 reaches). They are checked at send, counting sends whose context is still
-publishing, counted once at acceptance and pruned when their windows pass (a
+publishing, counted once at acceptance and removed when their windows pass (a
 workflow's counter two days after its latest message); replies and result
 deliveries count nothing. A message whose task could never dispatch is refused
 before counting (an oversized vault context shows `refused` in `message
@@ -305,13 +311,16 @@ load, hosting off or a receipt-database fault pauses local work, never fences
 it: new sends are refused with the reason, queued local tasks wait as `paused:
 <reason>`, replies are stored while their publication and delivery wait (a
 receipt-database fault instead refuses a reply and a completion until `atem
-runtime restart`), and a local launch not yet started waits out a file or
-hosting pause (one already handed to the spawner completes; a receipt-database
-fault, which lasts until a restart, fences it). `[collab] send = false` is no
-pause: it only refuses new sends, and accepted tasks, replies and deliveries go
-on. `local` is fenced only by a new host identity or a device-list freeze or
-fault. The agent commands connect only to the running runtime (none: "no Atem
-runtime is running; agents run inside one"; never started or replaced, whatever
+runtime restart`, and writes no `paused` detail), and a local launch not yet
+started waits out a file or hosting pause (one already handed to the spawner
+completes; a receipt-database fault or a session-journal halt, which last until
+a restart, fences it: `outcome_unknown`). A halted session journal fences
+`local` in memory only and holds its tasks the same way. `[collab] send = false`
+is no pause: it only refuses new sends, and accepted tasks, replies and
+deliveries go on. `local` is fenced for good only by a new host identity or a
+device-list freeze or fault. The agent commands connect only to the running
+runtime (none: "no Atem runtime is running; agents run inside one"; never
+started or replaced, whatever
 its build). Context jobs publish/read back exact decrypted Memory/Vault
 versions before dispatch. `message reply [--task ID] [--memory ID] [--vault
 ID:ENTRY@VERSION]` submits one durable reply for a task of any sender (local,
@@ -321,13 +330,18 @@ read it with `reply_query`. Only the sender completes a task: `message complete
 TASK_ID` (its sending session, or the owner outside any session; it stops a
 queued delivery) or `work_complete`. `results = true` on its origin route
 permits one queued result as data, ending with `Complete it with: atem message
-complete TASK_ID`. A task whose return grant ends early (origin process gone,
-sender authority or a route changed) keeps running but delivers nothing, and
-fails `sender gone` (`route changed` for its own route or profile) once it
-awaits its result; a queued local task whose route or profile approval changed
-fails `route changed` at once. Every task awaiting a result or of unknown
-outcome expires at its deadline, and one awaiting its result holds no queue
-slot. Automatic timeout reports remain status only. Empty routes can opt in to
+complete TASK_ID`. A task whose return grant ends early (its sending session
+gone, or its route no longer taking results) keeps running and stays awaiting
+its result (`sender gone; reply kept, not delivered`, `sender's route changed;
+reply kept, not delivered`): its reply is stored, never delivered, and the owner
+or the sending session completes it. A departed sender cancels nothing; a
+changed authority or route approval does end the task (`failed` at once, for
+every sender: queued, blocked, awaiting a result or of unknown outcome). A
+submitted task whose receipt is gone becomes `outcome_unknown` (`receipt no
+longer available`). Every task awaiting a result or of unknown outcome expires
+at its deadline, and one awaiting its result holds no queue slot. The design's
+"Lifecycle" table lists every event. Automatic timeout reports remain status
+only. Empty routes can opt in to
 `launch = "on_message"` (Claude Code profiles only; a Codex route is refused
 when the file loads): only `message send --launch` starts one, and only on a
 route an `atem:<id>/<route>` selector of that send names, using the existing
@@ -348,7 +362,8 @@ Cross-instance delivery is not built.
 **Shared Task Queue / Chisel/mark** (`runtime/host_work.rs`, `runtime/host_work_bridge.rs`):
 Executable messages and mark tasks share durable work records and FIFO order
 per session. Blocked/submitted/uncertain work holds later work on that session
-(uncertain work until it expires); independent sessions can proceed. All use
+(uncertain work until it expires, an offline sender's unstarted work until its
+deadline); independent sessions can proceed. All use
 current r9 sender authority, notify/prompt route consent,
 readiness/draft/approval/lease checks and normal session-v1 prompt receipts.
 Turn-end is `awaiting_result`; completion is explicit. No separate mark queue,
@@ -358,12 +373,14 @@ model triage or background `claude -p` remains.
 only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender
 principal/key. Verified private local PNG paths are appended before dispatch;
 missing/incomplete bytes block work. Limits: 256 uploads and 128 MiB reserved
-bytes. About once a minute `Store::prune` removes host-work records settled a
-day past their deadline (tasks with their reply/grant, messages whose tasks all
-go, launches, uploads no remaining task names); live tasks and what they need
-stay, and a pruned request's retry is refused as expired. `message.mark`
-carries typed annotation metadata and an immutable screenshot descriptor. See
-`designs/protocol/atem-host-work-v1.md` §6. Legacy ID-only `markTaskAssignment`
+bytes. No host-work record is ever deleted: about once a minute
+`Store::drop_payloads` clears the payloads (prompt, message and reply text,
+context text, upload bytes) of records settled a day past their deadline, so
+queries and retries (deduplicated by stored digest; `reply_query` says
+`dropped`) keep answering, and the 4,096-record limits count open records only
+(`open_records`); downgrading to v0.8.x needs the file moved aside.
+`message.mark` carries typed annotation metadata and an immutable screenshot
+descriptor. See `designs/protocol/atem-host-work-v1.md` §6. Legacy ID-only `markTaskAssignment`
 returns failed `markTaskResult` with upgrade guidance, never reads local task
 files or injects input. Not implemented: Station offline artifact delivery (an
 offline host).

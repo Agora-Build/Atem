@@ -151,6 +151,9 @@ when a worker with the reserved process generation was adopted, else
 principal's launch, or a profile that was removed, changed revision or no
 longer allows the caller is `forbidden`.
 
+A launch not yet started when hosting pauses waits for the pause to end
+([Observable behaviour](#observable-behaviour)).
+
 A started session appears in the registry (`list`, `session_changed`) under
 the returned `session_id` and `process_gen`. Send prompts through the normal
 receipts once its activity is `ready`.
@@ -228,12 +231,12 @@ capacity limit or on a storage failure). The reply follows the durable
 | `blocked` | waiting; `detail` says why |
 | `submitting` | the dispatch intent is durable; the prompt is being submitted |
 | `submitted` | the prompt's receipt is accepted or executing |
-| `awaiting_result` | the prompt's turn ended; no result yet |
+| `awaiting_result` | the prompt's turn ended (detail `turn interrupted` when it ended interrupted); no result yet |
 | `completed` | `work_complete` stored the result |
-| `failed` | the prompt was rejected, or couldn't be built |
+| `failed` | the prompt was rejected (its detail is the receipt's own), or couldn't be built, or the sender's authority or the route approval changed (below) |
 | `cancelled` | cancelled before submission |
 | `expired` | not submitted by `expires_at`, or still `awaiting_result` at it (detail `expired awaiting a result`) or `outcome_unknown` (detail `expired with its outcome unknown`) |
-| `outcome_unknown` | the submission is uncertain; never resubmitted; `expired` at `expires_at` |
+| `outcome_unknown` | the submission is uncertain, or its receipt is gone (detail `receipt no longer available`); never resubmitted; `expired` at `expires_at` |
 
 `receipt_id` (UUID v4, fixed at enqueue) is the session-v1 `request_id` of the
 prompt. `detail` is display text of at most 1024 bytes; clients don't parse
@@ -258,17 +261,22 @@ attachment:
 ```
 
 The receipt sets the task's state: `accepted` or `executing` →
-`submitted`, `completed` → `awaiting_result`, `rejected` → `failed`,
-`outcome_unknown` → `outcome_unknown`. No receipt after the submit, or a task
-found `submitting` at a restart, is `outcome_unknown`; it is reconciled from
-the receipt journal when a receipt exists. A task is never submitted twice.
-The host never renews or takes over a lease for it.
+`submitted`, `completed` → `awaiting_result`, `rejected` → `failed` (the
+receipt's own detail becomes the task's: `control revoked`, `host trust
+changed`, `session closed`), `outcome_unknown` → `outcome_unknown`. No receipt
+after the submit, or a task found `submitting` at a restart, is
+`outcome_unknown`; it is reconciled from the receipt journal when a receipt
+exists, and a `submitted` task whose receipt the session host no longer has
+becomes `outcome_unknown` (`receipt no longer available`). A task is never
+submitted twice. The host never renews or takes over a lease for it.
 
 ### Query, cancel, complete
 
 Each names the caller's own task under a route that still allows the caller;
 anything else is `forbidden`. An `outcome_unknown` task is reconciled from its
-receipt first.
+receipt first. Authority is checked on reads too: once the caller's
+`control_gen` moved on, or the route's revision, principals or profile
+changed, its own task is `forbidden`, a failed one included.
 
 - `work_query` returns the status.
 - `work_cancel` moves `queued` or `blocked` to `cancelled` (again on
@@ -292,20 +300,8 @@ says how it stands ("reply submitted", "reply received; publishing its
 context", "reply refused (…)"). A submitted reply proves the prompt's turn ran,
 so it moves an `outcome_unknown` task to `awaiting_result`.
 
-What a sender built for earlier hosts can observe change, with the same
-shapes:
-
-- task `detail` texts (display text; clients don't parse it): "in the agent's
-  turn" once the host saw a submitted prompt's turn begin, the reply's state
-  above, "expired awaiting a result", "expired with its outcome unknown";
-- `outcome_unknown` → `awaiting_result` when the task's agent submits a reply;
-- `awaiting_result` and `outcome_unknown` tasks expire at `expires_at`
-  (`expired`; nothing is resubmitted);
-- a task awaiting its result no longer counts toward the 256 unfinished tasks;
-- records settled a day past `expires_at` are pruned (§9): a query for one is
-  `forbidden`, as for an unknown id, and a retry is refused (its
-  `expires_at` passed: `invalid_request`, or `forbidden` if the route no
-  longer allows it), never new work.
+A sender built for earlier hosts can observe changed behaviour with the same
+shapes; [Observable behaviour](#observable-behaviour) lists it.
 
 ```json
 {"type":"session","data":{"v":1,"op":"reply_query","id":"11111111-1111-4111-8111-111111111111",
@@ -321,7 +317,7 @@ has no reply, else:
 {"kind":"reply","reply":{"result_id":"6ba7b810-9dad-51d1-80b4-00c04fd430c8","state":"submitted",
   "digest":"<SHA-256 hex>","text":"Done: /v2/orders is live",
   "context":[{"kind":"vault","id":"api-contract:3","version":1,"digest":"…","text":"…"}],
-  "submitted_at":1793620800000}}
+  "submitted_at":1793620800000,"dropped":false}}
 ```
 
 | Field | Meaning |
@@ -332,6 +328,7 @@ has no reply, else:
 | `text` | the reply text: at most 16 KiB, no control characters other than newline and tab |
 | `context` | 0–8 published context snapshots (§4), exact bytes; empty unless `submitted` |
 | `submitted_at` | Unix ms on the host's clock when the reply became `submitted`; `null` before |
+| `dropped` | `true` once the host no longer keeps the reply's text and context (§9): `text` is `""` and `context` `[]`; `result_id`, `state`, `digest` and `submitted_at` are unchanged. `false` otherwise |
 
 | State | Meaning |
 |---|---|
@@ -350,6 +347,79 @@ host's own `local` sender can't be asked at all: its id is a UUID v5, which
 `busy`. A reply may exist while the task is still `submitted` (the agent
 replies in its turn), and a task can end with no reply (a silent turn): poll
 `reply_query` for the reply and `work_query` for the task.
+
+### Observable behaviour
+
+No existing wire shape changes: the additions are the `reply_query` request,
+its `reply` result (with `dropped`) and the `host.reply` feature. A sender
+built for earlier hosts can still observe changed behaviour with the same
+shapes. `detail` is display text that clients don't parse; the texts below are
+exact. The lifecycle of local tasks is in
+[../agent-collaboration.md](../agent-collaboration.md), section 10.
+
+**Task states and details**
+
+- "in the agent's turn" once the host saw a submitted prompt's turn begin; the
+  reply's state in `detail` ("reply submitted", "reply received; publishing
+  its context", "reply refused (…)"); "expired awaiting a result" and "expired
+  with its outcome unknown".
+- `outcome_unknown` → `awaiting_result` when the task's agent submits a reply.
+- `awaiting_result` and `outcome_unknown` tasks expire at `expires_at`
+  (`expired`; nothing is resubmitted). A task awaiting its result no longer
+  counts toward the 256 unfinished tasks.
+- `failed`, `sender's authority changed`: the principal's `control_gen` moved
+  on after the task was accepted (a removal, a demotion, any change of a
+  service's roles, scope or expiry, a routine renewal included, a revoked
+  browser grant, this host's removal from the device list, a device-list
+  freeze or fault). `failed`, `sender's authorization expired`: the service or
+  browser grant the task was accepted under expired, even if the sender was
+  offline at the time and the grant was renewed later. Both apply at once to a
+  task that is `queued`, `blocked`, `awaiting_result` or `outcome_unknown` (a
+  queued or blocked one before it takes its session's place); a renewal or a
+  regrant never revives it. A task in `submitting` or `submitted` is left to
+  its receipt: a running turn is never interrupted, and the task fails once the
+  turn ends.
+- `failed`, `route changed`: the route or profile approval the task was
+  accepted under changed (the route removed, at another revision or no longer
+  listing the sender, or its profile with another id, revision or project),
+  for a task in the same states and for every sender. An edit that keeps those
+  (a profile's `cwd` or `provider`) is no change: the task stays `blocked`
+  until it expires.
+- A rejected prompt receipt's own detail reaches the task (`control revoked`,
+  `host trust changed`, `session closed`, …) in place of "agent submission
+  receipt reconciled; task completion requires an explicit result".
+- `awaiting_result`, `turn interrupted`: the turn ended interrupted
+  (session-v1 `interrupt`, Esc in the terminal). Nothing else changes: the next
+  task of the session goes on, and `work_complete` works.
+- `outcome_unknown`, `receipt no longer available`: a `submitted` task's
+  receipt is gone (evicted or lost). It then follows the `outcome_unknown`
+  rules.
+
+**Reads after a failure.** Authority is checked on reads (§2): once a task's
+authority or route approval changed, its sender's `work_query`,
+`work_complete`, `work_cancel` and `reply_query`, and a retry of its
+`work_enqueue`, are `forbidden`, the failed task included. `message_query`
+still answers while the caller's scope check holds (the route exists at that
+revision and covers the target), so a message's sender can see the failure
+there; a sender that used `work_enqueue` has no way to read it, and sees it
+only as later work no longer waiting behind it.
+
+**Launches.** A `host_launch` not yet started when hosting pauses (an invalid
+`runtime.toml`, `enabled = false`) waits and starts once the pause ends, while
+the sender's channel, `control_gen` and the profile approval hold and
+`expires_at` hasn't passed; requests, `host_launch_query` included, are `busy`
+meanwhile. Hosts of v0.8.2 fenced it. A receipt-database fault or a halted
+session journal fences a launch not yet started: it never starts and ends
+`outcome_unknown`.
+
+**Records.** A launch, task or message record is kept for the life of the
+database; a day after it settled past `expires_at` only its payloads are
+dropped (§9). `work_query`, `message_query` and `host_launch_query` keep
+answering with the final state, and `reply_query` answers `dropped: true`. A
+retry is deduplicated by the digest stored at acceptance: the same content
+returns the recorded receipt (`forbidden` if the route no longer allows the
+caller), other content is `request_id_reused`. The 4,096-record limits count
+open records only.
 
 ## 5. Messages
 
@@ -575,16 +645,21 @@ event.
 `<config>/runtime/host-work.sqlite` keeps launches, tasks, messages with their
 receipts, and upload bytes, each durable before its reply, bound to one host
 triple (a new identity moves it aside and starts an empty one; see [agent
-hosting](../agent-hosting.md#9-durable-records)). Records are pruned a day
-after their `expires_at` once settled: a task completed, failed, cancelled or
-expired (with its reply), a message whose tasks all go, a launch no longer
-`starting`, an upload no remaining task names. A live task, and its message,
-launch and uploads, is never pruned. A retry of a pruned request names an
-`expires_at` that passed, so it is refused (`invalid_request`, or `forbidden`
-if the route no longer allows it) and never becomes work; a query for a pruned
-id is `forbidden`, as for an unknown one. Nothing is evicted: at a limit (4,096
-launches, tasks or messages; 256 unfinished tasks, that is queued, blocked,
-submitting or submitted; 256 uploads or 128 MiB) new requests are `busy`.
+hosting](../agent-hosting.md#9-durable-records)). No record is deleted. A day
+after its `expires_at`, a settled record (a task completed, failed, cancelled
+or expired, with its reply; a message whose tasks all settled) drops its
+payloads: a task's prompt and context text, a message's text and context text,
+a reply's text and context, and the bytes of an upload (with its cached PNG)
+that no open task names. Ids, principals, revisions, session ids, states,
+details, digests, sizes, timestamps and attachment descriptors stay, as do a
+`work_complete` result (`work_query` returns it with its digest) and a
+message's `mark`. Every query keeps answering, and a retry is deduplicated by
+its stored digest (the same content: the recorded receipt; other content:
+`request_id_reused`). Nothing is evicted: at a limit (4,096 open launches,
+tasks or messages, a record being open until its payloads are dropped; 256
+unfinished tasks, that is queued, blocked, submitting or submitted; 256 uploads
+or 128 MiB) new requests are `busy`. An upload no task ever named is not
+dropped.
 
 ## 10. Planned (not implemented)
 
@@ -598,4 +673,5 @@ submitting or submitted; 256 uploads or 128 MiB) new requests are `busy`.
   host-to-host sender.
 - **Not implemented:** resolving an `outcome_unknown` task by hand (a reply
   its agent submits moves it to `awaiting_result`; otherwise it expires at
-  `expires_at`), and archival or compaction of the host's records.
+  `expires_at`), and deleting or archiving the host's records (every record is
+  kept; only payloads go, §9).
