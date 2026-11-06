@@ -3570,7 +3570,8 @@ launch = "on_message"
             start_reserved(&mut rig, root, &record, &cwd).await;
             rig.bridge
                 .remote_launched(&record.status.request_id, LaunchState::Started);
-            rig.bridge
+            let sent = rig
+                .bridge
                 .collab_send(
                     "atem-host",
                     &rig.sid,
@@ -3597,6 +3598,17 @@ launch = "on_message"
                 )
                 .unwrap();
             assert_eq!(again.result_id, first);
+            // `atem message status`: inside the session and from outside
+            // any, the latest and one message.
+            let sid = rig.sid.clone();
+            for (caller, id) in [
+                (Some(&sid), None),
+                (None, None),
+                (Some(&sid), Some(sent.as_str())),
+                (None, Some(sent.as_str())),
+            ] {
+                assert!(!rig.bridge.collab_status(caller, id).unwrap().is_empty());
+            }
             idle(&mut rig, 300).await;
             rig.bridge.work.store.as_mut().unwrap().db.trace(None);
             let statements: std::collections::BTreeSet<String> = TRACED
@@ -3621,6 +3633,8 @@ launch = "on_message"
                 "CROSS JOIN publications p",
                 "FROM resolutions WHERE session_id",
                 "FROM results WHERE digest",
+                "ORDER BY created_ms DESC,rowid DESC LIMIT 32",
+                "FROM outbox o\n    WHERE message_id=",
                 "CROSS JOIN work w ON w.id=o.id WHERE o.kind='work' ORDER BY",
                 "FROM open_records o CROSS JOIN work w ON w.id=o.id\n    WHERE o.kind='work' AND",
             ] {
@@ -3643,8 +3657,9 @@ launch = "on_message"
                 .collect();
             assert!(scans.is_empty(), "{scans:#?}");
             // Nor does any step through an index over closed records: run
-            // again (and rolled back) beside 1000, then 3000 of them, each
-            // statement takes as many VM steps.
+            // again (and rolled back) beside 1200, then 3600 of them (their
+            // resolutions spread over the rig's session and two others),
+            // each statement takes as many VM steps.
             let steps = |db: &rusqlite::Connection| -> Vec<i32> {
                 statements
                     .iter()
@@ -3665,9 +3680,10 @@ launch = "on_message"
                     })
                     .collect()
             };
-            add_closed_records(db, 0..1000);
+            let sessions = ["ses-closedaaaaaa", sid.as_str(), "ses-closedbbbbbb"];
+            add_closed_records(db, 0..1200, &sessions);
             let fewer = steps(db);
-            add_closed_records(db, 1000..3000);
+            add_closed_records(db, 1200..3600, &sessions);
             let more = steps(db);
             let grown: Vec<_> = statements
                 .iter()
@@ -3681,14 +3697,16 @@ launch = "on_message"
     /// Records closed long ago, numbered `n` (`closed-<n>`), in every table
     /// that keeps them: settled tasks, ended grants, replies, messages,
     /// accepted, refused and expired sends with their publications,
-    /// launches and resolutions. None is open (`open_records`).
-    fn add_closed_records(db: &rusqlite::Connection, n: std::ops::Range<usize>) {
+    /// launches and resolutions (to `sessions` in turn). None is open
+    /// (`open_records`).
+    fn add_closed_records(db: &rusqlite::Connection, n: std::ops::Range<usize>, sessions: &[&str]) {
         let tx = db.unchecked_transaction().unwrap();
         for i in n {
             let id = format!("closed-{i}");
             let settled = ["completed", "failed", "cancelled", "expired"][i % 4];
             let sent = ["accepted", "refused", "expired"][i % 3];
             let replied = ["submitted", "refused"][i % 2];
+            let session = sessions[i % sessions.len()];
             for (sql, state) in [
                 (
                     "INSERT INTO work(id,record,state) VALUES(?1,'{}',?2)",
@@ -3718,7 +3736,7 @@ launch = "on_message"
                 (
                     "INSERT INTO resolutions(message_id,recipient_id,task_id,route_id,session_id,
                     process_gen,record) VALUES(?1,?1,?1,'r',?2,'p','{}')",
-                    "ses-closedclosed",
+                    session,
                 ),
                 (
                     "INSERT INTO closed_records(kind,id,at_ms) VALUES('work',?1,0)",
@@ -3866,6 +3884,65 @@ launch = "on_message"
                 ended(&waiting),
                 ("ended".to_string(), Some(EarlyEnd::SenderGone))
             );
+        });
+    }
+
+    /// An identical reply without `--task` after its task closed (a day
+    /// past its deadline) answers as before the close: the recorded reply
+    /// (`results::replied_with`), as with `--task`; another reply still
+    /// finds no task.
+    #[test]
+    fn an_identical_reply_after_its_task_closed_answers_as_before() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let message = rig.message();
+            rig.publish(&message);
+            grant(&rig, &message);
+            rig.until(|r| r.work(&message).turn_id.is_some()).await;
+            let task = message.recipients[0].recipient_id.clone();
+            let first = reply(&mut rig, &task, "the answer", &[]).unwrap();
+            std::fs::write(rig.fake.join("complete"), "").unwrap();
+            rig.until(|r| r.work(&message).status.state == WorkState::AwaitingResult)
+                .await;
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap();
+            let retries = |rig: &mut LocalRig| {
+                let untasked = |rig: &mut LocalRig, text: &str| {
+                    rig.bridge
+                        .collab_reply(
+                            &rig.sid,
+                            crate::runtime::collab::ReplyRequest {
+                                task_id: None,
+                                text: text.into(),
+                                memory: vec![],
+                                vault: vec![],
+                            },
+                            &rig.sessions,
+                        )
+                        .map(|row| row.result_id)
+                        .map_err(|e| e.to_string())
+                };
+                [
+                    untasked(rig, "the answer"),
+                    reply(rig, &task, "the answer", &[]),
+                    untasked(rig, "another answer"),
+                ]
+            };
+            let before = retries(&mut rig);
+            assert_eq!(before[0], Ok(first.clone()));
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            store
+                .drop_payloads(message.expires_at + crate::runtime::host_work::PAYLOAD_RETENTION_MS)
+                .unwrap();
+            assert!(
+                !store
+                    .open_tasks()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t.task.task_id == task)
+            );
+            assert_eq!(retries(&mut rig), before);
         });
     }
 

@@ -720,6 +720,8 @@ const KEPT: [&str; 10] = [
 
 /// The query plan of `sql` on `db` (any parameter bound to `'x'`), and
 /// those of its steps that scan a `KEPT` table, by its name or an alias.
+/// A walk of an index in the order a `LIMIT` stops (`atem message
+/// status`'s newest first) is no scan; the VM-step test bounds it.
 #[cfg(test)]
 pub(super) fn kept_table_scans(db: &Connection, sql: &str) -> (Vec<String>, Vec<String>) {
     let mut q = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -744,6 +746,7 @@ pub(super) fn kept_table_scans(db: &Connection, sql: &str) -> (Vec<String>, Vec<
             names.insert(pair[1]);
         }
     }
+    let limited = sql.contains("ORDER BY") && sql.contains(" LIMIT ");
     let scans = steps
         .iter()
         .filter(|step| {
@@ -751,6 +754,7 @@ pub(super) fn kept_table_scans(db: &Connection, sql: &str) -> (Vec<String>, Vec<
                 .and_then(|rest| rest.split(' ').next())
                 .is_some_and(|name| names.contains(name))
                 && !step.contains("VIRTUAL TABLE")
+                && !(limited && step.contains(" USING INDEX "))
         })
         .cloned()
         .collect();
@@ -2615,6 +2619,109 @@ mod tests {
                 );
                 assert!(!step.contains("work_state"), "{sql}: {step}");
             }
+        }
+    }
+
+    /// The cached PNG of an upload a pass drops (`cache_seen_at_commit`).
+    static CACHED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    /// Whether it still existed when the pass committed.
+    static CACHED_AT_COMMIT: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+    fn cache_seen_at_commit(sql: &str) {
+        if sql.trim() == "COMMIT"
+            && let Some(path) = CACHED.lock().unwrap().as_ref()
+        {
+            *CACHED_AT_COMMIT.lock().unwrap() = Some(path.exists());
+        }
+    }
+
+    /// A dropped upload's cached PNG is gone before the pass commits, so
+    /// no crash leaves it behind with its row gone.
+    #[test]
+    fn a_dropped_uploads_cache_file_goes_before_the_commit() {
+        use atem_client::session::attachments::Attachment;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let owner = digest(b"sender");
+        let upload = Attachment {
+            attachment_id: uuid::Uuid::new_v4().to_string(),
+            digest: digest(b"png"),
+            size: 68,
+            media_type: "image/png".into(),
+        };
+        let mut r = task();
+        r.attachment_owner = owner.clone();
+        r.task.attachments = vec![upload.clone()];
+        r.task.expires_at = 1;
+        r.status.state = WorkState::Cancelled;
+        store
+            .db
+            .execute(
+                "INSERT INTO work(id,record,state) VALUES(?1,?2,'cancelled')",
+                params![r.task.task_id, serde_json::to_string(&r).unwrap()],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO attachments(owner,id,descriptor,size,bytes) VALUES(?1,?2,?3,68,x'00')",
+                params![
+                    owner,
+                    upload.attachment_id,
+                    serde_json::to_string(&upload).unwrap()
+                ],
+            )
+            .unwrap();
+        let cache = dir.path().join("attachments").join(&owner);
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = cache.join(format!("{}.png", upload.attachment_id));
+        std::fs::write(&cache, b"png").unwrap();
+        *CACHED.lock().unwrap() = Some(cache.clone());
+        store.db.trace(Some(cache_seen_at_commit));
+        let dropped = store.drop_payloads(1 + PAYLOAD_RETENTION_MS).unwrap();
+        store.db.trace(None);
+        assert_eq!(dropped.uploads, 1);
+        assert_eq!(*CACHED_AT_COMMIT.lock().unwrap(), Some(false));
+        assert!(!cache.exists());
+    }
+
+    /// A tracked record deleted (nothing deletes one today) leaves no open
+    /// record behind to count toward a cap forever.
+    #[test]
+    fn a_deleted_record_is_no_longer_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for (table, sql) in [
+            (
+                "work",
+                "INSERT INTO work(id,record,state) VALUES('x','{}','queued')",
+            ),
+            (
+                "messages",
+                "INSERT INTO messages(id,record) VALUES('x','{}')",
+            ),
+            (
+                "outbox",
+                "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
+                VALUES('x','{}','publishing','',0,0)",
+            ),
+            (
+                "launches",
+                "INSERT INTO launches(id,record) VALUES('x','{}')",
+            ),
+        ] {
+            store.db.execute(sql, []).unwrap();
+            assert_eq!(open_records(&store.db, table).unwrap(), 1, "{table}");
+            let id = if table == "outbox" {
+                "message_id"
+            } else {
+                "id"
+            };
+            store
+                .db
+                .execute(&format!("DELETE FROM {table} WHERE {id}='x'"), [])
+                .unwrap();
+            assert_eq!(open_records(&store.db, table).unwrap(), 0, "{table}");
         }
     }
 

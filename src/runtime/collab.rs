@@ -501,6 +501,22 @@ pub(super) fn sender_of(store: &Store, task_id: &str) -> Result<Option<String>> 
         .flatten())
 }
 
+/// `views`' messages: message `?1` by its primary key, or the 32 newest
+/// (`outbox_created`); with a scope `?2`, only those the session sent or
+/// with a task sent to it. `+r.session_id` keeps that check on
+/// `resolution_message`, one probe per message: through
+/// `resolution_session` it would read all of the session's resolutions for
+/// every message.
+const STATUS_BY_ID: &str = "SELECT message_id,envelope,state,detail FROM outbox o
+    WHERE message_id=?1 AND (?2 IS NULL OR json_extract(envelope,'$.from_session')=?2
+        OR EXISTS(SELECT 1 FROM resolutions r
+            WHERE r.message_id=o.message_id AND +r.session_id=?2))";
+const STATUS_LATEST: &str = "SELECT message_id,envelope,state,detail FROM outbox o
+    WHERE (?2 IS NULL OR json_extract(envelope,'$.from_session')=?2
+        OR EXISTS(SELECT 1 FROM resolutions r
+            WHERE r.message_id=o.message_id AND +r.session_id=?2))
+    ORDER BY created_ms DESC,rowid DESC LIMIT 32";
+
 /// The latest 32 messages (or message `id`), bounded to 1 MiB. With a
 /// `scope` (the calling session): the messages it sent, with all their
 /// tasks, and the messages with a task sent to it, with that task only.
@@ -509,13 +525,11 @@ pub(super) fn views(
     id: Option<&str>,
     scope: Option<&str>,
 ) -> Result<Vec<MessageView>> {
-    let mut query = store.db.prepare(
-        "SELECT message_id,envelope,state,detail FROM outbox o
-        WHERE (?1 IS NULL OR message_id=?1)
-        AND (?2 IS NULL OR json_extract(envelope,'$.from_session')=?2
-            OR EXISTS(SELECT 1 FROM resolutions r WHERE r.message_id=o.message_id AND r.session_id=?2))
-        ORDER BY created_ms DESC,rowid DESC LIMIT 32",
-    )?;
+    let mut query = store.db.prepare(if id.is_some() {
+        STATUS_BY_ID
+    } else {
+        STATUS_LATEST
+    })?;
     let rows = query.query_map(params![id, scope], |row| {
         Ok((
             row.get::<_, String>(0)?,
