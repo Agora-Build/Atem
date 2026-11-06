@@ -1060,9 +1060,9 @@ fn send_expiring(rig: &Rig, fake: &Path, n: u32, to: &str, expires: &str, text: 
     output["stdout"].as_str().unwrap().trim().to_string()
 }
 
-/// A local task whose sender is gone (its process ended) fails ("sender
-/// gone") instead of waiting for a sender that can never complete it or
-/// take its reply; it holds no slot, and the next task goes on.
+/// A local task awaiting its result whose sender is gone (its process
+/// ended) fails ("sender gone") instead of waiting for a sender that can
+/// never complete it; it holds no slot, and the next task goes on.
 #[test]
 fn a_task_whose_sender_is_gone_fails_instead_of_waiting() {
     let rig = Rig::new();
@@ -1089,6 +1089,140 @@ fn a_task_whose_sender_is_gone_fails_instead_of_waiting() {
             .unwrap_or_default()
             .contains("the next task")
     });
+}
+
+/// The sender leaves while its task is still queued: only the return grant
+/// ends. The task still runs, its agent's reply is stored (readable in
+/// status, never delivered), and once it awaits a result nobody can
+/// complete, it fails ("sender gone") and frees its slot.
+#[test]
+fn a_task_whose_sender_left_while_it_was_queued_still_runs_then_fails() {
+    let rig = Rig::new();
+    let (sender, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let (_, c) = rig.launch("c", "other");
+    rig.send(&c, 1, "tag:b", "keeps the recipient busy");
+    within("the recipient busy", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("keeps the recipient busy")
+    });
+    let id = rig.send(&a, 1, "tag:b", "queued while its sender leaves");
+    within("the task waits", || {
+        rig.status(&id)["tasks"][0]["state"] == "blocked"
+    });
+    let task = rig.status(&id)["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stopped = rig.request(json!({"op":"stop","session_id":sender}), "stopped");
+    assert_eq!(stopped["op"], "stopped", "{stopped}");
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(rig.status(&id)["tasks"][0]["state"], "blocked");
+    // The recipient's earlier turn ends during a pause, so the task is
+    // prompted well after that turn's end.
+    rig.write_config(&rig.config.replacen("enabled = true", "enabled = false", 1));
+    within("the pause", || {
+        rig.status(&id)["tasks"][0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("paused: "))
+    });
+    private(&b.join("complete"), "");
+    within("the earlier turn ended", || {
+        std::fs::read_to_string(b.join("events"))
+            .unwrap_or_default()
+            .contains("completed turn-1")
+    });
+    std::thread::sleep(Duration::from_millis(1_500));
+    // The task runs anyway once the pause is over.
+    rig.write_config(&rig.config);
+    within("the task's prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("queued while its sender leaves")
+    });
+    within("the task's turn", || {
+        rig.status(&id)["tasks"][0]["detail"] == IN_TURN
+    });
+    let reply = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "an answer nobody takes",
+        ],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    private(&b.join("complete"), "");
+    within("the task failed", || {
+        rig.status(&id)["tasks"][0]["state"] == "failed"
+    });
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["detail"], "sender gone", "{status}");
+    assert_eq!(status["result"]["state"], "submitted", "{status}");
+    assert_eq!(
+        status["result"]["text"], "an answer nobody takes",
+        "{status}"
+    );
+    assert!(
+        !std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("an answer nobody takes")
+    );
+    rig.send(&c, 2, "tag:b", "the next task");
+    within("the next task", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains("the next task")
+    });
+}
+
+/// The task's route changes (a new revision) while its turn runs: only the
+/// return grant ends. The turn finishes, the reply is stored and never
+/// delivered, and the task then fails ("sender gone").
+#[test]
+fn a_route_change_mid_turn_ends_only_the_return_grant() {
+    let mut rig = Rig::new();
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (session, b) = rig.launch("b", "recipient");
+    let id = rig.send(&a, 1, "tag:b", "the route changes under it");
+    let task = await_turn(&rig, &id, &session, &b, "the route changes under it");
+    let route = "[[routes]]\nid = \"b\"\nrevision = 1";
+    assert!(rig.config.contains(route));
+    rig.write_config(
+        &rig.config
+            .replace(route, "[[routes]]\nid = \"b\"\nrevision = 2"),
+    );
+    // The runtime re-reads runtime.toml about once a second.
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(rig.status(&id)["tasks"][0]["detail"], IN_TURN);
+    let reply = rig.agent(
+        &b,
+        1,
+        &["message", "reply", "--task", &task, "an answer for nobody"],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    private(&b.join("complete"), "");
+    within("the task failed", || {
+        rig.status(&id)["tasks"][0]["state"] == "failed"
+    });
+    let status = &rig.status(&id)["tasks"][0];
+    assert_eq!(status["detail"], "sender gone", "{status}");
+    assert_eq!(status["result"]["state"], "submitted", "{status}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !std::fs::read_to_string(a.join("input"))
+            .unwrap_or_default()
+            .contains("an answer for nobody")
+    );
 }
 
 /// A task awaiting its result expires at its deadline like any other: one

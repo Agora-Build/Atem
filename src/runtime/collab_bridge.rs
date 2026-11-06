@@ -16,8 +16,8 @@ use atem_client::session::select::{AgentLabels, MAX_AGENTS, Selector, selectors_
 /// stored the turn it became.
 pub(super) const IN_TURN: &str = "in the agent's turn";
 
-/// A local task whose return grant ended early: its sender can never take
-/// its reply or complete it.
+/// A local task awaiting its result whose return grant ended early: nobody
+/// can complete it any more.
 const SENDER_GONE: &str = "sender gone";
 
 /// How often counter rows whose window passed are pruned (besides at each
@@ -641,10 +641,13 @@ impl HostBridge {
     }
 
     /// Each return grant still open or consumed (spec section 10). One that
-    /// is no longer live ends: when it ended early (its sender's process
-    /// ended, the sender's authority or the route changed) its task fails
-    /// ("sender gone") instead of waiting, with a delivery still queued for
-    /// it; one that ran out ends with its task, which expires at its deadline
+    /// is no longer live ends, and nothing is delivered under it any more
+    /// (a delivery still queued is cancelled). An early end (its sender's
+    /// process ended, the sender's authority or the route changed) ends only
+    /// the grant: the task goes on through the queue and its agent may still
+    /// reply, stored and readable, never delivered. Once such a task awaits
+    /// its result, nobody can complete it: it fails ("sender gone"). A grant
+    /// that ran out ends with its task, which expires at its deadline
     /// (`Store::expire_awaiting`). An open, live grant permits the one
     /// delivery of a submitted reply (where the origin route opts in), or a
     /// report on a silent turn. A grant is written only when its state
@@ -654,7 +657,8 @@ impl HostBridge {
         let now = host_now().wall_ms;
         let mut q = store.db.prepare(
             "SELECT w.record,g.record,g.state,g.awaiting_since_ms FROM return_grants g
-            JOIN work w ON w.id=g.task_id WHERE g.state IN ('open','consumed')",
+            JOIN work w ON w.id=g.task_id WHERE g.state IN ('open','consumed')
+            OR (g.state='ended' AND w.state='awaiting_result')",
         )?;
         let pending = q
             .query_map([], |r| {
@@ -669,6 +673,13 @@ impl HostBridge {
         for (task, grant, state, since) in pending {
             let mut task: WorkRecord = serde_json::from_str(&task)?;
             let grant: ReturnGrant = serde_json::from_str(&grant)?;
+            if state == "ended" {
+                // Ended before its deadline, and now awaiting a result.
+                if now < grant.expires_at {
+                    self.collab_sender_gone(&mut task)?;
+                }
+                continue;
+            }
             // A broker that just started reads each session's launch record
             // (its project) on its first passes: until the sender's is read,
             // its route can't be checked, which is no change.
@@ -695,6 +706,7 @@ impl HostBridge {
                     WHERE task_id=?1 AND state IN ('open','consumed')",
                     [&grant.task_id],
                 )?;
+                self.collab_undelivered(&task.task.task_id)?;
                 if now < grant.expires_at {
                     self.collab_sender_gone(&mut task)?;
                 }
@@ -780,17 +792,24 @@ impl HostBridge {
         Ok(())
     }
 
-    /// The sender of `task` is gone for good: the task, and a delivery of
-    /// its reply still waiting to be prompted, fail instead of waiting for
-    /// it (spec section 10, "Ending early"). Settled ones stay as they are.
+    /// A task awaiting its result whose return grant ended early: nobody
+    /// can complete it any more, so it fails ("sender gone") instead of
+    /// waiting (spec section 10, "Ending early"); its reply, if any, stays
+    /// readable. A task in any other state is left as it is.
     fn collab_sender_gone(&self, task: &mut WorkRecord) -> Result<()> {
-        let store = self.work.store.as_ref().unwrap();
-        if !task.status.state.terminal() || task.status.state == WorkState::OutcomeUnknown {
+        if task.status.state == WorkState::AwaitingResult {
             task.status.state = WorkState::Failed;
             task.status.detail = SENDER_GONE.into();
-            store.save_work(task)?;
+            self.work.store.as_ref().unwrap().save_work(task)?;
         }
-        let delivery = results::load(&store.db, &task.task.task_id)?
+        Ok(())
+    }
+
+    /// The return grant of `task_id` ended: a delivery of its reply still
+    /// waiting to be prompted never is.
+    fn collab_undelivered(&self, task_id: &str) -> Result<()> {
+        let store = self.work.store.as_ref().unwrap();
+        let delivery = results::load(&store.db, task_id)?
             .and_then(|row| row.work_id)
             .map(|id| store.work(&id))
             .transpose()?
@@ -801,8 +820,8 @@ impl HostBridge {
                 WorkState::Queued | WorkState::Blocked
             )
         {
-            delivery.status.state = WorkState::Failed;
-            delivery.status.detail = SENDER_GONE.into();
+            delivery.status.state = WorkState::Cancelled;
+            delivery.status.detail = "not delivered: its return grant ended".into();
             store.save_work(&delivery)?;
         }
         Ok(())
