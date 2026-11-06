@@ -127,14 +127,14 @@ shell that has the values, or use `env_file`.
 removed profile fences launches that haven't started. Raise `revision` when
 approvals change: requests name the revision they were made under, a mismatch
 is `forbidden`, and work queued under an older revision stays blocked until it
-expires (a local agent's task fails at once, "route changed";
-[agent collaboration](agent-collaboration.md) section 10). A file that fails to load turns hosting off while it fails:
-launches that haven't started are fenced, requests are `busy`, and
-`runtime.log` names the problem once (the parser's reason and line, or the
-profile and rule); within a second of the file being fixed hosting follows
-it again, no restart needed. A host-work database fault (it can't be opened
-or recovered, or a write failed) turns hosting off until `atem runtime
-restart`, since a failed write leaves that step's outcome unknown
+expires (a local agent's task fails at once, "route changed"; [agent
+collaboration](agent-collaboration.md) section 10). A file that fails to load
+turns hosting off while it fails: launches that haven't started are fenced,
+requests are `busy`, and `runtime.log` names the problem once (the parser's
+reason and line, or the profile and rule); within a second of the file being
+fixed hosting follows it again, no restart needed. A host-work database fault
+(it can't be opened or recovered, or a write failed) turns hosting off until
+`atem runtime restart`, since a failed write leaves that step's outcome unknown
 (`runtime.log` names the database).
 
 ## 3. Commands
@@ -306,17 +306,17 @@ longer holds the session.
 **Replies.** The agent working on a task can answer it with `atem message
 reply`, for a task of any sender. The reply is durable, bound to the task, its
 session, process and turn, and never completes the task. The sender reads it
-with `reply_query{task_id}` (feature `host.reply`, op `notify`): the same
-authorization as `work_query`, answered `{kind:"reply", reply}` with `reply`
-`null` until one exists, else `{result_id, state, digest, text, context,
-submitted_at}` and a state of `publishing`, `submitted` or `refused`
+with `reply_query{task_id}` (feature `host.reply`, ops `notify` and `prompt`):
+the same authorization as `work_query`, answered `{kind:"reply", reply}` with
+`reply` `null` until one exists, else `{result_id, state, digest, text,
+context, submitted_at}` and a state of `publishing`, `submitted` or `refused`
 ([protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md#reply)). The
 reply isn't pushed: poll it, and complete the task with `work_complete`.
 
 **Cancel and expiry.** `work_cancel` works only while a task is `queued` or
 `blocked`; it never interrupts a turn (use session-v1 `interrupt`). A task not
-submitted by its `expires_at`, or still awaiting its result at it, becomes
-`expired`.
+submitted by its `expires_at`, or still awaiting its result or of unknown
+outcome at it, becomes `expired`; nothing is resubmitted.
 
 ## 8. Screenshots and Chisel/mark
 
@@ -369,12 +369,12 @@ and that no remaining task waits for, and uploads that no remaining task names
 (with their cached PNG). A live task is never removed, nor what it needs: its
 message and that message's other tasks, its launch, its uploads, the reply its
 delivery carries. A retry of a pruned request names a deadline that passed, so
-it is refused (`invalid_request`) and never becomes work again; a query for a
-pruned id gets the answer for an unknown one (`forbidden`). An upload that no
-task ever named is not pruned (the upload limits hold it). At a limit the
-runtime refuses new requests with `busy` instead of evicting anything. Files
-and the database are owner-private but not encrypted at rest; keep secrets out
-of screenshots and context.
+it is refused (`invalid_request`, or `forbidden` if the route no longer allows
+it) and never becomes work again; a query for a pruned id gets the answer for
+an unknown one (`forbidden`). An upload that no task ever named is not pruned
+(the upload limits hold it). At a limit the runtime refuses new requests with
+`busy` instead of evicting anything. Files and the database are owner-private
+but not encrypted at rest; keep secrets out of screenshots and context.
 
 ## 10. Limits
 

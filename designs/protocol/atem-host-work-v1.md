@@ -286,10 +286,26 @@ task of any sender (see
 sender reads it with `reply_query` (feature `host.reply`). A reply is
 read-only data: it never completes the task (`work_complete` does, whether or
 not the sender read the reply, and with the sender's own result snapshot), and
-no existing message or status changes. While a reply exists the task's
-`detail` says how it stands ("reply submitted", "reply received; publishing its
+no existing wire shape changes: the additions are `reply_query`, its `reply`
+result and the `host.reply` feature. While a reply exists the task's `detail`
+says how it stands ("reply submitted", "reply received; publishing its
 context", "reply refused (…)"). A submitted reply proves the prompt's turn ran,
 so it moves an `outcome_unknown` task to `awaiting_result`.
+
+What a sender built for earlier hosts can observe change, with the same
+shapes:
+
+- task `detail` texts (display text; clients don't parse it): "in the agent's
+  turn" once the host saw a submitted prompt's turn begin, the reply's state
+  above, "expired awaiting a result", "expired with its outcome unknown";
+- `outcome_unknown` → `awaiting_result` when the task's agent submits a reply;
+- `awaiting_result` and `outcome_unknown` tasks expire at `expires_at`
+  (`expired`; nothing is resubmitted);
+- a task awaiting its result no longer counts toward the 256 unfinished tasks;
+- records settled a day past `expires_at` are pruned (§9): a query for one is
+  `forbidden`, as for an unknown id, and a retry is refused (its
+  `expires_at` passed: `invalid_request`, or `forbidden` if the route no
+  longer allows it), never new work.
 
 ```json
 {"type":"session","data":{"v":1,"op":"reply_query","id":"11111111-1111-4111-8111-111111111111",
@@ -326,14 +342,14 @@ has no reply, else:
 The host checks exactly what `work_query` checks, in the same order: only the
 principal and key that enqueued the task (or sent the message), under a route
 that still allows it, may read its reply. Anyone else, an unknown task and a
-caller without the `notify` op get the answer `work_query` gives them for that
-task, `forbidden`. A task of the host's own `local` sender can't be asked at
-all: its id is a UUID v5, which `reply_query` (like `work_query`) refuses at
-decode as `invalid_request`. An `outcome_unknown` task is reconciled from its
-receipt first. Storage failure is `busy`. A reply may exist while the task is
-still `submitted` (the agent replies in its turn), and a task can end with no
-reply (a silent turn): poll `reply_query` for the reply and `work_query` for
-the task.
+caller without the `notify` and `prompt` ops (both, as for `work_query`) get
+the answer `work_query` gives them for that task, `forbidden`. A task of the
+host's own `local` sender can't be asked at all: its id is a UUID v5, which
+`reply_query` (like `work_query`) refuses at decode as `invalid_request`. An
+`outcome_unknown` task is reconciled from its receipt first. Storage failure is
+`busy`. A reply may exist while the task is still `submitted` (the agent
+replies in its turn), and a task can end with no reply (a silent turn): poll
+`reply_query` for the reply and `work_query` for the task.
 
 ## 5. Messages
 
@@ -558,17 +574,17 @@ event.
 
 `<config>/runtime/host-work.sqlite` keeps launches, tasks, messages with their
 receipts, and upload bytes, each durable before its reply, bound to one host
-triple (a new identity moves it aside and starts an empty one; see
-[agent hosting](../agent-hosting.md#9-durable-records)). Records are pruned a
-day after their `expires_at` once settled: a task completed, failed, cancelled
-or expired (with its reply), a message whose tasks all go, a launch no longer
+triple (a new identity moves it aside and starts an empty one; see [agent
+hosting](../agent-hosting.md#9-durable-records)). Records are pruned a day
+after their `expires_at` once settled: a task completed, failed, cancelled or
+expired (with its reply), a message whose tasks all go, a launch no longer
 `starting`, an upload no remaining task names. A live task, and its message,
 launch and uploads, is never pruned. A retry of a pruned request names an
-`expires_at` that passed, so it is `invalid_request` and never becomes work; a
-query for a pruned id is `forbidden`, as for an unknown one. Nothing is
-evicted: at a limit (4,096 launches, tasks or messages; 256 unfinished tasks,
-that is queued, blocked, submitting or submitted; 256 uploads or 128 MiB) new
-requests are `busy`.
+`expires_at` that passed, so it is refused (`invalid_request`, or `forbidden`
+if the route no longer allows it) and never becomes work; a query for a pruned
+id is `forbidden`, as for an unknown one. Nothing is evicted: at a limit (4,096
+launches, tasks or messages; 256 unfinished tasks, that is queued, blocked,
+submitting or submitted; 256 uploads or 128 MiB) new requests are `busy`.
 
 ## 10. Planned (not implemented)
 

@@ -253,87 +253,91 @@ private `runtime.toml`. Start creates missing configuration and starts or
 reuses the detached runtime without replacing another build; check validates
 without starting processes. Enabled healthy hosting keeps zero-session runtimes
 online. Detached startup forwards only runtime variables and enabled profiles'
-explicitly approved environment names, excluding test hooks.
-Encrypted r9 `host_profiles`/`host_launch`/`host_launch_query` use local approved
-profiles and durable reserved identities. `work_enqueue`/`work_query`/
+explicitly approved environment names, excluding test hooks. Encrypted r9
+`host_profiles`/`host_launch`/`host_launch_query` use local approved profiles
+and durable reserved identities. `work_enqueue`/`work_query`/
 `work_cancel`/`work_complete` use a private durable task queue, current scoped
 authority and normal session-v1 prompt receipts, blocking on drafts, busy or
 unknown readiness, approvals and leases. Turn-end waits for an explicit result;
-a task still awaiting it at its deadline expires. `reply_query` (feature
-`host.reply`, `notify` op, `work_query`'s authorization, returning `{kind:"reply",
-reply}`) reads the reply the task's agent submitted with `atem message reply`
-(state `publishing`/`submitted`/`refused`; it never completes the task).
-Not implemented: boot-service installation and Station publication/replay.
-Strict membership verifiers must know the launch/message/notify scope ops
-before a service is enrolled with them. The default runtime idle policy is unchanged.
+a task still awaiting it, or of unknown outcome, at its deadline expires.
+`reply_query` (feature `host.reply`, `notify` and `prompt` ops: `work_query`'s
+authorization, returning `{kind:"reply", reply}`) reads the reply the task's
+agent submitted with `atem message reply` (state
+`publishing`/`submitted`/`refused`; it never completes the task). Not
+implemented: boot-service installation and Station publication/replay. Strict
+membership verifiers must know the launch/message/notify scope ops before a
+service is enrolled with them. The default runtime idle policy is unchanged.
 `host.messages` adds `message_publish`/`message_query` with inline text and/or
-exact context snapshots, multiple resolved recipients and per-recipient progress
-(`crates/atem-client/src/session/messages.rs`, `designs/protocol/atem-host-work-v1.md` §5).
-The current channel principal must equal the envelope sender; its key is pinned
-in the private receipt store. Native members can store notices without execution consent;
-scoped services need non-control `message`. Agent deliveries still need the
-route's notify/prompt consent. Envelope, recipient decisions and queued tasks
-commit together. Progress stays on the original message/task receipt; there is
-no `runtime inbox` command. Not implemented: a Station durable outbox,
-offline origin proofs and direct Atem host senders.
+exact context snapshots, multiple resolved recipients and per-recipient
+progress (`crates/atem-client/src/session/messages.rs`,
+`designs/protocol/atem-host-work-v1.md` §5). The current channel principal must
+equal the envelope sender; its key is pinned in the private receipt store.
+Native members can store notices without execution consent; scoped services
+need non-control `message`. Agent deliveries still need the route's
+notify/prompt consent. Envelope, recipient decisions and queued tasks commit
+together. Progress stays on the original message/task receipt; there is no
+`runtime inbox` command. Not implemented: a Station durable outbox, offline
+origin proofs and direct Atem host senders.
 
 **Local agent collaboration** (stage 1, unreleased; `designs/agent-collaboration.md`):
 `atem agent tag add|remove|list` and `atem message send|reply` identify the
-calling agent from the local socket peer's verified process ancestry
-(`message status|cancel|complete` also run from the owner's terminal, outside
-any session: a verified process with no agent in its ancestry; one that can't
-be verified is refused, and under the same-user model this owner fallback is
-no security boundary). `runtime.toml` requires hosting, `[collab] send = true`, approved
-profiles and route consent for `local` (a route's own `principals` replaces the
-paired-Astation default); defaults keep sending, result prompts and launch off.
-Owner labels and agent-owned `self:` tags feed shared selectors; one message
-resolves once to at most 32 other sessions. Limits count messages: `per_hour`
-per sending session and `per_workflow` per workflow, for sends and again for
-receives (a message counts once however many agents it reaches). They are
-checked at send, counting sends whose context is still publishing, counted
-once at acceptance and pruned when their windows pass (a workflow's counter two
-days after its latest message); replies and result deliveries count nothing. A message whose task
-could never dispatch is refused before counting (an oversized vault context
-shows `refused` in `message status`, not as the send error). The SQLite outbox,
-tasks, resolutions, counters and return grants survive runtime restart. Local
-work uses the session host's internal attachment and ordinary prompt receipts,
-FIFO, readiness, drafts, approvals, leases and control fencing. A
-`runtime.toml` that doesn't load, hosting off or a receipt-database fault
-pauses local work, never fences it: new sends are refused with the reason,
-queued local tasks wait as `paused: <reason>`, replies are stored while their
-publication and delivery wait (a receipt-database fault instead refuses a reply
-and a completion until `atem runtime restart`), and a local launch not yet
-started waits out a file or hosting pause (one already handed to the spawner
-completes; a receipt-database fault, which lasts until a restart, fences it). `[collab] send =
-false` is no pause:
-it only refuses new sends, and accepted tasks, replies and deliveries go on.
-`local` is fenced only by a new host identity or a device-list freeze or fault.
-The agent commands connect only to the running runtime (none: "no Atem runtime
-is running; agents run inside one"; never started or replaced, whatever its
-build). Context jobs publish/read back exact decrypted Memory/Vault versions
-before dispatch. `message reply [--task ID] [--memory ID] [--vault ID:ENTRY@VERSION]`
-submits one durable reply for a task of any sender (local, member or service),
-bound to its task/session/process/turn; it never completes the task, and a
-reply's vault reference must name its entry. Remote senders read it with
-`reply_query`. Only the sender completes a task: `message complete TASK_ID`
-(its sending session, or the owner outside any session; it stops a queued
-delivery) or `work_complete`. `results = true` on its origin route permits one
-queued result as data, ending with `Complete it with: atem message complete
-TASK_ID`. A task whose return grant ends early (origin process gone, sender
-authority or a route changed) keeps running but delivers nothing, and fails
-`sender gone` (`route changed` for its own route or profile) once it awaits
-its result; a queued local task whose route or profile approval changed fails
-`route changed` at once. Every task awaiting a result or of unknown outcome
-expires at its deadline, and one awaiting its result holds no queue slot. Automatic timeout reports remain status only. Empty
-routes can opt in to `launch = "on_message"` (Claude Code profiles only; a Codex
-route is refused when the file loads): only `message send --launch` starts
-one, and only on a route an `atem:<id>/<route>` selector of that send names, using the existing approved-profile
-worker launcher; a send without it can share a pending launch but never starts
-one. `message status [ID]` (inside a session: its own messages and the local
-tasks sent to it), `cancel TASK_ID` (inside a session: its own messages) and
-`directory [SELECTOR]` inspect the local runtime. `host.select`, local `result`
-snapshots, the `local` sender and the local-only `from_session`/`reply_to` are
-never admitted from remote channels. Cross-instance delivery is not built.
+calling agent from the local socket peer's verified process ancestry (`message
+status|cancel|complete` also run from the owner's terminal, outside any
+session: a verified process with no agent in its ancestry; one that can't be
+verified is refused, and under the same-user model this owner fallback is no
+security boundary). `runtime.toml` requires hosting, `[collab] send = true`,
+approved profiles and route consent for `local` (a route's own `principals`
+replaces the paired-Astation default); defaults keep sending, result prompts
+and launch off. Owner labels and agent-owned `self:` tags feed shared
+selectors; one message resolves once to at most 32 other sessions. Limits count
+messages: `per_hour` per sending session and `per_workflow` per workflow, for
+sends and again for receives (a message counts once however many agents it
+reaches). They are checked at send, counting sends whose context is still
+publishing, counted once at acceptance and pruned when their windows pass (a
+workflow's counter two days after its latest message); replies and result
+deliveries count nothing. A message whose task could never dispatch is refused
+before counting (an oversized vault context shows `refused` in `message
+status`, not as the send error). The SQLite outbox, tasks, resolutions,
+counters and return grants survive runtime restart. Local work uses the session
+host's internal attachment and ordinary prompt receipts, FIFO, readiness,
+drafts, approvals, leases and control fencing. A `runtime.toml` that doesn't
+load, hosting off or a receipt-database fault pauses local work, never fences
+it: new sends are refused with the reason, queued local tasks wait as `paused:
+<reason>`, replies are stored while their publication and delivery wait (a
+receipt-database fault instead refuses a reply and a completion until `atem
+runtime restart`), and a local launch not yet started waits out a file or
+hosting pause (one already handed to the spawner completes; a receipt-database
+fault, which lasts until a restart, fences it). `[collab] send = false` is no
+pause: it only refuses new sends, and accepted tasks, replies and deliveries go
+on. `local` is fenced only by a new host identity or a device-list freeze or
+fault. The agent commands connect only to the running runtime (none: "no Atem
+runtime is running; agents run inside one"; never started or replaced, whatever
+its build). Context jobs publish/read back exact decrypted Memory/Vault
+versions before dispatch. `message reply [--task ID] [--memory ID] [--vault
+ID:ENTRY@VERSION]` submits one durable reply for a task of any sender (local,
+member or service), bound to its task/session/process/turn; it never completes
+the task, and a reply's vault reference must name its entry. Remote senders
+read it with `reply_query`. Only the sender completes a task: `message complete
+TASK_ID` (its sending session, or the owner outside any session; it stops a
+queued delivery) or `work_complete`. `results = true` on its origin route
+permits one queued result as data, ending with `Complete it with: atem message
+complete TASK_ID`. A task whose return grant ends early (origin process gone,
+sender authority or a route changed) keeps running but delivers nothing, and
+fails `sender gone` (`route changed` for its own route or profile) once it
+awaits its result; a queued local task whose route or profile approval changed
+fails `route changed` at once. Every task awaiting a result or of unknown
+outcome expires at its deadline, and one awaiting its result holds no queue
+slot. Automatic timeout reports remain status only. Empty routes can opt in to
+`launch = "on_message"` (Claude Code profiles only; a Codex route is refused
+when the file loads): only `message send --launch` starts one, and only on a
+route an `atem:<id>/<route>` selector of that send names, using the existing
+approved-profile worker launcher; a send without it can share a pending launch
+but never starts one. `message status [ID]` (inside a session: its own messages
+and the local tasks sent to it), `cancel TASK_ID` (inside a session: its own
+messages) and `directory [SELECTOR]` inspect the local runtime. `host.select`,
+local `result` snapshots, the `local` sender and the local-only
+`from_session`/`reply_to` are never admitted from remote channels.
+Cross-instance delivery is not built.
 
 **TUI State Machine** (`app.rs`): bare `atem` is a menu and a client of `atem runtime`; it opens no Astation connection (the runtime owns the machine's one link). Enum-based mode switching via `AppMode`:
 - `MainMenu` - Navigation between features
@@ -342,12 +346,13 @@ never admitted from remote channels. Cross-instance delivery is not built.
 - `AgentPanel` - The runtime's sessions (Enter attaches); agent sessions open in `tui/frontend.rs`
 
 **Shared Task Queue / Chisel/mark** (`runtime/host_work.rs`, `runtime/host_work_bridge.rs`):
-Executable messages and mark tasks share durable work records and FIFO order per
-session. Blocked/submitted/uncertain work holds later work on that session
-(uncertain work until it expires); independent sessions can proceed. All use current r9 sender authority,
-notify/prompt route consent, readiness/draft/approval/lease checks and normal
-session-v1 prompt receipts. Turn-end is `awaiting_result`; completion is explicit.
-No separate mark queue, model triage or background `claude -p` remains.
+Executable messages and mark tasks share durable work records and FIFO order
+per session. Blocked/submitted/uncertain work holds later work on that session
+(uncertain work until it expires); independent sessions can proceed. All use
+current r9 sender authority, notify/prompt route consent,
+readiness/draft/approval/lease checks and normal session-v1 prompt receipts.
+Turn-end is `awaiting_result`; completion is explicit. No separate mark queue,
+model triage or background `claude -p` remains.
 
 `host.attachments` adds encrypted `attachment_put` chunks (96 KiB decoded, PNG
 only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender
@@ -356,11 +361,12 @@ missing/incomplete bytes block work. Limits: 256 uploads and 128 MiB reserved
 bytes. About once a minute `Store::prune` removes host-work records settled a
 day past their deadline (tasks with their reply/grant, messages whose tasks all
 go, launches, uploads no remaining task names); live tasks and what they need
-stay, and a pruned request's retry is refused as expired. `message.mark` carries typed annotation metadata
-and an immutable screenshot descriptor. See `designs/protocol/atem-host-work-v1.md` §6.
-Legacy ID-only `markTaskAssignment` returns failed `markTaskResult` with upgrade
-guidance, never reads local task files or injects input. Not implemented:
-Station offline artifact delivery (an offline host).
+stay, and a pruned request's retry is refused as expired. `message.mark`
+carries typed annotation metadata and an immutable screenshot descriptor. See
+`designs/protocol/atem-host-work-v1.md` §6. Legacy ID-only `markTaskAssignment`
+returns failed `markTaskResult` with upgrade guidance, never reads local task
+files or injects input. Not implemented: Station offline artifact delivery (an
+offline host).
 
 **Astation Integration** (`websocket_client.rs`): WebSocket protocol with `AstationMessage` enum:
 - `MarkTaskAssignment { task_id, received_at_ms }` - received from Astation
