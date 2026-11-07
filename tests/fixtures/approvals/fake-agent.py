@@ -23,8 +23,6 @@
 #                       arriving that the shared fixtures name (event
 #                       "transcribed <n>")
 #   run-<n>.json        {argv}: run as its own child, to its end (run-<n>.out)
-#   bg-<n>.json         {argv}: started as its own child and left running in
-#                       the background (bg-<n>.out once it exited)
 # What it saw, in $FAKE_DIR: input (every byte its terminal delivered),
 # events (one line per thing it did: "started", "input <bytes>", "asked <n>", "answer <n>
 # <allow|deny|none> <message>", "ran <n>", "refused <n>", "completed <turn>",
@@ -140,7 +138,6 @@ def answered(n, ask):
 
 transcribed = 0
 commands_run = set()
-background = {}  # bg-<n>.json -> its process, still running
 START, END = b"\x1b[200~", b"\x1b[201~\r"
 buf = b""
 while True:
@@ -185,24 +182,6 @@ while True:
             with open(path + ".tmp", "w") as f:
                 json.dump(output, f)
             os.replace(path + ".tmp", path)
-    # A command left running in the background (bg-<n>.json), still the
-    # agent's own descendant after its turn ended, as an agent's background
-    # shell is: bg-<n>.out once it exited.
-    for name in sorted(os.listdir(ctl)):
-        if name.startswith("bg-") and name.endswith(".json") and name not in commands_run:
-            commands_run.add(name)
-            request = json.load(open(os.path.join(ctl, name)))
-            background[name] = subprocess.Popen(request["argv"], stdout=subprocess.PIPE,
-                                                stderr=subprocess.PIPE, text=True)
-    for name, proc in list(background.items()):
-        if proc.poll() is None:
-            continue
-        del background[name]
-        stdout, stderr = proc.communicate()
-        path = os.path.join(ctl, name[:-5] + ".out")
-        with open(path + ".tmp", "w") as f:
-            json.dump({"code": proc.returncode, "stdout": stdout, "stderr": stderr}, f)
-        os.replace(path + ".tmp", path)
     scripted = os.path.join(ctl, "transcript-%d.jsonl" % (transcribed + 1))
     if transcript and os.path.exists(scripted):
         transcribed += 1

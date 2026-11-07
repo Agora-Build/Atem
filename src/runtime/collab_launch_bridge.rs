@@ -264,7 +264,6 @@ impl HostBridge {
             );
             self.work.launches.push_back(RemoteLaunch {
                 request_id: status.request_id,
-                principal: "local".into(),
                 profile,
                 session_id: status.session_id,
                 process_gen: status.process_gen,

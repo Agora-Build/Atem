@@ -2907,3 +2907,57 @@ fn agent_commands_start_no_runtime() {
         assert!(!rig.sandbox.config().join("runtime.socket").exists());
     }
 }
+
+/// `atem message directory` classifies its caller like the other
+/// collaboration ops: a process that can't be verified (the one that
+/// connected is gone, and its child sends the request) is refused, never
+/// taken for the owner.
+#[test]
+fn a_directory_request_from_an_unverified_process_is_refused() {
+    const CLIENT: &str = r#"
+import json, os, socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(open(sys.argv[1]).read().strip())
+connector = os.getpid()
+if os.fork():
+    os._exit(0)
+deadline = time.time() + 10
+while os.path.exists("/proc/%d" % connector) and time.time() < deadline:
+    time.sleep(0.02)
+f = s.makefile("rw")
+for m in [{"op": "hello", "protocol": 1, "build": "test"},
+          {"op": "message_directory", "selector": None}]:
+    m["v"] = 1
+    f.write(json.dumps(m) + "\n")
+f.flush()
+for line in f:
+    if json.loads(line).get("op") in ("error", "message_directory"):
+        with open(sys.argv[2] + ".tmp", "w") as out:
+            out.write(line)
+        os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+        break
+"#;
+    let rig = Rig::new();
+    let out = rig.sandbox.dir.path().join("directory.json");
+    let mut connector = Command::new("python3")
+        .args(["-I", "-c", CLIENT])
+        .arg(rig.sandbox.config().join("runtime.socket"))
+        .arg(&out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Reaped here: the process that connected is gone.
+    assert!(connector.wait().unwrap().success());
+    within("the forked client's answer", || out.exists());
+    let reply: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(reply["op"], "error", "{reply}");
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .contains("the calling process could not be verified"),
+        "{reply}"
+    );
+}

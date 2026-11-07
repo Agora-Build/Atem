@@ -615,16 +615,9 @@ pub(super) fn save_tags(
     Ok(())
 }
 
-/// A removed session's tags go with it, and its latest prompt principal.
+/// A removed session's tags go with it.
 pub(super) fn remove_tags(state: &std::path::Path, session_id: &str) {
     let _ = std::fs::remove_file(state.join(format!("collab-tags-{session_id}.json")));
-    let _ = std::fs::remove_file(prompt_file(state, session_id));
-}
-
-/// Where a session's latest prompt principal is kept
-/// (`BrokerSession::keep_prompt_in`).
-pub(super) fn prompt_file(state: &std::path::Path, session_id: &str) -> std::path::PathBuf {
-    state.join(format!("collab-prompt-{session_id}.json"))
 }
 
 pub(super) fn restore_tags(state: &std::path::Path, session: &mut super::broker::BrokerSession) {

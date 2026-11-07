@@ -256,10 +256,6 @@ impl HostBridge {
             references,
             context: vec![],
             dropped: false,
-            prompt_from: match session.prompt_from() {
-                PromptFrom::Local => None,
-                other => Some(other.label().to_string()),
-            },
         };
         let digest = reply.digest();
         let store = self.work.store.as_ref().unwrap();
@@ -1237,17 +1233,9 @@ impl HostBridge {
     pub fn collab_directory(
         &mut self,
         atem_id: &str,
-        caller: Option<&SessionId>,
         selector: Option<&str>,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<Vec<DirectoryRow>> {
-        if let Some(caller) = caller {
-            let session = sessions
-                .get(caller)
-                .filter(|s| s.is_live())
-                .ok_or_else(|| anyhow!("the calling session ended"))?;
-            collab_prompt_local(session)?;
-        }
         self.work_config();
         let selector: Option<Selector> = selector
             .map(str::parse)
@@ -1352,12 +1340,6 @@ impl HostBridge {
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<String> {
         self.collab_ready()?;
-        collab_prompt_local(
-            sessions
-                .get(from)
-                .filter(|s| s.is_live())
-                .ok_or_else(|| anyhow!("originating session ended"))?,
-        )?;
         if let Some(problem) = selectors_problem(&request.to, MAX_AGENTS) {
             bail!("{problem}");
         }
@@ -1777,21 +1759,6 @@ impl HostBridge {
             self.work_fail();
         }
         written
-    }
-}
-
-/// Agents originate local work only from a turn started at this host (spec
-/// section 6): a session sends (or reads the directory) only while its
-/// latest prompt is `local`, typed in its terminal or a local task's.
-fn collab_prompt_local(session: &BrokerSession) -> Result<()> {
-    match session.prompt_from() {
-        PromptFrom::Local => Ok(()),
-        PromptFrom::Principal(principal) => bail!(
-            "this session's latest prompt came from {principal}; only a prompt from this host (its terminal or a local task) lets an agent send messages"
-        ),
-        PromptFrom::Unknown => bail!(
-            "this session's latest prompt can't be traced (for example, the runtime restarted since it began); a prompt from this host (its terminal or a local task) clears this: only such a prompt lets an agent send messages"
-        ),
     }
 }
 

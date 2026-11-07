@@ -6,7 +6,7 @@
 //! own tasks and report back, so a slow worker never stalls the loop.
 
 use super::adopt::{Adoption, SpawnRequest, WorkerHandle};
-use super::broker::{BrokerSession, Launcher, PromptFrom, SessionState};
+use super::broker::{BrokerSession, Launcher, SessionState};
 use super::host_bridge::{Clock, HostBridge};
 use super::ops::{BUSY, ClientUi, OpCall, OpEnv};
 use super::protocol::{
@@ -66,9 +66,6 @@ struct LaunchDone {
     remote: Option<String>,
     no_start: bool,
     request: SpawnRequest,
-    /// Whose launch it was: the new session's latest prompt principal
-    /// until its first prompt.
-    from: PromptFrom,
     /// The worker and the session's creation time.
     result: anyhow::Result<(WorkerHandle, u64)>,
 }
@@ -139,9 +136,6 @@ struct Attachment {
     exited_sent: bool,
     /// The summary it last got (in `attached` or `session`).
     sent: Option<SessionSummary>,
-    /// Who attached (`caller_of` when it attached): whose input its keys
-    /// are (`input_from`).
-    caller: Caller,
 }
 
 struct Server {
@@ -332,14 +326,12 @@ pub async fn serve(
     Ok(())
 }
 
-/// Waits until the workers found at start are adopted, so its answer
-/// includes them.
 /// Refuses a peer whose process can't be verified.
 const UNVERIFIED: &str =
     "the calling process could not be verified (it ended or was replaced); run the command again";
 
 /// Who calls over the local socket.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum Caller {
     /// An agent of this runtime: the nearest session agent in the caller's
     /// process ancestry.
@@ -386,6 +378,8 @@ pub(super) fn caller_of(
     Caller::Owner
 }
 
+/// Waits until the workers found at start are adopted, so its answer
+/// includes them.
 fn waits_for_adoption(incoming: &Incoming) -> bool {
     matches!(
         incoming,
@@ -583,21 +577,6 @@ impl Server {
         )
     }
 
-    /// Whose prompt `caller`'s input or launch carries: the owner's is
-    /// `Local`, an agent's that of the prompt its session works on, an
-    /// unverified process's unknown.
-    fn prompt_of(&self, caller: &Caller) -> PromptFrom {
-        match caller {
-            Caller::Owner => PromptFrom::Local,
-            Caller::Session(sid) => self
-                .sessions
-                .get(sid)
-                .filter(|s| s.is_live())
-                .map_or(PromptFrom::Unknown, |s| s.prompt_from().clone()),
-            Caller::Unverified => PromptFrom::Unknown,
-        }
-    }
-
     /// The calling session, for a command only an agent runs.
     fn calling_session(&self, client: u64, op: &str) -> Option<SessionId> {
         match self.caller(client) {
@@ -718,12 +697,8 @@ impl Server {
         since.elapsed() >= self.options.idle
     }
 
-    fn insert_session(&mut self, mut session: BrokerSession) {
+    fn insert_session(&mut self, session: BrokerSession) {
         let sid = session.id.clone();
-        session.keep_prompt_in(super::collab::prompt_file(
-            self.options.launcher.state(),
-            sid.as_str(),
-        ));
         if self.sessions.insert(sid.clone(), session).is_none() {
             self.order.push(sid);
         }
@@ -743,7 +718,6 @@ impl Server {
             remote,
             no_start,
             request,
-            from,
             result,
         } = done;
         if let Some(id) = &remote {
@@ -769,7 +743,7 @@ impl Server {
                     request.provider.as_str(),
                     handle.info.pid
                 );
-                let session = BrokerSession::launched(handle, &request, created_at_ms, from);
+                let session = BrokerSession::launched(handle, &request, created_at_ms);
                 let summary = session.summary(false);
                 self.insert_session(session);
                 if remote.is_none() {
@@ -805,10 +779,6 @@ impl Server {
             return;
         };
         super::collab::restore_tags(self.options.launcher.state(), &mut session);
-        session.restore_prompt(&super::collab::prompt_file(
-            self.options.launcher.state(),
-            session.id.as_str(),
-        ));
         if self.sessions.contains_key(&session.id) {
             return;
         }
@@ -1059,9 +1029,6 @@ impl Server {
                 };
                 #[cfg(not(debug_assertions))]
                 let session_id = SessionId::new();
-                // An agent's launch carries the prompt its own session works
-                // on: a remote principal can't start a local one this way.
-                let from = self.prompt_of(&self.caller(id));
                 let request = SpawnRequest {
                     session_id,
                     process_gen: uuid::Uuid::new_v4().to_string(),
@@ -1081,7 +1048,6 @@ impl Server {
                         remote: None,
                         no_start: false,
                         request,
-                        from,
                         result,
                     });
                     wake.notify_one();
@@ -1111,7 +1077,6 @@ impl Server {
                     restored: false,
                     exited_sent: false,
                     sent: None,
-                    caller: self.caller(id),
                 };
                 if let Some(previous) = self.attached.insert(sid.clone(), attachment)
                     && previous.client != id
@@ -1337,10 +1302,11 @@ impl Server {
                 }
             }
             ClientMsg::MessageDirectory { selector } => {
-                // Inside a session: only one whose latest prompt is local.
-                let Ok(caller) = self.session_or_owner(id, "message_directory") else {
+                // From a session or the owner's terminal; an unverified
+                // process is refused, as for the other collaboration ops.
+                if self.session_or_owner(id, "message_directory").is_err() {
                     return;
-                };
+                }
                 let result = self
                     .bridge
                     .as_mut()
@@ -1348,7 +1314,6 @@ impl Server {
                     .and_then(|b| {
                         b.collab_directory(
                             &self.app.astation_client.device_atem_id(),
-                            caller.as_ref(),
                             selector.as_deref(),
                             &self.sessions,
                         )
@@ -1755,21 +1720,10 @@ impl Server {
                 return None;
             }
         };
-        if !self.sessions[&sid].can_write() {
+        let session = self.sessions.get_mut(&sid).expect("checked above");
+        if !session.can_write() {
             return Some(message);
         }
-        // Keys from the owner's terminal arm a local prompt; an agent's (it
-        // attached itself) carry the prompt its own session works on.
-        if !bytes.is_empty() {
-            let from = self
-                .attached
-                .get(&sid)
-                .map_or(PromptFrom::Unknown, |a| self.prompt_of(&a.caller));
-            if let Some(session) = self.sessions.get_mut(&sid) {
-                session.note_input(from);
-            }
-        }
-        let session = self.sessions.get_mut(&sid).expect("checked above");
         let written = match self.bridge.as_mut() {
             Some(bridge) => {
                 bridge.local_input(&sid, bytes, &self.app.astation_client, &mut self.sessions)
@@ -1817,9 +1771,6 @@ impl Server {
                 }
                 continue;
             }
-            // A remote launch's session works on its sender's prompt until
-            // its first one; a local launch on message on `local`'s.
-            let from = PromptFrom::of(Some(&launch.principal));
             let request = SpawnRequest {
                 session_id: SessionId::parse(&launch.session_id).expect("reserved session id"),
                 process_gen: launch.process_gen.clone(),
@@ -1851,7 +1802,6 @@ impl Server {
                     remote: Some(launch.request_id),
                     no_start,
                     request,
-                    from,
                     result,
                 });
                 wake.notify_one();

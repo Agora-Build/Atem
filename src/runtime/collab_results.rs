@@ -177,11 +177,6 @@ pub struct Reply {
     /// Its text and context are no longer kept (`drop_payload`).
     #[serde(default)]
     pub dropped: bool,
-    /// Whose prompt the replying session worked on when it replied
-    /// (`PromptFrom::label`), when not a prompt from this host: delivered to
-    /// a local sender as data, the reply carries that origin, not `local`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_from: Option<String>,
 }
 
 impl Reply {
@@ -540,7 +535,6 @@ mod tests {
             references,
             context: vec![],
             dropped: false,
-            prompt_from: None,
         }
     }
 

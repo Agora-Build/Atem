@@ -1499,12 +1499,7 @@ async fn broker_session(dir: &Path) -> crate::runtime::broker::BrokerSession {
         ("CODEX_CLI_BIN".into(), agent.display().to_string()),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    crate::runtime::broker::BrokerSession::launched(
-        handle,
-        &request,
-        created_at_ms,
-        crate::runtime::broker::PromptFrom::Local,
-    )
+    crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms)
 }
 
 #[tokio::test]
@@ -2631,12 +2626,8 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
         ("FAKE_CODEX_HOOK".into(), hook),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    let mut session = crate::runtime::broker::BrokerSession::launched(
-        handle,
-        &request,
-        created_at_ms,
-        crate::runtime::broker::PromptFrom::Local,
-    );
+    let mut session =
+        crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
     agent_event(&fake, "started").await;
     ask(
         &fake,
@@ -3755,12 +3746,7 @@ async fn host_rebinds_drop_the_workers_session_rules() {
         ("FAKE_CODEX_HOOK".into(), hook),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    let session = crate::runtime::broker::BrokerSession::launched(
-        handle,
-        &request,
-        created_at_ms,
-        crate::runtime::broker::PromptFrom::Local,
-    );
+    let session = crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
     agent_event(&fake, "started").await;
     let mut sessions = std::collections::BTreeMap::new();
     sessions.insert(session.id.clone(), session);
