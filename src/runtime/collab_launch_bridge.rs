@@ -234,20 +234,19 @@ impl HostBridge {
                 route.clone(),
                 self.work.dir.clone(),
             );
+            // At the spawn boundary, as a remote launch's: a file that
+            // doesn't load (it may be the edit that removes the route),
+            // hosting switched off or a changed approval fences the launch
+            // (`take_remote_launches` holds the ones not handed out while
+            // the file doesn't load).
             let guard = Arc::new(move || {
                 flag.load(Ordering::SeqCst)
                     && host_now().wall_ms < expires_at
-                    // A pause (a file that doesn't load, hosting off) is no
-                    // change: a launch that is already under way isn't
-                    // failed by it (`take_remote_launches` holds the ones
-                    // not started). A changed approval is.
-                    && match Config::load(&dir) {
-                        Ok(c) if c.enabled => {
-                            c.profile(&approved.id) == Some(&approved)
-                                && c.route(&approved_route.id) == Some(&approved_route)
-                        }
-                        _ => true,
-                    }
+                    && Config::load(&dir).is_ok_and(|c| {
+                        c.enabled
+                            && c.profile(&approved.id) == Some(&approved)
+                            && c.route(&approved_route.id) == Some(&approved_route)
+                    })
                     && crate::memory::project::project_key_for(&approved.cwd) == approved.project
             });
             let status = launch.record.status;
@@ -293,19 +292,24 @@ impl HostBridge {
             .ok_or_else(|| anyhow!("missing reserved launch"))?;
         let (state, detail) = match record.status.state {
             LaunchState::Started => return Ok(false),
-            LaunchState::Starting => (WorkState::Blocked, "launching the approved route"),
+            LaunchState::Starting => (WorkState::Blocked, "launching the approved route".into()),
+            // The runtime refused to start it (the live-session limit, a
+            // restart): that, not the route's directory or environment.
             LaunchState::Failed => (
                 WorkState::Failed,
-                "approved route launch failed; check its cwd and environment",
+                match self.work.refused.get(&id) {
+                    Some(why) => format!("approved route launch not started: {why}"),
+                    None => "approved route launch failed; check its cwd and environment".into(),
+                },
             ),
             LaunchState::OutcomeUnknown => (
                 WorkState::OutcomeUnknown,
-                "launch outcome unknown; the reserved launch will not be repeated",
+                "launch outcome unknown; the reserved launch will not be repeated".into(),
             ),
         };
         if task.status.state != state || task.status.detail != detail {
             task.status.state = state;
-            task.status.detail = detail.into();
+            task.status.detail = detail;
             store.save_work(task)?;
         }
         Ok(true)

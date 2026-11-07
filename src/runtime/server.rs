@@ -1800,12 +1800,20 @@ impl Server {
             .map(|b| b.take_remote_launches())
             .unwrap_or_default();
         for launch in launches {
-            if self.restart || self.live_count() + self.launching >= crate::session::MAX_LIVE {
+            // Refused here, nothing started: the reason goes to its tasks.
+            let refused = if self.restart {
+                Some("the runtime is restarting; send again once it runs".to_string())
+            } else if self.live_count() + self.launching >= crate::session::MAX_LIVE {
+                Some(format!(
+                    "at most {} sessions can run at once",
+                    crate::session::MAX_LIVE
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = refused {
                 if let Some(bridge) = self.bridge.as_mut() {
-                    bridge.remote_launched(
-                        &launch.request_id,
-                        atem_client::session::host_work::LaunchState::Failed,
-                    );
+                    bridge.launch_refused(&launch.request_id, why);
                 }
                 continue;
             }

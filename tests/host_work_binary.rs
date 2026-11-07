@@ -2350,24 +2350,28 @@ fn hooked_rig(configure: impl FnOnce(&mut TestLog)) -> (Rig, String) {
     (rig, good)
 }
 
-/// A remote launch that has not started when a pause begins (an invalid
-/// `runtime.toml`, hosting switched off) waits for it to end, then starts:
-/// a pause is no fence.
+/// A remote launch that has not started when `runtime.toml` stops loading
+/// waits for it to load again, then starts: an invalid file is no fence.
+/// Hosting switched off (`enabled = false`) is a deliberate stop, as on
+/// v0.8.2: the launch is fenced, never starts, and ends `outcome_unknown`,
+/// even once hosting is on again.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook"
 )]
-fn a_remote_launch_waits_out_a_pause() {
+fn a_remote_launch_waits_out_an_invalid_file_but_not_hosting_off() {
     let (mut rig, good) = hooked_rig(|_| {});
     rig.start();
     let mut r = Router::new(&rig.astation);
     let invalid = good.replace("project = \"local:home\"\n", "");
     let state = launch_through_a_pause(&rig, &mut r, "svc-work", &invalid, &good);
     assert_eq!(state, "started");
+    let started = rig.sandbox.records().len();
     let off = good.replace("enabled = true", "enabled = false");
     let state = launch_through_a_pause(&rig, &mut r, "svc-work", &off, &good);
-    assert_eq!(state, "started");
+    assert_eq!(state, "outcome_unknown");
+    assert_eq!(rig.sandbox.records().len(), started, "nothing started");
 }
 
 /// The approval is compared when the pause ends: a launch whose profile

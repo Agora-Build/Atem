@@ -1739,13 +1739,14 @@ impl HostBridge {
     }
 
     /// `atem message cancel`: inside a session (`caller`), a task of a
-    /// message it sent; from outside any session, any local task.
+    /// message it sent; from outside any session, any local task. Under the
+    /// host's current authority with the store readable, as a reply or a
+    /// completion (`collab_store_ready`); the task and its return grant end
+    /// in one transaction, and a write that fails stops hosting until a
+    /// restart (`work_fail`), as a pass's does.
     pub fn collab_cancel(&mut self, caller: Option<&SessionId>, id: &str) -> Result<()> {
-        let store = self
-            .work
-            .store
-            .as_ref()
-            .ok_or_else(|| anyhow!("no task store"))?;
+        self.collab_store_ready()?;
+        let store = self.work.store.as_ref().unwrap();
         let mut task = store
             .work(id)?
             .filter(|r| r.principal == "local")
@@ -1762,7 +1763,20 @@ impl HostBridge {
         }
         task.status.state = WorkState::Cancelled;
         task.status.detail = "cancelled locally before submission".into();
-        store.save_work(&task)
+        let written = (|| -> Result<()> {
+            let tx = store.db.unchecked_transaction()?;
+            store.save_work(&task)?;
+            tx.execute(
+                "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state IN ('open','consumed')",
+                [id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if written.is_err() {
+            self.work_fail();
+        }
+        written
     }
 }
 

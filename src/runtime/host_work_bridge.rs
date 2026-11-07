@@ -156,6 +156,9 @@ pub(super) struct State {
     /// full check, and every task active since): their control states are
     /// kept (`SessionHost::keep_principals`).
     named: HashSet<String>,
+    /// Why the runtime refused to start a launch it was handed (the
+    /// live-session limit, a restart): the detail of its local tasks.
+    refused: HashMap<String, String>,
 }
 
 impl State {
@@ -184,6 +187,7 @@ impl State {
             recheck_tasks: true,
             recheck_grants: true,
             named: HashSet::new(),
+            refused: HashMap::new(),
         }
     }
 }
@@ -229,12 +233,12 @@ impl HostBridge {
     }
 
     /// The launches to start now. A launch that has not started, local or
-    /// remote, waits out a pause (spec section 9: `runtime.toml` not
-    /// loading, hosting off) and starts when it is over; a receipt database
-    /// fault, which lasts until a restart, fences it instead (`work_fail`).
-    /// Fences are evaluated first, so what changed while it waited is not
-    /// started on the old approval (a fenced one is handed out to fail at its
-    /// guard).
+    /// remote, waits out a `runtime.toml` that doesn't load and starts when
+    /// it loads again (spec section 9); hosting switched off (`enabled =
+    /// false`, a deliberate stop) and a receipt database fault, which lasts
+    /// until a restart (`work_fail`), fence it instead. Fences are evaluated
+    /// first, so what changed while it waited is not started on the old
+    /// approval (a fenced one is handed out to fail at its guard).
     pub fn take_remote_launches(&mut self) -> Vec<RemoteLaunch> {
         if self.work.launches.is_empty() {
             return Vec::new();
@@ -244,7 +248,7 @@ impl HostBridge {
             return Vec::new();
         }
         self.work_fence_launches();
-        let paused = !self.collab_paused().is_empty();
+        let paused = self.work.config_problem.is_some();
         let pending = &self.work.pending;
         let waits = |id: &str| {
             paused
@@ -262,6 +266,17 @@ impl HostBridge {
         }
         self.work.launches = waiting;
         ready
+    }
+
+    /// The runtime refused to start launch `request_id` (`why`: the
+    /// live-session limit, a restart): it failed, nothing was started, and
+    /// its local tasks say why.
+    pub fn launch_refused(&mut self, request_id: &str, why: String) {
+        if self.work.refused.len() >= 256 {
+            self.work.refused.clear();
+        }
+        self.work.refused.insert(request_id.to_string(), why);
+        self.remote_launched(request_id, LaunchState::Failed);
     }
 
     pub fn remote_launched(&mut self, request_id: &str, state: LaunchState) {
@@ -599,7 +614,9 @@ impl HostBridge {
     }
 
     fn work_fence_launches(&mut self) {
-        let paused = !self.collab_paused().is_empty();
+        // Only a file that doesn't load is waited out; `enabled = false`
+        // fences (a receipt database fault already did, `work_fail`).
+        let paused = self.work.config_problem.is_some();
         let ids: Vec<String> = self.work.pending.keys().cloned().collect();
         for id in ids {
             let attachment = self.work.pending[&id].attachment.clone();
@@ -617,26 +634,29 @@ impl HostBridge {
                     // identity, a lost device list, a changed approval. So
                     // does a plain session-journal halt (`local` is fenced in
                     // memory): only a restart ends it, and the restart drops
-                    // a launch not started anyway. A pause waits
-                    // (`take_remote_launches`); while it lasts the approval
-                    // can't be compared (the file may not load), which is no
-                    // change: it is compared again when the pause ends.
-                    // `[collab] send` never matters.
+                    // a launch not started anyway. So does hosting switched
+                    // off. A file that doesn't load is waited out
+                    // (`take_remote_launches`); while it doesn't the
+                    // approval can't be compared, which is no change: it is
+                    // compared again once it loads. `[collab] send` never
+                    // matters.
                     Some(route) => {
                         !p.attachment.is_empty()
                             && p.attachment == self.local_attachment()
                             && self.local_authorized()
                             && (paused
-                                || self.work.config.profile(&p.profile.id) == Some(&p.profile)
+                                || self.work.config.enabled
+                                    && self.work.config.profile(&p.profile.id) == Some(&p.profile)
                                     && self.work.config.route(&route.id) == Some(route)
                                     && route.principals.iter().any(|p| p == "local")
                                     && route.launch
                                         == crate::runtime::host_work::RouteLaunch::OnMessage)
                     }
-                    // A remote launch waits out a pause the same way while
-                    // its sender's authority holds (the same attachment and
-                    // principal, the control generation checked above); its
-                    // approval is compared again when the pause ends.
+                    // A remote launch waits out a file that doesn't load the
+                    // same way while its sender's authority holds (the same
+                    // attachment and principal, the control generation
+                    // checked above); its approval is compared again once it
+                    // loads. Hosting switched off fences it, as v0.8.2 did.
                     None => authority.as_ref().is_some_and(|a| {
                         a.name() == p.principal
                             && (paused
@@ -3518,11 +3538,11 @@ launch = "on_message"
     }
 
     /// Spec section 9, "Pauses, not fences": a local launch that has not
-    /// started when a pause begins (an invalid `runtime.toml`, hosting off)
-    /// waits for the pause to end, then starts. Its task is not failed
-    /// meanwhile.
+    /// started when `runtime.toml` stops loading waits for it to load again,
+    /// then starts. Its task is not failed meanwhile. Hosting switched off
+    /// is a deliberate stop instead: it fences a launch not started (below).
     #[test]
-    fn a_launch_that_has_not_started_waits_out_a_pause() {
+    fn a_launch_that_has_not_started_waits_out_an_invalid_file() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
             launch_route(&mut rig, root);
@@ -3530,24 +3550,16 @@ launch = "on_message"
             accept(&mut rig, &message, true);
             let request = launch_records(&rig)[0].status.request_id.clone();
             let good = rig.bridge.work.config.clone();
-            for pause in 0..2 {
-                match pause {
-                    0 => rig.bridge.work.config.enabled = false,
-                    _ => {
-                        rig.bridge.work.config = Config::default();
-                        rig.bridge.work.config_problem = Some("expected a table".into());
-                    }
-                }
+            {
+                rig.bridge.work.config = Config::default();
+                rig.bridge.work.config_problem = Some("expected a table".into());
                 idle(&mut rig, 350).await;
-                assert!(
-                    rig.bridge.take_remote_launches().is_empty(),
-                    "pause {pause}: held"
-                );
+                assert!(rig.bridge.take_remote_launches().is_empty(), "held");
                 assert!(
                     rig.bridge.work.pending[&request]
                         .permit
                         .load(Ordering::SeqCst),
-                    "pause {pause}: not fenced"
+                    "not fenced"
                 );
                 assert_eq!(launch_records(&rig)[0].status.state, LaunchState::Starting);
                 let task = rig
@@ -3559,11 +3571,7 @@ launch = "on_message"
                     .open_tasks()
                     .unwrap()
                     .remove(0);
-                assert!(
-                    !task.status.state.terminal(),
-                    "pause {pause}: {:?}",
-                    task.status
-                );
+                assert!(!task.status.state.terminal(), "{:?}", task.status);
                 rig.bridge.work.config = good.clone();
                 rig.bridge.work.config_problem = None;
             }
@@ -3587,6 +3595,51 @@ launch = "on_message"
                 .remove(0);
             assert_eq!(task.status.state, WorkState::Blocked);
             assert_eq!(task.status.detail, "launching the approved route");
+        });
+    }
+
+    /// Hosting switched off (`enabled = false` in a file that loads) is a
+    /// deliberate stop: a local launch that has not started is fenced, as a
+    /// remote one is (handed out to fail at its guard, never held), and
+    /// switching hosting on again doesn't revive it. Its task waits, as
+    /// queued tasks do, and then takes the launch's outcome.
+    #[test]
+    fn hosting_switched_off_fences_a_local_launch_not_started() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            let request = launch_records(&rig)[0].status.request_id.clone();
+            let good = rig.bridge.work.config.clone();
+            rig.bridge.work.config.enabled = false;
+            idle(&mut rig, 350).await;
+            let launches = rig.bridge.take_remote_launches();
+            assert_eq!(launches.len(), 1, "released to fail, never held");
+            assert_eq!(launches[0].request_id, request);
+            assert!(
+                !rig.bridge.work.pending[&request]
+                    .permit
+                    .load(Ordering::SeqCst)
+            );
+            assert!(!(launches[0].guard)());
+            let task = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .open_tasks()
+                .unwrap()
+                .remove(0);
+            assert!(!task.status.state.terminal(), "{:?}", task.status);
+            rig.bridge.work.config = good;
+            idle(&mut rig, 350).await;
+            assert!(
+                !rig.bridge.work.pending[&request]
+                    .permit
+                    .load(Ordering::SeqCst),
+                "never revived"
+            );
         });
     }
 
@@ -4370,10 +4423,11 @@ launch = "on_message"
         });
     }
 
-    /// A launch the spawner already holds is not failed by a pause (an
-    /// invalid file, hosting off), but a changed approval still stops it.
+    /// A launch handed to the spawner re-reads `runtime.toml` at the spawn
+    /// boundary, as a remote one does: a file that doesn't load, hosting
+    /// switched off or a changed approval stops it.
     #[test]
-    fn a_launch_under_way_survives_a_pause_but_not_a_change() {
+    fn a_launch_under_way_stops_on_an_invalid_file_hosting_off_or_a_change() {
         use std::os::unix::fs::PermissionsExt;
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
@@ -4389,14 +4443,163 @@ launch = "on_message"
             };
             write(&launch_toml(&cwd, 1));
             assert!(guard(), "the approved file");
+            // At the spawn boundary the guard fails closed: a file that
+            // doesn't load may be the edit that removes the route.
             write("not = [valid");
-            assert!(guard(), "an invalid file is a pause");
+            assert!(!guard(), "an invalid file fences it");
             write(&launch_toml(&cwd, 1).replace("enabled = true", "enabled = false"));
-            assert!(guard(), "hosting off is a pause");
+            assert!(!guard(), "hosting off fences it");
+            write(&launch_toml(&cwd, 1));
+            assert!(guard(), "the approved file again");
             write(&launch_toml(&cwd, 2));
             assert!(!guard(), "a changed route is a change");
             write(&launch_toml(&cwd, 1).replace("launch = \"on_message\"", "launch = \"off\""));
             assert!(!guard(), "a route that no longer launches");
+        });
+    }
+
+    /// A queued local task under an open return grant, as
+    /// `collab_accept` records it; its id.
+    fn queued_with_grant(rig: &LocalRig) -> String {
+        use crate::runtime::collab::results::{self, Origin, ReturnGrant};
+        let control_gen = rig.bridge.host.control_gen("local");
+        let id = insert_task(
+            rig,
+            "local",
+            control_gen,
+            WorkState::Queued,
+            host_now().wall_ms + 60_000,
+        );
+        let task = stored_record(rig, &id);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction().unwrap();
+        results::save_grant(
+            &tx,
+            &ReturnGrant {
+                task_id: id.clone(),
+                message_id: uuid::Uuid::new_v4().to_string(),
+                workflow_id: task.task.workflow_id.clone(),
+                origin: Origin {
+                    target: task.task.target.clone(),
+                    control_gen,
+                    route: None,
+                },
+                recipient: task.task.target.clone(),
+                expires_at: task.task.expires_at,
+                ended: None,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        id
+    }
+
+    fn stored_record(rig: &LocalRig, id: &str) -> WorkRecord {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .work(id)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn grant_state(rig: &LocalRig, id: &str) -> String {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT state FROM return_grants WHERE task_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `atem message cancel` ends the task's return grant in the same
+    /// transaction, needs the store as a reply or a completion does
+    /// (`collab_store_ready`: refused during a receipt-database fault), and
+    /// a write that fails stops hosting until a restart (`work_fail`).
+    #[test]
+    fn a_cancel_ends_its_grant_with_the_task_and_needs_a_working_store() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let id = queued_with_grant(&rig);
+            rig.bridge.collab_cancel(None, &id).unwrap();
+            let task = stored_record(&rig, &id);
+            assert_eq!(task.status.state, WorkState::Cancelled);
+            assert_eq!(grant_state(&rig, &id), "ended", "no pass needed");
+
+            let id = queued_with_grant(&rig);
+            rig.bridge.work.error = true;
+            let refused = rig.bridge.collab_cancel(None, &id).unwrap_err().to_string();
+            assert!(
+                refused.contains("agent hosting records are unavailable"),
+                "{refused}"
+            );
+            assert_eq!(stored_record(&rig, &id).status.state, WorkState::Queued);
+            assert_eq!(grant_state(&rig, &id), "open");
+            rig.bridge.work.error = false;
+
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute_batch(
+                    "CREATE TEMP TRIGGER no_write BEFORE UPDATE ON main.work
+                    BEGIN SELECT RAISE(FAIL,'injected write failure'); END;",
+                )
+                .unwrap();
+            assert!(rig.bridge.collab_cancel(None, &id).is_err());
+            assert!(rig.bridge.work.error, "hosting stopped");
+            assert_eq!(grant_state(&rig, &id), "open", "nothing half-written");
+        });
+    }
+
+    /// A local launch the runtime refused to start (the live-session limit,
+    /// a restart) fails its tasks with that cause, not with a hint at the
+    /// route's directory or environment.
+    #[test]
+    fn a_refused_launch_says_why_in_its_tasks() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            launch_route(&mut rig, root);
+            send_q(&mut rig, true);
+            let request = launch_records(&rig)[0].status.request_id.clone();
+            rig.bridge
+                .launch_refused(&request, "at most 16 sessions can run at once".into());
+            assert_eq!(launch_records(&rig)[0].status.state, LaunchState::Failed);
+            rig.until(|r| {
+                r.bridge
+                    .work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .open_tasks()
+                    .unwrap()
+                    .first()
+                    .is_some_and(|t| t.status.state == WorkState::Failed)
+            })
+            .await;
+            let task = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .open_tasks()
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                task.status.detail,
+                "approved route launch not started: at most 16 sessions can run at once"
+            );
         });
     }
 
