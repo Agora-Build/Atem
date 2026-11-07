@@ -2192,6 +2192,13 @@ impl<J: Journal> SessionHost<J> {
             .map(|e| self.render(&e.stored))
     }
 
+    /// The principal that submitted `request_id`, while its receipt is kept.
+    pub fn submitter(&self, request_id: &str) -> Option<&str> {
+        self.receipts
+            .get(request_id)
+            .map(|e| e.stored.principal.as_str())
+    }
+
     /// Every receipt's request id, every registered session's id and
     /// every principal with a control state (debug builds: the real
     /// runtime's fixture state dump).

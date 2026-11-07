@@ -325,7 +325,7 @@ has no reply, else:
 | `result_id` | UUID v5 of the task id: the same for every reply to the task, a corrected one included |
 | `state` | `publishing`, `submitted` or `refused` (below) |
 | `digest` | SHA-256 (hex) identifying the reply's content: the same for an identical retry, another for a corrected reply. Compare it; don't recompute it |
-| `text` | the reply text: at most 16 KiB, no control characters other than newline and tab |
+| `text` | the reply text: at most 16 KiB, no control characters other than newline and tab. Credential values are redacted (`[redacted]`, as chat-v1 redacts agent output) before the host stores the reply; `digest` is over the redacted text |
 | `context` | 0–8 published context snapshots (§4), exact bytes; empty unless `submitted` |
 | `submitted_at` | Unix ms on the host's clock when the reply became `submitted`; `null` before |
 | `dropped` | `true` once the host no longer keeps the reply's text and context (§9): `text` is `""` and `context` `[]`; `result_id`, `state`, `digest` and `submitted_at` are unchanged. `false` otherwise |

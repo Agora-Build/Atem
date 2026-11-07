@@ -4,9 +4,13 @@ Status (2026-11-06): **stage 1 implemented, unreleased**, on
 `feat/agent-collaboration`; sections 10 and 17 give its lifecycle, retention and
 known limits. Agents in one Atem runtime can send work and reply through the
 existing host queue. **Not implemented:** stages 2 and 3, cross-instance
-delivery, directory publication, the Station mailbox and signed projects. This
-changes no part of the remote permission contract: every part that would is
-marked **Needs agreement** and waits until all three projects agree.
+delivery, directory publication, the Station mailbox and signed projects. A
+remote principal still reaches only the routes approved for it: an agent sends
+local work only from a turn a prompt from this host began (section 6), so the
+`local` sender is no way around a route. What remains outside that rule is in
+section 6 ("What remains"). Every part of stages 2 and 3 that would change the
+remote permission contract is marked **Needs agreement** and waits until all
+three projects agree.
 
 Reviews (2026-11-04): Auth/Portal's answers and changes are folded in; so are
 Astation's ([#120](https://github.com/Agora-Build/Atem/issues/120)): a narrow
@@ -184,13 +188,59 @@ permission for that; a local sender needs only the route setting.
 
 **Today's two locks stay.** Every task still needs the caller's account
 permission and the receiving owner's route consent
-([agent-hosting.md](agent-hosting.md) section 4). Nothing here widens either.
+([agent-hosting.md](agent-hosting.md) section 4). A remote principal's work
+reaches only the routes that list it: the `local` sender below is no way
+around them.
 
 | Stage | Sender identity | Account permission | Route consent |
 |---|---|---|---|
-| 1. Local | `local`: an internal attachment of the session host, never welcomed over a link | none: the message never leaves the machine (the same-user boundary every local command has) | the route lists `local` in `principals` |
+| 1. Local | `local`: an internal attachment of the session host, never welcomed over a link | none: the message never leaves the machine (the same-user boundary every local command has), and the sending session's latest prompt came from this host (below) | the route lists `local` in `principals` |
 | 2. Online | an existing principal: the instance enrolled as a Station integration, `service:svc-<id>` | its signed service grant: `message`, `notify`, `prompt`, and `launch` for launches; its hosts and projects bound the targets | the route lists that service |
 | 3. Autonomous | the instance itself, `host:<host_id>`, signing with its pinned `host_key` (**needs agreement**) | a signed project grant, below (**needs agreement**) | the route lists `project:<name>` or the host (**needs agreement**) |
+
+**Local work starts only at this host.** A session may send (`atem message
+send`, with or without `--launch`) or read the directory (`atem message
+directory`) only while its latest prompt principal is `local`. That is the
+principal of the most recent prompt the session took: `local` for a prompt
+typed in its terminal at this host or a local task's prompt, and the submitter
+for a prompt submitted through a receipt by anyone else (a remote sender's
+task, a session-v1 or chat-v1 prompt of a native member, service or browser).
+Remote terminal input sets its principal at once. A session launched by a
+remote `host_launch` has its sender's until its first prompt; one launched
+locally (`atem agent launch`, the menu, a local launch on message) has
+`local`. Otherwise the command is refused: "this session's latest prompt came
+from <principal>; only a prompt from this host (its terminal or a local task)
+lets an agent send messages". The rule covers background processes a remote
+turn left running too, until a prompt from this host begins a newer turn.
+`atem message reply`, `complete`, `status`, `cancel` and `atem agent tag`
+don't depend on it: a reply answers the task the session works on, and status
+is scoped to the session.
+
+- Keys typed at this host's terminal count once the chat records the turn
+  they began, and never for a remote prompt's turn, so answering the agent's
+  own dialog during a remote turn changes nothing. A session without chat
+  (Codex with its hooks off) records no turn: once a remote principal wrote to
+  it, it can't send until it is launched again.
+- What an agent does through the local socket carries the prompt its own
+  session works on: a session it launches, and a prompt it types into another
+  session's terminal, count as that prompt's principal, not as the owner's.
+- A reply delivered to its sender as data (`results = true`, section 10)
+  counts as the prompt the replying session worked on when it replied:
+  `local`, or that remote principal.
+- The runtime keeps each session's latest prompt principal in
+  `<config>/runtime/collab-prompt-<session>.json`, written before a remote
+  principal's input reaches the agent, so a restarted runtime that adopts the
+  session knows it. A session it can't trace (no record, or another process
+  generation) is refused with "this session's latest prompt can't be traced
+  (…); a prompt from this host (its terminal or a local task) clears this".
+
+**What remains.** An agent's own shell can still do whatever the user can
+outside the receipt machinery: a process that leaves the agent's process tree
+(a double fork, a scheduler, a terminal multiplexer) is taken for the owner and
+can type into a session's terminal; there the same-user boundary is the only
+one. Against that, the owner opts in twice, with `[collab] send = true` and
+with `local` in a route's `principals`, and the agent's tool approvals apply to
+every command it runs.
 
 **Stage 2 in practice.** The instance sends nothing until the owner has
 approved its integration in Astation; Auth issues no token before that. One
@@ -430,7 +480,10 @@ its sender: two separate steps.
   the calling session is in its turn or awaits a result. A reply's vault
   reference names its entry: a bare `<id>@<version>` is refused before anything
   is stored. The text is at most 16 KiB, with no control characters other than
-  newline and tab.
+  newline and tab. Credential values in it are redacted, by the redactor
+  chat-v1 applies to agent output, before the reply is stored and its digest
+  taken (an identical retry is redacted the same way), so no sender, local or
+  remote, reads one and none is kept.
 - **Authorization.** The runtime accepts a reply only from the task's target
   session and process (found from the CLI's process ancestry), while the task
   is `submitted`, `awaiting_result` or `outcome_unknown`. It binds the reply,
@@ -534,9 +587,9 @@ its sender: two separate steps.
   it doesn't complete the task or consume the return grant. The timer starts
   once the prompt's receipt carries its turn. A route can opt in to include
   the turn's final assistant message in that report (`auto_report =
-  "final_message"`, up to 200 characters, kept in the task's status detail);
-  it may hold command output or values the agent never meant to send, so it
-  stays off by default.
+  "final_message"`, up to 200 characters, kept in the task's status detail,
+  credential values redacted as in chat-v1); it may hold command output or
+  values the agent never meant to send, so it stays off by default.
 - **Who sees what.** Inside a session, `atem message status` shows the messages
   that session sent, with all their tasks, and the messages with a task sent to
   it, with that task only: the local tasks it received. Tasks from remote
@@ -784,13 +837,14 @@ auto_report = "status"      # or "final_message" (opt-in)
 | `atem message complete <task id>` | The local sending agent (or the owner, outside any session) completes its task with the submitted reply, if any; also stops a queued delivery |
 | `atem message status [<id>]` | Delivery per instance and execution per task; inside a session, only its own messages and the local tasks sent to it |
 | `atem message cancel <task id>` | While the task is queued or blocked; inside a session, only its own messages |
-| `atem message directory [<selector>]` | Local routes and agents a selector reaches now; no cross-instance directory yet |
+| `atem message directory [<selector>]` | Local routes and agents a selector reaches now; no cross-instance directory yet. Inside a session, only while its latest prompt is local (section 6) |
 | `atem agent tag add\|remove\|list [<name>]` | The calling agent's own `self:` tags |
 
 Every command is a client of the local runtime, which does the work.
 Commands require pairing; `send`, `reply` and agent tags also require a child
-process of a live Atem-launched agent (`status`, `cancel` and `complete` also
-run from the owner's terminal). An ordinary terminal cannot impersonate
+process of a live Atem-launched agent (`status`, `cancel`, `complete` and
+`directory` also run from the owner's terminal), and `send` a session whose
+latest prompt came from this host (section 6). An ordinary terminal cannot impersonate
 one by supplying a session id. Keep the config mode 0600 and validate it with
 `atem runtime check`. Repeat `--to` for a union of selectors.
 
@@ -878,7 +932,8 @@ permissions; agents editing projects; message content leaving the account.
 ## 17. Stage 1 implementation
 
 Stage 1 is implemented in local commits on `feat/agent-collaboration`
-(unreleased) and has: limits counted in messages and checked at send, pauses
+(unreleased) and has: sends only from turns a prompt from this host began
+(section 6), limits counted in messages and checked at send, pauses
 instead of fences, agent commands that only connect, one reply for every sender
 with `reply_query` for remote ones, tasks that expire at their deadline, a
 defined lifecycle for revocation, departed senders, route changes, interrupts
@@ -976,6 +1031,18 @@ outside this implementation.
 ### Known limits
 
 Stage 1 ships with these limits.
+
+- **Origin of local work.** A remote principal can't make an agent send
+  through the receipt machinery (section 6), but an agent's own shell can
+  still do whatever the user can outside it: a process that leaves the
+  agent's process tree is taken for the owner and can type into a session's
+  terminal. The owner's opt-ins (`[collab] send = true`, `local` on a route)
+  and the agent's tool approvals are what stand against that. A session
+  without chat (Codex with its hooks off) can't tell a prompt typed here from
+  other keys: once a remote principal wrote to it, it sends nothing until it
+  is launched again. A remote prompt the agent never recorded as a turn claims
+  the next turn, so the first prompt typed after it doesn't let the agent send
+  (the next one does).
 
 - **Scaling.** Every 100 ms the pass reads the task rows that are unfinished or
   awaiting a result (`settle_overdue` extracts JSON fields from each, bounded by

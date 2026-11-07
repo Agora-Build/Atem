@@ -749,7 +749,10 @@ fn host_clock_at(path: &Path, wall_ms: u64) {
 /// with the same result id, state and digest), and a retry is answered
 /// from the record as before. runtime.log says what was dropped.
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_HOST_CLOCK hook")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_CLOCK hook"
+)]
 fn a_settled_task_keeps_its_records_when_its_payloads_go() {
     let mut rig = Rig::new("claude");
     let mut r = Router::new(&rig.astation);
@@ -841,7 +844,10 @@ fn a_settled_task_keeps_its_records_when_its_payloads_go() {
 /// A reply with context is `publishing` (no context, no time) until the
 /// context is published, then `submitted` with it; it survives a restart.
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook"
+)]
 fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart() {
     let mut rig = Rig::prepared("claude", |_| {});
     rig.context_hook = true;
@@ -915,7 +921,10 @@ fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart()
 /// A refused reply is read as refused (its reason is the task's detail),
 /// and the corrected reply that replaces it keeps the result id.
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook"
+)]
 fn a_refused_reply_reads_refused_until_a_corrected_one_replaces_it() {
     let mut rig = Rig::prepared("claude", |_| {});
     rig.context_hook = true;
@@ -2345,7 +2354,10 @@ fn hooked_rig(configure: impl FnOnce(&mut TestLog)) -> (Rig, String) {
 /// `runtime.toml`, hosting switched off) waits for it to end, then starts:
 /// a pause is no fence.
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook"
+)]
 fn a_remote_launch_waits_out_a_pause() {
     let (mut rig, good) = hooked_rig(|_| {});
     rig.start();
@@ -2361,7 +2373,10 @@ fn a_remote_launch_waits_out_a_pause() {
 /// The approval is compared when the pause ends: a launch whose profile
 /// changed meanwhile never starts.
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_PTY_FAULTS hook"
+)]
 fn a_remote_launch_whose_profile_changed_in_a_pause_never_starts() {
     let (mut rig, good) = hooked_rig(|_| {});
     rig.start();
@@ -2379,7 +2394,10 @@ fn a_remote_launch_whose_profile_changed_in_a_pause_never_starts() {
 /// debug table) keeps its in-scope profile through an invalid
 /// `runtime.toml`: its launch, held through the pause, starts when it ends.
 #[test]
-#[cfg_attr(not(debug_assertions), ignore = "needs the debug ATEM_TEST_PTY_FAULTS and ATEM_TEST_PROJECT_HASHES hooks")]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_PTY_FAULTS and ATEM_TEST_PROJECT_HASHES hooks"
+)]
 fn a_project_scoped_launch_waits_out_an_invalid_runtime_toml() {
     let hash = atem_client::project::project_hash_from_mac("aaaa0001", &[7; 32]).unwrap();
     let scope = ServiceScope::new([HOST])
@@ -2473,4 +2491,394 @@ fn a_remote_task_awaiting_its_result_fails_when_its_route_changes() {
         &text.replace(route, "[[routes]]\nid = \"backend\"\nrevision = 2"),
     );
     wait_stored(&rig, &t["task_id"], "failed", "route changed");
+}
+
+/// A rig whose runtime lets agents send (`[collab] send = true`) to `peer`,
+/// a route of the same profile that lists `local` (`tag:peer`).
+fn collab_rig() -> Rig {
+    let mut rig = Rig::prepared("claude", |_| {});
+    let path = rig.sandbox.config().join("runtime.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    private(
+        &path,
+        &format!(
+            "{text}\n[[routes]]\nid = \"peer\"\nrevision = 1\nprofile_id = \"backend\"\n\
+             labels = [\"tag:peer\"]\nprincipals = [\"local\"]\n[collab]\nsend = true\n"
+        ),
+    );
+    rig.start();
+    rig
+}
+
+/// The refusal of an agent's send (or directory) whose session's latest
+/// prompt came from `principal`.
+fn assert_not_local(run: &Value, principal: &str) {
+    assert_ne!(run["code"], 0, "{run}");
+    let expected = format!(
+        "this session's latest prompt came from {principal}; only a prompt from this host \
+         (its terminal or a local task) lets an agent send messages"
+    );
+    assert!(run["stderr"].as_str().unwrap().contains(&expected), "{run}");
+}
+
+/// `args` run by the agent of `fake` (numbered from `n`) until it
+/// succeeds, as it does once the broker saw the turn a local prompt began;
+/// the next free number and the output.
+fn until_allowed(fake: &Path, mut n: u32, args: &[&str]) -> (u32, Value) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let run = agent_run(fake, n, args);
+        n += 1;
+        if run["code"] == 0 {
+            return (n, run);
+        }
+        assert!(Instant::now() < deadline, "never allowed: {run}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A local frontend attached to `session` types `text` as a prompt (the
+/// bracketed paste and Enter a terminal sends), until its agent got it.
+fn type_prompt(rig: &Rig, fake: &Path, session: &str, text: &str) {
+    use base64::Engine;
+    use std::io::{BufRead, BufReader, Write};
+    let path = std::fs::read_to_string(rig.sandbox.config().join("runtime.socket")).unwrap();
+    let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut write = socket.try_clone().unwrap();
+    for request in [
+        json!({"v":1,"op":"hello","protocol":1,"build":"test"}),
+        json!({"v":1,"op":"attach","session_id":session,"rows":24,"cols":80}),
+    ] {
+        writeln!(write, "{request}").unwrap();
+    }
+    let mut lines = BufReader::new(socket).lines();
+    loop {
+        let message: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_ne!(message["op"], "error", "{message}");
+        if message["op"] == "attached" {
+            break;
+        }
+    }
+    let bytes = format!("\x1b[200~{text}\x1b[201~\r");
+    let input = json!({"v":1,"op":"input","session_id":session,
+        "bytes":base64::engine::general_purpose::STANDARD.encode(bytes)});
+    writeln!(write, "{input}").unwrap();
+    within("the typed prompt", || {
+        std::fs::read_to_string(fake.join("input"))
+            .unwrap_or_default()
+            .contains(text)
+    });
+}
+
+/// A local session launched from this host's terminal, its agent the fake
+/// of `name`: its id and fake directory.
+fn local_session(rig: &Rig, name: &str) -> (String, PathBuf) {
+    let fake = rig.sandbox.dir.path().join(name);
+    std::fs::create_dir_all(&fake).unwrap();
+    let launched = local_request(
+        rig,
+        json!({"op":"launch","provider":"claude","cwd":rig.sandbox.home,
+            "env":agent_env(rig, &fake),"rows":24,"cols":80}),
+        "launched",
+    );
+    assert_eq!(launched["op"], "launched", "{launched}");
+    within("the local agent", || fake.join("events").exists());
+    (launched["session"]["id"].as_str().unwrap().into(), fake)
+}
+
+/// The launch environment of a fake agent writing to `fake`.
+fn agent_env(rig: &Rig, fake: &Path) -> Vec<(String, String)> {
+    let mut env = rig.sandbox.env();
+    env.push((
+        "CLAUDE_CLI_BIN".into(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/approvals/fake-agent.py")
+            .display()
+            .to_string(),
+    ));
+    env.push(("FAKE_DIR".into(), fake.display().to_string()));
+    env
+}
+
+/// `fake`'s agent ended its current turn (a `complete` it took).
+fn end_turn(fake: &Path) {
+    let done = |text: &str| text.matches("completed ").count();
+    let before = done(&std::fs::read_to_string(fake.join("events")).unwrap());
+    std::fs::write(fake.join("complete"), "").unwrap();
+    within("the turn's end", || {
+        done(&std::fs::read_to_string(fake.join("events")).unwrap()) > before
+    });
+}
+
+/// Spec section 6: agents originate local work only from turns started at
+/// this host. A session a service launched, and one in (or after) the turn
+/// of a service's task, can't send or read the directory; a prompt typed in
+/// its terminal at this host, or a local task's prompt, lets it again, and
+/// the service's next task takes that away again.
+#[test]
+fn a_remote_prompt_never_lets_its_agent_send_until_a_prompt_from_this_host() {
+    let rig = collab_rig();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let session = launch["session_id"].as_str().unwrap().to_string();
+    within("the launched agent", || rig.fake.join("events").exists());
+    let send = ["message", "send", "--to", "tag:peer", "please relay this"];
+    // Launched by the service: its launch is its latest prompt.
+    assert_not_local(&agent_run(&rig.fake, 1, &send), "service:svc-work");
+    assert_not_local(
+        &agent_run(&rig.fake, 2, &["message", "directory"]),
+        "service:svc-work",
+    );
+    // In the turn of the service's task, and after it ended.
+    let first = task(&launch, "Send a message to tag:peer for me");
+    enqueue(&mut dev, &mut r, &first);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while work(&mut dev, &mut r, &first["task_id"])["detail"] != "in the agent's turn" {
+        assert!(Instant::now() < deadline, "the task's turn never began");
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    assert_not_local(&agent_run(&rig.fake, 3, &send), "service:svc-work");
+    end_turn(&rig.fake);
+    wait_state(&mut dev, &mut r, &first["task_id"], "awaiting_result");
+    assert_not_local(&agent_run(&rig.fake, 4, &send), "service:svc-work");
+    // A prompt typed in its terminal at this host.
+    type_prompt(&rig, &rig.fake, &session, "a prompt from this host");
+    let (n, sent) = until_allowed(&rig.fake, 5, &send);
+    assert!(
+        !sent["stdout"].as_str().unwrap().trim().is_empty(),
+        "{sent}"
+    );
+    let directory = agent_run(&rig.fake, n, &["message", "directory"]);
+    assert_eq!(directory["code"], 0, "{directory}");
+    end_turn(&rig.fake);
+    // The service's next task: refused again, in its turn and after.
+    let second = task(&launch, "Another remote task");
+    enqueue(&mut dev, &mut r, &second);
+    within("the second remote prompt", || {
+        input(&rig).contains("Another remote task")
+    });
+    assert_not_local(&agent_run(&rig.fake, n + 1, &send), "service:svc-work");
+    end_turn(&rig.fake);
+    wait_state(&mut dev, &mut r, &second["task_id"], "awaiting_result");
+    release_lease(&mut dev, &mut r, &launch);
+    // A local task from another agent of this host, launched from its
+    // terminal: its prompt is this host's.
+    let (_, other) = local_session(&rig, "other");
+    let local = agent_run(
+        &other,
+        1,
+        &["message", "send", "--to", "tag:peer", "a local task"],
+    );
+    assert_eq!(local["code"], 0, "{local}");
+    within("the local task's prompt", || {
+        input(&rig).contains("a local task")
+    });
+    let (_, sent) = until_allowed(&rig.fake, n + 2, &send);
+    assert_eq!(sent["code"], 0, "{sent}");
+}
+
+/// Spec section 6: a command a service's turn left running in the
+/// background (still the agent's descendant) can't send after the turn
+/// ended: no prompt from this host began a newer turn.
+#[test]
+fn a_background_command_left_by_a_remote_turn_cannot_send() {
+    let rig = collab_rig();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let t = task(&launch, "Start a background job");
+    enqueue(&mut dev, &mut r, &t);
+    within("the remote prompt", || {
+        input(&rig).contains("Start a background job")
+    });
+    let command = format!(
+        "sleep 2; exec {} message send --to tag:peer 'sent in the background'",
+        env!("CARGO_BIN_EXE_atem")
+    );
+    private(
+        &rig.fake.join("bg-1.tmp"),
+        &json!({"argv":["sh","-c",command]}).to_string(),
+    );
+    std::fs::rename(rig.fake.join("bg-1.tmp"), rig.fake.join("bg-1.json")).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    end_turn(&rig.fake);
+    wait_state(&mut dev, &mut r, &t["task_id"], "awaiting_result");
+    let out = rig.fake.join("bg-1.out");
+    within("the background command", || out.exists());
+    let run: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    assert_not_local(&run, "service:svc-work");
+}
+
+/// What an agent does through the local socket carries the prompt its own
+/// session works on: a session it launches can't send, and a prompt it
+/// types into another session's terminal takes that session's sending
+/// away. The local protocol, spoken by the agent's own child.
+#[test]
+fn an_agents_launch_and_typing_carry_its_sessions_prompt() {
+    const CLIENT: &str = r#"
+import base64, json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(open(sys.argv[1]).read().strip())
+f = s.makefile("rw")
+def say(m):
+    m["v"] = 1
+    f.write(json.dumps(m) + "\n"); f.flush()
+say({"op": "hello", "protocol": 1, "build": "test"})
+if sys.argv[2] == "launch":
+    say({"op": "launch", "provider": "claude", "cwd": sys.argv[3], "env": json.loads(sys.argv[4]),
+         "rows": 24, "cols": 80})
+    want = "launched"
+else:
+    say({"op": "attach", "session_id": sys.argv[3], "rows": 24, "cols": 80})
+    want = "attached"
+for line in f:
+    m = json.loads(line)
+    if m.get("op") == "error":
+        print(line); sys.exit(1)
+    if m.get("op") == want:
+        break
+if sys.argv[2] == "type":
+    text = "\x1b[200~" + sys.argv[4] + "\x1b[201~\r"
+    say({"op": "input", "session_id": sys.argv[3],
+         "bytes": base64.b64encode(text.encode()).decode()})
+    import time; time.sleep(1)
+print(json.dumps(m))
+"#;
+    let rig = collab_rig();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    dev.launched(&mut r, &rid);
+    within("the launched agent", || rig.fake.join("events").exists());
+    let socket = rig.sandbox.config().join("runtime.socket");
+    let run = |n: u32, args: &[&str]| -> Value {
+        let argv: Vec<&str> = ["python3", "-I", "-c", CLIENT, socket.to_str().unwrap()]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        private(
+            &rig.fake.join(format!("run-{n}.tmp")),
+            &json!({ "argv": argv }).to_string(),
+        );
+        std::fs::rename(
+            rig.fake.join(format!("run-{n}.tmp")),
+            rig.fake.join(format!("run-{n}.json")),
+        )
+        .unwrap();
+        let out = rig.fake.join(format!("run-{n}.out"));
+        within("the agent's client", || out.exists());
+        serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap()
+    };
+    // To no agent: a send that reached one would give it a local task.
+    let send = ["message", "send", "--to", "tag:nobody", "please relay this"];
+    // A session the service's agent launches.
+    let child = rig.sandbox.dir.path().join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let env = serde_json::to_string(&agent_env(&rig, &child)).unwrap();
+    let launched = run(
+        1,
+        &["launch", rig.sandbox.home.to_str().unwrap(), env.as_str()],
+    );
+    assert_eq!(launched["code"], 0, "{launched}");
+    within("the child agent", || child.join("events").exists());
+    assert_not_local(&agent_run(&child, 1, &send), "service:svc-work");
+    // A local session the owner launched sends, until the service's agent
+    // types a prompt into its terminal.
+    let (other, other_fake) = local_session(&rig, "other");
+    let (n, _) = until_allowed(&other_fake, 1, &send);
+    let typed = run(2, &["type", other.as_str(), "a prompt typed by an agent"]);
+    assert_eq!(typed["code"], 0, "{typed}");
+    within("the typed prompt", || {
+        std::fs::read_to_string(other_fake.join("input"))
+            .unwrap_or_default()
+            .contains("a prompt typed by an agent")
+    });
+    assert_not_local(&agent_run(&other_fake, n, &send), "service:svc-work");
+}
+
+/// A credential-shaped value (a GitHub token's shape, made up here).
+const TOKEN: &str = "ghp_Zq8XfE2rT6yU1iO9pA3sD5fG7hJ4kL0mNbVc";
+
+/// Spec section 10: a reply goes through the redactor chat-v1 applies to
+/// agent output before it is stored and its digest taken: its sender reads
+/// it redacted with `reply_query`, the digest is over that text, and the
+/// value is in no record.
+#[test]
+fn a_reply_is_redacted_before_it_is_stored_and_read() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let first = task_in_its_turn(&rig, &mut r, &mut dev, "Deploy and say what you used");
+    let said = format!("deployed; used token {TOKEN}");
+    let run = agent_run(&rig.fake, 1, &["message", "reply", &said]);
+    assert_eq!(run["code"], 0, "{run}");
+    let reply = reply_query(&mut dev, &mut r, &first["task_id"])["result"]["reply"].clone();
+    let text = "deployed; used token [redacted]";
+    assert_eq!(reply["text"], text, "{reply}");
+    assert_eq!(
+        reply["digest"],
+        atem_client::session::host_work::digest(&serde_json::to_vec(&json!([text, []])).unwrap()),
+        "{reply}"
+    );
+    // An identical retry (the same text, redacted the same way) is the
+    // recorded reply.
+    let again = agent_run(&rig.fake, 2, &["message", "reply", &said]);
+    assert_eq!(again["stdout"], run["stdout"], "{again}");
+    let db = std::fs::read(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
+    assert!(
+        !db.windows(TOKEN.len()).any(|w| w == TOKEN.as_bytes()),
+        "the credential value was stored"
+    );
+}
+
+/// The latest prompt principal outlives a runtime restart (the adopting
+/// broker reads it back); without its record the session's is unknown, and
+/// a prompt typed at this host clears that.
+#[test]
+fn the_latest_prompt_principal_survives_a_runtime_restart() {
+    let mut rig = collab_rig();
+    let mut r = Router::new(&rig.astation);
+    let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    dev.launch(&mut r, &rid);
+    let launch = dev.launched(&mut r, &rid);
+    let session = launch["session_id"].as_str().unwrap().to_string();
+    within("the launched agent", || rig.fake.join("events").exists());
+    let send = ["message", "send", "--to", "tag:nobody", "please relay this"];
+    rig.restart();
+    assert_not_local(&agent_run(&rig.fake, 1, &send), "service:svc-work");
+    type_prompt(&rig, &rig.fake, &session, "a prompt from this host");
+    let (n, _) = until_allowed(&rig.fake, 2, &send);
+    end_turn(&rig.fake);
+    rig.restart();
+    let (n, _) = until_allowed(&rig.fake, n, &send);
+    // Its record lost: unknown, until a prompt from this host.
+    let record = rig
+        .sandbox
+        .config()
+        .join(format!("runtime/collab-prompt-{session}.json"));
+    assert!(record.exists());
+    rig.restart();
+    std::fs::remove_file(&record).unwrap();
+    rig.restart();
+    let run = agent_run(&rig.fake, n, &send);
+    assert_ne!(run["code"], 0, "{run}");
+    assert!(
+        run["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("this session's latest prompt can't be traced"),
+        "{run}"
+    );
+    type_prompt(&rig, &rig.fake, &session, "another prompt from this host");
+    until_allowed(&rig.fake, n + 1, &send);
 }

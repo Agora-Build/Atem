@@ -288,12 +288,20 @@ origin proofs and direct Atem host senders.
 **Local agent collaboration** (stage 1, unreleased; `designs/agent-collaboration.md`):
 `atem agent tag add|remove|list` and `atem message send|reply` identify the
 calling agent from the local socket peer's verified process ancestry (`message
-status|cancel|complete` also run from the owner's terminal, outside any session:
-a verified process with no agent in its ancestry; one that can't be verified is
-refused, and under the same-user model this owner fallback is no security
-boundary). `runtime.toml` requires hosting, `[collab] send = true`, approved
-profiles and route consent for `local` (a route's own `principals` replaces the
+status|cancel|complete|directory` also run from the owner's terminal, outside
+any session: a verified process with no agent in its ancestry; one that can't be
+verified, or one under an agent whose start time isn't known, is refused, and
+under the same-user model this owner fallback is no security boundary).
+`runtime.toml` requires hosting, `[collab] send = true`, approved profiles and
+route consent for `local` (a route's own `principals` replaces the
 paired-Astation default); defaults keep sending, result prompts and launch off.
+An agent sends (and reads the directory) only while its session's latest prompt
+came from this host (`BrokerSession::prompt_from`: typed in its terminal, or a
+local task's; kept in `runtime/collab-prompt-<session>.json` for an adopting
+broker): a session a remote principal prompted, launched or typed into is
+refused until a prompt from this host begins a newer turn, and what an agent
+does through the local socket (a launch, typing into a session) carries its own
+session's prompt.
 Owner labels and agent-owned `self:` tags feed shared selectors; one message
 resolves once to at most 32 other sessions. Limits count messages: `per_hour`
 per sending session and `per_workflow` per workflow, for sends and again for
@@ -323,7 +331,8 @@ inside one"; never started or replaced, whatever its build). Context jobs
 publish/read back exact decrypted Memory/Vault versions before dispatch.
 `message reply [--task ID] [--memory ID] [--vault ID:ENTRY@VERSION]` submits one
 durable reply for a task of any sender (local, member or service), bound to its
-task/session/process/turn; it never completes the task, and a reply's vault
+task/session/process/turn, its text redacted of credential values before it is
+stored and digested; it never completes the task, and a reply's vault
 reference must name its entry. Remote senders read it with `reply_query`. Only
 the sender completes a task: `message complete TASK_ID` (its sending session, or
 the owner outside any session; it stops a queued delivery) or `work_complete`.

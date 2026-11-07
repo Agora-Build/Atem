@@ -930,3 +930,41 @@ fn ancestors_walk_to_init_and_stop_at_the_limit() {
     assert!(super::ancestors_with(42, 0, parent).is_empty());
     assert_eq!(super::ancestors_with(42, 64, |_| Some(42)), [42]);
 }
+
+/// A worker of an older build says no agent start time in its `hello`: the
+/// broker takes its record's for the same agent, so a process under that
+/// agent is classified as its session (server `caller_of`); with neither,
+/// the agent's pid is one a caller can't be verified against.
+#[tokio::test]
+async fn an_adopted_worker_without_an_agent_start_time_takes_its_records() {
+    use crate::runtime::broker::BrokerSession;
+    for record_knows in [true, false] {
+        let (running, mut handle) = start().await;
+        let mut record = running.record();
+        let pid = handle.info.agent_pid.unwrap();
+        let started = handle.info.agent_start_time.take().unwrap();
+        assert_eq!(record.agent_start_time, Some(started));
+        if !record_knows {
+            record.agent_start_time = None;
+        }
+        let mut session = BrokerSession::from_adoption(Adoption::Adopted(handle, record)).unwrap();
+        if record_knows {
+            assert_eq!(session.agent_pid(), Some((pid, started)));
+            assert_eq!(session.unverified_agent_pid(), None);
+        } else {
+            assert_eq!(session.agent_pid(), None);
+            assert_eq!(session.unverified_agent_pid(), Some(pid));
+        }
+        session.stop().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.is_live() {
+                session.pump();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(session);
+        let _ = tokio::time::timeout(Duration::from_secs(5), running.served).await;
+    }
+}

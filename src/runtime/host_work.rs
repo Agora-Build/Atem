@@ -2076,6 +2076,7 @@ mod tests {
                 }],
                 context: vec![snapshot("the reply's context")],
                 dropped: false,
+                prompt_from: None,
             };
             store
                 .db

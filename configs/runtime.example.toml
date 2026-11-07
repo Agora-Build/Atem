@@ -19,7 +19,14 @@ enabled = false
 # labels = ["project:backend", "tag:workstation"]
 #
 # [collab]
-# send = false
+# send = false            # true: agents may send local work to routes that
+#                         # list "local", but only from a turn a prompt from this
+#                         # host began (typed in its terminal, or a local
+#                         # task's); a session a remote device or service
+#                         # prompted, launched or typed into can't send until a
+#                         # prompt from this host begins a newer turn. An
+#                         # agent's own shell can still do whatever you can
+#                         # outside this check; its tool approvals still apply.
 # per_hour = 30
 # per_workflow = 8        # messages per workflow, however many agents each reaches
 # result_timeout = "30m"  # 1s-24h; automatic status never completes a task

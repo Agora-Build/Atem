@@ -233,6 +233,14 @@ impl HostBridge {
         {
             bail!("the reply has control characters");
         }
+        // Its sender may be remote (`reply_query`): credential values go
+        // through the redactor chat-v1 applies to agent output, before the
+        // reply is stored and its digest taken. The bound holds for what is
+        // stored too.
+        let text = crate::chat::session::redact(&request.text);
+        if text.len() > MAX_REPLY_TEXT {
+            bail!("a reply's text is at most 16 KiB once credential values are redacted");
+        }
         let mut reply = Reply {
             binding: Binding {
                 task_id: String::new(),
@@ -240,10 +248,14 @@ impl HostBridge {
                 process_gen: session.process_gen.clone(),
                 turn_id: String::new(),
             },
-            text: request.text,
+            text,
             references,
             context: vec![],
             dropped: false,
+            prompt_from: match session.prompt_from() {
+                PromptFrom::Local => None,
+                other => Some(other.label().to_string()),
+            },
         };
         let digest = reply.digest();
         let store = self.work.store.as_ref().unwrap();
@@ -858,9 +870,12 @@ impl HostBridge {
                         })
                         .last();
                     if let Some(text) = text {
+                        // A remote sender reads the detail: the redactor
+                        // chat-v1 applies (the chat redacted it already).
                         task.status.detail.push_str(": ");
                         task.status.detail.extend(
-                            text.chars()
+                            crate::chat::session::redact(&text)
+                                .chars()
                                 .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
                                 .take(200),
                         );
@@ -1127,9 +1142,17 @@ impl HostBridge {
     pub fn collab_directory(
         &mut self,
         atem_id: &str,
+        caller: Option<&SessionId>,
         selector: Option<&str>,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<Vec<DirectoryRow>> {
+        if let Some(caller) = caller {
+            let session = sessions
+                .get(caller)
+                .filter(|s| s.is_live())
+                .ok_or_else(|| anyhow!("the calling session ended"))?;
+            collab_prompt_local(session)?;
+        }
         self.work_config();
         let selector: Option<Selector> = selector
             .map(str::parse)
@@ -1234,6 +1257,12 @@ impl HostBridge {
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<String> {
         self.collab_ready()?;
+        collab_prompt_local(
+            sessions
+                .get(from)
+                .filter(|s| s.is_live())
+                .ok_or_else(|| anyhow!("originating session ended"))?,
+        )?;
         if let Some(problem) = selectors_problem(&request.to, MAX_AGENTS) {
             bail!("{problem}");
         }
@@ -1628,6 +1657,21 @@ impl HostBridge {
         task.status.state = WorkState::Cancelled;
         task.status.detail = "cancelled locally before submission".into();
         store.save_work(&task)
+    }
+}
+
+/// Agents originate local work only from a turn started at this host (spec
+/// section 6): a session sends (or reads the directory) only while its
+/// latest prompt is `local`, typed in its terminal or a local task's.
+fn collab_prompt_local(session: &BrokerSession) -> Result<()> {
+    match session.prompt_from() {
+        PromptFrom::Local => Ok(()),
+        PromptFrom::Principal(principal) => bail!(
+            "this session's latest prompt came from {principal}; only a prompt from this host (its terminal or a local task) lets an agent send messages"
+        ),
+        PromptFrom::Unknown => bail!(
+            "this session's latest prompt can't be traced (for example, the runtime restarted since it began); a prompt from this host (its terminal or a local task) clears this: only such a prompt lets an agent send messages"
+        ),
     }
 }
 

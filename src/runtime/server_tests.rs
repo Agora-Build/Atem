@@ -2093,27 +2093,51 @@ fn an_unverified_peer_is_refused_and_one_without_an_agent_is_the_owner() {
         _ => vec![pid, 1],
     };
     assert_eq!(
-        caller_of(Some((100, 5)), start, tree, &agents),
+        caller_of(Some((100, 5)), start, tree, &agents, &[]),
         Caller::Session(sid.clone())
     );
     assert_eq!(
-        caller_of(Some((300, 9)), start, tree, &agents),
+        caller_of(Some((300, 9)), start, tree, &agents, &[]),
         Caller::Owner
     );
     // An agent's pid now used by another process is no agent.
     let reused = [(sid, (200, 8))];
     assert_eq!(
-        caller_of(Some((100, 5)), start, tree, &reused),
+        caller_of(Some((100, 5)), start, tree, &reused, &[]),
         Caller::Owner
     );
     // The peer was replaced, or ended, since it connected; no credentials.
     assert_eq!(
-        caller_of(Some((100, 4)), start, tree, &agents),
+        caller_of(Some((100, 4)), start, tree, &agents, &[]),
         Caller::Unverified
     );
     assert_eq!(
-        caller_of(Some((400, 1)), start, tree, &agents),
+        caller_of(Some((400, 1)), start, tree, &agents, &[]),
         Caller::Unverified
     );
-    assert_eq!(caller_of(None, start, tree, &agents), Caller::Unverified);
+    assert_eq!(
+        caller_of(None, start, tree, &agents, &[]),
+        Caller::Unverified
+    );
+    // A live agent whose start time isn't known (a worker of an older build
+    // said none): a process under it is unverified, never the owner; a
+    // verified agent nearer the peer still names its session.
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &[], &[200]),
+        Caller::Unverified
+    );
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &[], &[150]),
+        Caller::Unverified
+    );
+    let nearer = [(SessionId::new(), (150, 6))];
+    let start_150 = |pid: u32| if pid == 150 { Some(6) } else { start(pid) };
+    assert!(matches!(
+        caller_of(Some((100, 5)), start_150, tree, &nearer, &[200]),
+        Caller::Session(_)
+    ));
+    assert_eq!(
+        caller_of(Some((300, 9)), start, tree, &[], &[200]),
+        Caller::Owner
+    );
 }

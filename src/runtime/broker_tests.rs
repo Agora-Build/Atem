@@ -38,7 +38,7 @@ async fn launch(body: &str) -> Setup {
         ("CODEX_CLI_BIN".into(), agent.display().to_string()),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    let mut session = BrokerSession::launched(handle, &request, created_at_ms);
+    let mut session = BrokerSession::launched(handle, &request, created_at_ms, PromptFrom::Local);
     session.tap.open();
     Setup { _dir: dir, session }
 }
@@ -568,4 +568,77 @@ async fn a_reload_takes_the_workers_cut_turn() {
     assert_eq!(turn_coverage(&session.chat, "t1"), Coverage::Partial);
     assert_eq!(turn_coverage(&session.chat, "t2"), Coverage::Complete);
     session.stop().unwrap();
+}
+
+/// Spec section 6: a session's latest prompt principal. A remote write sets
+/// it at once; keys typed here count only once the chat records the turn
+/// they began, and never claim a remote prompt's turn.
+#[test]
+fn the_latest_prompt_principal_follows_remote_writes_and_local_turns() {
+    let mut s = BrokerSession::new(
+        SessionId::new(),
+        uuid::Uuid::new_v4().to_string(),
+        "claude".into(),
+        PathBuf::from("/"),
+        0,
+        (24, 80),
+    );
+    let svc = PromptFrom::Principal("service:svc-a".into());
+    let member = PromptFrom::Principal("member:phone".into());
+    // Nothing known yet (an adopted worker).
+    assert_eq!(s.prompt_from(), &PromptFrom::Unknown);
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &PromptFrom::Unknown);
+    // A prompt typed here: its turn is local.
+    s.note_input(PromptFrom::Local);
+    assert_eq!(
+        s.prompt_from(),
+        &PromptFrom::Unknown,
+        "a key alone is no turn"
+    );
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &PromptFrom::Local);
+    // A remote prompt: its principal at once, and its turn stays its own
+    // even when keys were typed here before the chat recorded it.
+    s.note_prompt(svc.clone());
+    assert_eq!(s.prompt_from(), &svc);
+    s.note_input(PromptFrom::Local);
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &svc);
+    // Keys typed during that turn (the agent's own dialog) change nothing
+    // until a turn of their own.
+    s.note_input(PromptFrom::Local);
+    assert_eq!(s.prompt_from(), &svc);
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &PromptFrom::Local);
+    // Remote terminal input after local keys: the remote principal, for
+    // the turn too.
+    s.note_input(PromptFrom::Local);
+    s.note_input(member.clone());
+    assert_eq!(s.prompt_from(), &member);
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &member);
+    // A local task's prompt is local at once; an agent steered by a remote
+    // prompt typing here carries that prompt's principal.
+    s.note_prompt(PromptFrom::Local);
+    assert_eq!(s.prompt_from(), &PromptFrom::Local);
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &PromptFrom::Local);
+    s.note_input(svc.clone());
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &svc);
+    s.note_input(PromptFrom::Unknown);
+    assert_eq!(s.prompt_from(), &PromptFrom::Unknown);
+    // A remote prompt the agent never recorded claims the next turn, typed
+    // here or not; the one after it is local.
+    s.note_prompt(member.clone());
+    s.note_input(PromptFrom::Local);
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &member);
+    s.note_input(PromptFrom::Local);
+    s.turn_recorded();
+    assert_eq!(s.prompt_from(), &PromptFrom::Local);
+    for label in ["local", "service:svc-a", "unknown"] {
+        assert_eq!(PromptFrom::from_label(label).label(), label);
+    }
 }

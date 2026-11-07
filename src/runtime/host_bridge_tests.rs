@@ -1280,19 +1280,37 @@ fn legacy_mark_assignment_cannot_inject_local_origin_input() {
         let mut client = rt.client().await;
         let project = rt.dir.path().join("project");
         std::fs::create_dir_all(project.join(".chisel/tasks")).unwrap();
-        std::fs::write(project.join(".chisel/tasks/t1.json"),
-            json!({"title":"must not execute"}).to_string()).unwrap();
-        let agent = script(rt.dir.path(), "recorder",
-            "stty -echo\nprintf 'READY\\r\\n'\nsleep 1\nexec cat >> typed.txt");
+        std::fs::write(
+            project.join(".chisel/tasks/t1.json"),
+            json!({"title":"must not execute"}).to_string(),
+        )
+        .unwrap();
+        let agent = script(
+            rt.dir.path(),
+            "recorder",
+            "stty -echo\nprintf 'READY\\r\\n'\nsleep 1\nexec cat >> typed.txt",
+        );
         let typed = project.join("typed.txt");
-        let session = rt.launch(&mut client, "claude", &agent, Some(&project)).await;
+        let session = rt
+            .launch(&mut client, "claude", &agent, Some(&project))
+            .await;
         rt.peer.hello().await;
-        rt.peer.send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
+        rt.peer
+            .send(json!({"type":"markTaskAssignment","data":{"taskId":"t1","receivedAtMs":0}}));
         let result = rt.peer.wait(|v| v["type"] == "markTaskResult").await;
         assert_eq!(result["data"]["success"], false);
-        assert!(result["data"]["message"].as_str().unwrap().contains("message_publish"));
+        assert!(
+            result["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("message_publish")
+        );
         rt.peer.drain(Duration::from_millis(250)).await;
-        assert!(!std::fs::read_to_string(&typed).unwrap_or_default().contains("must not execute"));
+        assert!(
+            !std::fs::read_to_string(&typed)
+                .unwrap_or_default()
+                .contains("must not execute")
+        );
         let _ = session;
         rt.shutdown().await;
     });
@@ -1481,7 +1499,12 @@ async fn broker_session(dir: &Path) -> crate::runtime::broker::BrokerSession {
         ("CODEX_CLI_BIN".into(), agent.display().to_string()),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms)
+    crate::runtime::broker::BrokerSession::launched(
+        handle,
+        &request,
+        created_at_ms,
+        crate::runtime::broker::PromptFrom::Local,
+    )
 }
 
 #[tokio::test]
@@ -2608,8 +2631,12 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
         ("FAKE_CODEX_HOOK".into(), hook),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    let mut session =
-        crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
+    let mut session = crate::runtime::broker::BrokerSession::launched(
+        handle,
+        &request,
+        created_at_ms,
+        crate::runtime::broker::PromptFrom::Local,
+    );
     agent_event(&fake, "started").await;
     ask(
         &fake,
@@ -3728,7 +3755,12 @@ async fn host_rebinds_drop_the_workers_session_rules() {
         ("FAKE_CODEX_HOOK".into(), hook),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    let session = crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
+    let session = crate::runtime::broker::BrokerSession::launched(
+        handle,
+        &request,
+        created_at_ms,
+        crate::runtime::broker::PromptFrom::Local,
+    );
     agent_event(&fake, "started").await;
     let mut sessions = std::collections::BTreeMap::new();
     sessions.insert(session.id.clone(), session);

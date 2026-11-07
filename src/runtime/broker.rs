@@ -91,6 +91,70 @@ pub struct WriteOutcome {
     pub error: Option<String>,
 }
 
+/// Whose prompt a session's agent works on (spec section 6): `Local` for a
+/// prompt typed in its terminal at this host or a local task's prompt, the
+/// submitter's principal for any other, `Unknown` when the broker can't tell
+/// (a session it adopted, a prompt it didn't see pasted). Only a session
+/// whose latest prompt is `Local` may originate local work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptFrom {
+    Local,
+    Principal(String),
+    Unknown,
+}
+
+impl PromptFrom {
+    /// The principal as a session-host principal name.
+    pub fn of(principal: Option<&str>) -> Self {
+        match principal {
+            Some("local") => Self::Local,
+            Some(principal) => Self::Principal(principal.into()),
+            None => Self::Unknown,
+        }
+    }
+
+    /// How it is recorded (with a reply) and named: `local`, the principal,
+    /// or `unknown`.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Local => "local",
+            Self::Principal(principal) => principal,
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The inverse of `label`.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "unknown" => Self::Unknown,
+            other => Self::of(Some(other)),
+        }
+    }
+}
+
+/// How a session's latest prompt principal is kept. A remote write (a
+/// prompt pasted from a receipt, or terminal input) sets it at once. Local
+/// terminal input only arms `Local`: the next turn the chat records (a new
+/// user message) is then a prompt typed here, unless a remote write came in
+/// between, so a key typed at the agent's own dialog during a remote turn
+/// changes nothing. A remote prompt pasted claims the next turn the chat
+/// records, whatever was typed meanwhile. A session without chat records no
+/// turn: local input never clears a remote principal there.
+///
+/// It is kept in a file of the runtime's state (`file`, one per session),
+/// so a broker that adopts the session knows it: a remote principal (and a
+/// remote prompt's claim on the next turn) is written before its bytes go
+/// to the worker, a local one after the turn it names began. An adopted
+/// session without the file (or of another process generation) is
+/// `Unknown`.
+#[derive(Debug)]
+struct PromptTrack {
+    latest: PromptFrom,
+    armed: bool,
+    awaiting_remote: bool,
+    file: Option<PathBuf>,
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -133,6 +197,8 @@ fn activity_name(activity: Activity) -> &'static str {
 
 pub struct BrokerSession {
     self_tags: std::collections::BTreeSet<String>,
+    /// Its latest prompt principal (`PromptFrom`).
+    prompt: PromptTrack,
     pub id: SessionId,
     pub process_gen: String,
     pub provider: String,
@@ -232,6 +298,14 @@ impl BrokerSession {
         let chat = ChatSession::new(process_gen.clone(), now_ms());
         Self {
             self_tags: Default::default(),
+            // A launch says whose it is (`set_prompt_from`); anything else
+            // (an adopted worker) is unknown until a prompt from this host.
+            prompt: PromptTrack {
+                latest: PromptFrom::Unknown,
+                armed: false,
+                awaiting_remote: false,
+                file: None,
+            },
             id,
             process_gen,
             provider,
@@ -274,8 +348,14 @@ impl BrokerSession {
     }
 
     /// A session the broker just started (`request`) in `handle`'s worker,
-    /// created at `created_at_ms` (the worker record's).
-    pub fn launched(handle: WorkerHandle, request: &SpawnRequest, created_at_ms: u64) -> Self {
+    /// created at `created_at_ms` (the worker record's), for `from`: whose
+    /// launch it was (its latest prompt principal until its first prompt).
+    pub fn launched(
+        handle: WorkerHandle,
+        request: &SpawnRequest,
+        created_at_ms: u64,
+        from: PromptFrom,
+    ) -> Self {
         let mut session = Self::new(
             request.session_id.clone(),
             request.process_gen.clone(),
@@ -284,6 +364,7 @@ impl BrokerSession {
             created_at_ms,
             (request.rows.clamp(2, 200), request.cols.clamp(2, 400)),
         );
+        session.prompt.latest = from;
         // A worker that produced nothing yet has the blank screen of the
         // launch size; anything else is asked for.
         let fresh = handle.info.offset == 0 && handle.info.exited.is_none();
@@ -306,8 +387,16 @@ impl BrokerSession {
             )
         };
         Some(match adoption {
-            Adoption::Adopted(handle, record) => {
+            Adoption::Adopted(mut handle, record) => {
                 let mut session = from_record(&record);
+                // A worker of an older build says no agent start time in its
+                // `hello`: its record's, for the same agent.
+                if handle.info.agent_start_time.is_none()
+                    && handle.info.agent_pid.is_some()
+                    && handle.info.agent_pid == record.agent_pid
+                {
+                    handle.info.agent_start_time = record.agent_start_time;
+                }
                 session.connect(handle, false);
                 session
             }
@@ -403,10 +492,115 @@ impl BrokerSession {
         self.state == SessionState::Running && self.worker.is_some()
     }
 
+    /// The live agent's pid and the start time it was launched with.
     pub fn agent_pid(&self) -> Option<(u32, u64)> {
         let info = &self.worker.as_ref()?.info;
         self.is_live()
             .then_some((info.agent_pid?, info.agent_start_time?))
+    }
+
+    /// The live agent's pid when its start time isn't known (a worker of an
+    /// older build said none, nor did its record): a process under it can't
+    /// be told apart from one under another process with the same pid.
+    pub fn unverified_agent_pid(&self) -> Option<u32> {
+        let info = &self.worker.as_ref()?.info;
+        (self.is_live() && info.agent_start_time.is_none())
+            .then_some(info.agent_pid)
+            .flatten()
+    }
+
+    /// Its latest prompt principal (`PromptFrom`).
+    pub fn prompt_from(&self) -> &PromptFrom {
+        &self.prompt.latest
+    }
+
+    /// A prompt from a receipt is pasted for `from` (a remote submitter, or
+    /// a local task's): its principal at once. A remote one claims the next
+    /// turn the chat records.
+    pub fn note_prompt(&mut self, from: PromptFrom) {
+        self.prompt.armed = false;
+        let awaiting = from != PromptFrom::Local;
+        self.set_latest(from, awaiting);
+    }
+
+    /// Terminal input is written for `from`: local input arms `Local` for
+    /// the next turn the chat records; any other is its principal at once.
+    pub fn note_input(&mut self, from: PromptFrom) {
+        if from == PromptFrom::Local {
+            self.prompt.armed = !self.prompt.awaiting_remote;
+        } else {
+            self.prompt.armed = false;
+            self.set_latest(from, self.prompt.awaiting_remote);
+        }
+    }
+
+    /// The chat recorded a new turn (a user message).
+    fn turn_recorded(&mut self) {
+        if self.prompt.awaiting_remote {
+            self.set_latest(self.prompt.latest.clone(), false);
+            return;
+        }
+        if std::mem::take(&mut self.prompt.armed) {
+            self.set_latest(PromptFrom::Local, false);
+        }
+    }
+
+    fn set_latest(&mut self, from: PromptFrom, awaiting_remote: bool) {
+        if self.prompt.latest != from || self.prompt.awaiting_remote != awaiting_remote {
+            self.prompt.latest = from;
+            self.prompt.awaiting_remote = awaiting_remote;
+            self.save_prompt();
+        }
+    }
+
+    /// Keeps the latest prompt principal in `file` from now on (written at
+    /// once), in the runtime's state: `prompt_file`.
+    pub fn keep_prompt_in(&mut self, file: PathBuf) {
+        self.prompt.file = Some(file);
+        self.save_prompt();
+    }
+
+    /// An adopted session's latest prompt principal, as `file` kept it for
+    /// this process generation; else it stays unknown.
+    pub fn restore_prompt(&mut self, file: &Path) {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let read = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(file)
+            .ok()
+            .and_then(|f| {
+                let mut bytes = Vec::new();
+                f.take(4097).read_to_end(&mut bytes).ok()?;
+                (bytes.len() <= 4096).then_some(bytes)
+            })
+            .and_then(|bytes| serde_json::from_slice::<(String, String, bool)>(&bytes).ok());
+        if let Some((generation, label, awaiting_remote)) = read
+            && generation == self.process_gen
+        {
+            self.prompt.latest = PromptFrom::from_label(&label);
+            // A remote prompt pasted before the restart whose turn wasn't
+            // recorded yet may still begin it.
+            self.prompt.awaiting_remote = awaiting_remote;
+        }
+    }
+
+    /// Writes the latest prompt principal to its file; one that can't be
+    /// written is removed, so an adopting broker finds it unknown.
+    fn save_prompt(&self) {
+        let Some(file) = &self.prompt.file else {
+            return;
+        };
+        let bytes = serde_json::to_vec(&(
+            &self.process_gen,
+            self.prompt.latest.label(),
+            self.prompt.awaiting_remote,
+        ))
+        .expect("serializable");
+        if super::worker::write_atomic(file, &bytes).is_err() {
+            let _ = std::fs::remove_file(file);
+        }
     }
 
     pub fn self_tags(&self) -> &std::collections::BTreeSet<String> {
@@ -828,6 +1022,13 @@ impl BrokerSession {
                 }
                 for event in ends {
                     outs.extend(self.chat.on_event(event, now, input_count));
+                }
+                // Each new user message is a turn begun: whose prompt it is.
+                for out in &outs {
+                    if matches!(out, Out::Message(m) if m.role == crate::chat::session::Role::User)
+                    {
+                        self.turn_recorded();
+                    }
                 }
                 self.chat_out.extend(outs);
                 if self.chat_v1 && !chat_v1 {

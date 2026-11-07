@@ -63,7 +63,9 @@
 //! session accepts only the rules granted under its current identity and
 //! trust (`confirm_approval_rules`; the worker drops the rest, and allows by
 //! none until then), and a rebind or trust change drops them all.
-use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
+use super::broker::{
+    BrokerSession, PromptFrom, SessionState as BrokerState, WriteOutcome, WriteTag,
+};
 use super::project_scope::{AgentHasher, ProjectHasher, ProjectScopes};
 use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
@@ -513,6 +515,11 @@ pub struct HostBridge {
     submitters: HashMap<String, (String, String)>,
     /// Prompts pasted and not reported yet: request id → session.
     prompts: HashMap<String, String>,
+    /// Local tasks submitted and not dispatched yet: request id → whose
+    /// prompt each carries (`local`, or for a reply delivered as data the
+    /// prompt its author's session worked on). A local request this broker
+    /// didn't register is of unknown origin.
+    local_prompts: HashMap<String, PromptFrom>,
     /// Interrupts waiting for a turn to end, per session.
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
@@ -774,6 +781,7 @@ impl HostBridge {
             history_key: HistoryKey::random(),
             submitters: HashMap::new(),
             prompts: HashMap::new(),
+            local_prompts: HashMap::new(),
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
@@ -2414,6 +2422,15 @@ impl HostBridge {
                         }
                     };
                 let sent_ms = wall_ms() as i64;
+                // Whose prompt the agent now works on (spec section 6).
+                let from = match self.host.submitter(request_id) {
+                    Some("local") => self
+                        .local_prompts
+                        .remove(request_id)
+                        .unwrap_or(PromptFrom::Unknown),
+                    other => PromptFrom::of(other),
+                };
+                session.note_prompt(from);
                 match session.paste(&text, not_after) {
                     Ok(seq) => {
                         session
@@ -2689,7 +2706,9 @@ impl HostBridge {
                 let error = if self.host.admit_write(&sid, write.host_epoch, now) {
                     self.sync_epoch(&sid, cx);
                     let not_after = self.not_after(&sid);
+                    let from = PromptFrom::of(self.host.attachment_principal(&write.attachment));
                     let session = session_of(cx, &sid).expect("checked above");
+                    session.note_input(from);
                     match session.write_tagged(&write.bytes, WriteTag::Host, not_after) {
                         Ok(seq) => {
                             if let Some(per) = self.per.get_mut(&sid) {

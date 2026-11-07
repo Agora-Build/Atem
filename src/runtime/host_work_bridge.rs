@@ -82,6 +82,9 @@ impl Sender {
 
 pub struct RemoteLaunch {
     pub request_id: String,
+    /// Who asked for it (`local` for a local launch on message): the new
+    /// session's latest prompt principal until its first prompt.
+    pub principal: String,
     pub profile: Profile,
     pub session_id: String,
     pub process_gen: String,
@@ -704,6 +707,7 @@ impl HostBridge {
                 );
                 self.work.launches.push_back(RemoteLaunch {
                     request_id: request_id.clone(),
+                    principal: principal.clone(),
                     profile: p,
                     session_id: status.session_id.clone(),
                     process_gen: status.process_gen.clone(),
@@ -1136,6 +1140,12 @@ impl HostBridge {
     /// applies here (`pause_local_tasks` marks local tasks during one).
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
         let now = host_now().wall_ms;
+        // A local prompt registered for a dispatch that will never come.
+        self.local_prompts.retain(|rid, _| {
+            self.host.receipt(rid).is_some_and(|receipt| {
+                receipt.state == crate::session_protocol::wire::ReceiptState::Accepted
+            })
+        });
         // Awaiting a result, or of unknown outcome: past the deadline,
         // expired; under a sender's authority, a route or a profile approval
         // that is gone, failed. Either frees an unknown outcome's session
@@ -1279,7 +1289,8 @@ impl HostBridge {
             }
             let attachment = attachment.unwrap();
             let mut prompt = r.task.render_prompt();
-            if self.collab_result_delivery(&r)?.is_some() {
+            let delivery = self.collab_result_delivery(&r)?;
+            if delivery.is_some() {
                 prompt = prompt
                     .split_once('\n')
                     .map_or(prompt.clone(), |(_, body)| body.to_string());
@@ -1325,6 +1336,14 @@ impl HostBridge {
             r.status.state = WorkState::Submitting;
             r.status.detail = "dispatch intent persisted".into();
             self.work.store.as_ref().unwrap().save_work(&r)?;
+            // A local task's prompt is one from this host; a reply delivered
+            // as data carries the prompt its author's session worked on.
+            if r.principal == "local" {
+                let from = delivery
+                    .and_then(|(_, row)| row.reply.prompt_from)
+                    .map_or(PromptFrom::Local, |label| PromptFrom::from_label(&label));
+                self.local_prompts.insert(r.status.receipt_id.clone(), from);
+            }
             let effects = self.host.receive(
                 &attachment,
                 message.to_string().as_bytes(),
@@ -1337,6 +1356,16 @@ impl HostBridge {
             } else {
                 WorkState::OutcomeUnknown
             };
+            // Registered for a dispatch that is still to come only.
+            if self
+                .host
+                .receipt(&r.status.receipt_id)
+                .is_none_or(|receipt| {
+                    receipt.state != crate::session_protocol::wire::ReceiptState::Accepted
+                })
+            {
+                self.local_prompts.remove(&r.status.receipt_id);
+            }
             self.work.store.as_ref().unwrap().save_work(&r)?;
         }
         Ok(())
@@ -1564,7 +1593,12 @@ principals = ["local"]
                 .unwrap();
             let mut sessions = BTreeMap::from([(
                 sid.clone(),
-                BrokerSession::launched(handle, &request, created),
+                BrokerSession::launched(
+                    handle,
+                    &request,
+                    created,
+                    crate::runtime::broker::PromptFrom::Local,
+                ),
             )]);
             let mut cx = Cx {
                 client: &app.astation_client,
@@ -3207,7 +3241,12 @@ launch = "on_message"
             .unwrap();
         rig.sessions.insert(
             request.session_id.clone(),
-            BrokerSession::launched(handle, &request, created),
+            BrokerSession::launched(
+                handle,
+                &request,
+                created,
+                crate::runtime::broker::PromptFrom::Local,
+            ),
         );
     }
 
