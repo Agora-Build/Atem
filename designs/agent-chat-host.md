@@ -282,6 +282,24 @@ content will arrive: a late entry for the same `turnId` may still come as
 Atem reads the transcript to its end and sends what it found before
 `complete`.
 
+A `Stop` can be read late. The transcript's `end_turn` makes the session ready
+before that turn's `Stop` hook is read, so the next prompt may go in first.
+A `Stop` recorded (by its event file's time) before the transcript entry that
+began the current, still open turn is an earlier turn's: it ends nothing of
+the current turn, neither `complete` nor `ready`. On a filesystem that keeps
+whole seconds (a time counts to the end of its second), a `Stop` in the same
+second as that entry is stale only while the previous turn's own `Stop` is
+still owed (its transcript end was read, its hook not); otherwise it is the
+current turn's own, which is never dropped. When the current turn's user entry
+is no longer retained or has no time, a `Stop` applies as before. Codex has no
+hook turn end (its rollout's end record ends the turn), so the rule is
+Claude's. Known limits: the owed mark isn't carried across a broker restart, so
+right after one, on a whole-second filesystem, a same-second `Stop` of the
+previous turn still counts as the current turn's; and a previous turn's `Stop`
+read after the new turn's prompt hook but before its transcript entry isn't
+recognized (no turn start is known yet): it makes the session `ready` while the
+new turn runs, though it completes no receipt.
+
 ### Sending a prompt from chat
 
 `submit` is refused with an `error` (nothing is typed) unless all hold:
