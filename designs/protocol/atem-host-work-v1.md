@@ -411,14 +411,14 @@ only as later work no longer waiting behind it.
 **Launches.** A `host_launch` not yet started while `runtime.toml` doesn't
 load waits and starts once it loads again, while the sender's channel,
 `control_gen` and the profile approval hold and `expires_at` hasn't passed;
-requests, `host_launch_query` included, are `busy` meanwhile. A v0.8.2 host
+requests, `host_launch_query` included, are `busy` meanwhile. A v0.8.x host
 fences such a launch instead. Hosting switched off (`enabled = false`), a
 receipt-database fault or a halted session journal fences a launch not yet
-started, as v0.8.2 does for `enabled = false`: it never starts and ends
+started, as v0.8.x does for `enabled = false`: it never starts and ends
 `outcome_unknown`, and switching hosting on again doesn't revive it.
 
 **Uploads.** The bytes of an upload go once no open task names it (a day after
-its tasks settled past their deadline, §9); v0.8.2 never dropped them. A new
+its tasks settled past their deadline, §9); v0.8.x never drops them. A new
 task naming such an `attachment_id` stays `blocked` ("waiting for verified
 screenshot attachments") until it expires: upload the bytes again (a new
 `attachment_put`) for a new task rather than reuse an old upload.
@@ -435,7 +435,11 @@ answering with the final state, and `reply_query` answers `dropped: true`. A
 retry is deduplicated by the digest stored at acceptance: the same content
 returns the recorded receipt (`forbidden` if the route no longer allows the
 caller), other content is `request_id_reused`. The 4,096-record limits count
-open records only.
+open records only. A task record the host can't read (damage, or a shape
+another build wrote) no longer stops hosting: the host settles the task once
+as `failed` ("record unreadable"), requests that need its record (its
+`work_query`, `reply_query`, `work_cancel`, `work_complete`, its message's
+`message_query`) are `busy`, and other work goes on.
 
 ## 5. Messages
 

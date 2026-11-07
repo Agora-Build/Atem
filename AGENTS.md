@@ -295,13 +295,16 @@ under the same-user model this owner fallback is no security boundary).
 `runtime.toml` requires hosting, `[collab] send = true`, approved profiles and
 route consent for `local` (a route's own `principals` replaces the
 paired-Astation default); defaults keep sending, result prompts and launch off.
-An agent sends (and reads the directory) only while its session's latest prompt
-came from this host (`BrokerSession::prompt_from`: typed in its terminal, or a
-local task's; kept in `runtime/collab-prompt-<session>.json` for an adopting
-broker): a session a remote principal prompted, launched or typed into is
-refused until a prompt from this host begins a newer turn, and what an agent
-does through the local socket (a launch, typing into a session) carries its own
-session's prompt.
+Security is at user authentication (design §6): who may reach an agent is the
+paired Astation and the signed r9 device list's members (routes and `control`
+authorize them), and locally same-user socket peers (an agent's commands tied to
+its session by PID, start time and ancestry); every request is bound to its
+sender and checked against current authority at acceptance and again before
+dispatch; host work travels only in end-to-end `atem-ch1` channels. A principal
+allowed to reach an agent acts through it with the local user's permissions
+(shell, files, Atem commands, Memory, skills, vault): Atem doesn't track who
+prompted an agent, so its `message send` is `local` and reaches every route that
+lists `local`; the agent's tool approvals still apply.
 Owner labels and agent-owned `self:` tags feed shared selectors; one message
 resolves once to at most 32 other sessions. Limits count messages: `per_hour`
 per sending session and `per_workflow` per workflow, for sends and again for
@@ -382,7 +385,10 @@ authorization expiries come from the `work_waits` table's due index (kept by
 triggers on `work`), a grant's next look from `grant_dues`, and the authority,
 route and grant checks of all of them re-run only when their inputs changed
 (`HostBridge::work_inputs`: control generations, `local`'s standing, the loaded
-`runtime.toml`, the host identity, the sessions).
+`runtime.toml`, the host identity, the sessions). A task record this build
+can't read (damage, another build's shape) never stops a pass or hosting:
+`Store::fail_unreadable` settles it once (`failed`, "record unreadable", its
+return grant ended) and closes it, keeping its row and bytes.
 
 `host.attachments` adds encrypted `attachment_put` chunks (96 KiB decoded, PNG
 only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender

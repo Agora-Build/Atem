@@ -38,7 +38,7 @@ implemented)", and a design with nothing built says so in its status line.
 | Document | What it covers |
 |---|---|
 | [agent-hosting.md](agent-hosting.md) | OS service and boot startup, remote launch when work arrives, durable delivery through the Station (outbox, replay, offline senders) |
-| [agent-collaboration.md](agent-collaboration.md) | Stages 2-3: online cross-instance collaboration, Station adapters/capacity, return-grant agreement, sealed mailbox and signed projects |
+| [agent-collaboration.md](agent-collaboration.md) | Stages 2-3: online cross-instance collaboration, Station adapters/capacity, return-grant agreement, sealed mailbox and signed projects; a sandbox for agents |
 | [build-by-talk.md](build-by-talk.md) | Build by Talk: get the whole project clear by talking, with tool calls to the coding agents (Astation and Atem; nothing built) |
 | [e2e-encryption.md](e2e-encryption.md) | Credentials (`atem cred get` and the rest), device-signed writes, the recovery secret, auto-unlock |
 | [agora-account-grouping.md](agora-account-grouping.md) | Proposed: merge Astations under one Agora login (opt-in) |

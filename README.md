@@ -369,21 +369,34 @@ its agent; otherwise it remains visible through status. `--memory ID` and
 `--vault ID[:ENTRY]@VERSION` attach verified exact context to a message (a
 reply names its vault entry: `ID:ENTRY@VERSION`). The `atem message` and `atem
 agent tag` commands only connect to the running runtime: they never start or
-replace one. An agent sends only while its session's latest prompt came from
-this host (typed in its terminal, or a local task's): a session a remote device
-or service prompted or launched can't send until a prompt from this host
-begins a newer turn. A `runtime.toml` that doesn't load or hosting turned off
-pauses local work (new sends are refused, queued tasks wait) and never fences
-it, except that turning hosting off cancels launches not yet started;
-`send = false` only refuses new sends. A sender that goes away cancels nothing:
-its tasks still run and the reply is kept for you (`atem message complete
-TASK_ID`). A task whose sender's authority or route approval changed fails at
-once (`sender's authority changed`, `route changed`). Records are kept; a day
-after a task settles past its deadline only its text is dropped. A route can
-opt in to `launch = "on_message"`, but only for a Claude Code profile, and only
-`atem message send --launch --to atem:ATEM_ID/ROUTE_ID …` then starts its
-approved profile when no agent runs. Sending, result prompts and automatic
-launch are off by default.
+replace one.
+
+Security is at user authentication. Remotely, only the paired Astation and the
+members of your signed device list (devices, services, and browser grants your
+devices issue) reach your agents, and locally only your own user's processes;
+each request is bound to its sender and checked against the sender's current
+permission when it is accepted and again before it runs; host work travels
+only in end-to-end encrypted r9 channels the Station can't read or alter.
+Whoever may reach an agent (a route that lists it, or `control` over its
+session) acts through it with your permissions on this machine: the agent's
+shell, files and Atem commands, including `atem message send` (its tasks are
+`local` and reach every route that lists `local`), Memory, skills and the
+vault. Atem doesn't track who prompted an agent, so list a principal on a
+route, or give it `control`, only if you'd let it act as you;
+`[collab] send = true` and `local` on a route decide what your agents may
+reach. Each agent's own tool approvals still apply.
+
+A `runtime.toml` that doesn't load or hosting turned off pauses local work (new
+sends are refused, queued tasks wait) and never fences it, except that turning
+hosting off cancels launches not yet started; `send = false` only refuses new
+sends. A sender that goes away cancels nothing: its tasks still run and the
+reply is kept for you (`atem message complete TASK_ID`). A task whose sender's
+authority or route approval changed fails at once (`sender's authority
+changed`, `route changed`). Records are kept; a day after a task settles past
+its deadline only its text is dropped. A route can opt in to `launch =
+"on_message"`, but only for a Claude Code profile, and only `atem message send
+--launch --to atem:ATEM_ID/ROUTE_ID …` then starts its approved profile when no
+agent runs. Sending, result prompts and automatic launch are off by default.
 
 See the [collaboration design](designs/agent-collaboration.md) and
 [runtime sample](configs/runtime.example.toml). This stage is local and

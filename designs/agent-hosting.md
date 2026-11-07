@@ -206,6 +206,20 @@ owner's local consent in `runtime.toml`.
   its session's queue until the task's deadline.
 - Memory or vault access gives no execution right. Vault `writer_id` and relay
   room names are labels, not authority.
+- **Security is at user authentication.** Who may reach an agent is decided
+  here: the device list authenticates the caller and carries its account
+  permission (the table above), and a profile or route that lists it is your
+  consent. Every request is bound to its channel's principal, is checked
+  against current authority when accepted and again before it dispatches, and
+  travels only inside end-to-end `atem-ch1` channels that the Station can't
+  read or alter. A principal allowed to reach an agent (here, or with
+  `control` over its session) acts through it with your permissions on this
+  machine: the agent's shell, files and Atem commands, including `atem
+  message send` (its tasks are `local` and may reach every route that lists
+  `local`), Memory, skills and the vault. Atem doesn't track who prompted an
+  agent, so listing a principal, or granting it `control`, lets it act as you
+  through your agents. The agent's own tool approvals still apply to each
+  command (agent collaboration, section 6).
 
 ## 5. Remote launch
 
@@ -487,19 +501,19 @@ explicit correlated results. It uses this receiver and its approved routes.
 The agent answers any task, whoever sent it, with `atem message reply`; the
 sending agent completes its own task with `atem message complete`, a remote
 sender with `work_complete`. `atem message` and `atem agent tag` connect only
-to the running runtime (they never start or replace one). An agent sends only
-while its session's latest prompt came from this host (typed in its terminal,
-or a local task's; agent collaboration, section 6). A `runtime.toml` that
-doesn't load, hosting off or a database fault pauses local work without
-fencing it (sends are refused, queued tasks wait, replies are stored, except
-that a database fault refuses a reply, a completion and a cancel until `atem
-runtime restart`), though hosting off fences launches not yet started; a
-halted session journal holds local tasks the same way until that restart;
-`[collab] send = false` only refuses new sends. A session is
-launched only for `atem message send --launch` on a route with
-`launch = "on_message"`, and only for a Claude Code profile. **Not implemented:** cross-instance transport, the
-shared Station directory and mailbox, and the stages 2-3 permission
-agreements.
+to the running runtime (they never start or replace one). An agent's sends are
+`local` whoever prompted it, so a route that lists `local` takes work from
+every principal that may reach the agents that send (agent collaboration,
+section 6). A `runtime.toml` that doesn't load, hosting off or a database
+fault pauses local work without fencing it (sends are refused, queued tasks
+wait, replies are stored, except that a database fault refuses a reply, a
+completion and a cancel until `atem runtime restart`), though hosting off
+fences launches not yet started; a halted session journal holds local tasks
+the same way until that restart; `[collab] send = false` only refuses new
+sends. A session is launched only for `atem message send --launch` on a route
+with `launch = "on_message"`, and only for a Claude Code profile.
+**Not implemented:** cross-instance transport, the shared Station directory
+and mailbox, and the stages 2-3 permission agreements.
 
 ### OS service and boot startup (not implemented)
 
