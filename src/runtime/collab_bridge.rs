@@ -774,7 +774,7 @@ impl HostBridge {
                 .optional()?;
             match row {
                 Some((task, grant, state, since)) => {
-                    pending.push((task, grant, state, since, Some(due)))
+                    pending.push((task_id, task, grant, state, since, Some(due)))
                 }
                 // No grant or task (any more): nothing to look at.
                 None => {
@@ -785,8 +785,17 @@ impl HostBridge {
             }
         }
         let mut next_dues = Vec::new();
-        for (task, grant, state, since, due) in pending {
-            let task: WorkRecord = serde_json::from_str(&task)?;
+        for (task_id, task, grant, state, since, due) in pending {
+            let Ok(task) = serde_json::from_str::<WorkRecord>(&task) else {
+                // Its task can't be read: settled and closed, its grant
+                // ended, nothing more to look at.
+                self.work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .fail_unreadable(&task_id)?;
+                continue;
+            };
             let grant: ReturnGrant = serde_json::from_str(&grant)?;
             let next = self.collab_grant_step(task, &grant, &state, since, sessions, now)?;
             if next != due {

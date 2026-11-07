@@ -4523,6 +4523,54 @@ launch = "on_message"
         });
     }
 
+    /// A task whose record can't be read stops no pass and no hosting: a
+    /// waiting one (not JSON, so `work_waits` has no deadline for it) and
+    /// a queued one (a shape this build doesn't know) are settled once,
+    /// failed with "record unreadable", their return grants ended, and the
+    /// queue goes on: a local task behind them is dispatched.
+    #[test]
+    fn a_task_whose_record_cant_be_read_stops_no_pass() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let waiting = queued_with_grant(&rig);
+            let queued = queued_with_grant(&rig);
+            let db = &rig.bridge.work.store.as_ref().unwrap().db;
+            db.execute(
+                "UPDATE work SET state='awaiting_result',record='{not json' WHERE id=?1",
+                [&waiting],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE work SET record=json_set(record,'$.status.state','nonsense') WHERE id=?1",
+                [&queued],
+            )
+            .unwrap();
+            let behind = insert_task(
+                &rig,
+                "local",
+                rig.bridge.host.control_gen("local"),
+                WorkState::Queued,
+                host_now().wall_ms + 60_000,
+            );
+            let state = |r: &LocalRig, id: &str| -> String {
+                r.bridge
+                    .work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .query_row("SELECT state FROM work WHERE id=?1", [id], |r| r.get(0))
+                    .unwrap()
+            };
+            rig.until(|r| state(r, &behind) == "submitted").await;
+            assert!(!rig.bridge.work.error, "hosting goes on");
+            for id in [&waiting, &queued] {
+                assert_eq!(state(&rig, id), "failed");
+                assert_eq!(grant_state(&rig, id), "ended");
+            }
+        });
+    }
+
     /// A local launch the runtime refused to start (the live-session limit,
     /// a restart) fails its tasks with that cause, not with a hint at the
     /// route's directory or environment.

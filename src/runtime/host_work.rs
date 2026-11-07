@@ -34,6 +34,9 @@ pub const EXPIRED_UNKNOWN: &str = "expired with its outcome unknown";
 /// A task whose sender's authorization (a service or browser grant) expired
 /// since it was accepted: a renewal or a new grant never revives it.
 pub const AUTHORIZATION_EXPIRED: &str = "sender's authorization expired";
+/// The detail of a task whose record this build can't read
+/// (`Store::fail_unreadable`).
+pub const RECORD_UNREADABLE: &str = "record unreadable";
 
 #[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -654,10 +657,12 @@ const OPEN_COUNT: &str = "SELECT count(*) FROM open_records WHERE kind=?1";
 
 /// Settled tasks past the cutoff whose reply is no longer publishing and
 /// whose reply's carrier (the task delivering it to its local sender), if
-/// any, settled too.
+/// any, settled too. A record that isn't JSON is due at once (it is closed
+/// as it is, `Store::fail_unreadable`).
 const DUE_TASKS: &str = "SELECT w.id FROM open_records o CROSS JOIN work w ON w.id=o.id
     WHERE o.kind='work' AND w.state IN ('completed','failed','cancelled','expired')
-    AND json_extract(w.record,'$.task.expires_at')<=?1
+    AND CASE WHEN json_valid(w.record) THEN json_extract(w.record,'$.task.expires_at')
+        ELSE 0 END<=?1
     AND NOT EXISTS(SELECT 1 FROM results r LEFT JOIN work c ON c.id=r.work_id
         WHERE r.task_id=w.id AND (r.state='publishing'
         OR c.state NOT IN ('completed','failed','cancelled','expired')))
@@ -689,11 +694,11 @@ const DUE_LAUNCHES: &str = "SELECT l.id FROM open_records o CROSS JOIN launches 
 /// The open launches and tasks (`Store::open_launches`, `open_tasks`).
 const OPEN_LAUNCHES: &str = "SELECT l.record FROM open_records o
     CROSS JOIN launches l ON l.id=o.id WHERE o.kind='launches' ORDER BY l.rowid";
-const OPEN_TASKS: &str = "SELECT w.record FROM open_records o
+const OPEN_TASKS: &str = "SELECT w.id,w.record FROM open_records o
     CROSS JOIN work w ON w.id=o.id WHERE o.kind='work' ORDER BY w.rowid";
 
 /// The tasks in one state (`Store::tasks_in`).
-const TASKS_IN: &str = "SELECT record FROM work WHERE state=?1 ORDER BY rowid";
+const TASKS_IN: &str = "SELECT id,record FROM work WHERE state=?1 ORDER BY rowid";
 
 /// The principals of unsettled tasks (`Store::named_principals_at`).
 const NAMED_PRINCIPALS: &str = "SELECT DISTINCT json_extract(record,'$.principal') FROM work
@@ -836,6 +841,52 @@ fn wait_columns(t: &str, r: &str) -> String {
         profile_rev = field("profile_revision"),
         project = field("project"),
     )
+}
+
+/// A `record` column's text; anything else (a BLOB, NULL) as no text,
+/// which no record parses from.
+fn record_text(row: &rusqlite::Row, i: usize) -> rusqlite::Result<String> {
+    Ok(row.get_ref(i)?.as_str().unwrap_or_default().to_string())
+}
+
+/// A `work_waits` row's columns after its id, from `settle_due` (2) or
+/// `settle_lost` (9): its deadline and what it was accepted under. `None`
+/// when one isn't of its type (its record isn't JSON, or lacks it).
+fn waiting(values: Vec<rusqlite::types::Value>) -> Option<(u64, Accepted)> {
+    use rusqlite::types::Value;
+    let int = |v: &Value| match v {
+        Value::Integer(i) => u64::try_from(*i).ok(),
+        _ => None,
+    };
+    let text = |v: &Value| match v {
+        Value::Text(t) => Some(t.clone()),
+        _ => None,
+    };
+    let deadline = int(values.first()?)?;
+    let authorization_expires_at = match values.get(1)? {
+        Value::Null => None,
+        other => Some(int(other)?),
+    };
+    let mut accepted = Accepted {
+        principal: String::new(),
+        control_gen: 0,
+        authorization_expires_at,
+        route_id: String::new(),
+        route_revision: 0,
+        profile_id: String::new(),
+        profile_revision: 0,
+        project: String::new(),
+    };
+    if values.len() > 2 {
+        accepted.principal = text(values.get(2)?)?;
+        accepted.control_gen = int(values.get(3)?)?;
+        accepted.route_id = text(values.get(4)?)?;
+        accepted.route_revision = int(values.get(5)?)?;
+        accepted.profile_id = text(values.get(6)?)?;
+        accepted.profile_revision = int(values.get(7)?)?;
+        accepted.project = text(values.get(8)?)?;
+    }
+    Some((deadline, accepted))
 }
 
 /// `work_waits` holds one row per task awaiting its result or of unknown
@@ -1106,16 +1157,108 @@ impl Store {
         self.records(OPEN_LAUNCHES, [])
     }
 
+    /// The tasks `sql` reads (an `id` and a `record` column; `params`), in
+    /// its order. One whose record can't be read is left out
+    /// (`fail_unreadable`).
+    fn tasks(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<WorkRecord>> {
+        let rows: Vec<(String, String)> = {
+            let mut q = self.db.prepare(sql)?;
+            q.query_map(params, |r| Ok((r.get(0)?, record_text(r, 1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut tasks = Vec::with_capacity(rows.len());
+        for (id, text) in rows {
+            match serde_json::from_str(&text) {
+                Ok(task) => tasks.push(task),
+                Err(_) => self.fail_unreadable(&id)?,
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// Task `id`'s record; `None` when it can't be read
+    /// (`fail_unreadable`).
+    fn readable_work(&self, id: &str) -> Result<Option<WorkRecord>> {
+        let text = self
+            .db
+            .query_row("SELECT record FROM work WHERE id=?1", [id], |r| {
+                record_text(r, 0)
+            })
+            .optional()?
+            .ok_or_else(|| anyhow!("missing work record"))?;
+        match serde_json::from_str(&text) {
+            Ok(task) => Ok(Some(task)),
+            Err(_) => {
+                self.fail_unreadable(id)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// A task whose record this build can't read (not JSON, or not a task
+    /// it knows: damage, or another build's record) never fails a pass.
+    /// Unsettled, it fails (`RECORD_UNREADABLE`, in its record's `status`
+    /// when the record is a JSON object; other bytes stay as they are) and
+    /// its return grant ends. Settled or not, it is closed at once
+    /// (`closed_records`), so no pass reads it again, and its row stays.
+    /// One runtime.log line names it.
+    pub(super) fn fail_unreadable(&self, id: &str) -> Result<()> {
+        let tx = self
+            .db
+            .is_autocommit()
+            .then(|| self.db.unchecked_transaction())
+            .transpose()?;
+        let failed = self.db.execute(
+            "UPDATE work SET state='failed', record=CASE
+                WHEN json_valid(record) AND json_type(record)='object'
+                THEN json_set(record,'$.status.state','failed','$.status.detail',?2)
+                ELSE record END
+            WHERE id=?1 AND state IN
+            ('queued','blocked','submitting','submitted','awaiting_result','outcome_unknown')",
+            params![id, RECORD_UNREADABLE],
+        )? == 1;
+        if failed {
+            self.db.execute(
+                "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state IN ('open','consumed')",
+                [id],
+            )?;
+        }
+        self.db
+            .execute("DELETE FROM grant_dues WHERE task_id=?1", [id])?;
+        let closed = self
+            .db
+            .execute("DELETE FROM open_records WHERE kind='work' AND id=?1", [id])?
+            == 1;
+        self.db.execute(
+            "INSERT OR IGNORE INTO closed_records(kind,id,at_ms) VALUES('work',?1,?2)",
+            params![id, crate::session_protocol::membership::host_now().wall_ms],
+        )?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
+        if failed || closed {
+            eprintln!(
+                "atem runtime: host work: task {id}: its record can't be read; {} (record kept)",
+                if failed {
+                    "failed, \"record unreadable\""
+                } else {
+                    "closed"
+                }
+            );
+        }
+        Ok(())
+    }
+
     /// The tasks still open (`open_records`), oldest first: every one not
     /// settled, and those settled less than a day past their deadline.
     pub fn open_tasks(&self) -> Result<Vec<WorkRecord>> {
-        self.records(OPEN_TASKS, [])
+        self.tasks(OPEN_TASKS, [])
     }
 
     /// The tasks in `state`, oldest first, through the `work_state` index.
     pub fn tasks_in(&self, state: WorkState) -> Result<Vec<WorkRecord>> {
         let state = serde_json::to_value(state)?;
-        self.records(TASKS_IN, [state.as_str()])
+        self.tasks(TASKS_IN, [state.as_str()])
     }
 
     /// The tasks that hold, or wait for, a place in their session's queue
@@ -1123,12 +1266,10 @@ impl Store {
     /// outcome holds its session's queue too, but isn't read here: there may
     /// be thousands (`holds_unknown_outcome`).
     pub fn active_tasks(&self) -> Result<Vec<WorkRecord>> {
-        let mut q = self.db.prepare(
-            "SELECT record FROM work WHERE state IN ('queued','blocked','submitting','submitted') ORDER BY rowid",
-        )?;
-        q.query_map([], |r| r.get::<_, String>(0))?
-            .map(|r| Ok(serde_json::from_str(&r?)?))
-            .collect()
+        self.tasks(
+            "SELECT id,record FROM work WHERE state IN ('queued','blocked','submitting','submitted') ORDER BY rowid",
+            [],
+        )
     }
 
     /// A task of unknown outcome holds `session_id`'s queue (until it
@@ -1210,7 +1351,9 @@ impl Store {
     /// or return grant (spec section 10), so none waits, or holds its
     /// session's queue, forever; before it, one whose sender's authorization
     /// expired fails (`AUTHORIZATION_EXPIRED`). Read by `work_waits`' due
-    /// time, so a pass reads only what is due. Returns how many settled.
+    /// time, so a pass reads only what is due. A record that can't be read
+    /// (`work_waits` has no deadline for it, so it is due at once) is
+    /// settled as such (`fail_unreadable`). Returns how many settled.
     pub fn settle_due(&self, now: u64) -> Result<usize> {
         let mut due = Vec::new();
         {
@@ -1218,18 +1361,21 @@ impl Store {
                 "SELECT id,expires_at,authorization_expires_at FROM work_waits WHERE due_ms<=?1",
             )?;
             let rows = q.query_map([now], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u64>(1)?,
-                    r.get::<_, Option<u64>>(2)?,
-                ))
+                Ok((r.get::<_, String>(0)?, vec![r.get(1)?, r.get(2)?]))
             })?;
             for row in rows {
-                let (id, deadline, authorization) = row?;
-                if now >= deadline {
-                    due.push((id, None));
-                } else if authorization.is_some_and(|at| now >= at) {
-                    due.push((id, Some(AUTHORIZATION_EXPIRED)));
+                let (id, values) = row?;
+                match waiting(values) {
+                    None => due.push((id, Some(RECORD_UNREADABLE))),
+                    Some((deadline, _)) if now >= deadline => due.push((id, None)),
+                    Some((_, accepted))
+                        if accepted
+                            .authorization_expires_at
+                            .is_some_and(|at| now >= at) =>
+                    {
+                        due.push((id, Some(AUTHORIZATION_EXPIRED)))
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -1255,27 +1401,22 @@ impl Store {
                 route_id,route_revision,profile_id,profile_revision,project FROM work_waits",
             )?;
             let rows = q.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u64>(1)?,
-                    Accepted {
-                        principal: r.get(2)?,
-                        control_gen: r.get(3)?,
-                        authorization_expires_at: r.get(4)?,
-                        route_id: r.get(5)?,
-                        route_revision: r.get(6)?,
-                        profile_id: r.get(7)?,
-                        profile_revision: r.get(8)?,
-                        project: r.get(9)?,
-                    },
-                ))
+                let values = [1, 4, 2, 3, 5, 6, 7, 8, 9]
+                    .into_iter()
+                    .map(|i| r.get(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((r.get::<_, String>(0)?, values))
             })?;
             for row in rows {
-                let (id, deadline, accepted) = row?;
-                if now >= deadline {
-                    due.push((id, None));
-                } else if let Some(why) = lost(&accepted) {
-                    due.push((id, Some(why)));
+                let (id, values) = row?;
+                match waiting(values) {
+                    None => due.push((id, Some(RECORD_UNREADABLE))),
+                    Some((deadline, _)) if now >= deadline => due.push((id, None)),
+                    Some((_, accepted)) => {
+                        if let Some(why) = lost(&accepted) {
+                            due.push((id, Some(why)));
+                        }
+                    }
                 }
             }
         }
@@ -1294,16 +1435,21 @@ impl Store {
 
     /// Expires each of `due` (no reason) or fails it with its reason; an
     /// open return grant ends with an expired task, an open or consumed one
-    /// with a failed task. Writes only what is due; returns how many.
+    /// with a failed task; a record that can't be read is settled as such
+    /// (`fail_unreadable`). Writes only what is due; returns how many.
     fn settle(&self, due: Vec<(String, Option<&'static str>)>) -> Result<usize> {
         if due.is_empty() {
             return Ok(0);
         }
         let tx = self.db.unchecked_transaction()?;
         for (id, why) in &due {
-            let mut record = self
-                .work(id)?
-                .ok_or_else(|| anyhow!("missing work reservation"))?;
+            if *why == Some(RECORD_UNREADABLE) {
+                self.fail_unreadable(id)?;
+                continue;
+            }
+            let Some(mut record) = self.readable_work(id)? else {
+                continue;
+            };
             let end = match why {
                 Some(why) => {
                     record.status.state = WorkState::Failed;
@@ -1409,9 +1555,10 @@ impl Store {
         };
         let mut uploads = BTreeSet::new();
         for id in &due.tasks {
-            let mut record = self
-                .work(id)?
-                .ok_or_else(|| anyhow!("missing work record"))?;
+            // One that can't be read is closed as it is.
+            let Some(mut record) = self.readable_work(id)? else {
+                continue;
+            };
             record.drop_payload();
             self.save_work(&record)?;
             if let Some(reply) = text("SELECT record FROM results WHERE task_id=?1", id)? {
@@ -2048,6 +2195,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(grant, "ended");
+    }
+
+    /// A task whose record this build can't read never fails a pass: it is
+    /// settled once (failed, "record unreadable", in its status when the
+    /// record is a JSON object, other bytes kept as they are), its return
+    /// grant ends and it is closed, so nothing reads it again. Not JSON, or
+    /// an object without a deadline: at once; a shape this build doesn't
+    /// know: at its deadline, or when the queue reads it. One that settled
+    /// before it became unreadable is closed as it is when its payloads
+    /// are due.
+    #[test]
+    fn a_task_whose_record_cant_be_read_is_settled_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut ids = Vec::new();
+        for (state, record) in [
+            (WorkState::AwaitingResult, "'{not json'"),
+            (WorkState::OutcomeUnknown, "'{\"x\":1}'"),
+            (
+                WorkState::AwaitingResult,
+                "json_set(record,'$.status.state','nonsense')",
+            ),
+            (
+                WorkState::Queued,
+                "json_set(record,'$.status.state','nonsense')",
+            ),
+            (
+                WorkState::Completed,
+                "json_set(record,'$.status.state','nonsense')",
+            ),
+            (WorkState::Expired, "'{not json'"),
+        ] {
+            let mut r = task();
+            r.task.expires_at = 1_000;
+            assert!(store.enqueue(&r).unwrap());
+            r.status.state = state;
+            store.save_work(&r).unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO return_grants(task_id,record,state) VALUES(?1,'{}','open')",
+                    [&r.task.task_id],
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    &format!("UPDATE work SET record={record} WHERE id=?1"),
+                    [&r.task.task_id],
+                )
+                .unwrap();
+            ids.push(r.task.task_id);
+        }
+        let column = |sql: &str, id: &str| -> Option<String> {
+            store
+                .db
+                .query_row(sql, [id], |r| r.get(0))
+                .optional()
+                .unwrap()
+        };
+        let state = |id: &str| column("SELECT state FROM work WHERE id=?1", id).unwrap();
+        let record = |id: &str| column("SELECT record FROM work WHERE id=?1", id).unwrap();
+        let grant =
+            |id: &str| column("SELECT state FROM return_grants WHERE task_id=?1", id).unwrap();
+        let open = |id: &str| {
+            column(
+                "SELECT id FROM open_records WHERE kind='work' AND id=?1",
+                id,
+            )
+            .is_some()
+        };
+        let detail = |id: &str| {
+            let record: serde_json::Value = serde_json::from_str(&record(id)).unwrap();
+            (
+                record["status"]["state"].as_str().unwrap().to_string(),
+                record["status"]["detail"].as_str().unwrap().to_string(),
+            )
+        };
+        let unreadable = ("failed".to_string(), RECORD_UNREADABLE.to_string());
+        // A reply still publishing for one that isn't JSON: the publication
+        // pass reads past it.
+        store
+            .db
+            .execute(
+                "INSERT INTO results(task_id,result_id,state,detail,digest,created_ms,
+                record,next_try_ms,attempts) VALUES(?1,?2,'publishing','','d',0,'{}',0,0)",
+                params![ids[0], uuid::Uuid::new_v4().to_string()],
+            )
+            .unwrap();
+        assert!(
+            crate::runtime::collab::results::publishing_due(&store.db, 1, false)
+                .unwrap()
+                .is_empty()
+        );
+        // Not JSON, or an object without a deadline: at once, and once.
+        assert_eq!(store.settle_overdue(999, |_| None).unwrap(), 2);
+        assert_eq!(store.settle_overdue(999, |_| None).unwrap(), 0);
+        for id in &ids[..2] {
+            assert_eq!((state(id), grant(id)), ("failed".into(), "ended".into()));
+            assert!(!open(id), "closed");
+        }
+        assert_eq!(record(&ids[0]), "{not json", "kept as it is");
+        assert_eq!(detail(&ids[1]), unreadable);
+        // A shape this build doesn't know, queued: when the queue is read.
+        assert!(store.active_tasks().unwrap().is_empty());
+        assert_eq!(
+            (state(&ids[3]), grant(&ids[3])),
+            ("failed".into(), "ended".into())
+        );
+        assert_eq!(detail(&ids[3]), unreadable);
+        assert!(!open(&ids[3]));
+        // Awaiting its result: at its deadline.
+        assert_eq!(state(&ids[2]), "awaiting_result");
+        assert_eq!(store.settle_due(1_000).unwrap(), 1);
+        assert_eq!(detail(&ids[2]), unreadable);
+        assert_eq!(grant(&ids[2]), "ended");
+        // Settled before: closed as it is when its payloads are due (or
+        // when the open tasks are read).
+        assert!(open(&ids[4]) && open(&ids[5]));
+        let before = record(&ids[4]);
+        store.drop_payloads(1_000 + PAYLOAD_RETENTION_MS).unwrap();
+        assert!(!open(&ids[4]) && !open(&ids[5]));
+        assert_eq!(
+            (state(&ids[4]), record(&ids[4]), grant(&ids[4])),
+            ("completed".into(), before, "open".into())
+        );
+        assert_eq!(
+            (state(&ids[5]), record(&ids[5])),
+            ("expired".into(), "{not json".into())
+        );
+        assert!(store.open_tasks().unwrap().is_empty());
+        assert_eq!(store.settle_overdue(2_000, |_| None).unwrap(), 0);
     }
 
     /// Before its deadline, a task awaiting its result or of unknown outcome

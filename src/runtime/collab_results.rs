@@ -419,7 +419,8 @@ pub fn publishing_due(db: &Connection, now: u64, local: bool) -> Result<Vec<(Res
     let mut q = db.prepare(&format!(
         "SELECT {columns},r.attempts FROM results r CROSS JOIN work w ON w.id=r.task_id
         WHERE r.state='publishing' AND r.next_try_ms<=?1
-        AND (?2 OR json_extract(w.record,'$.principal')!='local')
+        AND (?2 OR CASE WHEN json_valid(w.record)
+            THEN json_extract(w.record,'$.principal') END!='local')
         ORDER BY r.created_ms LIMIT 16"
     ))?;
     q.query_map(params![now, local], |r| Ok((row(r)?, r.get::<_, u32>(8)?)))?
