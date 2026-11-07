@@ -604,7 +604,8 @@ its sender: two separate steps.
   boundary (a same-user process can leave an agent's process tree): it keeps an
   agent's commands to its own session.
 - **Storage.** The runtime writes a grant or result only when its state
-  changes, and keeps it with its task for the life of the database; a day
+  changes (when a grant is looked at next is kept beside it, in
+  `grant_dues`), and keeps it with its task for the life of the database; a day
   after the task settled past its deadline only the text goes ("Records and
   retention" below, [agent-hosting.md](agent-hosting.md) section 9).
 
@@ -720,6 +721,11 @@ insert triggers on `work`, `messages`, `outbox` and `launches` (so a v0.8.2
 binary's inserts count too), is what those counts and the payload pass read,
 and `closed_records` marks the closed ones; neither steps over a closed
 record. The 256 unfinished tasks and the upload limits are not affected.
+Two more tables are scheduling state, not records, and lose their rows when
+there is nothing left to schedule: `work_waits`, one row per task awaiting its
+result or of unknown outcome with its due time, target session and what it was
+accepted under (kept by triggers on `work`, whoever writes the task), and
+`grant_dues`, when each return grant is looked at next.
 
 When a pass drops anything, `runtime.log` gets one line with counts and no
 content, for example `atem runtime: host work: dropped the payloads of 3 tasks,
@@ -961,7 +967,7 @@ Sending and automatic actions remain opt-in.
 | Results | `src/runtime/collab_results.rs`, `collab_bridge.rs`: one durable reply per task for every sender, bound to its session, process and turn; narrow return grants, explicit completion by the sender, optional origin prompt, status-only automatic reports, grants that end early with their reason recorded (the task goes on) |
 | Remote replies | `crates/atem-client/src/session/host_work.rs`, `principal.rs`, `connect.rs`, `src/session_protocol/r9/mod.rs`, `host_work_bridge.rs`: `reply_query`, the `host.reply` feature, the shared vectors in `designs/protocol/fixtures/host-work/requests-v1.json` |
 | Chat turn attribution | `src/chat/session.rs`: a Claude `Stop` hook recorded before the current turn began ends nothing of it (the collaboration tests found it; it also affected remote chat prompts) |
-| Records | `src/runtime/host_work.rs`: `Store::drop_payloads` (every record kept, payloads dropped a day past a settled record's deadline), `open_records` and `closed_records`, `Store::settle_overdue`, `Store::retire` |
+| Records | `src/runtime/host_work.rs`: `Store::drop_payloads` (every record kept, payloads dropped a day past a settled record's deadline), `open_records` and `closed_records`, `work_waits` with `Store::settle_due`/`settle_lost`/`holds_unknown_outcome`, `grant_dues`, `Store::retire`; `host_work_bridge.rs`: `work_inputs` (what the checks of waiting tasks and grants depend on) |
 | Launch on message | `src/runtime/collab_launch_bridge.rs`: only for a send that asks, Claude profiles only; reserve task and launch identities in one transaction, share pending launches, reuse approved profile/environment loading and guarded worker spawn |
 | CLI | `src/cli.rs`, `src/runtime/client.rs`, `commands.rs`, `protocol.rs`: agent tags and runtime-backed send/reply/complete/status/cancel/directory commands, which only connect to a running runtime |
 
@@ -1014,8 +1020,10 @@ unchanged, retries deduplicated by digest after a drop, `reply_query` answering
 `dropped`, the record caps counting open records only (tasks, messages, local
 sends, launches), no recurring or per-request query reading a closed record
 (query plans, and steps that don't grow with 1,200 then 3,600 closed records),
-cached upload files removed before the commit, and a settled task's records
-answering through a restart with the host clock a day ahead.
+a pass where nothing changed running the same VM steps beside 500 and 4,000
+tasks awaiting their result, cached upload files removed before the commit,
+and a settled task's records answering through a restart with the host clock
+a day ahead.
 Shared client tests cover strict remote/local validation, `reply_query`, its
 vectors and the dropped reply separately; `chat::session` tests reproduce the stale `Stop` batch
 with exact and whole-second times. Host-work and R9 fixtures check that the
@@ -1044,12 +1052,25 @@ Stage 1 ships with these limits.
   the next turn, so the first prompt typed after it doesn't let the agent send
   (the next one does).
 
-- **Scaling.** Every 100 ms the pass reads the task rows that are unfinished or
-  awaiting a result (`settle_overdue` extracts JSON fields from each, bounded by
-  the cap of 4,096 open records) and runs a few queries for each submitted or
-  unknown-outcome task; every 60 s the payload pass reads each open record,
-  settled ones inside their day included. No recurring or per-request path
-  steps over closed records: they run through indexes. `atem message status`
+- **Scaling.** A 100 ms pass where nothing relevant changed reads no task
+  awaiting its result or of unknown outcome and no return grant: it reads
+  the tasks that hold or wait for a queue place (at most 256), deadlines and
+  authorization expiries through `work_waits`' due index, and the grants due
+  through `grant_dues`. The authority and route check of every waiting task
+  (`settle_lost`, from `work_waits`' columns, never a record) runs only in a
+  pass after its inputs changed: a raised control generation, `local`'s
+  standing, the `runtime.toml` that loaded, the host identity, the sessions
+  (process generations, liveness, directories, launch projects); such a change
+  also makes every open grant due, and a pass looks at 256 due grants at most.
+  Measured in a release build beside 4,096 tasks awaiting their result, each
+  with an open grant: a steady pass took about 0.2 ms with 4 KiB and with
+  30 KiB prompts (before this change: 133 ms and 310 ms, every pass); the pass
+  after an input change 31 ms and 40 ms, then 15 passes of at most 15 ms and
+  27 ms while the grants drain (`pass_timings_beside_awaiting_tasks`). Every
+  60 s the payload pass reads each open record, settled ones inside their day
+  included. Replies and sends whose context is still publishing (only while
+  the relay is unreachable or slow) are read each pass. No recurring or
+  per-request path steps over closed records: they run through indexes. `atem message status`
   scoped to a session with fewer than 32 matching messages reads every local
   send once, and a send reads the resolutions of each live session whose
   project is still unknown; both are on demand and linear. Records are never

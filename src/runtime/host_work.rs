@@ -31,6 +31,9 @@ const UNFINISHED: &str =
 pub const EXPIRED_AWAITING: &str = "expired awaiting a result";
 /// The detail of a task whose outcome was still unknown at its deadline.
 pub const EXPIRED_UNKNOWN: &str = "expired with its outcome unknown";
+/// A task whose sender's authorization (a service or browser grant) expired
+/// since it was accepted: a renewal or a new grant never revives it.
+pub const AUTHORIZATION_EXPIRED: &str = "sender's authorization expired";
 
 #[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -815,6 +818,75 @@ fn track_open_records(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The columns of a `work_waits` row, from `{r}` (a task record's JSON; a
+/// record that isn't JSON gives NULLs, due at once) for task `{t}`.
+fn wait_columns(t: &str, r: &str) -> String {
+    let field = |path: &str| format!("json_extract({r},'$.{path}')");
+    format!(
+        "{t}.id,{t}.state,min(coalesce({expires},0),coalesce({auth},{expires},0)),\
+        {expires},{auth},{session},{principal},{gen},{route},{route_rev},{profile},{profile_rev},{project}",
+        expires = field("task.expires_at"),
+        auth = field("authorization_expires_at"),
+        session = field("task.target.session_id"),
+        principal = field("principal"),
+        gen = field("control_gen"),
+        route = field("route_id"),
+        route_rev = field("route_revision"),
+        profile = field("profile_id"),
+        profile_rev = field("profile_revision"),
+        project = field("project"),
+    )
+}
+
+/// `work_waits` holds one row per task awaiting its result or of unknown
+/// outcome: when it is next due (`due_ms`: its deadline, or its sender's
+/// authorization expiry if sooner), its target session, and what it was
+/// accepted under. Triggers on `work` keep it, whoever writes the task (a
+/// v0.8.2 binary too: they change no v0.8.2 table), so the scheduling
+/// passes read these columns through their indexes and never a task's
+/// record (`Store::settle_due`, `settle_lost`, `holds_unknown_outcome`). A
+/// database without the table gets it, filled once.
+fn track_waits(db: &Connection) -> Result<()> {
+    let tracked: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_waits')",
+        [],
+        |r| r.get(0),
+    )?;
+    if tracked {
+        return Ok(());
+    }
+    let waiting = "('awaiting_result','outcome_unknown')";
+    let checked = "(SELECT CASE WHEN json_valid(NEW.record) THEN NEW.record ELSE '{}' END AS r)";
+    let new = wait_columns("NEW", "r");
+    let existing = wait_columns(
+        "w",
+        "(CASE WHEN json_valid(w.record) THEN w.record ELSE '{}' END)",
+    );
+    let tx = db.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "CREATE TABLE work_waits (id TEXT PRIMARY KEY, state TEXT NOT NULL, due_ms INTEGER,
+            expires_at INTEGER, authorization_expires_at INTEGER, session_id TEXT,
+            principal TEXT, control_gen INTEGER, route_id TEXT, route_revision INTEGER,
+            profile_id TEXT, profile_revision INTEGER, project TEXT) WITHOUT ROWID;
+        CREATE INDEX work_waits_due ON work_waits(due_ms);
+        CREATE INDEX work_waits_session ON work_waits(session_id, state);
+        CREATE TRIGGER work_waits_opened AFTER INSERT ON work
+            WHEN NEW.state IN {waiting} BEGIN
+            INSERT OR REPLACE INTO work_waits SELECT {new} FROM {checked};
+        END;
+        CREATE TRIGGER work_waits_changed AFTER UPDATE ON work BEGIN
+            DELETE FROM work_waits WHERE id=OLD.id;
+            INSERT INTO work_waits SELECT {new} FROM {checked} WHERE NEW.state IN {waiting};
+        END;
+        CREATE TRIGGER work_waits_deleted AFTER DELETE ON work BEGIN
+            DELETE FROM work_waits WHERE id=OLD.id;
+        END;
+        INSERT INTO work_waits SELECT {existing} FROM work w WHERE w.state IN {waiting};"
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(state: &Path) -> Result<Self> {
         super::worker::private_dir(state)?;
@@ -854,6 +926,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS return_grants (task_id TEXT PRIMARY KEY, record TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'open', awaiting_since_ms INTEGER);
             CREATE INDEX IF NOT EXISTS grant_state ON return_grants(state);
+            CREATE TABLE IF NOT EXISTS grant_dues (task_id TEXT PRIMARY KEY, due_ms INTEGER NOT NULL)
+                WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS grant_due ON grant_dues(due_ms);
             CREATE TABLE IF NOT EXISTS results (
                 task_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL,
                 detail TEXT NOT NULL, digest TEXT NOT NULL, created_ms INTEGER NOT NULL,
@@ -872,6 +947,7 @@ impl Store {
                 kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
                 PRIMARY KEY(kind,id)) WITHOUT ROWID;")?;
         track_open_records(&db)?;
+        track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
         Ok(Self {
             db,
@@ -1042,11 +1118,27 @@ impl Store {
         self.records(TASKS_IN, [state.as_str()])
     }
 
+    /// The tasks that hold, or wait for, a place in their session's queue
+    /// (`UNFINISHED`, at most `MAX_QUEUED`), oldest first. A task of unknown
+    /// outcome holds its session's queue too, but isn't read here: there may
+    /// be thousands (`holds_unknown_outcome`).
     pub fn active_tasks(&self) -> Result<Vec<WorkRecord>> {
-        let mut q = self.db.prepare("SELECT record FROM work WHERE state IN ('queued','blocked','submitting','submitted','outcome_unknown') ORDER BY rowid")?;
+        let mut q = self.db.prepare(
+            "SELECT record FROM work WHERE state IN ('queued','blocked','submitting','submitted') ORDER BY rowid",
+        )?;
         q.query_map([], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect()
+    }
+
+    /// A task of unknown outcome holds `session_id`'s queue (until it
+    /// expires or a reply proves its turn ran), through `work_waits`.
+    pub fn holds_unknown_outcome(&self, session_id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_waits WHERE session_id=?1 AND state='outcome_unknown')",
+            [session_id],
+            |r| r.get(0),
+        )?)
     }
 
     fn capacity(&self, table: &str) -> Result<()> {
@@ -1116,13 +1208,42 @@ impl Store {
     /// Tasks awaiting their result or whose outcome is unknown expire at
     /// their deadline, whoever sent them and whatever became of their reply
     /// or return grant (spec section 10), so none waits, or holds its
-    /// session's queue, forever. Before it, one that `lost` names a reason
-    /// for (from what it was accepted under: its sender's authority, its
-    /// route and profile approval) fails with it, and its return grant
-    /// ends: its sender can't complete it, nor its agent answer it. Nothing
-    /// is resubmitted. An open grant ends with an expired task. Writes only
-    /// what is due; returns how many settled.
-    pub fn settle_overdue(
+    /// session's queue, forever; before it, one whose sender's authorization
+    /// expired fails (`AUTHORIZATION_EXPIRED`). Read by `work_waits`' due
+    /// time, so a pass reads only what is due. Returns how many settled.
+    pub fn settle_due(&self, now: u64) -> Result<usize> {
+        let mut due = Vec::new();
+        {
+            let mut q = self.db.prepare(
+                "SELECT id,expires_at,authorization_expires_at FROM work_waits WHERE due_ms<=?1",
+            )?;
+            let rows = q.query_map([now], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, Option<u64>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, deadline, authorization) = row?;
+                if now >= deadline {
+                    due.push((id, None));
+                } else if authorization.is_some_and(|at| now >= at) {
+                    due.push((id, Some(AUTHORIZATION_EXPIRED)));
+                }
+            }
+        }
+        self.settle(due)
+    }
+
+    /// Before its deadline, a task awaiting its result or of unknown
+    /// outcome that `lost` names a reason for (from what it was accepted
+    /// under: its sender's authority, its route and profile approval) fails
+    /// with it, and its return grant ends: its sender can't complete it, nor
+    /// its agent answer it. Nothing is resubmitted. It reads every such task
+    /// (the columns `work_waits` keeps, never a record), so it runs only
+    /// when what `lost` depends on changed. Returns how many settled.
+    pub fn settle_lost(
         &self,
         now: u64,
         mut lost: impl FnMut(&Accepted) -> Option<&'static str>,
@@ -1130,13 +1251,8 @@ impl Store {
         let mut due = Vec::new();
         {
             let mut q = self.db.prepare(
-                "SELECT id,json_extract(record,'$.task.expires_at'),
-                json_extract(record,'$.principal'),json_extract(record,'$.control_gen'),
-                json_extract(record,'$.authorization_expires_at'),
-                json_extract(record,'$.route_id'),json_extract(record,'$.route_revision'),
-                json_extract(record,'$.profile_id'),json_extract(record,'$.profile_revision'),
-                json_extract(record,'$.project')
-                FROM work WHERE state IN ('awaiting_result','outcome_unknown') ORDER BY rowid",
+                "SELECT id,expires_at,principal,control_gen,authorization_expires_at,
+                route_id,route_revision,profile_id,profile_revision,project FROM work_waits",
             )?;
             let rows = q.query_map([], |r| {
                 Ok((
@@ -1163,6 +1279,23 @@ impl Store {
                 }
             }
         }
+        self.settle(due)
+    }
+
+    /// `settle_due`, then `settle_lost`.
+    #[cfg(test)]
+    pub fn settle_overdue(
+        &self,
+        now: u64,
+        lost: impl FnMut(&Accepted) -> Option<&'static str>,
+    ) -> Result<usize> {
+        Ok(self.settle_due(now)? + self.settle_lost(now, lost)?)
+    }
+
+    /// Expires each of `due` (no reason) or fails it with its reason; an
+    /// open return grant ends with an expired task, an open or consumed one
+    /// with a failed task. Writes only what is due; returns how many.
+    fn settle(&self, due: Vec<(String, Option<&'static str>)>) -> Result<usize> {
         if due.is_empty() {
             return Ok(0);
         }
@@ -1361,6 +1494,10 @@ impl Store {
         })
     }
 
+    /// Writes the task. Its return grant, if it has one the change may
+    /// concern (open or consumed, or ended while the task waits for its
+    /// result), is due at once (`grant_dues`: `collab_result_pass` takes it
+    /// on its next pass), so no pass has to read grants nothing happened to.
     pub fn save_work(&self, record: &WorkRecord) -> Result<()> {
         let state = serde_json::to_value(record.status.state)?;
         if self.db.execute(
@@ -1374,6 +1511,15 @@ impl Store {
         {
             bail!("missing work reservation");
         }
+        let waits = matches!(
+            record.status.state,
+            WorkState::AwaitingResult | WorkState::OutcomeUnknown
+        );
+        self.db.execute(
+            "INSERT OR REPLACE INTO grant_dues(task_id,due_ms) SELECT task_id,0 FROM return_grants
+            WHERE task_id=?1 AND (state IN ('open','consumed') OR ?2)",
+            params![record.task.task_id, waits],
+        )?;
         Ok(())
     }
 
@@ -1879,14 +2025,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.settle_overdue(999, |_| None).unwrap(), 0);
-        assert_eq!(store.active_tasks().unwrap().len(), 1);
-        assert_eq!(store.settle_overdue(1_000, |_| None).unwrap(), 1);
+        let session = r.task.target.session_id.clone();
+        assert!(store.holds_unknown_outcome(&session).unwrap());
+        assert!(
+            store.active_tasks().unwrap().is_empty(),
+            "none read per pass"
+        );
+        assert_eq!(store.settle_due(999).unwrap(), 0);
+        assert_eq!(store.settle_due(1_000).unwrap(), 1);
         let expired = store.work(&r.task.task_id).unwrap().unwrap();
         assert_eq!(
             (expired.status.state, expired.status.detail.as_str()),
             (WorkState::Expired, "expired with its outcome unknown")
         );
-        assert!(store.active_tasks().unwrap().is_empty());
+        assert!(!store.holds_unknown_outcome(&session).unwrap());
         let grant: String = store
             .db
             .query_row(
@@ -1937,7 +2089,7 @@ mod tests {
             .unwrap();
         assert_eq!(settled, 2);
         assert_eq!(asked.len(), 3);
-        assert_eq!(asked[2], store.work(&ids[2]).unwrap().unwrap().accepted());
+        assert!(asked.contains(&store.work(&ids[2]).unwrap().unwrap().accepted()));
         for (n, id) in ids.iter().enumerate() {
             let r = store.work(id).unwrap().unwrap();
             let grant: String = store

@@ -1109,6 +1109,21 @@ impl<J: Journal> SessionHost<J> {
         self.principal(principal).control_gen
     }
 
+    /// A digest of every principal's `control_gen` (a principal the host
+    /// doesn't keep has generation 1): it changes whenever one is raised (a
+    /// fence) or forgotten, so the runtime re-checks what was accepted
+    /// under them only then; a welcome or a disconnect changes nothing.
+    /// Independent of order; the count is part of it.
+    pub fn control_gens(&self) -> (usize, u64) {
+        use std::hash::{Hash, Hasher};
+        let digest = self.principals.iter().fold(0u64, |acc, (name, st)| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (name, st.control_gen).hash(&mut h);
+            acc ^ h.finish()
+        });
+        (self.principals.len(), digest)
+    }
+
     /// The principals the runtime's records outside this journal name, in
     /// place of the previous set: their control states are kept.
     pub fn keep_principals(&mut self, principals: HashSet<String>) {

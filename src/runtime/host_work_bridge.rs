@@ -1,6 +1,8 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
-use crate::runtime::host_work::{Accepted, Config, LaunchRecord, Profile, Store, WorkRecord};
+use crate::runtime::host_work::{
+    AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, Profile, Store, WorkRecord,
+};
 use crate::session_protocol::r9::ProjectScope;
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::{
@@ -23,10 +25,6 @@ const CLEANUP_EVERY: Duration = Duration::from_secs(60);
 /// freeze or fault, `local` losing the host's authority). Nothing of it
 /// goes on under the new authority, and no later grant revives it.
 const AUTHORITY_CHANGED: &str = "sender's authority changed";
-
-/// A task whose sender's authorization (a service or browser grant) expired
-/// since it was accepted: a renewal or a new grant never revives it.
-const AUTHORIZATION_EXPIRED: &str = "sender's authorization expired";
 
 /// A submitted task whose session receipt the session host no longer has
 /// (evicted or lost): its outcome can't be known any more.
@@ -101,6 +99,32 @@ struct PendingLaunch {
     local_route: Option<crate::runtime::host_work::Route>,
 }
 
+/// What the authority, route and grant checks of tasks awaiting their
+/// result (or of unknown outcome) and of return grants depend on, besides
+/// time (`work_inputs`): they are re-run only when one of these changed;
+/// deadlines and authorization expiries are found by their due times.
+#[derive(Clone, PartialEq)]
+struct WorkInputs {
+    control: (usize, u64),
+    local: (bool, bool, bool, String),
+    config: Config,
+    config_problem: Option<String>,
+    host: HostTarget,
+    sessions: Vec<SessionInput>,
+}
+
+/// One session as `WorkInputs` sees it.
+#[derive(Clone, PartialEq)]
+struct SessionInput {
+    id: String,
+    process_gen: String,
+    live: bool,
+    cwd: PathBuf,
+    provider: String,
+    project: Option<String>,
+    project_unread: bool,
+}
+
 pub(super) struct State {
     available: bool,
     dir: PathBuf,
@@ -122,6 +146,16 @@ pub(super) struct State {
         HashMap<String, tokio::sync::oneshot::Receiver<anyhow::Result<Vec<hw::ContextSnapshot>>>>,
     /// When the next cleanup (`work_cleanup`) runs.
     cleanup: Instant,
+    /// What the checks of waiting tasks and grants last ran under.
+    inputs: Option<WorkInputs>,
+    /// Those inputs changed: every waiting task (`settle_lost`) and every
+    /// return grant (`collab_result_pass`) is to be checked again.
+    recheck_tasks: bool,
+    recheck_grants: bool,
+    /// The principals of tasks not settled (awaiting ones as of the last
+    /// full check, and every task active since): their control states are
+    /// kept (`SessionHost::keep_principals`).
+    named: HashSet<String>,
 }
 
 impl State {
@@ -146,6 +180,10 @@ impl State {
             launches: VecDeque::new(),
             context_jobs: HashMap::new(),
             cleanup: Instant::now(),
+            inputs: None,
+            recheck_tasks: true,
+            recheck_grants: true,
+            named: HashSet::new(),
         }
     }
 }
@@ -465,15 +503,60 @@ impl HostBridge {
         self.work_fence_launches();
         if Instant::now() >= self.work.scheduled {
             self.work.scheduled = Instant::now() + Duration::from_millis(100);
-            if self
-                .collab_pass(cx)
-                .and_then(|_| self.collab_reply_pass())
+            let inputs = self.work_inputs(cx.sessions);
+            if self.work.inputs.as_ref() != Some(&inputs) {
+                self.work.inputs = Some(inputs);
+                self.work.recheck_tasks = true;
+                self.work.recheck_grants = true;
+            }
+            let passed = self
+                .collab_pass(cx, self.work.recheck_grants)
+                .and_then(|looked| {
+                    if looked {
+                        self.work.recheck_grants = false;
+                    }
+                    self.collab_reply_pass()
+                })
                 .and_then(|_| self.schedule_work(cx))
-                .and_then(|_| self.work_cleanup())
-                .is_err()
-            {
+                .and_then(|_| self.work_cleanup());
+            if passed.is_err() {
                 self.work_fail();
             }
+        }
+    }
+
+    /// The inputs of the checks of waiting tasks and return grants
+    /// (`WorkInputs`): the session host's control generations, `local`'s
+    /// standing, the configuration that loaded, the host identity and the
+    /// sessions (process generation, liveness, directory, provider, launch
+    /// project). Its cost doesn't depend on how many tasks wait.
+    fn work_inputs(&self, sessions: &BTreeMap<SessionId, BrokerSession>) -> WorkInputs {
+        WorkInputs {
+            control: self.host.control_gens(),
+            local: (
+                self.local_authorized(),
+                self.local_halted(),
+                self.hosting_enabled(),
+                self.local_attachment().to_string(),
+            ),
+            config: self.work.config.clone(),
+            config_problem: self.work.config_problem.clone(),
+            host: self.work_host(),
+            sessions: sessions
+                .values()
+                .map(|s| {
+                    let sid = s.id.as_str();
+                    SessionInput {
+                        id: sid.to_string(),
+                        process_gen: s.process_gen.clone(),
+                        live: s.is_live(),
+                        cwd: s.cwd.clone(),
+                        provider: s.provider.clone(),
+                        project: self.projects.key_of(sid).map(str::to_string),
+                        project_unread: self.project_unread.contains_key(sid),
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1147,26 +1230,48 @@ impl HostBridge {
             })
         });
         // Awaiting a result, or of unknown outcome: past the deadline,
-        // expired; under a sender's authority, a route or a profile approval
-        // that is gone, failed. Either frees an unknown outcome's session
-        // queue.
-        let mut named = HashSet::new();
-        self.work
-            .store
-            .as_ref()
-            .unwrap()
-            .settle_overdue(now, |accepted| {
+        // expired, and past the sender's authorization, failed (their due
+        // times, through an index); under a sender's authority, a route or a
+        // profile approval that is gone, failed (every one of them read, but
+        // only when what that depends on changed: `work_inputs`). Either
+        // frees an unknown outcome's session queue.
+        let store = self.work.store.as_ref().unwrap();
+        store.settle_due(now)?;
+        if self.work.recheck_tasks {
+            let mut named = HashSet::new();
+            store.settle_lost(now, |accepted| {
                 let lost = self.work_lost(accepted, now);
                 if lost.is_none() {
                     named.insert(accepted.principal.clone());
                 }
                 lost
             })?;
+            self.work.named = named;
+            self.work.recheck_tasks = false;
+        }
         let tasks = self.work.store.as_ref().unwrap().active_tasks()?;
-        named.extend(tasks.iter().map(|r| r.principal.clone()));
+        self.work
+            .named
+            .extend(tasks.iter().map(|r| r.principal.clone()));
         // Their control states stay known while a task names them.
-        self.host.keep_principals(named);
+        self.host.keep_principals(self.work.named.clone());
+        // A task of unknown outcome holds its session's queue.
         let mut occupied = HashSet::new();
+        for session in tasks
+            .iter()
+            .map(|r| r.task.target.session_id.as_str())
+            .collect::<HashSet<_>>()
+        {
+            if self
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .holds_unknown_outcome(session)?
+            {
+                occupied.insert(session.to_string());
+            }
+        }
         for mut r in tasks {
             if r.status.state.terminal() && r.status.state != WorkState::OutcomeUnknown {
                 continue;
@@ -3640,7 +3745,11 @@ launch = "on_message"
                 "WHERE state='outcome_unknown'",
                 "CROSS JOIN launches l",
                 "FROM return_grants g",
-                "FROM outbox WHERE state='publishing'",
+                "FROM grant_dues WHERE due_ms",
+                "CROSS JOIN work w ON w.id=g.task_id WHERE g.task_id=",
+                "FROM work_waits WHERE due_ms",
+                "FROM work_waits WHERE session_id",
+                "route_id,route_revision,profile_id,profile_revision,project FROM work_waits",
                 "CROSS JOIN publications p",
                 "FROM resolutions WHERE session_id",
                 "FROM results WHERE digest",
@@ -3703,6 +3812,230 @@ launch = "on_message"
                 .collect();
             assert!(grown.is_empty(), "{grown:#?}");
         });
+    }
+
+    /// VM steps of every statement the work store ran since the counter was
+    /// read (`count_steps`, through `sqlite3_trace_v2`).
+    static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    unsafe extern "C" fn count_steps(
+        kind: std::os::raw::c_uint,
+        _context: *mut std::os::raw::c_void,
+        statement: *mut std::os::raw::c_void,
+        _elapsed: *mut std::os::raw::c_void,
+    ) -> std::os::raw::c_int {
+        if kind == rusqlite::ffi::SQLITE_TRACE_PROFILE as std::os::raw::c_uint {
+            // SAFETY: a profile event's `statement` is the statement that
+            // just ran, valid for the call.
+            let steps = unsafe {
+                rusqlite::ffi::sqlite3_stmt_status(
+                    statement.cast(),
+                    rusqlite::ffi::SQLITE_STMTSTATUS_VM_STEP,
+                    1,
+                )
+            };
+            STEPS.fetch_add(steps.max(0) as u64, Ordering::SeqCst);
+        }
+        0
+    }
+
+    /// Counts the VM steps of every statement the rig's work store runs.
+    fn count_store_steps(rig: &LocalRig) {
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        // SAFETY: the callback reads only the statement it is given; the
+        // connection outlives the rig's passes.
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                db.handle(),
+                rusqlite::ffi::SQLITE_TRACE_PROFILE as std::os::raw::c_uint,
+                Some(count_steps),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    /// `n` tasks of the rig's session awaiting their result, each with a
+    /// prompt of `prompt` bytes and an open return grant from that session
+    /// (as `collab_accept` records them), an hour before their deadline.
+    fn add_awaiting(rig: &LocalRig, n: usize, prompt: usize) {
+        use crate::runtime::collab::results::{self, Origin, ReturnGrant};
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let control_gen = rig.bridge.host.control_gen("local");
+        let tx = store.db.unchecked_transaction().unwrap();
+        for _ in 0..n {
+            let message = rig.message();
+            let mut task = message.task(&message.recipients[0]).unwrap();
+            task.expires_at = host_now().wall_ms + 3_600_000;
+            task.prompt = "x".repeat(prompt);
+            let record = WorkRecord {
+                principal: "local".into(),
+                attachment_owner: Sender::Local.owner(),
+                control_gen,
+                route_id: "r".into(),
+                route_revision: 1,
+                profile_id: "p".into(),
+                profile_revision: 1,
+                project: "local:project".into(),
+                digest: hw::digest(b"task"),
+                status: WorkStatus {
+                    task_id: task.task_id.clone(),
+                    receipt_id: uuid::Uuid::new_v4().to_string(),
+                    state: WorkState::AwaitingResult,
+                    detail: "agent submission receipt reconciled; task completion requires an explicit result".into(),
+                    result: None,
+                },
+                task,
+                turn_id: Some("turn-0".into()),
+                authorization_expires_at: None,
+            };
+            tx.execute(
+                "INSERT INTO work(id,record,state) VALUES(?1,?2,'awaiting_result')",
+                rusqlite::params![record.task.task_id, serde_json::to_string(&record).unwrap()],
+            )
+            .unwrap();
+            results::save_grant(
+                &tx,
+                &ReturnGrant {
+                    task_id: record.task.task_id.clone(),
+                    message_id: message.message_id.clone(),
+                    workflow_id: message.workflow_id.clone(),
+                    origin: Origin {
+                        target: record.task.target.clone(),
+                        control_gen,
+                        route: None,
+                    },
+                    recipient: record.task.target.clone(),
+                    expires_at: record.task.expires_at,
+                    ended: None,
+                },
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// One scheduling pass of the rig, now: the VM steps the work store ran
+    /// in it and how long it took.
+    fn one_pass(rig: &mut LocalRig) -> (u64, Duration) {
+        for s in rig.sessions.values_mut() {
+            s.pump();
+        }
+        rig.bridge.work.scheduled = Instant::now();
+        STEPS.store(0, Ordering::SeqCst);
+        let started = Instant::now();
+        rig.bridge.tick(&mut rig.app, &mut rig.sessions, false);
+        (STEPS.load(Ordering::SeqCst), started.elapsed())
+    }
+
+    fn awaiting(rig: &LocalRig) -> i64 {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT count(*) FROM work WHERE state='awaiting_result'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Passes until no return grant is due (after a change, at most
+    /// `GRANTS_PER_PASS` are looked at a pass); how many it took.
+    fn drain(rig: &mut LocalRig) -> usize {
+        for n in 1..=64 {
+            one_pass(rig);
+            let due: i64 = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM grant_dues WHERE due_ms<=?1",
+                    [host_now().wall_ms],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if due == 0 {
+                return n;
+            }
+        }
+        panic!("grants still due after 64 passes");
+    }
+
+    /// Spec section 17, "Scaling": a 100 ms pass where nothing relevant
+    /// changed reads no task awaiting its result and no return grant: beside
+    /// 4,000 of them (4 KiB prompts) it runs exactly the VM steps it runs
+    /// beside 500. A changed input (here: none recorded yet) checks every
+    /// task again in that pass, and makes every grant due, looked at 256 a
+    /// pass.
+    #[test]
+    fn a_pass_where_nothing_changed_does_the_same_work_beside_thousands_of_awaiting_tasks() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            // The payload pass (once a minute) is not this pass.
+            rig.bridge.work.cleanup = Instant::now() + Duration::from_secs(3600);
+            count_store_steps(&rig);
+            add_awaiting(&rig, 500, 4096);
+            drain(&mut rig);
+            let fewer: Vec<u64> = (0..3).map(|_| one_pass(&mut rig).0).collect();
+            add_awaiting(&rig, 3500, 4096);
+            assert!(drain(&mut rig) >= 3500 / 256, "new grants, 256 a pass");
+            let more: Vec<u64> = (0..3).map(|_| one_pass(&mut rig).0).collect();
+            assert_eq!(fewer, more);
+            assert_eq!(awaiting(&rig), 4000);
+            rig.bridge.work.inputs = None;
+            let (recheck, _) = one_pass(&mut rig);
+            assert!(
+                recheck > more[0] + 4000 * 10,
+                "{recheck} steps re-check 4000 tasks"
+            );
+            assert!(drain(&mut rig) >= 4000 / 256 - 1);
+            assert_eq!(one_pass(&mut rig).0, more[0]);
+            assert_eq!(awaiting(&rig), 4000);
+        });
+    }
+
+    /// Timings of a pass beside 4,096 tasks awaiting their result, with 4 KiB
+    /// and 30 KiB prompts (each with an open return grant). Run in release:
+    /// `cargo test --release --bin atem -- --ignored --nocapture pass_timings`.
+    #[test]
+    #[ignore = "a timing report, not a check"]
+    fn pass_timings_beside_awaiting_tasks() {
+        for prompt in [4 * 1024, 30 * 1024] {
+            local_test(async |root| {
+                let mut rig = LocalRig::new(root).await;
+                rig.bridge.work.cleanup = Instant::now() + Duration::from_secs(3600);
+                count_store_steps(&rig);
+                add_awaiting(&rig, 4096, prompt);
+                drain(&mut rig);
+                let mut times: Vec<Duration> = (0..21).map(|_| one_pass(&mut rig).1).collect();
+                times.sort();
+                rig.bridge.work.inputs = None;
+                let (_, recheck) = one_pass(&mut rig);
+                let mut draining = Vec::new();
+                for _ in 0..64 {
+                    let (steps, took) = one_pass(&mut rig);
+                    if steps <= 1_000 {
+                        break;
+                    }
+                    draining.push(took);
+                }
+                eprintln!(
+                    "4096 awaiting tasks, {} KiB prompts: pass median {:?}, max {:?}; after an input change {:?}, then {} passes of at most {:?}",
+                    prompt / 1024,
+                    times[10],
+                    times[20],
+                    recheck,
+                    draining.len(),
+                    draining.iter().max().copied().unwrap_or_default()
+                );
+            });
+        }
     }
 
     /// Records closed long ago, numbered `n` (`closed-<n>`), in every table

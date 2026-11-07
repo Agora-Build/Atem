@@ -79,10 +79,15 @@ impl ReturnGrant {
     }
 }
 
+/// A new grant, due at once (`grant_dues`, `collab_result_pass`).
 pub fn save_grant(tx: &Transaction<'_>, grant: &ReturnGrant) -> Result<()> {
     tx.execute(
         "INSERT INTO return_grants(task_id,record) VALUES(?1,?2)",
         params![grant.task_id, serde_json::to_string(grant)?],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO grant_dues(task_id,due_ms) VALUES(?1,0)",
+        [&grant.task_id],
     )?;
     Ok(())
 }
@@ -431,6 +436,7 @@ pub fn publishing_due(db: &Connection, now: u64, local: bool) -> Result<Vec<(Res
 }
 
 /// The result ids of every reply still publishing.
+#[cfg(test)]
 pub fn publishing(db: &Connection) -> Result<Vec<String>> {
     let mut q = db.prepare("SELECT result_id FROM results WHERE state='publishing'")?;
     q.query_map([], |r| r.get(0))?.map(|r| Ok(r?)).collect()

@@ -42,6 +42,10 @@ pub(super) const ROUTE_CHANGED: &str = "route changed";
 /// A reply's text fits the task that carries it to its sender.
 const MAX_REPLY_TEXT: usize = atem_client::session::host_work::MAX_REPLY_TEXT_BYTES;
 
+/// The return grants a pass looks at, at most (`collab_result_pass`): after
+/// an input changed, thousands may be due at once.
+const GRANTS_PER_PASS: i64 = 256;
+
 /// What a task's reply does to it: a submitted reply proves its prompt
 /// arrived (an unknown outcome becomes awaiting its result), and the detail
 /// says how the reply stands. A reply never completes its task.
@@ -523,13 +527,14 @@ impl HostBridge {
     /// count against no limit; a full queue only delays one. A reply that
     /// can't be carried (checked when it was submitted and published, so
     /// this shouldn't happen) uses up the grant with a trace: the reply's
-    /// and the task's detail say why it wasn't delivered.
+    /// and the task's detail say why it wasn't delivered. Whether it used
+    /// up the grant (not with a full queue).
     fn collab_deliver(
         &self,
         grant: &ReturnGrant,
         route: &OriginRoute,
         row: &ResultRow,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let store = self.work.store.as_ref().unwrap();
         let task = results::delivery_task(
             &grant.task_id,
@@ -555,7 +560,7 @@ impl HostBridge {
             }
         } else {
             if !store.has_room()? {
-                return Ok(());
+                return Ok(false);
             }
             store.enqueue(&WorkRecord {
                 principal: "local".into(),
@@ -588,7 +593,7 @@ impl HostBridge {
             [&grant.task_id],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// The reply a delivery task carries, with the grant it was queued under.
@@ -702,189 +707,279 @@ impl HostBridge {
         Ok(())
     }
 
-    /// Each return grant still open or consumed (spec section 10). One that
-    /// is no longer live ends, and nothing is delivered under it any more
-    /// (a delivery still queued is cancelled). An early end (its sender's
-    /// process ended, the sender's route changed) ends only the grant, its
-    /// reason recorded: the task goes on through the queue and its agent may
-    /// still reply, stored and readable, never delivered
+    /// The return grants (spec section 10) due for a look (`grant_dues`: a
+    /// write to their task, a new grant, a silent turn's timer, a deadline),
+    /// through an index, at most `GRANTS_PER_PASS` a pass: a pass where
+    /// nothing happened reads none. With `full` (what a grant's liveness
+    /// depends on changed: `work_inputs`), every grant still open or
+    /// consumed and every ended one whose task waits for its result is due
+    /// at once first.
+    ///
+    /// One that is no longer live ends, and nothing is delivered under it
+    /// any more (a delivery still queued is cancelled). An early end (its
+    /// sender's process ended, the sender's route changed) ends only the
+    /// grant, its reason recorded: the task goes on through the queue and
+    /// its agent may still reply, stored and readable, never delivered
     /// (`collab_early_end`). The sender's lost authority, or a change of the
     /// task's own route, fails the task (`work_lost`, in `schedule_work`). A
-    /// grant that ran out ends with its task, which
-    /// expires at its deadline (`Store::settle_overdue`). An open, live grant
-    /// permits the one delivery of a submitted reply (where the origin route
-    /// opts in), or a report on a silent turn. A grant is written only when
-    /// its state changes. Runs only outside a pause.
-    fn collab_result_pass(&mut self, sessions: &BTreeMap<SessionId, BrokerSession>) -> Result<()> {
+    /// grant that ran out ends with its task, which expires at its deadline
+    /// (`Store::settle_due`). An open, live grant permits the one delivery
+    /// of a submitted reply (where the origin route opts in), or a report on
+    /// a silent turn. A grant is written only when its state changes (when
+    /// it is looked at next is kept beside it). Runs only outside a pause.
+    fn collab_result_pass(
+        &mut self,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+        full: bool,
+    ) -> Result<()> {
         let store = self.work.store.as_ref().unwrap();
         let now = host_now().wall_ms;
-        // Each part through an index: open and consumed grants by their
-        // state, ended ones by their task's (`grant_state`, `work_state`).
-        let mut q = store.db.prepare(
-            "SELECT w.record,g.record,g.state,g.awaiting_since_ms FROM return_grants g
-            CROSS JOIN work w ON w.id=g.task_id WHERE g.state IN ('open','consumed')
-            UNION ALL
-            SELECT w.record,g.record,g.state,g.awaiting_since_ms FROM work w
-            CROSS JOIN return_grants g ON g.task_id=w.id
-            WHERE w.state IN ('awaiting_result','outcome_unknown') AND g.state='ended'",
-        )?;
-        let pending = q
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<u64>>(3)?,
-                ))
+        if full {
+            // Each part through an index: open and consumed grants by their
+            // state, ended ones by their waiting task (`grant_state`,
+            // `work_waits`).
+            store.db.execute(
+                "INSERT OR REPLACE INTO grant_dues(task_id,due_ms)
+                SELECT g.task_id,0 FROM return_grants g WHERE g.state IN ('open','consumed')
+                UNION ALL
+                SELECT g.task_id,0 FROM work_waits w CROSS JOIN return_grants g ON g.task_id=w.id
+                WHERE g.state='ended'",
+                [],
+            )?;
+        }
+        // The due ones first, through `grant_due` alone; then each by its
+        // key (no sort ever holds a record).
+        let due: Vec<(String, u64)> = store
+            .db
+            .prepare(
+                "SELECT task_id,due_ms FROM grant_dues WHERE due_ms<=?1 ORDER BY due_ms LIMIT ?2",
+            )?
+            .query_map(rusqlite::params![now, GRANTS_PER_PASS], |r| {
+                Ok((r.get(0)?, r.get(1)?))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (task, grant, state, since) in pending {
-            let mut task: WorkRecord = serde_json::from_str(&task)?;
-            let grant: ReturnGrant = serde_json::from_str(&grant)?;
-            if state == "ended" {
-                // Ended before its deadline, and now awaiting a result (or of
-                // unknown outcome).
-                if now < grant.expires_at && self.collab_early_end(&mut task)? {
-                    store.save_work(&task)?;
+            .collect::<std::result::Result<_, _>>()?;
+        let mut pending = Vec::new();
+        for (task_id, due) in due {
+            let row = store
+                .db
+                .query_row(
+                    "SELECT w.record,g.record,g.state,g.awaiting_since_ms FROM return_grants g
+                    CROSS JOIN work w ON w.id=g.task_id WHERE g.task_id=?1",
+                    [&task_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<u64>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match row {
+                Some((task, grant, state, since)) => {
+                    pending.push((task, grant, state, since, Some(due)))
                 }
-                continue;
-            }
-            // A broker that just started reads each session's launch record
-            // (its project) on its first passes: until the sender's is read,
-            // its route can't be checked, which is no change.
-            if grant.origin.route.is_some()
-                && self
-                    .project_unread
-                    .contains_key(&grant.origin.target.session_id)
-            {
-                continue;
-            }
-            let store = self.work.store.as_ref().unwrap();
-            let route_valid = self.work_route_allowed(&task, &Sender::Local);
-            let live = self.collab_origin_live(&grant.origin, sessions)
-                && grant.live(
-                    now,
-                    task.status.state,
-                    &grant.origin.target,
-                    self.host.control_gen("local"),
-                    route_valid,
-                );
-            if !live {
-                // Why is recorded for an early end only: before the grant's
-                // deadline, its task going on (not settled, its own route
-                // and authority unchanged).
-                let goes_on = now < grant.expires_at
-                    && route_valid
-                    && !matches!(
-                        task.status.state,
-                        WorkState::Cancelled | WorkState::Expired | WorkState::Failed
-                    );
-                let ended = ReturnGrant {
-                    ended: goes_on
-                        .then(|| self.collab_origin_end(&grant.origin, sessions))
-                        .flatten(),
-                    ..grant.clone()
-                };
-                let tx = store.db.unchecked_transaction()?;
-                tx.execute(
-                    "UPDATE return_grants SET state='ended',record=?2
-                    WHERE task_id=?1 AND state IN ('open','consumed')",
-                    rusqlite::params![grant.task_id, serde_json::to_string(&ended)?],
-                )?;
-                self.collab_undelivered(&task.task.task_id)?;
-                if now < grant.expires_at && self.collab_early_end(&mut task)? {
-                    store.save_work(&task)?;
+                // No grant or task (any more): nothing to look at.
+                None => {
+                    store
+                        .db
+                        .execute("DELETE FROM grant_dues WHERE task_id=?1", [&task_id])?;
                 }
-                tx.commit()?;
-                continue;
-            }
-            if state != "open" {
-                continue;
-            }
-            let reply = results::load(&store.db, &grant.task_id)?;
-            if let Some(row) = &reply
-                && row.state == ReplyState::Submitted
-                && row.work_id.is_none()
-            {
-                if let Some(route) = grant.origin.route.as_ref().filter(|r| r.results) {
-                    self.collab_deliver(&grant, route, row)?;
-                }
-                continue;
-            }
-            if reply.is_some_and(|r| r.state != ReplyState::Refused) {
-                continue;
-            }
-            let since = match since {
-                Some(since) => since,
-                None if self
-                    .host
-                    .receipt(&task.status.receipt_id)
-                    .is_some_and(|r| r.result.is_some()) =>
-                {
-                    store.db.execute(
-                        "UPDATE return_grants SET awaiting_since_ms=?2 WHERE task_id=?1",
-                        rusqlite::params![grant.task_id, now],
-                    )?;
-                    now
-                }
-                None => continue,
-            };
-            // A turn that ended interrupted keeps saying so.
-            if task.status.state == WorkState::AwaitingResult
-                && now >= since.saturating_add(self.work.config.collab.result_timeout_ms())
-                && !task.status.detail.starts_with(SILENT)
-                && !task.status.detail.starts_with(SILENT_INTERRUPTED)
-            {
-                task.status.detail = if self.work_interrupted(&task) {
-                    SILENT_INTERRUPTED
-                } else {
-                    SILENT
-                }
-                .into();
-                if self.work.config.route(&task.route_id).is_some_and(|r| {
-                    r.auto_report == crate::runtime::host_work::AutoReport::FinalMessage
-                }) && let Some(session) =
-                    SessionId::parse(&task.task.target.session_id).and_then(|s| sessions.get(&s))
-                {
-                    let text = session
-                        .chat
-                        .retained()
-                        .filter(|m| {
-                            m.role == crate::chat::session::Role::Assistant
-                                && Some(m.turn_id.as_str()) == task.turn_id.as_deref()
-                        })
-                        .filter_map(|m| {
-                            let text = m
-                                .parts
-                                .iter()
-                                .filter_map(|p| {
-                                    if let crate::chat::adapter::Part::Text { markdown, .. } = p {
-                                        Some(markdown.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            (!text.is_empty()).then_some(text)
-                        })
-                        .last();
-                    if let Some(text) = text {
-                        // A remote sender reads the detail: the redactor
-                        // chat-v1 applies (the chat redacted it already).
-                        task.status.detail.push_str(": ");
-                        task.status.detail.extend(
-                            crate::chat::session::redact(&text)
-                                .chars()
-                                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-                                .take(200),
-                        );
-                    }
-                }
-                store.save_work(&task)?;
             }
         }
+        let mut next_dues = Vec::new();
+        for (task, grant, state, since, due) in pending {
+            let task: WorkRecord = serde_json::from_str(&task)?;
+            let grant: ReturnGrant = serde_json::from_str(&grant)?;
+            let next = self.collab_grant_step(task, &grant, &state, since, sessions, now)?;
+            if next != due {
+                next_dues.push((grant.task_id, next));
+            }
+        }
+        // When each is looked at next, beside the grant (the grant itself is
+        // written only when its state changes), in one transaction.
+        let db = &self.work.store.as_ref().unwrap().db;
+        let tx = db.unchecked_transaction()?;
+        for (task_id, next) in next_dues {
+            match next {
+                Some(next) => tx.execute(
+                    "INSERT OR REPLACE INTO grant_dues(task_id,due_ms) VALUES(?1,?2)",
+                    rusqlite::params![task_id, next],
+                )?,
+                None => tx.execute("DELETE FROM grant_dues WHERE task_id=?1", [&task_id])?,
+            };
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// One grant's look (`collab_result_pass`); when it is next due (none:
+    /// only a write to its task makes it due again).
+    fn collab_grant_step(
+        &mut self,
+        mut task: WorkRecord,
+        grant: &ReturnGrant,
+        state: &str,
+        since: Option<u64>,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+        now: u64,
+    ) -> Result<Option<u64>> {
+        let store = self.work.store.as_ref().unwrap();
+        if state == "ended" {
+            // Ended before its deadline, and now awaiting a result (or of
+            // unknown outcome).
+            if now < grant.expires_at && self.collab_early_end(&mut task)? {
+                store.save_work(&task)?;
+            }
+            return Ok(None);
+        }
+        // A broker that just started reads each session's launch record
+        // (its project) on its first passes: until the sender's is read,
+        // its route can't be checked, which is no change.
+        if grant.origin.route.is_some()
+            && self
+                .project_unread
+                .contains_key(&grant.origin.target.session_id)
+        {
+            return Ok(Some(now.saturating_add(1_000)));
+        }
+        let route_valid = self.work_route_allowed(&task, &Sender::Local);
+        let live = self.collab_origin_live(&grant.origin, sessions)
+            && grant.live(
+                now,
+                task.status.state,
+                &grant.origin.target,
+                self.host.control_gen("local"),
+                route_valid,
+            );
+        if !live {
+            // Why is recorded for an early end only: before the grant's
+            // deadline, its task going on (not settled, its own route
+            // and authority unchanged).
+            let goes_on = now < grant.expires_at
+                && route_valid
+                && !matches!(
+                    task.status.state,
+                    WorkState::Cancelled | WorkState::Expired | WorkState::Failed
+                );
+            let ended = ReturnGrant {
+                ended: goes_on
+                    .then(|| self.collab_origin_end(&grant.origin, sessions))
+                    .flatten(),
+                ..grant.clone()
+            };
+            let tx = store.db.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE return_grants SET state='ended',record=?2
+                WHERE task_id=?1 AND state IN ('open','consumed')",
+                rusqlite::params![grant.task_id, serde_json::to_string(&ended)?],
+            )?;
+            self.collab_undelivered(&task.task.task_id)?;
+            if now < grant.expires_at && self.collab_early_end(&mut task)? {
+                store.save_work(&task)?;
+            }
+            tx.commit()?;
+            return Ok(None);
+        }
+        // Live: looked at again by its deadline at the latest.
+        let deadline = Some(grant.expires_at);
+        if state != "open" {
+            return Ok(deadline);
+        }
+        let reply = results::load(&store.db, &grant.task_id)?;
+        if let Some(row) = &reply
+            && row.state == ReplyState::Submitted
+            && row.work_id.is_none()
+        {
+            if let Some(route) = grant.origin.route.as_ref().filter(|r| r.results)
+                && !self.collab_deliver(grant, route, row)?
+            {
+                // The queue is full: tried again in a second.
+                return Ok(Some(now.saturating_add(1_000)));
+            }
+            return Ok(deadline);
+        }
+        if reply.is_some_and(|r| r.state != ReplyState::Refused) {
+            return Ok(deadline);
+        }
+        let since = match since {
+            Some(since) => since,
+            None if self
+                .host
+                .receipt(&task.status.receipt_id)
+                .is_some_and(|r| r.result.is_some()) =>
+            {
+                store.db.execute(
+                    "UPDATE return_grants SET awaiting_since_ms=?2 WHERE task_id=?1",
+                    rusqlite::params![grant.task_id, now],
+                )?;
+                now
+            }
+            // Its turn hasn't ended: its task's next write makes it due.
+            None => return Ok(deadline),
+        };
+        let report_at = since.saturating_add(self.work.config.collab.result_timeout_ms());
+        // A turn that ended interrupted keeps saying so.
+        let reported = task.status.detail.starts_with(SILENT)
+            || task.status.detail.starts_with(SILENT_INTERRUPTED);
+        if task.status.state != WorkState::AwaitingResult || reported {
+            return Ok(deadline);
+        }
+        if now < report_at {
+            return Ok(Some(report_at.min(grant.expires_at)));
+        }
+        task.status.detail = if self.work_interrupted(&task) {
+            SILENT_INTERRUPTED
+        } else {
+            SILENT
+        }
+        .into();
+        if self
+            .work
+            .config
+            .route(&task.route_id)
+            .is_some_and(|r| r.auto_report == crate::runtime::host_work::AutoReport::FinalMessage)
+            && let Some(session) =
+                SessionId::parse(&task.task.target.session_id).and_then(|s| sessions.get(&s))
+        {
+            let text = session
+                .chat
+                .retained()
+                .filter(|m| {
+                    m.role == crate::chat::session::Role::Assistant
+                        && Some(m.turn_id.as_str()) == task.turn_id.as_deref()
+                })
+                .filter_map(|m| {
+                    let text = m
+                        .parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let crate::chat::adapter::Part::Text { markdown, .. } = p {
+                                Some(markdown.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.is_empty()).then_some(text)
+                })
+                .last();
+            if let Some(text) = text {
+                // A remote sender reads the detail: the redactor chat-v1
+                // applies (the chat redacted it already).
+                task.status.detail.push_str(": ");
+                task.status.detail.extend(
+                    crate::chat::session::redact(&text)
+                        .chars()
+                        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                        .take(200),
+                );
+            }
+        }
+        store.save_work(&task)?;
+        Ok(deadline)
     }
 
     /// Why `origin` no longer takes the result of a task it sent, recorded
@@ -1501,9 +1596,11 @@ impl HostBridge {
         Ok(())
     }
 
-    pub(super) fn collab_pass(&mut self, cx: &mut Cx) -> Result<()> {
+    /// One pass of local collaboration; `full`: what return grants depend
+    /// on changed (`collab_result_pass`). Whether the grants had their look.
+    pub(super) fn collab_pass(&mut self, cx: &mut Cx, full: bool) -> Result<bool> {
         if !self.local_healthy() {
-            return Ok(());
+            return Ok(false);
         }
         let local = self.local_attachment().to_string();
         let idle: Vec<_> = cx
@@ -1540,7 +1637,7 @@ impl HostBridge {
                 self.exec(effects, cx);
             }
         }
-        self.collab_result_pass(cx.sessions)?;
+        self.collab_result_pass(cx.sessions, full)?;
         let now = host_now().wall_ms;
         let store = self.work.store.as_ref().unwrap();
         store.db.execute(
@@ -1548,14 +1645,23 @@ impl HostBridge {
             WHERE state='publishing' AND json_extract(envelope,'$.expires_at')<=?1",
             [now],
         )?;
-        // Jobs of sends and of replies still publishing are kept.
-        let mut active: HashSet<String> = store
-            .db
-            .prepare("SELECT message_id FROM outbox WHERE state='publishing'")?
-            .query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        active.extend(results::publishing(&store.db)?);
-        self.work.context_jobs.retain(|id, _| active.contains(id));
+        // Jobs of sends and of replies still publishing are kept (each of
+        // the two at most looked up by its key).
+        let mut gone = Vec::new();
+        for id in self.work.context_jobs.keys() {
+            let publishing: bool = store.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM outbox WHERE message_id=?1 AND state='publishing')
+                OR EXISTS(SELECT 1 FROM results WHERE result_id=?1 AND state='publishing')",
+                [id],
+                |r| r.get(0),
+            )?;
+            if !publishing {
+                gone.push(id.clone());
+            }
+        }
+        for id in gone {
+            self.work.context_jobs.remove(&id);
+        }
         let pending = collab::context_due(store, now)?;
         for (mut message, publication, attempts) in pending {
             let id = message.message_id.clone();
@@ -1611,7 +1717,7 @@ impl HostBridge {
                 self.collab_publish_job(id, publication.context);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// `atem message status`: inside a session (`caller`), the messages it

@@ -370,11 +370,17 @@ Cross-instance delivery is not built.
 Executable messages and mark tasks share durable work records and FIFO order
 per session. Blocked/submitted/uncertain work holds later work on that session
 (uncertain work until it expires, an offline sender's unstarted work until its
-deadline); independent sessions can proceed. All use
-current r9 sender authority, notify/prompt route consent,
-readiness/draft/approval/lease checks and normal session-v1 prompt receipts.
-Turn-end is `awaiting_result`; completion is explicit. No separate mark queue,
-model triage or background `claude -p` remains.
+deadline); independent sessions can proceed. All use current r9 sender
+authority, notify/prompt route consent, readiness/draft/approval/lease checks
+and normal session-v1 prompt receipts. Turn-end is `awaiting_result`;
+completion is explicit. No separate mark queue, model triage or background
+`claude -p` remains. A 100 ms pass where nothing relevant changed reads no task
+awaiting its result (or of unknown outcome) and no return grant: deadlines and
+authorization expiries come from the `work_waits` table's due index (kept by
+triggers on `work`), a grant's next look from `grant_dues`, and the authority,
+route and grant checks of all of them re-run only when their inputs changed
+(`HostBridge::work_inputs`: control generations, `local`'s standing, the loaded
+`runtime.toml`, the host identity, the sessions).
 
 `host.attachments` adds encrypted `attachment_put` chunks (96 KiB decoded, PNG
 only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender
