@@ -179,10 +179,12 @@ request id, session id and process generation with the task before starting a
 worker, and waits until that session is ready. A send without `--launch` never
 starts a session, but it can share a pending launch, including one that just
 started and whose project isn't known yet: that session is the route's agent. A
-failed launch fails the task; a launch not yet started waits out a pause of
-`runtime.toml` or of hosting, and a receipt-database fault or a session-journal
-halt fences it (section 9). A remote sender also needs its existing `launch`
-permission for that; a local sender needs only the route setting.
+failed launch fails the task (with the reason when the runtime refused to start
+it: the live-session limit, a restart); a launch not yet started waits out a
+`runtime.toml` that doesn't load, and hosting switched off, a receipt-database
+fault or a session-journal halt fences it (section 9). A remote sender also
+needs its existing `launch` permission for that; a local sender needs only the
+route setting.
 
 ## 6. Permissions
 
@@ -280,8 +282,11 @@ membership, not scopes).
 - a send from an agent whose current turn came from a task reuses that task's
   `workflow_id`. Each instance sends at most `per_workflow` (default 8)
   **messages** per workflow and accepts at most that many messages per workflow
-  (a message counts once, however many agents it reaches), so a loop between
-  agents ends without a hop counter on the wire;
+  (a message counts once, however many agents it reaches). That bounds a loop
+  of task-bound turns, but it is no hard loop breaker: a send outside a turn
+  bound to a task (a background process the agent left running, a turn the
+  owner started) begins a new workflow. `per_hour` is the backstop: it bounds
+  every sending session, whatever its workflow;
 - the limits are checked when a message is sent, counting this session's and
   this workflow's sends whose context is still being published, and counted
   once, when the message is accepted. A burst of context sends can still be
@@ -420,17 +425,24 @@ writes no detail), and the publication of replies and the delivery of results
 wait. Nothing is fenced, so everything resumes as soon as the file is valid
 again (as for remote senders). A reply (and a completion) is accepted and
 stored during a pause, so an agent that finishes then loses nothing; the
-exception is a receipt-database fault, which refuses both ("agent hosting
-records are unavailable") until `atem runtime restart`. A halted session
-journal (a failed journal write) pauses local tasks the same way without being
-a hosting pause: `local` is fenced in memory only, its tasks wait, and replies
-and completions are refused ("the session journal halted") until `atem runtime
-restart` brings back its durable authority. A local launch not yet started
-waits out a pause of the file or of hosting and then starts; a launch already
-handed to the worker spawner completes. A receipt-database fault and a journal
-halt can't end without a restart, so either fences a local launch not yet
-started at once, as it does a remote one: the launch is never started
-(`outcome_unknown`), and its task's outcome is unknown until its deadline.
+exception is a receipt-database fault, which refuses both, and a cancel too
+("agent hosting records are unavailable"), until `atem runtime restart`. A
+halted session journal (a failed journal write) pauses local tasks the same way
+without being a hosting pause: `local` is fenced in memory only, its tasks
+wait, and replies, completions and cancels are refused ("the session journal
+halted") until `atem runtime restart` brings back its durable authority.
+Launches are the exception to "nothing is fenced". A launch not yet started,
+local or remote, waits out a `runtime.toml` that doesn't load and then starts.
+Switching hosting off (`enabled = false` in a file that loads) is a deliberate
+stop: it fences every launch not yet started, local and remote (as v0.8.2 did
+for remote ones), and switching hosting on again doesn't revive one; send
+again. A receipt-database fault and a journal halt can't end without a
+restart, so either fences a launch not yet started at once. A fenced launch is
+never started (`outcome_unknown`), and its task's outcome is unknown until its
+deadline. A launch already handed to the worker spawner re-reads
+`runtime.toml` at the spawn boundary: a file that doesn't load (it may be the
+edit that removes the route), hosting switched off or a changed approval fences
+it there too.
 `[collab] send = false` is not a pause: it only refuses new local sends. Local
 tasks already accepted keep dispatching, and replies and result deliveries are
 not held back. Only a real change of authority fences `local` for good: a new
@@ -465,7 +477,10 @@ nothing is typed or prompted into its session for a status (only a result,
 under its return grant, below).
 
 Without an id, status shows the latest 32 messages, bounded to 1 MiB; query
-an explicit message id for older receipts. Views carry result text and typed
+an explicit message id for older receipts. Views are cut at a whole message:
+the one that would take the output over 1 MiB is left out with every older
+one, so `atem message status <id>` of a message whose view alone is over 1 MiB
+(many tasks with long replies) prints nothing. Views carry result text and typed
 context references rather than copying full context snapshots into status.
 
 **Results.** A finished turn is not a finished task. For every sender, a
@@ -505,8 +520,9 @@ its sender: two separate steps.
   identical retry returns the recorded reply, with or without `--task`; a
   different reply for a task whose reply is publishing or submitted is refused
   (`request_id_reused`); a refused reply is replaced by a corrected one under
-  the same `result_id`. Malformed references are refused before anything is
-  stored.
+  the same `result_id`: the corrected reply's text and references take the
+  refused one's place, which isn't kept (its refusal stays in the task's
+  detail). Malformed references are refused before anything is stored.
 - **Delivery to a remote sender.** Astation's apps and integrations (and later
   other Atem instances) read it with a new host-work query,
   `reply_query{task_id}` (feature `host.reply`, advertised with `host.work`;
@@ -529,8 +545,9 @@ its sender: two separate steps.
   task `detail` texts, `outcome_unknown` → `awaiting_result` on a reply, the
   expiry of `awaiting_result` and `outcome_unknown` tasks, no queue slot for a
   task awaiting its result, tasks that fail when their sender's authority or
-  route approval changed (and the `forbidden` its sender then gets), and
-  records kept with their payloads dropped. Integrations need a matching
+  route approval changed (and the `forbidden` its sender then gets), records
+  kept with their payloads dropped (upload bytes included), and a launch that
+  waits out an invalid `runtime.toml`. Integrations need a matching
   Station task route (Station's work).
 - **Delivery to a local sender: the return grant.** Sending a request creates,
   in the runtime, one narrow return grant per task: `{task_id, workflow_id, the
@@ -628,7 +645,7 @@ exact.
 | Event | Queued or blocked | Running turn | Awaiting its result, or outcome unknown | Return grant and reply | Lease | Resumes? |
 |---|---|---|---|---|---|---|
 | `[collab] send = false` | Dispatch as usual | Untouched | Untouched; replies and completions work | Untouched: results are still delivered, and a send still publishing its context completes and makes its tasks | Untouched | Nothing is paused; only new sends are refused |
-| Pause: an invalid `runtime.toml`, or hosting disabled | Wait, nothing dispatches. A local task's detail reads `paused: <reason>`; a remote task keeps its own | Runs on; its receipt is read when the pause ends | Wait; nothing expires, a deadline included. A local reply or `atem message complete` is accepted and stored; a remote request is `busy` | Kept; a reply's context publication and its delivery wait | Untouched | By itself, within a second of a valid file with `enabled = true`; a launch not started waits too |
+| Pause: an invalid `runtime.toml`, or hosting disabled | Wait, nothing dispatches. A local task's detail reads `paused: <reason>`; a remote task keeps its own | Runs on; its receipt is read when the pause ends | Wait; nothing expires, a deadline included. A local reply or `atem message complete` is accepted and stored; a remote request is `busy` | Kept; a reply's context publication and its delivery wait | Untouched | By itself, within a second of a valid file with `enabled = true`. A launch not started waits out an invalid file; hosting switched off fences it (`outcome_unknown`) |
 | Pause: a receipt-database fault | Wait as above; no detail is written | Runs on | Wait; replies and completions are refused ("agent hosting records are unavailable; run `atem runtime restart`") | Kept; nothing is published or delivered | Untouched | Only after `atem runtime restart`; a launch not started is fenced at once (`outcome_unknown`) |
 | Pause: a plain session-journal halt | Local tasks wait with "waiting for the sender's authorized channel and current route"; `local` is fenced in memory only, so none fails. Remote requests are `unauthorized`, and remote tasks wait the same way | Runs on; no remote input is written. A local prompt accepted but not yet written is rejected, and its task fails `control revoked` | Wait; replies and completions are refused ("the session journal halted; run `atem runtime restart`") | Kept; nothing is delivered | Can't be renewed (every session request is `busy`) and lapses after 15 s | Only after `atem runtime restart`, under the authority the tasks were accepted with; a launch not started is fenced at once (`outcome_unknown`) |
 | Sender offline (remote sender) | `blocked`, "waiting for the sender's authorized channel and current route", holding its target session's queue until its deadline (`expired before submission`); raising the route's revision frees it | Finishes | Wait for `work_complete` until the deadline (`expired awaiting a result`); an unknown outcome holds its session's queue until then (`expired with its outcome unknown`) | A remote sender has no return grant; the reply is stored and read with `reply_query` once the sender is back | Lapses 15 s after its last renewal | When the sender reconnects under the same authority |
@@ -745,15 +762,17 @@ That loses no host-work history: a task's record keeps its own state, detail,
 receipt id and turn id. Only a task still `submitted` when its receipt is gone
 ends `outcome_unknown` (`receipt no longer available`).
 
-The file only grows. No record is deleted automatically; a closed local send
-costs a few KB (synthetic rows of that shape came to 270 to 670 MB at 200,000
-sends), and moving the file aside, as an identity change does, is the only
-reset. A v0.8.x binary opens and writes the file, but it counts every row
-against the cap and compares `message_publish` retries by full content: a host
-that kept 4,096 rows or more would refuse new work, and an identical retry of a
-message whose text was dropped would be `request_id_reused`. Downgrading needs
-`host-work.sqlite` moved aside. `atem message status` lists the 32 newest
-messages, and `atem message status <id>` reaches any older one.
+The file only grows. No receipt or audit record is deleted automatically; a
+closed local send costs a few KB (synthetic rows of that shape came to 270 to
+670 MB at 200,000 sends), and moving the file aside, as an identity change
+does, is the only reset. Downgrading needs `host-work.sqlite` moved aside: a
+v0.8.2 binary's start-up reconcile reads every work record, and once any local
+task has completed, its `result` (a snapshot of `kind: "result"`, which v0.8.2
+doesn't know) can't be read, so hosting stops with "receipt database failed"
+(it fails closed). Even before that, v0.8.2 counts every row against the cap
+and compares `message_publish` retries by full content. `atem message status`
+lists the 32 newest messages, and `atem message status <id>` reaches any older
+one.
 
 ## 11. Recovery
 
@@ -850,9 +869,9 @@ Every command is a client of the local runtime, which does the work.
 Commands require pairing; `send`, `reply` and agent tags also require a child
 process of a live Atem-launched agent (`status`, `cancel`, `complete` and
 `directory` also run from the owner's terminal), and `send` a session whose
-latest prompt came from this host (section 6). An ordinary terminal cannot impersonate
-one by supplying a session id. Keep the config mode 0600 and validate it with
-`atem runtime check`. Repeat `--to` for a union of selectors.
+latest prompt came from this host (section 6). An ordinary terminal cannot
+impersonate one by supplying a session id. Keep the config mode 0600 and
+validate it with `atem runtime check`. Repeat `--to` for a union of selectors.
 
 ## 14. Ownership and dependencies
 
@@ -952,7 +971,8 @@ can observe changed behaviour with the same shapes (task `detail` texts,
 `outcome_unknown` → `awaiting_result` on a reply, `awaiting_result` and
 `outcome_unknown` tasks that expire, no queue slot for a task awaiting its
 result, tasks that fail when their sender's authority or route approval changed,
-records kept with their payloads dropped), listed in
+records kept with their payloads dropped, upload bytes included, a launch that
+waits out an invalid `runtime.toml`, redacted reply text), listed in
 [atem-host-work-v1.md](protocol/atem-host-work-v1.md#observable-behaviour).
 Sending and automatic actions remain opt-in.
 
@@ -1012,18 +1032,24 @@ route that changed or dropped its sender fails queued and awaiting tasks of
 remote and local senders alike; an interrupted turn awaits its result, takes a
 reply and says so in the silent-turn report; a submitted task whose receipt is
 gone ends `outcome_unknown`; an accepted context send outlives its session and
-`send = false`; a remote launch waits out a pause (an invalid `runtime.toml`,
-hosting off, a project-scoped sender included) and never starts under a profile
-changed meanwhile. Retention: payloads dropped past the retention with every
-row kept, a database with only the v0.8.2 tables opening and working
-unchanged, retries deduplicated by digest after a drop, `reply_query` answering
-`dropped`, the record caps counting open records only (tasks, messages, local
-sends, launches), no recurring or per-request query reading a closed record
-(query plans, and steps that don't grow with 1,200 then 3,600 closed records),
-a pass where nothing changed running the same VM steps beside 500 and 4,000
-tasks awaiting their result, cached upload files removed before the commit,
-and a settled task's records answering through a restart with the host clock
-a day ahead.
+`send = false`; a launch, remote or local, waits out an invalid `runtime.toml`
+(a project-scoped sender included) and never starts under a profile changed
+meanwhile, while hosting switched off fences it for good and a spawn guard
+fails closed on an invalid file; a refused launch names its cause; a cancel
+ends its return grant with it and needs a working store. Origin of local work:
+a session a service launched or prompted, a background process its turn left
+and a session an agent launched or typed into can't send, a prompt typed here
+or a local task's lets it again, and that survives a runtime restart. Replies
+and silent-turn reports are redacted. Retention: payloads dropped past the
+retention with every row kept, a database with only the v0.8.2 tables opening
+and working unchanged, retries deduplicated by digest after a drop,
+`reply_query` answering `dropped`, the record caps counting open records only
+(tasks, messages, local sends, launches), no recurring or per-request query
+reading a closed record (query plans, and steps that don't grow with 1,200 then
+3,600 closed records), a pass where nothing changed running the same VM steps
+beside 500 and 4,000 tasks awaiting their result, cached upload files removed
+before the commit, and a settled task's records answering through a restart
+with the host clock a day ahead.
 Shared client tests cover strict remote/local validation, `reply_query`, its
 vectors and the dropped reply separately; `chat::session` tests reproduce the stale `Stop` batch
 with exact and whole-second times. Host-work and R9 fixtures check that the
@@ -1070,13 +1096,13 @@ Stage 1 ships with these limits.
   60 s the payload pass reads each open record, settled ones inside their day
   included. Replies and sends whose context is still publishing (only while
   the relay is unreachable or slow) are read each pass. No recurring or
-  per-request path steps over closed records: they run through indexes. `atem message status`
-  scoped to a session with fewer than 32 matching messages reads every local
-  send once, and a send reads the resolutions of each live session whose
-  project is still unknown; both are on demand and linear. Records are never
-  removed, so `host-work.sqlite` grows by a compact row set per task (the
-  estimate is under "Records and retention"), and retired database files are
-  kept.
+  per-request path steps over closed records: they run through indexes.
+  `atem message status` scoped to a session with fewer than 32 matching
+  messages reads every local send once, and a send reads the resolutions of
+  each live session whose project is still unknown; both are on demand and
+  linear. Records are never removed, so `host-work.sqlite` grows by a compact
+  row set per task (the estimate is under "Records and retention"), and
+  retired database files are kept.
 - **Caps.** 256 unfinished tasks; 4,096 open tasks, messages, local sends and
   launches; 256 uploads and 128 MiB (an upload no task ever named is never
   dropped); 4,096 receipts per session in the session host (a submit past it
@@ -1084,10 +1110,16 @@ Stage 1 ships with these limits.
   sender's unstarted task holds its session's queue until its deadline; the
   owner can free the queue by raising the route's revision. One runtime per
   host: stage 1 reaches the agents of one runtime.
-- **Remote spawn guard.** The guard of a remote launch re-reads `runtime.toml`
-  at the spawn boundary, so a launch handed to the spawner at the instant a
-  pause begins fails (`outcome_unknown`). One not yet handed over waits out the
-  pause. A local launch's guard tolerates a pause.
+- **Spawn guard.** The guard of a launch, remote or local, re-reads
+  `runtime.toml` at the spawn boundary, so a launch handed to the spawner at
+  the instant the file stops loading, or hosting is switched off, fails
+  (`outcome_unknown`). One not yet handed over waits out an invalid file;
+  hosting switched off fences it.
+- **Shared queue capacity.** Local and remote work share the 256 unfinished
+  tasks. A misled local agent can send 8 messages a turn (`per_workflow`) to up
+  to 32 agents each, so a few of its turns can fill the cap for a while: remote
+  `work_enqueue` and `message_publish` are then `busy` until those tasks
+  drain, each taking a turn of its agent (`per_hour` bounds how often).
 - **Reads after a fence.** After a fence or a route change a remote sender's
   `work_query`, `work_complete`, `work_cancel` and `reply_query` are
   `forbidden`, because authority is checked on reads too. It sees the failure

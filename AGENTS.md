@@ -317,11 +317,13 @@ prompt receipts, FIFO, readiness, drafts, approvals, leases and control fencing.
 A `runtime.toml` that doesn't load, hosting off or a receipt-database fault
 pauses local work, never fences it: new sends are refused with the reason,
 queued local tasks wait as `paused: <reason>`, replies are stored while their
-publication and delivery wait (a receipt-database fault instead refuses a reply
-and a completion until `atem runtime restart`, and writes no `paused` detail),
-and a local launch not yet started waits out a file or hosting pause (one
-already handed to the spawner completes; a receipt-database fault or a
-session-journal halt, which last until a restart, fences it: `outcome_unknown`).
+publication and delivery wait (a receipt-database fault instead refuses a
+reply, a completion and a cancel until `atem runtime restart`, and writes no
+`paused` detail), and a launch not yet started, local or remote, waits out a
+file that doesn't load. Hosting switched off (a deliberate stop), a
+receipt-database fault or a session-journal halt fences it (`outcome_unknown`,
+never revived), and the spawn guard re-reads the file at the spawn boundary
+(one that doesn't load, or hosting off, fences it there too).
 A halted session journal fences `local` in memory only and holds its tasks the
 same way. `[collab] send = false` is no pause: it only refuses new sends, and
 accepted tasks, replies and deliveries go on. `local` is fenced for good only by

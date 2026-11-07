@@ -239,12 +239,14 @@ another principal is `request_id_reused`. After a runtime restart a `starting`
 launch becomes `started` when its worker was adopted with the reserved process
 generation, else `outcome_unknown`.
 
-A launch that hasn't started when hosting pauses (an invalid `runtime.toml`,
-`enabled = false`) waits and starts once the pause ends, while its sender's
-channel, `control_gen` and the profile approval hold and its expiry hasn't
-passed; requests are `busy` meanwhile. A receipt-database fault fences it, and
-so does a halted session journal: it is never started and ends
-`outcome_unknown`.
+A launch that hasn't started while `runtime.toml` doesn't load waits and starts
+once it loads again, while its sender's channel, `control_gen` and the profile
+approval hold and its expiry hasn't passed; requests are `busy` meanwhile.
+Switching hosting off (`enabled = false`) is a deliberate stop and fences it,
+as a receipt-database fault and a halted session journal do: it is never
+started and ends `outcome_unknown`, and switching hosting on again doesn't
+revive it. A launch already handed to the spawner re-reads the file at the
+spawn boundary: a file that doesn't load or hosting off fences it there too.
 
 A remote session is an ordinary session: `atem agent list` shows it, `atem
 agent attach` opens it locally, and remote terminal and chat work as for any
@@ -485,12 +487,15 @@ explicit correlated results. It uses this receiver and its approved routes.
 The agent answers any task, whoever sent it, with `atem message reply`; the
 sending agent completes its own task with `atem message complete`, a remote
 sender with `work_complete`. `atem message` and `atem agent tag` connect only
-to the running runtime (they never start or replace one). A `runtime.toml`
-that doesn't load, hosting off or a database fault pauses local work without
+to the running runtime (they never start or replace one). An agent sends only
+while its session's latest prompt came from this host (typed in its terminal,
+or a local task's; agent collaboration, section 6). A `runtime.toml` that
+doesn't load, hosting off or a database fault pauses local work without
 fencing it (sends are refused, queued tasks wait, replies are stored, except
-that a database fault refuses a reply and a completion until `atem runtime
-restart`); a halted session journal holds local tasks the same way until that
-restart; `[collab] send = false` only refuses new sends. A session is
+that a database fault refuses a reply, a completion and a cancel until `atem
+runtime restart`), though hosting off fences launches not yet started; a
+halted session journal holds local tasks the same way until that restart;
+`[collab] send = false` only refuses new sends. A session is
 launched only for `atem message send --launch` on a route with
 `launch = "on_message"`, and only for a Claude Code profile. **Not implemented:** cross-instance transport, the
 shared Station directory and mailbox, and the stages 2-3 permission

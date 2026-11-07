@@ -369,8 +369,12 @@ its agent; otherwise it remains visible through status. `--memory ID` and
 `--vault ID[:ENTRY]@VERSION` attach verified exact context to a message (a
 reply names its vault entry: `ID:ENTRY@VERSION`). The `atem message` and `atem
 agent tag` commands only connect to the running runtime: they never start or
-replace one. A `runtime.toml` that doesn't load or hosting turned off pauses
-local work (new sends are refused, queued tasks wait) and never fences it;
+replace one. An agent sends only while its session's latest prompt came from
+this host (typed in its terminal, or a local task's): a session a remote device
+or service prompted or launched can't send until a prompt from this host
+begins a newer turn. A `runtime.toml` that doesn't load or hosting turned off
+pauses local work (new sends are refused, queued tasks wait) and never fences
+it, except that turning hosting off cancels launches not yet started;
 `send = false` only refuses new sends. A sender that goes away cancels nothing:
 its tasks still run and the reply is kept for you (`atem message complete
 TASK_ID`). A task whose sender's authority or route approval changed fails at

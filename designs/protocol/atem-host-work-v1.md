@@ -151,8 +151,8 @@ when a worker with the reserved process generation was adopted, else
 principal's launch, or a profile that was removed, changed revision or no
 longer allows the caller is `forbidden`.
 
-A launch not yet started when hosting pauses waits for the pause to end
-([Observable behaviour](#observable-behaviour)).
+A launch not yet started while `runtime.toml` doesn't load waits until it
+loads again ([Observable behaviour](#observable-behaviour)).
 
 A started session appears in the registry (`list`, `session_changed`) under
 the returned `session_id` and `process_gen`. Send prompts through the normal
@@ -408,13 +408,25 @@ revision and covers the target), so a message's sender can see the failure
 there; a sender that used `work_enqueue` has no way to read it, and sees it
 only as later work no longer waiting behind it.
 
-**Launches.** A `host_launch` not yet started when hosting pauses (an invalid
-`runtime.toml`, `enabled = false`) waits and starts once the pause ends, while
-the sender's channel, `control_gen` and the profile approval hold and
-`expires_at` hasn't passed; requests, `host_launch_query` included, are `busy`
-meanwhile. A v0.8.2 host fences such a launch instead. A receipt-database fault
-or a halted session journal fences a launch not yet started: it never starts and
-ends `outcome_unknown`.
+**Launches.** A `host_launch` not yet started while `runtime.toml` doesn't
+load waits and starts once it loads again, while the sender's channel,
+`control_gen` and the profile approval hold and `expires_at` hasn't passed;
+requests, `host_launch_query` included, are `busy` meanwhile. A v0.8.2 host
+fences such a launch instead. Hosting switched off (`enabled = false`), a
+receipt-database fault or a halted session journal fences a launch not yet
+started, as v0.8.2 does for `enabled = false`: it never starts and ends
+`outcome_unknown`, and switching hosting on again doesn't revive it.
+
+**Uploads.** The bytes of an upload go once no open task names it (a day after
+its tasks settled past their deadline, §9); v0.8.2 never dropped them. A new
+task naming such an `attachment_id` stays `blocked` ("waiting for verified
+screenshot attachments") until it expires: upload the bytes again (a new
+`attachment_put`) for a new task rather than reuse an old upload.
+
+**Replies.** `reply_query` is new; the reply text it returns has credential
+values redacted (`[redacted]`) before the host stored it, and its `digest` is
+over that text. A task `detail` that quotes the agent's final message (a local
+sender's silent-turn report) is redacted the same way.
 
 **Records.** A launch, task or message record is kept for the life of the
 database; a day after it settled past `expires_at` only its payloads are
