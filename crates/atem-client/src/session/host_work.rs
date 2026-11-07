@@ -3,14 +3,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4};
+use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4, is_uuid_v5};
 use crate::canonical::MAX_SAFE_INTEGER;
 
 pub const LAUNCH_FEATURE: &str = "host.launch";
 pub const WORK_FEATURE: &str = "host.work";
+/// `reply_query`: the reply the agent working on a task submitted.
+pub const REPLY_FEATURE: &str = "host.reply";
 pub const MAX_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_CONTEXT_BYTES: usize = 128 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
+/// The longest reply text an agent can submit.
+pub const MAX_REPLY_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +55,8 @@ pub struct ContextSnapshot {
 pub enum ContextKind {
     Memory,
     Vault,
+    /// A locally stored explicit reply. Never admitted as remote context.
+    Result,
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -59,6 +65,10 @@ pub fn digest(bytes: &[u8]) -> String {
 
 impl ContextSnapshot {
     pub fn valid(&self) -> bool {
+        self.kind != ContextKind::Result && self.valid_local()
+    }
+
+    pub fn valid_local(&self) -> bool {
         is_opaque_id(&self.id)
             && self.version > 0
             && self.version <= MAX_SAFE_INTEGER
@@ -84,7 +94,18 @@ pub struct WorkTask {
 
 impl WorkTask {
     pub fn valid(&self, host: &HostTarget) -> bool {
-        is_uuid_v4(&self.task_id)
+        self.valid_for(host, false)
+    }
+
+    /// A task of the runtime's own `local` sender: its ids may be the
+    /// deterministic UUIDv5 of a selector's fixed resolution. Every bound
+    /// (prompt and context size, characters, snapshots) is the remote one.
+    pub fn valid_local(&self, host: &HostTarget) -> bool {
+        self.valid_for(host, true)
+    }
+
+    fn valid_for(&self, host: &HostTarget, local: bool) -> bool {
+        (is_uuid_v4(&self.task_id) || local && is_uuid_v5(&self.task_id))
             && is_uuid_v4(&self.workflow_id)
             && host.contains(&self.target)
             && is_session_id(&self.target.session_id)
@@ -98,7 +119,13 @@ impl WorkTask {
                 .chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
             && self.context.len() <= 8
-            && self.context.iter().all(ContextSnapshot::valid)
+            && self.context.iter().all(|c| {
+                if local {
+                    c.valid_local()
+                } else {
+                    c.valid()
+                }
+            })
             && self.attachments.len() <= 4
             && self.attachments.iter().all(super::attachments::Attachment::valid)
             && self.attachments.iter().map(|a| &a.attachment_id).collect::<std::collections::BTreeSet<_>>().len() == self.attachments.len()
@@ -169,6 +196,13 @@ pub enum Request {
         host: HostTarget,
         task_id: String,
     },
+    #[serde(rename = "reply_query")]
+    ReplyQuery {
+        v: u8,
+        id: String,
+        host: HostTarget,
+        task_id: String,
+    },
     #[serde(rename = "work_cancel")]
     Cancel {
         v: u8,
@@ -218,6 +252,7 @@ impl Request {
             | Self::LaunchQuery { id, .. }
             | Self::Enqueue { id, .. }
             | Self::WorkQuery { id, .. }
+            | Self::ReplyQuery { id, .. }
             | Self::Cancel { id, .. }
             | Self::Complete { id, .. }
             | Self::Publish { id, .. }
@@ -233,6 +268,7 @@ impl Request {
             | Self::LaunchQuery { host, .. }
             | Self::Enqueue { host, .. }
             | Self::WorkQuery { host, .. }
+            | Self::ReplyQuery { host, .. }
             | Self::Cancel { host, .. }
             | Self::Complete { host, .. }
             | Self::Publish { host, .. }
@@ -254,6 +290,8 @@ impl Request {
             LAUNCH_FEATURE
         } else if matches!(self, Self::Publish { .. } | Self::MessageQuery { .. }) {
             super::messages::FEATURE
+        } else if matches!(self, Self::ReplyQuery { .. }) {
+            REPLY_FEATURE
         } else {
             WORK_FEATURE
         }
@@ -318,9 +356,9 @@ impl Request {
                         && *route_revision <= MAX_SAFE_INTEGER
                         && task.valid(host)
                 }
-                Self::WorkQuery { task_id, .. } | Self::Cancel { task_id, .. } => {
-                    is_uuid_v4(task_id)
-                }
+                Self::WorkQuery { task_id, .. }
+                | Self::ReplyQuery { task_id, .. }
+                | Self::Cancel { task_id, .. } => is_uuid_v4(task_id),
                 Self::Complete {
                     task_id, result, ..
                 } => is_uuid_v4(task_id) && result.valid(),
@@ -413,6 +451,75 @@ impl WorkStatus {
     }
 }
 
+/// Where a task's reply stands. `publishing`: the agent's reply is recorded
+/// and its context is being published (the context is empty meanwhile);
+/// `submitted`: the reply is final, context included; `refused`: the host
+/// refused it, and a corrected reply replaces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyState {
+    Publishing,
+    Submitted,
+    Refused,
+}
+
+impl ReplyState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Publishing => "publishing",
+            Self::Submitted => "submitted",
+            Self::Refused => "refused",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "publishing" => Self::Publishing,
+            "submitted" => Self::Submitted,
+            "refused" => Self::Refused,
+            _ => return None,
+        })
+    }
+}
+
+/// The one reply of a task. `result_id` never changes for the task, a
+/// corrected reply included; `digest` identifies the reply's content (the
+/// same for an identical retry, another for a corrected one).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultReply {
+    pub result_id: String,
+    pub state: ReplyState,
+    pub digest: String,
+    pub text: String,
+    /// The published context snapshots; empty unless `submitted`.
+    pub context: Vec<ContextSnapshot>,
+    /// Unix ms on the host's wall clock; exactly when `submitted`.
+    pub submitted_at: Option<u64>,
+    /// The host no longer keeps the reply's text and context (a day after
+    /// its task settled past its deadline): `text` is empty, `context` too,
+    /// and `digest` still identifies the reply.
+    pub dropped: bool,
+}
+
+impl ResultReply {
+    pub fn valid(&self) -> bool {
+        is_uuid_v5(&self.result_id)
+            && is_digest(&self.digest)
+            && (!self.dropped || self.text.is_empty() && self.context.is_empty())
+            && self.text.len() <= MAX_REPLY_TEXT_BYTES
+            && !self
+                .text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            && self.context.len() <= 8
+            && self.context.iter().all(ContextSnapshot::valid)
+            && (self.state == ReplyState::Submitted || self.context.is_empty())
+            && (self.state == ReplyState::Submitted) == self.submitted_at.is_some()
+            && self.submitted_at.is_none_or(|at| at <= MAX_SAFE_INTEGER)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResultBody {
@@ -427,6 +534,10 @@ pub enum ResultBody {
     },
     Work {
         work: WorkStatus,
+    },
+    /// The task's reply, or none yet.
+    Reply {
+        reply: Option<ResultReply>,
     },
     Message {
         message: super::messages::MessageReceipt,
@@ -480,6 +591,7 @@ impl Response {
                     && is_uuid_v4(&launch.process_gen)
             }
             ResultBody::Work { work } => work.valid(),
+            ResultBody::Reply { reply } => reply.as_ref().is_none_or(ResultReply::valid),
             ResultBody::Message { message } => message.valid(),
         };
         if !valid {
@@ -519,6 +631,7 @@ impl Response {
                 ResultBody::Launch { launch },
                 Request::Launch { request_id, .. } | Request::LaunchQuery { request_id, .. },
             ) => &launch.request_id == request_id,
+            (ResultBody::Reply { .. }, Request::ReplyQuery { .. }) => true,
             (ResultBody::Work { work }, Request::Enqueue { task, .. }) => {
                 work.task_id == task.task_id
             }
@@ -583,6 +696,29 @@ mod tests {
         }
     }
 
+    /// The shared result vectors: `reply` results, a dropped reply among them.
+    #[test]
+    fn shared_host_work_fixture_results() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../../designs/protocol/fixtures/host-work/requests-v1.json"
+        ))
+        .unwrap();
+        let cases = fixtures["results"].as_array().unwrap();
+        assert!(
+            cases
+                .iter()
+                .any(|c| c["result"]["result"]["reply"]["dropped"] == true)
+        );
+        for case in cases {
+            assert_eq!(
+                Response::from_data(&case["result"]).is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
     #[test]
     fn result_correlation_distinguishes_task_and_message_identities() {
         let request = Request::LaunchQuery {
@@ -621,6 +757,209 @@ mod tests {
         response.re = request.id().into();
         response.host.host_trust_gen += 1;
         assert!(!response.answers(&request));
+    }
+
+    fn reply_host() -> HostTarget {
+        HostTarget {
+            account_id: "account".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 1,
+        }
+    }
+
+    fn reply_query() -> Request {
+        Request::ReplyQuery {
+            v: 1,
+            id: super::super::new_id(),
+            host: reply_host(),
+            task_id: super::super::new_id(),
+        }
+    }
+
+    fn reply_answer(request: &Request, reply: Option<ResultReply>) -> Response {
+        let json = result(
+            &super::super::new_id(),
+            request.id(),
+            request.host(),
+            &super::super::new_id(),
+            "channel",
+            ResultBody::Reply { reply },
+        );
+        Response::from_data(&json["data"]).unwrap()
+    }
+
+    fn submitted_reply() -> ResultReply {
+        let context = ContextSnapshot {
+            kind: ContextKind::Vault,
+            id: "v-notes:entry".into(),
+            version: 2,
+            digest: digest(b"the notes"),
+            text: "the notes".into(),
+        };
+        ResultReply {
+            result_id: "6ba7b810-9dad-51d1-80b4-00c04fd430c8".into(),
+            state: ReplyState::Submitted,
+            digest: digest(b"reply"),
+            text: "Done: /v2/orders is live".into(),
+            context: vec![context],
+            submitted_at: Some(1_793_620_800_000),
+            dropped: false,
+        }
+    }
+
+    /// `reply_query` names one task, is a `host.reply` request, and has
+    /// exactly the fields of `work_query`.
+    #[test]
+    fn reply_query_names_one_task_under_its_own_feature() {
+        let request = reply_query();
+        assert_eq!(request.feature(), REPLY_FEATURE);
+        assert_eq!(REPLY_FEATURE, "host.reply");
+        assert!(!request.is_launch());
+        let data = request.to_json()["data"].clone();
+        assert_eq!(data["op"], "reply_query");
+        assert_eq!(Request::from_data(&data), Ok(request.clone()));
+        assert_eq!(
+            Request::decode(request.to_json().to_string().as_bytes()),
+            Ok(request)
+        );
+        for (field, value) in [
+            ("task_id", json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+            ("task_id", json!("not a uuid")),
+            ("extra", json!(1)),
+            ("result_id", json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ] {
+            let mut bad = data.clone();
+            bad[field] = value;
+            assert!(Request::from_data(&bad).is_err(), "{bad}");
+        }
+        let mut missing = data;
+        missing.as_object_mut().unwrap().remove("task_id");
+        assert!(Request::from_data(&missing).is_err());
+    }
+
+    #[test]
+    fn a_reply_result_round_trips_in_every_state_and_answers_only_its_query() {
+        let request = reply_query();
+        let none = reply_answer(&request, None);
+        assert!(none.answers(&request));
+        assert_eq!(
+            serde_json::to_value(&none.result).unwrap(),
+            json!({"kind":"reply","reply":null})
+        );
+        let mut reply = submitted_reply();
+        let submitted = reply_answer(&request, Some(reply.clone()));
+        assert!(submitted.answers(&request));
+        let wire = serde_json::to_value(&submitted.result).unwrap();
+        assert_eq!(wire["kind"], "reply");
+        assert_eq!(wire["reply"]["state"], "submitted");
+        assert_eq!(wire["reply"]["submitted_at"], 1_793_620_800_000u64);
+        assert_eq!(wire["reply"]["context"][0]["kind"], "vault");
+        assert_eq!(
+            serde_json::from_value::<ResultBody>(wire).unwrap(),
+            submitted.result
+        );
+        // Dropped once its task settled a day past its deadline: the same
+        // reply, without its text and context.
+        let mut dropped = submitted_reply();
+        dropped.text.clear();
+        dropped.context.clear();
+        dropped.dropped = true;
+        let answer = reply_answer(&request, Some(dropped.clone()));
+        assert!(answer.answers(&request));
+        let wire = serde_json::to_value(&answer.result).unwrap();
+        assert_eq!(wire["reply"]["dropped"], true);
+        assert_eq!(wire["reply"]["text"], "");
+        assert_eq!(wire["reply"]["context"], json!([]));
+        assert_eq!(wire["reply"]["digest"], json!(reply.digest));
+        assert_eq!(wire["reply"]["submitted_at"], 1_793_620_800_000u64);
+        // Not yet submitted: no time and no context.
+        for state in [ReplyState::Publishing, ReplyState::Refused] {
+            reply.state = state;
+            reply.submitted_at = None;
+            reply.context = vec![];
+            assert!(reply_answer(&request, Some(reply.clone())).answers(&request));
+        }
+        // Only a reply query is answered by a reply, and only its own.
+        assert!(!submitted.answers(&Request::WorkQuery {
+            v: 1,
+            id: request.id().into(),
+            host: reply_host(),
+            task_id: super::super::new_id(),
+        }));
+        let other = reply_query();
+        assert!(!submitted.answers(&other));
+    }
+
+    #[test]
+    fn a_reply_result_that_breaks_a_bound_is_not_a_result() {
+        let request = reply_query();
+        let build = |edit: &dyn Fn(&mut ResultReply)| {
+            let mut reply = submitted_reply();
+            edit(&mut reply);
+            let json = result(
+                &super::super::new_id(),
+                request.id(),
+                request.host(),
+                &super::super::new_id(),
+                "channel",
+                ResultBody::Reply { reply: Some(reply) },
+            );
+            Response::from_data(&json["data"])
+        };
+        assert!(build(&|_| {}).is_ok());
+        let cases: [(&str, &dyn Fn(&mut ResultReply)); 12] = [
+            ("result id is not a UUID", &|r| r.result_id = "x".into()),
+            ("result id is a v4", &|r| {
+                r.result_id = super::super::new_id()
+            }),
+            ("digest", &|r| r.digest = "abc".into()),
+            ("text too long", &|r| {
+                r.text = "x".repeat(MAX_REPLY_TEXT_BYTES + 1)
+            }),
+            ("control character", &|r| r.text = "bell \u{7}".into()),
+            ("NUL", &|r| r.text = "a\0b".into()),
+            ("nine context snapshots", &|r| {
+                r.context = vec![r.context[0].clone(); 9]
+            }),
+            ("a result snapshot is never remote context", &|r| {
+                r.context[0].kind = ContextKind::Result
+            }),
+            ("submitted without a time", &|r| r.submitted_at = None),
+            ("a time on a reply that is not submitted", &|r| {
+                r.state = ReplyState::Publishing;
+                r.context = vec![];
+            }),
+            ("dropped, with its text", &|r| {
+                r.dropped = true;
+                r.context = vec![];
+            }),
+            ("dropped, with its context", &|r| {
+                r.dropped = true;
+                r.text.clear();
+            }),
+        ];
+        for (name, edit) in cases {
+            assert!(build(edit).is_err(), "{name}");
+        }
+        // Context only comes with a submitted reply.
+        assert!(
+            build(&|r| {
+                r.state = ReplyState::Refused;
+                r.submitted_at = None;
+            })
+            .is_err()
+        );
+        assert!(
+            build(&|r| {
+                r.dropped = true;
+                r.text.clear();
+                r.context = vec![];
+            })
+            .is_ok()
+        );
+        // The longest text the host accepts, and tabs and newlines.
+        assert!(build(&|r| r.text = "a\tb\nc".repeat(2_000)).is_ok());
+        assert!(build(&|r| r.text = "x".repeat(MAX_REPLY_TEXT_BYTES)).is_ok());
     }
 
     #[test]
@@ -662,5 +1001,49 @@ mod tests {
         snapshot.digest = digest(snapshot.text.as_bytes());
         snapshot.version = 0;
         assert!(!snapshot.valid());
+    }
+
+    /// The runtime's own `local` sender makes deterministic UUIDv5 task ids;
+    /// every other rule is the remote one.
+    #[test]
+    fn a_local_task_may_carry_a_derived_id_but_obeys_every_other_bound() {
+        let host = HostTarget {
+            account_id: "account".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 1,
+        };
+        let task = |prompt: &str| WorkTask {
+            task_id: "6ba7b810-9dad-51d1-80b4-00c04fd430c8".into(),
+            workflow_id: super::super::new_id(),
+            target: Target {
+                account_id: "account".into(),
+                atem_device_id: "host".into(),
+                host_trust_gen: 1,
+                session_id: "ses-aaaaaaaaaaaa".into(),
+                process_gen: super::super::new_id(),
+            },
+            expires_at: 1,
+            prompt: prompt.into(),
+            context: vec![],
+            attachments: vec![],
+        };
+        let derived = task("work");
+        assert!(!derived.valid(&host), "a remote task id is a UUIDv4");
+        assert!(derived.valid_local(&host));
+        assert!(!task("bell \u{7}").valid_local(&host));
+        assert!(!task(&"x".repeat(33_000)).valid_local(&host));
+        let mut context = task("work");
+        let text = "y".repeat(40_000);
+        context.context = vec![ContextSnapshot {
+            kind: ContextKind::Vault,
+            id: "v-big:1".into(),
+            version: 1,
+            digest: digest(text.as_bytes()),
+            text,
+        }];
+        assert!(
+            !context.valid_local(&host),
+            "prompt and context share the 32 KiB bound"
+        );
     }
 }

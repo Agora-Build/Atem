@@ -1,0 +1,19 @@
+{
+  "atem_id": "host-1",
+  "route_id": "auth",
+  "labels": ["project:astation", "tag:auth", "self:tokens"],
+  "cases": [
+    {"selector": "project:astation", "matches": true},
+    {"selector": "tag:auth", "matches": true},
+    {"selector": "self:tokens", "matches": true},
+    {"selector": "project:astation+tag:auth", "matches": true},
+    {"selector": "project:astation+tag:mobile", "matches": false},
+    {"selector": "atem:host-1", "matches": true},
+    {"selector": "atem:host-1/auth", "matches": true},
+    {"selector": "atem:host-1/mobile", "matches": false},
+    {"selector": "atem:host-2/auth", "matches": false},
+    {"selector": "atem:测试主机-1a2b3c4d-956631ec", "matches": false},
+    {"selector": "atem:测试主机-1a2b3c4d-956631ec/auth", "matches": false}
+  ],
+  "invalid": ["", "tag:", "self:Tokens", "project:a/", "tag:a+", "atem:h/a/b", "atem:a:b", "atem:a+b"]
+}

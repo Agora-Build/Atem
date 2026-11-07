@@ -678,6 +678,7 @@ mod tests {
             rows: 4,
             cols: 20,
             generation: "g".into(),
+            self_tags: vec![],
             worker_build: None,
         }
     }

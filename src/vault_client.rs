@@ -259,6 +259,12 @@ impl VaultClient {
         encryption.blocking(move |encryption| open_entries(encryption, &vault_id, entries)).await
     }
 
+    pub async fn read_back(&self, vault_id: &str, entry_no: u32, version: u32, seq: u64) -> Result<String> {
+        let rows = self.read(vault_id, Some(seq.saturating_sub(1)), true).await?;
+        rows.into_iter().find(|e| e.kind == "content" && e.entry_no == entry_no && e.version == version && e.seq == seq)
+            .map(|e| e.content).ok_or_else(|| anyhow::anyhow!("published vault version not readable"))
+    }
+
     pub async fn write(&self, vault_id: &str, text: &str, entry_id: Option<u32>) -> Result<WriteResult> {
         let encryption = self.encryption()?;
         let text = if encryption.should_encrypt() {

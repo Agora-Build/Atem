@@ -23,6 +23,7 @@ pub mod client;
 pub mod host_policy;
 pub mod host_work;
 pub mod messages;
+pub mod select;
 pub mod attachments;
 pub mod mark;
 pub mod r9;

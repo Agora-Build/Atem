@@ -2,7 +2,7 @@
 
 Status: implemented and released (Atem v0.8.2; principals default to the paired Astation since v0.8.3).
 **Not implemented:** OS service installation and boot startup, automatic
-launch when work arrives, and durable delivery through the Station (outbox,
+remote launch when work arrives, and durable delivery through the Station (outbox,
 replay, offline senders); section 12 lists the rest.
 
 Agent hosting lets an authorized device or service start a new Claude Code or
@@ -12,6 +12,12 @@ opt-in and uses the machine's one `atem runtime`. The wire contract is
 workers and sessions are described in [agent-runtime.md](agent-runtime.md);
 principals, scopes and the device list in [account-trust.md](account-trust.md)
 and the r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md).
+
+[Agent collaboration](agent-collaboration.md) adds opt-in messaging between
+agents in this runtime, including selectors, context publication, correlated
+replies and local launch on message (stage 1, unreleased). It adds one
+read-only remote op, `reply_query` (section 7); the remote contract described
+here otherwise retains its existing admission rules.
 
 ## 1. What it does
 
@@ -120,15 +126,20 @@ shell that has the values, or use `env_file`.
 **Reloads.** The runtime rereads `runtime.toml` every second. A changed or
 removed profile fences launches that haven't started. Raise `revision` when
 approvals change: requests name the revision they were made under, a mismatch
-is `forbidden`, and work queued under an older revision stays blocked until it
-expires. A file that fails to load turns hosting off while it fails:
-launches that haven't started are fenced, requests are `busy`, and
-`runtime.log` names the problem once (the parser's reason and line, or the
-profile and rule); within a second of the file being fixed hosting follows
-it again, no restart needed. A host-work database fault (it can't be opened
-or recovered, or a write failed) turns hosting off until `atem runtime
-restart`, since a failed write leaves that step's outcome unknown
-(`runtime.log` names the database).
+is `forbidden`, and work queued under an older revision, or under a route that
+no longer lists its sender, fails at once for every sender (`route changed`;
+[agent collaboration](agent-collaboration.md) section 10, "Lifecycle"). A
+profile edit that keeps its id, revision and project (a changed `cwd` or
+`provider`) is no change of approval: its queued work stays blocked until it
+expires. A file that fails to load turns hosting off while it fails: launches
+that haven't started wait, requests are `busy`, queued work waits (nothing
+dispatches, fails or expires), and `runtime.log` names the problem once (the
+parser's reason and line, or the profile and rule); within a second of the
+file being fixed hosting follows it again, no restart needed. A host-work
+database fault (it can't be opened or recovered, or a write failed) turns
+hosting off until `atem runtime restart`, since a failed write leaves that
+step's outcome unknown (`runtime.log` names the database), and fences launches
+that haven't started.
 
 ## 3. Commands
 
@@ -186,10 +197,29 @@ owner's local consent in `runtime.toml`.
 - Before launch and before each dispatch the runtime checks again: membership
   not held, frozen or faulted, journal healthy, channel not expired, the
   caller's key unchanged, its `control_gen` unchanged, scope and local consent
-  still in place. Work fenced this way stays blocked until it expires; a new
-  grant doesn't revive it.
+  still in place. A task whose sender's `control_gen` moved on (a fence) or
+  whose authorization expired fails at once (`sender's authority changed`,
+  `sender's authorization expired`), whether it is queued, blocked, awaiting
+  its result or of unknown outcome; a running turn is never interrupted. A new
+  grant doesn't revive it, and its sender can no longer read it (`forbidden`).
+  A sender that merely has no authorized channel open waits, and its task holds
+  its session's queue until the task's deadline.
 - Memory or vault access gives no execution right. Vault `writer_id` and relay
   room names are labels, not authority.
+- **Security is at user authentication.** Who may reach an agent is decided
+  here: the device list authenticates the caller and carries its account
+  permission (the table above), and a profile or route that lists it is your
+  consent. Every request is bound to its channel's principal, is checked
+  against current authority when accepted and again before it dispatches, and
+  travels only inside end-to-end `atem-ch1` channels that the Station can't
+  read or alter. A principal allowed to reach an agent (here, or with
+  `control` over its session) acts through it with your permissions on this
+  machine: the agent's shell, files and Atem commands, including `atem
+  message send` (its tasks are `local` and may reach every route that lists
+  `local`), Memory, skills and the vault. Atem doesn't track who prompted an
+  agent, so listing a principal, or granting it `control`, lets it act as you
+  through your agents. The agent's own tool approvals still apply to each
+  command (agent collaboration, section 6).
 
 ## 5. Remote launch
 
@@ -223,6 +253,15 @@ another principal is `request_id_reused`. After a runtime restart a `starting`
 launch becomes `started` when its worker was adopted with the reserved process
 generation, else `outcome_unknown`.
 
+A launch that hasn't started while `runtime.toml` doesn't load waits and starts
+once it loads again, while its sender's channel, `control_gen` and the profile
+approval hold and its expiry hasn't passed; requests are `busy` meanwhile.
+Switching hosting off (`enabled = false`) is a deliberate stop and fences it,
+as a receipt-database fault and a halted session journal do: it is never
+started and ends `outcome_unknown`, and switching hosting on again doesn't
+revive it. A launch already handed to the spawner re-reads the file at the
+spawn boundary: a file that doesn't load or hosting off fences it there too.
+
 A remote session is an ordinary session: `atem agent list` shows it, `atem
 agent attach` opens it locally, and remote terminal and chat work as for any
 session.
@@ -253,9 +292,11 @@ The client helper `Message::publications()` builds one request per host from
 one envelope. It is an in-memory builder, not an outbox: the client keeps the
 envelope and retries each host until it accepted.
 
-**Not implemented:** nothing on the host shows or applies a stored notice, and
-the runtime fetches no memory or vault reference. It accepts only snapshots the
-publisher resolved, and checks their digests, not their publication.
+**Not implemented:** nothing on the host shows or applies a stored remote
+notice. The remote receiver accepts only snapshots the publisher resolved,
+and checks their digests, not their publication. The local collaboration
+sender publishes Memory and reads back pinned Memory/Vault versions before
+it queues their exact snapshots.
 
 ## 7. Directed work
 
@@ -268,10 +309,12 @@ context snapshot (version and digest), and adds verified screenshot paths.
 **Scheduling.** The runtime checks the queue every 100 ms; no model call or
 agent polling is involved. Tasks run FIFO per session, mark tasks included. An
 earlier task that is blocked, being submitted, submitted or uncertain holds
-later tasks for its session; other sessions go on. A task is blocked while:
+later tasks for its session (an offline sender's task, until its deadline);
+other sessions go on. A task is blocked while:
 
 - an earlier task holds the session;
-- the sender has no authorized channel open, or its route consent changed;
+- the sender has no authorized channel open (its route consent changing fails
+  the task instead: `route changed`);
 - the target session is gone, not live, has no chat, or isn't `ready`
   (working, waiting or unknown);
 - the terminal has unsent input (a draft);
@@ -280,23 +323,41 @@ later tasks for its session; other sessions go on. A task is blocked while:
 - its screenshots aren't fully uploaded and verified.
 
 **Dispatch.** When nothing blocks it, the runtime records `submitting` with a
-fixed receipt id, then submits a session-v1 `prompt` with `acquire: true` on
-the sender's channel. It is remote input under the sender's principal: no
-takeover, no local-input exception, no typing into a running tool or approval
-dialog. The scheduler never renews or takes over a lease. The prompt receipt
-decides the task's state: `submitted`, then `awaiting_result` when the turn
-ends, `failed` when rejected, `outcome_unknown` when uncertain. After a
-restart, a task left `submitting` becomes `outcome_unknown` and is reconciled
-from its receipt; it is never sent again.
+fixed receipt id, then submits a session-v1 `prompt` with `acquire: true` on the
+sender's channel. It is remote input under the sender's principal: no takeover,
+no local-input exception, no typing into a running tool or approval dialog. The
+scheduler never renews or takes over a lease. The prompt receipt decides the
+task's state: `submitted`, then `awaiting_result` when the turn ends (detail
+`turn interrupted` when it ended interrupted), `failed` when rejected (with the
+receipt's own detail, for example `control revoked`, `host trust changed` or
+`session closed`), `outcome_unknown` when uncertain. A submitted task whose
+receipt the session host no longer has becomes `outcome_unknown` (detail
+`receipt no longer available`). After a restart, a task left `submitting`
+becomes `outcome_unknown` and is reconciled from its receipt; it is never sent
+again.
 
 **Results.** A finished turn is not a finished task. The sender calls
 `work_complete` with an immutable result snapshot (e.g. the vault entry the
 work produced); the task becomes `completed`. A task awaiting its result no
 longer holds the session.
 
+**Replies.** The agent working on a task can answer it with `atem message
+reply`, for a task of any sender. The reply is durable, bound to the task, its
+session, process and turn, and never completes the task. The sender reads it
+with `reply_query{task_id}` (feature `host.reply`, ops `notify` and `prompt`):
+the same authorization as `work_query`, answered `{kind:"reply", reply}` with
+`reply` `null` until one exists, else `{result_id, state, digest, text,
+context, submitted_at, dropped}` and a state of `publishing`, `submitted` or
+`refused`
+([protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md#reply)). The
+reply isn't pushed: poll it, and complete the task with `work_complete`.
+
 **Cancel and expiry.** `work_cancel` works only while a task is `queued` or
-`blocked`; it never interrupts a turn (use session-v1 `interrupt`). A task not
-submitted by its `expires_at` becomes `expired`.
+`blocked`; it never interrupts a turn (use session-v1 `interrupt`, which ends
+the turn and leaves the task awaiting its result). A task not submitted by its
+`expires_at`, or still awaiting its result or of unknown outcome at it,
+becomes `expired`; nothing is resubmitted. A task whose sender's authority or
+whose route approval changed fails before its deadline (section 4, section 2).
 
 ## 8. Screenshots and Chisel/mark
 
@@ -341,19 +402,35 @@ started, and starts an empty one. Nothing it held could be honored again:
 every request names the host, trust generation included, so a retry for the
 old identity is `stale_target`.
 
-Records are never pruned; ids stay as tombstones. At a limit the runtime
-refuses new requests with `busy` instead of evicting anything. Files and the
-database are owner-private but not encrypted at rest; keep secrets out of
-screenshots and context.
+Records are never deleted. Every launch, task, message and reply row stays for
+the life of the database, so a query or a retry is always answered from its
+record. A day after a record settled past its deadline, the runtime (about once
+a minute) drops its payloads only: a task's prompt and context text, a
+message's inline text and context text, a reply's text, and the bytes of an
+upload (with its cached PNG) that no open task names. Ids, principals,
+revisions, session ids, states, details, digests, sizes, timestamps and a
+task's attachment descriptors stay, and so do a `work_complete` result and a
+message's `mark`. The queries keep answering (`reply_query` says `dropped:
+true`), and a retry is deduplicated by the digest stored at acceptance: the
+identical request returns the recorded receipt, other content is
+`request_id_reused`. The 4,096-record limits count records not yet closed this
+way, so a closed record frees its slot; at a limit the runtime refuses new
+requests with `busy` instead of evicting anything. An upload no task ever named
+is not dropped (the upload limits hold it). The file grows by a compact row set
+per task and is never trimmed: moving it aside is the only reset. [Agent
+collaboration](agent-collaboration.md) section 10 ("Records and retention") has
+the details. Files and the database are owner-private but not encrypted at
+rest; keep secrets out of screenshots and context.
 
 ## 10. Limits
 
 | Item | Limit |
 |---|---|
 | Profiles, routes | 64 each; 64 principals each |
-| Launch identities | 4,096 |
-| Work identities, messages | 4,096 each |
-| Unfinished tasks (queued, blocked, submitting, submitted, awaiting a result) | 256 |
+| Open launch records | 4,096 (a record closes when its payloads are dropped; none is deleted) |
+| Open work records, messages, local sends | 4,096 each (same) |
+| Unfinished tasks (queued, blocked, submitting, submitted; not those awaiting a result or of unknown outcome) | 256 |
+| Local collaboration (`[collab]`) | 32 agents per message; 30 messages per session per hour and 8 per workflow by default (a message counts once, however many agents it reaches) |
 | Uploads | 256 identities, 128 MiB declared bytes (partial uploads included) |
 | Live sessions | 16 (remote launches included) |
 | Request size | 256 KiB; message envelope 240 KiB |
@@ -379,31 +456,64 @@ screenshots and context.
 
 ## 12. Planned (not implemented)
 
-- **Not implemented:** automatic launch when work arrives. A coordinator can
-  launch, wait for readiness, then enqueue.
+- **Not implemented:** automatic launch when remote work arrives. A coordinator
+  can launch, wait for readiness, then enqueue. Local collaboration supports
+  `launch = "on_message"` on an explicitly approved route.
 - **Not implemented:** durable delivery through the Station: atomic
   write-and-notify with memory or vault, an outbox, replay with cursors across
   replicas, and delivery to an offline host. Today a sender must reach the host
   while it is online.
 - **Not implemented:** work from an offline sender. Dispatch uses the sender's
   live channel, so its tasks wait until it reconnects. There is no origin proof
-  that would let the Station replay an envelope, and no Atem-to-Atem sender.
-- **Not implemented:** role routing and subscriptions. Senders resolve
-  recipients (host, route, session, process) themselves; there are no role ids,
-  routing generations or context subscriptions that create work.
-- **Not implemented:** result routing and workflow limits. Results go back only
-  through `work_query`/`message_query`; there are no hop budgets, per-route rate
-  limits or delivery of results to the sender's agent.
+  that would let the Station replay an envelope. Cross-instance sending is
+  planned in [agent-collaboration.md](agent-collaboration.md).
+- **Not implemented:** remote selector routing and context subscriptions.
+  Remote senders resolve recipients (host, route, session, process) themselves.
+  Local collaboration expands selectors once and persists that resolution.
+- **Not implemented:** cross-instance result routing and workflow limits.
+  A remote sender reads an agent's reply with `reply_query` (feature
+  `host.reply`) and completes the task with `work_complete`; progress goes back
+  through `work_query`/`message_query`. Local collaboration has durable workflow
+  limits counted in messages and one correlated reply per task for every
+  sender, delivered into a local sender's agent only with origin-route
+  consent.
 - **Not implemented:** progress push. Launch and task status are query-only.
-- **Not implemented:** resolving an `outcome_unknown` task by hand. It keeps
-  holding its session's queue.
-- **Not implemented:** retention, compaction or pruning of `host-work.sqlite`
-  and uploads.
+- **Not implemented:** resolving an `outcome_unknown` task by hand. It holds
+  its session's queue until it expires at its deadline ("expired with its
+  outcome unknown"; nothing is resubmitted), unless its agent submits a reply
+  first (the task becomes `awaiting_result`) or, for a local task, its sender
+  completes it.
+- **Not implemented:** deleting, archiving or compacting records in
+  `host-work.sqlite` (every receipt is kept and only payloads go, section 9),
+  and dropping an upload that no task ever named.
 - **Not implemented:** `atem cred get` as an environment source for profiles.
 - **Not implemented:** launching into a new clone or Git worktree; profiles name
   existing directories.
 - **Not implemented:** hosting state in `atem status` and `atem --version`;
   `atem runtime check` is the only report.
+
+### Sending work from Atem agents
+
+[Agent collaboration](agent-collaboration.md) stage 1 is implemented and
+unreleased: agents in this runtime can address work by project, tag or
+`atem_id`, with a durable outbox, publish-before-notify, status reports and
+explicit correlated results. It uses this receiver and its approved routes.
+The agent answers any task, whoever sent it, with `atem message reply`; the
+sending agent completes its own task with `atem message complete`, a remote
+sender with `work_complete`. `atem message` and `atem agent tag` connect only
+to the running runtime (they never start or replace one). An agent's sends are
+`local` whoever prompted it, so a route that lists `local` takes work from
+every principal that may reach the agents that send (agent collaboration,
+section 6). A `runtime.toml` that doesn't load, hosting off or a database
+fault pauses local work without fencing it (sends are refused, queued tasks
+wait, replies are stored, except that a database fault refuses a reply, a
+completion and a cancel until `atem runtime restart`), though hosting off
+fences launches not yet started; a halted session journal holds local tasks
+the same way until that restart; `[collab] send = false` only refuses new
+sends. A session is launched only for `atem message send --launch` on a route
+with `launch = "on_message"`, and only for a Claude Code profile.
+**Not implemented:** cross-instance transport, the shared Station directory
+and mailbox, and the stages 2-3 permission agreements.
 
 ### OS service and boot startup (not implemented)
 
@@ -432,7 +542,9 @@ design:
 fake CLIs in temp profiles: `runtime start`/`check` and pairing, concurrent
 starts, approved exports, launch deduplication and adoption after restart,
 scoped and local consent, drafts, leases, approvals, cancel and expiry, sender
-fencing, message fanout, uploads and mark tasks. Shared request vectors are
+fencing and the failures it causes, route changes, launches that wait out a
+pause, message fanout, uploads, mark tasks, replies read with `reply_query`,
+and records kept with their payloads dropped. Shared request vectors are
 `protocol/fixtures/host-work/requests-v1.json`. Real provider APIs, OS services
 and Station delivery are not exercised.
 

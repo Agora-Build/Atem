@@ -50,13 +50,22 @@ pub const MAX_FEATURES: usize = 64;
 
 /// Lowercase canonical UUID v4 (`8-4-4-4-12`, version 4, RFC 4122 variant).
 pub fn is_uuid_v4(s: &str) -> bool {
+    is_uuid(s, b'4')
+}
+
+/// Local selector resolutions use deterministic UUID v5 task ids.
+pub fn is_uuid_v5(s: &str) -> bool {
+    is_uuid(s, b'5')
+}
+
+fn is_uuid(s: &str, version: u8) -> bool {
     let b = s.as_bytes();
     b.len() == 36
         && b.iter().enumerate().all(|(i, &c)| match i {
             8 | 13 | 18 | 23 => c == b'-',
             _ => c.is_ascii_digit() || (b'a'..=b'f').contains(&c),
         })
-        && b[14] == b'4'
+        && b[14] == version
         && matches!(b[19], b'8' | b'9' | b'a' | b'b')
 }
 

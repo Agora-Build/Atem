@@ -483,6 +483,7 @@ struct Link {
 }
 
 pub struct HostBridge {
+    local: Option<(String, Identity)>,
     work: host_work_bridge::State,
     host: SessionHost<FileJournal>,
     dir: std::path::PathBuf,
@@ -632,6 +633,18 @@ impl HostBridge {
             };
         }
         let mut host = Self::build(journal, &identity, epoch, previous, &clock)?;
+        // The principals host-work tasks name keep their control states from
+        // the first control write on (the device list's start fences below
+        // may be one): a task compares its sender's control generation with
+        // the one it was accepted under. Each scheduling pass renews the set.
+        match crate::runtime::host_work::Store::named_principals_at(dir.parent().unwrap_or(dir)) {
+            Ok(named) => host.keep_principals(named),
+            // The store won't open for hosting either: nothing of it
+            // dispatches until it does.
+            Err(error) => eprintln!(
+                "atem runtime: agent hosting records can't be read ({error:#}); the principals their tasks name are kept once hosting runs"
+            ),
+        }
         // r9 §R9.3: the device list is opened before any remote admission
         // and before recovered work is resolved; its start fences go
         // through the host's §H fence now (only durable generations: no
@@ -722,6 +735,7 @@ impl HostBridge {
             None => Arc::new(NoHasher),
         };
         Ok(Self {
+            local: None,
             work: host_work_bridge::State::open(dir, profile.is_some()),
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
@@ -1481,6 +1495,7 @@ impl HostBridge {
         let mut cx = Cx { client, sessions };
         self.sync_link(app_link(app), &mut cx);
         self.sync_sessions(&mut cx);
+        self.sync_local(&mut cx);
         if !adopting && !self.recovered {
             self.recovered = true;
             let effects = self.host.recover();
@@ -1554,6 +1569,7 @@ impl HostBridge {
             self.r9_exec(effects, &mut cx);
         }
         self.test_carriage(&mut cx);
+        self.sync_local(&mut cx);
         self.work_config();
         self.project_pass(&mut cx);
         self.sync_all(&mut cx);
@@ -1873,7 +1889,89 @@ impl HostBridge {
     /// The attachment is the link's own or an r9 channel's: its messages
     /// have somewhere to go.
     fn reachable(&self, attachment: &str) -> bool {
-        self.current(attachment) || self.r9.owns(attachment)
+        self.current(attachment)
+            || self.r9.owns(attachment)
+            || (!attachment.is_empty() && attachment == self.local_attachment())
+    }
+
+    pub(super) fn local_attachment(&self) -> &str {
+        self.local.as_ref().map_or("", |(attachment, _)| attachment)
+    }
+
+    /// `local` still has the authority of a verified host: paired, a usable
+    /// session journal, a device list that is neither frozen nor faulted.
+    /// Without it `sync_local` fences `local`. A new host identity, an
+    /// unpairing or a device list that went unusable is a real change of
+    /// authority; a plain session-journal halt fences `local` in memory
+    /// only, a pause for its tasks (`local_halted`: they wait, and the
+    /// restart that ends the halt brings back its durable control state).
+    /// The switches in `runtime.toml` are not part of it (`collab_paused`).
+    pub(super) fn local_authorized(&self) -> bool {
+        self.host.context().account_id != UNPAIRED
+            && !self.host.journal_halted()
+            && self.membership_error.is_none()
+            && self
+                .membership
+                .as_ref()
+                .is_none_or(|m| !m.is_frozen() && m.faulted().is_none() && m.held().is_none())
+    }
+
+    /// Local work may dispatch now: authorized, and not paused by
+    /// `runtime.toml` (not loading, hosting off) or a failed receipt
+    /// database. `[collab] send` only governs new sends (`collab_ready`).
+    pub(super) fn local_healthy(&self) -> bool {
+        self.hosting_enabled() && self.local_authorized()
+    }
+
+    /// Keeps the internal local attachment. A pause leaves it (and `local`'s
+    /// control generation) alone, so queued local work and return grants
+    /// resume as they were; a lost authority or a new host identity fences
+    /// `local` and ends the attachment. A plain session-journal halt does
+    /// too, in memory only: `local`'s tasks take it as a pause
+    /// (`local_halted`) and wait for the restart.
+    fn sync_local(&mut self, cx: &mut Cx) {
+        let context = self.host.context();
+        let identity = Identity {
+            account_id: context.account_id.clone(),
+            atem_device_id: context.atem_device_id.clone(),
+            host_trust_gen: context.host_trust_gen,
+        };
+        let current = self.local.as_ref().is_some_and(|(att, bound)| {
+            *bound == identity && self.host.attachment_principal(att) == Some("local")
+        });
+        if current && self.local_authorized() {
+            return;
+        }
+        if let Some((old, _)) = self.local.take() {
+            let effects = self.host.fence_principal("local", 0);
+            self.exec(effects, cx);
+            let effects = self.host.disconnect(&old);
+            self.exec(effects, cx);
+        }
+        if !self.local_healthy() {
+            return;
+        }
+        let attachment = uuid::Uuid::new_v4().to_string();
+        let attach = Attach {
+            client: "atem-internal-local".into(),
+            principal: "local".into(),
+            attachment_gen: attachment.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: atem_client::canonical::MAX_SAFE_INTEGER
+                .saturating_sub(self.clock.now()),
+        };
+        if let Ok(effects) = self.host.connect(attach) {
+            self.local = Some((attachment.clone(), identity));
+            self.exec(effects, cx);
+            if self.host.welcome_r9(&attachment, self.clock.now()).is_err() {
+                self.local = None;
+                let effects = self.host.disconnect(&attachment);
+                self.exec(effects, cx);
+            }
+            let effects = self.host.take_effects();
+            self.exec(effects, cx);
+        }
     }
 
     // ── Messages ──
@@ -2005,6 +2103,9 @@ impl HostBridge {
     }
 
     fn send(&mut self, attachment: &str, message: &Envelope, cx: &mut Cx) {
+        if !attachment.is_empty() && attachment == self.local_attachment() {
+            return;
+        }
         if self.r9.owns(attachment) {
             let host_id = self.host.context().atem_device_id.clone();
             self.r9.deliver(
@@ -2045,6 +2146,9 @@ impl HostBridge {
     }
 
     fn send_chat(&mut self, attachment: &str, env: ChatEnvelope, cx: &mut Cx) {
+        if !attachment.is_empty() && attachment == self.local_attachment() {
+            return;
+        }
         if env.op == "error"
             && let Some(code) = env.body.get("code").and_then(Value::as_str)
         {
@@ -2100,6 +2204,10 @@ impl HostBridge {
                 // delivery as uncertain. Other attachments it closes are
                 // already gone from the link.
                 Effect::Close { attachment } => {
+                    if !attachment.is_empty() && attachment == self.local_attachment() {
+                        self.local = None;
+                        continue;
+                    }
                     if self.r9.owns(&attachment) {
                         self.r9.close_attachment(&attachment, host_now().mono_ms);
                         self.forget_r9(&attachment);
@@ -3957,15 +4065,18 @@ impl ProjectHasher for NoHasher {
 /// is authenticating an authenticated link again (a routed one keeps it).
 fn r9_app_link(app: &App) -> Option<u64> {
     // A routed link keeps its r9 carrier while Astation authenticates it.
-    (app.r9_link_up() && !app.station_direct_blocked()
+    (app.r9_link_up()
+        && !app.station_direct_blocked()
         && (app.astation_reauth.is_none() || app.astation_routed))
         .then_some(app.astation_link_gen)
 }
 
 fn app_link(app: &App) -> Option<u64> {
-    (app.astation_connected && !app.station_direct_blocked()
-        && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
-        .then_some(app.astation_link_gen)
+    (app.astation_connected
+        && !app.station_direct_blocked()
+        && app.astation_reauth.is_none()
+        && !app.astation_client.is_ws_closed())
+    .then_some(app.astation_link_gen)
 }
 
 /// §6: what a failed host write proves (`None`: it was written).

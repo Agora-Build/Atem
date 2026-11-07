@@ -88,6 +88,7 @@ enum Outgoing {
 }
 
 struct Client {
+    peer: Option<(u32, u64)>,
     rx: mpsc::Receiver<Incoming>,
     tx: mpsc::UnboundedSender<Outgoing>,
     /// Raw output bytes queued and not yet written.
@@ -325,13 +326,75 @@ pub async fn serve(
     Ok(())
 }
 
+/// Refuses a peer whose process can't be verified.
+const UNVERIFIED: &str =
+    "the calling process could not be verified (it ended or was replaced); run the command again";
+
+/// Who calls over the local socket.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Caller {
+    /// An agent of this runtime: the nearest session agent in the caller's
+    /// process ancestry.
+    Session(SessionId),
+    /// A verified process with no agent of this runtime in its ancestry: the
+    /// owner, at a terminal outside any session.
+    Owner,
+    /// No process to verify: no peer credentials, or the peer ended or was
+    /// replaced (another start time) since it connected.
+    Unverified,
+}
+
+/// Classifies a socket peer `(pid, start time when it connected)` against the
+/// live agents `(session, (pid, start time))` and the pids of live agents
+/// whose start time isn't known (`unverified`). A peer that can't be
+/// verified is never taken for the owner, nor is one under an agent that
+/// can't be. Same-user model: the owner fallback is not a security boundary
+/// (a same-user process can leave an agent's process tree); it only keeps
+/// an agent's commands scoped to its own session.
+pub(super) fn caller_of(
+    peer: Option<(u32, u64)>,
+    start_time: impl Fn(u32) -> Option<u64>,
+    ancestors: impl Fn(u32) -> Vec<u32>,
+    agents: &[(SessionId, (u32, u64))],
+    unverified: &[u32],
+) -> Caller {
+    let Some((pid, started)) = peer else {
+        return Caller::Unverified;
+    };
+    if start_time(pid) != Some(started) {
+        return Caller::Unverified;
+    }
+    // Prefer the nearest agent, and verify its launch-time process identity.
+    for pid in ancestors(pid) {
+        if let Some(sid) = agents.iter().find_map(|(sid, (agent, start))| {
+            (pid == *agent && start_time(*agent) == Some(*start)).then(|| sid.clone())
+        }) {
+            return Caller::Session(sid);
+        }
+        if unverified.contains(&pid) {
+            return Caller::Unverified;
+        }
+    }
+    Caller::Owner
+}
+
 /// Waits until the workers found at start are adopted, so its answer
 /// includes them.
 fn waits_for_adoption(incoming: &Incoming) -> bool {
     matches!(
         incoming,
-        Incoming::Message(ClientMsg::List | ClientMsg::Attach { .. } | ClientMsg::Stop { .. })
-            | Incoming::Bad(DecodeError::Version(_))
+        Incoming::Message(
+            ClientMsg::List
+                | ClientMsg::Attach { .. }
+                | ClientMsg::Stop { .. }
+                | ClientMsg::Tag { .. }
+                | ClientMsg::MessageSend { .. }
+                | ClientMsg::MessageReply { .. }
+                | ClientMsg::MessageComplete { .. }
+                | ClientMsg::MessageStatus { .. }
+                | ClientMsg::MessageCancel { .. }
+                | ClientMsg::MessageDirectory { .. }
+        ) | Incoming::Bad(DecodeError::Version(_))
     )
 }
 
@@ -391,6 +454,14 @@ pub(crate) async fn read_line_max(
 
 impl Server {
     fn add_client(&mut self, stream: UnixStream) {
+        let peer = stream
+            .peer_cred()
+            .ok()
+            .and_then(|c| c.pid())
+            .and_then(|pid| {
+                let pid = u32::try_from(pid).ok()?;
+                Some((pid, super::adopt::process_start_time(pid)?))
+            });
         let id = self.next_client;
         self.next_client += 1;
         let (read, mut write) = stream.into_split();
@@ -452,6 +523,7 @@ impl Server {
         self.clients.insert(
             id,
             Client {
+                peer,
                 rx,
                 tx,
                 backlog,
@@ -481,6 +553,55 @@ impl Server {
             .collect();
         for sid in gone {
             self.detach(&sid);
+        }
+    }
+
+    /// Who sent `client`'s request (`caller_of`).
+    fn caller(&self, client: u64) -> Caller {
+        let agents: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(sid, session)| Some((sid.clone(), session.agent_pid()?)))
+            .collect();
+        let unverified: Vec<u32> = self
+            .sessions
+            .values()
+            .filter_map(BrokerSession::unverified_agent_pid)
+            .collect();
+        caller_of(
+            self.clients.get(&client).and_then(|c| c.peer),
+            super::adopt::process_start_time,
+            |pid| super::adopt::ancestors(pid, 64),
+            &agents,
+            &unverified,
+        )
+    }
+
+    /// The calling session, for a command only an agent runs.
+    fn calling_session(&self, client: u64, op: &str) -> Option<SessionId> {
+        match self.caller(client) {
+            Caller::Session(sid) => Some(sid),
+            Caller::Owner => {
+                self.error(client, "not inside an Atem session", op);
+                None
+            }
+            Caller::Unverified => {
+                self.error(client, UNVERIFIED, op);
+                None
+            }
+        }
+    }
+
+    /// The calling session, or none for the owner outside any session; an
+    /// unverified peer is refused.
+    fn session_or_owner(&self, client: u64, op: &str) -> Result<Option<SessionId>, ()> {
+        match self.caller(client) {
+            Caller::Session(sid) => Ok(Some(sid)),
+            Caller::Owner => Ok(None),
+            Caller::Unverified => {
+                self.error(client, UNVERIFIED, op);
+                Err(())
+            }
         }
     }
 
@@ -586,6 +707,7 @@ impl Server {
     fn remove_session(&mut self, sid: &SessionId) {
         self.sessions.remove(sid);
         self.order.retain(|id| id != sid);
+        super::collab::remove_tags(self.options.launcher.state(), sid.as_str());
     }
 
     /// A launch's worker started (or didn't).
@@ -656,6 +778,7 @@ impl Server {
         let Some(mut session) = BrokerSession::from_adoption(adoption) else {
             return;
         };
+        super::collab::restore_tags(self.options.launcher.state(), &mut session);
         if self.sessions.contains_key(&session.id) {
             return;
         }
@@ -817,6 +940,10 @@ impl Server {
                     return self.close(id);
                 }
                 ClientMsg::Launch { .. }
+                | ClientMsg::MessageSend { .. }
+                | ClientMsg::MessageReply { .. }
+                | ClientMsg::MessageComplete { .. }
+                | ClientMsg::MessageCancel { .. }
                 | ClientMsg::AstationOp { .. }
                 | ClientMsg::Attach { .. }
                 | ClientMsg::Restart => return self.error(id, RESTARTING_NOW, message.op()),
@@ -1051,6 +1178,150 @@ impl Server {
             ClientMsg::List => {
                 let sessions = self.order.iter().map(|sid| self.summary(sid)).collect();
                 self.send(id, &RuntimeMsg::Sessions { sessions });
+            }
+            ClientMsg::Tag { action, name } => {
+                let Some(sid) = self.calling_session(id, "tag") else {
+                    return;
+                };
+                let session = self.sessions.get_mut(&sid).unwrap();
+                let before = session.self_tags().clone();
+                let result = match (action, name) {
+                    (super::protocol::TagOp::Add, Some(label)) => session.add_tag(label),
+                    (super::protocol::TagOp::Remove, Some(label)) => session.remove_tag(&label),
+                    (super::protocol::TagOp::List, None) => Ok(()),
+                    _ => Err(anyhow::anyhow!("tag add/remove needs a self: label")),
+                };
+                if let Err(error) = result {
+                    return self.error(id, error.to_string(), "tag");
+                }
+                if let Err(error) = super::collab::save_tags(self.options.launcher.state(), session)
+                {
+                    for tag in session.self_tags().clone() {
+                        let _ = session.remove_tag(&tag);
+                    }
+                    for tag in before {
+                        let _ = session.add_tag(tag);
+                    }
+                    return self.error(id, error.to_string(), "tag");
+                }
+                let tags = session.self_tags().iter().cloned().collect();
+                self.send(
+                    id,
+                    &RuntimeMsg::Tags {
+                        session_id: sid.to_string(),
+                        tags,
+                    },
+                );
+            }
+            ClientMsg::MessageSend { request } => {
+                let Some(sid) = self.calling_session(id, "message_send") else {
+                    return;
+                };
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| {
+                        b.collab_send(
+                            &self.app.astation_client.device_atem_id(),
+                            &sid,
+                            request,
+                            &self.sessions,
+                        )
+                    });
+                match result {
+                    Ok(message_id) => self.send(id, &RuntimeMsg::MessageSent { message_id }),
+                    Err(e) => self.error(id, e.to_string(), "message_send"),
+                }
+            }
+            ClientMsg::MessageReply { request } => {
+                let Some(sid) = self.calling_session(id, "message_reply") else {
+                    return;
+                };
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_reply(&sid, request, &self.sessions));
+                match result {
+                    Ok(row) => self.send(
+                        id,
+                        &RuntimeMsg::MessageReplied {
+                            task_id: row.task_id().to_string(),
+                            result_id: row.result_id,
+                            state: row.state,
+                            detail: row.detail,
+                        },
+                    ),
+                    Err(e) => self.error(id, e.to_string(), "message_reply"),
+                }
+            }
+            ClientMsg::MessageComplete { task_id } => {
+                // Outside any session: the owner.
+                let Ok(caller) = self.session_or_owner(id, "message_complete") else {
+                    return;
+                };
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_complete(caller.as_ref(), &task_id, &self.sessions));
+                match result {
+                    Ok(()) => self.send(id, &RuntimeMsg::MessageCompleted { task_id }),
+                    Err(e) => self.error(id, e.to_string(), "message_complete"),
+                }
+            }
+            ClientMsg::MessageStatus { message_id } => {
+                // Inside a session: its own messages and the tasks sent to it.
+                let Ok(caller) = self.session_or_owner(id, "message_status") else {
+                    return;
+                };
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_status(caller.as_ref(), message_id.as_deref()));
+                match result {
+                    Ok(messages) => self.send(id, &RuntimeMsg::MessageStatus { messages }),
+                    Err(e) => self.error(id, e.to_string(), "message_status"),
+                }
+            }
+            ClientMsg::MessageCancel { task_id } => {
+                // Inside a session: its own messages only.
+                let Ok(caller) = self.session_or_owner(id, "message_cancel") else {
+                    return;
+                };
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| b.collab_cancel(caller.as_ref(), &task_id));
+                match result {
+                    Ok(()) => self.send(id, &RuntimeMsg::MessageCancelled { task_id }),
+                    Err(e) => self.error(id, e.to_string(), "message_cancel"),
+                }
+            }
+            ClientMsg::MessageDirectory { selector } => {
+                // From a session or the owner's terminal; an unverified
+                // process is refused, as for the other collaboration ops.
+                if self.session_or_owner(id, "message_directory").is_err() {
+                    return;
+                }
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(|b| {
+                        b.collab_directory(
+                            &self.app.astation_client.device_atem_id(),
+                            selector.as_deref(),
+                            &self.sessions,
+                        )
+                    });
+                match result {
+                    Ok(rows) => self.send(id, &RuntimeMsg::MessageDirectory { rows }),
+                    Err(e) => self.error(id, e.to_string(), "message_directory"),
+                }
             }
             ClientMsg::Stop { session_id } => {
                 let Some(sid) = self.find(&session_id) else {
@@ -1483,12 +1754,20 @@ impl Server {
             .map(|b| b.take_remote_launches())
             .unwrap_or_default();
         for launch in launches {
-            if self.restart || self.live_count() + self.launching >= crate::session::MAX_LIVE {
+            // Refused here, nothing started: the reason goes to its tasks.
+            let refused = if self.restart {
+                Some("the runtime is restarting; send again once it runs".to_string())
+            } else if self.live_count() + self.launching >= crate::session::MAX_LIVE {
+                Some(format!(
+                    "at most {} sessions can run at once",
+                    crate::session::MAX_LIVE
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = refused {
                 if let Some(bridge) = self.bridge.as_mut() {
-                    bridge.remote_launched(
-                        &launch.request_id,
-                        atem_client::session::host_work::LaunchState::Failed,
-                    );
+                    bridge.launch_refused(&launch.request_id, why);
                 }
                 continue;
             }

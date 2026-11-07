@@ -3,6 +3,7 @@
 //! list and stop print and exit.
 
 use super::client::RuntimeClient;
+use super::collab::results::ReplyState;
 use super::protocol::{ClientMsg, LaunchEnv, RuntimeMsg, SessionSummary};
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::IsTerminal;
@@ -44,6 +45,149 @@ pub async fn sessions(client: &mut RuntimeClient) -> Result<Vec<SessionSummary>>
         _ => None,
     })
     .await
+}
+
+pub async fn tag(action: super::protocol::TagOp, name: Option<String>) -> Result<()> {
+    crate::auth::require_pairing("agent collaboration")?;
+    let mut client = RuntimeClient::connect_existing().await?;
+    client.send(&ClientMsg::Tag { action, name }).await?;
+    let (session_id, tags) = reply(&mut client, "tag", |m| match m {
+        RuntimeMsg::Tags { session_id, tags } => Some((session_id, tags)),
+        _ => None,
+    })
+    .await?;
+    println!("{session_id}: {}", tags.join(", "));
+    Ok(())
+}
+
+pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
+    use crate::cli::MessageCommands;
+    crate::auth::require_pairing("agent collaboration")?;
+    let mut client = RuntimeClient::connect_existing().await?;
+    let request = match command {
+        MessageCommands::Send {
+            to,
+            text,
+            memory,
+            vault,
+            launch,
+            expires,
+        } => ClientMsg::MessageSend {
+            request: super::collab::SendRequest {
+                to,
+                text,
+                memory,
+                vault,
+                launch,
+                expires_ms: super::host_work::duration_ms(&expires)
+                    .ok_or_else(|| anyhow!("expiry must be 1s to 24h"))?,
+            },
+        },
+        MessageCommands::Reply {
+            task,
+            text,
+            memory,
+            vault,
+        } => ClientMsg::MessageReply {
+            request: super::collab::ReplyRequest {
+                task_id: task,
+                text,
+                memory,
+                vault,
+            },
+        },
+        MessageCommands::Complete { task_id } => ClientMsg::MessageComplete { task_id },
+        MessageCommands::Status { id } => ClientMsg::MessageStatus { message_id: id },
+        MessageCommands::Cancel { task_id } => ClientMsg::MessageCancel { task_id },
+        MessageCommands::Directory { selector } => ClientMsg::MessageDirectory { selector },
+    };
+    let op = request.op();
+    client.send(&request).await?;
+    let response = reply(&mut client, op, |m| match m {
+        RuntimeMsg::MessageSent { .. }
+        | RuntimeMsg::MessageReplied { .. }
+        | RuntimeMsg::MessageCompleted { .. }
+        | RuntimeMsg::MessageStatus { .. }
+        | RuntimeMsg::MessageCancelled { .. }
+        | RuntimeMsg::MessageDirectory { .. } => Some(m),
+        _ => None,
+    })
+    .await?;
+    match response {
+        RuntimeMsg::MessageSent { message_id } => println!("{message_id}"),
+        RuntimeMsg::MessageReplied {
+            task_id,
+            result_id,
+            state,
+            detail,
+        } => match state {
+            ReplyState::Publishing => {
+                println!("{task_id}: reply publishing its context; result {result_id}")
+            }
+            ReplyState::Submitted => println!("{task_id}: reply submitted; result {result_id}"),
+            ReplyState::Refused => bail!(
+                "{task_id}: reply refused: {detail}; send a corrected reply (result {result_id})"
+            ),
+        },
+        RuntimeMsg::MessageCompleted { task_id } => println!("{task_id}: completed"),
+        RuntimeMsg::MessageCancelled { task_id } => println!("{task_id}: cancelled"),
+        RuntimeMsg::MessageDirectory { rows } => {
+            for row in rows {
+                println!(
+                    "atem:{}/{}  {}  {}  local={}",
+                    row.atem_id,
+                    row.route_id,
+                    row.session_id.as_deref().unwrap_or("(no live agent)"),
+                    row.labels.join(", "),
+                    row.local_consent
+                );
+            }
+        }
+        RuntimeMsg::MessageStatus { messages } => {
+            for m in messages {
+                println!(
+                    "{}  {}  {}  workflow {}",
+                    m.message_id, m.delivery, m.detail, m.workflow_id
+                );
+                for task in m.tasks {
+                    println!(
+                        "  {}  {}  {}",
+                        task.task_id,
+                        serde_json::to_value(task.state)?.as_str().unwrap(),
+                        task.detail
+                    );
+                    if let Some(result) = task.result {
+                        println!(
+                            "    reply {} ({}): {}",
+                            result.result_id,
+                            serde_json::to_value(result.state)?.as_str().unwrap(),
+                            reply_text(&result)
+                        );
+                        if !result.detail.is_empty() {
+                            println!("    {}", result.detail);
+                        }
+                        for reference in result.context {
+                            println!(
+                                "    {:?}:{}@{} sha256 {}",
+                                reference.kind, reference.id, reference.version, reference.digest
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// A reply's text as `atem message status` shows it.
+fn reply_text(result: &super::collab::ResultView) -> &str {
+    if result.dropped {
+        "(text no longer kept)"
+    } else {
+        &result.text
+    }
 }
 
 /// A provider name `atem agent launch` accepts.
@@ -168,6 +312,12 @@ pub fn format_list(client: &super::client::Welcome, sessions: &[SessionSummary])
             s.cwd.display()
         ));
         // Why a session isn't running, on its own line.
+        if !s.self_tags.is_empty() {
+            text.push_str(&format!(
+                "                  tags: {}\n",
+                s.self_tags.join(", ")
+            ));
+        }
         if let Some(status) = s.exited.as_ref().filter(|_| s.state != "running") {
             text.push_str(&format!("{:<16}  ({status})\n", ""));
         }
@@ -211,6 +361,24 @@ pub async fn stop(sid: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A reply whose text the runtime dropped (a day after its task
+    /// settled past its deadline) says so rather than show nothing.
+    #[test]
+    fn a_dropped_reply_says_its_text_is_no_longer_kept() {
+        let mut result = super::super::collab::ResultView {
+            result_id: uuid::Uuid::new_v4().to_string(),
+            state: ReplyState::Submitted,
+            detail: String::new(),
+            text: "done".into(),
+            context: vec![],
+            dropped: false,
+        };
+        assert_eq!(reply_text(&result), "done");
+        result.text.clear();
+        result.dropped = true;
+        assert_eq!(reply_text(&result), "(text no longer kept)");
+    }
+
     fn summary(id: &str, state: &str, exited: Option<&str>) -> SessionSummary {
         SessionSummary {
             id: id.into(),
@@ -225,6 +393,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            self_tags: vec![],
             worker_build: None,
         }
     }

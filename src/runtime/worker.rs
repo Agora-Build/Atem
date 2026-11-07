@@ -716,6 +716,7 @@ impl Worker {
             pid: self.options.pid,
             start_time: self.options.start_time,
             agent_pid: self.record.agent_pid,
+            agent_start_time: self.record.agent_start_time,
             offset: self.offset,
             input_epoch: self.input.input_epoch(),
             dropped: self.dropped,

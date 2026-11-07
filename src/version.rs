@@ -148,6 +148,7 @@ mod tests {
             rows: 24,
             cols: 80,
             generation: "g".into(),
+            self_tags: vec![],
             worker_build: build.map(str::to_string),
         }
     }
