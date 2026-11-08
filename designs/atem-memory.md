@@ -526,10 +526,25 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - 503: the relay is temporarily unavailable (e.g. its database).
    - 413 on a chunk: its ops are retried one at a time. A single op that is
      still too large stays queued with a note and is never acked.
+
+   While the account is encrypted, the ops are sealed ahead of their requests
+   in groups of as many as one cred-agent `Crypt` request holds (1,024 ops,
+   2 MiB; skills need two dependent requests, paths then files), the next
+   group while the request before it is in flight. A request sends an op as
+   sealed ahead only while it is still exactly the queued op (an earlier
+   request's `canonical_id` rewrite, or another writer, may have changed or
+   removed it) and the account's mode, key and data account are unchanged;
+   otherwise it is sealed again first. A group that fails to seal (a locked
+   agent) switches that group to sealing each request just before it is sent,
+   so the push stops where it did before read-ahead.
 3. **Pull** memories and skills since `cursor`, page by page. Upsert rows and
    apply tombstones locally. Advance `cursor` after each page, in the same
    local transaction as the page's rows (an interrupted page is pulled again
-   whole; the cursor never passes a row that isn't stored). Cursors are
+   whole; the cursor never passes a row that isn't stored). Page k+1 is
+   fetched while page k is opened (from the cursor page k ends at) and used
+   once page k is committed; a page that fails to open or apply discards it,
+   and the next sync starts from the committed cursor. No request is in
+   flight while a page's or a push request's transaction is open. Cursors are
    kept per account (`memory_cursor:<astation_id>`,
    `skill_cursor:<astation_id>`), so pairing with a different Astation
    pulls that account from 0; the legacy unkeyed cursor is ignored.
@@ -731,6 +746,13 @@ lives.
   detection, and a crash in the middle of a push batch's results or a pulled
   page (the disk as a killed process leaves it: nothing of the batch or page
   applied, the next sync completes it).
+- **Sealing ahead and prefetching** (`sync_pipeline_tests.rs`): `Crypt`
+  requests per phase (a push in full groups, a pull and a read-back one per
+  page, a migration in full groups), an op rewritten, acked or under a new
+  mode after it was sealed (sealed again or dropped), a lock while the next
+  group is sealed, a page that fails to open or a crash while one is applied
+  with the next one fetched, and what another connection sees of the queue
+  and cursor at each relay request.
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge

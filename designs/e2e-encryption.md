@@ -1122,7 +1122,12 @@ signed final state is useful delivery assurance, not an authorization rule.
    Disabling requires no encrypted/keyed protected fields to remain. A
    failed, incomplete or interrupted pass sends no completion. Writes and
    scans can be retried; a successful rewrite acknowledgment alone is not
-   a successful verification pass.
+   a successful verification pass. The rewrite opens and seals rows in groups
+   as large as one cred-agent request holds (1,024 ops, 2 MiB), the next
+   group while the POST before it is in flight (vaults: the next vault while
+   the previous one is POSTed), and POSTs them in the same 64-fact and
+   16-skill batches; the read-back checks each page while the next one is
+   fetched, and the first failure ends the pass.
 3. **Authenticate before dispatch.** `encryptionMigrationComplete` carries
    `completion: SignedWire`, an Ed25519 `atem-migration-complete-v1` signed
    by the device's pinned device-signing key. Its fields are length-prefixed

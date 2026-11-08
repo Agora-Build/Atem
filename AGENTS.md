@@ -163,6 +163,7 @@ src/
 │   ├── adapters.rs      #   Claude/Codex targets + apply report
 │   ├── api.rs           #   relay /api/memory, /api/skills client
 │   ├── sync.rs          #   harvest → push → pull → apply
+│   ├── sync_pipeline_tests.rs # (test-only) ops sealed ahead in full Crypt groups, page prefetch: requests per phase, rewrites after sealing, failures, crashes, commit order
 │   ├── encoding.rs      #   length-prefixed fields for signed/bound inputs, base32
 │   ├── statements.rs    #   Astation-signed statements (P-256 verify)
 │   ├── device_keys.rs   #   device X25519 + Ed25519 signing + unlock-auth keys
