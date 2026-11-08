@@ -1028,6 +1028,7 @@ pub async fn run_cred_agent() -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    // Bound: a poll may connect from here; if the agent dies before serving, `open()` may relaunch it (rare, accepted).
     let watch = Watch::new(&socket, &paths.agent_socket, ORPHAN_CHECK)?;
     // A key-file error never stops the agent: it starts locked and says why
     // on `atem status` (see CredAgent::new).

@@ -876,18 +876,23 @@ fn an_agent_that_comes_up_at_once_is_reached_without_the_old_fixed_wait() {
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         took
     });
+    // Found by the first poll (5 ms) or, on a busy host, a few polls later;
+    // the old wait was at least 100 ms by construction (a 100 ms sleep).
     assert!(
-        best < Duration::from_millis(60),
+        best < Duration::from_millis(80),
         "first contact took {best:?}"
     );
 }
 
 #[test]
 fn an_agent_that_starts_slowly_is_waited_for_and_reached_soon_after() {
-    // Up after 120 ms: well past the first polls, so it is found by one of
-    // the backed-off ones (not before it listens, and not a whole old poll
-    // interval after: the old fixed polls would have found it at 200 ms).
-    let delay = Duration::from_millis(120);
+    // Up about 105 ms after the launch, past the 5 ms polls: with the
+    // schedule's polls at 110 and 130 ms (`START_POLLS_MS`: 5 x 8, 10 x 3,
+    // 20 x 3, ...) it is found at 110 ms, or at 130 ms if the in-process
+    // start takes longer than the 5 ms before that poll; the old fixed polls
+    // (100, 200 ms) found it at 200 ms. The 150 ms bound leaves 20 ms over the
+    // 130 ms path and 50 ms under the old one; change it with the schedule.
+    let delay = Duration::from_millis(105);
     let best = best_of(3, || {
         let dir = short_dir();
         let launches = Arc::new(AtomicUsize::new(0));
@@ -903,7 +908,7 @@ fn an_agent_that_starts_slowly_is_waited_for_and_reached_soon_after() {
         took
     });
     assert!(best >= delay, "reached before it listened? {best:?}");
-    assert!(best < Duration::from_millis(185), "found after {best:?}");
+    assert!(best < Duration::from_millis(150), "found after {best:?}");
 }
 
 #[test]
