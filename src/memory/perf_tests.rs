@@ -389,6 +389,8 @@ struct RelayData {
     requests: usize,
     up_bytes: usize,
     down_bytes: usize,
+    /// The length of the last pushed skill's first file value, as sent.
+    last_file_value: usize,
 }
 
 impl RelayData {
@@ -658,6 +660,13 @@ fn handle(
             for op in body["ops"].as_array().unwrap() {
                 match op["op"].as_str().unwrap() {
                     "push" => {
+                        if let Some(value) = op["skill"]["files"]
+                            .as_object()
+                            .and_then(|files| files.values().next())
+                            .and_then(Value::as_str)
+                        {
+                            data.last_file_value = value.len();
+                        }
                         let skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
                         let version = skill.version;
                         let seq = data.put_skill(skill);
@@ -2479,6 +2488,74 @@ fn perf_6_ciphertext_sizes() {
             sealed.len(),
             12 + 4 * (n.max(1) + 40).div_ceil(3)
         );
+    }
+}
+
+// ───────────────────────── 7. a skill file on the wire ─────────────────────────
+
+/// One skill with one `SKILL.md` of `size` bytes pushed to and pulled from
+/// the fake relay through `KnowledgeClient`: the HTTP bodies as sent and
+/// received, the file's value inside the push, and the median times (F8,
+/// budget "skill files at most 1.4× raw on the wire").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn perf_7_skill_file_wire() {
+    let relay = Relay::start();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut off = UnlockedDevice::new(a.path());
+    off.state(EncryptionMode::Off, None);
+    let mut on = UnlockedDevice::new(b.path());
+    on.set_key(EncryptionMode::On, KID, KEY);
+    settle();
+    println!("\n## 7. One skill file on the wire (push body up, pull body down)");
+    println!(
+        "| mode | file B | file value B | value ×raw | push body B | push ×raw | pull body B | pull ×raw | push ms | pull ms |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for (label, device) in [("off", &off), ("on", &on)] {
+        let knowledge = relay.knowledge(&device.paths, device.agent.clone());
+        for size in [1usize << 10, 64 << 10, 1 << 20] {
+            let files = BTreeMap::from([("SKILL.md".to_string(), text(size, 7).into_bytes())]);
+            let op = PendingOp::PushSkill {
+                skill: Skill {
+                    content_hash: skill_hash(&files),
+                    files,
+                    ..skill(0, 1, 1)
+                },
+                base_version: 0,
+            };
+            let reps = if size >= 1 << 20 { 9 } else { 21 };
+            let (mut pushes, mut pulls) = (Vec::new(), Vec::new());
+            let (mut value, mut up, mut down) = (0, 0, 0);
+            for _ in 0..reps + 1 {
+                relay.reset();
+                let start = Instant::now();
+                knowledge.push(&[&op], false).await.unwrap();
+                pushes.push(start.elapsed());
+                let (_, sent, _) = relay.traffic();
+                value = relay.data.lock().unwrap().last_file_value;
+                relay.reset_counters();
+                let start = Instant::now();
+                let pulled = knowledge.pull_skills(0).await.unwrap();
+                pulls.push(start.elapsed());
+                assert_eq!(pulled.len(), 1);
+                let PendingOp::PushSkill { skill, .. } = &op else { unreachable!() };
+                assert_eq!(pulled[0].files, skill.files);
+                let (_, _, received) = relay.traffic();
+                (up, down) = (sent, received);
+            }
+            // The first run warms up.
+            pushes.remove(0);
+            pulls.remove(0);
+            println!(
+                "| {label} | {size} | {value} | {:.3} | {up} | {:.3} | {down} | {:.3} | {:.2} | {:.2} |",
+                value as f64 / size as f64,
+                up as f64 / size as f64,
+                down as f64 / size as f64,
+                ms(median(pushes)),
+                ms(median(pulls)),
+            );
+        }
     }
 }
 
