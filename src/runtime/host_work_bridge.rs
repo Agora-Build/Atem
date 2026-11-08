@@ -1810,6 +1810,24 @@ principals = ["local"]
         }
     }
 
+    /// The account's signed encryption mode is `on` in the profile at
+    /// `root`, as vault context needs it (spec section 8).
+    fn encryption_on(root: &Path) {
+        use crate::memory::fake_astation::{pin, set_state};
+        let paths = crate::paths::CredPaths::in_dir(root);
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let astation = crate::memory::statements::FakeAstation::new();
+        let keys = crate::memory::device_keys::DeviceKeys::generate();
+        pin(&paths, &astation, &keys, true);
+        set_state(
+            &paths,
+            &astation,
+            crate::memory::crypto::EncryptionMode::On,
+            Some("0a1b2c3d"),
+            2,
+        );
+    }
+
     fn local_test(body: impl AsyncFnOnce(&Path)) {
         let dir = tempfile::Builder::new()
             .prefix("atem-cw")
@@ -2503,6 +2521,7 @@ principals = ["local"]
         use crate::runtime::collab_context::{ContextSpec, VaultRef};
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
+            encryption_on(root);
             let mut message = rig.message();
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
@@ -2621,6 +2640,7 @@ principals = ["local"]
         use crate::runtime::collab_context::{ContextSpec, VaultRef};
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
+            encryption_on(root);
             let mut message = rig.message();
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
@@ -3401,6 +3421,7 @@ launch = "on_message"
         use crate::runtime::collab_context::{ContextSpec, VaultRef};
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
+            encryption_on(root);
             launch_route(&mut rig, root);
             for launch in [false, true] {
                 let message = select_message(&rig, "atem:atem-host/q");

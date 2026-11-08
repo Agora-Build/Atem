@@ -185,6 +185,9 @@ pub struct VaultClient {
     astation_id: String,
     http: reqwest::Client,
     encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
+    /// Reads refuse unless the account's signed mode is `on`
+    /// (`encryption_on_only`).
+    encryption_on_only: bool,
 }
 
 impl VaultClient {
@@ -199,7 +202,17 @@ impl VaultClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             encryption_with: None,
+            encryption_on_only: false,
         }
+    }
+
+    /// Every read refuses unless the account's signed encryption mode is
+    /// `on`, checked with the context that opens the entries (so each entry
+    /// must be sealed): vault text that becomes another agent's context must
+    /// not come from the relay (`collab_context`).
+    pub(crate) fn encryption_on_only(mut self) -> Self {
+        self.encryption_on_only = true;
+        self
     }
 
     
@@ -254,6 +267,9 @@ impl VaultClient {
     pub async fn read(&self, vault_id: &str, since: Option<u64>, history: bool) -> Result<Vec<VaultEntry>> {
         let req = read_vault_request(&self.base, &self.client_id, vault_id, since, history);
         let encryption = self.encryption()?;
+        if self.encryption_on_only && encryption.mode != crate::memory::crypto::EncryptionMode::On {
+            return Err(anyhow!(crate::runtime::collab_context::VAULT_NEEDS_E2E));
+        }
         let entries: Vec<VaultEntry> = self.send(req).await?.json().await?;
         let vault_id = vault_id.to_string();
         encryption.blocking(move |encryption| open_entries(encryption, &vault_id, entries)).await

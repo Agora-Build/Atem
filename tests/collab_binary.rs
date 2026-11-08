@@ -8,7 +8,7 @@ use std::os::unix::{fs::PermissionsExt, net::UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use support::astation::{FakeAstation, write_verified_pairing};
+use support::astation::{FakeAstation, write_encryption_mode, write_verified_pairing};
 use support::r9::write_pin;
 use support::r9log::{TestLog, secret};
 use support::{Sandbox, within};
@@ -38,9 +38,12 @@ impl Rig {
     }
 
     /// The same sandbox before its runtime starts, to prepare its files.
+    /// The account's encryption is on: vault context needs it (spec
+    /// section 8).
     fn unstarted() -> Self {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
+        write_encryption_mode(&sandbox.config(), "on");
         let mut log = TestLog::genesis(ACCOUNT, &secret("collab astation"));
         let seed = secret("collab host");
         log.add_host(HOST, 1, &seed);
@@ -180,7 +183,12 @@ principals = ["local"]
     }
 
     fn send(&self, fake: &Path, n: u32, selector: &str, text: &str) -> String {
-        let output = self.agent(fake, n, &["message", "send", "--to", selector, text]);
+        self.send_with(fake, n, &["--to", selector, text])
+    }
+
+    /// `atem message send ARGS` by the agent's child; its message id.
+    fn send_with(&self, fake: &Path, n: u32, args: &[&str]) -> String {
+        let output = self.agent(fake, n, &[&["message", "send"], args].concat());
         assert_eq!(output["code"], 0, "{output}");
         output["stdout"].as_str().unwrap().trim().to_string()
     }
@@ -937,6 +945,205 @@ fn an_unreachable_relay_keeps_the_send_publishing() {
     assert_eq!(status["delivery"], "publishing");
     assert!(status["tasks"].as_array().unwrap().is_empty());
     assert!(std::fs::read(b.join("input")).unwrap().is_empty());
+}
+
+/// What the relay hands the runtime for the vault reference `key`
+/// (`ID:ENTRY@VERSION`), through the debug `ATEM_TEST_CONTEXT_DIR` hook.
+fn vault_snapshot(rig: &Rig, key: &str, text: &str) {
+    use sha2::{Digest, Sha256};
+    let (id, version) = key.rsplit_once('@').unwrap();
+    let name = format!("{:x}", Sha256::digest(key.as_bytes()));
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{name}.json")),
+        &json!({"kind":"vault","id":id,"version":version.parse::<u64>().unwrap(),
+            "digest":format!("{:x}", Sha256::digest(text.as_bytes())),"text":text})
+        .to_string(),
+    );
+}
+
+/// Holds (`true`) or releases the publication of the vault reference `key`.
+fn hold_vault(rig: &Rig, key: &str, held: bool) {
+    use sha2::{Digest, Sha256};
+    let name = format!("{:x}", Sha256::digest(key.as_bytes()));
+    let hold = rig
+        .sandbox
+        .dir
+        .path()
+        .join("context")
+        .join(format!("{name}.hold"));
+    if held {
+        private(&hold, "");
+    } else {
+        std::fs::remove_file(hold).unwrap();
+    }
+}
+
+const NEEDS_E2E: &str = "vault context needs end-to-end encryption on";
+
+/// Vault text comes from the relay: only vault encryption, under the
+/// account's signed mode `on`, keeps the relay from writing it (spec section
+/// 8). With encryption off a send and a reply with `--vault` are refused
+/// before anything is stored; `--memory` is not affected. With it on, both go
+/// through.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook"
+)]
+fn vault_context_needs_end_to_end_encryption_on() {
+    let mut rig = Rig::unstarted();
+    rig.context_hook = true;
+    write_encryption_mode(&rig.sandbox.config(), "off");
+    rig.start();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    let text = "Vault contract the relay can't author.";
+    vault_snapshot(&rig, "v-e2e:1@1", text);
+    let send = ["message", "send", "--to", "tag:b", "--vault", "v-e2e:1@1"];
+    let refused = rig.agent(&a, 1, &[&send[..], &["use the contract"]].concat());
+    assert_ne!(refused["code"], 0, "{refused}");
+    assert!(
+        refused["stderr"].as_str().unwrap().contains(NEEDS_E2E),
+        "{refused}"
+    );
+    let all = rig.request(json!({"op":"message_status"}), "message_status");
+    assert_eq!(all["messages"], json!([]), "nothing stored: {all}");
+    let id = rig.send(&a, 2, "tag:b", "a request to answer");
+    let task = await_task(&rig, &id, &b);
+    let reply = [
+        "message",
+        "reply",
+        "--task",
+        &task,
+        "--vault",
+        "v-e2e:1@1",
+        "answer",
+    ];
+    let refused = rig.agent(&b, 1, &reply);
+    assert_ne!(refused["code"], 0, "{refused}");
+    assert!(
+        refused["stderr"].as_str().unwrap().contains(NEEDS_E2E),
+        "{refused}"
+    );
+    assert_eq!(
+        rig.status(&id)["tasks"][0]["result"],
+        Value::Null,
+        "no reply stored"
+    );
+    write_encryption_mode(&rig.sandbox.config(), "on");
+    let accepted = rig.agent(&b, 2, &reply);
+    assert_eq!(accepted["code"], 0, "{accepted}");
+    within("reply submitted", || {
+        rig.status(&id)["tasks"][0]["result"]["state"] == "submitted"
+    });
+    let sent = rig.agent(&a, 3, &[&send[..], &["use the contract"]].concat());
+    assert_eq!(sent["code"], 0, "{sent}");
+    within("vault context prompt", || {
+        std::fs::read_to_string(b.join("input"))
+            .unwrap_or_default()
+            .contains(text)
+    });
+}
+
+/// The mode is checked again when the entry is read: a send accepted with
+/// encryption on whose encryption is off by the time its context is read is
+/// refused, and nothing reaches an agent.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook"
+)]
+fn a_vault_send_whose_encryption_went_off_before_publication_is_refused() {
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    vault_snapshot(&rig, "v-late:1@1", "Read after the mode changed.");
+    hold_vault(&rig, "v-late:1@1", true);
+    let id = rig.send_with(
+        &a,
+        1,
+        &["--to", "tag:b", "--vault", "v-late:1@1", "late context"],
+    );
+    assert_eq!(rig.status(&id)["delivery"], "publishing");
+    write_encryption_mode(&rig.sandbox.config(), "off");
+    hold_vault(&rig, "v-late:1@1", false);
+    within("publication refused", || {
+        rig.status(&id)["delivery"] == "refused"
+    });
+    assert_eq!(rig.status(&id)["detail"], NEEDS_E2E);
+    assert!(std::fs::read(b.join("input")).unwrap().is_empty());
+}
+
+/// A vault entry whose text holds a credential value never becomes context:
+/// the send and the reply are refused once the entry is read, before their
+/// snapshot is frozen, and a corrected reply replaces the refused one.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook"
+)]
+fn vault_context_with_a_credential_value_is_refused() {
+    const TOKEN: &str = "ghp_Zq8XfE2rT6yU1iO9pA3sD5fG7hJ4kL0mNbVc";
+    const CREDENTIAL: &str = "vault context contains a credential value; remove it";
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.restart();
+    let (_, a) = rig.launch("a", "sender");
+    let (_, b) = rig.launch("b", "recipient");
+    vault_snapshot(&rig, "v-cred:1@1", &format!("deploy with {TOKEN}"));
+    vault_snapshot(&rig, "v-clean:1@1", "deploy with the stored key");
+    let id = rig.send_with(&a, 1, &["--to", "tag:b", "--vault", "v-cred:1@1", "deploy"]);
+    within("send refused", || rig.status(&id)["delivery"] == "refused");
+    assert_eq!(rig.status(&id)["detail"], CREDENTIAL);
+    let id = rig.send(&a, 2, "tag:b", "a request to answer");
+    let task = await_task(&rig, &id, &b);
+    let input = std::fs::read_to_string(b.join("input")).unwrap();
+    assert!(!input.contains(TOKEN), "{input}");
+    let reply = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-cred:1@1",
+            "answer",
+        ],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("reply refused", || {
+        rig.status(&id)["tasks"][0]["result"]["state"] == "refused"
+    });
+    let status = &rig.status(&id)["tasks"][0];
+    assert!(
+        status["detail"].as_str().unwrap().contains(CREDENTIAL),
+        "{status}"
+    );
+    let corrected = rig.agent(
+        &b,
+        2,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-clean:1@1",
+            "answer",
+        ],
+    );
+    assert_eq!(corrected["code"], 0, "{corrected}");
+    within("corrected reply submitted", || {
+        rig.status(&id)["tasks"][0]["result"]["state"] == "submitted"
+    });
 }
 
 fn await_task(rig: &Rig, message: &str, fake: &Path) -> String {

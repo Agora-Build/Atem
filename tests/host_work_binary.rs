@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use support::astation::{ASTATION, FakeAstation, write_verified_pairing};
+use support::astation::{ASTATION, FakeAstation, write_encryption_mode, write_verified_pairing};
 use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
@@ -851,6 +851,8 @@ fn a_settled_task_keeps_its_records_when_its_payloads_go() {
 fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart() {
     let mut rig = Rig::prepared("claude", |_| {});
     rig.context_hook = true;
+    // Vault context needs the account's encryption on.
+    write_encryption_mode(&rig.sandbox.config(), "on");
     rig.start();
     let mut r = Router::new(&rig.astation);
     let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);
@@ -928,6 +930,7 @@ fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart()
 fn a_refused_reply_reads_refused_until_a_corrected_one_replaces_it() {
     let mut rig = Rig::prepared("claude", |_| {});
     rig.context_hook = true;
+    write_encryption_mode(&rig.sandbox.config(), "on");
     rig.start();
     let mut r = Router::new(&rig.astation);
     let mut dev = Dev::new(&mut r, &rig.log, "svc-work", true);

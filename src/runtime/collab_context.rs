@@ -67,9 +67,51 @@ impl ContextSpec {
     }
 }
 
-pub fn capture(dir: &Path, memories: &[String], vaults: &[String]) -> Result<Vec<ContextSpec>> {
+/// Why a vault reference can't be context: its text comes from the relay,
+/// and only vault encryption keeps the relay from writing it (spec section
+/// 8).
+pub const VAULT_NEEDS_E2E: &str = "vault context needs end-to-end encryption on";
+
+/// Why a vault entry read for context can't be frozen: the redactor chat-v1
+/// applies to agent output would change its text.
+pub const VAULT_CREDENTIAL: &str = "vault context contains a credential value; remove it";
+
+/// Refuses vault context unless the newest signed encryption state of
+/// `account` (the host's verified account) in the profile at `dir` is `on`:
+/// only then are its entries sealed end to end, so the relay can't author
+/// them (an entry in the clear is refused when it is read). Anything else,
+/// an unreadable state included, refuses.
+pub fn require_vault_encryption(dir: &Path, account: &str) -> Result<()> {
+    let trust =
+        crate::memory::trust::TrustStore::load_from(&crate::paths::CredPaths::in_dir(dir).trust);
+    let on = trust
+        .and_then(|trust| crate::memory::verification::newest_states(&trust))
+        .ok()
+        .and_then(|mut states| states.remove(account).flatten())
+        .is_some_and(|state| state.mode == crate::memory::crypto::EncryptionMode::On);
+    if !on {
+        bail!(VAULT_NEEDS_E2E);
+    }
+    Ok(())
+}
+
+/// The context of a send or a reply by `account`'s host: memories frozen as
+/// they are now, vault references to be read (with encryption on only).
+pub fn capture(
+    dir: &Path,
+    account: &str,
+    memories: &[String],
+    vaults: &[String],
+) -> Result<Vec<ContextSpec>> {
     if memories.len() + vaults.len() > 8 {
         bail!("at most 8 context snapshots");
+    }
+    let references = vaults
+        .iter()
+        .map(|text| VaultRef::parse(text))
+        .collect::<Result<Vec<_>>>()?;
+    if !references.is_empty() {
+        require_vault_encryption(dir, account)?;
     }
     let mut specs = Vec::new();
     if !memories.is_empty() {
@@ -88,10 +130,8 @@ pub fn capture(dir: &Path, memories: &[String], vaults: &[String]) -> Result<Vec
             });
         }
     }
-    for text in vaults {
-        specs.push(ContextSpec::Vault {
-            reference: VaultRef::parse(text)?,
-        });
+    for reference in references {
+        specs.push(ContextSpec::Vault { reference });
     }
     Ok(specs)
 }
@@ -122,6 +162,10 @@ pub async fn publish(
                     || snapshot.version != u64::from(reference.version)
                 {
                     bail!("context changed");
+                }
+                // Its text reaches other agents and remote senders as is.
+                if crate::chat::session::redact(&snapshot.text) != snapshot.text {
+                    bail!(VAULT_CREDENTIAL);
                 }
                 snapshot
             }
@@ -173,7 +217,8 @@ impl RelayPublisher {
                 paired.session_id.clone(),
                 paired.astation_id.clone(),
             ),
-            VaultClient::new(paired.relay_base, id, paired.session_id, paired.astation_id),
+            VaultClient::new(paired.relay_base, id, paired.session_id, paired.astation_id)
+                .encryption_on_only(),
         ))
     }
 }
@@ -205,14 +250,28 @@ impl ContextPublisher for RelayPublisher {
         }
         Ok(snapshot)
     }
+    /// The mode is checked again here, before the entry is read and once
+    /// it was (it may have changed since the send or reply was captured, or
+    /// while the entry was read), and by every read of the vault client.
     async fn vault(&self, reference: &VaultRef) -> Result<ContextSnapshot> {
+        require_vault_encryption(&self.dir, &self.host.account_id)?;
         let key = match reference.entry {
             Some(n) => format!("{}:{n}@{}", reference.id, reference.version),
             None => format!("{}@{}", reference.id, reference.version),
         };
-        if let Some(result) = test_snapshot(&key).await {
-            return result;
-        }
+        let snapshot = match test_snapshot(&key).await {
+            Some(result) => result?,
+            None => self.read_vault(reference).await?,
+        };
+        require_vault_encryption(&self.dir, &self.host.account_id)?;
+        Ok(snapshot)
+    }
+}
+
+impl RelayPublisher {
+    /// Entry `reference` as the relay holds it, read twice and opened with
+    /// the account's key.
+    async fn read_vault(&self, reference: &VaultRef) -> Result<ContextSnapshot> {
         let (_, client) = self.clients()?;
         let versions = client.read(&reference.id, None, true).await?;
         let mut matches = versions.iter().filter(|e| {
@@ -339,6 +398,126 @@ mod tests {
             .to_string(),
             "context changed"
         );
+    }
+
+    /// Vault context is taken only while the newest signed encryption state
+    /// of the host's account is `on`: not before a signed state, not off or
+    /// migrating, not for another account. A memory needs no vault.
+    #[test]
+    fn vault_context_needs_the_accounts_signed_mode_on() {
+        use crate::memory::crypto::EncryptionMode;
+        use crate::memory::fake_astation::{ACCOUNT, pin, set_state};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::CredPaths::in_dir(dir.path());
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let vault = || capture(dir.path(), ACCOUNT, &[], &["v-a:1@1".into()]);
+        let refused = |result: Result<Vec<ContextSpec>>| {
+            assert_eq!(result.unwrap_err().to_string(), VAULT_NEEDS_E2E);
+        };
+        refused(vault());
+        let astation = crate::memory::statements::FakeAstation::new();
+        pin(
+            &paths,
+            &astation,
+            &crate::memory::device_keys::DeviceKeys::generate(),
+            true,
+        );
+        refused(vault());
+        set_state(&paths, &astation, EncryptionMode::Off, None, 2);
+        refused(vault());
+        set_state(
+            &paths,
+            &astation,
+            EncryptionMode::Enabling,
+            Some("0a1b2c3d"),
+            3,
+        );
+        refused(vault());
+        set_state(&paths, &astation, EncryptionMode::On, Some("0a1b2c3d"), 4);
+        assert!(matches!(
+            vault().unwrap().as_slice(),
+            [ContextSpec::Vault { .. }]
+        ));
+        refused(capture(
+            dir.path(),
+            "another-account",
+            &[],
+            &["v-a:1@1".into()],
+        ));
+        // A malformed reference says so, whatever the mode.
+        assert_eq!(
+            capture(dir.path(), ACCOUNT, &[], &["v-a".into()])
+                .unwrap_err()
+                .to_string(),
+            "vault reference must be ID[:ENTRY]@VERSION"
+        );
+        set_state(
+            &paths,
+            &astation,
+            EncryptionMode::Disabling,
+            Some("0a1b2c3d"),
+            5,
+        );
+        refused(vault());
+        assert!(capture(dir.path(), ACCOUNT, &[], &[]).unwrap().is_empty());
+    }
+
+    /// The publisher checks the mode again before it reads an entry: a send
+    /// or reply captured with encryption on whose encryption is off by then
+    /// is refused, before any relay or test hook is asked.
+    #[tokio::test]
+    async fn the_publisher_checks_the_mode_before_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = RelayPublisher::new(
+            dir.path().to_path_buf(),
+            hw::HostTarget {
+                account_id: crate::memory::fake_astation::ACCOUNT.into(),
+                atem_device_id: "host".into(),
+                host_trust_gen: 1,
+            },
+        );
+        let error = publisher
+            .vault(&VaultRef::parse("v-a:1@1").unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), VAULT_NEEDS_E2E);
+    }
+
+    struct VaultPublisher(&'static str);
+    impl ContextPublisher for VaultPublisher {
+        async fn memory(&self, _: &Memory) -> Result<ContextSnapshot> {
+            unreachable!()
+        }
+        async fn vault(&self, reference: &VaultRef) -> Result<ContextSnapshot> {
+            Ok(ContextSnapshot {
+                kind: ContextKind::Vault,
+                id: format!("{}:1", reference.id),
+                version: reference.version.into(),
+                digest: hw::digest(self.0.as_bytes()),
+                text: self.0.into(),
+            })
+        }
+    }
+
+    /// An entry the credential redactor would change is refused before its
+    /// snapshot is frozen; its text never reaches another agent or a remote
+    /// sender.
+    #[tokio::test]
+    async fn a_vault_entry_with_a_credential_value_is_refused() {
+        let specs = [ContextSpec::Vault {
+            reference: VaultRef::parse("v-a:1@1").unwrap(),
+        }];
+        let error = publish(
+            &VaultPublisher("deploy with ghp_Zq8XfE2rT6yU1iO9pA3sD5fG7hJ4kL0mNbVc"),
+            &specs,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), VAULT_CREDENTIAL);
+        let snapshots = publish(&VaultPublisher("deploy with the stored key"), &specs)
+            .await
+            .unwrap();
+        assert_eq!(snapshots[0].text, "deploy with the stored key");
     }
 
     #[test]

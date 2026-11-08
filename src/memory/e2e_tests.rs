@@ -355,6 +355,38 @@ async fn real_clients_migrate_upload_pull_and_rotate_every_history_row() {
     assert_eq!(vault.read("v-test", None, true).await.unwrap().len(), 3);
 }
 
+/// The vault client collaboration reads context with (`encryption_on_only`)
+/// reads only while the account's signed mode is on: off or migrating it
+/// refuses; on, it opens the sealed entries and refuses one the relay sent in
+/// the clear.
+#[tokio::test]
+async fn a_context_vault_client_reads_only_with_encryption_on() {
+    use crate::runtime::collab_context::VAULT_NEEDS_E2E;
+    let directory = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(directory.path());
+    let relay_state = Arc::new(Mutex::new(RelayState::seeded()));
+    let base = stub_relay(relay_state.clone()).await;
+    let (_, vault) = clients(&base, &device);
+    let context = clients(&base, &device).1.encryption_on_only();
+    device.state(EncryptionMode::Off, None);
+    assert_eq!(vault.read("v-test", None, true).await.unwrap().len(), 3);
+    assert_eq!(context.read("v-test", None, true).await.unwrap_err().to_string(), VAULT_NEEDS_E2E);
+    assert_eq!(context.read_back("v-test", 1, 1, 4).await.unwrap_err().to_string(), VAULT_NEEDS_E2E);
+    device.set_key(EncryptionMode::Enabling, OLD_KID, [7; 32]);
+    vault.migrate_encryption().await.unwrap();
+    assert_eq!(context.read("v-test", None, true).await.unwrap_err().to_string(), VAULT_NEEDS_E2E);
+    device.state(EncryptionMode::On, Some(OLD_KID));
+    let entries = context.read("v-test", None, true).await.unwrap();
+    assert_eq!(
+        entries.iter().map(|entry| entry.content.as_str()).collect::<Vec<_>>(),
+        vec!["first secret", "rotated secret", "recovery note"]
+    );
+    assert_eq!(context.read_back("v-test", 1, 2, 5).await.unwrap(), "rotated secret");
+    relay_state.lock().unwrap().vault_entries[1]["content"] = json!("written by the relay");
+    let error = context.read("v-test", None, true).await.unwrap_err();
+    assert!(format!("{error:#}").contains("plain-text vault entry"), "{error:#}");
+}
+
 #[tokio::test]
 async fn repeated_signed_pending_states_resume_interrupted_migrations_with_a_loaded_key() {
     use crate::memory::cred_agent::CredAgentApi;

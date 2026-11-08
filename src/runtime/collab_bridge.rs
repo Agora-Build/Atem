@@ -79,6 +79,8 @@ fn publication_refused(detail: &str) -> bool {
             | "invalid message content"
             | "context publication refused"
             | "request_id_reused"
+            | collab_context::VAULT_NEEDS_E2E
+            | collab_context::VAULT_CREDENTIAL
     ) || collab::TASK_PROBLEMS.contains(&detail)
         || detail.starts_with("ambiguous vault reference")
         || detail.starts_with("limit:")
@@ -223,7 +225,12 @@ impl HostBridge {
         {
             bail!("ambiguous vault reference {bare}: a reply names the entry, ID:ENTRY@VERSION");
         }
-        let references = collab_context::capture(&self.work.dir, &request.memory, &request.vault)?;
+        let references = collab_context::capture(
+            &self.work.dir,
+            &self.work_host().account_id,
+            &request.memory,
+            &request.vault,
+        )?;
         if request.text.trim().is_empty() && references.is_empty() {
             bail!("a reply needs text");
         }
@@ -1357,6 +1364,7 @@ impl HostBridge {
         }
         let specs = crate::runtime::collab_context::capture(
             &self.work.dir,
+            &self.work_host().account_id,
             &request.memory,
             &request.vault,
         )?;

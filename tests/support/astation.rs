@@ -237,6 +237,36 @@ pub fn write_verified_pairing(config: &Path, account: &str, device: &str, trust_
     .unwrap();
 }
 
+/// Stores `mode` (`off`, `on`, …) as the account's signed encryption state
+/// in the pairing `write_verified_pairing` wrote, at the next epoch, as atem
+/// keeps an accepted `encryptionMode`: a stored state is read, never checked
+/// against its signature again.
+pub fn write_encryption_mode(config: &Path, mode: &str) {
+    use atem_client::encoding::{enc, u64_field};
+    use base64::Engine;
+    let path = super::profile::CredPaths::in_dir(config).trust;
+    let mut trust: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let entry = &mut trust["astations"][ASTATION];
+    let epoch = entry["account_epoch"].as_u64().unwrap() + 1;
+    let kid: &[u8] = if mode == "off" { b"" } else { b"0a1b2c3d" };
+    let statement = enc(&[
+        b"atem-account-state-v1",
+        entry["data_account"].as_str().unwrap().as_bytes(),
+        &u64_field(1),
+        mode.as_bytes(),
+        kid,
+        &u64_field(epoch),
+    ]);
+    entry["account_state"] = json!({
+        "statement": base64::engine::general_purpose::STANDARD.encode(statement),
+        "signature": "",
+    });
+    entry["account_epoch"] = json!(epoch);
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, trust.to_string()).unwrap();
+    std::fs::rename(temp, path).unwrap();
+}
+
 /// How the fake relay answers a host connection's route proof (§R9.7b).
 #[derive(Clone, Debug)]
 pub enum Reply {
