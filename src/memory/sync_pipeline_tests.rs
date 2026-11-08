@@ -2506,10 +2506,63 @@ async fn a_skill_with_an_empty_file_travels_as_e1_text_and_comes_back_whole() {
     );
 }
 
+/// A sealed skill with an empty file stored before the empty-file rule (by
+/// a client of the legacy routes) is served by Astation's adapter at 963c74b
+/// as `base64`: its `encode_row` finds `""` isn't an envelope, so the whole
+/// row keeps the stored form. The client reads that row as the same bytes
+/// and opens it whole.
+#[tokio::test]
+async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let skill = skill_with_an_empty_file("m2");
+    let mut sealed = context(&device).encrypt_skill(skill.clone()).unwrap();
+    sealed.seq = 5;
+    assert!(sealed.files.values().any(Vec::is_empty));
+    let mut row = serde_json::to_value(&sealed).unwrap();
+    row["files_encoding"] = serde_json::json!("base64");
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay);
+    let (base, _log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "GET" && p.starts_with("/api/skills/v2?") {
+            let rows = if since(p) < 5 {
+                vec![row.clone()]
+            } else {
+                Vec::new()
+            };
+            return (200, serde_json::json!({"wire_version": 2, "skills": rows}));
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    let (_home, ctx) = test_ctx();
+    let client = client_with(&base, &device, device.agent.clone());
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pulled, 1);
+    let pulled = s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!(pulled.files, skill.files);
+    assert_eq!(pulled.content_hash, skill_hash(&skill.files));
+}
+
 /// A skill push whose outcome is unknown (the connection closed with no
 /// answer) stays queued and goes again by the same v2 route in the same
-/// format: never in another format. (The Station here hadn't applied it; a
-/// sealed push it had applied would come back as a concurrent version.)
+/// format: never in another format.
+///
+/// Here the Station hadn't applied the first POST. A known pre-existing
+/// bug (not skill wire v2's; the legacy wire had it too) makes the other
+/// case unreadable: the Station stores every push as `max(version) + 1`,
+/// but a sealed skill's associated data names the version it was sealed
+/// under (`scope:name:version`). A sealed push the Station had already
+/// applied is stored again under a version its envelopes don't name, and
+/// every reader's skill pull then fails ("encrypted field authentication
+/// failed"); a concurrent push from another machine does the same. The
+/// owner decided the fix on Atem #130 (comment 6726291208): the Station
+/// stores the version the push was sealed under, or answers
+/// `version_conflict`.
 #[tokio::test]
 async fn an_uncertain_skill_push_goes_again_in_the_same_format() {
     let dir = tempfile::tempdir().unwrap();

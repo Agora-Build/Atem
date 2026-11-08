@@ -105,6 +105,60 @@
     },
     {
       "expect": "accept",
+      "name": "base64: a sealed row with an empty file, as 963c74b serves it",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0=",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "files_encoding": "base64",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "served": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "stored": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0=",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "expect": "accept",
       "name": "base64: a plain file",
       "row": {
         "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

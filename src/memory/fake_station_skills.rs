@@ -6,6 +6,13 @@
 //! form (`Skill`'s own serde: base64 files) and translate at the v2
 //! routes, as the Station does. Written apart from the client's
 //! `skill_wire` (its own envelope check), so each side checks the other.
+//!
+//! A batch is refused as the Station refuses it, in its order: `ops` not
+//! an array (400 `invalid batch`), more than 16 ops (413), a refused files
+//! encoding (400), a normalized body over 16 MiB (413), then an unknown op
+//! or one missing a field (400 `invalid batch`). Not modelled: the 16 MiB
+//! bound on the body as received (the fake relays get it parsed), and
+//! authentication.
 
 use crate::memory::model::Skill;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -13,6 +20,11 @@ use serde_json::{Map, Value, json};
 
 /// The Station's answer (HTTP 400) to a batch with a refused encoding.
 pub(crate) const INVALID: &str = "invalid skill files encoding";
+
+/// The Station's bounds on a skills batch (`SKILLS_BATCH_BODY_LIMIT`,
+/// `SKILLS_BATCH_MAX_OPS`).
+pub(crate) const BODY_LIMIT: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_OPS: usize = 16;
 
 /// Astation's `envelope_kid`: `e1`, a kid of 8 lowercase hex digits, and
 /// standard base64 of at least a nonce and a tag (40 bytes).
@@ -111,12 +123,55 @@ pub(crate) fn page<'a>(rows: impl IntoIterator<Item = &'a Skill>) -> Value {
     json!({"wire_version": 2, "skills": rows.into_iter().map(row).collect::<Vec<_>>()})
 }
 
-/// A v2 batch: every op is checked first (400 and nothing applied on a
-/// refusal), then `apply` gets each op in its stored form.
+/// Bytes written, none kept: a serialized size without the copy.
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An op the Station's `SkillOp` parses: a known `op` with its fields.
+fn known_op(op: &Value) -> bool {
+    let has = |fields: &[&str]| fields.iter().all(|field| op.get(*field).is_some());
+    match op["op"].as_str() {
+        Some("push") => op["skill"].is_object() && op["base_version"].is_i64(),
+        Some("delete") | Some("purge") => has(&["scope", "name"]),
+        Some("rewrite") => {
+            has(&["scope", "name", "files", "content_hash"]) && op["version"].is_i64()
+        }
+        _ => false,
+    }
+}
+
+/// A v2 batch: every op is checked first, in the Station's order (a
+/// refusal applies nothing), then `apply` gets each op in its stored form.
 pub(crate) fn batch(body: &Value, mut apply: impl FnMut(&Value) -> Value) -> (u16, Value) {
-    let mut ops = body["ops"].as_array().cloned().unwrap_or_default();
+    let refused = |status: u16, error: &str| (status, json!({"error": error}));
+    let Some(ops) = body.get("ops").and_then(Value::as_array) else {
+        return refused(400, "invalid batch");
+    };
+    if ops.len() > MAX_OPS {
+        return refused(413, "too many ops");
+    }
+    let mut ops = ops.clone();
     if normalize_ops(&mut ops).is_err() {
-        return (400, json!({"error": INVALID}));
+        return refused(400, INVALID);
+    }
+    // Compact transport must not bypass the stored form's bound.
+    let mut normalized = Counted(0);
+    serde_json::to_writer(&mut normalized, &ops).unwrap();
+    if normalized.0 + br#"{"ops":}"#.len() > BODY_LIMIT {
+        return refused(413, "normalized request body too large");
+    }
+    if !ops.iter().all(known_op) {
+        return refused(400, "invalid batch");
     }
     let results: Vec<Value> = ops.iter().map(&mut apply).collect();
     (200, json!({"wire_version": 2, "results": results}))
@@ -127,5 +182,73 @@ pub(crate) fn batch_ok(body: &Value, apply: impl FnMut(&Value) -> Value) -> Valu
     match batch(body, apply) {
         (200, results) => results,
         (_, error) => panic!("the fake Station refused a batch: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope_of(marker: u8, bytes: usize) -> String {
+        format!("e1.0123abcd.{}", STANDARD.encode(vec![marker; bytes]))
+    }
+
+    fn push(files: Value) -> Value {
+        json!({"op": "push", "base_version": 0, "skill": {
+            "scope": "global", "project": "", "name": "demo", "version": 1,
+            "files_encoding": "e1-text", "files": files,
+            "content_hash": format!("h1.0123abcd.{}", "a".repeat(64)),
+            "source_agent": "test", "source_machine": "synthetic",
+            "created_at": 1, "deleted": false, "seq": 0,
+        }})
+    }
+
+    /// The Station's refusals, in its order, and nothing applied.
+    #[test]
+    fn a_batch_is_refused_as_the_station_refuses_it() {
+        let valid = push(json!({envelope_of(1, 40): envelope_of(2, 40)}));
+        let unsealed = push(json!({envelope_of(1, 40): "plaintext"}));
+        let huge = push(json!({envelope_of(1, 40): envelope_of(2, 9_800_000)}));
+        let cases = [
+            (json!({}), 400, "invalid batch"),
+            (json!({"ops": {}}), 400, "invalid batch"),
+            (
+                json!({"ops": vec![valid.clone(); MAX_OPS + 1]}),
+                413,
+                "too many ops",
+            ),
+            (json!({"ops": [valid.clone(), unsealed]}), 400, INVALID),
+            // An unknown op is refused only after the encodings passed.
+            (
+                json!({"ops": [valid.clone(), {"op": "unknown"}]}),
+                400,
+                "invalid batch",
+            ),
+            (
+                json!({"ops": [{"op": "delete", "scope": "global"}]}),
+                400,
+                "invalid batch",
+            ),
+            (
+                json!({"ops": [huge]}),
+                413,
+                "normalized request body too large",
+            ),
+        ];
+        for (body, status, error) in cases {
+            let mut applied = 0;
+            let answer = batch(&body, |_| {
+                applied += 1;
+                json!({"ok": true})
+            });
+            assert_eq!(answer, (status, json!({"error": error})), "{error}");
+            assert_eq!(applied, 0, "{error}");
+        }
+        let answer = batch(&json!({"ops": vec![valid; MAX_OPS]}), |op| {
+            assert_eq!(op["skill"].get("files_encoding"), None);
+            json!({"ok": true})
+        });
+        assert_eq!(answer.0, 200);
+        assert_eq!(answer.1["wire_version"], 2);
     }
 }

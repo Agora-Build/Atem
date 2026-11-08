@@ -58,12 +58,15 @@ These are public synthetic vectors for what Astation's vector doesn't cover. The
     "skill files at most 1.4× raw on the wire".
   - Test: `atems_large_file_vector_shows_the_wire_expansion`.
 - **`atem-rows.json`**: rows the client and the Station both accept (with the stored legacy form)
-  or both refuse (`invalid skill files encoding`). The cases are:
+  or both refuse (`invalid skill files encoding`). An accepted case with `served` is one the fake
+  Station serves in another form of the same bytes. The cases are:
   - missing, unknown and non-string encodings;
   - malformed, short, uppercase-kid and twice-encoded envelopes;
   - mixed plain and sealed entries, an empty path, and non-string values;
   - invalid or unpadded base64;
-  - tombstones, plain and binary `base64` rows.
+  - tombstones, plain and binary `base64` rows;
+  - a sealed row with an empty file as `base64`, which is how Astation's adapter at `963c74b`
+    serves it. Its `served` is the `e1-text` form under the empty-file rule.
 
   Test: `atems_row_vectors_are_read_and_stored_alike`.
 
@@ -77,7 +80,14 @@ plain and sealed entries are still refused.
 
 The owner chose this rule on Atem #130 and asked Astation for it. Astation's adapter at
 `963c74b` refuses `""` in an `e1-text` row (`normalize_files` calls `envelope_kid` on every value),
-and on reads it serves such rows as `base64`. Until Astation pins the rule:
+and on reads it serves such rows as `base64`.
+
+The client reads that `base64` form as the same bytes. Two tests pin this:
+- the row case "base64: a sealed row with an empty file, as 963c74b serves it";
+- `a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole`
+  (`src/memory/sync_pipeline_tests.rs`), which also opens it.
+
+Until Astation pins the rule:
 - a sealed skill with an empty file, such as a `.gitkeep`, is refused by that adapter;
 - the `empty_file_*` rows of `atem-envelope.json` and the matching case of `atem-rows.json` hold
   only against Atem's fake Station, which implements the rule.

@@ -343,8 +343,12 @@ no detection, fallback or switch.
 - **Files.** Every skill row a v2 route returns, every `push.skill` and every
   `rewrite` carries `files_encoding` next to `files`:
   - `e1-text`: every path is a sealed `e1.` envelope, and every value is
-    the envelope's own text (encoded once, not base64 of it). An empty file
-    is `""`, never sealed. atem sends this for a sealed skill.
+    the envelope's own text (encoded once, not base64 of it). atem sends
+    this for a sealed skill. An empty file is `""`, never sealed (the
+    empty-file rule). **Pending Astation's next pin:** its adapter at
+    963c74b refuses `""` in an `e1-text` row, so a sealed skill with an
+    empty file gets 400 there, and it serves such a stored row as
+    `base64`, which atem reads as the same bytes.
   - `base64`: standard padded base64 of the bytes. atem sends this for a
     plain skill, and only while the account's mode permits plain text
     (`off`, or `disabling`'s rewrite back).

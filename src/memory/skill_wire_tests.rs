@@ -391,7 +391,11 @@ fn atems_row_vectors_are_read_and_stored_alike() {
                 let skill = read(row).unwrap_or_else(|e| panic!("{name}: {e:#}"));
                 assert_eq!(legacy(&skill), case["stored"], "{name}");
                 assert_eq!(stored(row).unwrap(), case["stored"], "{name}");
-                assert_eq!(&served(&case["stored"]), row, "{name}");
+                // The fake Station serves the stored row as `row`, or (a
+                // case's `served`) as another form of the same bytes.
+                let served_row = case.get("served").unwrap_or(row);
+                assert_eq!(&served(&case["stored"]), served_row, "{name}");
+                assert_eq!(read(served_row).unwrap(), skill, "{name}");
             }
             "refuse" => {
                 let error = read(row).expect_err(name);
@@ -531,6 +535,23 @@ fn print_skill_wire_vectors() {
             "e1-text: a tombstone has no files",
             base(Some("e1-text"), json!({})),
         ),
+        {
+            // How Astation's adapter at 963c74b serves a stored sealed row
+            // with an empty file (`envelope_kid("")` fails, so the whole row
+            // is `base64`); with the empty-file rule it is `e1-text`.
+            let mut case = accept(
+                "base64: a sealed row with an empty file, as 963c74b serves it",
+                base(
+                    Some("base64"),
+                    json!({p1.clone(): STANDARD.encode(&f1), p2.clone(): ""}),
+                ),
+            );
+            case["served"] = base(
+                Some("e1-text"),
+                json!({p1.clone(): f1.clone(), p2.clone(): ""}),
+            );
+            case
+        },
         accept(
             "base64: a plain file",
             base(

@@ -1417,14 +1417,20 @@ mod tests {
         path.starts_with("/api/skills/v2?").then(|| (200, serde_json::json!({"wire_version": 2, "skills": []})))
     }
 
-    /// Every op accepted; a skills batch answers as skill wire v2 does.
-    fn ok_results(path: &str, body: &serde_json::Value) -> serde_json::Value {
-        let n = body["ops"].as_array().map(|a| a.len()).unwrap_or(0);
-        let mut results = serde_json::json!({"results": (0..n).map(|i| serde_json::json!({"ok": true, "seq": i + 1})).collect::<Vec<_>>()});
+    /// Every op accepted. A skills v2 batch goes through the fake Station
+    /// (`fake_station_skills::batch`): refused as the Station refuses it,
+    /// else answered as skill wire v2 answers.
+    fn ok_results(path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+        let mut seq = 0;
+        let mut ok = |_: &serde_json::Value| {
+            seq += 1;
+            serde_json::json!({"ok": true, "seq": seq})
+        };
         if path.starts_with("/api/skills/v2/batch?") {
-            results["wire_version"] = serde_json::json!(2);
+            return crate::memory::fake_station_skills::batch(body, ok);
         }
-        results
+        let results: Vec<serde_json::Value> = body["ops"].as_array().map_or(Vec::new(), |ops| ops.iter().map(&mut ok).collect());
+        (200, serde_json::json!({"results": results}))
     }
 
     pub(super) fn test_ctx() -> (tempfile::TempDir, Ctx) {
@@ -1535,7 +1541,7 @@ mod tests {
             if body["ops"].as_array().unwrap().len() > 1 {
                 return (413, serde_json::json!({"error": "request body too large"}));
             }
-            (200, ok_results(p, body))
+            ok_results(p, body)
         })).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
@@ -1561,7 +1567,7 @@ mod tests {
             if ops.len() > 1 || ops[0]["memory"]["content"] == "huge" {
                 return (413, serde_json::json!({"error": "request body too large"}));
             }
-            (200, ok_results(p, body))
+            ok_results(p, body)
         })).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
@@ -1680,7 +1686,7 @@ mod tests {
             if body["ops"].as_array().unwrap().iter().any(|o| o["op"] == "invalidate") {
                 return (400, serde_json::json!({"error": "unknown op"}));
             }
-            (200, ok_results(p, body))
+            ok_results(p, body)
         })).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
@@ -1787,7 +1793,7 @@ mod tests {
             if let Some(r) = empty_pulls(m, p) {
                 return r;
             }
-            (200, ok_results(p, body))
+            ok_results(p, body)
         })
     }
 
@@ -1867,7 +1873,7 @@ mod tests {
                 s.enqueue(&PendingOp::DeleteSkill { scope: Scope::Global, project: String::new(), name: format!("s{i:03}") }).unwrap();
             }
         }
-        let (base, log) = stub_relay(Box::new(|m, p, body| empty_pulls(m, p).unwrap_or_else(|| (200, ok_results(p, body))))).await;
+        let (base, log) = stub_relay(Box::new(|m, p, body| empty_pulls(m, p).unwrap_or_else(|| ok_results(p, body)))).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
         assert!(out.notes.is_empty(), "{:?}", out.notes);
@@ -2326,7 +2332,7 @@ mod tests {
             }
             // The legacy routes, never to be used.
             if m == "POST" {
-                return (200, ok_results(p, body));
+                return ok_results(p, body);
             }
             (200, serde_json::json!({"skills": [], "versions": []}))
         })).await;
