@@ -12,6 +12,7 @@ How Atem reaches Astation: the link, its order, authentication, pairing, the rel
 - A link is one WebSocket: local (`astation_ws`) or the paired Astation's identity room on a Station (the one Astation selected, else `astation_relay_url`; see [Station selection](#station-selection)).
 - Astation authenticates the link. The relay only routes it, except for the r9 host route proof.
 - r8 session-v1, terminal-v1 and chat-v1 run on the authenticated link. On a host with a device list, r9 clients come through `atem-ch1` channels carried on the same link. See the r9 appendix of [atem-session-v1.md](protocol/atem-session-v1.md).
+- **Planned (owner decision 2026-11-08), not implemented:** no host serves r8 on the link; remote sessions run only inside `atem-ch1` channels. See [Remote sessions need r9](#remote-sessions-need-r9-planned).
 
 ## Identity
 
@@ -63,6 +64,7 @@ Astation challenges a new local socket at once, and a relay link after Atem's `h
 - Astation, not the relay, checks the proof. It answers `auth{status:"granted", session_id, token}`, `authenticated`, `auth{status:"denied", message}` or `error{message}` (expired or pairing required).
 - Test vector (`device_auth_proof_matches_protocol_vector`): token `token-abc`, challenge `challenge-123`, Astation `astation-home`, Atem `atem-office`, session `session-456` → `9fde5ba861c1a159d377b89e6fb3f92d245795998af958f5db3ad343d589d0ba`.
 - Bounds: the challenge within 5 s on local and 10 s on the relay; everything after it within 300 s.
+- The proof runs one way. Atem proves itself to Astation and doesn't authenticate Astation in return: it accepts `authenticated` or `auth{granted}` from whoever answered (`auth_response_saving`, no proof checked), and takes the challenge's `transport` on the peer's word. Anything that ends the socket can answer as Astation: the relay operator, an active attacker on a `ws://` link, another process listening on `127.0.0.1:8080`.
 
 The saved session:
 
@@ -86,6 +88,7 @@ The saved session:
 - Device verification is commit-then-reveal: a 12-character safety code the user compares, Touch ID on the Mac, then the signed `deviceVerified` applied atomically. A failure keeps the pairing, and `atem pair verify` retries. See AGENTS.md ("SSO auth") and [e2e-encryption.md](e2e-encryption.md#devices).
 - `atem pair verify` runs on the runtime's link, authenticated with the saved session. It first moves the pairing to a new binding in the next host trust generation (`pairing::rebind_for_verification`, durable before `verifyCommit`), because every ceremony reveals a fresh `host_channel_key`. The Astation, session and shared login stay.
 - Verification pins the account's signed device list. Relay only and the host route proof build on it. See [account-trust.md](account-trust.md).
+- `atem pair verify` on a pairing the Astation already verified prints `Already verified (safety code …)` and connects to nothing, whether or not a device list is pinned. **Planned (owner decision 2026-11-08), not implemented:** it runs the ceremony again when the verified pairing has no pinned list, so a host verified before device lists were pinned can pin one (see [Remote sessions need r9](#remote-sessions-need-r9-planned)).
 - `atem unpair` commits the next host trust generation, removes the pairing record and tells a running runtime, which drops that pairing's link with its attachments.
 
 ## Relay identity room and Stations
@@ -102,7 +105,29 @@ Transport security:
 - A relay link is WSS.
 - A direct link to a LAN or VPN address is plaintext `ws://`. The proof shows possession of the token. It doesn't encrypt the link or stop an active man-in-the-middle.
 - A session grant and `credentialSync` cross such a link in the clear.
-- r9 channel traffic (`atem-ch1`) is end-to-end encrypted on any link.
+- Atem doesn't authenticate Astation when it connects (see Authentication), so a direct link is open to an active attacker at pairing and afterwards, not only "during initial pairing". WSS certificate pinning is not implemented.
+- r9 channel traffic (`atem-ch1`) is end-to-end encrypted on any link, and both ends are authenticated inside the channel.
+- An r8 host (no device list) also sends session-v1, terminal-v1 and chat-v1 on this link, readable and forgeable by whatever ends the socket. **Planned (owner decision 2026-11-08), not implemented:** r8 is no longer served (next section).
+
+## Remote sessions need r9 (planned)
+
+**Planned (owner decision 2026-11-08), not implemented.** Atem serves remote sessions only over r9 (`atem-ch1`).
+
+Today:
+
+- A host with a pinned device list admits remote clients only through `atem-ch1` channels and refuses an r8 `hello` on the link.
+- A host without one (a pairing verified before device lists were pinned and not verified since) welcomes an r8 `hello` from the paired Astation on the link: `view` and `control` for 24 h, with session-v1, terminal-v1 and chat-v1 readable by the relay. The peer is not authenticated to Atem (Authentication, above), so the relay operator, a `ws://` attacker or a local listener on `127.0.0.1:8080` can take that role.
+
+Planned:
+
+- Every host refuses an r8 `hello`. The link has no session attachment of its own.
+- A host without a pinned list serves no remote client until one is pinned. Local agents, the terminal and the Astation operations (`atem pair`, `atem pair verify`, `atem cred …`, `credentialSync`, Station selection) are unaffected.
+- `atem pair verify` pins the list (`atem unpair`, then `atem pair`, also works).
+- `atem status` shows `Authorization: not authorized (no device list pinned; Atem serves remote sessions only over r9: run atem pair verify)`, and runtime.log gets a line at start and one per refused `hello`.
+- The clear relay push messages (`push_approval`, `push_resolved`) go; the sealed hints of r9 stay.
+- No Station change. Astation's apps already use r9. The timing needs Astation's agreement: an Astation that still reaches such a host over r8 stops working when this ships.
+
+The wire rules are in the r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md) ("No r8 admission").
 
 ## Station selection
 
@@ -152,7 +177,7 @@ Astation can pick the Station for this Atem. This is station-route v1, released 
 - It answers only the pinned Astation, non-interactively, with the connect path's proof (`AstationClient::answer_auth_required`, the shared `auth_proof`).
 - Success restores the link as a new attachment.
 - Denial, expiry, another `astation_id`, or no answer within 15 s leaves a notice and closes the socket for the normal reconnect. It never pairs.
-- An r8 attachment is authorized for 24 h. Then it is fenced, the link is dropped and the reconnect authenticates again. An r9 host keeps its link; each channel has its own lifetime.
+- An r8 attachment is authorized for 24 h. Then it is fenced, the link is dropped and the reconnect authenticates again. An r9 host keeps its link; each channel has its own lifetime. **Planned (owner decision 2026-11-08), not implemented:** with r8 gone only the channel lifetimes remain.
 
 ## Switching Stations and pairings
 

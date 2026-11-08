@@ -70,7 +70,10 @@ Unknown fields are ignorable everywhere; new fields are always optional.
    `permissions` (`view`, `control`), `authorization_ms_left`,
    `server_time`. Refuse a `welcome` without `revision: 8`.
    Only an attachment with `control` can submit, answer approvals or see
-   approval cards.
+   approval cards. **Planned (owner decision 2026-11-08), not implemented:**
+   the clear `hello` on the Astation link is refused by every host
+   (`unsupported_version`, `revision: 9`); only the r9 `hello` inside an
+   `atem-ch1` channel is welcomed, and r8's messages run unchanged inside it.
 2. `list` -> `sessions`, then `session_changed` events (`seq` per attachment;
    a gap or lower `runtime_epoch` rules are in session-v1 section 4).
 
@@ -456,6 +459,12 @@ A `kind:"approval"` submission, from chat with `approval` in place of `text`:
   `always_rules`), `deny` (optional `message`, <= 512 bytes, handed to the agent
   with the denial). `rule_id` only with `allow_always`; `message` only with
   `deny`; anything else is refused. A submit carries `text` or `approval`, never both.
+  **Planned (owner decision 2026-11-08), not implemented:** `message` is
+  accepted only from a principal that also holds `prompt` (a native member
+  with `control`, a service or browser grant with `prompt` in its ops);
+  from any other it is refused `invalid_request`, nothing recorded, the
+  approval still pending. A `deny` without `message` is always fine; show no
+  text field to a principal without `prompt`.
 - No lease: the binding's `lease_epoch` is optional and ignored (a stale one
   is fine), an answer never takes, renews or moves the lease, and `acquire`
   (in the payload or beside it) is refused `unsupported_version`. A phone
@@ -484,7 +493,7 @@ The final card carries the reason as `reason`.
 
 Over the verified link an r8 host sends the relay (not you) the messages
 below; a host with a device list (r9) sends sealed `push_hint`/`push_seen`
-instead (appendix "r9", §R9.9):
+instead (appendix "r9", §R9.9). The r8 messages:
 
 ```json
 {"type":"relay","data":{"v":1,"op":"push_approval","approval_id":"88888888-…","atem_device_id":"host-a",
@@ -493,6 +502,8 @@ instead (appendix "r9", §R9.9):
 ```
 
 Relays and apps use them for push notifications; collapse by `approval_id`.
+**Planned (owner decision 2026-11-08), not implemented:** these clear messages
+go with r8 hosts; only the sealed hints remain.
 `expires_at` is when the agent gives up (Claude 600 s, Codex 300 s). Best effort:
 approvals pending across a broker restart are released without
 `push_resolved`, so a notification may linger and a tap returns `stale_target`.
@@ -659,7 +670,8 @@ Ops: `hello`, `list`, chat `open`/`submit` or session-v1 `submit`
 - An r8 host has one native Astation link; compatibility mode has no resume
   (`hello` with `resume` is `unauthorized`), an attachment is authorized for
   24 h, then fenced and reconnected, and chat content is readable by the
-  relay. A host with a device list (r9, v0.8.0; `designs/account-trust.md`)
+  relay. (**Planned (owner decision 2026-11-08), not implemented:** no r8
+  host; a host without a pinned device list serves no chat at all.) A host with a device list (r9, v0.8.0; `designs/account-trust.md`)
   admits several devices, services and browsers at once, each in its own
   end-to-end `atem-ch1` channel the relay can't read.
 - Remote session launch (v0.8.2) only from launch profiles the host approved

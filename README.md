@@ -105,7 +105,11 @@ network). From the runtime it shows the session authorization
 Astation link (`connected via relay (<relay> as <atem id>)`, `connected
 locally`, `not connected (retrying)`) and the local agents (`2 running
 (claude ready, codex working)`); without a runtime all three say `no runtime
-running`.
+running`. **Planned (owner decision 2026-11-08), not implemented:** Atem
+serves remote sessions only over r9, so a pairing verified before device lists
+were pinned serves none until the device list is pinned. `atem pair verify`
+(which today answers `Already verified`) will pin it, and `Authorization` will
+say `not authorized (no device list pinned; …)`.
 
 ### Device keys (`atem cred`)
 
@@ -250,7 +254,11 @@ Every remote request names the exact session. On a verified host,
 Astation, your phone and approved services reach it over end-to-end
 encrypted channels checked against your account's signed device list. Keep
 Atem and Astation up to date together: an older Astation is refused until
-it is updated.
+it is updated. A host verified before device lists were pinned still accepts
+the old session protocol (r8) from its Astation link, which is not end to end
+and does not authenticate Astation to Atem. **Planned (owner decision
+2026-11-08), not implemented:** no host serves r8; such a host serves no
+remote client until `atem pair verify` pins a device list.
 
 Atem's own keys start with a prefix, Ctrl+] by default. Press it, then:
 
@@ -312,7 +320,11 @@ exactly this command in this folder, for the rest of this Codex process, kept
 by Atem; later runs of
 the very same command are allowed without asking and show as "auto allowed",
 and the rule can be revoked from Astation) or **Deny** (with an optional
-note for the agent).
+note for the agent). **Planned (owner decision 2026-11-08), not implemented:**
+the note is accepted only from a device or service that may also send prompts
+(your own devices with control can; a service scoped to approvals only
+denies without text), because the agent presents it to the model as your
+reason.
 Answering needs no control of the session: any of your devices that can
 control it answers, whoever is typing, and the first answer wins. The
 finished card shows how it ended. The terminal can
@@ -397,7 +409,16 @@ Anything that looks like a credential value is refused; save the
 credential's name, never its value. See `designs/atem-memory.md`.
 
 Works with end-to-end encryption on or off. When it is on, changes sync only
-while the device is unlocked (`atem cred unlock`); see below.
+while the device is unlocked (`atem cred unlock`); see below. **Planned (owner
+decision 2026-11-08), not implemented:** as a transition measure, facts and
+skills reach your agents' files (the managed blocks and skill directories) only
+while encryption is on, because with it off the relay could plant instructions
+there. With it off, Memory and skills still sync and `atem memory list` and
+`search` still work, but nothing synced is written into the agents' files (this
+machine's own facts too, so an account that is still off loses all injection
+until it is migrated), and `atem status` and the managed block say why. The
+measure ends when encryption becomes the only mode (see End-to-end encryption
+below).
 
 ### End-to-end encryption
 
@@ -421,6 +442,16 @@ Turning encryption off migrates shared data to plaintext; local Astation
 Keychain credentials keep their protection. The local `knowledge.db` stays
 plain text (mode 0600). See the [user guide](docs/credentials.md) and
 [protocol design](designs/e2e-encryption.md).
+
+**Planned (owner decision 2026-11-08), not implemented:** encryption stops
+being optional for memory, skills and vault notes. New accounts start with it
+on; accounts still off get a notice and are then migrated (content that only
+came from the relay stays held back from your agents until its author device
+republishes it or you approve it in Astation); the relay stops
+accepting plain text; and the Astation setting becomes a status display (no
+Turn Off). Alongside come signed writes and a check that a pulled row never
+rolls back what Atem already holds, and the encrypted path gets performance
+budgets, set from measurements, that block a release when broken. It needs Astation's agreement; tracked in Atem issue #130.
 
 ### Dev Servers
 
@@ -543,9 +574,15 @@ continues when Wi-Fi is disabled, and LAN operation needs no relay once the IP i
 configured.
 
 Direct LAN currently uses plaintext `ws://`. Authentication prevents a stolen
-session ID from being sufficient, but it does not stop traffic inspection or an
-active LAN attacker during initial pairing. Treat direct LAN as pre-production
-until WSS certificate pinning is implemented. How Atem connects to Astation and authenticates is described in
+session ID from being sufficient, but it proves Atem to Astation only: Atem does
+not authenticate Astation in return. It does not stop traffic inspection or an
+active LAN attacker, at pairing or afterwards, and whatever ends the socket (a
+relay operator, a LAN attacker, another process listening on
+`127.0.0.1:8080`) can answer as Astation. Treat direct LAN as pre-production
+until WSS certificate pinning is implemented. **Planned (owner decision
+2026-11-08), not implemented:** remote sessions only over r9 (end-to-end
+channels that authenticate both ends), so session traffic no longer rests on
+this link. How Atem connects to Astation and authenticates is described in
 [`designs/astation-connection.md`](designs/astation-connection.md).
 
 ### TUI Modes

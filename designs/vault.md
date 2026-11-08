@@ -65,6 +65,17 @@ atem C ─┘◀─────────────────────�
   re-read. No content rides the WS.
 - **atem-mediated**: the agent's only interface is the `atem vault` CLI. atem
   holds the session credential and the client id; the agent never sees them.
+- **Not injected**: vault content is never written into an agent's files. An
+  agent gets it only by running `atem vault read`, so the planned transition
+  rule that Memory and skills are injected only while encryption is on
+  (**Planned (owner decision 2026-11-08), not implemented:**
+  [atem-memory.md](atem-memory.md#injection-into-agents-requires-encryption-on-planned))
+  doesn't cover vault reads. **Planned (owner decision 2026-11-08), not
+  implemented:** vault notes are covered by encryption becoming the only mode
+  ([e2e-encryption.md](e2e-encryption.md#encryption-becomes-the-only-mode-planned)),
+  with the anti-rollback check applied to entry versions (reads keep no local
+  state today) and the vault's latency and migration throughput under the
+  performance budgets.
 
 ## Auth model
 

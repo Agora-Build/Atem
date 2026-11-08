@@ -38,7 +38,10 @@ implemented)", and a design with nothing built says so in its status line.
 |---|---|
 | [agent-hosting.md](agent-hosting.md) | OS service and boot startup, launch when work arrives, durable delivery through the Station (outbox, replay, offline senders) |
 | [build-by-talk.md](build-by-talk.md) | Build by Talk: get the whole project clear by talking, with tool calls to the coding agents (Astation and Atem; nothing built) |
-| [e2e-encryption.md](e2e-encryption.md) | Credentials (`atem cred get` and the rest), device-signed writes, the recovery secret, auto-unlock |
+| [e2e-encryption.md](e2e-encryption.md) | Owner decision 2026-11-08: encryption as the only mode for memory, skills and vault (new accounts on, forced migration of accounts still off with relay-sourced content quarantined until its author republishes it or the owner approves it in Astation, relay refuses plain text, `off` and `disabling` removed), signed writes and an anti-rollback check on pulled rows (the replay and rollback residual of On), and performance budgets that block a release when broken. Also credentials (`atem cred get` and the rest), the recovery secret, auto-unlock |
+| [atem-memory.md](atem-memory.md) | Owner decision 2026-11-08, a transition measure until encryption is the only mode: facts and skills are injected into agents' files only while the account's encryption is On; with it off they still sync and stay searchable |
+| [protocol/atem-session-v1.md](protocol/atem-session-v1.md) | Owner decisions 2026-11-08: remote sessions only over r9 (no r8 on any host; a host without a pinned device list serves none), and approval deny text only from principals that also hold `prompt` |
+| [astation-connection.md](astation-connection.md) | Remote sessions need r9: Atem doesn't authenticate Astation on the link, so session traffic stops riding on it (owner decision 2026-11-08) |
 | [agora-account-grouping.md](agora-account-grouping.md) | Proposed: merge Astations under one Agora login (opt-in) |
 
 ## Test data

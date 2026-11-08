@@ -12,6 +12,10 @@ lease-free approval answers (`approval.lease_free`, §G), the submitter
 principal and its durable control fence (§H) and one admission persistence
 rule (§I, which removes §6's double-I/O exception). Without a device list
 Atem's host speaks only r8: a `hello` without `revision: 8` is refused.
+**Planned (owner decision 2026-11-08), not implemented:** no host speaks r8
+on the Astation link. Remote sessions are served only over r9 (appendix "r9",
+"No r8 admission"), and r8's rules stay as the inner protocol the channel
+carries.
 The shared fixtures and where they run: [README.md](README.md).
 **r9 (signed off 2026-10-19; implemented by Atem 2026-10-20, PR #89, merged
 into `main` and released in v0.8.0 on 2026-10-31; joint live tests with
@@ -109,7 +113,9 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
   Astation already verified with this host. In this mode: no resume (§3), no
   browser clients, no account-wide native access, and no claim of relay
   confidentiality. Admission fails closed; no placeholder trust decision is
-  exposed as production authorization.
+  exposed as production authorization. **Planned (owner decision 2026-11-08),
+  not implemented:** compatibility mode is removed with r8 admission (appendix
+  "r9", "No r8 admission").
 - **One session authority, no legacy paths** (r6). Atem and Astation are
   updated together; there is no backward compatibility. Every remote mutation
   of a session — terminal input/resize/stop, chat submit, interrupt — is a
@@ -1004,6 +1010,10 @@ the refusal is explicit at admission rather than a silent misreading later.
   one opens), the `status.page` marker (replaced by `history_end`), a
   `hello` without `revision`, and `acquire` on an approval answer (r7 §6a;
   in the payload or beside it, §G).
+- **Planned (owner decision 2026-11-08), not implemented:** an r8 `hello` on
+  the Astation link is refused by every host, with or without a device list.
+  §A–§I keep their force inside an r9 channel (appendix "r9", "No r8
+  admission").
 
 ### B. History pages in the ordered conversation stream
 
@@ -1404,6 +1414,26 @@ moves it.
   as for `approval_rule_revoke` (r7.3): a stale epoch or someone else's
   isn't refused. chat-v1 answers (`submit` with `approval`) follow the same
   rules.
+- **Planned (owner decision 2026-11-08), not implemented: `message` needs
+  `prompt`.** The text of a `deny` reaches the agent as the denial reason (the
+  hook prints `{"behavior":"deny","message":…}`, and Claude Code shows the
+  model that message: [account-trust.md](../account-trust.md) §6a). Today any
+  principal that may answer approvals can attach up to 512 bytes of its own
+  words, including one that holds `approval` but not `prompt` (a scoped
+  service, a browser grant), which turns approvals into a prompt channel.
+  Planned: a `deny` carrying `message` is admitted only from a principal that
+  also holds `prompt`: a native member with `control` (it holds every op), a
+  service whose `scope.ops` has `prompt`, a browser grant whose `ops` has
+  `prompt`. From any other principal the request is refused `invalid_request`,
+  like the other field-rule refusals of §F: nothing is recorded and the
+  approval stays pending. The same `deny` without `message` is admitted (the
+  agent is told "Denied from Astation"). The text is refused, not dropped: the
+  payload digest covers it, and a sender must not believe its words reached
+  the agent. The check sits with the op scope check (R9.6) and comes after
+  it, so a principal without `approval` is still `forbidden`; it applies to
+  the session-v1 and the chat-v1 form alike. Clients show no text field to
+  such principals. This touches the scope contract, so it needs Astation's
+  agreement.
 - **Admission**, in order: a duplicate `request_id` returns its receipt
   (view only); `control` → `forbidden` (a verified attachment with
   `control`; view-only ones get no card and can't answer); a session that
@@ -1709,7 +1739,9 @@ crash before the grant: no lease, and after the restart `rejected`
 Status: **implemented by Atem and released in v0.8.0** (2026-10-31:
 `crates/atem-client`, its bindings and the runtime host; PR #89). A host
 with a pinned device list speaks r9 and refuses r8; one without speaks r8
-(above).
+(above). **Planned (owner decision 2026-11-08), not implemented:** every host
+refuses r8, and a host without a pinned list serves no remote client
+("No r8 admission", below).
 r9 adds remote clients that reach Atem independently of the Mac: native
 members (Mac, iPhone, iPad, Android), scoped bots (`service`) and short
 browser grants, all over one end-to-end channel (`atem-ch1`) whose
@@ -1737,6 +1769,50 @@ Mac is the genesis member using the same channel as every other client
 (over Atem's link to the relay or to Astation's :8080, inside the
 channel envelope of R9.7a). Its link stays for pairing,
 `cred unlock`, `credentialSync`, key grants and relay messages.
+
+**No r8 admission.** *Planned (owner decision 2026-11-08), not implemented.*
+Atem will serve remote sessions only over r9.
+
+Today a host with no pinned device list (a pairing verified before device
+lists were pinned and not verified since) still welcomes an r8 `hello` on the
+Astation link: one attachment for the paired Astation (`link_principal`), with
+`view` and `control` (`link_permissions`), authorized for 24 h. That link is
+not end to end through the relay, and Atem doesn't authenticate Astation on
+it. Atem answers the challenge and then accepts `authenticated` or
+`auth{granted}` with no proof in return (`auth_response_saving`), and takes the
+challenge's `transport` on the peer's word. So the relay operator, an active
+attacker on a direct `ws://` link, or another local listener on
+`127.0.0.1:8080` can pose as the paired Astation for session-v1, terminal-v1
+and chat-v1. Hosts with a device list are not exposed this way: their clients
+come through `atem-ch1`, which authenticates both ends.
+
+Planned:
+
+- **Every host refuses an r8 `hello`**, as a host with a device list does
+  today (`unsupported_version`, `revision: 9`), with a `detail` that names a
+  missing pin where there is none. The link then has no session authority of
+  its own, so §H's link principal (`astation:<account>:<astation id>`) and
+  the 24 h link attachment go. Compatibility mode (§0, §3) goes with them.
+- **A host without a pinned list serves no remote client** until one is
+  pinned: r9 channels need the list, and r8 is gone. Local agents, the
+  terminal and the Astation operations (`atem pair`, `atem pair verify`,
+  `atem cred …`) are unaffected.
+- **`atem pair verify` pins one.** Today it prints `Already verified` and does
+  nothing for a pairing verified earlier. It will run the ceremony again when
+  the verified pairing has no pinned list (`atem unpair`, then `atem pair`,
+  also works).
+- **Atem says why.** `atem status` shows `Authorization: not authorized (no
+  device list pinned; Atem serves remote sessions only over r9: run atem pair
+  verify)`, and runtime.log gets one line when the runtime starts (it already
+  has one per `hello`, welcomed or refused).
+- **The clear relay push** (`push_approval`, `push_resolved`, sent by r8 hosts
+  only) goes with r8; the sealed `push_hint` and `seen` of R9.9 stay.
+- **r8's wire contract stays.** §A–§I are the inner protocol r9 carries
+  inside the channel (R9 "What r9 keeps"); only the admission of an r8 `hello`
+  on the link goes.
+- **No Station change.** Astation's apps already reach hosts over r9 channels.
+  The timing needs Astation's agreement: an Astation that still reaches such
+  a host over r8 stops working when it ships.
 
 ### R9.1 Encodings and signed objects
 
@@ -2621,7 +2697,9 @@ required), `prompt` (prompt submits, with or without §F acquire),
 `interrupt`, `stop`, `terminal` (terminal input/resize), `approval`
 (§G answers), `rule_revoke`. Lease ops (`acquire`/`renew`/`release`)
 need one of `prompt`, `interrupt`, `stop`, `terminal`. A request outside
-the ops is `forbidden`.
+the ops is `forbidden`. **Planned (owner decision 2026-11-08), not
+implemented:** a `deny` with `message` also needs `prompt` (§G, "`message`
+needs `prompt`"); without it the request is `invalid_request`.
 
 **Service scope:** `{"hosts":[host_id] (1–16), "projects"?:["h1.<kid>.<64
 hex>"] (≤ 64; memory sync's keyed project hash), "sessions"?:["ses-…"] (≤ 64), "ops":[…]}`; an absent list
@@ -2881,7 +2959,9 @@ id only, distinct from the cryptographic `channel_id = hex(th4[0..16])`
    `channel` is demultiplexed before any other handling of the link's
    messages. Once a device list exists (R9.3), r8 admission is refused
    (`hello` → `unsupported_version`, `revision: 9`): neither the link
-   itself nor routing possession bypasses r9 admission.
+   itself nor routing possession bypasses r9 admission. **Planned (owner
+   decision 2026-11-08), not implemented:** it is refused whether or not a
+   list exists.
 
 **Bounds** (each exceeded bound closes the channel, or refuses a new
 one, with a `close` naming the reason; records are never silently
