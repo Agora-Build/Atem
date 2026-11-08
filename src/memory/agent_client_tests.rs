@@ -410,6 +410,27 @@ fn a_stateless_request_whose_connection_drops_unanswered_is_sent_again() {
     assert_eq!(client.traffic().connections(), 2);
 }
 
+/// A connection that never answered (here: a client without a build check,
+/// so its first request is the connection's first) may be one the agent
+/// never served at all: even a stateless request dropped on it is an error,
+/// never sent again.
+#[test]
+fn a_request_on_a_connection_that_never_answered_is_never_sent_again() {
+    let dir = short_dir();
+    let socket = start_agent(dir.path(), own_uid());
+    let proxy = Proxy::start(dir.path(), socket);
+    let client = CredAgentClient::at(proxy.socket.clone());
+    proxy.swallow_next();
+    let error = format!("{:#}", client.pending_rotation().err().unwrap());
+    assert!(error.contains("closed the connection"), "{error}");
+    let (seen, passed) = (proxy.seen(), proxy.passed());
+    assert_eq!(Proxy::count(&seen, "pending_rotation"), 1, "{seen:?}");
+    assert_eq!(Proxy::count(&passed, "pending_rotation"), 0, "{passed:?}");
+    // The next request works on a new connection.
+    assert_eq!(client.pending_rotation().unwrap(), None);
+    assert_eq!(Proxy::count(&proxy.passed(), "pending_rotation"), 1);
+}
+
 #[test]
 fn a_request_that_changes_the_agent_is_never_sent_again() {
     let dir = short_dir();
