@@ -1462,11 +1462,12 @@ async fn perf_2c_sync_against_a_relay_with_latency() {
     let relay = Relay::start();
     let profiles = Profiles::new(EncryptionMode::On);
     let scratch = tempfile::tempdir().unwrap();
+    const REPS: usize = 7;
     println!(
-        "\n## 2c. Sync cycle against a relay that answers each request after a fixed latency, file store, median of 3"
+        "\n## 2c. Sync cycle against a relay that answers each request after a fixed latency, file store; {REPS} reps, off and on interleaved; medians, and the median of the paired differences (on − off, same rep)"
     );
     println!(
-        "| latency ms | scenario | N | mode | total ms | added vs off ms | added % | agent ms | Crypt reqs (seal / open) | HTTP reqs |"
+        "| latency ms | scenario | N | off ms | on (production) ms | added ms (median of pairs) | added % | agent ms | Crypt reqs (seal / open) | HTTP reqs |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|");
     for latency in [5u64, 20] {
@@ -1476,34 +1477,43 @@ async fn perf_2c_sync_against_a_relay_with_latency() {
             (Scenario::Pull, 1000),
             (Scenario::Pull, 5000),
         ] {
-            let mut off_total = Duration::ZERO;
-            for mode in [Mode::Off, Mode::Production] {
-                let mut runs = Vec::new();
-                for rep in 0..3 {
-                    let work = scratch.path().join(format!("{rep}"));
-                    runs.push(sync_run(&relay, &profiles, mode, n, scenario, &work, true).await);
-                }
-                let run = median_run(runs);
-                if mode == Mode::Off {
-                    off_total = run.total;
-                }
-                let added = run.total.as_secs_f64() - off_total.as_secs_f64();
-                let label = match scenario {
-                    Scenario::PushPull => "push+pull+apply",
-                    _ => "pull+apply (other device's facts)",
-                };
-                println!(
-                    "| {latency} | {label} | {n} | {mode:?} | {:.1} | {:.1} | {:.1}% | {:.1} | {} ({} / {}) | {} |",
-                    ms(run.total),
-                    added * 1e3,
-                    added / off_total.as_secs_f64() * 100.0,
-                    ms(run.agent),
-                    run.crypts,
-                    run.crypts - run.open_crypts,
-                    run.open_crypts,
-                    run.http
-                );
+            let (mut offs, mut ons, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+            for rep in 0..REPS {
+                let work = scratch.path().join(format!("{rep}"));
+                let off = sync_run(&relay, &profiles, Mode::Off, n, scenario, &work, true).await;
+                let on = sync_run(
+                    &relay,
+                    &profiles,
+                    Mode::Production,
+                    n,
+                    scenario,
+                    &work,
+                    true,
+                )
+                .await;
+                pairs.push(on.total.as_secs_f64() - off.total.as_secs_f64());
+                offs.push(off);
+                ons.push(on);
             }
+            pairs.sort_by(f64::total_cmp);
+            let added = pairs[REPS / 2];
+            let (off, on) = (median_run(offs), median_run(ons));
+            let label = match scenario {
+                Scenario::PushPull => "push+pull+apply",
+                _ => "pull+apply (other device's facts)",
+            };
+            println!(
+                "| {latency} | {label} | {n} | {:.1} | {:.1} | {:.1} | {:.1}% | {:.1} | {} ({} / {}) | {} |",
+                ms(off.total),
+                ms(on.total),
+                added * 1e3,
+                added / off.total.as_secs_f64() * 100.0,
+                ms(on.agent),
+                on.crypts,
+                on.crypts - on.open_crypts,
+                on.open_crypts,
+                on.http
+            );
         }
     }
     relay.set_latency(Duration::ZERO);
