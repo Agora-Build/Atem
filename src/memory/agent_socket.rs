@@ -256,6 +256,7 @@ fn refused(error: &anyhow::Error) -> Response {
 
 const UNENCODABLE: &[u8] =
     b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent could not encode its reply\"}";
+const NOT_CRYPTED: &[u8] = b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent answered a Crypt request with another kind of reply\"}";
 
 /// The reply to the line `line`; whether it was a lock that stops the agent;
 /// and whether it was a `status` that told the client this connection reads
@@ -304,7 +305,7 @@ fn respond_frame(agent: &Mutex<CredAgent>, head: Head, body: SecretBytes) -> Res
     drop(body);
     Ok(match agent.call(Request::Crypt { astation_id, ops }) {
         Ok(Reply::Crypted { results }) => agent_frame::crypted_reply(&results),
-        Ok(_) => agent_frame::json_reply(UNENCODABLE),
+        Ok(_) => agent_frame::json_reply(NOT_CRYPTED),
         // A refusal carries no secret.
         Err(error) => match serde_json::to_vec(&refused(&error)) {
             Ok(json) => agent_frame::json_reply(&json),
@@ -1443,8 +1444,6 @@ pub struct CredAgentClient {
     /// The connection kept between requests; holding it is holding the
     /// right to send the next request.
     link: Mutex<Link>,
-    /// How long a connection may sit idle and still carry a request.
-    reuse_idle: Duration,
     #[cfg(test)]
     traffic: Traffic,
 }
@@ -1469,7 +1468,6 @@ impl CredAgentClient {
             older_build: Mutex::new(None),
             runtime_check: false,
             link: Mutex::new(Link::default()),
-            reuse_idle: REUSE_IDLE,
             #[cfg(test)]
             traffic: Traffic::default(),
         }
@@ -1616,11 +1614,13 @@ impl CredAgentClient {
         Some(usize::try_from(peeked).unwrap_or(0))
     }
 
-    /// Replaces a connection idle for `idle` before its next request.
+    /// Moves the kept connection's last reply `by` into the past, as if it
+    /// had sat idle that much longer (tests move the clock, never wait).
     #[cfg(test)]
-    pub(crate) fn reusing_for(mut self, idle: Duration) -> Self {
-        self.reuse_idle = idle;
-        self
+    pub(crate) fn idle_for(&self, by: Duration) {
+        if let Some(conn) = &mut self.link.lock().unwrap().conn {
+            conn.idle_since = conn.idle_since.checked_sub(by).unwrap();
+        }
     }
 
     /// Expects the listener to run as `uid` instead of this user.
@@ -1884,7 +1884,7 @@ impl CredAgentClient {
         let Some(conn) = &link.conn else {
             return;
         };
-        if conn.idle(self.reuse_idle) {
+        if conn.idle(REUSE_IDLE) {
             link.conn = None;
         } else if conn.closed() {
             if conn.replies == 1 {

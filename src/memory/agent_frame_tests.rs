@@ -181,6 +181,35 @@ fn frames_carry_the_largest_batches_and_bigger_ones_go_as_lines() {
     drop(device);
 }
 
+/// The largest reply to a request within the bounds: one seal whose frame
+/// body is exactly 6 MiB (the most one op may carry) comes back as an `e1.`
+/// text of about 8 MiB, which the client reads through its reply check
+/// (`agent_frame::reply_head`) as a frame.
+#[test]
+fn the_largest_seal_reply_passes_the_reply_check() {
+    let dir = short_dir();
+    let (device, socket) = served_device(dir.path());
+    let proxy = Proxy::start(dir.path(), socket);
+    let client = framing_client(&proxy.socket);
+    // The body: the astation id, then the op's tag and its three fields,
+    // each field with a 4-byte length.
+    let plain = (6 << 20) - (4 + ASTATION_ID.len() + 1 + (4 + 1) + (4 + 1) + 4);
+    let op = CryptOp::seal("r", "f", &vec![7; plain]);
+    let request = agent_frame::crypt_request(ASTATION_ID, std::slice::from_ref(&op)).unwrap();
+    assert_eq!(request.len() - agent_frame::HEADER, 6 << 20);
+    let sealed = client
+        .crypt(ASTATION_ID, vec![op])
+        .unwrap()
+        .remove(0)
+        .into_text()
+        .unwrap();
+    assert_eq!(sealed.len(), crate::memory::account_keys::sealed_len(plain));
+    assert!(sealed.len() > (8 << 20) - (1 << 10), "{}", sealed.len());
+    assert!(sealed.starts_with(&format!("e1.{KID}.")));
+    assert_eq!((client.traffic().frames(), proxy.frames()), (1, 1));
+    drop(device);
+}
+
 /// A seal's or hash's text.
 fn text_of(result: &CryptOut) -> &str {
     match result {

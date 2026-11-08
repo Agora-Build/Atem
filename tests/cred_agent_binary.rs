@@ -189,7 +189,8 @@ fn the_real_agent_answers_several_requests_on_one_connection() {
 /// and one keyed hash (tag 3) of `value`, each field a 4-byte length first.
 fn keyed_hash_frame(kind: u8, value: &[u8]) -> Vec<u8> {
     let field = |bytes: &[u8]| [&(bytes.len() as u32).to_le_bytes()[..], bytes].concat();
-    let body = [field(b"astation-1"), vec![3], field(value)].concat();
+    // 11 bytes: no length byte of the frames these tests send is a newline.
+    let body = [field(b"astation-01"), vec![3], field(value)].concat();
     let mut frame = vec![0xFF, kind];
     frame.extend_from_slice(&1u32.to_le_bytes());
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -259,24 +260,34 @@ fn the_real_agent_reads_crypt_frames_on_a_connection_whose_status_offered_them()
     (&stream).write_all(&keyed_hash_frame(9, b"x")).unwrap();
     let mut byte = [0u8; 1];
     assert!(matches!(replies.read(&mut byte), Ok(0) | Err(_)));
-    // A connection that never agreed reads the same bytes as a line.
+    // A connection that never agreed reads the same bytes as one line (the
+    // frame holds no newline byte of its own): one refusal.
     let other = UnixStream::connect(&socket).unwrap();
     other
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let mut frame = keyed_hash_frame(1, b"x");
+    assert!(!frame.contains(&b'\n'), "{frame:?}");
     frame.push(b'\n');
     (&other).write_all(&frame).unwrap();
+    let mut other_replies = std::io::BufReader::new(&other);
     line.clear();
-    std::io::BufReader::new(&other)
-        .read_line(&mut line)
-        .unwrap();
+    other_replies.read_line(&mut line).unwrap();
     let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(reply["ok"], false, "{reply}");
     assert!(
         reply["error"].as_str().unwrap().contains("not JSON"),
         "{reply}"
     );
+    // The next reply answers the next line: nothing else was queued.
+    (&other)
+        .write_all(b"{\"op\":\"status\",\"v\":2}\n")
+        .unwrap();
+    line.clear();
+    other_replies.read_line(&mut line).unwrap();
+    let status: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["reply"]["frames"], 1, "{status}");
     // The agent still serves.
     assert_eq!(status_at(&socket).unwrap()["ok"], true);
 }

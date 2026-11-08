@@ -677,6 +677,9 @@ async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 }
 
 /// A task's handle that aborts it when dropped: its result is never used.
+/// Aborting stops the task at its next await; work it handed to the blocking
+/// pool (an open in flight, `cred_agent::blocking`) still runs to its end,
+/// and only its result is dropped.
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
@@ -705,8 +708,10 @@ impl<R> FetchedPage<R> {
 /// of its own as it arrives (F2). At most one page beyond the one being
 /// applied is fetched or opened: a page is fetched only once the page two
 /// before it is committed (`permits`, one given back per committed page).
-/// Dropping it aborts the fetching and the opening; the pages not applied
-/// are discarded.
+/// Dropping it aborts the fetching (a GET in flight is cancelled) and stops
+/// waiting for the openings: an open already running on the blocking pool
+/// runs to completion, holding the cred agent connection for that one
+/// request, and its result is dropped. The pages not applied are discarded.
 struct PagesInFlight<R> {
     pages: tokio::sync::mpsc::Receiver<std::result::Result<FetchedPage<R>, ApiError>>,
     permits: std::sync::Arc<tokio::sync::Semaphore>,

@@ -397,13 +397,16 @@ fn a_connection_reused_after_the_idle_limit_is_replaced() {
     let dir = short_dir();
     let socket = start_agent(dir.path(), own_uid());
     let proxy = Proxy::start(dir.path(), socket);
-    let client = CredAgentClient::at(proxy.socket.clone()).reusing_for(Duration::from_millis(100));
+    let client = CredAgentClient::at(proxy.socket.clone());
     assert_eq!(client.pending_rotation().unwrap(), None);
+    assert_eq!(client.pending_rotation().unwrap(), None);
+    // Idle for half the limit: kept. The clock is moved, never waited for.
+    client.idle_for(REUSE_IDLE / 2);
     assert_eq!(client.pending_rotation().unwrap(), None);
     assert_eq!(proxy.connections(), 1);
     // Idle past the limit (kept well under the agent's own): replaced
     // before anything is written.
-    std::thread::sleep(Duration::from_millis(150));
+    client.idle_for(REUSE_IDLE);
     client.lock_keys().unwrap();
     assert_eq!(proxy.connections(), 2);
     assert_eq!(proxy.passed(), proxy.seen(), "nothing sent twice");
