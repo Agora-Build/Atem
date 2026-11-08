@@ -1,8 +1,8 @@
 //! (test-only) Kept connections to the cred agent: one client per agent in a
 //! process (`shared`), one connection kept between requests, the build check
 //! on each new connection, which requests go again when a connection drops,
-//! agents that answer one request per connection, and what a kept
-//! connection retains (designs/e2e-encryption.md "Keys on disk (atem)").
+//! the clean error an agent that closes after each reply gets, and what a
+//! kept connection retains (designs/e2e-encryption.md "Keys on disk (atem)").
 use super::tests::{
     OTHER_DONE, cred_agent_process, eventually, make_private, own_uid, short_dir, sock,
     start_agent, start_scripted_agent, start_stoppable_agent,
@@ -348,7 +348,6 @@ fn a_connection_the_agent_closed_while_idle_is_replaced_before_sending() {
     let socket = start_agent(dir.path(), own_uid());
     let proxy = Proxy::start(dir.path(), socket);
     let client = CredAgentClient::at(proxy.socket.clone());
-    // Two answers on one connection: this agent keeps connections.
     assert_eq!(client.pending_rotation().unwrap(), None);
     assert_eq!(client.pending_rotation().unwrap(), None);
     // The agent drops connections idle for a minute.
@@ -371,25 +370,6 @@ fn a_connection_the_agent_closed_while_idle_is_replaced_before_sending() {
         ]
     );
     assert_eq!(proxy.passed(), proxy.seen(), "nothing sent twice");
-    assert!(
-        !client.one_per_connection(),
-        "an agent that keeps connections"
-    );
-}
-
-#[test]
-fn a_request_that_changes_the_agent_goes_where_it_answered_twice() {
-    let dir = short_dir();
-    let socket = start_agent(dir.path(), own_uid());
-    let proxy = Proxy::start(dir.path(), socket);
-    let client = CredAgentClient::at(proxy.socket.clone());
-    assert_eq!(client.pending_rotation().unwrap(), None);
-    // One answer on this connection so far: a status proves the agent
-    // keeps it before the lock goes there.
-    client.lock_keys().unwrap();
-    client.lock_keys().unwrap();
-    assert_eq!(proxy.seen(), ["pending_rotation", "status", "lock", "lock"]);
-    assert_eq!(proxy.connections(), 1);
 }
 
 #[test]
@@ -428,10 +408,6 @@ fn a_stateless_request_whose_connection_drops_unanswered_is_sent_again() {
     assert_eq!(proxy.passed(), ["pending_rotation"; 3]);
     assert_eq!(proxy.connections(), 2);
     assert_eq!(client.traffic().connections(), 2);
-    assert!(
-        !client.one_per_connection(),
-        "it answered twice on one connection"
-    );
 }
 
 #[test]
@@ -450,42 +426,9 @@ fn a_request_that_changes_the_agent_is_never_sent_again() {
     let (seen, passed) = (proxy.seen(), proxy.passed());
     assert_eq!(Proxy::count(&seen, "lock"), 1, "{seen:?}");
     assert_eq!(Proxy::count(&passed, "lock"), 0, "{passed:?}");
-    assert!(
-        !client.one_per_connection(),
-        "an agent that answered twice on the connection stopped or restarted"
-    );
     // The next request works on a new connection.
     client.lock_keys().unwrap();
     assert_eq!(Proxy::count(&proxy.passed(), "lock"), 1);
-}
-
-#[test]
-fn a_switch_to_a_connection_per_request_ends_once_the_agent_answers_twice() {
-    let dir = short_dir();
-    let socket = start_agent(dir.path(), own_uid());
-    let proxy = Proxy::start(dir.path(), socket);
-    let client = CredAgentClient::at(proxy.socket.clone()).checking_build(build_id());
-    // The connection drops right after its only reply (the build check),
-    // as an agent that stops then, or one that answers once per
-    // connection, would do.
-    proxy.swallow_ops("pending_rotation", 1);
-    assert_eq!(client.pending_rotation().unwrap(), None);
-    // The new connection was checked, and a second status there showed an
-    // agent that keeps connections: the request went there.
-    assert_eq!(
-        proxy.seen(),
-        [
-            "status",
-            "pending_rotation",
-            "status",
-            "status",
-            "pending_rotation"
-        ]
-    );
-    assert!(!client.one_per_connection());
-    assert_eq!(client.pending_rotation().unwrap(), None);
-    assert_eq!(proxy.connections(), 2);
-    assert_eq!(client.traffic().probes(), 2);
 }
 
 #[test]
@@ -495,7 +438,8 @@ fn a_stateless_request_goes_at_most_once_more() {
     let proxy = Proxy::start(dir.path(), socket);
     let client = CredAgentClient::at(proxy.socket.clone()).checking_build(build_id());
     assert_eq!(client.pending_rotation().unwrap(), None);
-    // Dropped on the kept connection, then again on the new one.
+    // Dropped on the kept connection, then again on the new (checked) one:
+    // written twice, never a third time.
     proxy.swallow_ops("pending_rotation", 2);
     let error = format!("{:#}", client.pending_rotation().err().unwrap());
     assert!(error.contains("closed the connection"), "{error}");
@@ -575,7 +519,8 @@ fn a_client_reconnects_to_a_restarted_agent_process_and_checks_it_again() {
 }
 
 /// An agent that closes every connection after its first reply (no released
-/// build does), answering `status` as this build; the ops of the request
+/// build does: v0.6.11 to v0.8.3 all serve several requests per
+/// connection), answering `status` as this build; the ops of the request
 /// lines it read.
 fn start_one_reply_agent(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
     let socket = sock(&dir.join("run"));
@@ -609,47 +554,30 @@ fn start_one_reply_agent(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
 }
 
 #[test]
-fn an_agent_that_answers_one_request_per_connection_gets_a_connection_per_request() {
-    // As `autostart` makes clients (it may start an agent, never needed
-    // here, and checks the build), and a client without either; a request
-    // that changes the agent first, and a stateless one first.
-    for (checks, change_first) in [(true, true), (true, false), (false, true), (false, false)] {
-        let dir = short_dir();
-        let (socket, read) = start_one_reply_agent(dir.path());
-        let mut client = CredAgentClient::with_launcher(
-            socket,
-            Box::new(|| -> Result<()> { panic!("an agent answers") }),
-        );
-        if checks {
-            client = client.checking_build(build_id());
-        }
-        let mut sent = Vec::new();
-        if change_first {
-            client.lock_keys().unwrap();
-            sent.push("lock");
-        }
-        for _ in 0..3 {
-            assert_eq!(client.pending_rotation().unwrap(), None);
-            client.lock_keys().unwrap();
-            sent.extend(["pending_rotation", "lock"]);
-        }
-        assert!(client.one_per_connection());
-        let read = read.lock().unwrap().clone();
-        let requests: Vec<&String> = read.iter().filter(|op| *op != "status").collect();
-        // Each request read once, in order.
-        assert_eq!(requests, sent, "{read:?}");
-        if checks {
-            // Each one on a connection of its own, after the build check on
-            // a new connection.
-            for (at, op) in read.iter().enumerate() {
-                if op != "status" {
-                    assert!(at > 0 && read[at - 1] == "status", "{read:?}");
-                }
-            }
-        } else {
-            assert_eq!(read.len(), sent.len(), "{read:?}");
-        }
-    }
+fn an_agent_that_closes_after_each_reply_gets_a_clean_error() {
+    // As `autostart` makes clients: it may start an agent (never needed
+    // here) and checks the build on each new connection. The build check
+    // takes each connection's only reply, so every request after it fails,
+    // promptly, and one that changes the agent is never sent again.
+    let dir = short_dir();
+    let (socket, read) = start_one_reply_agent(dir.path());
+    let client = CredAgentClient::with_launcher(
+        socket,
+        Box::new(|| -> Result<()> { panic!("an agent answers") }),
+    )
+    .checking_build(build_id());
+    let started = std::time::Instant::now();
+    let error = format!("{:#}", client.lock_keys().err().unwrap());
+    assert!(error.contains("closed the connection"), "{error}");
+    let error = format!("{:#}", client.pending_rotation().err().unwrap());
+    assert!(error.contains("closed the connection"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5), "no hang");
+    // The agent read build checks (and the statuses that explain the
+    // errors) only: the lock never reached it, let alone twice. The
+    // stateless request was written twice (once more, as for any agent).
+    let read = read.lock().unwrap().clone();
+    assert!(read.iter().all(|op| op == "status"), "{read:?}");
+    assert_eq!(client.traffic().probes(), 3, "a check per new connection");
 }
 
 /// Whether `needle` occurs in `bytes`.

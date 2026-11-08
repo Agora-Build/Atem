@@ -478,22 +478,20 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   checks the build (`status`) once per connection, before its first request,
   since a new connection may reach a restarted agent. A connection idle for
   30 s, or one the agent has closed, is replaced before anything is written
-  on it. A request that changes the agent goes only on a new connection or
-  one the agent has answered twice on; on a connection with one answer the
-  agent first answers a `status` there. An agent that closes a connection
-  after its only answer then gets each request on a connection of its own,
-  after the build check on a new connection, until it answers twice on one
-  connection again. When a connection that had already answered at least
-  once (the build check's `status` counts) drops after a request was written
-  but before any byte of its reply, only a request that leaves the agent as
-  it was (`status`, `Crypt`, `HeldKid`, `PublicKeys`, `PendingRotation`,
-  `CheckGrant`, `MigrationComplete`) is sent once more on a new connection,
-  at most once; for every other request, and for any request on a
-  connection that never answered, the dropped connection is its error.
-  Requests carry secrets, so once a connection's
-  requests are answered the agent wipes everything they left in its read
-  buffers (the whole allocation past any unread bytes); the client keeps no
-  request or reply bytes between requests.
+  on it. There is no fallback for an agent that closes a connection after
+  a reply (none was released): the request after such a connection's build
+  check fails with the error of a dropped connection, below, at once, and
+  is never sent twice when it changes the agent. When a connection that had
+  already answered at least once (the build check's `status` counts) drops
+  after a request was written but before any byte of its reply, only a
+  request that leaves the agent as it was (`status`, `Crypt`, `HeldKid`,
+  `PublicKeys`, `PendingRotation`, `CheckGrant`, `MigrationComplete`) is
+  sent once more on a new connection, at most once; for every other
+  request, and for any request on a connection that never answered, the
+  dropped connection is its error. Requests carry secrets, so once a
+  connection's requests are answered the agent wipes everything they left
+  in its read buffers (the whole allocation past any unread bytes); the
+  client keeps no request or reply bytes between requests.
 - **No needless wait for an agent the client started.** A client that may
   start the agent (`autostart`) polls the new agent instead of sleeping a
   fixed 100 ms: short pauses at first, growing to the old 100 ms for an agent
@@ -1541,7 +1539,7 @@ and after each, in the task that built it):
 |---|---|---|---|
 | F1 | Binary `Crypt` frames on the agent socket: a 10-byte header and length-prefixed raw fields (no base64 of the plain text, no JSON pass), agreed per connection in the build check's `status`; each buffer allocated once and wiped once over its allocation (`memset` and a compiler barrier) | built | 1 MiB seal / open 16.1 / 15.0 to 2.3 / 2.3 ms; 100 B op 5.1 to 2.5 to 3.3 µs; vault 1 MiB write plus read-back +36.3 to +6.0 ms (Task 3) |
 | F2 | Full-size, overlapped batches. Push and migration seal groups of whole relay chunks, up to four `Crypt` requests' worth per step: the first chunk alone, then each group while the POST before it is in flight; a chunk sends an op as sealed ahead only while it is unchanged under the same mode, key and data account, and a status goes before each POST of ops sealed by an earlier request (the lock bound). Pull and read-back open one `Crypt` request per page, the next page fetched and opened while the one before it is applied (one page ahead) | built | `Crypt` requests per 1,000 facts: push 20 to 4, pull 5 (one per page), migration rewrite 18 to 6; added wall time of a 1,000-fact push and pull against a 20 ms relay +5.5% and +3.3% before (two runs) to +0.8% (45 pairs); both modes about 40% faster (a 5,000-fact pull at 20 ms with no encryption: 1.48 to 0.87 s) (Task 4; final run) |
-| F3 | One client and one connection per process: a process-wide agent client, the build check once per connection, a connection kept between requests; the agent keeps the parsed trust state while `cred/state.json` is unchanged | built | batch-1 request 114 to 26 µs (16 µs with F1); socket round trips per 1,000-fact push and pull 50 on 50 connections to 26 on one (Task 2) |
+| F3 | One client and one connection per process: a process-wide agent client, the build check once per connection, a connection kept between requests (no fallback for an agent that closes connections after a reply: every released agent serves several requests per connection); the agent keeps the parsed trust state while `cred/state.json` is unchanged | built | batch-1 request 114 to 26 µs (16 µs with F1); socket round trips per 1,000-fact push and pull 50 on 50 connections to 26 on one (Task 2) |
 | F4 | Remove redundant ops: deduplicate keyed hashes within a batch, build the HMAC once per request, cache `project_names.json` per context | not approved | (estimate) one third fewer push ops; keyed hash about 40% cheaper for short inputs |
 | F5 | A lighter agent: a current-thread runtime (or 1 to 2 workers), a cap on the largest request, optionally `malloc_trim` after a large one | not approved | (estimate) locked RSS 72 to about 40 MiB; peak without the lock about 20 MiB |
 | F6 | The local store: one transaction per push batch's results and per pulled page (rows and cursor together), each chunk read from the queue after the last op sent | built | 1,000-fact push and pull 5.64 to 0.25 s (0.30 s encrypted); 5,000 facts 30.5 to 1.34 s (1.54 s) (Task 1) |

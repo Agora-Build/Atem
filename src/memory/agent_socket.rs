@@ -1121,12 +1121,9 @@ struct Conn {
     stream: UnixStream,
     /// When the last reply arrived: the agent's idle timer starts then.
     idle_since: std::time::Instant,
-    /// Replies read on it. An agent that answered twice on a connection
-    /// serves several requests per connection (every released build does);
-    /// after one reply, it might be one that closes it.
+    /// Replies read on it: a request dropped unanswered goes once more only
+    /// when its connection had answered before (a kept or checked one).
     replies: u32,
-    /// Its first exchange was the build check.
-    checked: bool,
     /// The build check's `status` said the agent reads frames here
     /// (agent_frame.rs).
     frames: bool,
@@ -1138,7 +1135,6 @@ impl Conn {
             stream,
             idle_since: std::time::Instant::now(),
             replies: 0,
-            checked: false,
             frames: false,
         }
     }
@@ -1208,18 +1204,6 @@ enum Received {
     /// A reply frame that doesn't read (out of bounds, or its body): the
     /// connection goes with it.
     Unreadable,
-}
-
-/// A client's kept connection, and what it learnt about its agent.
-#[derive(Default)]
-struct Link {
-    conn: Option<Conn>,
-    /// The agent closed a connection after its only reply: it may answer
-    /// one request per connection (or it stopped then). Until it answers
-    /// twice on one connection again, no request goes on a connection with
-    /// a single reply before a `status` there: each request goes, after the
-    /// build check on a new connection, on a connection of its own.
-    one_per_connection: bool,
 }
 
 /// A reply, and whether it was exactly one line with nothing after it, or
@@ -1443,7 +1427,7 @@ pub struct CredAgentClient {
     runtime_check: bool,
     /// The connection kept between requests; holding it is holding the
     /// right to send the next request.
-    link: Mutex<Link>,
+    conn: Mutex<Option<Conn>>,
     #[cfg(test)]
     traffic: Traffic,
 }
@@ -1467,7 +1451,7 @@ impl CredAgentClient {
             build: None,
             older_build: Mutex::new(None),
             runtime_check: false,
-            link: Mutex::new(Link::default()),
+            conn: Mutex::new(None),
             #[cfg(test)]
             traffic: Traffic::default(),
         }
@@ -1590,17 +1574,11 @@ impl CredAgentClient {
         &self.traffic
     }
 
-    /// Whether this client gives every request a connection of its own.
-    #[cfg(test)]
-    pub(crate) fn one_per_connection(&self) -> bool {
-        self.link.lock().is_ok_and(|link| link.one_per_connection)
-    }
-
     /// Unread bytes queued on the kept connection; `None` when none is kept.
     #[cfg(test)]
     pub(crate) fn kept_unread(&self) -> Option<usize> {
-        let link = self.link.lock().ok()?;
-        let conn = link.conn.as_ref()?;
+        let kept = self.conn.lock().ok()?;
+        let conn = kept.as_ref()?;
         let mut bytes = [0u8; 256];
         // SAFETY: peeks at most `bytes.len()` bytes into `bytes`, without blocking.
         let peeked = unsafe {
@@ -1618,7 +1596,7 @@ impl CredAgentClient {
     /// had sat idle that much longer (tests move the clock, never wait).
     #[cfg(test)]
     pub(crate) fn idle_for(&self, by: Duration) {
-        if let Some(conn) = &mut self.link.lock().unwrap().conn {
+        if let Some(conn) = &mut *self.conn.lock().unwrap() {
             conn.idle_since = conn.idle_since.checked_sub(by).unwrap();
         }
     }
@@ -1662,9 +1640,9 @@ impl CredAgentClient {
     /// request holds it), else a dial succeeds. Starts nothing.
     #[cfg_attr(test, allow(dead_code))]
     pub fn answers(&self) -> bool {
-        if let Ok(mut link) = self.link.try_lock() {
-            self.drop_unusable(&mut link);
-            if link.conn.is_some() {
+        if let Ok(mut kept) = self.conn.try_lock() {
+            drop_unusable(&mut kept);
+            if kept.is_some() {
                 return true;
             }
         }
@@ -1788,10 +1766,7 @@ impl CredAgentClient {
             return Ok(conn);
         };
         match self.check_build(conn, build)? {
-            Some(mut conn) => {
-                conn.checked = true;
-                Ok(conn)
-            }
+            Some(conn) => Ok(conn),
             // The check got no answer, or stopped a locked agent of another
             // build: the request goes on a new connection, to the agent
             // `connect` finds or starts, unchecked (as before).
@@ -1874,123 +1849,60 @@ impl CredAgentClient {
         conn.round_trip(out)
     }
 
-    /// Drops the kept connection when it can't carry a request: idle for
-    /// `reuse_idle`, or closed by the agent. Nothing has been written on it,
-    /// so no request goes twice. An agent that closed it after its only
-    /// reply may answer one request per connection
-    /// (`Link::one_per_connection`); one that had answered twice on it has
-    /// stopped or restarted.
-    fn drop_unusable(&self, link: &mut Link) {
-        let Some(conn) = &link.conn else {
-            return;
-        };
-        if conn.idle(REUSE_IDLE) {
-            link.conn = None;
-        } else if conn.closed() {
-            if conn.replies == 1 {
-                link.one_per_connection = true;
-            }
-            link.conn = None;
-        }
-    }
-
-    /// The request (`line`, else `again` as a JSON line) on a connection of
-    /// its own, closed after the reply; first, unless it `checked` just now,
-    /// the build check on a connection of its own (an agent that closes
-    /// connections after a reply can't take both).
-    fn alone(
-        &self,
-        line: Option<Zeroizing<String>>,
-        again: Option<&Request>,
-        checked: bool,
-    ) -> Result<Received> {
-        let line = match line {
-            Some(line) => line,
-            None => encode_request(again.ok_or_else(unencoded)?)?,
-        };
-        if let Some(build) = self.build.as_deref()
-            && !checked
-        {
-            drop(self.check_build(self.connection()?, build)?);
-        }
-        let mut conn = self.connection()?;
-        match self.send(&mut conn, Outgoing::Line(line)) {
-            Ok(answer) => Ok(answer.reply),
-            Err(failed) => Err(self.closed(failed.into_error())),
-        }
-    }
-
     /// The request on the kept connection (opened, and checked, when none
-    /// is kept): `line`, or without one, `again` encoded for the connection
-    /// (`outgoing`: a `Crypt` as a frame where it agreed to them). A request
-    /// never goes where the agent might close the connection under it when
-    /// that would cost more than a resend: on a connection with a single
-    /// reply, a request that changes the agent (`again` is `None`), a resend,
-    /// or any request while the agent may close connections after a reply
-    /// (`Link::one_per_connection`) goes only once the agent answered a
-    /// `status` there (two replies prove it keeps connections, and end that
-    /// mode). An agent that closes it instead gets the request on a
-    /// connection of its own (`alone`).
+    /// is kept, or when the kept one can't carry it: `drop_unusable`):
+    /// `line`, or without one, `again` encoded for the connection
+    /// (`outgoing`: a `Crypt` as a frame where it agreed to them).
     ///
     /// When the connection drops after the request was written but before
     /// any byte of the reply, the request in `again` (a `resendable` one)
-    /// goes once more, on a new connection; every other failure is the
-    /// request's error. A drop after a single reply means the agent may
-    /// close connections after a reply; after two, it stopped or restarted.
+    /// goes once more, on a new connection, when the dropped one had
+    /// answered before (the agent stopped or restarted meanwhile); every
+    /// other failure is the request's error. Every released agent serves
+    /// several requests per connection; one that closed a connection after
+    /// a reply would only make the next request on it fail this way.
     fn exchange(
         &self,
-        link: &mut Link,
+        kept: &mut Option<Conn>,
         mut line: Option<Zeroizing<String>>,
         again: Option<&Request>,
     ) -> Result<Received> {
         let mut resent = false;
         loop {
-            self.drop_unusable(link);
-            let opened = link.conn.is_none();
-            let conn = match &mut link.conn {
+            drop_unusable(kept);
+            let conn = match kept {
                 Some(conn) => conn,
-                None => link.conn.insert(self.open()?),
+                None => kept.insert(self.open()?),
             };
-            if conn.replies == 1 && (again.is_none() || resent || link.one_per_connection) {
-                let status = encode_request(&Request::Status)?;
-                match self.send(conn, Outgoing::Line(status)) {
-                    Ok(answer) if answer.in_step => link.one_per_connection = false,
-                    Ok(_) => {
-                        link.conn = None;
-                        bail!("the cred agent sent more than one reply to a status");
-                    }
-                    Err(Failed::Unanswered(_)) => {
-                        let checked = opened && conn.checked;
-                        link.conn = None;
-                        link.one_per_connection = true;
-                        return self.alone(line, again, checked);
-                    }
-                    Err(failed) => {
-                        link.conn = None;
-                        return Err(self.closed(failed.into_error()));
-                    }
-                }
-            }
             let out = match line.take() {
                 Some(line) => Outgoing::Line(line),
                 None => outgoing(conn, again.ok_or_else(unencoded)?)?,
             };
             let replies = conn.replies;
             let failed = match self.send(conn, out) {
-                Ok(answer) => return Ok(keep(link, answer)),
+                Ok(answer) => return Ok(keep(kept, answer)),
                 Err(failed) => failed,
             };
-            link.conn = None;
+            *kept = None;
             let resend = matches!(failed, Failed::Unanswered(_)) && replies > 0 && !resent;
             if !resend || again.is_none() {
                 return Err(self.closed(failed.into_error()));
             }
-            if replies == 1 {
-                link.one_per_connection = true;
-            }
             // `line` is taken: the new connection encodes `again` its way.
             resent = true;
         }
+    }
+}
+
+/// Drops the kept connection when it can't carry a request: idle for
+/// `REUSE_IDLE`, or closed by the agent (it stopped or restarted). Nothing
+/// has been written on it, so no request goes twice.
+fn drop_unusable(kept: &mut Option<Conn>) {
+    if kept
+        .as_ref()
+        .is_some_and(|conn| conn.idle(REUSE_IDLE) || conn.closed())
+    {
+        *kept = None;
     }
 }
 
@@ -2000,9 +1912,9 @@ fn unencoded() -> anyhow::Error {
 }
 
 /// `answer`'s reply; its connection stays kept only while in step.
-fn keep(link: &mut Link, answer: Answer) -> Received {
+fn keep(kept: &mut Option<Conn>, answer: Answer) -> Received {
     if !answer.in_step {
-        link.conn = None;
+        *kept = None;
     }
     answer.reply
 }
@@ -2038,17 +1950,17 @@ impl CredAgentApi for CredAgentClient {
         // written is wiped as soon as it is); any other request is wiped now.
         let again = resendable(&request).then_some(request);
         let reply = {
-            let mut link = self.link.lock().unwrap_or_else(|poisoned| {
+            let mut kept = self.conn.lock().unwrap_or_else(|poisoned| {
                 // A request that panicked midway leaves no usable connection.
-                self.link.clear_poison();
-                let mut link = poisoned.into_inner();
-                link.conn = None;
-                link
+                self.conn.clear_poison();
+                let mut kept = poisoned.into_inner();
+                *kept = None;
+                kept
             });
-            let reply = self.exchange(&mut link, line, again.as_ref());
+            let reply = self.exchange(&mut kept, line, again.as_ref());
             if stops {
                 // The agent closes it once it has answered.
-                link.conn = None;
+                *kept = None;
             }
             reply
         };

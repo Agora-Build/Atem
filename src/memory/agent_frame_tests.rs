@@ -579,11 +579,11 @@ fn a_framed_crypt_dropped_unanswered_goes_once_more_as_a_frame() {
     proxy.swallow_ops("crypt", 1);
     let again = client.crypt(ASTATION_ID, hash()).unwrap();
     assert_eq!(text_of(&first[0]), text_of(&again[0]));
-    // The new connection was checked (and agreed again), a status proved
-    // it before the resend, which went as a frame; the agent got it once.
+    // The new connection was checked (and agreed again), and the resend
+    // went there as a frame; the agent got it once.
     assert_eq!(
         proxy.seen(),
-        ["status", "crypt", "crypt", "status", "status", "crypt"]
+        ["status", "crypt", "crypt", "status", "crypt"]
     );
     assert_eq!(Proxy::count(&proxy.passed(), "crypt"), 2);
     assert_eq!(client.traffic().frames(), 3);
