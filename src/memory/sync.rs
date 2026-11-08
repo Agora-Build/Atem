@@ -589,40 +589,109 @@ async fn push_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 /// Pull cursors are per account (the paired Astation id); see
 /// `memory_cursor_key`.
 async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome) -> Result<()> {
-    let fetch_memories = |since| {
-        let client = client.clone();
-        async move { client.fetch_memories(since).await }
+    let memories = {
+        let (fetching, opening) = (client.clone(), client.clone());
+        pull_pages(store, out, &memory_cursor_key(client.account()),
+            move |since| {
+                let client = fetching.clone();
+                async move { client.fetch_memories(since).await }
+            },
+            move |rows| {
+                let client = opening.clone();
+                async move { client.open_memories(rows).await }
+            },
+            apply_pulled_memories, |m: &Memory| m.seq).await?
     };
-    let memories = pull_pages(store, out, &memory_cursor_key(client.account()),
-        fetch_memories, |rows| client.open_memories(rows),
-        apply_pulled_memories, |m: &Memory| m.seq).await?;
     if memories {
-        let fetch_skills = |since| {
-            let client = client.clone();
-            async move { client.fetch_skills(since).await }
-        };
+        let (fetching, opening) = (client.clone(), client.clone());
         pull_pages(store, out, &skill_cursor_key(client.account()),
-            fetch_skills, |rows| client.open_skills(rows),
+            move |since| {
+                let client = fetching.clone();
+                async move { client.fetch_skills(since).await }
+            },
+            move |rows| {
+                let client = opening.clone();
+                async move { client.open_skills(rows).await }
+            },
             apply_pulled_skills, |s: &Skill| s.seq).await?;
     }
     Ok(())
 }
 
-/// The next page's request, on a task of its own so it runs while this
-/// page is opened and applied. Dropped (the request aborted, its page never
-/// applied) unless the page before it commits.
-struct Prefetch<R>(tokio::task::JoinHandle<std::result::Result<Vec<R>, ApiError>>);
+/// A task's handle that aborts it when dropped: its result is never used.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
-impl<R> Prefetch<R> {
-    async fn page(mut self) -> std::result::Result<Vec<R>, ApiError> {
-        (&mut self.0).await
-            .unwrap_or_else(|e| Err(ApiError::Decode(format!("the page request didn't finish: {e}"))))
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
-impl<R> Drop for Prefetch<R> {
-    fn drop(&mut self) {
-        self.0.abort();
+/// A fetched page: the cursor it was fetched from, its row count, and its
+/// rows being opened on a task of their own.
+struct FetchedPage<R> {
+    since: i64,
+    len: usize,
+    opened: AbortOnDrop<std::result::Result<Vec<R>, ApiError>>,
+}
+
+impl<R> FetchedPage<R> {
+    async fn opened(mut self) -> std::result::Result<Vec<R>, ApiError> {
+        (&mut self.opened.0).await
+            .unwrap_or_else(|e| Err(ApiError::Encryption(format!("opening the page didn't finish: {e}"))))
+    }
+}
+
+/// One kind's pages from `since`, fetched in order on a task of their own,
+/// each from the cursor the page before it ends at, and each opened on a task
+/// of its own as it arrives (F2). At most one page beyond the one being
+/// applied is fetched or opened: a page is fetched only once the page two
+/// before it is committed (`permits`, one given back per committed page).
+/// Dropping it aborts the fetching and the opening; the pages not applied
+/// are discarded.
+struct PagesInFlight<R> {
+    pages: tokio::sync::mpsc::Receiver<std::result::Result<FetchedPage<R>, ApiError>>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    _fetching: AbortOnDrop<()>,
+}
+
+impl<R: Send + 'static> PagesInFlight<R> {
+    fn start<F, FF, O, OF>(since: i64, fetch: F, open: O, seq: fn(&R) -> i64) -> Self
+    where
+        F: Fn(i64) -> FF + Send + 'static,
+        FF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
+        O: Fn(Vec<R>) -> OF + Send + 'static,
+        OF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
+    {
+        let (tx, pages) = tokio::sync::mpsc::channel(2);
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let available = permits.clone();
+        let fetching = tokio::spawn(async move {
+            let mut since = since;
+            loop {
+                let Ok(permit) = available.acquire().await else { return };
+                permit.forget();
+                let (page, next) = match fetch(since).await {
+                    Ok(rows) => {
+                        let (len, max) = (rows.len(), rows.iter().map(seq).fold(0, i64::max));
+                        // The next page starts where this one ends; none after
+                        // a short page or one that doesn't move the cursor.
+                        let next = (len >= PULL_LIMIT as usize && max > since).then_some(max);
+                        let opened = AbortOnDrop(tokio::spawn(open(rows)));
+                        (Ok(FetchedPage { since, len, opened }), next)
+                    }
+                    Err(e) => (Err(e), None),
+                };
+                if tx.send(page).await.is_err() {
+                    return;
+                }
+                match next {
+                    Some(next) => since = next,
+                    None => return,
+                }
+            }
+        });
+        Self { pages, permits, _fetching: AbortOnDrop(fetching) }
     }
 }
 
@@ -631,11 +700,13 @@ impl<R> Drop for Prefetch<R> {
 /// cursor never passes a row that isn't stored, and a page cut short (an
 /// error, a crash) is pulled again whole (upserts are idempotent).
 ///
-/// Page k+1 is fetched on its own task while page k is opened and applied
-/// (F2), from the cursor page k ends at. Page k's transaction never waits
-/// for it; it is used only once page k is committed and the committed
-/// cursor is that one, and a page that fails to open or apply drops it
-/// unapplied. `Ok(false)`: a request failed (noted); stop pulling.
+/// The next page is fetched and opened while this one is applied
+/// (`PagesInFlight`, F2), from the cursor this one ends at. A page's
+/// transaction never waits for that work; a page is applied only after the
+/// one before it committed, from the committed cursor, and a page that
+/// fails to open or apply discards the page after it unapplied (the next
+/// sync starts from the committed cursor). `Ok(false)`: a request failed
+/// (noted); stop pulling.
 async fn pull_pages<R, F, FF, O, OF>(
     store: &Store,
     out: &mut SyncOutcome,
@@ -647,29 +718,36 @@ async fn pull_pages<R, F, FF, O, OF>(
 ) -> Result<bool>
 where
     R: Send + 'static,
-    F: Fn(i64) -> FF,
+    F: Fn(i64) -> FF + Clone + Send + 'static,
     FF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
-    O: Fn(Vec<R>) -> OF,
-    OF: Future<Output = std::result::Result<Vec<R>, ApiError>>,
+    O: Fn(Vec<R>) -> OF + Clone + Send + 'static,
+    OF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
 {
     let mut since = store.get_state(key)?;
-    let mut fetched = fetch(since).await;
+    let mut in_flight = PagesInFlight::start(since, fetch.clone(), open.clone(), seq);
     loop {
-        let page = match fetched {
-            Ok(page) => page,
-            Err(e) => {
+        let page = match in_flight.pages.recv().await {
+            Some(Ok(page)) => page,
+            Some(Err(e)) => {
                 out.failed(e, None);
                 return Ok(false);
             }
+            // The fetching always ends with a last page or a failure.
+            None => {
+                out.failed(ApiError::Decode("the page requests stopped".into()), None);
+                return Ok(false);
+            }
         };
-        if page.is_empty() {
+        if page.len == 0 {
             return Ok(true);
         }
-        let len = page.len();
-        let page_max = page.iter().map(seq).fold(0, i64::max);
-        let more = len >= PULL_LIMIT as usize && page_max > since;
-        let next = more.then(|| Prefetch(tokio::spawn(fetch(page_max))));
-        let opened = match open(page).await {
+        if page.since != since {
+            // Another writer moved the cursor: start again from it.
+            in_flight = PagesInFlight::start(since, fetch.clone(), open.clone(), seq);
+            continue;
+        }
+        let len = page.len;
+        let opened = match page.opened().await {
             Ok(opened) => opened,
             Err(e) => {
                 out.failed(e, None);
@@ -681,6 +759,7 @@ where
             store.set_state(key, max.max(since))?;
             Ok(max)
         })?;
+        in_flight.permits.add_permits(1);
         out.pulled += opened.len();
         if !cursor_advances(max, since, len) {
             out.note(STUCK_CURSOR_NOTE.into());
@@ -689,13 +768,7 @@ where
         if len < PULL_LIMIT as usize {
             return Ok(true);
         }
-        // The next page is the one after the committed cursor.
-        let committed = store.get_state(key)?;
-        fetched = match next {
-            Some(next) if committed == page_max => next.page().await,
-            _ => fetch(committed).await,
-        };
-        since = committed;
+        since = store.get_state(key)?;
     }
 }
 

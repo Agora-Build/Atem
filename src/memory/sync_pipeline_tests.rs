@@ -32,11 +32,10 @@ struct Call {
     ok: bool,
 }
 
-type Hook = Box<dyn Fn(usize, bool, &Mutex<CredAgent>) + Send + Sync>;
+type Hook = Box<dyn Fn(usize, &[CryptOp], &Mutex<CredAgent>) + Send + Sync>;
 
 /// The in-process agent, recording every `Crypt` request. `hook` runs
-/// before a request reaches the agent, with its index (from 0) and whether
-/// it opens.
+/// before a request reaches the agent, with its index (from 0) and its ops.
 struct Recorder {
     inner: Arc<Mutex<CredAgent>>,
     started: AtomicUsize,
@@ -81,7 +80,7 @@ impl CredAgentApi for Recorder {
         };
         (self.hook)(
             self.started.fetch_add(1, Ordering::SeqCst),
-            seen.opens,
+            ops,
             &self.inner,
         );
         let reply = self.inner.call(request);
@@ -176,6 +175,12 @@ fn since(path: &str) -> i64 {
         .unwrap()
         .parse()
         .unwrap()
+}
+
+/// Whether `ops` open a field of record `id`.
+fn opens(ops: &[CryptOp], id: &str) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, CryptOp::Open { record, .. } if record == id))
 }
 
 /// Waits up to `limit` for `done`.
@@ -566,8 +571,8 @@ async fn a_page_is_opened_while_the_next_one_is_fetched() {
     // While page 1 is opened: has the relay been asked for page 2?
     let recorder = Recorder::with_hook(
         device.agent.clone(),
-        Box::new(move |index, _, _| {
-            if index == 0 {
+        Box::new(move |_, ops, _| {
+            if opens(ops, "mem_r0001") {
                 seen.store(
                     wait_for(Duration::from_secs(2), || memory_gets(&gets).contains(&200)),
                     Ordering::SeqCst,
@@ -594,6 +599,65 @@ async fn a_page_is_opened_while_the_next_one_is_fetched() {
     assert_eq!(memory_gets(&log), vec![0, 200, 400]);
 }
 
+/// Page 2 is opened while page 1's transaction runs: page 1's last insert
+/// waits (bounded) for page 2's open to reach the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_is_opened_while_the_one_before_is_applied() {
+    use rusqlite::functions::FunctionFlags;
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    seed_sealed(&relay, &device, 450);
+    let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+    let page_two_opening = Arc::new(AtomicBool::new(false));
+    let opening = page_two_opening.clone();
+    let recorder = Recorder::with_hook(
+        device.agent.clone(),
+        Box::new(move |_, ops, _| {
+            if opens(ops, "mem_r0201") {
+                opening.store(true, Ordering::SeqCst);
+            }
+        }),
+    );
+    let s = Store::open_in_memory().unwrap();
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let (seen, opening) = (overlapped.clone(), page_two_opening.clone());
+    s.test_conn()
+        .create_scalar_function(
+            "wait_for_page_two",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                seen.store(
+                    wait_for(Duration::from_secs(2), || opening.load(Ordering::SeqCst)),
+                    Ordering::SeqCst,
+                );
+                Ok(0i64)
+            },
+        )
+        .unwrap();
+    s.test_conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER page_one_last BEFORE INSERT ON memories WHEN new.id = 'mem_r0200' BEGIN SELECT wait_for_page_two(); END;",
+        )
+        .unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pulled, 450);
+    assert!(
+        overlapped.load(Ordering::SeqCst),
+        "page 2 was opened only after page 1 was applied"
+    );
+}
+
 // ─────────────── ruling 3: the prefetched page ───────────────
 
 /// Page 2's open fails (its ciphertext was tampered with) after page 3 came
@@ -615,11 +679,11 @@ async fn a_page_that_fails_to_open_drops_the_page_fetched_meanwhile() {
     };
     let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
     let gets = log.clone();
-    // Page 2's open (the second request) waits until page 3 came back.
+    // Page 2's open waits until page 3 came back.
     let recorder = Recorder::with_hook(
         device.agent.clone(),
-        Box::new(move |index, _, _| {
-            if index == 1 {
+        Box::new(move |_, ops, _| {
+            if opens(ops, "mem_r0300") {
                 assert!(wait_for(Duration::from_secs(2), || memory_gets(&gets).contains(&400)));
             }
         }),
@@ -1120,8 +1184,9 @@ async fn the_read_back_checks_every_page_while_the_next_one_is_fetched() {
     // read-back's, of page 1. Is page 2 being fetched meanwhile?
     let recorder = Recorder::with_hook(
         device.agent.clone(),
-        Box::new(move |_, opens, _| {
-            if opens && !opened.swap(true, Ordering::SeqCst) {
+        Box::new(move |_, ops, _| {
+            let opening = ops.iter().any(|op| matches!(op, CryptOp::Open { .. }));
+            if opening && !opened.swap(true, Ordering::SeqCst) {
                 let read_back_gets = || {
                     let log = gets.lock().unwrap();
                     log[from.load(Ordering::SeqCst).min(log.len())..]
