@@ -38,7 +38,8 @@ implemented)", and a design with nothing built says so in its status line.
 | Document | What it covers |
 |---|---|
 | [agent-hosting.md](agent-hosting.md) | OS service and boot startup, remote launch when work arrives, durable delivery through the Station (outbox, replay, offline senders) |
-| [agent-collaboration.md](agent-collaboration.md) | Stages 2-3: online cross-instance collaboration, Station adapters/capacity, return-grant agreement, sealed mailbox and signed projects; a sandbox for agents |
+| [delegated-host-work.md](delegated-host-work.md) | Agreed 2026-11-08, nothing built: delegated host work (Atem owns accepted tasks of covered integrations, native members and host senders: control records, the revocation gate, attempts and recovery, unknown-outcome alerts) and stages 2-3 of agent collaboration, host-to-host senders (signed projects, Revoke/Readmit, host encryption keys, the sealed Station mailbox), plus prompt framing for every rendered prompt; diagram: [delegated-host-work-flows.html](delegated-host-work-flows.html) |
+| [agent-collaboration.md](agent-collaboration.md) | Parts of local collaboration not built: launch on message for Codex, atomic write-and-notify in the Station, a sandbox for agents (stages 2-3 are in delegated-host-work.md) |
 | [build-by-talk.md](build-by-talk.md) | Build by Talk: get the whole project clear by talking, with tool calls to the coding agents (Astation and Atem; nothing built) |
 | [e2e-encryption.md](e2e-encryption.md) | Credentials (`atem cred get` and the rest), device-signed writes, the recovery secret, auto-unlock |
 | [agora-account-grouping.md](agora-account-grouping.md) | Proposed: merge Astations under one Agora login (opt-in) |
