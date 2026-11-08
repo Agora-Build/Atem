@@ -57,14 +57,16 @@ fn op_of(line: &str) -> String {
 /// Sits between clients and the agent at `upstream`: counts the
 /// connections it accepts and the request lines it reads (by op), and on
 /// request closes every open client connection (as the agent does with
-/// idle ones) or swallows the next request: reads it, never passes it
-/// on, and closes that connection unanswered.
+/// idle ones) or swallows requests (the next one, or the next ones of an
+/// op): reads one, never passes it on, and closes that connection
+/// unanswered.
 struct Proxy {
     socket: PathBuf,
     connections: Arc<std::sync::atomic::AtomicUsize>,
     seen: Arc<Mutex<Vec<String>>>,
     passed: Arc<Mutex<Vec<String>>>,
-    swallow: Arc<std::sync::atomic::AtomicBool>,
+    /// The op to swallow (any when `None`) and how many more.
+    swallow: Arc<Mutex<(Option<String>, usize)>>,
     live: Arc<Mutex<Vec<UnixStream>>>,
 }
 
@@ -111,7 +113,16 @@ impl Proxy {
                             return;
                         }
                         seen.lock().unwrap().push(op_of(&line));
-                        if swallow.swap(false, SeqCst) {
+                        let swallowed = {
+                            let mut rule = swallow.lock().unwrap();
+                            let hit =
+                                rule.1 > 0 && rule.0.as_deref().is_none_or(|op| op == op_of(&line));
+                            if hit {
+                                rule.1 -= 1;
+                            }
+                            hit
+                        };
+                        if swallowed {
                             let _ = client.shutdown(std::net::Shutdown::Both);
                             return;
                         }
@@ -156,8 +167,13 @@ impl Proxy {
 
     /// The next request line is read and dropped with its connection.
     fn swallow_next(&self) {
-        self.swallow
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.swallow.lock().unwrap() = (None, 1);
+    }
+
+    /// The next `count` request lines of `op` are each read and dropped
+    /// with their connection.
+    fn swallow_ops(&self, op: &str, count: usize) {
+        *self.swallow.lock().unwrap() = (Some(op.to_string()), count);
     }
 }
 
@@ -392,9 +408,57 @@ fn a_request_that_changes_the_agent_is_never_sent_again() {
     let (seen, passed) = (proxy.seen(), proxy.passed());
     assert_eq!(Proxy::count(&seen, "lock"), 1, "{seen:?}");
     assert_eq!(Proxy::count(&passed, "lock"), 0, "{passed:?}");
+    assert!(
+        !client.one_per_connection(),
+        "an agent that answered twice on the connection stopped or restarted"
+    );
     // The next request works on a new connection.
     client.lock_keys().unwrap();
     assert_eq!(Proxy::count(&proxy.passed(), "lock"), 1);
+}
+
+#[test]
+fn a_switch_to_a_connection_per_request_ends_once_the_agent_answers_twice() {
+    let dir = short_dir();
+    let socket = start_agent(dir.path(), own_uid());
+    let proxy = Proxy::start(dir.path(), socket);
+    let client = CredAgentClient::at(proxy.socket.clone()).checking_build(build_id());
+    // The connection drops right after its only reply (the build check),
+    // as an agent that stops then, or one that answers once per
+    // connection, would do.
+    proxy.swallow_ops("pending_rotation", 1);
+    assert_eq!(client.pending_rotation().unwrap(), None);
+    // The new connection was checked, and a second status there showed an
+    // agent that keeps connections: the request went there.
+    assert_eq!(
+        proxy.seen(),
+        [
+            "status",
+            "pending_rotation",
+            "status",
+            "status",
+            "pending_rotation"
+        ]
+    );
+    assert!(!client.one_per_connection());
+    assert_eq!(client.pending_rotation().unwrap(), None);
+    assert_eq!(proxy.connections(), 2);
+    assert_eq!(client.traffic().probes(), 2);
+}
+
+#[test]
+fn a_stateless_request_goes_at_most_once_more() {
+    let dir = short_dir();
+    let socket = start_agent(dir.path(), own_uid());
+    let proxy = Proxy::start(dir.path(), socket);
+    let client = CredAgentClient::at(proxy.socket.clone()).checking_build(build_id());
+    assert_eq!(client.pending_rotation().unwrap(), None);
+    // Dropped on the kept connection, then again on the new one.
+    proxy.swallow_ops("pending_rotation", 2);
+    let error = format!("{:#}", client.pending_rotation().err().unwrap());
+    assert!(error.contains("closed the connection"), "{error}");
+    assert_eq!(Proxy::count(&proxy.seen(), "pending_rotation"), 3);
+    assert_eq!(Proxy::count(&proxy.passed(), "pending_rotation"), 1);
 }
 
 #[test]
@@ -491,6 +555,8 @@ fn start_one_reply_agent(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
             seen.lock().unwrap().push(op_of(&line));
             let reply = if line.contains("\"op\":\"status\"") {
                 status.as_str()
+            } else if line.contains("\"op\":\"pending_rotation\"") {
+                r#"{"v":2,"ok":true,"reply":{"kind":"pending_rotation","rotation":null}}"#
             } else {
                 OTHER_DONE
             };
@@ -504,7 +570,7 @@ fn start_one_reply_agent(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
 fn an_agent_that_answers_one_request_per_connection_gets_a_connection_per_request() {
     // As `autostart` makes clients (it may start an agent, never needed
     // here, and checks the build), and a client without either; a request
-    // that changes the agent first, and a status first.
+    // that changes the agent first, and a stateless one first.
     for (checks, change_first) in [(true, true), (true, false), (false, true), (false, false)] {
         let dir = short_dir();
         let (socket, read) = start_one_reply_agent(dir.path());
@@ -515,22 +581,32 @@ fn an_agent_that_answers_one_request_per_connection_gets_a_connection_per_reques
         if checks {
             client = client.checking_build(build_id());
         }
-        let mut locks = 0;
+        let mut sent = Vec::new();
         if change_first {
             client.lock_keys().unwrap();
-            locks += 1;
+            sent.push("lock");
         }
         for _ in 0..3 {
-            assert!(client.status().unwrap().unlocked);
+            assert_eq!(client.pending_rotation().unwrap(), None);
             client.lock_keys().unwrap();
-            locks += 1;
+            sent.extend(["pending_rotation", "lock"]);
         }
+        assert!(client.one_per_connection());
         let read = read.lock().unwrap().clone();
-        assert_eq!(
-            Proxy::count(&read, "lock"),
-            locks,
-            "each lock read once: {read:?}"
-        );
+        let requests: Vec<&String> = read.iter().filter(|op| *op != "status").collect();
+        // Each request read once, in order.
+        assert_eq!(requests, sent, "{read:?}");
+        if checks {
+            // Each one on a connection of its own, after the build check on
+            // a new connection.
+            for (at, op) in read.iter().enumerate() {
+                if op != "status" {
+                    assert!(at > 0 && read[at - 1] == "status", "{read:?}");
+                }
+            }
+        } else {
+            assert_eq!(read.len(), sent.len(), "{read:?}");
+        }
     }
 }
 
@@ -602,6 +678,61 @@ fn a_big_answered_request_gives_its_buffer_back() {
     // The grown buffer went (wiped as it was dropped); the chunk is wiped.
     assert_eq!(lines.pending.0.capacity(), 4096);
     assert!(lines.retained(0).iter().all(|byte| *byte == 0));
+}
+
+/// An agent for the key files in `dir`, served on its own thread, whose
+/// connections report what they hold once they have answered.
+fn start_reporting_agent(dir: &Path) -> (PathBuf, HeldLog) {
+    let socket = sock(&dir.join("run"));
+    let paths = CredPaths::in_dir(dir);
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let (ready, started) = std::sync::mpsc::channel();
+    let (path, log) = (socket.clone(), held.clone());
+    std::thread::spawn(move || {
+        SETTLED.with(|settled| *settled.borrow_mut() = Some(log));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = bind(&path).unwrap();
+            let agent = Arc::new(Mutex::new(CredAgent::new(paths).unwrap()));
+            ready.send(()).unwrap();
+            let _ = serve(listener, agent, own_uid()).await;
+        });
+    });
+    started.recv().unwrap();
+    (socket, held)
+}
+
+#[test]
+fn the_agent_wipes_what_a_request_left_once_it_has_answered() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let dir = short_dir();
+    let (socket, held) = start_reporting_agent(dir.path());
+    let client = CredAgentClient::at(socket);
+    // Read and answered: the locked agent refuses it.
+    let error = format!(
+        "{:#}",
+        client
+            .crypt(
+                "astation-1",
+                vec![CryptOp::seal("r", "f", b"SECRET-PLAIN-TEXT")]
+            )
+            .err()
+            .unwrap()
+    );
+    assert!(error.contains(crate::memory::cred_agent::LOCKED), "{error}");
+    assert!(eventually(|| !held.lock().unwrap().is_empty()));
+    let on_the_wire = STANDARD.encode(b"SECRET-PLAIN-TEXT");
+    for bytes in held.lock().unwrap().iter() {
+        assert!(
+            !holds(bytes, on_the_wire.as_bytes()),
+            "{}",
+            String::from_utf8_lossy(bytes)
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
 }
 
 #[test]

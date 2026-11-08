@@ -682,6 +682,12 @@ async fn serve_connection(
         }
         if answered {
             lines.settle();
+            #[cfg(test)]
+            SETTLED.with(|log| {
+                if let Some(log) = &*log.borrow() {
+                    log.lock().unwrap().push(lines.held());
+                }
+            });
         }
         if lines.too_long() {
             bail!("a request is too long");
@@ -701,6 +707,17 @@ async fn serve_connection(
     }
 }
 
+/// Tests: what connections held once they had answered, one entry each time.
+#[cfg(test)]
+type HeldLog = Arc<Mutex<Vec<Vec<u8>>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: what the connections served on this thread hold once they
+    /// have answered (`Lines::held`), when a test asks for it.
+    static SETTLED: std::cell::RefCell<Option<HeldLog>> = const { std::cell::RefCell::new(None) };
+}
+
 /// What an agent connection has read and not yet handled (`pending`), and
 /// the chunk it reads into. Requests carry secrets (device keys, plain text
 /// to seal) and clients keep their connection between requests, so once the
@@ -713,6 +730,9 @@ struct Lines {
     /// `Crypt` line arrives in 4 KiB reads, and rescanning it all each time
     /// would be quadratic.
     scanned: usize,
+    /// Tests: how much of `pending`'s allocation is known written.
+    #[cfg(test)]
+    written: usize,
 }
 
 impl Lines {
@@ -721,6 +741,8 @@ impl Lines {
             pending: WipingBuf::new(),
             chunk: Zeroizing::new([0u8; 4096]),
             scanned: 0,
+            #[cfg(test)]
+            written: 0,
         }
     }
 
@@ -760,10 +782,25 @@ impl Lines {
     fn settle(&mut self) {
         if self.pending.0.is_empty() && self.pending.0.capacity() > KEPT_BUFFER {
             self.pending = WipingBuf::new();
+            #[cfg(test)]
+            {
+                self.written = 0;
+            }
         } else {
             self.pending.0.spare_capacity_mut().zeroize();
+            #[cfg(test)]
+            {
+                self.written = self.pending.0.capacity();
+            }
         }
         self.chunk.zeroize();
+    }
+
+    /// Tests: everything this connection holds in user space whose bytes
+    /// are known written (`retained`).
+    #[cfg(test)]
+    fn held(&self) -> Vec<u8> {
+        self.retained(self.written)
     }
 
     /// The first `len` bytes of everything this connection holds in user
@@ -916,6 +953,8 @@ struct Conn {
     /// serves several requests per connection (every released build does);
     /// after one reply, it might be one that closes it.
     replies: u32,
+    /// Its first exchange was the build check.
+    checked: bool,
 }
 
 impl Conn {
@@ -924,6 +963,7 @@ impl Conn {
             stream,
             idle_since: std::time::Instant::now(),
             replies: 0,
+            checked: false,
         }
     }
 
@@ -963,10 +1003,11 @@ impl Conn {
 #[derive(Default)]
 struct Link {
     conn: Option<Conn>,
-    /// The agent closed a connection after its only reply: it answers one
-    /// request per connection. For the rest of the client's life every
-    /// request then goes on a connection of its own, as before connections
-    /// were kept (the build was checked on the first one).
+    /// The agent closed a connection after its only reply: it may answer
+    /// one request per connection (or it stopped then). Until it answers
+    /// twice on one connection again, no request goes on a connection with
+    /// a single reply before a `status` there: each request goes, after the
+    /// build check on a new connection, on a connection of its own.
     one_per_connection: bool,
 }
 
@@ -1459,7 +1500,10 @@ impl CredAgentClient {
             return Ok(conn);
         };
         match self.check_build(conn, build)? {
-            Some(conn) => Ok(conn),
+            Some(mut conn) => {
+                conn.checked = true;
+                Ok(conn)
+            }
             // The check got no answer, or stopped a locked agent of another
             // build: the request goes on a new connection, to the agent
             // `connect` finds or starts, unchecked (as before).
@@ -1535,8 +1579,9 @@ impl CredAgentClient {
     /// Drops the kept connection when it can't carry a request: idle for
     /// `reuse_idle`, or closed by the agent. Nothing has been written on it,
     /// so no request goes twice. An agent that closed it after its only
-    /// reply answers one request per connection (`Link::one_per_connection`);
-    /// one that had answered twice on it has stopped or restarted.
+    /// reply may answer one request per connection
+    /// (`Link::one_per_connection`); one that had answered twice on it has
+    /// stopped or restarted.
     fn drop_unusable(&self, link: &mut Link) {
         let Some(conn) = &link.conn else {
             return;
@@ -1551,8 +1596,15 @@ impl CredAgentClient {
         }
     }
 
-    /// `line` on a connection of its own, closed after the reply.
-    fn alone(&self, line: Zeroizing<String>) -> Result<WipingBuf> {
+    /// `line` on a connection of its own, closed after the reply; first,
+    /// unless it `checked` just now, the build check on a connection of its
+    /// own (an agent that closes connections after a reply can't take both).
+    fn alone(&self, line: Zeroizing<String>, checked: bool) -> Result<WipingBuf> {
+        if let Some(build) = self.build.as_deref()
+            && !checked
+        {
+            drop(self.check_build(self.connection()?, build)?);
+        }
         let mut conn = self.connection()?;
         match self.send(&mut conn, line) {
             Ok(answer) => Ok(answer.reply),
@@ -1561,18 +1613,20 @@ impl CredAgentClient {
     }
 
     /// `line` on the kept connection (opened, and checked, when none is
-    /// kept). A request that changes the agent (`again` is `None`) never
-    /// goes where the agent might close the connection under it: on a
-    /// connection with a single reply, the agent first answers a `status`
-    /// there (two replies prove it keeps connections), and an agent that
-    /// closes it instead answers one request per connection.
+    /// kept). A request never goes where the agent might close the
+    /// connection under it when that would cost more than a resend: on a
+    /// connection with a single reply, a request that changes the agent
+    /// (`again` is `None`), a resend, or any request while the agent may
+    /// close connections after a reply (`Link::one_per_connection`) goes only
+    /// once the agent answered a `status` there (two replies prove it keeps
+    /// connections, and end that mode). An agent that closes it instead
+    /// gets the request on a connection of its own (`alone`).
     ///
     /// When the connection drops after `line` was written but before any
     /// byte of the reply, the request in `again` (a `resendable` one) goes
-    /// once more: on a connection of its own when the connection had a
-    /// single reply (the agent closes connections after a reply), on a new
-    /// kept one when the agent had answered twice on it (it stopped or
-    /// restarted). Every other failure is the request's error.
+    /// once more, on a new connection; every other failure is the request's
+    /// error. A drop after a single reply means the agent may close
+    /// connections after a reply; after two, it stopped or restarted.
     fn exchange(
         &self,
         link: &mut Link,
@@ -1582,26 +1636,24 @@ impl CredAgentClient {
         let mut resent = false;
         loop {
             self.drop_unusable(link);
-            if link.one_per_connection {
-                link.conn = None;
-                return self.alone(line);
-            }
+            let opened = link.conn.is_none();
             let conn = match &mut link.conn {
                 Some(conn) => conn,
                 None => link.conn.insert(self.open()?),
             };
-            if again.is_none() && conn.replies == 1 {
+            if conn.replies == 1 && (again.is_none() || resent || link.one_per_connection) {
                 let status = encode_request(&Request::Status)?;
                 match self.send(conn, status) {
-                    Ok(answer) if answer.in_step => {}
+                    Ok(answer) if answer.in_step => link.one_per_connection = false,
                     Ok(_) => {
                         link.conn = None;
                         bail!("the cred agent sent more than one reply to a status");
                     }
                     Err(Failed::Unanswered(_)) => {
+                        let checked = opened && conn.checked;
                         link.conn = None;
                         link.one_per_connection = true;
-                        continue;
+                        return self.alone(line, checked);
                     }
                     Err(failed) => {
                         link.conn = None;
@@ -1615,10 +1667,7 @@ impl CredAgentClient {
                 Err(failed) => failed,
             };
             link.conn = None;
-            let resend = match (&failed, again) {
-                (Failed::Unanswered(_), Some(_)) => replies == 1 || (replies > 1 && !resent),
-                _ => false,
-            };
+            let resend = matches!(failed, Failed::Unanswered(_)) && replies > 0 && !resent;
             let Some(request) = again.filter(|_| resend) else {
                 return Err(self.closed(failed.into_error()));
             };

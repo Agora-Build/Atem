@@ -481,8 +481,9 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   on it. A request that changes the agent goes only on a new connection or
   one the agent has answered twice on; on a connection with one answer the
   agent first answers a `status` there. An agent that closes a connection
-  after its only answer gets a connection per request from then on (the
-  build checked once, as before connections were kept). When a connection
+  after its only answer then gets each request on a connection of its own,
+  after the build check on a new connection, until it answers twice on one
+  connection again. When a connection
   drops after a request was written but before any byte of its reply, only a
   request that leaves the agent as it was (`status`, `Crypt`, `HeldKid`,
   `PublicKeys`, `PendingRotation`, `CheckGrant`, `MigrationComplete`) is sent
