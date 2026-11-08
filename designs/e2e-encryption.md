@@ -472,16 +472,25 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   (each `EncryptionContext`, the knowledge and vault clients, the runtime's
   Astation link) shares one client per agent (keyed by its socket path and
   key directory), which sends one request at a time over one connection kept
-  between requests; the agent serves any number of lines on a connection and
-  drops one idle for 60 s. The client checks the build (`status`) once per
-  connection, before its first request, since a new connection may reach a
-  restarted agent. A connection idle for 30 s, or one the agent has closed,
-  is replaced before anything is written on it. When a connection drops
-  after a request was written but before any byte of its reply, only a
+  between requests; `running_agent` callers share another that never starts
+  an agent. Every released agent (v0.6.11, the first, to v0.8.3) serves any
+  number of lines on a connection and drops one idle for 60 s. The client
+  checks the build (`status`) once per connection, before its first request,
+  since a new connection may reach a restarted agent. A connection idle for
+  30 s, or one the agent has closed, is replaced before anything is written
+  on it. A request that changes the agent goes only on a new connection or
+  one the agent has answered twice on; on a connection with one answer the
+  agent first answers a `status` there. An agent that closes a connection
+  after its only answer gets a connection per request from then on (the
+  build checked once, as before connections were kept). When a connection
+  drops after a request was written but before any byte of its reply, only a
   request that leaves the agent as it was (`status`, `Crypt`, `HeldKid`,
   `PublicKeys`, `PendingRotation`, `CheckGrant`, `MigrationComplete`) is sent
   once more on a new connection; for every other request the dropped
-  connection is its error.
+  connection is its error. Requests carry secrets, so once a connection's
+  requests are answered the agent wipes everything they left in its read
+  buffers (the whole allocation past any unread bytes); the client keeps no
+  request or reply bytes between requests.
 - **The agent's cached trust state.** `Crypt`, `HeldKid` and the prune of
   retired keys read `cred/state.json` (and decode its signed states) only
   when the file changed since the last read: another device, inode, size,

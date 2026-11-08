@@ -748,6 +748,11 @@ impl CredAgent {
         self.unlocked()?;
         self.prune_retired();
         let view = self.trust_view()?;
+        // Unverified first, as before the cache: even when a stored state
+        // doesn't decode (which still fails a verified Astation's request).
+        if view.trust.verified(astation_id).is_none() {
+            bail!("this device isn't verified with Astation {astation_id}");
+        }
         let (account, state) = effective_state_with(&view.trust, view.newest()?, astation_id)
             .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))?;
         let state = state.ok_or_else(|| {
@@ -1747,8 +1752,12 @@ pub fn running_agent() -> Option<Box<dyn CredAgentApi>> {
     {
         #[cfg(unix)]
         {
-            let client = crate::memory::agent_socket::CredAgentClient::existing();
-            if client.is_running() {
+            // The process-wide client that never starts an agent (it has no
+            // launcher and runs no build check, like a new `existing()`).
+            let client = crate::memory::agent_socket::shared(
+                crate::memory::agent_socket::CredAgentClient::existing(),
+            );
+            if client.answers() {
                 return Some(Box::new(client));
             }
         }

@@ -1,7 +1,8 @@
-//! (test-only) The cred agent client's connection: one client per agent in
-//! a process (`shared`), one connection kept between requests, the build
-//! check on each new connection, and which requests go again when a
-//! connection drops (designs/e2e-encryption.md "Keys on disk (atem)").
+//! (test-only) Kept connections to the cred agent: one client per agent in a
+//! process (`shared`), one connection kept between requests, the build check
+//! on each new connection, which requests go again when a connection drops,
+//! agents that answer one request per connection, and what a kept
+//! connection retains (designs/e2e-encryption.md "Keys on disk (atem)").
 use super::tests::{
     OTHER_DONE, cred_agent_process, eventually, make_private, own_uid, short_dir, sock,
     start_agent, start_scripted_agent, start_stoppable_agent,
@@ -292,9 +293,12 @@ fn a_connection_the_agent_closed_while_idle_is_replaced_before_sending() {
     let socket = start_agent(dir.path(), own_uid());
     let proxy = Proxy::start(dir.path(), socket);
     let client = CredAgentClient::at(proxy.socket.clone());
+    // Two answers on one connection: this agent keeps connections.
+    assert_eq!(client.pending_rotation().unwrap(), None);
     assert_eq!(client.pending_rotation().unwrap(), None);
     // The agent drops connections idle for a minute.
     proxy.drop_connections();
+    assert_eq!(client.pending_rotation().unwrap(), None);
     assert_eq!(client.pending_rotation().unwrap(), None);
     proxy.drop_connections();
     // A request that changes the agent goes on a new connection too:
@@ -303,9 +307,34 @@ fn a_connection_the_agent_closed_while_idle_is_replaced_before_sending() {
     assert_eq!(proxy.connections(), 3);
     assert_eq!(
         proxy.seen(),
-        ["pending_rotation", "pending_rotation", "lock"]
+        [
+            "pending_rotation",
+            "pending_rotation",
+            "pending_rotation",
+            "pending_rotation",
+            "lock"
+        ]
     );
     assert_eq!(proxy.passed(), proxy.seen(), "nothing sent twice");
+    assert!(
+        !client.one_per_connection(),
+        "an agent that keeps connections"
+    );
+}
+
+#[test]
+fn a_request_that_changes_the_agent_goes_where_it_answered_twice() {
+    let dir = short_dir();
+    let socket = start_agent(dir.path(), own_uid());
+    let proxy = Proxy::start(dir.path(), socket);
+    let client = CredAgentClient::at(proxy.socket.clone());
+    assert_eq!(client.pending_rotation().unwrap(), None);
+    // One answer on this connection so far: a status proves the agent
+    // keeps it before the lock goes there.
+    client.lock_keys().unwrap();
+    client.lock_keys().unwrap();
+    assert_eq!(proxy.seen(), ["pending_rotation", "status", "lock", "lock"]);
+    assert_eq!(proxy.connections(), 1);
 }
 
 #[test]
@@ -332,14 +361,19 @@ fn a_stateless_request_whose_connection_drops_unanswered_is_sent_again() {
     let proxy = Proxy::start(dir.path(), socket);
     let client = CredAgentClient::at(proxy.socket.clone());
     assert_eq!(client.pending_rotation().unwrap(), None);
+    assert_eq!(client.pending_rotation().unwrap(), None);
     // The connection drops after the request was written, before any
     // byte of the reply: the agent never acted, and reading again is safe.
     proxy.swallow_next();
     assert_eq!(client.pending_rotation().unwrap(), None);
-    assert_eq!(proxy.seen(), ["pending_rotation"; 3]);
-    assert_eq!(proxy.passed(), ["pending_rotation"; 2]);
+    assert_eq!(proxy.seen(), ["pending_rotation"; 4]);
+    assert_eq!(proxy.passed(), ["pending_rotation"; 3]);
     assert_eq!(proxy.connections(), 2);
     assert_eq!(client.traffic().connections(), 2);
+    assert!(
+        !client.one_per_connection(),
+        "it answered twice on one connection"
+    );
 }
 
 #[test]
@@ -348,6 +382,7 @@ fn a_request_that_changes_the_agent_is_never_sent_again() {
     let socket = start_agent(dir.path(), own_uid());
     let proxy = Proxy::start(dir.path(), socket);
     let client = CredAgentClient::at(proxy.socket.clone());
+    assert_eq!(client.pending_rotation().unwrap(), None);
     assert_eq!(client.pending_rotation().unwrap(), None);
     proxy.swallow_next();
     let error = format!("{:#}", client.lock_keys().err().unwrap());
@@ -433,11 +468,19 @@ fn a_client_reconnects_to_a_restarted_agent_process_and_checks_it_again() {
     assert_eq!(client.older_build_warning(), None, "the same build");
 }
 
-/// An agent that closes every connection after its first reply.
-fn start_one_reply_agent(dir: &Path) -> PathBuf {
+/// An agent that closes every connection after its first reply (no released
+/// build does), answering `status` as this build; the ops of the request
+/// lines it read.
+fn start_one_reply_agent(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
     let socket = sock(&dir.join("run"));
     make_private(socket.parent().unwrap());
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let status = format!(
+        r#"{{"v":2,"ok":true,"reply":{{"kind":"status","unlocked":true,"storage_kid":"0a1b2c3d","escrowed":true,"build":"{}"}}}}"#,
+        build_id()
+    );
+    let read = Arc::new(Mutex::new(Vec::new()));
+    let seen = read.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
@@ -445,29 +488,158 @@ fn start_one_reply_agent(dir: &Path) -> PathBuf {
             if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
                 continue;
             }
+            seen.lock().unwrap().push(op_of(&line));
             let reply = if line.contains("\"op\":\"status\"") {
-                OTHER_UNLOCKED
+                status.as_str()
             } else {
                 OTHER_DONE
             };
             let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
         }
     });
-    socket
+    (socket, read)
 }
 
 #[test]
-fn an_agent_that_answers_one_request_per_connection_still_works() {
-    let dir = short_dir();
-    let client = CredAgentClient::at(start_one_reply_agent(dir.path()));
-    for _ in 0..5 {
-        assert!(client.status().unwrap().unlocked);
+fn an_agent_that_answers_one_request_per_connection_gets_a_connection_per_request() {
+    // As `autostart` makes clients (it may start an agent, never needed
+    // here, and checks the build), and a client without either; a request
+    // that changes the agent first, and a status first.
+    for (checks, change_first) in [(true, true), (true, false), (false, true), (false, false)] {
+        let dir = short_dir();
+        let (socket, read) = start_one_reply_agent(dir.path());
+        let mut client = CredAgentClient::with_launcher(
+            socket,
+            Box::new(|| -> Result<()> { panic!("an agent answers") }),
+        );
+        if checks {
+            client = client.checking_build(build_id());
+        }
+        let mut locks = 0;
+        if change_first {
+            client.lock_keys().unwrap();
+            locks += 1;
+        }
+        for _ in 0..3 {
+            assert!(client.status().unwrap().unlocked);
+            client.lock_keys().unwrap();
+            locks += 1;
+        }
+        let read = read.lock().unwrap().clone();
+        assert_eq!(
+            Proxy::count(&read, "lock"),
+            locks,
+            "each lock read once: {read:?}"
+        );
     }
-    // Once it has closed the last connection, a request that changes
-    // the agent goes on a new one without error.
-    std::thread::sleep(Duration::from_millis(50));
-    client.lock_keys().unwrap();
-    // A connection each (one more when a status raced the close and
-    // went again).
-    assert!(client.traffic().connections() >= 6);
+}
+
+/// Whether `needle` occurs in `bytes`.
+fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Reads `bytes` into `lines` the way the agent does, a chunk at a time.
+fn feed(lines: &mut Lines, bytes: &[u8]) {
+    for part in bytes.chunks(4096) {
+        lines.chunk()[..part.len()].copy_from_slice(part);
+        lines.take(part.len());
+    }
+}
+
+#[test]
+fn an_answered_request_leaves_nothing_in_the_agents_connection_buffers() {
+    let request = br#"{"op":"load_unlocked","device":"SECRET-DEVICE-KEY","storage_key":"SECRET-STORAGE-KEY","v":2}
+"#;
+    let mut lines = Lines::new();
+    feed(&mut lines, request);
+    assert_eq!(&lines.next_line().unwrap()[..], &request[..]);
+    assert!(lines.next_line().is_none());
+    lines.settle();
+    let retained = lines.retained(request.len());
+    assert!(
+        !holds(&retained, b"SECRET"),
+        "{}",
+        String::from_utf8_lossy(&retained)
+    );
+    assert!(retained.iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn the_next_requests_first_bytes_stay_and_nothing_of_the_answered_one() {
+    let first = br#"{"op":"crypt","astation_id":"a","ops":[{"seal":{"plain":"SECRET-ONE"}}],"v":2}
+"#;
+    let next = br#"{"op":"status""#;
+    let mut lines = Lines::new();
+    feed(&mut lines, &[&first[..], &next[..]].concat());
+    assert_eq!(&lines.next_line().unwrap()[..], &first[..]);
+    assert!(lines.next_line().is_none());
+    lines.settle();
+    let retained = lines.retained(first.len() + next.len());
+    assert!(
+        !holds(&retained, b"SECRET-ONE"),
+        "{}",
+        String::from_utf8_lossy(&retained)
+    );
+    assert_eq!(&retained[..next.len()], &next[..]);
+    feed(&mut lines, b",\"v\":2}\n");
+    assert_eq!(
+        &lines.next_line().unwrap()[..],
+        b"{\"op\":\"status\",\"v\":2}\n"
+    );
+}
+
+#[test]
+fn a_big_answered_request_gives_its_buffer_back() {
+    let big = format!(
+        "{{\"op\":\"crypt\",\"plain\":\"SECRET-{}\",\"v\":2}}\n",
+        "x".repeat(20 << 10)
+    );
+    let mut lines = Lines::new();
+    feed(&mut lines, big.as_bytes());
+    assert_eq!(&lines.next_line().unwrap()[..], big.as_bytes());
+    lines.settle();
+    // The grown buffer went (wiped as it was dropped); the chunk is wiped.
+    assert_eq!(lines.pending.0.capacity(), 4096);
+    assert!(lines.retained(0).iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn a_kept_connection_holds_no_reply_bytes_after_a_request() {
+    let dir = short_dir();
+    let client = CredAgentClient::at(start_agent(dir.path(), own_uid()));
+    assert!(!client.status().unwrap().unlocked);
+    assert_eq!(client.pending_rotation().unwrap(), None);
+    assert_eq!(client.kept_unread(), Some(0), "kept, nothing unread");
+    // An agent that sends more than one line for a request: the reply is
+    // refused and its connection not kept.
+    let other = short_dir();
+    let doubled = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}
+{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
+    let client = CredAgentClient::at(start_scripted_agent(other.path(), doubled, doubled));
+    assert!(client.lock_keys().is_err());
+    assert_eq!(client.kept_unread(), None, "not kept");
+}
+
+#[test]
+fn clients_that_may_start_an_agent_and_clients_that_never_do_are_shared_apart() {
+    let dir = short_dir();
+    let paths = CredPaths::in_dir(&dir.path().join("config"));
+    let run = dir.path().join("run");
+    make_private(&run);
+    let never = || CredAgentClient::for_paths(&paths, Some(run.clone().into_os_string()), None);
+    let starting = || {
+        CredAgentClient::for_paths(
+            &paths,
+            Some(run.clone().into_os_string()),
+            Some(Box::new(|| -> Result<()> { Ok(()) })),
+        )
+        .waiting(Duration::from_millis(100))
+    };
+    let first = shared(never());
+    assert!(Arc::ptr_eq(&first, &shared(never())));
+    assert!(!Arc::ptr_eq(&first, &shared(starting())));
+    // `running_agent`'s client never starts one.
+    let error = format!("{:#}", first.status().err().unwrap());
+    assert!(error.contains("isn't running"), "{error}");
 }

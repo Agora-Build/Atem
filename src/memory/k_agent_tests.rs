@@ -976,3 +976,18 @@ fn a_lock_drops_the_cached_state() {
     device.agent.lock_keys().unwrap();
     assert!(!device.agent.lock().unwrap().trust_cached());
 }
+
+#[test]
+fn an_unverified_astation_is_reported_before_a_stored_state_that_does_not_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::On, A, [1; 32]);
+    let mut store: serde_json::Value = serde_json::from_slice(&std::fs::read(&device.paths.trust).unwrap()).unwrap();
+    store["astations"][ASTATION_ID]["account_state"]["statement"] = "not base64!".into();
+    std::fs::write(&device.paths.trust, serde_json::to_vec(&store).unwrap()).unwrap();
+    let error = error_of(device.agent.crypt("astation-unknown", vec![CryptOp::seal("mem", "content", b"x")]));
+    assert!(error.contains("isn't verified with Astation astation-unknown"), "{error}");
+    // The verified one still fails closed.
+    let error = error_of(try_seal(&device));
+    assert!(error.contains("not base64"), "{error}");
+}

@@ -25,7 +25,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::daemon::{
     self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, recorded_socket,
@@ -41,8 +41,9 @@ use crate::paths::CredPaths;
 /// `EncryptionContext`, and one skill (at most 1 MiB, base64 on the wire)
 /// always fits.
 const MAX_LINE: usize = 8 << 20;
-/// The most read buffer an agent keeps for a connection between requests.
-const KEPT_BUFFER: usize = 64 << 10;
+/// The read buffer an agent keeps for a connection between requests (what
+/// `WipingBuf::new` allocates): a bigger one goes once its request is answered.
+const KEPT_BUFFER: usize = 4 << 10;
 /// A connection that says nothing for this long is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a stopping agent lets requests already in flight finish.
@@ -662,41 +663,33 @@ async fn serve_connection(
     }
     let mut stopped = stopping.subscribe();
     let (mut read, mut write) = stream.into_split();
-    let mut pending = WipingBuf::new();
-    let mut chunk = Zeroizing::new([0u8; 4096]);
-    // Bytes of `pending` already known to hold no newline: a multi-MiB
-    // `Crypt` line arrives in 4 KiB reads, and rescanning it all each time
-    // would be quadratic.
-    let mut scanned = 0;
+    let mut lines = Lines::new();
     loop {
-        while let Some(offset) = pending.0[scanned..].iter().position(|byte| *byte == b'\n') {
-            let end = scanned + offset;
-            scanned = 0;
-            let line = Zeroizing::new(pending.0.drain(..=end).collect::<Vec<u8>>());
+        let mut answered = false;
+        while let Some(line) = lines.next_line() {
+            let end = line.len() - 1;
             let (reply, stop) = match std::str::from_utf8(&line[..end]) {
                 Ok(text) => respond(agent, text),
                 Err(_) => respond(agent, ""),
             };
+            drop(line);
             write.write_all(&reply.0).await?;
+            answered = true;
             if stop {
                 stopping.send_replace(true);
                 return Ok(());
             }
         }
-        // Clients keep their connection between requests: a big request's
-        // buffer goes (wiped) once it has been answered, not when the
-        // connection closes.
-        if pending.0.is_empty() && pending.0.capacity() > KEPT_BUFFER {
-            pending = WipingBuf::new();
+        if answered {
+            lines.settle();
         }
-        scanned = pending.0.len();
-        if pending.0.len() > MAX_LINE {
+        if lines.too_long() {
             bail!("a request is too long");
         }
         // A stopping agent takes no further request; one only partly read
         // is dropped (its client sees the connection close).
         let n = tokio::select! {
-            read = tokio::time::timeout(IDLE_TIMEOUT, read.read(&mut chunk[..])) => {
+            read = tokio::time::timeout(IDLE_TIMEOUT, read.read(lines.chunk())) => {
                 read.map_err(|_| anyhow!("closed an idle connection"))??
             }
             _ = stopped.wait_for(|stop| *stop) => return Ok(()),
@@ -704,7 +697,86 @@ async fn serve_connection(
         if n == 0 {
             return Ok(());
         }
-        pending.append(&chunk[..n]);
+        lines.take(n);
+    }
+}
+
+/// What an agent connection has read and not yet handled (`pending`), and
+/// the chunk it reads into. Requests carry secrets (device keys, plain text
+/// to seal) and clients keep their connection between requests, so once the
+/// lines read so far are answered, `settle` wipes every byte they left in
+/// either buffer. Both are wiped whole when the connection ends (`Zeroizing`).
+struct Lines {
+    pending: WipingBuf,
+    chunk: Zeroizing<[u8; 4096]>,
+    /// Bytes of `pending` already known to hold no newline: a multi-MiB
+    /// `Crypt` line arrives in 4 KiB reads, and rescanning it all each time
+    /// would be quadratic.
+    scanned: usize,
+}
+
+impl Lines {
+    fn new() -> Self {
+        Self {
+            pending: WipingBuf::new(),
+            chunk: Zeroizing::new([0u8; 4096]),
+            scanned: 0,
+        }
+    }
+
+    /// The next whole line read (with its newline), if one has arrived.
+    fn next_line(&mut self) -> Option<Zeroizing<Vec<u8>>> {
+        let Some(offset) = self.pending.0[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        else {
+            self.scanned = self.pending.0.len();
+            return None;
+        };
+        let end = self.scanned + offset;
+        self.scanned = 0;
+        Some(Zeroizing::new(self.pending.0.drain(..=end).collect()))
+    }
+
+    /// Where the next read goes.
+    fn chunk(&mut self) -> &mut [u8] {
+        &mut self.chunk[..]
+    }
+
+    /// Takes the `n` bytes just read into `chunk`.
+    fn take(&mut self, n: usize) {
+        self.pending.append(&self.chunk[..n]);
+    }
+
+    fn too_long(&self) -> bool {
+        self.pending.0.len() > MAX_LINE
+    }
+
+    /// Once the lines read so far are answered: wipes the whole of `pending`
+    /// past its unread bytes (the start of a next request, if any), so its
+    /// allocation holds nothing of an answered request, and the whole chunk.
+    /// A buffer that grew for a big request goes instead, wiped whole as it
+    /// is dropped.
+    fn settle(&mut self) {
+        if self.pending.0.is_empty() && self.pending.0.capacity() > KEPT_BUFFER {
+            self.pending = WipingBuf::new();
+        } else {
+            self.pending.0.spare_capacity_mut().zeroize();
+        }
+        self.chunk.zeroize();
+    }
+
+    /// The first `len` bytes of everything this connection holds in user
+    /// space: `pending`'s allocation (its unread bytes, then the rest of its
+    /// capacity), then `chunk`. Only bytes that were written are read.
+    #[cfg(test)]
+    fn retained(&self, len: usize) -> Vec<u8> {
+        let capacity = self.pending.0.capacity();
+        let len = len.min(capacity);
+        // SAFETY: the first `len` bytes of the allocation were all written
+        // (read data or a wipe), and the allocation is `capacity` long.
+        let pending = unsafe { std::slice::from_raw_parts(self.pending.0.as_ptr(), len) };
+        [pending, &self.chunk[..]].concat()
     }
 }
 
@@ -840,6 +912,10 @@ struct Conn {
     stream: UnixStream,
     /// When the last reply arrived: the agent's idle timer starts then.
     idle_since: std::time::Instant,
+    /// Replies read on it. An agent that answered twice on a connection
+    /// serves several requests per connection (every released build does);
+    /// after one reply, it might be one that closes it.
+    replies: u32,
 }
 
 impl Conn {
@@ -847,16 +923,16 @@ impl Conn {
         Self {
             stream,
             idle_since: std::time::Instant::now(),
+            replies: 0,
         }
     }
 
-    /// Whether the next request may go on this connection: it hasn't been
-    /// idle for `reuse_idle`, and the agent hasn't closed it (nor sent
-    /// anything unasked). Nothing has been written on it when this says no.
-    fn reusable(&self, reuse_idle: Duration) -> bool {
-        if self.idle_since.elapsed() >= reuse_idle {
-            return false;
-        }
+    fn idle(&self, reuse_idle: Duration) -> bool {
+        self.idle_since.elapsed() >= reuse_idle
+    }
+
+    /// Whether the agent has closed it (or sent anything unasked).
+    fn closed(&self) -> bool {
         let mut byte = 0u8;
         // SAFETY: peeks at most one byte into `byte`, without blocking.
         let peeked = unsafe {
@@ -867,7 +943,7 @@ impl Conn {
                 libc::MSG_PEEK | libc::MSG_DONTWAIT,
             )
         };
-        peeked < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+        !(peeked < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock)
     }
 
     /// Writes `line`, wipes it while the agent works, and reads the reply.
@@ -878,8 +954,20 @@ impl Conn {
         drop(line);
         let answer = read_answer(&self.stream)?;
         self.idle_since = std::time::Instant::now();
+        self.replies += 1;
         Ok(answer)
     }
+}
+
+/// A client's kept connection, and what it learnt about its agent.
+#[derive(Default)]
+struct Link {
+    conn: Option<Conn>,
+    /// The agent closed a connection after its only reply: it answers one
+    /// request per connection. For the rest of the client's life every
+    /// request then goes on a connection of its own, as before connections
+    /// were kept (the build was checked on the first one).
+    one_per_connection: bool,
 }
 
 /// A reply, and whether it was exactly one line with nothing after it: only
@@ -983,20 +1071,24 @@ fn resendable(request: &Request) -> bool {
 /// The clients this process shares (`shared`).
 static SHARED: Mutex<Vec<Arc<CredAgentClient>>> = Mutex::new(Vec::new());
 
-/// The process-wide client of the agent `client` reaches: the one already
-/// shared for the same socket and key directory, else `client`, shared from
-/// now on. Every `EncryptionContext`, knowledge and vault client of a
-/// process then uses one connection, checked once. Keyed by the resolved
-/// paths, so clients of two agents (two tests' temp profiles) never share.
-/// Callers pass clients built the same way (`autostart`).
+/// The process-wide client of the agent `client` reaches, built the way
+/// `client` is: the one already shared for the same socket and key
+/// directory, the same ability to start an agent and the same build to
+/// check, else `client`, shared from now on. Every `EncryptionContext`,
+/// knowledge and vault client of a process then uses one connection, checked
+/// once (`autostart`), and `running_agent` callers another that never starts
+/// an agent (`existing`). Keyed by the resolved paths, so clients of two
+/// agents (two tests' temp profiles) never share.
 pub(crate) fn shared(client: CredAgentClient) -> Arc<CredAgentClient> {
     let mut shared = SHARED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(known) = shared
-        .iter()
-        .find(|known| known.socket == client.socket && known.record == client.record)
-    {
+    if let Some(known) = shared.iter().find(|known| {
+        known.socket == client.socket
+            && known.record == client.record
+            && known.launcher.is_some() == client.launcher.is_some()
+            && known.build == client.build
+    }) {
         return known.clone();
     }
     let client = Arc::new(client);
@@ -1034,7 +1126,7 @@ pub struct CredAgentClient {
     runtime_check: bool,
     /// The connection kept between requests; holding it is holding the
     /// right to send the next request.
-    conn: Mutex<Option<Conn>>,
+    link: Mutex<Link>,
     /// How long a connection may sit idle and still carry a request.
     reuse_idle: Duration,
     #[cfg(test)]
@@ -1060,7 +1152,7 @@ impl CredAgentClient {
             build: None,
             older_build: Mutex::new(None),
             runtime_check: false,
-            conn: Mutex::new(None),
+            link: Mutex::new(Link::default()),
             reuse_idle: REUSE_IDLE,
             #[cfg(test)]
             traffic: Traffic::default(),
@@ -1184,6 +1276,30 @@ impl CredAgentClient {
         &self.traffic
     }
 
+    /// Whether this client gives every request a connection of its own.
+    #[cfg(test)]
+    pub(crate) fn one_per_connection(&self) -> bool {
+        self.link.lock().is_ok_and(|link| link.one_per_connection)
+    }
+
+    /// Unread bytes queued on the kept connection; `None` when none is kept.
+    #[cfg(test)]
+    pub(crate) fn kept_unread(&self) -> Option<usize> {
+        let link = self.link.lock().ok()?;
+        let conn = link.conn.as_ref()?;
+        let mut bytes = [0u8; 256];
+        // SAFETY: peeks at most `bytes.len()` bytes into `bytes`, without blocking.
+        let peeked = unsafe {
+            libc::recv(
+                conn.stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        Some(usize::try_from(peeked).unwrap_or(0))
+    }
+
     /// Replaces a connection idle for `idle` before its next request.
     #[cfg(test)]
     pub(crate) fn reusing_for(mut self, idle: Duration) -> Self {
@@ -1224,6 +1340,19 @@ impl CredAgentClient {
 
     pub fn is_running(&self) -> bool {
         matches!(self.dial(), Ok(Ok(_)))
+    }
+
+    /// Whether an agent answers: the kept connection is open (when no
+    /// request holds it), else a dial succeeds. Starts nothing.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn answers(&self) -> bool {
+        if let Ok(mut link) = self.link.try_lock() {
+            self.drop_unusable(&mut link);
+            if link.conn.is_some() {
+                return true;
+            }
+        }
+        self.is_running()
     }
 
     fn connect(&self) -> Result<UnixStream> {
@@ -1403,54 +1532,109 @@ impl CredAgentClient {
         conn.round_trip(line)
     }
 
-    /// `line` on the kept connection `slot`, replaced first when it can't
-    /// carry a request (`Conn::reusable`; nothing was written on it, so no
-    /// request goes twice). When a reused connection drops after `line` was
-    /// written but before any byte of the reply, the request in `again` (a
-    /// `resendable` one) goes once more on a new connection; every other
-    /// failure is the request's error, and its connection is dropped.
+    /// Drops the kept connection when it can't carry a request: idle for
+    /// `reuse_idle`, or closed by the agent. Nothing has been written on it,
+    /// so no request goes twice. An agent that closed it after its only
+    /// reply answers one request per connection (`Link::one_per_connection`);
+    /// one that had answered twice on it has stopped or restarted.
+    fn drop_unusable(&self, link: &mut Link) {
+        let Some(conn) = &link.conn else {
+            return;
+        };
+        if conn.idle(self.reuse_idle) {
+            link.conn = None;
+        } else if conn.closed() {
+            if conn.replies == 1 {
+                link.one_per_connection = true;
+            }
+            link.conn = None;
+        }
+    }
+
+    /// `line` on a connection of its own, closed after the reply.
+    fn alone(&self, line: Zeroizing<String>) -> Result<WipingBuf> {
+        let mut conn = self.connection()?;
+        match self.send(&mut conn, line) {
+            Ok(answer) => Ok(answer.reply),
+            Err(failed) => Err(self.closed(failed.into_error())),
+        }
+    }
+
+    /// `line` on the kept connection (opened, and checked, when none is
+    /// kept). A request that changes the agent (`again` is `None`) never
+    /// goes where the agent might close the connection under it: on a
+    /// connection with a single reply, the agent first answers a `status`
+    /// there (two replies prove it keeps connections), and an agent that
+    /// closes it instead answers one request per connection.
+    ///
+    /// When the connection drops after `line` was written but before any
+    /// byte of the reply, the request in `again` (a `resendable` one) goes
+    /// once more: on a connection of its own when the connection had a
+    /// single reply (the agent closes connections after a reply), on a new
+    /// kept one when the agent had answered twice on it (it stopped or
+    /// restarted). Every other failure is the request's error.
     fn exchange(
         &self,
-        slot: &mut Option<Conn>,
-        line: Zeroizing<String>,
+        link: &mut Link,
+        mut line: Zeroizing<String>,
         again: Option<&Request>,
     ) -> Result<WipingBuf> {
-        if slot
-            .as_ref()
-            .is_some_and(|conn| !conn.reusable(self.reuse_idle))
-        {
-            *slot = None;
-        }
-        let reused = slot.is_some();
-        let conn = match slot {
-            Some(conn) => conn,
-            None => slot.insert(self.open()?),
-        };
-        let mut failed = match self.send(conn, line) {
-            Ok(answer) => return Ok(keep(slot, answer)),
-            Err(failed) => failed,
-        };
-        *slot = None;
-        if let Some(request) = again
-            && reused
-            && matches!(failed, Failed::Unanswered(_))
-        {
-            let line = encode_request(request)?;
-            let conn = slot.insert(self.open()?);
-            failed = match self.send(conn, line) {
-                Ok(answer) => return Ok(keep(slot, answer)),
+        let mut resent = false;
+        loop {
+            self.drop_unusable(link);
+            if link.one_per_connection {
+                link.conn = None;
+                return self.alone(line);
+            }
+            let conn = match &mut link.conn {
+                Some(conn) => conn,
+                None => link.conn.insert(self.open()?),
+            };
+            if again.is_none() && conn.replies == 1 {
+                let status = encode_request(&Request::Status)?;
+                match self.send(conn, status) {
+                    Ok(answer) if answer.in_step => {}
+                    Ok(_) => {
+                        link.conn = None;
+                        bail!("the cred agent sent more than one reply to a status");
+                    }
+                    Err(Failed::Unanswered(_)) => {
+                        link.conn = None;
+                        link.one_per_connection = true;
+                        continue;
+                    }
+                    Err(failed) => {
+                        link.conn = None;
+                        return Err(self.closed(failed.into_error()));
+                    }
+                }
+            }
+            let replies = conn.replies;
+            let failed = match self.send(conn, line) {
+                Ok(answer) => return Ok(keep(link, answer)),
                 Err(failed) => failed,
             };
-            *slot = None;
+            link.conn = None;
+            let resend = match (&failed, again) {
+                (Failed::Unanswered(_), Some(_)) => replies == 1 || (replies > 1 && !resent),
+                _ => false,
+            };
+            let Some(request) = again.filter(|_| resend) else {
+                return Err(self.closed(failed.into_error()));
+            };
+            if replies == 1 {
+                link.one_per_connection = true;
+            }
+            resent = true;
+            line = encode_request(request)?;
         }
-        Err(self.closed(failed.into_error()))
     }
 }
 
-/// `answer`'s reply; its connection stays in `slot` only while in step.
-fn keep(slot: &mut Option<Conn>, answer: Answer) -> WipingBuf {
+/// `answer`'s reply; its connection stays kept only while in step.
+fn keep(link: &mut Link, answer: Answer) -> WipingBuf {
     if !answer.in_step {
-        *slot = None;
+        link.conn = None;
     }
     answer.reply
 }
@@ -1481,17 +1665,17 @@ impl CredAgentApi for CredAgentClient {
         // is wiped now.
         let again = resendable(&request).then_some(request);
         let reply = {
-            let mut slot = self.conn.lock().unwrap_or_else(|poisoned| {
+            let mut link = self.link.lock().unwrap_or_else(|poisoned| {
                 // A request that panicked midway leaves no usable connection.
-                self.conn.clear_poison();
-                let mut slot = poisoned.into_inner();
-                *slot = None;
-                slot
+                self.link.clear_poison();
+                let mut link = poisoned.into_inner();
+                link.conn = None;
+                link
             });
-            let reply = self.exchange(&mut slot, line, again.as_ref());
+            let reply = self.exchange(&mut link, line, again.as_ref());
             if stops {
                 // The agent closes it once it has answered.
-                *slot = None;
+                link.conn = None;
             }
             reply
         };
