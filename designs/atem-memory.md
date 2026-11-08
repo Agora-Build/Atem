@@ -543,9 +543,17 @@ atem memory status                  # account, machine, pending ops, last sync, 
    is sealed again first. Before a request with ops sealed by an earlier
    `Crypt` request is sent, the cred agent must still be unlocked (a status
    on the agent connection), so `atem cred lock` stops the push within one
-   request, as when each request was sealed just before it was sent. A group
-   that fails to seal stops the push with that error, after the request in
-   flight (whose results are applied first); it is not retried.
+   request, as when each request was sealed just before it was sent; a
+   `Crypt` request made just before the send (a group, or the request's ops
+   sealed again) shows that already, and a request refused as too large and
+   resent one op at a time checks before each op the agent sealed earlier.
+   Ops whose sealing needs no agent (a memory's delete or invalidation, a
+   global skill's delete or purge) are sealed by no `Crypt` request: they
+   never wait for the check and go out while the agent is locked, as before
+   sealing ahead, and a push of only such ops never contacts (so never
+   starts) the agent. A group that fails to seal stops the push with that
+   error, after the request in flight (whose results are applied first); it
+   is not retried.
 3. **Pull** memories and skills since `cursor`, page by page. Upsert rows and
    apply tombstones locally. Advance `cursor` after each page, in the same
    local transaction as the page's rows (an interrupted page is pulled again
@@ -555,7 +563,11 @@ atem memory status                  # account, machine, pending ops, last sync, 
    committed) and applied once page k is committed; a page that fails to
    open or apply drops the page after it unapplied, and the next sync starts
    from the committed cursor. A transaction never waits for a request or an
-   open. Cursors are
+   open. A page opened before `atem cred lock`, a mode or key change or the
+   loss of this device's verification is still applied (its plain text is
+   already in the process): at most one page more than when each page was
+   opened just before it was applied; the next page's open is refused or
+   follows the new state. Cursors are
    kept per account (`memory_cursor:<astation_id>`,
    `skill_cursor:<astation_id>`), so pairing with a different Astation
    pulls that account from 0; the legacy unkeyed cursor is ignored.
@@ -762,7 +774,9 @@ lives.
   page, a migration in full groups; large skills never more requests than
   one request at a time), an op rewritten, acked, or under a new mode or key
   after it was sealed (sealed again or dropped), a lock between two seals or
-  during one (the push stops within one request; a refusal is not retried),
+  during one (the push stops within one request; a refusal is not retried;
+  deletes, invalidations and a global skill's purge still go, without
+  contacting the agent),
   a page that fails to open or apply, or a crash, with the next one fetched
   or opened, a cursor moved by another writer, and what another connection
   sees of the queue and cursor at each relay request.
