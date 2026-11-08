@@ -14,8 +14,31 @@ use crate::memory::crypto::{
 };
 
 pub const PULL_LIMIT: u32 = 200;
-const MEMORY_MIGRATION_CHUNK: usize = 64;
-const SKILL_MIGRATION_CHUNK: usize = 16;
+
+/// What an encryption migration rewrites on the relay, per batch POST.
+#[derive(Clone, Copy)]
+enum Rewrite {
+    Memory,
+    Skills,
+}
+
+impl Rewrite {
+    fn kind(self) -> &'static str {
+        match self { Self::Memory => "memory", Self::Skills => "skills" }
+    }
+
+    /// Rows per POST.
+    fn chunk(self) -> usize {
+        match self { Self::Memory => 64, Self::Skills => 16 }
+    }
+
+    fn refused(self) -> &'static str {
+        match self {
+            Self::Memory => "relay refused a memory encryption rewrite",
+            Self::Skills => "relay refused a skill encryption rewrite",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiRequest {
@@ -329,6 +352,18 @@ impl KnowledgeClient {
         Ok((state, sealed))
     }
 
+    /// Before ops sealed by an earlier request are sent: the cred agent is
+    /// still unlocked (a status on the shared connection), so a lock stops a
+    /// push within one POST, as when each chunk was sealed just before its
+    /// POST. Nothing to confirm while the account isn't encrypting.
+    pub async fn confirm_unlocked(&self) -> Result<(), ApiError> {
+        let encryption = self.encryption()?;
+        if !encryption.should_encrypt() {
+            return Ok(());
+        }
+        encryption.blocking(|encryption| encryption.confirm_unlocked()).await.map_err(ApiError::from)
+    }
+
     /// POSTs ops in their wire form (`seal_ops`) as one batch.
     pub async fn post_ops(&self, wire: &[Value], memory: bool) -> Result<Vec<OpResult>, ApiError> {
         self.post_batch(if memory { "memory" } else { "skills" }, wire).await
@@ -509,10 +544,10 @@ impl KnowledgeClient {
 
         let enabling = encryption.mode == EncryptionMode::Enabling;
         let none = Cost::default();
-        self.rewrite_all(&encryption, memories, "memory", MEMORY_MIGRATION_CHUNK,
+        self.rewrite_all(&encryption, memories, Rewrite::Memory,
             |row| [memory_open_cost(row), if enabling { memory_seal_cost(row) } else { none }, none],
             rewritten_memories).await?;
-        self.rewrite_all(&encryption, skills, "skills", SKILL_MIGRATION_CHUNK,
+        self.rewrite_all(&encryption, skills, Rewrite::Skills,
             |row| {
                 let [paths, files] = if enabling { skill_seal_cost(row) } else { [none; 2] };
                 [skill_open_cost(row), paths, files]
@@ -520,23 +555,24 @@ impl KnowledgeClient {
             rewritten_skills).await
     }
 
-    /// Rewrites `rows` on the relay, `chunk` rows per POST, in order. The rows
-    /// are opened and sealed again (`prepare`) in groups that each fit one
-    /// `Crypt` request per step (`plan_groups`), the next group while the POST
-    /// before it is in flight (F2). Nothing is recorded locally: a failure
-    /// stops the migration, which runs again from a new snapshot, and only the
-    /// read-back says it is done.
+    /// Rewrites `rows` on the relay, `kind.chunk()` rows per POST, in order.
+    /// The rows are opened and sealed again (`prepare`) in groups of whole
+    /// POSTs (`plan_groups`), the next group while the POST before it is in
+    /// flight (F2). A POST of rows prepared by an earlier request first
+    /// confirms the cred agent is still unlocked, so a lock stops the
+    /// migration within one POST, as when each POST was prepared just before
+    /// it. Nothing is recorded locally: a failure stops the migration, which
+    /// runs again from a new snapshot, and only the read-back says it is done.
     async fn rewrite_all<R: Clone + Send + 'static>(
         &self,
         encryption: &EncryptionContext,
         rows: Vec<R>,
-        kind: &str,
-        chunk: usize,
+        kind: Rewrite,
         cost: impl Fn(&R) -> Steps,
         prepare: fn(&EncryptionContext, Vec<R>) -> anyhow::Result<Vec<Value>>,
     ) -> Result<(), ApiError> {
-        let refused = if kind == "memory" { "relay refused a memory encryption rewrite" } else { "relay refused a skill encryption rewrite" };
-        let mut groups = plan_groups(&rows, cost).into_iter();
+        let chunk = kind.chunk();
+        let mut groups = plan_groups(&rows, chunk, cost).into_iter();
         let seal = |range: std::ops::Range<usize>| {
             let rows = rows[range].to_vec();
             encryption.blocking(move |encryption| prepare(encryption, rows))
@@ -546,12 +582,17 @@ impl KnowledgeClient {
         while sent < rows.len() {
             let end = (sent + chunk).min(rows.len());
             // The first chunk, or the read-ahead fell behind: this POST's rows first.
+            let mut prepared_now = false;
             while sent + ready.len() < end {
                 let Some(range) = groups.next() else { break };
                 ready.extend(seal(range).await?);
+                prepared_now = true;
             }
             if sent + ready.len() < end {
                 return Err(ApiError::Encryption("a migration batch lost rows".into()));
+            }
+            if !prepared_now {
+                encryption.blocking(|encryption| encryption.confirm_unlocked()).await?;
             }
             let ops: Vec<Value> = ready.drain(..end - sent).collect();
             // Prepare the next group while this POST is in flight, once what is
@@ -559,14 +600,14 @@ impl KnowledgeClient {
             let next = if ready.len() < chunk { groups.next() } else { None };
             let (posted, prepared) = match next {
                 Some(range) => {
-                    let (posted, prepared) = tokio::join!(self.post_batch(kind, &ops), seal(range));
+                    let (posted, prepared) = tokio::join!(self.post_batch(kind.kind(), &ops), seal(range));
                     (posted, Some(prepared))
                 }
-                None => (self.post_batch(kind, &ops).await, None),
+                None => (self.post_batch(kind.kind(), &ops).await, None),
             };
             let results = posted?;
             if results.len() != ops.len() || results.iter().any(|result| !result.ok) {
-                return Err(ApiError::Encryption(refused.into()));
+                return Err(ApiError::Encryption(kind.refused().into()));
             }
             if let Some(prepared) = prepared {
                 ready.extend(prepared?);

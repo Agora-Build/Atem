@@ -333,7 +333,9 @@ impl VaultClient {
         }
 
         // Each vault is opened and sealed again while the one before it is
-        // POSTed.
+        // POSTed; a vault prepared that way is POSTed only while the cred
+        // agent is still unlocked (a lock stops the migration within one
+        // POST, as when each vault was prepared just before its POST).
         let prepare = |(item, entries): (VaultListItem, Vec<VaultEntry>)| {
             let vault_id = item.vault_id.clone();
             let body = encryption.blocking(move |encryption| migrated_vault(encryption, &item, &entries));
@@ -352,7 +354,11 @@ impl VaultClient {
         let mut snapshot = snapshot.into_iter();
         let Some(first) = snapshot.next() else { return Ok(()) };
         let (mut vault_id, mut body) = prepare(first).await?;
+        let mut prepared_ahead = false;
         loop {
+            if prepared_ahead {
+                encryption.blocking(|encryption| encryption.confirm_unlocked()).await?;
+            }
             let Some(next) = snapshot.next() else {
                 post(vault_id, body).await?;
                 return Ok(());
@@ -360,6 +366,7 @@ impl VaultClient {
             let (posted, prepared) = tokio::join!(post(vault_id, body), prepare(next));
             posted?;
             (vault_id, body) = prepared?;
+            prepared_ahead = true;
         }
     }
 }

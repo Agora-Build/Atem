@@ -19,6 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const KID: &str = "0123abcd";
+/// Project facts (3 `Crypt` ops each) whose push is two groups: the first
+/// `GROUP_ONE_CHUNKS` chunks of 50 (4,050 ops, within four requests' worth),
+/// sealed in `GROUP_ONE_REQUESTS` requests, then the rest.
+const TWO_GROUPS: usize = 1400;
+const GROUP_ONE_CHUNKS: usize = 27;
+const GROUP_ONE_REQUESTS: usize = 4;
 const PROJECT: &str = "github.com/agora/atem";
 
 type Log = Arc<Mutex<Vec<(String, String, serde_json::Value)>>>;
@@ -513,11 +519,12 @@ async fn the_next_group_is_sealed_while_a_chunk_is_posted() {
     let in_flight = Arc::new(AtomicBool::new(false));
     let overlapped = Arc::new(AtomicBool::new(false));
     let (flag, seen) = (in_flight.clone(), overlapped.clone());
-    // The second request is the next group's: is a POST in flight then?
+    // Group 1 (27 chunks, 4,050 ops) is four requests; the fifth is the next
+    // group's: is a POST in flight then?
     let recorder = Recorder::with_hook(
         device.agent.clone(),
         Box::new(move |index, _, _| {
-            if index == 1 {
+            if index == GROUP_ONE_REQUESTS {
                 seen.store(
                     wait_for(Duration::from_secs(2), || flag.load(Ordering::SeqCst)),
                     Ordering::SeqCst,
@@ -527,21 +534,21 @@ async fn the_next_group_is_sealed_while_a_chunk_is_posted() {
     );
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let keeping = keeping_relay(relay.clone());
-    let flag = in_flight.clone();
+    let (flag, posts) = (in_flight.clone(), AtomicUsize::new(0));
     let (base, _log) = stub_relay(Box::new(move |m, p, body| {
-        if m != "POST" {
+        // The last chunk of group 1 is held a while.
+        if m != "POST" || posts.fetch_add(1, Ordering::SeqCst) + 1 != GROUP_ONE_CHUNKS {
             return keeping(m, p, body);
         }
         flag.store(true, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(300));
         let answer = keeping(m, p, body);
         flag.store(false, Ordering::SeqCst);
         answer
     }))
     .await;
     let s = Store::open_in_memory().unwrap();
-    // 1,200 Crypt ops: two groups.
-    queue(&s, (0..400).map(|i| fact(i, true)));
+    queue(&s, (0..TWO_GROUPS).map(|i| fact(i, true)));
     let (_home, ctx) = test_ctx();
     let out = run_sync(
         &s,
@@ -552,11 +559,13 @@ async fn the_next_group_is_sealed_while_a_chunk_is_posted() {
     .await
     .unwrap();
     assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
-    assert_eq!(out.pushed, 400);
+    assert_eq!(out.pushed, TWO_GROUPS);
     assert!(
         overlapped.load(Ordering::SeqCst),
         "the next group was sealed between POSTs"
     );
+    let (seals, _) = recorder.seals_and_opens();
+    assert_eq!(seals.len(), GROUP_ONE_REQUESTS + 1);
 }
 
 #[tokio::test]
@@ -894,18 +903,120 @@ async fn a_page_that_fails_or_crashes_while_the_next_is_in_flight_keeps_the_curs
     }
 }
 
+/// Page 2's transaction fails after page 3 was already opened: page 3 is
+/// dropped unapplied, the cursor stays at page 1, and the next sync resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_that_fails_to_apply_after_the_next_was_opened_keeps_the_cursor() {
+    use rusqlite::functions::FunctionFlags;
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    seed_sealed(&relay, &device, 600);
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    let opened_three = Arc::new(AtomicBool::new(false));
+    let (seen, opens) = (opened_three.clone(), recorder.clone());
+    s.test_conn()
+        .create_scalar_function(
+            "stop_after_page_three",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| -> rusqlite::Result<i64> {
+                seen.store(
+                    wait_for(Duration::from_secs(2), || opens.calls().len() >= 3),
+                    Ordering::SeqCst,
+                );
+                Err(rusqlite::Error::UserFunctionError("injected stop".into()))
+            },
+        )
+        .unwrap();
+    s.test_conn()
+        .execute_batch("CREATE TEMP TRIGGER stop_mid_page BEFORE INSERT ON memories WHEN new.id = 'mem_r0300' BEGIN SELECT stop_after_page_three(); END;")
+        .unwrap();
+    let (_home, ctx) = test_ctx();
+    let client = client_with(&base, &device, recorder.clone());
+    let err = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("injected stop"), "{err:#}");
+    assert!(
+        opened_three.load(Ordering::SeqCst),
+        "page 3 wasn't opened during page 2's transaction"
+    );
+    assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 200);
+    assert_eq!(s.history_memories().unwrap().len(), 200);
+    assert!(s.history_memories().unwrap().iter().all(|m| m.seq <= 200));
+
+    s.test_conn()
+        .execute_batch("DROP TRIGGER stop_mid_page;")
+        .unwrap();
+    log.lock().unwrap().clear();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pulled, 400);
+    assert_eq!(memory_gets(&log), vec![200, 400, 600]);
+    assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 600);
+    assert_eq!(s.history_memories().unwrap().len(), 600);
+}
+
+/// Another writer moves the cursor past page 2 as page 1 commits: the page 2
+/// fetched meanwhile (from page 1's end) is dropped, and the pull starts again
+/// from the committed cursor.
+#[tokio::test]
+async fn a_cursor_moved_by_another_writer_restarts_the_pull_from_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    seed_sealed(&relay, &device, 600);
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    let key = memory_cursor_key(ASTATION_ID);
+    s.test_conn()
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER other_writer AFTER INSERT ON sync_state WHEN new.key = '{key}' AND new.value = 200 \
+             BEGIN UPDATE sync_state SET value = 400 WHERE key = new.key; END;"
+        ))
+        .unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, device.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pulled, 400);
+    assert_eq!(s.get_state(&key).unwrap(), 600);
+    let rows = s.history_memories().unwrap();
+    assert_eq!(rows.len(), 400);
+    assert!(
+        rows.iter().all(|m| m.seq <= 200 || m.seq > 400),
+        "page 2 was applied"
+    );
+    let gets = memory_gets(&log);
+    assert!(
+        gets.contains(&200) && gets.ends_with(&[400, 600]),
+        "{gets:?}"
+    );
+}
+
 // ─────────────── ruling 5: a lock while a POST is in flight ───────────────
 
 #[tokio::test]
 async fn a_lock_while_the_next_group_is_sealed_stops_the_push_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let device = device(dir.path(), EncryptionMode::On);
-    // `atem cred lock` lands just as the next group is sealed, while chunk 6
-    // (the last whole chunk of group 1) is in flight.
+    // `atem cred lock` lands just as the next group is sealed, while the last
+    // chunk of group 1 is in flight.
     let recorder = Recorder::with_hook(
         device.agent.clone(),
         Box::new(|index, _, agent| {
-            if index == 1 {
+            if index == GROUP_ONE_REQUESTS {
                 agent.lock_keys().unwrap();
             }
         }),
@@ -913,8 +1024,7 @@ async fn a_lock_while_the_next_group_is_sealed_stops_the_push_cleanly() {
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
     let s = Store::open_in_memory().unwrap();
-    // 341 facts of 3 ops fill group 1.
-    queue(&s, (0..400).map(|i| fact(i, true)));
+    queue(&s, (0..TWO_GROUPS).map(|i| fact(i, true)));
     let queued = s.pending().unwrap();
     let (_home, ctx) = test_ctx();
     let client = client_with(&base, &device, recorder.clone());
@@ -927,18 +1037,29 @@ async fn a_lock_while_the_next_group_is_sealed_stops_the_push_cleanly() {
         "{:?}",
         out.notes
     );
-    // Chunks 1 to 6 went out, sealed before the lock; nothing after it.
-    assert_eq!(out.pushed, 300);
+    // Group 1's chunks went out, sealed before the lock; the failed group
+    // stopped the push at once (one refused request, never retried), and the
+    // pull's open was refused too.
+    let sent = GROUP_ONE_CHUNKS * 50;
+    assert_eq!(out.pushed, sent);
     assert_eq!(
         posted_ops(&log).iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![50; 6]
+        vec![50; GROUP_ONE_CHUNKS]
     );
-    assert_eq!(s.pending().unwrap(), queued[300..].to_vec());
+    assert_eq!(s.pending().unwrap(), queued[sent..].to_vec());
     let calls = recorder.calls();
-    assert!(calls[0].ok && calls[1..].iter().all(|c| !c.ok), "{calls:?}");
+    assert_eq!(calls.len(), GROUP_ONE_REQUESTS + 2, "{calls:?}");
+    assert!(
+        calls[..GROUP_ONE_REQUESTS].iter().all(|c| c.ok),
+        "{calls:?}"
+    );
+    assert!(
+        calls[GROUP_ONE_REQUESTS..].iter().all(|c| !c.ok),
+        "{calls:?}"
+    );
     {
         let r = relay.lock().unwrap();
-        assert_eq!(r.rows.len(), 300);
+        assert_eq!(r.rows.len(), sent);
         assert!(
             r.rows
                 .values()
@@ -960,16 +1081,15 @@ async fn a_lock_while_the_next_group_is_sealed_stops_the_push_cleanly() {
     .await
     .unwrap();
     assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
-    assert_eq!((out.pushed, out.pulled), (100, 400));
+    assert_eq!((out.pushed, out.pulled), (TWO_GROUPS - sent, TWO_GROUPS));
     assert_eq!(s.pending_count().unwrap(), 0);
     let r = relay.lock().unwrap();
-    assert_eq!((r.rows.len(), r.ops_received), (400, 400));
+    assert_eq!((r.rows.len(), r.ops_received), (TWO_GROUPS, TWO_GROUPS));
 }
 
-/// An op that can't be sealed (a field over the agent's limit) is a group of
-/// its own (over the budget) and fails it, while chunk 2 is in flight; from
-/// then on the push seals chunk by chunk, so it stops at that op's own chunk,
-/// as before read-ahead.
+/// A chunk with an op that can't be sealed (a field over the agent's limit)
+/// is a group of its own, sealed while chunk 2 is in flight; its failure
+/// stops the push at that chunk, as before read-ahead.
 #[tokio::test]
 async fn an_op_that_cannot_be_sealed_stops_the_push_at_its_own_chunk() {
     let dir = tempfile::tempdir().unwrap();
@@ -1002,10 +1122,211 @@ async fn an_op_that_cannot_be_sealed_stops_the_push_at_its_own_chunk() {
         vec![50, 50]
     );
     assert_eq!(s.pending_count().unwrap(), 51);
-    // The 120 facts before it in one request; nothing reached the agent for
-    // the failed group or chunk.
+    // Chunks 1 and 2 in one request; nothing reached the agent for the
+    // failed chunk.
     let (seals, _) = recorder.seals_and_opens();
-    assert_eq!(seals.iter().map(|c| c.ops).collect::<Vec<_>>(), vec![240]);
+    assert_eq!(seals.iter().map(|c| c.ops).collect::<Vec<_>>(), vec![200]);
+}
+
+/// `atem cred lock` lands after the whole group was sealed, while chunk 1 is
+/// in flight: chunk 2 (sealed before the lock) is not sent, as when each
+/// chunk was sealed just before its POST.
+#[tokio::test]
+async fn a_lock_between_two_seals_stops_the_push_within_one_post() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let (agent, first) = (device.agent.clone(), AtomicBool::new(true));
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            agent.lock_keys().unwrap();
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    // One group: 1,200 ops in two requests, both before chunk 1 is sent.
+    queue(&s, (0..400).map(|i| fact(i, true)));
+    let queued = s.pending().unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert!(
+        out.notes.iter().any(|n| n.contains("atem cred unlock")),
+        "{:?}",
+        out.notes
+    );
+    assert_eq!(out.pushed, 50);
+    assert_eq!(
+        posted_ops(&log).iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![50]
+    );
+    assert_eq!(s.pending().unwrap(), queued[50..].to_vec());
+    // The group's two requests, then only the pull's refused open.
+    let calls = recorder.calls();
+    assert_eq!(
+        calls.iter().map(|c| (c.ops, c.ok)).collect::<Vec<_>>(),
+        vec![(1024, true), (176, true), (50, false)]
+    );
+}
+
+/// A locked agent refuses the push's first seal once: the refusal is the
+/// note, and nothing is asked again.
+#[tokio::test]
+async fn a_locked_agent_refuses_a_push_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    device.agent.lock_keys().unwrap();
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    queue(&s, (0..60).map(|i| fact(i, false)));
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert!(
+        out.notes.iter().any(|n| n.contains("atem cred unlock")),
+        "{:?}",
+        out.notes
+    );
+    assert_eq!(out.pushed, 0);
+    assert!(posted_ops(&log).is_empty());
+    assert_eq!(s.pending_count().unwrap(), 60);
+    let calls = recorder.calls();
+    assert_eq!(
+        calls.iter().map(|c| (c.ops, c.ok)).collect::<Vec<_>>(),
+        vec![(120, false)]
+    );
+}
+
+/// The key rotates while chunk 1 is in flight, after both chunks were sealed
+/// under the old kid: chunk 2 goes out under the new kid, never the old one.
+#[tokio::test]
+async fn a_key_rotation_after_sealing_seals_again_under_the_new_kid() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = Arc::new(Mutex::new(device(dir.path(), EncryptionMode::On)));
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let (rotate, first) = (device.clone(), AtomicBool::new(true));
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            rotate
+                .lock()
+                .unwrap()
+                .set_key(EncryptionMode::On, "89abcdef", [8; 32]);
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    queue(&s, (0..60).map(|i| fact(i, true)));
+    let (_home, ctx) = test_ctx();
+    let client = {
+        let device = device.lock().unwrap();
+        client_with(&base, &device, device.agent.clone())
+    };
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert_eq!(out.pushed, 60, "{:?}", out.notes);
+    let posts = posted_ops(&log);
+    assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 10]);
+    let under = |op: &serde_json::Value, kid: &str| {
+        op["memory"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("e1.{kid}."))
+            && op["memory"]["content_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("h1.{kid}."))
+            && op["memory"]["project"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("h1.{kid}."))
+    };
+    assert!(posts[0].iter().all(|op| under(op, KID)));
+    assert!(posts[1].iter().all(|op| under(op, "89abcdef")));
+}
+
+/// Skills whose files fill more than half a request each take exactly the
+/// requests sealing their chunk alone did (paths and hashes, then the files
+/// packed into as few requests as fit), never a pair per skill.
+#[tokio::test]
+async fn large_skills_never_take_more_requests_than_sealing_chunk_by_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    for i in 0..3u8 {
+        let files: std::collections::BTreeMap<String, Vec<u8>> = (0..6)
+            .map(|f| (format!("part-{f}.md"), vec![b'a' + (i + f) % 26; 100 << 10]))
+            .collect();
+        let skill = Skill {
+            scope: Scope::Global,
+            project: String::new(),
+            name: format!("big{i:02}"),
+            version: 1,
+            content_hash: skill_hash(&files),
+            files,
+            source_agent: "cli".into(),
+            source_machine: "m1".into(),
+            created_at: 1,
+            deleted: false,
+            seq: 0,
+        };
+        s.put_skill(&skill).unwrap();
+        s.enqueue(&PendingOp::PushSkill {
+            skill,
+            base_version: 0,
+        })
+        .unwrap();
+    }
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(!out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pushed, 3);
+    assert_eq!(
+        posted_ops(&log).iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![3]
+    );
+    let (seals, _) = recorder.seals_and_opens();
+    // 3 × (6 paths + 1 hash), then 18 files at 7 per request: as sealing
+    // the chunk alone did, not two requests per skill.
+    assert_eq!(
+        seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
+        vec![21, 7, 7, 4]
+    );
+    assert!(
+        seals.iter().all(|c| c.bytes <= CRYPT_BATCH_BYTES),
+        "{seals:?}"
+    );
 }
 
 // ─────────────── ruling 1: the order of commits ───────────────

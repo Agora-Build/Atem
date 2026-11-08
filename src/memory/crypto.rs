@@ -236,36 +236,41 @@ pub(crate) const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 
-/// What a batch adds to one `Crypt` request: its ops, and their bytes as
-/// `run` counts them (`CryptOp::wire_len`). For planning batches only: `run`
-/// splits at the limits itself, so a wrong estimate costs a request, never
-/// a result.
+/// What a batch adds to one step of its `Crypt` work: its ops, their bytes
+/// as `run` counts them (`CryptOp::wire_len`), and its largest op. For
+/// planning batches only: `run` splits at the limits itself, so a wrong
+/// estimate costs a request, never a result.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Cost {
     pub ops: usize,
     pub bytes: usize,
+    pub largest: usize,
 }
 
 impl Cost {
+    fn one(bytes: usize) -> Self {
+        Self { ops: 1, bytes, largest: bytes }
+    }
+
     fn seal(record: &str, field: usize, plain: usize) -> Self {
         if plain == 0 { return Self::default(); }
-        Self { ops: 1, bytes: CryptOp::seal_wire_len(record.len(), field, plain) }
+        Self::one(CryptOp::seal_wire_len(record.len(), field, plain))
     }
 
     fn open(record: &str, field: usize, value: usize) -> Self {
         if value == 0 { return Self::default(); }
-        Self { ops: 1, bytes: CryptOp::open_wire_len(record.len(), field, value) }
+        Self::one(CryptOp::open_wire_len(record.len(), field, value))
     }
 
     fn hash(value: usize) -> Self {
-        Self { ops: 1, bytes: CryptOp::keyed_hash_wire_len(value) }
+        Self::one(CryptOp::keyed_hash_wire_len(value))
     }
 }
 
 impl std::ops::Add for Cost {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        Self { ops: self.ops + other.ops, bytes: self.bytes + other.bytes }
+        Self { ops: self.ops + other.ops, bytes: self.bytes + other.bytes, largest: self.largest.max(other.largest) }
     }
 }
 
@@ -275,15 +280,32 @@ impl std::ops::AddAssign for Cost {
     }
 }
 
-/// An item's cost in each dependent `Crypt` request of its batch, in order:
+/// An item's cost in each dependent `Crypt` step of its batch, in order:
 /// opening, then sealing (paths and hashes), then a skill's files (sealed
 /// under their sealed paths, so after the paths).
 pub(crate) type Steps = [Cost; 3];
 
-/// Items gathered into one batch while each step still fits one `Crypt`
-/// request (`CRYPT_BATCH_OPS` ops, `CRYPT_BATCH_BYTES`), at most
-/// `CRYPT_BATCH_OPS` items (an op with no sealed field costs nothing). The
-/// first item always fits: a bigger one is split by `run`.
+/// Most `Crypt` requests' worth a planned group holds per step: what a
+/// group of relay chunks may be sealed or opened together in (and so how
+/// far sealing runs ahead of the relay).
+pub(crate) const GROUP_REQUESTS: usize = 4;
+
+/// Whether some op of `steps` is over the agent's limit for one op: `run`
+/// refuses the whole batch holding it.
+pub(crate) fn too_large(steps: &Steps) -> bool {
+    steps.iter().any(|step| step.largest > CRYPT_OP_MAX_BYTES)
+}
+
+/// Whole relay chunks gathered into one group of `Crypt` work (F2): each
+/// step stays within `GROUP_REQUESTS` requests' worth (ops, bytes, and
+/// items: an op with no sealed field costs nothing), the first chunk always
+/// fits, and a chunk with an op over the agent's limit is a group of its own
+/// (so it fails alone, as it did when each chunk was sealed alone).
+///
+/// `run` splits each step of a group at the agent's limits, op by op, in
+/// order. Sealing whole chunks together this way never takes more requests
+/// than sealing each chunk alone: packing ops in order into requests, a
+/// sequence never needs more requests than its parts packed apart.
 #[derive(Debug, Default)]
 pub(crate) struct Budget {
     steps: Steps,
@@ -291,35 +313,53 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
-    pub(crate) fn fits(&self, item: &Steps) -> bool {
+    pub(crate) fn fits(&self, chunk: &Steps, items: usize) -> bool {
         self.items == 0
-            || (self.items < CRYPT_BATCH_OPS
-                && self.steps.iter().zip(item).all(|(used, more)| {
-                    used.ops + more.ops <= CRYPT_BATCH_OPS && used.bytes + more.bytes <= CRYPT_BATCH_BYTES
+            || (!too_large(chunk)
+                && self.items + items <= GROUP_REQUESTS * CRYPT_BATCH_OPS
+                && self.steps.iter().zip(chunk).all(|(used, more)| {
+                    used.ops + more.ops <= GROUP_REQUESTS * CRYPT_BATCH_OPS
+                        && used.bytes + more.bytes <= GROUP_REQUESTS * CRYPT_BATCH_BYTES
                 }))
     }
 
-    pub(crate) fn add(&mut self, item: &Steps) {
-        for (used, more) in self.steps.iter_mut().zip(item) {
+    pub(crate) fn add(&mut self, chunk: &Steps, items: usize) {
+        for (used, more) in self.steps.iter_mut().zip(chunk) {
             *used += *more;
         }
-        self.items += 1;
+        self.items += items;
+    }
+
+    /// No chunk may join after one with an op over the agent's limit.
+    pub(crate) fn closed(&self) -> bool {
+        too_large(&self.steps)
     }
 }
 
-/// `items` in consecutive batches that each fit one `Crypt` request per
-/// step: as few requests as the agent's limits allow, whatever the relay's
-/// chunk size (designs/e2e-encryption.md "Performance", F2).
-pub(crate) fn plan_groups<T>(items: &[T], cost: impl Fn(&T) -> Steps) -> Vec<std::ops::Range<usize>> {
+/// The steps of `items` together.
+pub(crate) fn total<T>(items: &[T], cost: impl Fn(&T) -> Steps) -> Steps {
+    items.iter().map(cost).fold(Steps::default(), |mut sum, item| {
+        for (sum, more) in sum.iter_mut().zip(item) {
+            *sum += more;
+        }
+        sum
+    })
+}
+
+/// `items`, sent to the relay `chunk` at a time, in groups of whole chunks
+/// planned with `Budget` (F2): as few `Crypt` requests as the agent's limits
+/// allow, and never more than sealing each chunk alone.
+pub(crate) fn plan_groups<T>(items: &[T], chunk: usize, cost: impl Fn(&T) -> Steps) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
     let (mut start, mut budget) = (0, Budget::default());
-    for (index, item) in items.iter().enumerate() {
-        let item = cost(item);
-        if !budget.fits(&item) {
-            groups.push(start..index);
-            (start, budget) = (index, Budget::default());
+    for (index, part) in items.chunks(chunk.max(1)).enumerate() {
+        let at = index * chunk.max(1);
+        let part_cost = total(part, &cost);
+        if budget.closed() || !budget.fits(&part_cost, part.len()) {
+            groups.push(start..at);
+            (start, budget) = (at, Budget::default());
         }
-        budget.add(&item);
+        budget.add(&part_cost, part.len());
     }
     if start < items.len() {
         groups.push(start..items.len());
@@ -474,6 +514,16 @@ impl EncryptionContext {
         }
         results.extend(agent.crypt(&self.astation_id, batch)?);
         Ok(results)
+    }
+
+    /// Fails as a locked agent's `Crypt` does while the cred agent is locked;
+    /// nothing to confirm without an agent (encryption off).
+    pub fn confirm_unlocked(&self) -> Result<()> {
+        let Some(agent) = &self.agent else { return Ok(()) };
+        if !agent.status()?.unlocked {
+            bail!(crate::memory::cred_agent::LOCKED);
+        }
+        Ok(())
     }
 
     pub fn should_encrypt(&self) -> bool {
@@ -1110,19 +1160,69 @@ mod tests {
 
     #[test]
     fn group_plans_fill_each_request() {
-        let cost = |ops: usize| [Cost { ops, bytes: ops * 100 }, Cost::default(), Cost::default()];
-        // 3-op items: 341 per group (1,023 ops), and the rest.
-        let items = vec![3usize; 700];
-        let groups = plan_groups(&items, |&n| cost(n));
-        assert_eq!(groups, vec![0..341, 341..682, 682..700]);
-        // Bytes bind first: 1 MiB items, two per group; an item over the limit alone.
-        let big = [Cost { ops: 1, bytes: 1 << 20 }, Cost::default(), Cost::default()];
-        let huge = [Cost { ops: 1, bytes: 3 << 20 }, Cost::default(), Cost::default()];
-        let items = [big, big, big, huge, big];
-        assert_eq!(plan_groups(&items, |c| *c), vec![0..2, 2..3, 3..4, 4..5]);
-        // Free items (an invalidation) still close a group at 1,024.
-        let items = vec![0usize; 2050];
-        assert_eq!(plan_groups(&items, |&n| cost(n)), vec![0..1024, 1024..2048, 2048..2050]);
+        let cost = |ops: usize, bytes: usize| [Cost { ops, bytes, largest: bytes / ops.max(1) }, Cost::default(), Cost::default()];
+        // 3-op items, 50 per chunk: 27 chunks (4,050 ops) per group.
+        let items = vec![3usize; 3000];
+        assert_eq!(plan_groups(&items, 50, |&n| cost(n, n * 100)), vec![0..1350, 1350..2700, 2700..3000]);
+        // Bytes bind first: chunks of 3.2 MiB, two per group; a bigger
+        // first chunk alone.
+        let items = vec![400usize << 10; 48];
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..16, 16..32, 32..48]);
+        let items: Vec<usize> = [vec![2 << 20; 8], vec![1 << 10; 8]].concat();
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..16]);
+        // A chunk with an op over the agent's limit is a group of its own.
+        let mut items = vec![1usize << 10; 24];
+        items[12] = 7 << 20;
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..16, 16..24]);
+        // Free items (an invalidation) still close a group.
+        let items = vec![0usize; 5000];
+        assert_eq!(plan_groups(&items, 50, |&n| cost(n, 0)), vec![0..4050, 4050..5000]);
+    }
+
+    /// The requests `run` splits `sizes` (each op's `wire_len`, in order) into.
+    fn requests(sizes: &[usize]) -> usize {
+        let (mut count, mut ops, mut bytes) = (0, 0, 0);
+        for &size in sizes {
+            if ops > 0 && (bytes + size > CRYPT_BATCH_BYTES || ops >= CRYPT_BATCH_OPS) {
+                (count, ops, bytes) = (count + 1, 0, 0);
+            }
+            (ops, bytes) = (ops + 1, bytes + size);
+        }
+        count + usize::from(ops > 0)
+    }
+
+    #[test]
+    fn planned_groups_never_take_more_requests_than_their_chunks_alone() {
+        // Items of one to three ops, from tiny to over 1 MiB, in random orders.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for round in 0..200 {
+            let chunk = [8usize, 50, 64][round % 3];
+            let big = round % 4 == 0;
+            let items: Vec<Vec<usize>> = (0..(50 + next(500)) as usize)
+                .map(|_| (0..1 + next(3)).map(|_| if big { 1 + next(1_600_000) as usize } else { 100 + next(1900) as usize }).collect())
+                .collect();
+            let cost = |item: &Vec<usize>| {
+                let step = item.iter().fold(Cost::default(), |sum, &bytes| sum + Cost::one(bytes));
+                [step, Cost::default(), Cost::default()]
+            };
+            let sizes = |range: std::ops::Range<usize>| items[range].iter().flatten().copied().collect::<Vec<_>>();
+            let grouped: usize = plan_groups(&items, chunk, cost).into_iter().map(|g| requests(&sizes(g))).sum();
+            let alone: usize = (0..items.len()).step_by(chunk).map(|at| requests(&sizes(at..(at + chunk).min(items.len())))).sum();
+            assert!(grouped <= alone, "round {round}: {grouped} > {alone}");
+            let ops: usize = items.iter().map(Vec::len).sum();
+            if !big {
+                // Small ops (1,024 of them stay under 2 MiB): at most one
+                // request per 1,024 ops, plus one per group.
+                let groups = plan_groups(&items, chunk, cost).len();
+                assert!(grouped < ops.div_ceil(CRYPT_BATCH_OPS) + groups, "round {round}");
+            }
+        }
     }
 
     /// Records each `Crypt` request's op count and bytes.
@@ -1134,7 +1234,8 @@ mod tests {
     impl CredAgentApi for Sizes {
         fn call(&self, request: Request) -> Result<Reply> {
             if let Request::Crypt { ops, .. } = &request {
-                self.seen.lock().unwrap().push(Cost { ops: ops.len(), bytes: ops.iter().map(CryptOp::wire_len).sum() });
+                let sizes: Vec<usize> = ops.iter().map(CryptOp::wire_len).collect();
+                self.seen.lock().unwrap().push(Cost { ops: ops.len(), bytes: sizes.iter().sum(), largest: sizes.iter().copied().max().unwrap_or(0) });
             }
             self.inner.call(request)
         }

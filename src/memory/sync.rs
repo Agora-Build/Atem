@@ -4,9 +4,10 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
 use crate::memory::api::{seal_cost, ApiError, KnowledgeClient, OpResult, SealState, PULL_LIMIT};
-use crate::memory::crypto::Budget;
+use crate::memory::crypto::{total, Budget};
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
 use crate::memory::model::{content_hash, new_memory_id, now_secs, skill_hash, Memory, Scope, Skill};
@@ -399,45 +400,41 @@ fn group_failed(store: &Store, e: ApiError, sent: &[(i64, PendingOp)], is_mem: b
 }
 
 /// One push group's ops sealed ahead of their POST (F2), by queue `n`: each
-/// with the op as it was read and the state it was sealed under.
+/// with the op as it was read and the state its group was sealed under.
 struct ReadAhead {
-    sealed: BTreeMap<i64, (PendingOp, Value, SealState)>,
+    sealed: BTreeMap<i64, (PendingOp, Value, Arc<SealState>)>,
     /// The last queue `n` a group was read through.
     through: i64,
-    /// A group failed to seal: from then on each chunk is sealed just before
-    /// its POST, as before read-ahead, so a failure stops the group at the
-    /// same chunk it did then.
-    per_chunk: bool,
+}
+
+/// Whether an op sealed ahead may be sent as sealed: the queued op is still
+/// exactly the op that was sealed (an earlier chunk's results, or another
+/// writer, may have changed it), under the same state (mode, key, data
+/// account).
+fn reusable(sealed: &PendingOp, sealed_under: &SealState, op: &PendingOp, state: &SealState) -> bool {
+    sealed == op && sealed_under == state
 }
 
 impl ReadAhead {
     fn new() -> Self {
-        Self { sealed: BTreeMap::new(), through: i64::MIN, per_chunk: false }
+        Self { sealed: BTreeMap::new(), through: i64::MIN }
     }
 
-    fn add(&mut self, sealed: std::result::Result<(SealState, Vec<(PendingOp, Value)>), ApiError>, ns: &[i64]) {
-        match sealed {
-            Ok((state, ops)) => {
-                for (&n, (op, wire)) in ns.iter().zip(ops) {
-                    self.sealed.insert(n, (op, wire, state.clone()));
-                }
-            }
-            Err(_) => {
-                self.sealed.clear();
-                self.per_chunk = true;
-            }
+    fn add(&mut self, state: SealState, ns: &[i64], ops: Vec<(PendingOp, Value)>) {
+        let state = Arc::new(state);
+        for (&n, (op, wire)) in ns.iter().zip(ops) {
+            self.sealed.insert(n, (op, wire, state.clone()));
         }
     }
 
-    /// The sealed wire of each op of `chunk` that is still exactly the op
-    /// that was sealed, under the same state; `None` for the others (an
-    /// earlier chunk's results rewrote it, the state changed, or it was never
-    /// read ahead). Forgets every entry up to the chunk's last op: sent now,
-    /// or gone from the queue (acked or removed meanwhile).
+    /// The sealed wire of each op of `chunk` that is `reusable`; `None` for
+    /// the others (rewritten, sealed under another state, or never read
+    /// ahead). Forgets every entry up to the chunk's last op: sent now, or
+    /// gone from the queue (acked or removed meanwhile).
     fn take(&mut self, chunk: &[(i64, PendingOp)], state: &SealState) -> Vec<Option<Value>> {
         let wire = chunk.iter()
             .map(|(n, op)| match self.sealed.remove(n) {
-                Some((sealed, wire, at)) if sealed == *op && at == *state => Some(wire),
+                Some((sealed, wire, under)) if reusable(&sealed, &under, op, state) => Some(wire),
                 _ => None,
             })
             .collect();
@@ -448,40 +445,46 @@ impl ReadAhead {
     }
 }
 
-/// The queued ops of one kind after `after` that one batch seals in one
-/// `Crypt` request per step (`Budget`), at least one, read `slice` at a time.
-fn read_group(store: &Store, after: i64, is_mem: bool, slice: usize) -> Result<Vec<(i64, PendingOp)>> {
-    let mut group = Vec::new();
+/// The queued ops of one kind after `after` that are sealed together as one
+/// group: whole chunks, read `chunk` at a time as the push will send them,
+/// planned with `Budget` (at most `GROUP_REQUESTS` requests' worth per step,
+/// and never more requests than sealing each chunk alone; a chunk with an op
+/// over the agent's limit is a group of its own).
+fn read_group(store: &Store, after: i64, is_mem: bool, chunk: usize) -> Result<Vec<(i64, PendingOp)>> {
+    let mut group: Vec<(i64, PendingOp)> = Vec::new();
     let mut budget = Budget::default();
     let mut cursor = after;
     loop {
-        let read = store.pending_after(cursor, is_mem, slice)?;
-        let more = read.len() == slice;
-        for (n, op) in read {
-            let cost = seal_cost(&op);
-            if !budget.fits(&cost) {
-                return Ok(group);
-            }
-            budget.add(&cost);
-            cursor = n;
-            group.push((n, op));
+        let read = store.pending_after(cursor, is_mem, chunk)?;
+        let Some(&(last, _)) = read.last() else { return Ok(group) };
+        let cost = total(&read, |(_, op)| seal_cost(op));
+        if budget.closed() || !budget.fits(&cost, read.len()) {
+            return Ok(group);
         }
-        if !more {
+        budget.add(&cost, read.len());
+        let whole = read.len() == chunk;
+        group.extend(read);
+        cursor = last;
+        if !whole {
             return Ok(group);
         }
     }
 }
 
-/// Seals `group` into the read-ahead.
-async fn seal_ahead(client: &KnowledgeClient, ahead: &mut ReadAhead, group: Vec<(i64, PendingOp)>) {
+/// Seals `group` into the read-ahead; the seal's error, if it failed.
+async fn seal_ahead(client: &KnowledgeClient, ahead: &mut ReadAhead, group: Vec<(i64, PendingOp)>) -> std::result::Result<(), ApiError> {
     let (ns, ops): (Vec<i64>, Vec<PendingOp>) = group.into_iter().unzip();
-    ahead.add(client.seal_ops(ops).await, &ns);
+    let (state, sealed) = client.seal_ops(ops).await?;
+    ahead.add(state, &ns, sealed);
+    Ok(())
 }
 
-/// The wire form of every op of `chunk`: as sealed ahead while unchanged,
-/// the others sealed now, together.
-async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i64, PendingOp)], state: &SealState) -> std::result::Result<Vec<Value>, ApiError> {
+/// The wire form of every op of `chunk` (as sealed ahead where `reusable`,
+/// the others sealed now, together), and whether some op was sealed by an
+/// earlier request.
+async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i64, PendingOp)], state: &SealState) -> std::result::Result<(Vec<Value>, bool), ApiError> {
     let mut wire = ahead.take(chunk, state);
+    let reused = wire.iter().any(Option::is_some);
     let stale: Vec<usize> = (0..chunk.len()).filter(|&i| wire[i].is_none()).collect();
     if !stale.is_empty() {
         let (_, sealed) = client.seal_ops(stale.iter().map(|&i| chunk[i].1.clone()).collect()).await?;
@@ -489,7 +492,10 @@ async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i
             wire[i] = Some(value);
         }
     }
-    wire.into_iter().map(|value| value.ok_or_else(|| ApiError::Encryption("an op of the chunk was not sealed".into()))).collect()
+    let wire = wire.into_iter()
+        .map(|value| value.ok_or_else(|| ApiError::Encryption("an op of the chunk was not sealed".into())))
+        .collect::<std::result::Result<_, _>>()?;
+    Ok((wire, reused))
 }
 
 /// Push a group in chunks, in queue order. Any failure stops the group (its
@@ -503,13 +509,16 @@ async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i
 /// an earlier chunk's results rewrote in still-queued ops (a relay canonical
 /// id; the relay only knows the rewritten ids).
 ///
-/// Sealing runs ahead of the chunks (F2): the ops are sealed in groups that
-/// fit one `Crypt` request per step (`read_group`), the next group while
-/// the chunk before it is POSTed. A chunk sends an op as sealed ahead only
-/// while it is exactly the op read now under the same state; any other op
-/// (rewritten or removed meanwhile, a mode or key change) is sealed again
-/// first. A chunk's results are applied in their own transaction after its
-/// POST, before the next chunk is read; no request is in flight then.
+/// Sealing runs ahead of the chunks (F2): the ops are sealed in groups of
+/// whole chunks (`read_group`), the next group while the chunk before it is
+/// POSTed. A chunk sends an op as sealed ahead only while it is `reusable`;
+/// any other op is sealed again first. Before a chunk with ops sealed by an
+/// earlier request is POSTed, the cred agent must still be unlocked, so a
+/// lock stops the push within one POST, as when each chunk was sealed just
+/// before it. A group that fails to seal stops the push with that error
+/// (after the chunk in flight, whose results are applied first); nothing is
+/// retried. A chunk's results are applied in their own transaction after
+/// its POST, before the next chunk is read; no request is in flight then.
 async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
     let mut after = i64::MIN;
     let mut ahead = ReadAhead::new();
@@ -524,27 +533,39 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
         };
         // The first group, or the read-ahead fell behind: seal from here.
-        while !ahead.per_chunk && last > ahead.through {
+        let mut sealed_now = false;
+        while last > ahead.through {
             let group = read_group(store, ahead.through.max(after), is_mem, chunk_size)?;
             ahead.through = group.last().map_or(last, |&(n, _)| n);
-            seal_ahead(client, &mut ahead, group).await;
+            if let Err(e) = seal_ahead(client, &mut ahead, group).await {
+                return group_failed(store, e, &chunk, is_mem, out);
+            }
+            sealed_now = true;
         }
-        let wire = match chunk_wire(client, &mut ahead, &chunk, &state).await {
+        let (wire, reused) = match chunk_wire(client, &mut ahead, &chunk, &state).await {
             Ok(wire) => wire,
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
         };
+        // Sealed by an earlier request (not just now): still unlocked?
+        if reused && !sealed_now && let Err(e) = client.confirm_unlocked().await {
+            return group_failed(store, e, &chunk, is_mem, out);
+        }
         // Seal the next group while this chunk is in flight, once the
         // read-ahead no longer covers the next chunk.
-        let next = if !ahead.per_chunk && ahead.sealed.len() < chunk_size {
+        let next = if ahead.sealed.len() < chunk_size {
             read_group(store, ahead.through.max(last), is_mem, chunk_size)?
         } else {
             Vec::new()
         };
+        let mut ahead_failed = None;
         let posted = if let Some(&(through, _)) = next.last() {
             ahead.through = through;
             let (ns, ops): (Vec<i64>, Vec<PendingOp>) = next.into_iter().unzip();
             let (posted, sealed) = tokio::join!(client.post_ops(&wire, is_mem), client.seal_ops(ops));
-            ahead.add(sealed, &ns);
+            match sealed {
+                Ok((state, sealed)) => ahead.add(state, &ns, sealed),
+                Err(e) => ahead_failed = Some(e),
+            }
             posted
         } else {
             client.post_ops(&wire, is_mem).await
@@ -557,11 +578,12 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                     // Re-read by `n`: an earlier single op may have rewritten it.
                     let Some(op) = store.pending_op(*n)? else { continue };
                     let one = [(*n, op)];
-                    let now = client.seal_state();
-                    let single = if one[0].1 == *sent && now.as_ref().is_ok_and(|now| *now == state) {
-                        Ok(vec![sealed.clone()])
-                    } else {
-                        client.seal_ops(vec![one[0].1.clone()]).await.map(|(_, ops)| ops.into_iter().map(|(_, wire)| wire).collect())
+                    let single = match client.seal_state() {
+                        Ok(now) if reusable(sent, &state, &one[0].1, &now) => {
+                            client.confirm_unlocked().await.map(|()| vec![sealed.clone()])
+                        }
+                        Ok(_) => client.seal_ops(vec![one[0].1.clone()]).await.map(|(_, ops)| ops.into_iter().map(|(_, wire)| wire).collect()),
+                        Err(e) => Err(e),
                     };
                     let posted = match single {
                         Ok(single) => client.post_ops(&single, is_mem).await,
@@ -575,6 +597,11 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                 }
             }
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
+        }
+        // The next group failed to seal while this chunk was in flight: the
+        // push stops here, as it did when that chunk's seal failed.
+        if let Some(e) = ahead_failed {
+            return group_failed(store, e, &[], is_mem, out);
         }
         after = last;
     }
