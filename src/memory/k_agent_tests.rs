@@ -841,3 +841,138 @@ fn project_scopes_learn_a_kid_installed_later_and_keep_matches_after_a_lock() {
         assert_eq!(scopes.matches(sid, entry), Some(true), "{entry}");
     }
 }
+
+// ───── the agent's cached cred/state.json (F3) ─────
+
+/// The agent trusts a cached cred/state.json only once the file is
+/// `window` old (`CredAgent::trust_view`).
+fn racy_window(device: &UnlockedDevice, window: std::time::Duration) {
+    device.agent.lock().unwrap().set_racy_window(window);
+}
+
+fn trust_loads(device: &UnlockedDevice) -> usize {
+    device.agent.lock().unwrap().trust_loads()
+}
+
+fn try_seal(device: &UnlockedDevice) -> anyhow::Result<()> {
+    device.agent.crypt(ASTATION_ID, vec![CryptOp::seal("mem", "content", b"fact")]).map(drop)
+}
+
+/// cred/state.json as `set_state` would write it (made in a scratch copy),
+/// padded with trailing spaces to `size` bytes, which JSON allows.
+fn state_bytes(device: &UnlockedDevice, mode: EncryptionMode, kid: Option<&str>, epoch: u64, size: usize) -> Vec<u8> {
+    let scratch = tempfile::tempdir().unwrap();
+    let paths = crate::paths::CredPaths::in_dir(scratch.path());
+    crate::paths::create_private_dir(&paths.dir).unwrap();
+    std::fs::copy(&device.paths.trust, &paths.trust).unwrap();
+    set_state(&paths, &device.server.astation, mode, kid, epoch);
+    let mut bytes = std::fs::read(&paths.trust).unwrap();
+    assert!(bytes.len() <= size, "{} bytes", bytes.len());
+    bytes.resize(size, b' ');
+    bytes
+}
+
+/// Puts `bytes` in place of cred/state.json through a rename (a new file).
+fn rename_into_place(device: &UnlockedDevice, bytes: &[u8]) {
+    let staged = device.paths.trust.with_extension("staged");
+    std::fs::write(&staged, bytes).unwrap();
+    std::fs::rename(&staged, &device.paths.trust).unwrap();
+}
+
+#[test]
+fn an_unchanged_state_file_is_read_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::On, A, [1; 32]);
+    racy_window(&device, std::time::Duration::ZERO);
+    let before = trust_loads(&device);
+    for _ in 0..10 {
+        try_seal(&device).unwrap();
+        assert_eq!(device.agent.held_kid(ASTATION_ID).unwrap().as_deref(), Some(A));
+    }
+    assert_eq!(trust_loads(&device) - before, 1);
+}
+
+#[test]
+fn a_same_size_state_file_renamed_into_place_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::On, A, [1; 32]);
+    let size = 8192;
+    rename_into_place(&device, &state_bytes(&device, EncryptionMode::On, Some(A), 10, size));
+    // Only the file's identity decides here (no racy window), and the old
+    // file is kept, so the new one can't reuse its inode number.
+    racy_window(&device, std::time::Duration::ZERO);
+    try_seal(&device).unwrap();
+    let keep = dir.path().join("state.keep");
+    std::fs::hard_link(&device.paths.trust, &keep).unwrap();
+    let off = state_bytes(&device, EncryptionMode::Off, None, 11, size);
+    rename_into_place(&device, &off);
+    assert_eq!(std::fs::metadata(&device.paths.trust).unwrap().len(), size as u64);
+    let error = error_of(try_seal(&device));
+    assert!(error.contains(crate::memory::account_keys::ENCRYPTION_OFF), "{error}");
+}
+
+#[test]
+fn a_same_size_state_file_rewritten_in_place_with_its_old_time_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::On, A, [1; 32]);
+    let size = 8192;
+    rename_into_place(&device, &state_bytes(&device, EncryptionMode::On, Some(A), 10, size));
+    racy_window(&device, std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    try_seal(&device).unwrap();
+    let loads = trust_loads(&device);
+    try_seal(&device).unwrap();
+    assert_eq!(trust_loads(&device), loads, "cached");
+    // The same file, the same size, its modification time put back.
+    let modified = std::fs::metadata(&device.paths.trust).unwrap().modified().unwrap();
+    std::fs::write(&device.paths.trust, state_bytes(&device, EncryptionMode::Off, None, 11, size)).unwrap();
+    std::fs::File::options().write(true).open(&device.paths.trust).unwrap().set_modified(modified).unwrap();
+    let error = error_of(try_seal(&device));
+    assert!(error.contains(crate::memory::account_keys::ENCRYPTION_OFF), "{error}");
+    assert!(trust_loads(&device) > loads);
+}
+
+/// Makes `dir` unsearchable until dropped.
+struct Blocked(std::path::PathBuf);
+
+impl Drop for Blocked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[test]
+fn a_state_file_that_cannot_be_looked_at_is_never_served_from_the_cache() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::On, A, [1; 32]);
+    racy_window(&device, std::time::Duration::ZERO);
+    try_seal(&device).unwrap();
+    {
+        let _blocked = Blocked(device.paths.dir.clone());
+        std::fs::set_permissions(&device.paths.dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = error_of(try_seal(&device));
+        assert!(error.contains("ermission denied"), "{error}");
+    }
+    try_seal(&device).unwrap();
+    std::fs::remove_file(&device.paths.trust).unwrap();
+    let error = error_of(try_seal(&device));
+    assert!(error.contains("isn't verified"), "{error}");
+}
+
+#[test]
+fn a_lock_drops_the_cached_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = UnlockedDevice::new(dir.path());
+    device.set_key(EncryptionMode::On, A, [1; 32]);
+    racy_window(&device, std::time::Duration::ZERO);
+    try_seal(&device).unwrap();
+    assert!(device.agent.lock().unwrap().trust_cached());
+    device.agent.lock_keys().unwrap();
+    assert!(!device.agent.lock().unwrap().trust_cached());
+}

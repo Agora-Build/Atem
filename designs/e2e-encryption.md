@@ -468,6 +468,14 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
+- **The agent's cached trust state.** `Crypt`, `HeldKid` and the prune of
+  retired keys read `cred/state.json` (and decode its signed states) only
+  when the file changed since the last read: another device, inode, size,
+  or modification or change time (with nanoseconds). A file changed less
+  than 3 s before it was looked at is read again at every request (file
+  times have a granularity, and a freed inode number can be reused by the
+  next write), as is one whose metadata can't be read; a lock drops the
+  cache with the keys.
 - **Private writes.** Every key file and `cred/state.json` is written to a
   temp file with a name of its own (`.<name>.<pid>.<counter>.<random>.tmp`,
   0600, `O_NOFOLLOW`), fsynced and renamed. A writer that crashes leaves
