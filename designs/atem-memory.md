@@ -638,6 +638,7 @@ atem memory status                  # account, machine, pending ops, last sync, 
    (owner decision 2026-11-08), not implemented:** only while the account's
    encryption is on, a transition measure until encryption is the only mode
    (next section).
+
 ## Injection into agents requires encryption On (planned)
 
 **Planned (owner decision 2026-11-08), not implemented.** This is a

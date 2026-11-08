@@ -1498,12 +1498,23 @@ the 1,024-op limit splits a request):
   count toward the 4,096 queued ops, so they can end a group early; that
   costs at most one partly filled request per such group (the first bound).
 - At any size: never more requests than sealing each chunk alone (before F2).
+- Groups are planned by the ops as queued. A fact queued under a project hash
+  this device names only later (a replacement of a fact it couldn't name, see
+  "Projects not known here yet" in [atem-memory.md](atem-memory.md)) is
+  hashed under that name when sealed, one op more than planned: a group
+  holding u such facts can take up to ⌈u / 1,024⌉ requests more than the
+  second bound. The first and the last bound hold as stated.
 
 For uniform facts this is exactly "1 per 1,024 plus one" up to 4,562 facts of
-two ops and 5,791 of three, and then about one request more per 22 groups
-(90,000 ops): 30,000 three-op facts take 90 requests against 89 (bound 93),
-100,000 take 298 against 294 (bound 305); for facts in general at most about
-3.7% more, plus one. Pinned by `planned_requests_stay_within_the_documented_bound`
+two ops and 5,791 of three, and then one request more now and then, as the
+unused slots add up: a group of three-op facts (27 chunks, 4,050 ops) leaves
+46, about one request more per 22 groups (about 90,000 ops); a group of
+two-op facts (40 chunks, 4,000 ops) leaves 96, about one more per 11 groups
+(about 43,000 ops). 30,000 three-op facts take 90 requests against 89 (bound
+93), 100,000 take 298 against 294 (bound 305), and 100,000 two-op facts take
+201 against 197 (bound 202). For facts in general at most about
+(k − 1) / (4,097 − k) more, plus one: 3.8% at k = 150 (149 / 3,947). Pinned by
+`planned_requests_stay_within_the_documented_bound`
 (both bounds, the group sizes, these examples) and
 `planned_groups_never_take_more_requests_than_their_chunks_alone`.
 
