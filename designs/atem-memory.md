@@ -514,8 +514,11 @@ atem memory status                  # account, machine, pending ops, last sync, 
 
 1. **Harvest** Claude's memory for the current repo, unless disabled.
 2. **Push** `pending_ops` for memories, then skills (at most 50 memory ops
-   and 8 skill ops per request). Apply `canonical_id` rewrites and remove the
-   ops the server answered. A per-op refusal is permanent and is removed
+   and 8 skill ops per request), each request's ops read from the queue after
+   the last op sent. Apply `canonical_id` rewrites and remove the
+   ops the server answered, in one local transaction per request, committed
+   before the ops count as pushed (an interrupted one leaves the request's ops
+   queued, sent again next time). A per-op refusal is permanent and is removed
    (with a note); a failed request (network error, any HTTP error) leaves
    the ops queued and stops that group, keeping queue order:
    - 401: the relay didn't recognize the Astation session (see Identity &
@@ -524,7 +527,9 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - 413 on a chunk: its ops are retried one at a time. A single op that is
      still too large stays queued with a note and is never acked.
 3. **Pull** memories and skills since `cursor`, page by page. Upsert rows and
-   apply tombstones locally. Advance `cursor` after each page. Cursors are
+   apply tombstones locally. Advance `cursor` after each page, in the same
+   local transaction as the page's rows (an interrupted page is pulled again
+   whole; the cursor never passes a row that isn't stored). Cursors are
    kept per account (`memory_cursor:<astation_id>`,
    `skill_cursor:<astation_id>`), so pairing with a different Astation
    pulls that account from 0; the legacy unkeyed cursor is ignored.
@@ -723,7 +728,9 @@ lives.
 - **Local store:** `pending_ops`, cursor handling, `canonical_id` rewrite,
   `harvest_map` edit and delete handling, the `held_back` and `excluded`
   states (and clearing them when the file changes), `applied` drift
-  detection.
+  detection, and a crash in the middle of a push batch's results or a pulled
+  page (the disk as a killed process leaves it: nothing of the batch or page
+  applied, the next sync completes it).
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge

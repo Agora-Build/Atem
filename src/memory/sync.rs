@@ -194,6 +194,13 @@ pub fn too_large_note(op: &PendingOp) -> String {
 /// refusals (e.g. the server's secret check) must not retry forever.
 /// A result count that doesn't match can't be paired up, so nothing is
 /// acked: the batch stays queued and a note explains why.
+///
+/// One transaction: the batch's effects and its acks commit together, before
+/// the caller reports anything. An error or a crash part way leaves the whole
+/// batch queued as it was, and the next sync sends it again, as after a sync
+/// that stopped between the POST and its results. Memory ops are idempotent
+/// on the relay (add by id, delete, invalidate); a re-sent skill push is
+/// appended again as a new version.
 pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
     if results.len() != sent.len() {
         return Ok(vec![format!(
@@ -201,6 +208,10 @@ pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[O
             results.len(), sent.len()
         )]);
     }
+    store.in_transaction(|| apply_paired_results(store, sent, results))
+}
+
+fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     for ((n, op), r) in sent.iter().zip(results) {
         if r.ok {
@@ -389,29 +400,27 @@ fn group_failed(store: &Store, e: ApiError, sent: &[(i64, PendingOp)], is_mem: b
 /// as too large (413) is retried one op at a time; a single op that is still
 /// too large is never acked — it stays queued with a note.
 ///
-/// Every send re-reads its ops from the queue: an earlier chunk's results
-/// can rewrite still-queued ops (a relay canonical id), and the relay only
-/// knows the rewritten ids. `after` is the last op sent, so each send moves
-/// strictly forward in queue order.
+/// Each chunk is read from the queue just before it is sent, after `after`,
+/// the last op sent (an `n > ?` cursor): every op is read once per group,
+/// each send moves strictly forward in queue order, and a chunk carries what
+/// an earlier chunk's results rewrote in still-queued ops (a relay canonical
+/// id; the relay only knows the rewritten ids).
 async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
-    let queued_after = |after: i64| -> Result<Vec<(i64, PendingOp)>> {
-        Ok(store.pending()?.into_iter().filter(|(n, op)| *n > after && op.is_memory() == is_mem).collect())
-    };
     let mut after = i64::MIN;
     loop {
         if out.offline {
             return Ok(());
         }
-        let chunk: Vec<_> = queued_after(after)?.into_iter().take(chunk_size).collect();
+        let chunk = store.pending_after(after, is_mem, chunk_size)?;
         let Some(&(last, _)) = chunk.last() else { return Ok(()) };
         match send_chunk(store, client, &chunk, is_mem, out).await? {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(ApiError::Http(413, _)) if chunk.len() > 1 => {
                 for n in chunk.iter().map(|(n, _)| *n) {
-                    // Re-fetched by `n`: an earlier single op may have rewritten it.
-                    let Some(one) = store.pending()?.into_iter().find(|(m, _)| *m == n) else { continue };
-                    let one = [one];
+                    // Re-read by `n`: an earlier single op may have rewritten it.
+                    let Some(op) = store.pending_op(n)? else { continue };
+                    let one = [(n, op)];
                     match send_chunk(store, client, &one, is_mem, out).await? {
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
@@ -433,6 +442,10 @@ async fn push_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 
 /// Pull cursors are per account (the paired Astation id); see
 /// `memory_cursor_key`.
+///
+/// Each page's rows and its cursor commit in one transaction, before the page
+/// is counted: the cursor never passes a row that isn't stored, and a page cut
+/// short (an error, a crash) is pulled again whole (upserts are idempotent).
 async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome) -> Result<()> {
     let mem_key = memory_cursor_key(client.account());
     loop {
@@ -442,8 +455,11 @@ async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
                 if page.is_empty() {
                     break;
                 }
-                let max = apply_pulled_memories(store, &page)?;
-                store.set_state(&mem_key, max.max(since))?;
+                let max = store.in_transaction(|| {
+                    let max = apply_pulled_memories(store, &page)?;
+                    store.set_state(&mem_key, max.max(since))?;
+                    Ok(max)
+                })?;
                 out.pulled += page.len();
                 if !cursor_advances(max, since, page.len()) {
                     out.note(STUCK_CURSOR_NOTE.into());
@@ -467,8 +483,11 @@ async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
                 if page.is_empty() {
                     break;
                 }
-                let max = apply_pulled_skills(store, &page)?;
-                store.set_state(&skill_key, max.max(since))?;
+                let max = store.in_transaction(|| {
+                    let max = apply_pulled_skills(store, &page)?;
+                    store.set_state(&skill_key, max.max(since))?;
+                    Ok(max)
+                })?;
                 out.pulled += page.len();
                 if !cursor_advances(max, since, page.len()) {
                     out.note(STUCK_CURSOR_NOTE.into());
@@ -575,6 +594,8 @@ mod tests {
     use super::*;
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     fn valid(id: &str, content: &str) -> Memory {
         Memory {
@@ -1458,6 +1479,249 @@ mod tests {
         assert_eq!(msg(ApiError::Http(404, "404 page not found".into()), Some(9)), SKILL_HISTORY_UNSUPPORTED);
         assert_eq!(msg(ApiError::Http(404, "".into()), None), SKILL_HISTORY_UNSUPPORTED);
         assert!(msg(ApiError::Http(500, "boom".into()), None).contains("500"));
+    }
+
+    #[tokio::test]
+    async fn chunks_walk_the_queue_in_order_past_the_other_kind() {
+        let s = Store::open_in_memory().unwrap();
+        // 120 memory adds with a skill delete after every tenth.
+        for i in 0..120 {
+            queue_memories(&s, &[format!("f{i:03}").as_str()]);
+            if i % 10 == 9 {
+                s.enqueue(&PendingOp::DeleteSkill { scope: Scope::Global, project: String::new(), name: format!("s{i:03}") }).unwrap();
+            }
+        }
+        let (base, log) = stub_relay(Box::new(|m, p, body| empty_pulls(m, p).unwrap_or_else(|| (200, ok_results(body))))).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        assert_eq!(out.pushed, 132);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        let posts = posted_ops(&log);
+        assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 50, 20, 8, 4]);
+        let sent: Vec<&str> = posts.iter().flatten()
+            .map(|o| o["memory"]["id"].as_str().or_else(|| o["name"].as_str()).unwrap()).collect();
+        let want: Vec<String> = (0..120).map(|i| format!("mem_f{i:03}"))
+            .chain((0..12).map(|k| format!("s{:03}", k * 10 + 9))).collect();
+        assert_eq!(sent, want);
+    }
+
+    // ─────────────── a crash inside a store transaction ───────────────
+
+    const T: i64 = 1_790_000_000;
+
+    /// A relay that keeps its memory rows, so an op sent again meets what its
+    /// first send did: an add of an id it has is a no-op, an add of a fact it
+    /// has under another id (same scope, project, machine and content hash,
+    /// still valid) is deduped onto that row (`canonical_id`), and
+    /// invalidation is final (a repeat changes nothing). Every write takes the
+    /// next seq; pulls page by seq.
+    #[derive(Default)]
+    struct KeepingRelay {
+        rows: BTreeMap<String, Memory>,
+        next_seq: i64,
+        ops_received: usize,
+    }
+
+    impl KeepingRelay {
+        fn put(&mut self, mut m: Memory) -> i64 {
+            self.next_seq += 1;
+            m.seq = self.next_seq;
+            self.rows.insert(m.id.clone(), m);
+            self.next_seq
+        }
+
+        fn op(&mut self, op: &serde_json::Value) -> serde_json::Value {
+            self.ops_received += 1;
+            match op["op"].as_str().unwrap() {
+                "add" => {
+                    let m: Memory = serde_json::from_value(op["memory"].clone()).unwrap();
+                    if let Some(r) = self.rows.get(&m.id) {
+                        return serde_json::json!({"ok": true, "seq": r.seq});
+                    }
+                    let key = |r: &Memory| (r.scope, r.project.clone(), r.machine.clone(), r.content_hash.clone());
+                    if let Some(r) = self.rows.values().find(|r| r.is_valid() && key(r) == key(&m)) {
+                        return serde_json::json!({"ok": true, "seq": r.seq, "canonical_id": r.id});
+                    }
+                    serde_json::json!({"ok": true, "seq": self.put(m)})
+                }
+                "invalidate" => {
+                    let Some(mut r) = self.rows.get(op["id"].as_str().unwrap()).cloned() else {
+                        return serde_json::json!({"ok": true});
+                    };
+                    if r.invalid_at.is_none() {
+                        r.invalid_at = op["invalid_at"].as_i64();
+                        r.superseded_by = op["superseded_by"].as_str().map(str::to_string);
+                        self.put(r);
+                    }
+                    serde_json::json!({"ok": true})
+                }
+                other => panic!("unexpected op {other}"),
+            }
+        }
+
+        fn page(&self, since: i64, limit: usize) -> serde_json::Value {
+            let mut rows: Vec<&Memory> = self.rows.values().filter(|r| r.seq > since).collect();
+            rows.sort_by_key(|r| r.seq);
+            rows.truncate(limit);
+            serde_json::json!({"memories": rows})
+        }
+    }
+
+    fn keeping_relay(relay: Arc<Mutex<KeepingRelay>>) -> Box<Handler> {
+        Box::new(move |m, p, body| {
+            let (path, query) = p.split_once('?').unwrap_or((p, ""));
+            let arg = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k)?.strip_prefix('=')?.parse::<i64>().ok());
+            let mut r = relay.lock().unwrap();
+            match (m, path) {
+                ("POST", "/api/memory/batch") => {
+                    let results: Vec<_> = body["ops"].as_array().unwrap().iter().map(|op| r.op(op)).collect();
+                    (200, serde_json::json!({"results": results}))
+                }
+                ("GET", "/api/memory") => (200, r.page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
+                ("GET", "/api/skills") => (200, serde_json::json!({"skills": []})),
+                _ => panic!("unexpected request {m} {p}"),
+            }
+        })
+    }
+
+    /// Arm a crash inside the store's next transaction: `trigger` creates a
+    /// TEMP trigger that calls `crash()`. That copies the database file and
+    /// its rollback journal into `image`'s directory, as a process killed at
+    /// that instant leaves them on disk, then fails the statement (the sync
+    /// gets an error and its transaction rolls back).
+    fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
+        use rusqlite::functions::FunctionFlags;
+        let (db, image) = (db.to_path_buf(), image.to_path_buf());
+        s.test_conn().create_scalar_function("crash", 0, FunctionFlags::SQLITE_UTF8, move |_| -> rusqlite::Result<i64> {
+            let copy = || -> std::io::Result<()> {
+                std::fs::create_dir_all(image.parent().unwrap())?;
+                for suffix in ["", "-journal"] {
+                    let (mut from, mut to) = (db.clone().into_os_string(), image.clone().into_os_string());
+                    from.push(suffix);
+                    to.push(suffix);
+                    if Path::new(&from).exists() {
+                        std::fs::copy(&from, &to)?;
+                    }
+                }
+                Ok(())
+            };
+            copy().map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+            Err(rusqlite::Error::UserFunctionError("injected crash".into()))
+        }).unwrap();
+        s.test_conn().execute_batch(trigger).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_crash_while_push_results_are_applied_leaves_the_chunk_queued_and_the_next_sync_completes() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        let mut old = valid("mem_old", "port 8765");
+        {
+            let mut r = relay.lock().unwrap();
+            r.put(valid("mem_canon", "beta")); // another machine added "beta" first
+            old.seq = r.put(old.clone()); // synced from here earlier
+        }
+        let s = Store::open(&db).unwrap();
+        s.upsert_memory(&old).unwrap();
+        queue_memories(&s, &["alpha", "beta"]); // ops 1 and 2
+        s.harvest_put(&HarvestEntry { origin: "m1:/x/beta.md".into(), memory_id: "mem_beta".into(), content_hash: content_hash("beta"), status: HarvestStatus::Synced }).unwrap();
+        assert!(invalidate_and_queue(&s, "mem_old", T, Some("mem_alpha")).unwrap()); // op 3
+        queue_memories(&s, &["gamma"]); // op 4
+        let queued = s.pending().unwrap();
+        let rows_before = s.history_memories().unwrap();
+        // At op 3's ack: ops 1 and 2 were applied (a seq, a canonical rewrite) and acked.
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_chunk BEFORE DELETE ON pending_ops WHEN old.n = {} BEGIN SELECT crash(); END;", queued[2].0));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        assert_eq!(relay.lock().unwrap().ops_received, 4); // the relay applied the chunk
+        drop(s);
+
+        // As the crash left the disk, and after the error's rollback: the
+        // chunk still queued as it was, none of its results applied.
+        let as_before = |s: &Store| {
+            assert_eq!(s.pending().unwrap(), queued);
+            assert_eq!(s.history_memories().unwrap(), rows_before);
+            assert!(s.get_memory("mem_canon").unwrap().is_none());
+            assert_eq!(s.harvest_get("m1:/x/beta.md").unwrap().unwrap().memory_id, "mem_beta");
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        as_before(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        as_before(&s);
+
+        // The next sync sends the chunk again and completes.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pushed, 4);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        assert!(s.get_state(LAST_SYNC_AT).unwrap() > 0);
+        let r = relay.lock().unwrap();
+        // Sent twice, applied once: one row per fact, the invalidation as first sent.
+        assert_eq!(r.ops_received, 8);
+        assert_eq!(r.rows.keys().map(String::as_str).collect::<Vec<_>>(), vec!["mem_alpha", "mem_canon", "mem_gamma", "mem_old"]);
+        assert_eq!((r.rows["mem_old"].invalid_at, r.rows["mem_old"].superseded_by.as_deref()), (Some(T), Some("mem_alpha")));
+        // This store holds the relay's rows exactly, the canonical rewrite done.
+        assert_eq!(s.history_memories().unwrap().len(), r.rows.len());
+        for row in r.rows.values() {
+            assert_eq!(s.get_memory(&row.id).unwrap().as_ref(), Some(row), "{}", row.id);
+        }
+        assert_eq!(s.harvest_get("m1:/x/beta.md").unwrap().unwrap().memory_id, "mem_canon");
+        assert_eq!(s.get_state(&memory_cursor_key("ast-a")).unwrap(), r.next_seq);
+    }
+
+    #[tokio::test]
+    async fn a_crash_inside_a_pulled_page_keeps_the_cursor_at_the_last_whole_page() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let page = PULL_LIMIT as usize;
+        let total = 2 * page + 50;
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        {
+            let mut r = relay.lock().unwrap();
+            for i in 1..=total {
+                let mut m = valid(&format!("mem_r{i:03}"), &format!("remote fact {i}"));
+                m.source_machine = "m2".into();
+                r.put(m);
+            }
+        }
+        let s = Store::open(&db).unwrap();
+        // Half way through the second page.
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_page BEFORE INSERT ON memories WHEN new.id = 'mem_r{:03}' BEGIN SELECT crash(); END;", page + page / 2));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        drop(s);
+
+        // The first page whole, with its cursor; nothing of the second.
+        let first_page_only = |s: &Store| {
+            let cursor = s.get_state(&memory_cursor_key("ast-a")).unwrap();
+            assert_eq!(cursor, page as i64);
+            let rows = s.history_memories().unwrap();
+            assert_eq!(rows.len(), page);
+            assert!(rows.iter().all(|m| m.seq <= cursor));
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        first_page_only(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        first_page_only(&s);
+
+        // The next sync pulls the second page again, whole, and the rest.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pulled, total - page);
+        assert_eq!(s.get_state(&memory_cursor_key("ast-a")).unwrap(), total as i64);
+        let r = relay.lock().unwrap();
+        assert_eq!(s.history_memories().unwrap().len(), total);
+        for row in r.rows.values() {
+            assert_eq!(s.get_memory(&row.id).unwrap().as_ref(), Some(row), "{}", row.id);
+        }
     }
 
     #[tokio::test]
