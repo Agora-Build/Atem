@@ -449,8 +449,9 @@ impl ReadAhead {
 /// group: whole chunks, read `chunk` at a time as the push will send them,
 /// planned with `Budget` (at most `GROUP_REQUESTS` requests' worth per step,
 /// and never more requests than sealing each chunk alone; a chunk with an op
-/// over the agent's limit is a group of its own).
-fn read_group(store: &Store, after: i64, is_mem: bool, chunk: usize) -> Result<Vec<(i64, PendingOp)>> {
+/// over the agent's limit is a group of its own). The `first` group is one
+/// chunk, so the first POST starts as soon as it is sealed.
+fn read_group(store: &Store, after: i64, is_mem: bool, chunk: usize, first: bool) -> Result<Vec<(i64, PendingOp)>> {
     let mut group: Vec<(i64, PendingOp)> = Vec::new();
     let mut budget = Budget::default();
     let mut cursor = after;
@@ -465,7 +466,7 @@ fn read_group(store: &Store, after: i64, is_mem: bool, chunk: usize) -> Result<V
         let whole = read.len() == chunk;
         group.extend(read);
         cursor = last;
-        if !whole {
+        if !whole || first {
             return Ok(group);
         }
     }
@@ -510,8 +511,8 @@ async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i
 /// id; the relay only knows the rewritten ids).
 ///
 /// Sealing runs ahead of the chunks (F2): the ops are sealed in groups of
-/// whole chunks (`read_group`), the next group while the chunk before it is
-/// POSTed. A chunk sends an op as sealed ahead only while it is `reusable`;
+/// whole chunks (`read_group`; the first is chunk 1 alone), the next group
+/// while the chunk before it is POSTed. A chunk sends an op as sealed ahead only while it is `reusable`;
 /// any other op is sealed again first. Before a chunk with ops sealed by an
 /// earlier request is POSTed, the cred agent must still be unlocked, so a
 /// lock stops the push within one POST, as when each chunk was sealed just
@@ -535,7 +536,8 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
         // The first group, or the read-ahead fell behind: seal from here.
         let mut sealed_now = false;
         while last > ahead.through {
-            let group = read_group(store, ahead.through.max(after), is_mem, chunk_size)?;
+            let first = ahead.through == i64::MIN;
+            let group = read_group(store, ahead.through.max(after), is_mem, chunk_size, first)?;
             ahead.through = group.last().map_or(last, |&(n, _)| n);
             if let Err(e) = seal_ahead(client, &mut ahead, group).await {
                 return group_failed(store, e, &chunk, is_mem, out);
@@ -553,7 +555,7 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
         // Seal the next group while this chunk is in flight, once the
         // read-ahead no longer covers the next chunk.
         let next = if ahead.sealed.len() < chunk_size {
-            read_group(store, ahead.through.max(last), is_mem, chunk_size)?
+            read_group(store, ahead.through.max(last), is_mem, chunk_size, false)?
         } else {
             Vec::new()
         };

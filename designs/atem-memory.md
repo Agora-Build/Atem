@@ -531,7 +531,9 @@ atem memory status                  # account, machine, pending ops, last sync, 
    in groups of whole requests (at most four cred-agent `Crypt` requests'
    worth per step: 1,024 ops and 2 MiB each; skills take two dependent
    steps, paths then files), the next group while the request before it is
-   in flight. The agent splits each step of a group into as few requests as
+   in flight. The first group is the first request alone, so it is sent as
+   soon as it is sealed (this can cost one `Crypt` request more than packing
+   it with the next ones; wall time comes first). The agent splits each step of a group into as few requests as
    its limits allow, and a group never takes more requests than sealing its
    requests one at a time would; a request with an op over the agent's limit
    for one op is a group of its own. A request sends an op as sealed ahead

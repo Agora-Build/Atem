@@ -1125,8 +1125,9 @@ signed final state is useful delivery assurance, not an authorization rule.
    a successful verification pass. The rewrite opens and seals rows in groups
    of whole POSTs (the same 64-fact and 16-skill batches; at most four
    cred-agent requests' worth of 1,024 ops and 2 MiB per step, and never more
-   requests than one POST at a time), the next group while the POST before
-   it is in flight (vaults: the next vault while the previous one is POSTed).
+   requests than one POST at a time; the first group is the first POST
+   alone), the next group while the POST before it is in flight (vaults: the
+   next vault while the previous one is POSTed).
    A POST of rows prepared by an earlier request first confirms that the
    cred agent is still unlocked, so a lock stops the migration within one
    POST. The read-back checks each page while the next one is fetched, and

@@ -1474,6 +1474,7 @@ async fn perf_2c_sync_against_a_relay_with_latency() {
         relay.set_latency(Duration::from_millis(latency));
         for (scenario, n) in [
             (Scenario::PushPull, 1000usize),
+            (Scenario::PushPull, 5000),
             (Scenario::Pull, 1000),
             (Scenario::Pull, 5000),
         ] {

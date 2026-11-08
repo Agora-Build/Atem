@@ -347,15 +347,17 @@ pub(crate) fn total<T>(items: &[T], cost: impl Fn(&T) -> Steps) -> Steps {
 }
 
 /// `items`, sent to the relay `chunk` at a time, in groups of whole chunks
-/// planned with `Budget` (F2): as few `Crypt` requests as the agent's limits
-/// allow, and never more than sealing each chunk alone.
+/// planned with `Budget` (F2): never more `Crypt` requests than sealing each
+/// chunk alone. The first group is the first chunk alone, so the first POST
+/// starts as soon as it is sealed (wall time first: this can cost one
+/// request more than packing the first chunk with the next ones).
 pub(crate) fn plan_groups<T>(items: &[T], chunk: usize, cost: impl Fn(&T) -> Steps) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
     let (mut start, mut budget) = (0, Budget::default());
     for (index, part) in items.chunks(chunk.max(1)).enumerate() {
         let at = index * chunk.max(1);
         let part_cost = total(part, &cost);
-        if budget.closed() || !budget.fits(&part_cost, part.len()) {
+        if index == 1 || budget.closed() || !budget.fits(&part_cost, part.len()) {
             groups.push(start..at);
             (start, budget) = (at, Budget::default());
         }
@@ -1161,22 +1163,23 @@ mod tests {
     #[test]
     fn group_plans_fill_each_request() {
         let cost = |ops: usize, bytes: usize| [Cost { ops, bytes, largest: bytes / ops.max(1) }, Cost::default(), Cost::default()];
-        // 3-op items, 50 per chunk: 27 chunks (4,050 ops) per group.
+        // 3-op items, 50 per chunk: the first chunk alone, then 27 chunks
+        // (4,050 ops) per group.
         let items = vec![3usize; 3000];
-        assert_eq!(plan_groups(&items, 50, |&n| cost(n, n * 100)), vec![0..1350, 1350..2700, 2700..3000]);
+        assert_eq!(plan_groups(&items, 50, |&n| cost(n, n * 100)), vec![0..50, 50..1400, 1400..2750, 2750..3000]);
         // Bytes bind first: chunks of 3.2 MiB, two per group; a bigger
-        // first chunk alone.
+        // chunk alone.
         let items = vec![400usize << 10; 48];
-        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..16, 16..32, 32..48]);
-        let items: Vec<usize> = [vec![2 << 20; 8], vec![1 << 10; 8]].concat();
-        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..16]);
-        // A chunk with an op over the agent's limit is a group of its own.
-        let mut items = vec![1usize << 10; 24];
-        items[12] = 7 << 20;
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..24, 24..40, 40..48]);
+        let items: Vec<usize> = [vec![1 << 10; 8], vec![2 << 20; 8], vec![1 << 10; 8]].concat();
         assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..16, 16..24]);
+        // A chunk with an op over the agent's limit is a group of its own.
+        let mut items = vec![1usize << 10; 32];
+        items[20] = 7 << 20;
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..16, 16..24, 24..32]);
         // Free items (an invalidation) still close a group.
         let items = vec![0usize; 5000];
-        assert_eq!(plan_groups(&items, 50, |&n| cost(n, 0)), vec![0..4050, 4050..5000]);
+        assert_eq!(plan_groups(&items, 50, |&n| cost(n, 0)), vec![0..50, 50..4100, 4100..5000]);
     }
 
     /// The requests `run` splits `sizes` (each op's `wire_len`, in order) into.

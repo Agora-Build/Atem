@@ -19,12 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const KID: &str = "0123abcd";
-/// Project facts (3 `Crypt` ops each) whose push is two groups: the first
-/// `GROUP_ONE_CHUNKS` chunks of 50 (4,050 ops, within four requests' worth),
-/// sealed in `GROUP_ONE_REQUESTS` requests, then the rest.
-const TWO_GROUPS: usize = 1400;
-const GROUP_ONE_CHUNKS: usize = 27;
-const GROUP_ONE_REQUESTS: usize = 4;
+/// Project facts (3 `Crypt` ops each) whose push is two groups: chunk 1
+/// alone (`GROUP_ONE_CHUNKS`, sealed in `GROUP_ONE_REQUESTS` request), then
+/// the other seven chunks (1,050 ops), sealed while chunk 1 is in flight.
+const TWO_GROUPS: usize = 400;
+const GROUP_ONE_CHUNKS: usize = 1;
+const GROUP_ONE_REQUESTS: usize = 1;
 const PROJECT: &str = "github.com/agora/atem";
 
 type Log = Arc<Mutex<Vec<(String, String, serde_json::Value)>>>;
@@ -234,11 +234,13 @@ async fn a_push_seals_full_groups_and_a_pull_opens_page_by_page() {
         vec![50; 20]
     );
     let (seals, opens) = recorder.seals_and_opens();
-    // Every op sealed once, in one request per 1,024 ops / 2 MiB.
+    // Every op sealed once: chunk 1 alone (so the first POST starts at
+    // once), then the rest in one request per 1,024 ops / 2 MiB.
     assert_eq!(seals.iter().map(|c| c.ops).sum::<usize>(), 2500);
+    assert_eq!(seals[0].ops, 125);
     assert_eq!(
         seals.len(),
-        2500usize.div_ceil(CRYPT_BATCH_OPS),
+        2375usize.div_ceil(CRYPT_BATCH_OPS) + 1,
         "{seals:?}"
     );
     assert!(
@@ -308,11 +310,13 @@ async fn a_skill_group_seals_in_two_requests_with_its_deletes_and_purges() {
         vec![8, 4]
     );
     let (seals, opens) = recorder.seals_and_opens();
-    // Paths, hashes and the deleted and purged projects' hashes, then the
-    // file contents (sealed under their sealed paths): two requests.
+    // Per group (chunk 1, then chunk 2 with the delete and the purge): paths,
+    // hashes and the deleted and purged projects' hashes, then the file
+    // contents sealed under their sealed paths. Two requests per group, the
+    // purge's and delete's hashes riding along (five before F2).
     assert_eq!(
         seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
-        vec![10 * 2 + 10 * 2 + 2, 10 * 2],
+        vec![8 * 4, 8 * 2, 2 * 4 + 2, 2 * 2],
         "{seals:?}"
     );
     assert_eq!(opens.len(), 1);
@@ -322,6 +326,59 @@ async fn a_skill_group_seals_in_two_requests_with_its_deletes_and_purges() {
             .values()
             .all(|k| k.project.starts_with("h1.") && k.files.keys().all(|p| p.starts_with("e1.")))
     );
+}
+
+/// The first group is chunk 1 alone, so the first POST starts as soon as one
+/// request is answered; the rest go in full groups, and the push never takes
+/// more requests than sealing chunk by chunk did (one per chunk here).
+#[tokio::test]
+async fn the_first_group_is_one_chunk_and_no_more_requests_than_chunk_by_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let posted_after_first = Arc::new(AtomicBool::new(false));
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let (seen, first) = (posted_after_first.clone(), AtomicBool::new(true));
+    let recorder = Recorder::new(device.agent.clone());
+    let sealed = recorder.clone();
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            // Chunk 1 arrives after one request: the next group's are not
+            // needed before it is sent.
+            seen.store(sealed.calls().len() == 1, Ordering::SeqCst);
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    // 1,000 project facts: 20 chunks of 150 ops.
+    queue(&s, (0..1000).map(|i| fact(i, true)));
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pushed, 1000);
+    assert_eq!(
+        posted_ops(&log).iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![50; 20]
+    );
+    assert!(
+        posted_after_first.load(Ordering::SeqCst),
+        "chunk 1 waited for more than its own request"
+    );
+    let (seals, _) = recorder.seals_and_opens();
+    assert_eq!(
+        seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
+        vec![150, 1024, 1024, 802]
+    );
+    // Sealing chunk by chunk took one request per chunk: 20.
+    assert!(seals.len() <= 20);
 }
 
 // ─────────────── ruling 2: rewrites after sealing ───────────────
@@ -379,7 +436,7 @@ async fn a_canonical_rewrite_of_an_op_sealed_ahead_is_sent_rewritten() {
     let (seals, _) = recorder.seals_and_opens();
     assert_eq!(
         seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
-        vec![51 * 2]
+        vec![50 * 2, 2]
     );
 }
 
@@ -448,7 +505,7 @@ async fn an_op_changed_or_acked_after_it_was_sealed_is_sealed_again_or_dropped()
     let (seals, _) = recorder.seals_and_opens();
     assert_eq!(
         seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
-        vec![60 * 2, 2]
+        vec![50 * 2, 10 * 2, 2]
     );
     assert_eq!(s.pending_count().unwrap(), 0);
 }
@@ -519,8 +576,8 @@ async fn the_next_group_is_sealed_while_a_chunk_is_posted() {
     let in_flight = Arc::new(AtomicBool::new(false));
     let overlapped = Arc::new(AtomicBool::new(false));
     let (flag, seen) = (in_flight.clone(), overlapped.clone());
-    // Group 1 (27 chunks, 4,050 ops) is four requests; the fifth is the next
-    // group's: is a POST in flight then?
+    // Group 1 (chunk 1) is one request; the second is the next group's: is
+    // a POST in flight then?
     let recorder = Recorder::with_hook(
         device.agent.clone(),
         Box::new(move |index, _, _| {
@@ -536,7 +593,7 @@ async fn the_next_group_is_sealed_while_a_chunk_is_posted() {
     let keeping = keeping_relay(relay.clone());
     let (flag, posts) = (in_flight.clone(), AtomicUsize::new(0));
     let (base, _log) = stub_relay(Box::new(move |m, p, body| {
-        // The last chunk of group 1 is held a while.
+        // Chunk 1 (all of group 1) is held a while.
         if m != "POST" || posts.fetch_add(1, Ordering::SeqCst) + 1 != GROUP_ONE_CHUNKS {
             return keeping(m, p, body);
         }
@@ -565,7 +622,10 @@ async fn the_next_group_is_sealed_while_a_chunk_is_posted() {
         "the next group was sealed between POSTs"
     );
     let (seals, _) = recorder.seals_and_opens();
-    assert_eq!(seals.len(), GROUP_ONE_REQUESTS + 1);
+    assert_eq!(
+        seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
+        vec![150, 1024, 26]
+    );
 }
 
 #[tokio::test]
@@ -1011,8 +1071,8 @@ async fn a_cursor_moved_by_another_writer_restarts_the_pull_from_it() {
 async fn a_lock_while_the_next_group_is_sealed_stops_the_push_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let device = device(dir.path(), EncryptionMode::On);
-    // `atem cred lock` lands just as the next group is sealed, while the last
-    // chunk of group 1 is in flight.
+    // `atem cred lock` lands just as the next group is sealed, while chunk 1
+    // (all of group 1) is in flight.
     let recorder = Recorder::with_hook(
         device.agent.clone(),
         Box::new(|index, _, agent| {
@@ -1125,7 +1185,10 @@ async fn an_op_that_cannot_be_sealed_stops_the_push_at_its_own_chunk() {
     // Chunks 1 and 2 in one request; nothing reached the agent for the
     // failed chunk.
     let (seals, _) = recorder.seals_and_opens();
-    assert_eq!(seals.iter().map(|c| c.ops).collect::<Vec<_>>(), vec![200]);
+    assert_eq!(
+        seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
+        vec![100, 100]
+    );
 }
 
 /// `atem cred lock` lands after the whole group was sealed, while chunk 1 is
@@ -1138,16 +1201,23 @@ async fn a_lock_between_two_seals_stops_the_push_within_one_post() {
     let recorder = Recorder::new(device.agent.clone());
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let keeping = keeping_relay(relay.clone());
-    let (agent, first) = (device.agent.clone(), AtomicBool::new(true));
+    let (agent, sealed, first) = (
+        device.agent.clone(),
+        recorder.clone(),
+        AtomicBool::new(true),
+    );
     let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        // Chunk 1 is in flight: once the next group (chunks 2 to 8) is
+        // sealed, the agent is locked.
         if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            assert!(wait_for(Duration::from_secs(2), || sealed.calls().len() == 3));
             agent.lock_keys().unwrap();
         }
         keeping(m, p, body)
     }))
     .await;
     let s = Store::open_in_memory().unwrap();
-    // One group: 1,200 ops in two requests, both before chunk 1 is sent.
+    // Chunk 1 alone, then chunks 2 to 8 (1,050 ops) in two requests.
     queue(&s, (0..400).map(|i| fact(i, true)));
     let queued = s.pending().unwrap();
     let (_home, ctx) = test_ctx();
@@ -1171,11 +1241,11 @@ async fn a_lock_between_two_seals_stops_the_push_within_one_post() {
         vec![50]
     );
     assert_eq!(s.pending().unwrap(), queued[50..].to_vec());
-    // The group's two requests, then only the pull's refused open.
+    // Both groups' requests, then only the pull's refused open.
     let calls = recorder.calls();
     assert_eq!(
         calls.iter().map(|c| (c.ops, c.ok)).collect::<Vec<_>>(),
-        vec![(1024, true), (176, true), (50, false)]
+        vec![(150, true), (1024, true), (26, true), (50, false)]
     );
 }
 
@@ -1212,7 +1282,7 @@ async fn a_locked_agent_refuses_a_push_once() {
     let calls = recorder.calls();
     assert_eq!(
         calls.iter().map(|c| (c.ops, c.ok)).collect::<Vec<_>>(),
-        vec![(120, false)]
+        vec![(100, false)]
     );
 }
 
@@ -1456,14 +1526,15 @@ async fn a_migration_seals_full_groups_and_reads_back_page_by_page() {
     );
     let (seals, opens) = recorder.seals_and_opens();
     assert!(opens.is_empty());
-    // Facts: 2,500 ops in 3 requests. Skills: paths and hashes, then files.
+    // Every field sealed once.
     assert_eq!(
         seals.iter().map(|c| c.ops).sum::<usize>(),
         2500 + 20 * 4 + 20 * 3
     );
     assert_eq!(
         seals.len(),
-        2500usize.div_ceil(CRYPT_BATCH_OPS) + 2,
+        // Facts: chunk 1 alone, then 2,340 ops; skills: two chunks of two requests.
+        2340usize.div_ceil(CRYPT_BATCH_OPS) + 1 + 2 * 2,
         "{seals:?}"
     );
     assert!(
