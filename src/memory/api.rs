@@ -267,6 +267,12 @@ impl SealState {
     fn of(encryption: &EncryptionContext) -> Self {
         Self { mode: encryption.mode, kid: encryption.kid.clone(), data_account: encryption.data_account.clone() }
     }
+
+    /// Whether ops are sealed under this state (the account encrypts): only
+    /// then does sealing an op with a protected field ask the cred agent.
+    pub fn encrypts(&self) -> bool {
+        matches!(self.mode, EncryptionMode::Enabling | EncryptionMode::On)
+    }
 }
 
 /// The body of a batch POST, serialized from borrowed ops.

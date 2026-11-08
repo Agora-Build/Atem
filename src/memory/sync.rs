@@ -469,23 +469,45 @@ fn read_group(store: &Store, after: i64, is_mem: bool, chunk: usize, first: bool
     }
 }
 
-/// Seals `group` into the read-ahead; the seal's error, if it failed.
-async fn seal_ahead(client: &KnowledgeClient, ahead: &mut ReadAhead, group: Vec<(i64, PendingOp)>) -> std::result::Result<(), ApiError> {
+/// Whether sealing `op` under `state` asked the cred agent: an op with a
+/// protected field (a memory's content or project, a skill, a project-scoped
+/// skill's delete or purge) while the account encrypts. Deletes and
+/// invalidations of memories and a global skill's delete or purge never do,
+/// so they never wait for the unlocked check and never start the agent.
+fn sealed_by_agent(op: &PendingOp, state: &SealState) -> bool {
+    state.encrypts() && seal_cost(op).iter().any(|step| step.ops > 0)
+}
+
+/// Whether some of `sealed` (as `seal_ops` returned them, under `state`)
+/// asked the cred agent: a `Crypt` request that succeeded, which shows the
+/// agent unlocked when it was answered.
+fn asked_agent(state: &SealState, sealed: &[(PendingOp, Value)]) -> bool {
+    sealed.iter().any(|(op, _)| sealed_by_agent(op, state))
+}
+
+/// Seals `group` into the read-ahead: whether that asked the cred agent
+/// (`asked_agent`), or the seal's error.
+async fn seal_ahead(client: &KnowledgeClient, ahead: &mut ReadAhead, group: Vec<(i64, PendingOp)>) -> std::result::Result<bool, ApiError> {
     let (ns, ops): (Vec<i64>, Vec<PendingOp>) = group.into_iter().unzip();
     let (state, sealed) = client.seal_ops(ops).await?;
+    let asked = asked_agent(&state, &sealed);
     ahead.add(state, &ns, sealed);
-    Ok(())
+    Ok(asked)
 }
 
 /// The wire form of every op of `chunk` (as sealed ahead where `reusable`,
-/// the others sealed now, together), and whether some op was sealed by an
-/// earlier request.
-async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i64, PendingOp)], state: &SealState) -> std::result::Result<(Vec<Value>, bool), ApiError> {
+/// the others sealed now, together), and whether its POST must first check
+/// that the cred agent is still unlocked: some op goes out as sealed by an
+/// earlier `Crypt` request (`sealed_by_agent`), and no `Crypt` request since
+/// (`asked`: a group sealed in this pass, or this chunk's ops sealed again
+/// now) showed the agent unlocked.
+async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i64, PendingOp)], state: &SealState, mut asked: bool) -> std::result::Result<(Vec<Value>, bool), ApiError> {
     let mut wire = ahead.take(chunk, state);
-    let reused = wire.iter().any(Option::is_some);
+    let sealed_earlier = chunk.iter().zip(&wire).any(|((_, op), value)| value.is_some() && sealed_by_agent(op, state));
     let stale: Vec<usize> = (0..chunk.len()).filter(|&i| wire[i].is_none()).collect();
     if !stale.is_empty() {
-        let (_, sealed) = client.seal_ops(stale.iter().map(|&i| chunk[i].1.clone()).collect()).await?;
+        let (now, sealed) = client.seal_ops(stale.iter().map(|&i| chunk[i].1.clone()).collect()).await?;
+        asked |= asked_agent(&now, &sealed);
         for (&i, (_, value)) in stale.iter().zip(sealed) {
             wire[i] = Some(value);
         }
@@ -493,7 +515,7 @@ async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i
     let wire = wire.into_iter()
         .map(|value| value.ok_or_else(|| ApiError::Encryption("an op of the chunk was not sealed".into())))
         .collect::<std::result::Result<_, _>>()?;
-    Ok((wire, reused))
+    Ok((wire, sealed_earlier && !asked))
 }
 
 /// Push a group in chunks, in queue order. Any failure stops the group (its
@@ -509,14 +531,18 @@ async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i
 ///
 /// Sealing runs ahead of the chunks (F2): the ops are sealed in groups of
 /// whole chunks (`read_group`; the first is chunk 1 alone), the next group
-/// while the chunk before it is POSTed. A chunk sends an op as sealed ahead only while it is `reusable`;
-/// any other op is sealed again first. Before a chunk with ops sealed by an
-/// earlier request is POSTed, the cred agent must still be unlocked, so a
-/// lock stops the push within one POST, as when each chunk was sealed just
-/// before it. A group that fails to seal stops the push with that error
-/// (after the chunk in flight, whose results are applied first); nothing is
-/// retried. A chunk's results are applied in their own transaction after
-/// its POST, before the next chunk is read; no request is in flight then.
+/// while the chunk before it is POSTed. A chunk sends an op as sealed ahead
+/// only while it is `reusable`; any other op is sealed again first. Before a
+/// chunk with ops the agent sealed in an earlier request is POSTed, the cred
+/// agent must still be unlocked (a status, unless a `Crypt` request since
+/// showed it), so a lock stops the push within one POST, as when each chunk
+/// was sealed just before it. Ops sealed without the agent (deletes,
+/// invalidations, a global skill's delete or purge) go out while it is
+/// locked, as before read-ahead. A group that fails to seal stops the push
+/// with that error (after the chunk in flight, whose results are applied
+/// first); nothing is retried. A chunk's results are applied in their own
+/// transaction after its POST, before the next chunk is read; no request is
+/// in flight then.
 async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
     let mut after = i64::MIN;
     let mut ahead = ReadAhead::new();
@@ -531,26 +557,24 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
         };
         // The first group, or the read-ahead fell behind: seal from here.
-        let mut sealed_now = false;
+        // Only a group that asked the agent (deletes and invalidations alone
+        // don't) shows it is unlocked now.
+        let mut asked = false;
         while last > ahead.through {
             let first = ahead.through == i64::MIN;
             let group = read_group(store, ahead.through.max(after), is_mem, chunk_size, first)?;
             ahead.through = group.last().map_or(last, |&(n, _)| n);
-            // Only a group with a sealed field asks the agent (deletes and
-            // invalidations alone don't), so only such a seal shows it is
-            // unlocked now.
-            let asks = total(&group, |(_, op)| seal_cost(op)).iter().any(|step| step.ops > 0);
-            if let Err(e) = seal_ahead(client, &mut ahead, group).await {
-                return group_failed(store, e, &chunk, is_mem, out);
+            match seal_ahead(client, &mut ahead, group).await {
+                Ok(group_asked) => asked |= group_asked,
+                Err(e) => return group_failed(store, e, &chunk, is_mem, out),
             }
-            sealed_now |= asks;
         }
-        let (wire, reused) = match chunk_wire(client, &mut ahead, &chunk, &state).await {
+        let (wire, unchecked) = match chunk_wire(client, &mut ahead, &chunk, &state, asked).await {
             Ok(wire) => wire,
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
         };
-        // Sealed by an earlier request (not just now): still unlocked?
-        if reused && !sealed_now && let Err(e) = client.confirm_unlocked().await {
+        // Ops the agent sealed in an earlier request: still unlocked?
+        if unchecked && let Err(e) = client.confirm_unlocked().await {
             return group_failed(store, e, &chunk, is_mem, out);
         }
         // Seal the next group while this chunk is in flight, once the
@@ -582,8 +606,12 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                     let Some(op) = store.pending_op(*n)? else { continue };
                     let one = [(*n, op)];
                     let single = match client.seal_state() {
+                        // Sealed before the chunk's POST: an op the agent
+                        // sealed waits for the unlocked check, so a lock
+                        // while the chunk was in flight stops it.
                         Ok(now) if reusable(sent, &state, &one[0].1, &now) => {
-                            client.confirm_unlocked().await.map(|()| vec![sealed.clone()])
+                            let checked = if sealed_by_agent(sent, &state) { client.confirm_unlocked().await } else { Ok(()) };
+                            checked.map(|()| vec![sealed.clone()])
                         }
                         Ok(_) => client.seal_ops(vec![one[0].1.clone()]).await.map(|(_, ops)| ops.into_iter().map(|(_, wire)| wire).collect()),
                         Err(e) => Err(e),

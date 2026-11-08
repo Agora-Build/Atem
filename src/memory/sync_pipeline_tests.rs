@@ -40,12 +40,16 @@ struct Call {
 
 type Hook = Box<dyn Fn(usize, &[CryptOp], &Mutex<CredAgent>) + Send + Sync>;
 
-/// The in-process agent, recording every `Crypt` request. `hook` runs
-/// before a request reaches the agent, with its index (from 0) and its ops.
+/// The in-process agent, recording every `Crypt` request and counting every
+/// request of any kind (in production the first request starts the agent).
+/// `hook` runs before a `Crypt` request reaches the agent, with its index
+/// (from 0) and its ops.
 struct Recorder {
     inner: Arc<Mutex<CredAgent>>,
     started: AtomicUsize,
     calls: Mutex<Vec<Call>>,
+    requests: AtomicUsize,
+    statuses: AtomicUsize,
     hook: Hook,
 }
 
@@ -59,6 +63,8 @@ impl Recorder {
             inner,
             started: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
+            requests: AtomicUsize::new(0),
+            statuses: AtomicUsize::new(0),
             hook,
         })
     }
@@ -71,10 +77,24 @@ impl Recorder {
     fn seals_and_opens(&self) -> (Vec<Call>, Vec<Call>) {
         self.calls().into_iter().partition(|call| !call.opens)
     }
+
+    /// Every request that reached the agent, of any kind.
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    /// The status requests (the unlocked check before a POST).
+    fn statuses(&self) -> usize {
+        self.statuses.load(Ordering::SeqCst)
+    }
 }
 
 impl CredAgentApi for Recorder {
     fn call(&self, request: Request) -> anyhow::Result<Reply> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        if matches!(request, Request::Status) {
+            self.statuses.fetch_add(1, Ordering::SeqCst);
+        }
         let Request::Crypt { ops, .. } = &request else {
             return self.inner.call(request);
         };
@@ -520,6 +540,9 @@ async fn an_op_changed_or_acked_after_it_was_sealed_is_sealed_again_or_dropped()
         seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
         vec![50 * 2, 10 * 2, 2]
     );
+    // Sealing the changed op again, just before chunk 2's POST, showed the
+    // agent unlocked: no status check for the ops sealed ahead beside it.
+    assert_eq!(recorder.statuses(), 0);
     assert_eq!(s.pending_count().unwrap(), 0);
 }
 
@@ -1507,6 +1530,230 @@ async fn a_group_of_free_ops_does_not_stand_in_for_the_unlocked_check() {
         calls.iter().map(|c| (c.ops, c.ok)).collect::<Vec<_>>(),
         vec![(100, true), (100, true), (50, false)]
     );
+}
+
+/// Deletes and invalidations carry no sealed field: sealing them never asks
+/// the cred agent, so they are never "sealed by an earlier request". A push
+/// of only those goes out while the agent is locked, as before read-ahead,
+/// and never contacts the agent (in production, a request would start it).
+#[tokio::test]
+async fn deletes_and_invalidations_alone_are_pushed_while_the_agent_is_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    device.agent.lock_keys().unwrap();
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    // Two chunks: chunk 1 sealed alone, chunk 2 sealed ahead of its POST.
+    for i in 0..60 {
+        s.enqueue(&if i % 3 == 0 {
+            PendingOp::DeleteMemory {
+                id: format!("mem_deleted_{i}"),
+            }
+        } else {
+            PendingOp::InvalidateMemory {
+                id: format!("mem_outdated_{i}"),
+                invalid_at: T0,
+                superseded_by: None,
+            }
+        })
+        .unwrap();
+    }
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pushed, 60);
+    assert_eq!(
+        posted_ops(&log).iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![50, 10]
+    );
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert_eq!(recorder.requests(), 0);
+}
+
+/// A global skill's purge (erasing its files on the relay, e.g. a leaked
+/// value) and delete carry no project hash: they go out while the agent is
+/// locked, without contacting it.
+#[tokio::test]
+async fn a_global_skill_purge_is_pushed_while_the_agent_is_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    device.agent.lock_keys().unwrap();
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    s.enqueue(&PendingOp::PurgeSkill {
+        scope: Scope::Global,
+        project: String::new(),
+        name: "leaked".into(),
+        versions: None,
+    })
+    .unwrap();
+    s.enqueue(&PendingOp::DeleteSkill {
+        scope: Scope::Global,
+        project: String::new(),
+        name: "old".into(),
+    })
+    .unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pushed, 2);
+    let posts = posted_ops(&log);
+    assert_eq!(
+        posts[0]
+            .iter()
+            .map(|op| op["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["purge", "delete"]
+    );
+    assert_eq!(posts.len(), 1);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert_eq!(recorder.requests(), 0);
+}
+
+/// `atem cred lock` lands while chunk 1 is in flight, after the next group
+/// (chunks 2 and 3) was sealed: chunk 2, only invalidations, needs no agent
+/// and still goes out; chunk 3, facts sealed before the lock, is checked and
+/// stopped.
+#[tokio::test]
+async fn after_a_lock_free_ops_go_and_ops_sealed_ahead_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let (agent, sealed, first) = (
+        device.agent.clone(),
+        recorder.clone(),
+        AtomicBool::new(true),
+    );
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            assert!(wait_for(Duration::from_secs(2), || sealed.calls().len() == 2));
+            agent.lock_keys().unwrap();
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    queue(&s, (0..50).map(|i| fact(i, false)));
+    for i in 0..50 {
+        s.enqueue(&PendingOp::InvalidateMemory {
+            id: format!("mem_outdated_{i}"),
+            invalid_at: T0,
+            superseded_by: None,
+        })
+        .unwrap();
+    }
+    queue(&s, (50..100).map(|i| fact(i, false)));
+    let queued = s.pending().unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert!(
+        out.notes.iter().any(|n| n.contains("atem cred unlock")),
+        "{:?}",
+        out.notes
+    );
+    assert_eq!(out.pushed, 100);
+    let posts = posted_ops(&log);
+    assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 50]);
+    assert!(posts[1].iter().all(|op| op["op"] == "invalidate"));
+    assert_eq!(s.pending().unwrap(), queued[100..].to_vec());
+    // Chunk 1, then chunks 2 and 3 in one request; the check before chunk 3
+    // only, then the pull's refused open.
+    assert_eq!(recorder.statuses(), 1);
+    assert_eq!(
+        recorder
+            .calls()
+            .iter()
+            .map(|c| (c.ops, c.ok))
+            .collect::<Vec<_>>(),
+        vec![(100, true), (100, true), (50, false)]
+    );
+}
+
+/// A chunk refused as too large (413) is sent again one op at a time. A lock
+/// while it was in flight stops the first op the agent sealed; the free ops
+/// before it still go.
+#[tokio::test]
+async fn a_chunk_refused_as_too_large_sends_its_free_ops_after_a_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let (agent, first) = (device.agent.clone(), AtomicBool::new(true));
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m != "POST" {
+            return keeping(m, p, body);
+        }
+        if first.swap(false, Ordering::SeqCst) {
+            agent.lock_keys().unwrap();
+        }
+        if body["ops"].as_array().unwrap().len() > 1 {
+            return (413, serde_json::json!({"error": "request body too large"}));
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    for i in 0..2 {
+        s.enqueue(&PendingOp::InvalidateMemory {
+            id: format!("mem_outdated_{i}"),
+            invalid_at: T0,
+            superseded_by: None,
+        })
+        .unwrap();
+    }
+    queue(&s, [fact(0, false)]);
+    let queued = s.pending().unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert!(
+        out.notes.iter().any(|n| n.contains("atem cred unlock")),
+        "{:?}",
+        out.notes
+    );
+    assert_eq!(out.pushed, 2);
+    assert_eq!(
+        posted_ops(&log).iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![3, 1, 1]
+    );
+    assert_eq!(s.pending().unwrap(), queued[2..].to_vec());
+    assert_eq!(recorder.statuses(), 1);
 }
 
 // ─────────────── ruling 1: the order of commits ───────────────
