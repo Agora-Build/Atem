@@ -281,7 +281,8 @@ async fn a_whole_sync_uses_one_agent_connection() {
         "one connection for the whole sync: {seen:?}"
     );
     // One build check, then one unlocked check before each chunk sent as
-    // sealed ahead (chunks 2 and 3 of the one group).
+    // sealed ahead (chunks 2 and 3, the second group, sealed while chunk 1
+    // was in flight).
     assert_eq!(
         Proxy::count(&seen, "status"),
         1 + 2,

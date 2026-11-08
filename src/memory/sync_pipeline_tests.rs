@@ -336,16 +336,29 @@ async fn the_first_group_is_one_chunk_and_no_more_requests_than_chunk_by_chunk()
     let dir = tempfile::tempdir().unwrap();
     let device = device(dir.path(), EncryptionMode::On);
     let posted_after_first = Arc::new(AtomicBool::new(false));
+    let chunk_one_arrived = Arc::new(AtomicBool::new(false));
+    // The next group's first request waits (bounded) for chunk 1 to reach
+    // the relay: if chunk 1 needed more than its own request, it never does.
+    let arrived = chunk_one_arrived.clone();
+    let recorder = Recorder::with_hook(
+        device.agent.clone(),
+        Box::new(move |index, _, _| {
+            if index == 1 {
+                wait_for(Duration::from_secs(2), || arrived.load(Ordering::SeqCst));
+            }
+        }),
+    );
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let keeping = keeping_relay(relay.clone());
-    let (seen, first) = (posted_after_first.clone(), AtomicBool::new(true));
-    let recorder = Recorder::new(device.agent.clone());
-    let sealed = recorder.clone();
+    let (seen, sealed, first) = (
+        posted_after_first.clone(),
+        recorder.clone(),
+        AtomicBool::new(true),
+    );
     let (base, log) = stub_relay(Box::new(move |m, p, body| {
         if m == "POST" && first.swap(false, Ordering::SeqCst) {
-            // Chunk 1 arrives after one request: the next group's are not
-            // needed before it is sent.
             seen.store(sealed.calls().len() == 1, Ordering::SeqCst);
+            chunk_one_arrived.store(true, Ordering::SeqCst);
         }
         keeping(m, p, body)
     }))
@@ -510,10 +523,10 @@ async fn an_op_changed_or_acked_after_it_was_sealed_is_sealed_again_or_dropped()
     assert_eq!(s.pending_count().unwrap(), 0);
 }
 
-/// The account's mode changes while chunk 1 is in flight, after both
-/// chunks were sealed (or left plain) under the old one: chunk 2 goes out as
-/// the new mode says, as it did when each chunk was sealed just before its
-/// POST.
+/// The account's mode changes while chunk 1 is in flight, once chunk 2 (the
+/// next group) was sealed, or left plain, under the old one: chunk 2 goes out
+/// as the new mode says, sealed again, as it did when each chunk was sealed
+/// just before its POST.
 #[tokio::test]
 async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
     for (from, to) in [
@@ -525,12 +538,19 @@ async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
         if from == EncryptionMode::Off {
             device.state(EncryptionMode::Off, None);
         }
+        let recorder = Recorder::new(device.agent.clone());
         let device = Arc::new(Mutex::new(device));
         let relay = Arc::new(Mutex::new(KeepingRelay::default()));
         let keeping = keeping_relay(relay.clone());
-        let (switch, first) = (device.clone(), AtomicBool::new(true));
+        let (switch, sealed, first) = (device.clone(), recorder.clone(), AtomicBool::new(true));
         let (base, log) = stub_relay(Box::new(move |m, p, body| {
             if m == "POST" && first.swap(false, Ordering::SeqCst) {
+                // Chunk 2 is sealed first: under on, its request has come
+                // back; under off it was left plain without the agent, in the
+                // same poll that sent chunk 1, before this relay could run.
+                if from == EncryptionMode::On {
+                    assert!(wait_for(Duration::from_secs(2), || sealed.calls().len() == 2));
+                }
                 let kid = (to == EncryptionMode::On).then_some(KID);
                 switch.lock().unwrap().state(to, kid);
             }
@@ -542,7 +562,7 @@ async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
         let (_home, ctx) = test_ctx();
         let client = {
             let device = device.lock().unwrap();
-            client_with(&base, &device, device.agent.clone())
+            client_with(&base, &device, recorder.clone())
         };
         let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
             .await
@@ -564,6 +584,16 @@ async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
                 .all(|op| sealed(op) == (to == EncryptionMode::On)),
             "{from:?} → {to:?}"
         );
+        // The push's requests: under on, both groups (chunk 2's ciphertext is
+        // dropped for its plain form); under off, none until chunk 2 is
+        // sealed again under on.
+        let pushed: Vec<usize> = recorder.seals_and_opens().0.iter().map(|c| c.ops).collect();
+        let want = if from == EncryptionMode::On {
+            vec![150, 30]
+        } else {
+            vec![30]
+        };
+        assert_eq!(pushed, want, "{from:?} → {to:?}");
     }
 }
 
@@ -1286,17 +1316,22 @@ async fn a_locked_agent_refuses_a_push_once() {
     );
 }
 
-/// The key rotates while chunk 1 is in flight, after both chunks were sealed
-/// under the old kid: chunk 2 goes out under the new kid, never the old one.
+/// The key rotates while chunk 1 is in flight, once chunk 2 (the next
+/// group) was sealed under the old kid: chunk 2 is sealed again and goes out
+/// under the new kid, never the old one.
 #[tokio::test]
 async fn a_key_rotation_after_sealing_seals_again_under_the_new_kid() {
     let dir = tempfile::tempdir().unwrap();
-    let device = Arc::new(Mutex::new(device(dir.path(), EncryptionMode::On)));
+    let device = device(dir.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let device = Arc::new(Mutex::new(device));
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let keeping = keeping_relay(relay.clone());
-    let (rotate, first) = (device.clone(), AtomicBool::new(true));
+    let (rotate, sealed, first) = (device.clone(), recorder.clone(), AtomicBool::new(true));
     let (base, log) = stub_relay(Box::new(move |m, p, body| {
         if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            // Chunk 2's request (under the old kid) has come back first.
+            assert!(wait_for(Duration::from_secs(2), || sealed.calls().len() == 2));
             rotate
                 .lock()
                 .unwrap()
@@ -1310,7 +1345,7 @@ async fn a_key_rotation_after_sealing_seals_again_under_the_new_kid() {
     let (_home, ctx) = test_ctx();
     let client = {
         let device = device.lock().unwrap();
-        client_with(&base, &device, device.agent.clone())
+        client_with(&base, &device, recorder.clone())
     };
     let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
         .await
@@ -1334,6 +1369,9 @@ async fn a_key_rotation_after_sealing_seals_again_under_the_new_kid() {
     };
     assert!(posts[0].iter().all(|op| under(op, KID)));
     assert!(posts[1].iter().all(|op| under(op, "89abcdef")));
+    // Chunk 1, chunk 2 under the old kid (dropped), chunk 2 again.
+    let pushed: Vec<usize> = recorder.seals_and_opens().0.iter().map(|c| c.ops).collect();
+    assert_eq!(pushed, vec![150, 30, 30]);
 }
 
 /// Skills whose files fill more than half a request each take exactly the
@@ -1396,6 +1434,78 @@ async fn large_skills_never_take_more_requests_than_sealing_chunk_by_chunk() {
     assert!(
         seals.iter().all(|c| c.bytes <= CRYPT_BATCH_BYTES),
         "{seals:?}"
+    );
+}
+
+/// Another writer acks ten ops of chunk 2 and queues ten invalidations, then
+/// the agent is locked, all while chunk 1 is in flight: chunk 2 is now forty
+/// ops sealed ahead plus a group of invalidations, which seals without asking
+/// the agent. That proves nothing about the lock, so chunk 2 is checked and
+/// stopped like any chunk sealed ahead.
+#[tokio::test]
+async fn a_group_of_free_ops_does_not_stand_in_for_the_unlocked_check() {
+    let td = tempfile::tempdir().unwrap();
+    let db = td.path().join("knowledge.db");
+    let device = device(td.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let s = Store::open(&db).unwrap();
+    queue(&s, (0..100).map(|i| fact(i, false)));
+    let gone: Vec<i64> = s.pending().unwrap()[50..60]
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let (agent, sealed, other_writer, first) = (
+        device.agent.clone(),
+        recorder.clone(),
+        db.clone(),
+        AtomicBool::new(true),
+    );
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            assert!(wait_for(Duration::from_secs(2), || sealed.calls().len() == 2));
+            let other = Store::open(&other_writer).unwrap();
+            for (i, n) in gone.iter().enumerate() {
+                other.ack(*n).unwrap();
+                other
+                    .enqueue(&PendingOp::InvalidateMemory {
+                        id: format!("mem_gone_{i}"),
+                        invalid_at: T0,
+                        superseded_by: None,
+                    })
+                    .unwrap();
+            }
+            agent.lock_keys().unwrap();
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert!(
+        out.notes.iter().any(|n| n.contains("atem cred unlock")),
+        "{:?}",
+        out.notes
+    );
+    assert_eq!(out.pushed, 50);
+    assert_eq!(
+        posted_ops(&log).iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![50]
+    );
+    assert_eq!(s.pending_count().unwrap(), 50);
+    let calls = recorder.calls();
+    assert_eq!(
+        calls.iter().map(|c| (c.ops, c.ok)).collect::<Vec<_>>(),
+        vec![(100, true), (100, true), (50, false)]
     );
 }
 

@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
 use crate::memory::api::{seal_cost, ApiError, KnowledgeClient, OpResult, SealState, PULL_LIMIT};
-use crate::memory::crypto::{total, Budget};
+use crate::memory::crypto::{total, Planner};
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
 use crate::memory::model::{content_hash, new_memory_id, now_secs, skill_hash, Memory, Scope, Skill};
@@ -447,26 +447,23 @@ impl ReadAhead {
 
 /// The queued ops of one kind after `after` that are sealed together as one
 /// group: whole chunks, read `chunk` at a time as the push will send them,
-/// planned with `Budget` (at most `GROUP_REQUESTS` requests' worth per step,
-/// and never more requests than sealing each chunk alone; a chunk with an op
-/// over the agent's limit is a group of its own). The `first` group is one
-/// chunk, so the first POST starts as soon as it is sealed.
+/// planned by `Planner` (as the migration's groups: at most
+/// `GROUP_REQUESTS` requests' worth per step, never more requests than
+/// sealing each chunk alone; the run's `first` group is one chunk).
 fn read_group(store: &Store, after: i64, is_mem: bool, chunk: usize, first: bool) -> Result<Vec<(i64, PendingOp)>> {
     let mut group: Vec<(i64, PendingOp)> = Vec::new();
-    let mut budget = Budget::default();
+    let mut planner = Planner::new(first);
     let mut cursor = after;
     loop {
         let read = store.pending_after(cursor, is_mem, chunk)?;
         let Some(&(last, _)) = read.last() else { return Ok(group) };
-        let cost = total(&read, |(_, op)| seal_cost(op));
-        if budget.closed() || !budget.fits(&cost, read.len()) {
+        if !planner.take(&total(&read, |(_, op)| seal_cost(op)), read.len()) {
             return Ok(group);
         }
-        budget.add(&cost, read.len());
         let whole = read.len() == chunk;
         group.extend(read);
         cursor = last;
-        if !whole || first {
+        if !whole {
             return Ok(group);
         }
     }
@@ -539,10 +536,14 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
             let first = ahead.through == i64::MIN;
             let group = read_group(store, ahead.through.max(after), is_mem, chunk_size, first)?;
             ahead.through = group.last().map_or(last, |&(n, _)| n);
+            // Only a group with a sealed field asks the agent (deletes and
+            // invalidations alone don't), so only such a seal shows it is
+            // unlocked now.
+            let asks = total(&group, |(_, op)| seal_cost(op)).iter().any(|step| step.ops > 0);
             if let Err(e) = seal_ahead(client, &mut ahead, group).await {
                 return group_failed(store, e, &chunk, is_mem, out);
             }
-            sealed_now = true;
+            sealed_now |= asks;
         }
         let (wire, reused) = match chunk_wire(client, &mut ahead, &chunk, &state).await {
             Ok(wire) => wire,

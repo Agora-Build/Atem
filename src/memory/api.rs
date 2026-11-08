@@ -237,9 +237,8 @@ fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::R
     })).collect()
 }
 
-/// What `encrypted_ops` asks the cred agent for `op`, per dependent
-/// request: a batch whose ops fit one request per step (`Budget`) is sealed
-/// in one request (memory) or two (skills: paths and hashes, then files).
+/// What `encrypted_ops` asks the cred agent for `op`, per dependent step
+/// (memory: one; skills: paths and hashes, then files), for `Planner`.
 pub(crate) fn seal_cost(op: &PendingOp) -> Steps {
     let none = Cost::default();
     match op {

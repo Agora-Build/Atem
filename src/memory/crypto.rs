@@ -307,13 +307,13 @@ pub(crate) fn too_large(steps: &Steps) -> bool {
 /// than sealing each chunk alone: packing ops in order into requests, a
 /// sequence never needs more requests than its parts packed apart.
 #[derive(Debug, Default)]
-pub(crate) struct Budget {
+struct Budget {
     steps: Steps,
     items: usize,
 }
 
 impl Budget {
-    pub(crate) fn fits(&self, chunk: &Steps, items: usize) -> bool {
+    fn fits(&self, chunk: &Steps, items: usize) -> bool {
         self.items == 0
             || (!too_large(chunk)
                 && self.items + items <= GROUP_REQUESTS * CRYPT_BATCH_OPS
@@ -323,7 +323,7 @@ impl Budget {
                 }))
     }
 
-    pub(crate) fn add(&mut self, chunk: &Steps, items: usize) {
+    fn add(&mut self, chunk: &Steps, items: usize) {
         for (used, more) in self.steps.iter_mut().zip(chunk) {
             *used += *more;
         }
@@ -331,8 +331,40 @@ impl Budget {
     }
 
     /// No chunk may join after one with an op over the agent's limit.
-    pub(crate) fn closed(&self) -> bool {
+    fn closed(&self) -> bool {
         too_large(&self.steps)
+    }
+}
+
+/// The one rule that plans a group, a relay chunk at a time (F2): the push
+/// (`sync::read_group`) and the migration (`plan_groups`) both use it. A
+/// group takes whole chunks within its `Budget`; a run's first group is its
+/// first chunk alone, so the first POST starts as soon as it is sealed (wall
+/// time first: this can cost one request more than packing it with the next
+/// chunks).
+#[derive(Debug, Default)]
+pub(crate) struct Planner {
+    budget: Budget,
+    chunks: usize,
+    one_chunk: bool,
+}
+
+impl Planner {
+    /// A group's planner; `first`: the run's first group (one chunk).
+    pub(crate) fn new(first: bool) -> Self {
+        Self { one_chunk: first, ..Self::default() }
+    }
+
+    /// Whether the next chunk (its steps and its item count) joins this
+    /// group; it is counted in when it does.
+    pub(crate) fn take(&mut self, chunk: &Steps, items: usize) -> bool {
+        let joins = self.chunks == 0
+            || (!self.one_chunk && !self.budget.closed() && self.budget.fits(chunk, items));
+        if joins {
+            self.budget.add(chunk, items);
+            self.chunks += 1;
+        }
+        joins
     }
 }
 
@@ -347,21 +379,19 @@ pub(crate) fn total<T>(items: &[T], cost: impl Fn(&T) -> Steps) -> Steps {
 }
 
 /// `items`, sent to the relay `chunk` at a time, in groups of whole chunks
-/// planned with `Budget` (F2): never more `Crypt` requests than sealing each
-/// chunk alone. The first group is the first chunk alone, so the first POST
-/// starts as soon as it is sealed (wall time first: this can cost one
-/// request more than packing the first chunk with the next ones).
+/// planned by `Planner` (F2): never more `Crypt` requests than sealing each
+/// chunk alone, and the first chunk alone.
 pub(crate) fn plan_groups<T>(items: &[T], chunk: usize, cost: impl Fn(&T) -> Steps) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
-    let (mut start, mut budget) = (0, Budget::default());
+    let (mut start, mut planner) = (0, Planner::new(true));
     for (index, part) in items.chunks(chunk.max(1)).enumerate() {
         let at = index * chunk.max(1);
         let part_cost = total(part, &cost);
-        if index == 1 || budget.closed() || !budget.fits(&part_cost, part.len()) {
+        if !planner.take(&part_cost, part.len()) {
             groups.push(start..at);
-            (start, budget) = (at, Budget::default());
+            (start, planner) = (at, Planner::new(false));
+            planner.take(&part_cost, part.len());
         }
-        budget.add(&part_cost, part.len());
     }
     if start < items.len() {
         groups.push(start..items.len());
