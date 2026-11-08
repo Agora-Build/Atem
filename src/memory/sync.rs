@@ -200,7 +200,8 @@ pub fn too_large_note(op: &PendingOp) -> String {
 /// batch queued as it was, and the next sync sends it again, as after a sync
 /// that stopped between the POST and its results. Memory ops are idempotent
 /// on the relay (add by id, delete, invalidate); a re-sent skill push is
-/// appended again as a new version.
+/// appended again as a new version. It opens that transaction itself, so it
+/// must not be called inside `Store::in_transaction` (not nestable).
 pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
     if results.len() != sent.len() {
         return Ok(vec![format!(
@@ -1514,11 +1515,15 @@ mod tests {
     /// first send did: an add of an id it has is a no-op, an add of a fact it
     /// has under another id (same scope, project, machine and content hash,
     /// still valid) is deduped onto that row (`canonical_id`), and
-    /// invalidation is final (a repeat changes nothing). Every write takes the
-    /// next seq; pulls page by seq.
+    /// invalidation is final (a repeat changes nothing). Skills as the real
+    /// relay keeps them: every push is appended as the next version of its
+    /// skill (`superseded_concurrent` when its `base_version` is behind), and
+    /// every version stays a row. Every write takes the next seq; pulls page
+    /// by seq.
     #[derive(Default)]
     struct KeepingRelay {
         rows: BTreeMap<String, Memory>,
+        skills: BTreeMap<i64, Skill>,
         next_seq: i64,
         ops_received: usize,
     }
@@ -1566,6 +1571,34 @@ mod tests {
             rows.truncate(limit);
             serde_json::json!({"memories": rows})
         }
+
+        fn latest_skill(&self, name: &str) -> Option<&Skill> {
+            self.skills.values().filter(|s| s.name == name).max_by_key(|s| s.version)
+        }
+
+        fn put_skill(&mut self, mut skill: Skill) -> i64 {
+            self.next_seq += 1;
+            skill.seq = self.next_seq;
+            self.skills.insert(skill.seq, skill);
+            self.next_seq
+        }
+
+        fn skill_op(&mut self, op: &serde_json::Value) -> serde_json::Value {
+            self.ops_received += 1;
+            assert_eq!(op["op"], "push");
+            let mut skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
+            let latest = self.latest_skill(&skill.name).map_or(0, |s| s.version);
+            skill.version = latest + 1;
+            let version = skill.version;
+            let seq = self.put_skill(skill);
+            serde_json::json!({"ok": true, "version": version, "seq": seq,
+                "superseded_concurrent": op["base_version"].as_i64().unwrap() < latest})
+        }
+
+        fn skill_page(&self, since: i64, limit: usize) -> serde_json::Value {
+            let rows: Vec<&Skill> = self.skills.range(since + 1..).map(|(_, s)| s).take(limit).collect();
+            serde_json::json!({"skills": rows})
+        }
     }
 
     fn keeping_relay(relay: Arc<Mutex<KeepingRelay>>) -> Box<Handler> {
@@ -1578,8 +1611,12 @@ mod tests {
                     let results: Vec<_> = body["ops"].as_array().unwrap().iter().map(|op| r.op(op)).collect();
                     (200, serde_json::json!({"results": results}))
                 }
+                ("POST", "/api/skills/batch") => {
+                    let results: Vec<_> = body["ops"].as_array().unwrap().iter().map(|op| r.skill_op(op)).collect();
+                    (200, serde_json::json!({"results": results}))
+                }
                 ("GET", "/api/memory") => (200, r.page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
-                ("GET", "/api/skills") => (200, serde_json::json!({"skills": []})),
+                ("GET", "/api/skills") => (200, r.skill_page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
                 _ => panic!("unexpected request {m} {p}"),
             }
         })
@@ -1589,7 +1626,9 @@ mod tests {
     /// TEMP trigger that calls `crash()`. That copies the database file and
     /// its rollback journal into `image`'s directory, as a process killed at
     /// that instant leaves them on disk, then fails the statement (the sync
-    /// gets an error and its transaction rolls back).
+    /// gets an error and its transaction rolls back). It copies the database
+    /// and `-journal` only (the store's default rollback journal): a switch to
+    /// WAL must also copy `-wal` and `-shm`.
     fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
         use rusqlite::functions::FunctionFlags;
         let (db, image) = (db.to_path_buf(), image.to_path_buf());
@@ -1721,6 +1760,122 @@ mod tests {
         assert_eq!(s.history_memories().unwrap().len(), total);
         for row in r.rows.values() {
             assert_eq!(s.get_memory(&row.id).unwrap().as_ref(), Some(row), "{}", row.id);
+        }
+    }
+
+    fn skill_v1(name: &str, body: &str, machine: &str) -> Skill {
+        let mut files = BTreeMap::new();
+        files.insert("SKILL.md".to_string(), body.as_bytes().to_vec());
+        Skill {
+            scope: Scope::Global, project: String::new(), name: name.into(), version: 1,
+            content_hash: skill_hash(&files), files, source_agent: "cli".into(), source_machine: machine.into(),
+            created_at: 1, deleted: false, seq: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_crash_while_skill_push_results_are_applied_leaves_every_skill_op_queued() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        relay.lock().unwrap().put_skill(skill_v1("beta", "# beta from m2", "m2")); // another machine pushed beta first
+        let s = Store::open(&db).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            let skill = skill_v1(name, &format!("# {name}"), "m1");
+            s.put_skill(&skill).unwrap();
+            s.enqueue(&PendingOp::PushSkill { skill, base_version: 0 }).unwrap();
+        }
+        let queued = s.pending().unwrap();
+        let skills_before = s.all_skills().unwrap();
+        // At op 2's ack: op 1 was acked, op 2's result applied (beta moved to the relay's v2).
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_skill_batch BEFORE DELETE ON pending_ops WHEN old.n = {} BEGIN SELECT crash(); END;", queued[1].0));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        assert_eq!(relay.lock().unwrap().ops_received, 3); // the relay applied the batch
+        drop(s);
+
+        // As the crash left the disk, and after the error's rollback: no
+        // skill op acked, none of the batch's results applied.
+        let as_before = |s: &Store| {
+            assert_eq!(s.pending().unwrap(), queued);
+            assert_eq!(s.all_skills().unwrap(), skills_before);
+            assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), 0);
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        as_before(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        as_before(&s);
+
+        // The next sync sends the batch again and completes. The relay
+        // appends every push as a new version (designs/atem-memory.md), so the
+        // re-sent pushes are new versions, each flagged concurrent.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(!out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pushed, 3);
+        assert_eq!(out.notes.len(), 3, "{:?}", out.notes);
+        assert!(out.notes.iter().all(|n| n.contains("another machine pushed an edit at the same time")), "{:?}", out.notes);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        assert!(s.get_state(LAST_SYNC_AT).unwrap() > 0);
+        let r = relay.lock().unwrap();
+        assert_eq!(r.ops_received, 6);
+        let versions = |name: &str| r.skills.values().filter(|k| k.name == name).map(|k| k.version).collect::<Vec<_>>();
+        assert_eq!((versions("alpha"), versions("beta"), versions("gamma")), (vec![1, 2], vec![1, 2, 3], vec![1, 2]));
+        // This store holds each skill's latest relay version exactly.
+        assert_eq!(s.all_skills().unwrap().len(), 3);
+        for name in ["alpha", "beta", "gamma"] {
+            assert_eq!(s.get_skill(Scope::Global, "", name).unwrap().as_ref(), r.latest_skill(name), "{name}");
+        }
+        assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), r.next_seq);
+    }
+
+    #[tokio::test]
+    async fn a_crash_inside_a_pulled_skill_page_keeps_the_skill_cursor_at_the_last_whole_page() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let page = PULL_LIMIT as usize;
+        let total = 2 * page + 50;
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        {
+            let mut r = relay.lock().unwrap();
+            for i in 1..=total {
+                r.put_skill(skill_v1(&format!("skill{i:03}"), &format!("# skill {i}"), "m2"));
+            }
+        }
+        let s = Store::open(&db).unwrap();
+        // Half way through the second skill page.
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_skill_page BEFORE INSERT ON skills WHEN new.name = 'skill{:03}' BEGIN SELECT crash(); END;", page + page / 2));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        drop(s);
+
+        // The first skill page whole, with its cursor; nothing of the second.
+        let first_page_only = |s: &Store| {
+            let cursor = s.get_state(&skill_cursor_key("ast-a")).unwrap();
+            assert_eq!(cursor, page as i64);
+            let skills = s.all_skills().unwrap();
+            assert_eq!(skills.len(), page);
+            assert!(skills.iter().all(|k| k.seq <= cursor));
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        first_page_only(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        first_page_only(&s);
+
+        // The next sync pulls the second page again, whole, and the rest.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pulled, total - page);
+        assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), total as i64);
+        let r = relay.lock().unwrap();
+        assert_eq!(s.all_skills().unwrap().len(), total);
+        for row in r.skills.values() {
+            assert_eq!(s.get_skill(row.scope, &row.project, &row.name).unwrap().as_ref(), Some(row), "{}", row.name);
         }
     }
 
