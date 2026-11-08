@@ -1258,6 +1258,84 @@ mod tests {
         }
     }
 
+    /// The requests `plan_groups` and `run` take for `items` sent `chunk` at a
+    /// time (each item's ops per step, by wire size), and the groups.
+    fn planned_requests(items: &[[Vec<usize>; 3]], chunk: usize) -> (usize, usize) {
+        let cost = |item: &[Vec<usize>; 3]| item.clone().map(|ops| ops.iter().fold(Cost::default(), |sum, &bytes| sum + Cost::one(bytes)));
+        let groups = plan_groups(items, chunk, cost);
+        let requests = groups.iter()
+            .map(|g| (0..3).map(|step| requests(&items[g.clone()].iter().flat_map(|item| item[step].clone()).collect::<Vec<_>>())).sum::<usize>())
+            .sum();
+        (requests, groups.len())
+    }
+
+    /// The bound designs/e2e-encryption.md "Performance" states for a push or
+    /// a rewrite of small ops (each at most 2 KiB on the wire, so only the
+    /// 1,024-op limit splits a request). With `ops` `Crypt` ops, `groups`
+    /// planned groups and `steps` dependent steps: at most
+    /// ⌈ops / 1,024⌉ + steps × groups − 1 requests (each group's last request
+    /// per step may be partly filled). With one step and an op in every item
+    /// (a push of facts): at most ⌈ops / 1,024⌉ + 1 + ⌈(groups − 2) × (k − 1)
+    /// / 1,024⌉, `k` the most ops one chunk carries (a group ends only when
+    /// the next chunk would pass 4,096 ops, so it leaves fewer than `k`
+    /// unused). And the examples the design names.
+    #[test]
+    fn planned_requests_stay_within_the_documented_bound() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for round in 0..60 {
+            let chunk = [8usize, 50, 64][round % 3];
+            let one_step = round % 2 == 0;
+            let count = 500 + next(30_000) as usize;
+            let items: Vec<[Vec<usize>; 3]> = (0..count)
+                .map(|_| {
+                    let counts = if one_step {
+                        // A fact: 1 to 3 ops in one step.
+                        [1 + next(3), 0, 0]
+                    } else if next(4) == 0 {
+                        // A delete or an invalidation: no op at all.
+                        [0, 0, 0]
+                    } else {
+                        // A skill or a rewritten row: 0 to 3 ops in each step.
+                        [next(4), next(4), next(4)]
+                    };
+                    // Each op 100 to 1,999 bytes on the wire.
+                    counts.map(|n| (0..n).map(|_| 100 + next(1_900) as usize).collect())
+                })
+                .collect();
+            let ops: usize = items.iter().flatten().map(Vec::len).sum();
+            let (planned, groups) = planned_requests(&items, chunk);
+            let steps = if one_step { 1 } else { 3 };
+            assert!(planned < ops.div_ceil(CRYPT_BATCH_OPS) + steps * groups, "round {round}: {planned} requests, {ops} ops, {groups} groups");
+            if one_step {
+                let k = items.chunks(chunk).map(|part| part.iter().map(|item| item[0].len()).sum::<usize>()).max().unwrap();
+                let extra = (groups.saturating_sub(2) * (k - 1)).div_ceil(CRYPT_BATCH_OPS);
+                assert!(planned <= ops.div_ceil(CRYPT_BATCH_OPS) + 1 + extra, "round {round}: {planned} > {} + 1 + {extra}", ops.div_ceil(CRYPT_BATCH_OPS));
+                // So the groups: the first chunk, then groups of more than
+                // 4,096 − k ops each but the last.
+                let planned_groups = plan_groups(&items, chunk, |item| [total(&item[0], |&bytes| [Cost::one(bytes), Cost::default(), Cost::default()])[0], Cost::default(), Cost::default()]);
+                assert_eq!(planned_groups[0], 0..chunk.min(items.len()));
+                for group in planned_groups.iter().skip(1).rev().skip(1) {
+                    let group_ops: usize = items[group.clone()].iter().map(|item| item[0].len()).sum();
+                    assert!(group_ops > GROUP_REQUESTS * CRYPT_BATCH_OPS - k, "round {round}: a group of {group_ops} ops");
+                }
+            }
+        }
+        // Uniform facts of two or three ops, 50 per relay chunk: "1 per 1,024
+        // ops plus one for the first chunk" holds up to 4,562 and 5,791
+        // facts, then takes a request more now and then.
+        let facts = |count: usize, ops: usize| planned_requests(&vec![[vec![200; ops], Vec::new(), Vec::new()]; count], 50).0;
+        let wording = |count: usize, ops: usize| (count * ops).div_ceil(CRYPT_BATCH_OPS) + 1;
+        for (count, ops, over) in [(4_562, 2, 0), (4_563, 2, 1), (5_791, 3, 0), (5_792, 3, 1), (30_000, 3, 1), (100_000, 3, 4), (100_000, 2, 4)] {
+            assert_eq!(facts(count, ops), wording(count, ops) + over, "{count} facts of {ops} ops");
+        }
+    }
+
     /// Records each `Crypt` request's op count and bytes.
     struct Sizes {
         inner: Arc<std::sync::Mutex<crate::memory::cred_agent::CredAgent>>,
