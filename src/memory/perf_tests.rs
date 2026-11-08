@@ -2484,11 +2484,11 @@ fn perf_6_ciphertext_sizes() {
 
 // ───────────────────────── a check found while reading ─────────────────────────
 
-/// A project-scoped fact from a project this device never hashed fails the
-/// whole pulled page (UNKNOWN_PROJECT), so the cursor never moves.
+/// A project-scoped fact from a project this device never hashed used to fail
+/// the whole pulled page; since #132 it is kept under its hash, unresolved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn perf_x_an_unknown_project_hash_stops_the_pull() {
+async fn perf_x_an_unknown_project_hash_no_longer_stops_the_pull() {
     let relay = Relay::start();
     let dir = tempfile::tempdir().unwrap();
     let mut device = UnlockedDevice::new(dir.path());
@@ -2516,9 +2516,10 @@ async fn perf_x_an_unknown_project_hash_stops_the_pull() {
         .wire_project("github.com/agora/atem")
         .unwrap();
     let knowledge = relay.knowledge(&device.paths, device.agent.clone() as Arc<dyn CredAgentApi>);
-    let error = knowledge.pull_memories(0).await.unwrap_err().to_string();
-    println!("\npull of 10 facts with one from an unknown project: {error}");
-    assert!(error.contains("unknown on this Atem"));
+    let pulled = knowledge.pull_memories(0).await.unwrap();
+    let unresolved = pulled.iter().filter(|m| crate::memory::model::is_unresolved_project(&m.project)).count();
+    println!("\npull of 10 facts with one from an unknown project: {} pulled, {unresolved} unresolved", pulled.len());
+    assert_eq!((pulled.len(), unresolved), (10, 1));
 }
 
 // ───────────────────────── 1d. Where a large field's time goes ─────────────────────────

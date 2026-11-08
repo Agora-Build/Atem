@@ -400,17 +400,21 @@ fn group_failed(store: &Store, e: ApiError, sent: &[(i64, PendingOp)], is_mem: b
 }
 
 /// One push group's ops sealed ahead of their POST (F2), by queue `n`: each
-/// with the op as it was read and the state its group was sealed under.
+/// with the op as it was sealed (as read, with a project hash named since put
+/// under its name: `seal_ops`) and the state its group was sealed under.
 struct ReadAhead {
     sealed: BTreeMap<i64, (PendingOp, Value, Arc<SealState>)>,
     /// The last queue `n` a group was read through.
     through: i64,
 }
 
-/// Whether an op sealed ahead may be sent as sealed: the queued op is still
-/// exactly the op that was sealed (an earlier chunk's results, or another
-/// writer, may have changed it), under the same state (mode, key, data
-/// account).
+/// Whether an op sealed ahead may be sent as sealed: the queued op, as it
+/// would be sealed now (`KnowledgeClient::seal_state`), is still exactly the
+/// op that was sealed, under the same state (mode, key, data account). An
+/// earlier chunk's results or another writer may have changed the op, and a
+/// project pulled as a hash may have been named since (resolution, or this
+/// Atem hashing that project): either counts as a change, so the op is
+/// sealed again, never sent under the hash it was sealed with.
 fn reusable(sealed: &PendingOp, sealed_under: &SealState, op: &PendingOp, state: &SealState) -> bool {
     sealed == op && sealed_under == state
 }
@@ -427,10 +431,11 @@ impl ReadAhead {
         }
     }
 
-    /// The sealed wire of each op of `chunk` that is `reusable`; `None` for
-    /// the others (rewritten, sealed under another state, or never read
-    /// ahead). Forgets every entry up to the chunk's last op: sent now, or
-    /// gone from the queue (acked or removed meanwhile).
+    /// The sealed wire of each op of `chunk` (each op as it would be sealed
+    /// now) that is `reusable`; `None` for the others (rewritten or named
+    /// since, sealed under another state, or never read ahead). Forgets every
+    /// entry up to the chunk's last op: sent now, or gone from the queue
+    /// (acked or removed meanwhile).
     fn take(&mut self, chunk: &[(i64, PendingOp)], state: &SealState) -> Vec<Option<Value>> {
         let wire = chunk.iter()
             .map(|(n, op)| match self.sealed.remove(n) {
@@ -495,8 +500,9 @@ async fn seal_ahead(client: &KnowledgeClient, ahead: &mut ReadAhead, group: Vec<
     Ok(asked)
 }
 
-/// The wire form of every op of `chunk` (as sealed ahead where `reusable`,
-/// the others sealed now, together), and whether its POST must first check
+/// The wire form of every op of `chunk` (each op as it would be sealed now:
+/// `KnowledgeClient::seal_state`; as sealed ahead where `reusable`, the
+/// others sealed now, together), and whether its POST must first check
 /// that the cred agent is still unlocked: some op goes out as sealed by an
 /// earlier `Crypt` request (`sealed_by_agent`), and no `Crypt` request since
 /// (`asked`: a group sealed in this pass, or this chunk's ops sealed again
@@ -552,8 +558,11 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
         }
         let chunk = store.pending_after(after, is_mem, chunk_size)?;
         let Some(&(last, _)) = chunk.last() else { return Ok(()) };
-        let state = match client.seal_state() {
-            Ok(state) => state,
+        // The state ops are sealed under now, and the chunk's ops as they
+        // would be sealed now (a project hash named since under its name):
+        // what an op sealed ahead must still be to go out as sealed.
+        let (state, named) = match client.seal_state(chunk.iter().map(|(_, op)| op.clone()).collect()) {
+            Ok((state, named)) => (state, chunk.iter().map(|&(n, _)| n).zip(named).collect::<Vec<_>>()),
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
         };
         // The first group, or the read-ahead fell behind: seal from here.
@@ -569,7 +578,7 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                 Err(e) => return group_failed(store, e, &chunk, is_mem, out),
             }
         }
-        let (wire, unchecked) = match chunk_wire(client, &mut ahead, &chunk, &state, asked).await {
+        let (wire, unchecked) = match chunk_wire(client, &mut ahead, &named, &state, asked).await {
             Ok(wire) => wire,
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
         };
@@ -601,15 +610,15 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(ApiError::Http(413, _)) if chunk.len() > 1 => {
-                for ((n, sent), sealed) in chunk.iter().zip(&wire) {
+                for ((n, sent), sealed) in named.iter().zip(&wire) {
                     // Re-read by `n`: an earlier single op may have rewritten it.
                     let Some(op) = store.pending_op(*n)? else { continue };
                     let one = [(*n, op)];
-                    let single = match client.seal_state() {
+                    let single = match client.seal_state(vec![one[0].1.clone()]) {
                         // Sealed before the chunk's POST: an op the agent
                         // sealed waits for the unlocked check, so a lock
                         // while the chunk was in flight stops it.
-                        Ok(now) if reusable(sent, &state, &one[0].1, &now) => {
+                        Ok((now, renamed)) if reusable(sent, &state, &renamed[0], &now) => {
                             let checked = if sealed_by_agent(sent, &state) { client.confirm_unlocked().await } else { Ok(()) };
                             checked.map(|()| vec![sealed.clone()])
                         }
@@ -835,6 +844,27 @@ where
     }
 }
 
+/// Names the projects of rows pulled as hashes this Atem had no name for
+/// (`model::is_unresolved_project`), once it has one: recorded since in
+/// project_names.json, or learned now (the checkout this sync runs in, and
+/// after a rotation the projects it already knows). Skills under a hash it
+/// can never name are dropped (see `Store::resolve_projects`). Rows it
+/// still can't name stay unresolved: kept, listed, never applied.
+///
+/// Runs once the pull is over (`pull_all` returns after its last page
+/// committed, the pages fetched or opened beyond it discarded), never inside
+/// a page's transaction: the agent's work comes first, then one transaction
+/// of its own.
+async fn resolve_projects(store: &Store, client: &KnowledgeClient, ctx: &Ctx) -> Result<()> {
+    let hashes = store.unresolved_projects()?;
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let current = ctx.repo.as_ref().map(|repo| repo.key.clone());
+    let naming = client.learn_project_names(hashes, current).await?;
+    store.resolve_projects(&naming.named, &naming.stale)
+}
+
 /// `client = None` means offline: harvest and apply still run locally.
 pub async fn run_sync(store: &Store, client: Option<&KnowledgeClient>, ctx: &Ctx, opts: &SyncOptions) -> Result<SyncOutcome> {
     let mut out = SyncOutcome::default();
@@ -849,6 +879,10 @@ pub async fn run_sync(store: &Store, client: Option<&KnowledgeClient>, ctx: &Ctx
             push_all(store, c, &mut out).await?;
             if !out.offline {
                 pull_all(store, c, &mut out).await?;
+            }
+            // A failure only leaves those rows unresolved.
+            if let Err(e) = resolve_projects(store, c, ctx).await {
+                out.note(format!("rows of projects this machine doesn't know yet stay unapplied: {:#}", e));
             }
             // Only a sync where push and pull both finished cleanly counts.
             if !out.offline && !out.relay_error {

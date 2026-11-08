@@ -1083,7 +1083,15 @@ doesn't cover it; it is covered by encryption becoming the only mode.
   "Anti-rollback check on pulled rows".
 - **Project keys** would reveal repo names. `HMAC-SHA256(K, key)` keeps
   per-project filtering working; atem keeps the hash → name mapping
-  locally.
+  locally. A pulled memory or skill whose hash has no name on this device
+  (a project it never used) doesn't fail the page: it is kept unresolved
+  under the hash, never applied, resolved once the device has the name
+  (after a rotation, the device hashes the projects it knows under the new
+  key), and pushed back with the same hash unless the device has named it
+  since; skills under another key's hash, or under any hash while off, are
+  dropped, since the migration delivers them again (designs/atem-memory.md
+  "Projects not known here yet"). A malformed `h1.` value or a non-`h1.`
+  project while on still fails it, and migration still needs every name.
 - **`content_hash`** is what the relay dedupes on. A plain SHA-256 of a
   short fact can be guessed; a keyed HMAC can't.
 - The local `knowledge.db` stays plain text (mode 0600), so search and
@@ -1546,23 +1554,21 @@ and after each, in the task that built it):
 | F7 | Faster cold autostart: poll a started agent after short pauses that grow to the old 100 ms (`START_POLLS_MS`), within the same 10 s | built | first contact 101 to 16 ms (Task 5) |
 | F8 | Skill files without double base64: carry a sealed file's `e1.` text as a JSON string (a wire change with the relay) | approved; waits for Astation (#130) | (estimate) skill transfer 1.78x to 1.33x raw |
 
-**Known bug: a pulled fact with an unknown project stops Memory sync (current
-behaviour).** A project-scoped fact whose `h1.` project hash this device has
-never computed (a repo it never opened) makes `decrypt_memories` fail the whole
-200-row page (`crypto.rs:703-707`, "encrypted project name is unknown on this
-Atem; sync from a device that used it first"). `pull_pages` then returns
-`Ok(false)` without moving the cursor (`sync.rs:813-818`), and `pull_all`
-skips the skills pull (`sync.rs:663`), so every later sync fails on the same
-page. The performance test `perf_x_an_unknown_project_hash_stops_the_pull`
-reproduces it. With encryption the only mode, one fact from a repo this
-machine never opened blocks Memory sync for that device. The skill path
-checks its project the same way (`decrypt_skills`, `crypto.rs:822-826`; not
-tested). This is an availability bug, not a speed one.
-**Planned (owner decision 2026-11-08), not implemented:** the pull keeps the
-row, marks its project unresolved, never injects it (like a held row, see
-"Quarantine of relay-sourced content at the migration"), shows it in explicit
-reads as unresolved, and moves the cursor on. It resolves when the device
-learns the project name.
+**Fixed (#132): a pulled fact with an unknown project no longer stops Memory
+sync.** A project-scoped fact or skill whose `h1.` project hash this device has
+never computed used to fail its whole pulled page, so the cursor never moved
+and every later sync failed on that page. It is now kept under its hash,
+unresolved: never injected or installed, shown in explicit reads as
+`project:(not known here yet)`, and the cursor moves on. It resolves when the
+device learns the project name ("Projects not known here yet" in
+[atem-memory.md](atem-memory.md)). The performance test
+`perf_x_an_unknown_project_hash_no_longer_stops_the_pull` checks it. In the
+overlapped pull (F2) the rule applies as each page is opened: an unresolved
+row is committed with its page and the page's cursor, like any other row,
+and the resolve step runs once the pull's last page has committed, outside
+any page's transaction. A push compares an op sealed ahead as it would be
+sealed now, its project hash named since or not, so an op whose hash was
+named after it was sealed is sealed again, never sent under that hash.
 
 ## Credentials (`atem cred`)
 

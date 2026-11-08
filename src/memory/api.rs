@@ -10,7 +10,7 @@ use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::store::PendingOp;
 use crate::memory::crypto::{
     memory_open_cost, memory_seal_cost, plan_groups, project_hash_cost, skill_open_cost, skill_seal_cost, Cost,
-    EncryptionContext, EncryptionMode, Steps,
+    EncryptionContext, EncryptionMode, ProjectNaming, Steps,
 };
 
 pub const PULL_LIMIT: u32 = 200;
@@ -205,8 +205,24 @@ pub struct KnowledgeClient {
     encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 }
 
-/// The wire form of `ops`, encrypted when the account is: every memory,
-/// skill and project hash of the batch in a few cred-agent round trips.
+/// `ops` with every project pulled as a hash this Atem has named since put
+/// back under its name (`EncryptionContext::name_hashes`): a replacement
+/// queued while its fact was unresolved goes out like any other once the
+/// name is known, never with a stale hash. What `seal_ops` seals, and what
+/// an op sealed ahead is compared with before its POST (`seal_state`).
+fn named_ops(encryption: &EncryptionContext, mut ops: Vec<PendingOp>) -> anyhow::Result<Vec<PendingOp>> {
+    encryption.name_hashes(ops.iter_mut().filter_map(|op| match op {
+        PendingOp::AddMemory { memory } => Some(&mut memory.project),
+        PendingOp::PushSkill { skill, .. } => Some(&mut skill.project),
+        PendingOp::DeleteSkill { project, .. } | PendingOp::PurgeSkill { project, .. } => Some(project),
+        PendingOp::DeleteMemory { .. } | PendingOp::InvalidateMemory { .. } => None,
+    }))?;
+    Ok(ops)
+}
+
+/// The wire form of `ops` (as `named_ops` made them), encrypted when the
+/// account is: every memory, skill and project hash of the batch in a few
+/// cred-agent round trips.
 fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<Value>> {
     if !encryption.should_encrypt() {
         return Ok(ops.iter().map(op_to_wire).collect());
@@ -238,7 +254,10 @@ fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::R
 }
 
 /// What `encrypted_ops` asks the cred agent for `op`, per dependent step
-/// (memory: one; skills: paths and hashes, then files), for `Planner`.
+/// (memory: one; skills: paths and hashes, then files), for `Planner`. A
+/// project this Atem can't name costs nothing (it goes out as it came);
+/// `Planner` prices ops as queued, so one named since (`named_ops`) costs a
+/// keyed hash more when sealed: an estimate, never a result (`Cost`).
 pub(crate) fn seal_cost(op: &PendingOp) -> Steps {
     let none = Cost::default();
     match op {
@@ -339,18 +358,26 @@ impl KnowledgeClient {
             .map_err(ApiError::from)
     }
 
-    /// The state ops sealed now would be sealed under.
-    pub fn seal_state(&self) -> Result<SealState, ApiError> {
-        Ok(SealState::of(&self.encryption()?))
+    /// The state ops sealed now would be sealed under, and `ops` as they
+    /// would be sealed now (`named_ops`; project_names.json is read only
+    /// when some op has a project pulled as a hash). An op sealed earlier
+    /// goes out as sealed only while both are unchanged (`sync::reusable`).
+    pub fn seal_state(&self, ops: Vec<PendingOp>) -> Result<(SealState, Vec<PendingOp>), ApiError> {
+        let encryption = self.encryption()?;
+        let named = named_ops(&encryption, ops)?;
+        Ok((SealState::of(&encryption), named))
     }
 
     /// `ops` in their wire form, sealed while the account is encrypted, and
-    /// the state they were sealed under. Ops planned with `seal_cost` to fit
-    /// one batch are one `Crypt` request per step.
+    /// the state they were sealed under; each wire beside the op it was
+    /// sealed from (`named_ops`: a project hash named since under its name).
+    /// Ops planned with `seal_cost` to fit one batch are one `Crypt` request
+    /// per step.
     pub async fn seal_ops(&self, ops: Vec<PendingOp>) -> Result<(SealState, Vec<(PendingOp, Value)>), ApiError> {
         let encryption = self.encryption()?;
         let state = SealState::of(&encryption);
         let sealed = encryption.blocking(move |encryption| {
+            let ops = named_ops(encryption, ops)?;
             let wire = encrypted_ops(encryption, &ops)?;
             Ok(ops.into_iter().zip(wire).collect::<Vec<_>>())
         }).await?;
@@ -396,10 +423,12 @@ impl KnowledgeClient {
         Ok(page.memories)
     }
 
-    /// Fetched memory rows opened: plain text is refused while encryption is on.
+    /// A pulled page's memory rows opened (`decrypt_pulled_memories`):
+    /// plain text is refused while encryption is on, and a well-formed
+    /// project hash this Atem can't name stays as it is (unresolved).
     pub async fn open_memories(&self, rows: Vec<Memory>) -> Result<Vec<Memory>, ApiError> {
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_memories(rows)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_memories(rows)).await.map_err(ApiError::from)
     }
 
     #[cfg(test)]
@@ -415,16 +444,25 @@ impl KnowledgeClient {
         Ok(page.skills)
     }
 
-    /// Fetched skill rows opened: plain text is refused while encryption is on.
+    /// A pulled page's skill rows opened (`decrypt_pulled_skills`): as
+    /// `open_memories`.
     pub async fn open_skills(&self, rows: Vec<Skill>) -> Result<Vec<Skill>, ApiError> {
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_skills(rows)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_skills(rows)).await.map_err(ApiError::from)
     }
 
     #[cfg(test)]
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let rows = self.fetch_skills(since).await?;
         self.open_skills(rows).await
+    }
+
+    /// Names what it can of the pulled project hashes `hashes`, hashing and
+    /// recording `current` (the checkout a sync runs in) and the projects it
+    /// knows first. See `EncryptionContext::learn_project_names`.
+    pub async fn learn_project_names(&self, hashes: Vec<String>, current: Option<String>) -> Result<ProjectNaming, ApiError> {
+        let encryption = self.encryption()?;
+        encryption.blocking(move |encryption| encryption.learn_project_names(&hashes, current.as_deref())).await.map_err(ApiError::from)
     }
 
     /// A skill's history, newest first (no files).

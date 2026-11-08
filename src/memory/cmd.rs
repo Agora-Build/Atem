@@ -688,10 +688,22 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             println!("Astation:   {}", astation_status_line(&astation_id));
             println!("Machine:    {}", ctx.atem_id);
             println!("Project:    {}", ctx.repo.as_ref().map(|r| r.label.as_str()).unwrap_or("(not in a git repo)"));
-            let valid = store.live_memories()?.len();
+            let live = store.live_memories()?;
+            let valid = live.len();
             let outdated = store.history_memories()?.len() - valid;
+            let skills = store.live_skills()?;
             println!("Memories:   {} valid, {} outdated (kept as history)", valid, outdated);
-            println!("Skills:     {} live", store.live_skills()?.len());
+            println!("Skills:     {} live", skills.len());
+            let unknown = (
+                live.iter().filter(|m| m.has_unresolved_project()).count(),
+                skills.iter().filter(|s| s.has_unresolved_project()).count(),
+            );
+            if unknown != (0, 0) {
+                println!(
+                    "Not known:  {} memories, {} skills of projects this machine doesn't know yet (kept, not applied; `atem sync` in a project's checkout applies its own)",
+                    unknown.0, unknown.1
+                );
+            }
             println!("Pending:    {} change(s) waiting to sync", store.pending_count()?);
             println!("Last sync:  {}", if last == 0 { "never".to_string() } else { format!("{}s ago", now_secs() - last) });
             println!("Held back:  {} harvested memory file(s) (possible credentials)", store.held_back_count()?);

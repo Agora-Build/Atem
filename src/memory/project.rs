@@ -44,8 +44,17 @@ pub fn remote_label(url: &str) -> Option<String> {
     atem_client::project::remote_label(url)
 }
 
-/// Short name for display: the last path segment (`atem`, `scratch`).
+/// What listings show for a project this Atem can't name yet (an `h1.`
+/// hash pulled from the relay; `model::is_unresolved_project`), also from
+/// inside its checkout until a sync runs there.
+pub const UNRESOLVED_PROJECT: &str = "(not known here yet)";
+
+/// Short name for display: the last path segment (`atem`, `scratch`), or
+/// `UNRESOLVED_PROJECT`.
 pub fn display_name(key: &str) -> &str {
+    if crate::memory::model::is_unresolved_project(key) {
+        return UNRESOLVED_PROJECT;
+    }
     key.rsplit('/').next().unwrap_or(key).trim_start_matches("local:")
 }
 
@@ -119,6 +128,7 @@ mod tests {
     fn display_name_is_last_segment() {
         assert_eq!(display_name("github.com/agora-build/atem"), "atem");
         assert_eq!(display_name("local:scratch"), "scratch");
+        assert_eq!(display_name("h1.0123abcd.abababababababababababababababababababababababababababababababab"), "(not known here yet)");
     }
 
     #[test]
