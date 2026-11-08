@@ -236,6 +236,143 @@ pub(crate) const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 
+/// What a batch adds to one `Crypt` request: its ops, and their bytes as
+/// `run` counts them (`CryptOp::wire_len`). For planning batches only: `run`
+/// splits at the limits itself, so a wrong estimate costs a request, never
+/// a result.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cost {
+    pub ops: usize,
+    pub bytes: usize,
+}
+
+impl Cost {
+    fn seal(record: &str, field: usize, plain: usize) -> Self {
+        if plain == 0 { return Self::default(); }
+        Self { ops: 1, bytes: CryptOp::seal_wire_len(record.len(), field, plain) }
+    }
+
+    fn open(record: &str, field: usize, value: usize) -> Self {
+        if value == 0 { return Self::default(); }
+        Self { ops: 1, bytes: CryptOp::open_wire_len(record.len(), field, value) }
+    }
+
+    fn hash(value: usize) -> Self {
+        Self { ops: 1, bytes: CryptOp::keyed_hash_wire_len(value) }
+    }
+}
+
+impl std::ops::Add for Cost {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self { ops: self.ops + other.ops, bytes: self.bytes + other.bytes }
+    }
+}
+
+impl std::ops::AddAssign for Cost {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
+    }
+}
+
+/// An item's cost in each dependent `Crypt` request of its batch, in order:
+/// opening, then sealing (paths and hashes), then a skill's files (sealed
+/// under their sealed paths, so after the paths).
+pub(crate) type Steps = [Cost; 3];
+
+/// Items gathered into one batch while each step still fits one `Crypt`
+/// request (`CRYPT_BATCH_OPS` ops, `CRYPT_BATCH_BYTES`), at most
+/// `CRYPT_BATCH_OPS` items (an op with no sealed field costs nothing). The
+/// first item always fits: a bigger one is split by `run`.
+#[derive(Debug, Default)]
+pub(crate) struct Budget {
+    steps: Steps,
+    items: usize,
+}
+
+impl Budget {
+    pub(crate) fn fits(&self, item: &Steps) -> bool {
+        self.items == 0
+            || (self.items < CRYPT_BATCH_OPS
+                && self.steps.iter().zip(item).all(|(used, more)| {
+                    used.ops + more.ops <= CRYPT_BATCH_OPS && used.bytes + more.bytes <= CRYPT_BATCH_BYTES
+                }))
+    }
+
+    pub(crate) fn add(&mut self, item: &Steps) {
+        for (used, more) in self.steps.iter_mut().zip(item) {
+            *used += *more;
+        }
+        self.items += 1;
+    }
+}
+
+/// `items` in consecutive batches that each fit one `Crypt` request per
+/// step: as few requests as the agent's limits allow, whatever the relay's
+/// chunk size (designs/e2e-encryption.md "Performance", F2).
+pub(crate) fn plan_groups<T>(items: &[T], cost: impl Fn(&T) -> Steps) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let (mut start, mut budget) = (0, Budget::default());
+    for (index, item) in items.iter().enumerate() {
+        let item = cost(item);
+        if !budget.fits(&item) {
+            groups.push(start..index);
+            (start, budget) = (index, Budget::default());
+        }
+        budget.add(&item);
+    }
+    if start < items.len() {
+        groups.push(start..items.len());
+    }
+    groups
+}
+
+/// What `encrypt_memories` asks the agent for `memory`.
+pub(crate) fn memory_seal_cost(memory: &Memory) -> Cost {
+    let mut cost = Cost::default();
+    if !memory.project.is_empty() { cost += Cost::hash(memory.project.len()); }
+    if !memory.content.is_empty() {
+        cost += Cost::hash(memory.content.len()) + Cost::seal(&memory.id, "content".len(), memory.content.len());
+    }
+    cost
+}
+
+/// What `decrypt_memories` asks the agent for `memory`.
+pub(crate) fn memory_open_cost(memory: &Memory) -> Cost {
+    if !memory.content.starts_with("e1.") { return Cost::default(); }
+    Cost::open(&memory.id, "content".len(), memory.content.len())
+}
+
+/// A skill's content hash: hex SHA-256 (`skill_hash`).
+const SKILL_HASH_LEN: usize = 64;
+
+/// What `encrypt_skills` asks the agent for `skill`, in its two requests:
+/// paths and hashes, then the files.
+pub(crate) fn skill_seal_cost(skill: &Skill) -> [Cost; 2] {
+    let record = skill_record(skill);
+    let mut first = Cost::hash(SKILL_HASH_LEN) + project_hash_cost(&skill.project);
+    let mut files = Cost::default();
+    for (path, bytes) in &skill.files {
+        first += Cost::seal(&record, "path".len(), path.len());
+        files += Cost::seal(&record, "file:".len() + crate::memory::account_keys::sealed_len(path.len()), bytes.len());
+    }
+    [first, files]
+}
+
+/// What `decrypt_skills` asks the agent for `skill`.
+pub(crate) fn skill_open_cost(skill: &Skill) -> Cost {
+    if !skill.files.keys().any(|path| path.starts_with("e1.")) { return Cost::default(); }
+    let record = skill_record(skill);
+    skill.files.iter()
+        .map(|(path, bytes)| Cost::open(&record, "path".len(), path.len()) + Cost::open(&record, "file:".len() + path.len(), bytes.len()))
+        .fold(Cost::default(), |sum, cost| sum + cost)
+}
+
+/// What `wire_projects` asks the agent for `project`.
+pub(crate) fn project_hash_cost(project: &str) -> Cost {
+    if project.is_empty() { Cost::default() } else { Cost::hash(project.len()) }
+}
+
 /// One Astation's encryption mode, and a handle on the cred agent, which
 /// holds `K` and does every seal, open and keyed hash: this process never
 /// sees `K`. Mode and kid come from the latest signed account state; off
@@ -507,7 +644,14 @@ impl EncryptionContext {
     /// Two batches: every file path with the project and content hashes,
     /// then every file's bytes bound to its encrypted path.
     pub fn encrypt_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
-        if !self.should_encrypt() { return Ok(skills); }
+        Ok(self.encrypt_skills_with_projects(skills, &[])?.0)
+    }
+
+    /// `encrypt_skills`, and `projects` as `wire_projects` makes them, with
+    /// their hashes in the skills' first batch: a push of skills with their
+    /// deletes and purges is two agent requests, not three.
+    pub fn encrypt_skills_with_projects(&self, skills: Vec<Skill>, projects: &[String]) -> Result<(Vec<Skill>, Vec<String>)> {
+        if !self.should_encrypt() { return Ok((skills, self.wire_projects(projects)?)); }
         let mut ops = Vec::new();
         for skill in &skills {
             let record = skill_record(skill);
@@ -517,6 +661,7 @@ impl EncryptionContext {
             if !skill.project.is_empty() { ops.push(CryptOp::keyed_hash(skill.project.as_bytes())); }
             ops.push(CryptOp::keyed_hash(skill_hash(&skill.files).as_bytes()));
         }
+        ops.extend(projects.iter().filter(|project| !project.is_empty()).map(|project| CryptOp::keyed_hash(project.as_bytes())));
         let mut results = self.run(ops)?.into_iter();
         let mut names = Vec::new();
         let mut staged = Vec::with_capacity(skills.len());
@@ -534,6 +679,14 @@ impl EncryptionContext {
             let hash = next_text(&mut results)?;
             staged.push((skill, paths, project, hash));
         }
+        let wire = projects.iter()
+            .map(|project| {
+                if project.is_empty() { return Ok(String::new()); }
+                let hash = next_text(&mut results)?;
+                names.push((hash.clone(), project.clone()));
+                Ok(hash)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut ops = Vec::new();
         for (skill, paths, _, _) in &staged {
             let record = skill_record(skill);
@@ -555,7 +708,7 @@ impl EncryptionContext {
             encrypted.push(skill);
         }
         self.remember(names)?;
-        Ok(encrypted)
+        Ok((encrypted, wire))
     }
 
     pub fn decrypt_skill(&self, skill: Skill) -> Result<Skill> {
@@ -953,5 +1106,82 @@ mod tests {
         assert_eq!(fs::read(&victim).unwrap(), b"untouched");
         assert!(live.exists(), "a live writer's temp is left alone");
         assert!(other.exists() && unlike.exists(), "other files' temps are left alone");
+    }
+
+    #[test]
+    fn group_plans_fill_each_request() {
+        let cost = |ops: usize| [Cost { ops, bytes: ops * 100 }, Cost::default(), Cost::default()];
+        // 3-op items: 341 per group (1,023 ops), and the rest.
+        let items = vec![3usize; 700];
+        let groups = plan_groups(&items, |&n| cost(n));
+        assert_eq!(groups, vec![0..341, 341..682, 682..700]);
+        // Bytes bind first: 1 MiB items, two per group; an item over the limit alone.
+        let big = [Cost { ops: 1, bytes: 1 << 20 }, Cost::default(), Cost::default()];
+        let huge = [Cost { ops: 1, bytes: 3 << 20 }, Cost::default(), Cost::default()];
+        let items = [big, big, big, huge, big];
+        assert_eq!(plan_groups(&items, |c| *c), vec![0..2, 2..3, 3..4, 4..5]);
+        // Free items (an invalidation) still close a group at 1,024.
+        let items = vec![0usize; 2050];
+        assert_eq!(plan_groups(&items, |&n| cost(n)), vec![0..1024, 1024..2048, 2048..2050]);
+    }
+
+    /// Records each `Crypt` request's op count and bytes.
+    struct Sizes {
+        inner: Arc<std::sync::Mutex<crate::memory::cred_agent::CredAgent>>,
+        seen: std::sync::Mutex<Vec<Cost>>,
+    }
+
+    impl CredAgentApi for Sizes {
+        fn call(&self, request: Request) -> Result<Reply> {
+            if let Request::Crypt { ops, .. } = &request {
+                self.seen.lock().unwrap().push(Cost { ops: ops.len(), bytes: ops.iter().map(CryptOp::wire_len).sum() });
+            }
+            self.inner.call(request)
+        }
+    }
+
+    #[test]
+    fn planned_costs_are_the_requests_the_agent_sees() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device, _) = device(dir.path(), EncryptionMode::On);
+        let sizes = Arc::new(Sizes { inner: device.agent.clone(), seen: Default::default() });
+        let context = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, sizes.clone()).unwrap();
+        let take = || std::mem::take(&mut *sizes.seen.lock().unwrap());
+        let sum = |costs: Vec<Cost>| costs.into_iter().fold(Cost::default(), |a, b| a + b);
+
+        let memories: Vec<Memory> = (0..40).map(|i| {
+            let project = if i % 2 == 0 { "github.com/agora/atem" } else { "" };
+            memory(&format!("mem-{i}"), project, &"fact ".repeat(i + 1))
+        }).collect();
+        let sealed = context.encrypt_memories(memories.clone()).unwrap();
+        assert_eq!(take(), vec![sum(memories.iter().map(memory_seal_cost).collect())]);
+        context.decrypt_memories(sealed.clone()).unwrap();
+        assert_eq!(take(), vec![sum(sealed.iter().map(memory_open_cost).collect())]);
+
+        let skills: Vec<Skill> = (0..5).map(|i| {
+            let mut files = BTreeMap::new();
+            files.insert("SKILL.md".to_string(), format!("# skill {i}").into_bytes());
+            files.insert(format!("ref/part-{i}.md"), vec![b'x'; 100 * i]);
+            files.insert("empty.md".to_string(), Vec::new());
+            Skill {
+                scope: crate::memory::model::Scope::Project, project: if i % 2 == 0 { "github.com/agora/atem".into() } else { String::new() },
+                name: format!("skill-{i}"), version: 3, content_hash: skill_hash(&files), files,
+                source_agent: "test".into(), source_machine: "mac".into(), created_at: 1, deleted: false, seq: 0,
+            }
+        }).collect();
+        let projects = vec!["github.com/agora/atem".to_string(), String::new(), "github.com/agora/other".to_string()];
+        let (sealed, wire) = context.encrypt_skills_with_projects(skills.clone(), &projects).unwrap();
+        let [first, files] = skills.iter().map(skill_seal_cost)
+            .fold([Cost::default(); 2], |[a, b], [c, d]| [a + c, b + d]);
+        let first = first + sum(projects.iter().map(|p| project_hash_cost(p)).collect());
+        assert_eq!(take(), vec![first, files]);
+        assert_eq!(wire, context.wire_projects(&projects).unwrap());
+        take();
+        context.decrypt_skills(sealed.clone()).unwrap();
+        assert_eq!(take(), vec![sum(sealed.iter().map(skill_open_cost).collect())]);
+        // The same skills sealed with and without the projects.
+        let alone = context.decrypt_skills(context.encrypt_skills(skills.clone()).unwrap()).unwrap();
+        assert_eq!(alone, context.decrypt_skills(sealed).unwrap());
+        assert_eq!(alone, skills);
     }
 }

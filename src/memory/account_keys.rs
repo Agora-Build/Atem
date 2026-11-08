@@ -402,17 +402,43 @@ impl CryptOp {
                 record,
                 field,
                 plain,
-            } => record.len() + field.len() + base64_len(plain.len()) * 2 + 96,
+            } => Self::seal_wire_len(record.len(), field.len(), plain.len()),
             Self::Open {
                 record,
                 field,
                 value,
-            } => record.len() + field.len() + value.len() * 2 + 96,
+            } => Self::open_wire_len(record.len(), field.len(), value.len()),
             Self::KeyedHash { value, kid } => {
-                base64_len(value.len()) + 160 + kid.as_ref().map_or(0, |k| k.len() + 8)
+                Self::keyed_hash_wire_len(value.len()) + kid.as_ref().map_or(0, |k| k.len() + 8)
             }
         }
     }
+
+    /// [`CryptOp::wire_len`] of a seal, from the lengths of its record,
+    /// field and plain text: what a batch will cost before its ops exist.
+    pub fn seal_wire_len(record: usize, field: usize, plain: usize) -> usize {
+        record + field + base64_len(plain) * 2 + 96
+    }
+
+    /// [`CryptOp::wire_len`] of an open of an `e1.` value of `value` bytes.
+    pub fn open_wire_len(record: usize, field: usize, value: usize) -> usize {
+        record + field + value * 2 + 96
+    }
+
+    /// [`CryptOp::wire_len`] of a keyed hash under the current key.
+    pub fn keyed_hash_wire_len(value: usize) -> usize {
+        base64_len(value) + 160
+    }
+}
+
+/// The length of the `e1.` field `seal_field` makes of `plain` bytes (a kid
+/// is 8 characters): a sealed skill path's length, which its file's field
+/// name carries.
+pub(crate) fn sealed_len(plain: usize) -> usize {
+    if plain == 0 {
+        return 0;
+    }
+    "e1.".len() + 8 + ".".len() + base64_len(24 + plain + 16)
 }
 
 /// One result of a `Crypt` request, in the order of the ops.
@@ -886,6 +912,31 @@ mod tests {
         assert!(AccountKeys::from_wire(serde_json::from_str(bad_kid).unwrap()).is_err());
         let short_key = r#"{"acct":{"kid":"0123abcd","key":"AAAA"}}"#;
         assert!(AccountKeys::from_wire(serde_json::from_str(short_key).unwrap()).is_err());
+    }
+
+    #[test]
+    fn lengths_known_before_an_op_exists_are_its_own() {
+        let k = key("0123abcd", 7);
+        for len in [0usize, 1, 2, 3, 4, 100, 4096] {
+            let plain = vec![b'x'; len];
+            assert_eq!(
+                sealed_len(len),
+                seal_field(&k, "r", "path", &plain).unwrap().len()
+            );
+            assert_eq!(
+                CryptOp::seal_wire_len(3, 7, len),
+                CryptOp::seal("rec", "content", &plain).wire_len()
+            );
+            assert_eq!(
+                CryptOp::keyed_hash_wire_len(len),
+                CryptOp::keyed_hash(&plain).wire_len()
+            );
+            let sealed = "e1.".to_string() + &"A".repeat(len);
+            assert_eq!(
+                CryptOp::open_wire_len(3, 7, sealed.len()),
+                CryptOp::open("rec", "content", &sealed).wire_len()
+            );
+        }
     }
 
     #[test]

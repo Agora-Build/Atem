@@ -1,9 +1,12 @@
 //! The learning loop: harvest what Claude learned → push local changes →
 //! pull what other agents/machines learned → apply to every agent here.
 use anyhow::{anyhow, bail, Result};
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
-use crate::memory::api::{ApiError, KnowledgeClient, OpResult, PULL_LIMIT};
+use crate::memory::api::{seal_cost, ApiError, KnowledgeClient, OpResult, SealState, PULL_LIMIT};
+use crate::memory::crypto::Budget;
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
 use crate::memory::model::{content_hash, new_memory_id, now_secs, skill_hash, Memory, Scope, Skill};
@@ -356,12 +359,11 @@ impl SyncOutcome {
     }
 }
 
-/// Send one chunk and apply its results. `Ok(true)`: acked, carry on with
-/// the group; `Ok(false)`: results couldn't be paired up (nothing acked),
-/// stop the group; `Err`: the request failed, nothing acked.
-async fn send_chunk(store: &Store, client: &KnowledgeClient, chunk: &[(i64, PendingOp)], is_mem: bool, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
-    let refs: Vec<&PendingOp> = chunk.iter().map(|(_, op)| op).collect();
-    match client.push(&refs, is_mem).await {
+/// Apply a POSTed chunk's results (`posted`). `Ok(true)`: acked, carry on
+/// with the group; `Ok(false)`: results couldn't be paired up (nothing
+/// acked), stop the group; `Err`: the request failed, nothing acked.
+fn finish_chunk(store: &Store, chunk: &[(i64, PendingOp)], posted: std::result::Result<Vec<OpResult>, ApiError>, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
+    match posted {
         Ok(results) => {
             out.notes.extend(apply_push_results(store, chunk, &results)?);
             if results.len() != chunk.len() {
@@ -396,6 +398,100 @@ fn group_failed(store: &Store, e: ApiError, sent: &[(i64, PendingOp)], is_mem: b
     Ok(())
 }
 
+/// One push group's ops sealed ahead of their POST (F2), by queue `n`: each
+/// with the op as it was read and the state it was sealed under.
+struct ReadAhead {
+    sealed: BTreeMap<i64, (PendingOp, Value, SealState)>,
+    /// The last queue `n` a group was read through.
+    through: i64,
+    /// A group failed to seal: from then on each chunk is sealed just before
+    /// its POST, as before read-ahead, so a failure stops the group at the
+    /// same chunk it did then.
+    per_chunk: bool,
+}
+
+impl ReadAhead {
+    fn new() -> Self {
+        Self { sealed: BTreeMap::new(), through: i64::MIN, per_chunk: false }
+    }
+
+    fn add(&mut self, sealed: std::result::Result<(SealState, Vec<(PendingOp, Value)>), ApiError>, ns: &[i64]) {
+        match sealed {
+            Ok((state, ops)) => {
+                for (&n, (op, wire)) in ns.iter().zip(ops) {
+                    self.sealed.insert(n, (op, wire, state.clone()));
+                }
+            }
+            Err(_) => {
+                self.sealed.clear();
+                self.per_chunk = true;
+            }
+        }
+    }
+
+    /// The sealed wire of each op of `chunk` that is still exactly the op
+    /// that was sealed, under the same state; `None` for the others (an
+    /// earlier chunk's results rewrote it, the state changed, or it was never
+    /// read ahead). Forgets every entry up to the chunk's last op: sent now,
+    /// or gone from the queue (acked or removed meanwhile).
+    fn take(&mut self, chunk: &[(i64, PendingOp)], state: &SealState) -> Vec<Option<Value>> {
+        let wire = chunk.iter()
+            .map(|(n, op)| match self.sealed.remove(n) {
+                Some((sealed, wire, at)) if sealed == *op && at == *state => Some(wire),
+                _ => None,
+            })
+            .collect();
+        if let Some(&(last, _)) = chunk.last() {
+            self.sealed = self.sealed.split_off(&last.saturating_add(1));
+        }
+        wire
+    }
+}
+
+/// The queued ops of one kind after `after` that one batch seals in one
+/// `Crypt` request per step (`Budget`), at least one, read `slice` at a time.
+fn read_group(store: &Store, after: i64, is_mem: bool, slice: usize) -> Result<Vec<(i64, PendingOp)>> {
+    let mut group = Vec::new();
+    let mut budget = Budget::default();
+    let mut cursor = after;
+    loop {
+        let read = store.pending_after(cursor, is_mem, slice)?;
+        let more = read.len() == slice;
+        for (n, op) in read {
+            let cost = seal_cost(&op);
+            if !budget.fits(&cost) {
+                return Ok(group);
+            }
+            budget.add(&cost);
+            cursor = n;
+            group.push((n, op));
+        }
+        if !more {
+            return Ok(group);
+        }
+    }
+}
+
+/// Seals `group` into the read-ahead.
+async fn seal_ahead(client: &KnowledgeClient, ahead: &mut ReadAhead, group: Vec<(i64, PendingOp)>) {
+    let (ns, ops): (Vec<i64>, Vec<PendingOp>) = group.into_iter().unzip();
+    ahead.add(client.seal_ops(ops).await, &ns);
+}
+
+/// The wire form of every op of `chunk`: as sealed ahead while unchanged,
+/// the others sealed now, together.
+async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i64, PendingOp)], state: &SealState) -> std::result::Result<Vec<Value>, ApiError> {
+    let mut wire = ahead.take(chunk, state);
+    let stale: Vec<usize> = (0..chunk.len()).filter(|&i| wire[i].is_none()).collect();
+    if !stale.is_empty() {
+        let (_, sealed) = client.seal_ops(stale.iter().map(|&i| chunk[i].1.clone()).collect()).await?;
+        for (&i, (_, value)) in stale.iter().zip(sealed) {
+            wire[i] = Some(value);
+        }
+    }
+    wire.into_iter().map(|value| value.ok_or_else(|| ApiError::Encryption("an op of the chunk was not sealed".into()))).collect()
+}
+
 /// Push a group in chunks, in queue order. Any failure stops the group (its
 /// remaining ops stay queued, preserving order). A chunk the relay refuses
 /// as too large (413) is retried one op at a time; a single op that is still
@@ -406,23 +502,72 @@ fn group_failed(store: &Store, e: ApiError, sent: &[(i64, PendingOp)], is_mem: b
 /// each send moves strictly forward in queue order, and a chunk carries what
 /// an earlier chunk's results rewrote in still-queued ops (a relay canonical
 /// id; the relay only knows the rewritten ids).
+///
+/// Sealing runs ahead of the chunks (F2): the ops are sealed in groups that
+/// fit one `Crypt` request per step (`read_group`), the next group while
+/// the chunk before it is POSTed. A chunk sends an op as sealed ahead only
+/// while it is exactly the op read now under the same state; any other op
+/// (rewritten or removed meanwhile, a mode or key change) is sealed again
+/// first. A chunk's results are applied in their own transaction after its
+/// POST, before the next chunk is read; no request is in flight then.
 async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
     let mut after = i64::MIN;
+    let mut ahead = ReadAhead::new();
     loop {
         if out.offline {
             return Ok(());
         }
         let chunk = store.pending_after(after, is_mem, chunk_size)?;
         let Some(&(last, _)) = chunk.last() else { return Ok(()) };
-        match send_chunk(store, client, &chunk, is_mem, out).await? {
+        let state = match client.seal_state() {
+            Ok(state) => state,
+            Err(e) => return group_failed(store, e, &chunk, is_mem, out),
+        };
+        // The first group, or the read-ahead fell behind: seal from here.
+        while !ahead.per_chunk && last > ahead.through {
+            let group = read_group(store, ahead.through.max(after), is_mem, chunk_size)?;
+            ahead.through = group.last().map_or(last, |&(n, _)| n);
+            seal_ahead(client, &mut ahead, group).await;
+        }
+        let wire = match chunk_wire(client, &mut ahead, &chunk, &state).await {
+            Ok(wire) => wire,
+            Err(e) => return group_failed(store, e, &chunk, is_mem, out),
+        };
+        // Seal the next group while this chunk is in flight, once the
+        // read-ahead no longer covers the next chunk.
+        let next = if !ahead.per_chunk && ahead.sealed.len() < chunk_size {
+            read_group(store, ahead.through.max(last), is_mem, chunk_size)?
+        } else {
+            Vec::new()
+        };
+        let posted = if let Some(&(through, _)) = next.last() {
+            ahead.through = through;
+            let (ns, ops): (Vec<i64>, Vec<PendingOp>) = next.into_iter().unzip();
+            let (posted, sealed) = tokio::join!(client.post_ops(&wire, is_mem), client.seal_ops(ops));
+            ahead.add(sealed, &ns);
+            posted
+        } else {
+            client.post_ops(&wire, is_mem).await
+        };
+        match finish_chunk(store, &chunk, posted, out)? {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(ApiError::Http(413, _)) if chunk.len() > 1 => {
-                for n in chunk.iter().map(|(n, _)| *n) {
+                for ((n, sent), sealed) in chunk.iter().zip(&wire) {
                     // Re-read by `n`: an earlier single op may have rewritten it.
-                    let Some(op) = store.pending_op(n)? else { continue };
-                    let one = [(n, op)];
-                    match send_chunk(store, client, &one, is_mem, out).await? {
+                    let Some(op) = store.pending_op(*n)? else { continue };
+                    let one = [(*n, op)];
+                    let now = client.seal_state();
+                    let single = if one[0].1 == *sent && now.as_ref().is_ok_and(|now| *now == state) {
+                        Ok(vec![sealed.clone()])
+                    } else {
+                        client.seal_ops(vec![one[0].1.clone()]).await.map(|(_, ops)| ops.into_iter().map(|(_, wire)| wire).collect())
+                    };
+                    let posted = match single {
+                        Ok(single) => client.post_ops(&single, is_mem).await,
+                        Err(e) => return group_failed(store, e, &one, is_mem, out),
+                    };
+                    match finish_chunk(store, &one, posted, out)? {
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
                         Err(e) => return group_failed(store, e, &one, is_mem, out),
@@ -443,68 +588,93 @@ async fn push_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 
 /// Pull cursors are per account (the paired Astation id); see
 /// `memory_cursor_key`.
-///
-/// Each page's rows and its cursor commit in one transaction, before the page
-/// is counted: the cursor never passes a row that isn't stored, and a page cut
-/// short (an error, a crash) is pulled again whole (upserts are idempotent).
 async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome) -> Result<()> {
-    let mem_key = memory_cursor_key(client.account());
-    loop {
-        let since = store.get_state(&mem_key)?;
-        match client.pull_memories(since).await {
-            Ok(page) => {
-                if page.is_empty() {
-                    break;
-                }
-                let max = store.in_transaction(|| {
-                    let max = apply_pulled_memories(store, &page)?;
-                    store.set_state(&mem_key, max.max(since))?;
-                    Ok(max)
-                })?;
-                out.pulled += page.len();
-                if !cursor_advances(max, since, page.len()) {
-                    out.note(STUCK_CURSOR_NOTE.into());
-                    break;
-                }
-                if page.len() < PULL_LIMIT as usize {
-                    break;
-                }
-            }
-            Err(e) => {
-                out.failed(e, None);
-                return Ok(());
-            }
-        }
-    }
-    let skill_key = skill_cursor_key(client.account());
-    loop {
-        let since = store.get_state(&skill_key)?;
-        match client.pull_skills(since).await {
-            Ok(page) => {
-                if page.is_empty() {
-                    break;
-                }
-                let max = store.in_transaction(|| {
-                    let max = apply_pulled_skills(store, &page)?;
-                    store.set_state(&skill_key, max.max(since))?;
-                    Ok(max)
-                })?;
-                out.pulled += page.len();
-                if !cursor_advances(max, since, page.len()) {
-                    out.note(STUCK_CURSOR_NOTE.into());
-                    break;
-                }
-                if page.len() < PULL_LIMIT as usize {
-                    break;
-                }
-            }
-            Err(e) => {
-                out.failed(e, None);
-                return Ok(());
-            }
-        }
+    let memories = pull_pages(store, out, &memory_cursor_key(client.account()),
+        |since| client.fetch_memories(since), |rows| client.open_memories(rows),
+        apply_pulled_memories, |m: &Memory| m.seq).await?;
+    if memories {
+        pull_pages(store, out, &skill_cursor_key(client.account()),
+            |since| client.fetch_skills(since), |rows| client.open_skills(rows),
+            apply_pulled_skills, |s: &Skill| s.seq).await?;
     }
     Ok(())
+}
+
+/// Pulls one kind's pages from its committed cursor `key`. Each page's rows
+/// and its cursor commit in one transaction, before the page is counted: the
+/// cursor never passes a row that isn't stored, and a page cut short (an
+/// error, a crash) is pulled again whole (upserts are idempotent).
+///
+/// Page k+1 is fetched while page k is opened (F2), from the cursor page k
+/// ends at, and is used only once page k is committed and the committed
+/// cursor is that one; a page that fails to open or apply discards it
+/// unapplied. No request is in flight while a page's transaction is open.
+/// `Ok(false)`: a request failed (noted); stop pulling.
+async fn pull_pages<R, F, FF, O, OF>(
+    store: &Store,
+    out: &mut SyncOutcome,
+    key: &str,
+    fetch: F,
+    open: O,
+    apply: fn(&Store, &[R]) -> Result<i64>,
+    seq: fn(&R) -> i64,
+) -> Result<bool>
+where
+    F: Fn(i64) -> FF,
+    FF: Future<Output = std::result::Result<Vec<R>, ApiError>>,
+    O: Fn(Vec<R>) -> OF,
+    OF: Future<Output = std::result::Result<Vec<R>, ApiError>>,
+{
+    let mut since = store.get_state(key)?;
+    let mut fetched = fetch(since).await;
+    loop {
+        let page = match fetched {
+            Ok(page) => page,
+            Err(e) => {
+                out.failed(e, None);
+                return Ok(false);
+            }
+        };
+        if page.is_empty() {
+            return Ok(true);
+        }
+        let len = page.len();
+        let page_max = page.iter().map(seq).fold(0, i64::max);
+        let more = len >= PULL_LIMIT as usize && page_max > since;
+        let (opened, next) = if more {
+            let (opened, next) = tokio::join!(open(page), fetch(page_max));
+            (opened, Some(next))
+        } else {
+            (open(page).await, None)
+        };
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                out.failed(e, None);
+                return Ok(false);
+            }
+        };
+        let max = store.in_transaction(|| {
+            let max = apply(store, &opened)?;
+            store.set_state(key, max.max(since))?;
+            Ok(max)
+        })?;
+        out.pulled += opened.len();
+        if !cursor_advances(max, since, len) {
+            out.note(STUCK_CURSOR_NOTE.into());
+            return Ok(true);
+        }
+        if len < PULL_LIMIT as usize {
+            return Ok(true);
+        }
+        // The next page is the one after the committed cursor.
+        let committed = store.get_state(key)?;
+        fetched = match next {
+            Some(next) if committed == page_max => next,
+            _ => fetch(committed).await,
+        };
+        since = committed;
+    }
 }
 
 /// `client = None` means offline: harvest and apply still run locally.
@@ -598,7 +768,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    fn valid(id: &str, content: &str) -> Memory {
+    pub(super) fn valid(id: &str, content: &str) -> Memory {
         Memory {
             id: id.into(), scope: Scope::Global, content: content.into(), content_hash: content_hash(content),
             confidence: "high".into(), source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1,
@@ -974,12 +1144,12 @@ mod tests {
 
     // ─────────────── relay round trips (local stub relay) ───────────────
 
-    type Handler = dyn Fn(&str, &str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync;
+    pub(super) type Handler = dyn Fn(&str, &str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync;
 
     /// A tiny HTTP/1.1 relay stub on 127.0.0.1: one request per connection,
     /// answered by `f(method, path_and_query, json_body)`. Returns the base
     /// URL and a log of (method, path_and_query, body) for every request.
-    async fn stub_relay(f: Box<Handler>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) {
+    pub(super) async fn stub_relay(f: Box<Handler>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1052,7 +1222,7 @@ mod tests {
         serde_json::json!({"results": (0..n).map(|i| serde_json::json!({"ok": true, "seq": i + 1})).collect::<Vec<_>>()})
     }
 
-    fn test_ctx() -> (tempfile::TempDir, Ctx) {
+    pub(super) fn test_ctx() -> (tempfile::TempDir, Ctx) {
         let td = tempfile::tempdir().unwrap();
         let ctx = Ctx { home: td.path().to_path_buf(), repo: None, atem_id: "m1".into(), allow_tracked: false };
         (td, ctx)
@@ -1080,7 +1250,7 @@ mod tests {
         }
     }
 
-    const NO_HARVEST: SyncOptions = SyncOptions { harvest: false };
+    pub(super) const NO_HARVEST: SyncOptions = SyncOptions { harvest: false };
 
     #[tokio::test]
     async fn pulled_replacement_leaves_the_block_but_stays_in_history() {
@@ -1225,7 +1395,7 @@ mod tests {
         })
     }
 
-    fn posted_ops(log: &std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) -> Vec<Vec<serde_json::Value>> {
+    pub(super) fn posted_ops(log: &std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) -> Vec<Vec<serde_json::Value>> {
         log.lock().unwrap().iter().filter(|(m, _, _)| m == "POST")
             .map(|(_, _, b)| b["ops"].as_array().unwrap().clone()).collect()
     }
@@ -1521,15 +1691,15 @@ mod tests {
     /// every version stays a row. Every write takes the next seq; pulls page
     /// by seq.
     #[derive(Default)]
-    struct KeepingRelay {
-        rows: BTreeMap<String, Memory>,
-        skills: BTreeMap<i64, Skill>,
+    pub(super) struct KeepingRelay {
+        pub(super) rows: BTreeMap<String, Memory>,
+        pub(super) skills: BTreeMap<i64, Skill>,
         next_seq: i64,
-        ops_received: usize,
+        pub(super) ops_received: usize,
     }
 
     impl KeepingRelay {
-        fn put(&mut self, mut m: Memory) -> i64 {
+        pub(super) fn put(&mut self, mut m: Memory) -> i64 {
             self.next_seq += 1;
             m.seq = self.next_seq;
             self.rows.insert(m.id.clone(), m);
@@ -1561,6 +1731,20 @@ mod tests {
                     }
                     serde_json::json!({"ok": true})
                 }
+                // An encryption migration's rewrite of a row's protected fields.
+                "rewrite" => {
+                    let mut r = self.rows[op["id"].as_str().unwrap()].clone();
+                    for field in ["project", "content", "content_hash"] {
+                        let value = op[field].as_str().unwrap().to_string();
+                        match field {
+                            "project" => r.project = value,
+                            "content" => r.content = value,
+                            _ => r.content_hash = value,
+                        }
+                    }
+                    serde_json::json!({"ok": true, "seq": self.put(r)})
+                }
+                "delete" => serde_json::json!({"ok": true}),
                 other => panic!("unexpected op {other}"),
             }
         }
@@ -1576,7 +1760,7 @@ mod tests {
             self.skills.values().filter(|s| s.name == name).max_by_key(|s| s.version)
         }
 
-        fn put_skill(&mut self, mut skill: Skill) -> i64 {
+        pub(super) fn put_skill(&mut self, mut skill: Skill) -> i64 {
             self.next_seq += 1;
             skill.seq = self.next_seq;
             self.skills.insert(skill.seq, skill);
@@ -1585,7 +1769,20 @@ mod tests {
 
         fn skill_op(&mut self, op: &serde_json::Value) -> serde_json::Value {
             self.ops_received += 1;
-            assert_eq!(op["op"], "push");
+            match op["op"].as_str().unwrap() {
+                "push" => {}
+                "delete" | "purge" => return serde_json::json!({"ok": true}),
+                "rewrite" => {
+                    let (name, version) = (op["name"].as_str().unwrap(), op["version"].as_i64().unwrap());
+                    let seq = self.skills.values().find(|k| k.name == name && k.version == version).unwrap().seq;
+                    let mut skill = self.skills.remove(&seq).unwrap();
+                    skill.project = op["project"].as_str().unwrap().into();
+                    skill.files = serde_json::from_value(op["files"].clone()).unwrap();
+                    skill.content_hash = op["content_hash"].as_str().unwrap().into();
+                    return serde_json::json!({"ok": true, "version": version, "seq": self.put_skill(skill)});
+                }
+                other => panic!("unexpected skill op {other}"),
+            }
             let mut skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
             let latest = self.latest_skill(&skill.name).map_or(0, |s| s.version);
             skill.version = latest + 1;
@@ -1601,7 +1798,7 @@ mod tests {
         }
     }
 
-    fn keeping_relay(relay: Arc<Mutex<KeepingRelay>>) -> Box<Handler> {
+    pub(super) fn keeping_relay(relay: Arc<Mutex<KeepingRelay>>) -> Box<Handler> {
         Box::new(move |m, p, body| {
             let (path, query) = p.split_once('?').unwrap_or((p, ""));
             let arg = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k)?.strip_prefix('=')?.parse::<i64>().ok());
@@ -1629,7 +1826,7 @@ mod tests {
     /// gets an error and its transaction rolls back). It copies the database
     /// and `-journal` only (the store's default rollback journal): a switch to
     /// WAL must also copy `-wal` and `-shm`.
-    fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
+    pub(super) fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
         use rusqlite::functions::FunctionFlags;
         let (db, image) = (db.to_path_buf(), image.to_path_buf());
         s.test_conn().create_scalar_function("crash", 0, FunctionFlags::SQLITE_UTF8, move |_| -> rusqlite::Result<i64> {
@@ -1763,7 +1960,7 @@ mod tests {
         }
     }
 
-    fn skill_v1(name: &str, body: &str, machine: &str) -> Skill {
+    pub(super) fn skill_v1(name: &str, body: &str, machine: &str) -> Skill {
         let mut files = BTreeMap::new();
         files.insert("SKILL.md".to_string(), body.as_bytes().to_vec());
         Skill {
@@ -1891,3 +2088,7 @@ mod tests {
         assert_eq!(s.pending_count().unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "sync_pipeline_tests.rs"]
+mod pipeline_tests;
