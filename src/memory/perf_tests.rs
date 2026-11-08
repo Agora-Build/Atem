@@ -1955,7 +1955,7 @@ fn perf_5_cold_start_unlock_and_memory() {
         }
     }
     println!(
-        "- client autostart (no agent running): first status after {:.1} ms (spawn + the client's 100 ms poll); then a Crypt is refused (locked) in {:.2} ms",
+        "- client autostart (no agent running): first status after {:.1} ms (spawn + the client's polls); then a Crypt is refused (locked) in {:.2} ms",
         ms(median(first)),
         ms(median(to_locked_error))
     );
@@ -2129,6 +2129,158 @@ fn perf_5_cold_start_unlock_and_memory() {
     println!(
         "\n- `atem memory search` work on 5,000 facts (open knowledge.db + FTS query; no cred agent involved): {:.2} ms",
         ms(search)
+    );
+}
+
+/// Kills the detached agents a test started, even when it panics.
+struct Detached(Vec<u32>);
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+        }
+    }
+}
+
+/// What a client's launcher does in production (`agent_socket::spawn_agent`,
+/// the detached spawn of `daemon`), with only HOME, XDG_RUNTIME_DIR and PATH
+/// set (temp dirs); the pid goes on `started`.
+fn detached_launcher(
+    home: &Path,
+    run: &Path,
+    log: &Path,
+    started: Arc<Mutex<Detached>>,
+) -> Box<dyn Fn() -> anyhow::Result<()> + Send + Sync> {
+    let (home, run, log) = (home.to_path_buf(), run.to_path_buf(), log.to_path_buf());
+    Box::new(move || {
+        let envs = [
+            ("HOME".into(), home.clone().into_os_string()),
+            ("XDG_RUNTIME_DIR".into(), run.clone().into_os_string()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ];
+        let pid = crate::daemon::spawn_detached_clean(
+            &atem_binary(),
+            "cred-agent",
+            Path::new("/"),
+            &log,
+            &envs,
+        )?;
+        started.lock().unwrap().0.push(pid);
+        Ok(())
+    })
+}
+
+/// F7: from the spawn of an agent to a client's first contact with it.
+/// Three clocks per run, each from just before the (detached) spawn:
+/// the socket accepting connections, a client that starts the agent getting
+/// its first `status` reply, and a command as production makes it (the
+/// build check on the connection, then a `Crypt` that the locked agent
+/// refuses).
+#[test]
+#[ignore]
+fn perf_5c_cold_autostart_first_contact() {
+    println!(
+        "\n## 5c. Cold autostart: first contact after the spawn (detached spawn, release agent)"
+    );
+    let build = RealAgent::start(EncryptionMode::On, None).build.clone();
+    let runs = 30;
+    let mut listening = Vec::new();
+    let mut first_status = Vec::new();
+    let mut command = Vec::new();
+    for _ in 0..runs {
+        let started = Arc::new(Mutex::new(Detached(Vec::new())));
+        // (i) the socket accepting connections (a raw 200 µs poll).
+        {
+            let dir = short_dir();
+            let (home, run) = (dir.path().join("h"), dir.path().join("r"));
+            std::fs::create_dir_all(&home).unwrap();
+            private_dir(&run);
+            let paths = CredPaths::in_dir(&home.join(".config").join("atem"));
+            let socket = paths.agent_sock(Some(run.as_path()));
+            let launch = detached_launcher(&home, &run, &dir.path().join("a.log"), started.clone());
+            let start = Instant::now();
+            launch().unwrap();
+            while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+                assert!(start.elapsed() < Duration::from_secs(10), "no agent");
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            listening.push(start.elapsed());
+        }
+        // (ii) a client that starts the agent: its first `status` reply.
+        // (iii) a command: build check, then a `Crypt` the locked agent refuses.
+        for (clock, checked) in [(&mut first_status, false), (&mut command, true)] {
+            let dir = short_dir();
+            let (home, run) = (dir.path().join("h"), dir.path().join("r"));
+            std::fs::create_dir_all(&home).unwrap();
+            private_dir(&run);
+            let paths = CredPaths::in_dir(&home.join(".config").join("atem"));
+            let launch = detached_launcher(&home, &run, &dir.path().join("a.log"), started.clone());
+            let mut client =
+                CredAgentClient::with_launcher(paths.agent_sock(Some(run.as_path())), launch);
+            if checked {
+                client = client.checking_build(&build);
+            }
+            let start = Instant::now();
+            if checked {
+                assert!(
+                    client
+                        .crypt(ASTATION_ID, vec![CryptOp::seal("m", "content", b"x")])
+                        .is_err()
+                );
+            } else {
+                client.status().unwrap();
+            }
+            clock.push(start.elapsed());
+        }
+        drop(started);
+    }
+    let spread = |samples: &[Duration]| {
+        let mut sorted = samples.to_vec();
+        sorted.sort();
+        format!(
+            "median {:.1} ms, min {:.1}, p90 {:.1}, max {:.1}",
+            ms(median(samples.to_vec())),
+            ms(sorted[0]),
+            ms(sorted[sorted.len() * 9 / 10]),
+            ms(*sorted.last().unwrap())
+        )
+    };
+    println!(
+        "- spawn to socket accepting connections ({runs} runs): {}",
+        spread(&listening)
+    );
+    println!(
+        "- spawn to a starting client's first `status` reply: {}",
+        spread(&first_status)
+    );
+    println!(
+        "- cold command (build check + refused `Crypt`, locked agent): {}",
+        spread(&command)
+    );
+    // Startup alone, with and without `mlockall` (RLIMIT_MEMLOCK 8 MiB: no
+    // lock), to see what the lock costs.
+    let mut unlocked_limit = Vec::new();
+    for _ in 0..runs {
+        let dir = short_dir();
+        let (home, run) = (dir.path().join("h"), dir.path().join("r"));
+        std::fs::create_dir_all(&home).unwrap();
+        private_dir(&run);
+        let paths = CredPaths::in_dir(&home.join(".config").join("atem"));
+        let socket = paths.agent_sock(Some(run.as_path()));
+        let start = Instant::now();
+        let mut child = spawn_agent(&home, &run, &dir.path().join("a.log"), Some(8 << 20));
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no agent");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        unlocked_limit.push(start.elapsed());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    println!(
+        "- spawn to socket accepting connections, RLIMIT_MEMLOCK 8 MiB (no mlockall; plain spawn): {}",
+        spread(&unlocked_limit)
     );
 }
 
