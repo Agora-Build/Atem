@@ -492,6 +492,20 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   requests are answered the agent wipes everything they left in its read
   buffers (the whole allocation past any unread bytes); the client keeps no
   request or reply bytes between requests.
+- **No needless wait for an agent the client started.** A client that may
+  start the agent (`autostart`) polls the new agent instead of sleeping a
+  fixed 100 ms: the first look is 5 ms after the spawn, then every 5 ms up to
+  40 ms, then 10, 20 and 50 ms steps and every 100 ms after that, up to the
+  same 10 s overall wait. Ready is what it always was: a connection accepted
+  on the expected socket (the recorded one first), by a listener running as
+  this user. A missing socket, a stale socket file (connection refused) and
+  an agent still starting are "not yet"; a listener of another user is the
+  error it always was; no agent within the wait is the same error ("the cred
+  agent didn't start"; a held key-directory lock is named as before). The
+  spawn is unchanged (detached, no extra descriptor: a readiness pipe was
+  not used, since it would change what the agent inherits). A client that
+  finds an agent running, and every `existing()` client, spawns and waits
+  for nothing.
 - **Binary frames for `Crypt`.** An agent that reads them says
   `"frames": 1` in its answer to a `status` (no released agent does) and
   from then on reads them on that connection, beside JSON lines. A client

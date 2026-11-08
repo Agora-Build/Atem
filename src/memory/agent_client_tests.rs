@@ -817,3 +817,200 @@ fn clients_that_may_start_an_agent_and_clients_that_never_do_are_shared_apart() 
     let error = format!("{:#}", first.status().err().unwrap());
     assert!(error.contains("isn't running"), "{error}");
 }
+
+// ───────────── the wait for an agent this client started (F7) ─────────────
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A launcher that starts an in-process agent for `dir` `delay` from now and
+/// returns at once, as spawning a process does; counts its calls.
+fn spawning_after(dir: &Path, delay: Duration, launches: &Arc<AtomicUsize>) -> Launcher {
+    let (dir, launches) = (dir.to_path_buf(), launches.clone());
+    Box::new(move || {
+        launches.fetch_add(1, Ordering::SeqCst);
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            start_agent(&dir, own_uid());
+        });
+        Ok(())
+    })
+}
+
+/// A launcher that starts nothing; counts its calls.
+fn spawning_nothing(launches: &Arc<AtomicUsize>) -> Launcher {
+    let launches = launches.clone();
+    Box::new(move || {
+        launches.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+}
+
+/// A socket file nobody listens on, as a dead agent leaves it.
+fn leave_stale_socket(socket: &Path) {
+    make_private(socket.parent().unwrap());
+    drop(std::os::unix::net::UnixListener::bind(socket).unwrap());
+    assert!(socket.exists());
+}
+
+/// The time `attempt` takes, best of `runs` (one run stalled by a busy
+/// machine doesn't decide).
+fn best_of(runs: usize, mut attempt: impl FnMut() -> Duration) -> Duration {
+    (0..runs).map(|_| attempt()).min().unwrap()
+}
+
+#[test]
+fn an_agent_that_comes_up_at_once_is_reached_without_the_old_fixed_wait() {
+    // The client used to sleep 100 ms before its first look at an agent it
+    // had just started, however quickly it came up.
+    let best = best_of(5, || {
+        let dir = short_dir();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let client = CredAgentClient::with_launcher(
+            sock(&dir.path().join("run")),
+            spawning_after(dir.path(), Duration::ZERO, &launches),
+        );
+        let started = std::time::Instant::now();
+        assert!(!client.status().unwrap().unlocked);
+        let took = started.elapsed();
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        took
+    });
+    assert!(
+        best < Duration::from_millis(60),
+        "first contact took {best:?}"
+    );
+}
+
+#[test]
+fn an_agent_that_starts_slowly_is_waited_for_and_reached_soon_after() {
+    // Up after 120 ms: well past the first polls, so it is found by one of
+    // the backed-off ones (not before it listens, and not a whole old poll
+    // interval after: the old fixed polls would have found it at 200 ms).
+    let delay = Duration::from_millis(120);
+    let best = best_of(3, || {
+        let dir = short_dir();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let client = CredAgentClient::with_launcher(
+            sock(&dir.path().join("run")),
+            spawning_after(dir.path(), delay, &launches),
+        );
+        let started = std::time::Instant::now();
+        assert!(!client.status().unwrap().unlocked);
+        let took = started.elapsed();
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "one start, one agent");
+        assert!(client.is_running());
+        took
+    });
+    assert!(best >= delay, "reached before it listened? {best:?}");
+    assert!(best < Duration::from_millis(185), "found after {best:?}");
+}
+
+#[test]
+fn a_stale_socket_file_is_not_an_agent_and_is_replaced_by_the_one_that_starts() {
+    let dir = short_dir();
+    let socket = sock(&dir.path().join("run"));
+    leave_stale_socket(&socket);
+    let launches = Arc::new(AtomicUsize::new(0));
+    let client = CredAgentClient::with_launcher(
+        socket,
+        spawning_after(dir.path(), Duration::from_millis(60), &launches),
+    );
+    // The refused connections while the file is stale are "not yet".
+    assert!(!client.status().unwrap().unlocked);
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn no_agent_within_the_wait_is_todays_error_after_that_wait() {
+    let dir = short_dir();
+    let socket = sock(&dir.path().join("run"));
+    leave_stale_socket(&socket);
+    let launches = Arc::new(AtomicUsize::new(0));
+    let wait = Duration::from_millis(300);
+    let client = CredAgentClient::with_launcher(socket.clone(), spawning_nothing(&launches))
+        .waiting(wait)
+        .logging_to(dir.path().join("agent.log"));
+    let started = std::time::Instant::now();
+    let error = format!("{:#}", client.status().err().unwrap());
+    let took = started.elapsed();
+    assert_eq!(
+        error,
+        format!(
+            "the cred agent didn't start; see {}",
+            dir.path().join("agent.log").display()
+        )
+    );
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        1,
+        "started once, then polled"
+    );
+    assert!(took >= wait, "gave up after {took:?}");
+    assert!(
+        took < wait + Duration::from_secs(2),
+        "gave up after {took:?}"
+    );
+    assert!(
+        socket.exists(),
+        "the stale file is not the client's to remove"
+    );
+}
+
+#[test]
+fn a_running_agent_is_neither_started_again_nor_waited_for() {
+    let dir = short_dir();
+    let socket = start_agent(dir.path(), own_uid());
+    let launches = Arc::new(AtomicUsize::new(0));
+    let client = CredAgentClient::with_launcher(socket, spawning_nothing(&launches))
+        .waiting(Duration::from_millis(50));
+    for _ in 0..3 {
+        assert!(!client.status().unwrap().unlocked);
+    }
+    // Another client of the same agent, with its own connection.
+    let (socket, other) = (sock(&dir.path().join("run")), Arc::new(AtomicUsize::new(0)));
+    let second = CredAgentClient::with_launcher(socket, spawning_nothing(&other));
+    assert!(!second.status().unwrap().unlocked);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert_eq!(other.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_listener_of_another_user_that_appears_is_refused_not_polled_past() {
+    let dir = short_dir();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let client = CredAgentClient::with_launcher(
+        sock(&dir.path().join("run")),
+        spawning_after(dir.path(), Duration::ZERO, &launches),
+    )
+    .expecting_uid(own_uid() + 1)
+    .waiting(Duration::from_secs(20));
+    let started = std::time::Instant::now();
+    let error = format!("{:#}", client.status().err().unwrap());
+    assert!(error.contains("served by another user"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "not the end of the wait"
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_polls_of_a_started_agent_begin_at_5_ms_and_back_off_to_the_old_interval() {
+    let pauses: Vec<Duration> = (0..40).map(start_poll_pause).collect();
+    assert_eq!(pauses[0], Duration::from_millis(5));
+    assert!(
+        pauses.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{pauses:?}"
+    );
+    assert_eq!(pauses[pauses.len() - 1], START_POLL_MAX);
+    assert_eq!(START_POLL_MAX, Duration::from_millis(100), "the old poll");
+    // An agent within its 25 ms startup budget is found within one 5 ms step.
+    let mut at = Duration::ZERO;
+    for pause in &pauses {
+        at += *pause;
+        if at <= Duration::from_millis(40) {
+            assert_eq!(*pause, Duration::from_millis(5), "{pauses:?}");
+        }
+    }
+}

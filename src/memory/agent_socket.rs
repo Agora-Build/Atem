@@ -376,6 +376,22 @@ const ORPHAN_CHECK: Duration = Duration::from_secs(5);
 /// How long a client waits for an agent it started.
 const START_WAIT: Duration = Duration::from_secs(10);
 
+/// The pauses before a client's polls of an agent it just started, in ms. A
+/// started agent listens within about 15 ms (its budget is 25), so the first
+/// look is at 5 ms and the next ones stay close, then back off; a pause
+/// after the last entry is `START_POLL_MAX`.
+const START_POLLS_MS: [u64; 16] = [5, 5, 5, 5, 5, 5, 5, 5, 10, 10, 10, 20, 20, 20, 50, 50];
+/// The pause between polls once an agent is slow to start (what every poll
+/// used to be).
+const START_POLL_MAX: Duration = Duration::from_millis(100);
+
+/// The pause before poll number `poll` (from 0) of a started agent.
+fn start_poll_pause(poll: usize) -> Duration {
+    START_POLLS_MS
+        .get(poll)
+        .map_or(START_POLL_MAX, |ms| Duration::from_millis(*ms))
+}
+
 /// Another agent holds the key directory's lock but answers on no socket
 /// (e.g. its runtime dir was removed while it kept running).
 #[derive(Debug)]
@@ -1667,9 +1683,19 @@ impl CredAgentClient {
                 if let Some(launch) = &self.launcher {
                     launch()?;
                 }
+                // Ready is a same-user agent accepting a connection on the
+                // expected socket (`dial`); a missing or stale socket is "not
+                // yet" until `start_wait` has passed, and a listener of
+                // another user is the error it always was.
                 let deadline = std::time::Instant::now() + self.start_wait;
-                while std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(100));
+                let mut polls = 0;
+                loop {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(start_poll_pause(polls).min(left));
+                    polls += 1;
                     if let Ok(checked) = self.dial() {
                         return checked;
                     }
