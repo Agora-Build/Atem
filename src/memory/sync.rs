@@ -899,20 +899,19 @@ pub const SKILL_HISTORY_OFFLINE: &str = "Skill history lives on the relay, which
 
 pub const SKILL_HISTORY_UNAUTHORIZED: &str = "The relay doesn't recognize this machine's Astation session. Make sure your Astation (latest version) is running and connected to the relay, then try again.";
 pub const SKILL_HISTORY_UNAVAILABLE: &str = "The relay is temporarily unavailable; try again shortly.";
-pub const SKILL_HISTORY_UNSUPPORTED: &str = "This relay doesn't support skill history yet — update the relay (Astation) and try again.";
 
-/// A skill-history request failed: say why, plainly. Only a 404 whose body
-/// is the relay's own "no such skill version" means the version is missing;
-/// any other 404 is a relay without the history routes.
+/// A skill-history request failed: say why, plainly. A 404 here is the
+/// Station's own "no such skill version": `KnowledgeClient` turns any other
+/// 404 of the v2 routes into `ApiError::NoSkillWireV2` (a Station without
+/// skill wire v2, `SKILL_WIRE_V2_MISSING`).
 pub fn skill_history_error(e: ApiError, name: &str, version: Option<i64>) -> anyhow::Error {
     match (e, version) {
         (ApiError::Offline(_), _) => anyhow!(SKILL_HISTORY_OFFLINE),
         (ApiError::Http(401, _), _) => anyhow!(SKILL_HISTORY_UNAUTHORIZED),
         (ApiError::Http(503, _), _) => anyhow!(SKILL_HISTORY_UNAVAILABLE),
-        (ApiError::Http(404, body), Some(v)) if body.contains("no such skill version") => {
+        (ApiError::Http(404, _), Some(v)) => {
             anyhow!("Skill {} has no version {}. See `atem skill history {}`.", name, v, name)
         }
-        (ApiError::Http(404, _), _) => anyhow!(SKILL_HISTORY_UNSUPPORTED),
         (ApiError::Http(410, _), Some(v)) => anyhow!("v{} of skill {} was purged: its files were erased, so it can't be restored.", v, name),
         (e, _) => anyhow!("{}", e),
     }
@@ -955,6 +954,7 @@ pub async fn restore_skill(store: &Store, client: &KnowledgeClient, atem_id: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::api::SKILL_WIRE_V2_MISSING;
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -1339,8 +1339,10 @@ mod tests {
     pub(super) type Handler = dyn Fn(&str, &str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync;
 
     /// A tiny HTTP/1.1 relay stub on 127.0.0.1: one request per connection,
-    /// answered by `f(method, path_and_query, json_body)`. Returns the base
-    /// URL and a log of (method, path_and_query, body) for every request.
+    /// answered by `f(method, path_and_query, json_body)`; a status of 0
+    /// closes the connection with no answer (an uncertain outcome). Returns
+    /// the base URL and a log of (method, path_and_query, body) for every
+    /// request.
     pub(super) async fn stub_relay(f: Box<Handler>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1386,6 +1388,10 @@ mod tests {
                     let body: serde_json::Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(serde_json::Value::Null);
                     let (code, resp) = f(&method, &path, &body);
                     log.lock().unwrap().push((method, path, body));
+                    if code == 0 {
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
                     let text = resp.to_string();
                     let out = format!(
                         "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -1406,12 +1412,19 @@ mod tests {
         if path.starts_with("/api/memory?") {
             return Some((200, serde_json::json!({"memories": []})));
         }
-        Some((200, serde_json::json!({"skills": []})))
+        // Skills only through the v2 routes (skill wire v2): any other GET
+        // is the test's own, or no route at all.
+        path.starts_with("/api/skills/v2?").then(|| (200, serde_json::json!({"wire_version": 2, "skills": []})))
     }
 
-    fn ok_results(body: &serde_json::Value) -> serde_json::Value {
+    /// Every op accepted; a skills batch answers as skill wire v2 does.
+    fn ok_results(path: &str, body: &serde_json::Value) -> serde_json::Value {
         let n = body["ops"].as_array().map(|a| a.len()).unwrap_or(0);
-        serde_json::json!({"results": (0..n).map(|i| serde_json::json!({"ok": true, "seq": i + 1})).collect::<Vec<_>>()})
+        let mut results = serde_json::json!({"results": (0..n).map(|i| serde_json::json!({"ok": true, "seq": i + 1})).collect::<Vec<_>>()});
+        if path.starts_with("/api/skills/v2/batch?") {
+            results["wire_version"] = serde_json::json!(2);
+        }
+        results
     }
 
     pub(super) fn test_ctx() -> (tempfile::TempDir, Ctx) {
@@ -1522,7 +1535,7 @@ mod tests {
             if body["ops"].as_array().unwrap().len() > 1 {
                 return (413, serde_json::json!({"error": "request body too large"}));
             }
-            (200, ok_results(body))
+            (200, ok_results(p, body))
         })).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
@@ -1548,7 +1561,7 @@ mod tests {
             if ops.len() > 1 || ops[0]["memory"]["content"] == "huge" {
                 return (413, serde_json::json!({"error": "request body too large"}));
             }
-            (200, ok_results(body))
+            (200, ok_results(p, body))
         })).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
@@ -1667,7 +1680,7 @@ mod tests {
             if body["ops"].as_array().unwrap().iter().any(|o| o["op"] == "invalidate") {
                 return (400, serde_json::json!({"error": "unknown op"}));
             }
-            (200, ok_results(body))
+            (200, ok_results(p, body))
         })).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
@@ -1697,7 +1710,7 @@ mod tests {
 
         let s2 = Store::open_in_memory().unwrap();
         let (base2, _log2) = stub_relay(Box::new(|m, p, _| {
-            if p.starts_with("/api/skills?") {
+            if p.starts_with("/api/skills/v2?") {
                 return (503, serde_json::json!({"error": "temporarily unavailable"}));
             }
             empty_pulls(m, p).unwrap()
@@ -1734,7 +1747,7 @@ mod tests {
         // a: from 0 (legacy 99 ignored); b: its own cursor, from 0; a again: resumes at 7.
         assert_eq!(mem_sinces, vec!["since=0", "since=0", "since=7"]);
         assert_eq!(s.get_state(&memory_cursor_key("ast-b")).unwrap(), 7);
-        let skill_first = log.lock().unwrap().iter().find(|(_, p, _)| p.starts_with("/api/skills?")).unwrap().1.clone();
+        let skill_first = log.lock().unwrap().iter().find(|(_, p, _)| p.starts_with("/api/skills/v2?")).unwrap().1.clone();
         assert!(skill_first.contains("since=0&"), "{}", skill_first);
     }
 
@@ -1743,17 +1756,17 @@ mod tests {
         if !deleted {
             files.insert("SKILL.md".to_string(), body.as_bytes().to_vec());
         }
-        serde_json::to_value(Skill {
+        crate::memory::fake_station_skills::row(&Skill {
             scope: Scope::Global, project: String::new(), name: "demo".into(), version,
             content_hash: skill_hash(&files), files, source_agent: "codex".into(), source_machine: "m2".into(),
             created_at: 1_790_000_000, deleted, seq: version * 10,
-        }).unwrap()
+        })
     }
 
     fn history_relay() -> Box<Handler> {
         Box::new(|m, p, body| {
-            if m == "GET" && p.starts_with("/api/skills/versions?") {
-                return (200, serde_json::json!({"versions": [
+            if m == "GET" && p.starts_with("/api/skills/v2/versions?") {
+                return (200, serde_json::json!({"wire_version": 2, "versions": [
                     {"version": 5, "created_at": 1_791_036_600, "source_agent": "claude", "source_machine": "mac-mini", "file_count": 1, "deleted": false, "purged": false},
                     {"version": 4, "created_at": 1_791_036_540, "source_agent": "codex", "source_machine": "genie", "file_count": 1, "deleted": false, "purged": false},
                     {"version": 3, "created_at": 1_790_900_000, "source_agent": "cli", "source_machine": "genie", "file_count": 0, "deleted": true, "purged": false},
@@ -1761,12 +1774,12 @@ mod tests {
                     {"version": 1, "created_at": 1_790_700_000, "source_agent": "claude", "source_machine": "genie", "file_count": 0, "deleted": true, "purged": true},
                 ]}));
             }
-            if m == "GET" && p.starts_with("/api/skills/version?") {
+            if m == "GET" && p.starts_with("/api/skills/v2/version?") {
                 let v = p.split('&').find_map(|kv| kv.strip_prefix("version=")).unwrap_or("");
                 return match v {
-                    "4" => (200, serde_json::json!({"skill": remote_skill(4, "# v4 body", false)})),
-                    "3" => (200, serde_json::json!({"skill": remote_skill(3, "", true)})),
-                    "2" => (200, serde_json::json!({"skill": remote_skill(2, "key AKIAIOSFODNN7EXAMPLE", false)})),
+                    "4" => (200, serde_json::json!({"wire_version": 2, "skill": remote_skill(4, "# v4 body", false)})),
+                    "3" => (200, serde_json::json!({"wire_version": 2, "skill": remote_skill(3, "", true)})),
+                    "2" => (200, serde_json::json!({"wire_version": 2, "skill": remote_skill(2, "key AKIAIOSFODNN7EXAMPLE", false)})),
                     "1" => (410, serde_json::json!({"error": "skill version purged"})),
                     _ => (404, serde_json::json!({"error": "no such skill version"})),
                 };
@@ -1774,7 +1787,7 @@ mod tests {
             if let Some(r) = empty_pulls(m, p) {
                 return r;
             }
-            (200, ok_results(body))
+            (200, ok_results(p, body))
         })
     }
 
@@ -1838,9 +1851,9 @@ mod tests {
         assert!(!SKILL_HISTORY_UNAVAILABLE.contains("queued"));
         assert_eq!(msg(ApiError::Http(404, "{\"error\":\"no such skill version\"}".into()), Some(9)),
             "Skill demo has no version 9. See `atem skill history demo`.");
-        // An older relay without the routes answers a bare 404.
-        assert_eq!(msg(ApiError::Http(404, "404 page not found".into()), Some(9)), SKILL_HISTORY_UNSUPPORTED);
-        assert_eq!(msg(ApiError::Http(404, "".into()), None), SKILL_HISTORY_UNSUPPORTED);
+        // A Station without the skill wire v2 routes.
+        assert_eq!(msg(ApiError::NoSkillWireV2, Some(9)), SKILL_WIRE_V2_MISSING);
+        assert_eq!(msg(ApiError::NoSkillWireV2, None), SKILL_WIRE_V2_MISSING);
         assert!(msg(ApiError::Http(500, "boom".into()), None).contains("500"));
     }
 
@@ -1854,7 +1867,7 @@ mod tests {
                 s.enqueue(&PendingOp::DeleteSkill { scope: Scope::Global, project: String::new(), name: format!("s{i:03}") }).unwrap();
             }
         }
-        let (base, log) = stub_relay(Box::new(|m, p, body| empty_pulls(m, p).unwrap_or_else(|| (200, ok_results(body))))).await;
+        let (base, log) = stub_relay(Box::new(|m, p, body| empty_pulls(m, p).unwrap_or_else(|| (200, ok_results(p, body))))).await;
         let (_td, ctx) = test_ctx();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
         assert!(out.notes.is_empty(), "{:?}", out.notes);
@@ -1969,7 +1982,7 @@ mod tests {
                     let seq = self.skills.values().find(|k| k.name == name && k.version == version).unwrap().seq;
                     let mut skill = self.skills.remove(&seq).unwrap();
                     skill.project = op["project"].as_str().unwrap().into();
-                    skill.files = serde_json::from_value(op["files"].clone()).unwrap();
+                    skill.files = crate::memory::model::b64map::deserialize(&op["files"]).unwrap();
                     skill.content_hash = op["content_hash"].as_str().unwrap().into();
                     return serde_json::json!({"ok": true, "version": version, "seq": self.put_skill(skill)});
                 }
@@ -1985,8 +1998,7 @@ mod tests {
         }
 
         fn skill_page(&self, since: i64, limit: usize) -> serde_json::Value {
-            let rows: Vec<&Skill> = self.skills.range(since + 1..).map(|(_, s)| s).take(limit).collect();
-            serde_json::json!({"skills": rows})
+            crate::memory::fake_station_skills::page(self.skills.range(since + 1..).map(|(_, s)| s).take(limit))
         }
     }
 
@@ -2000,12 +2012,9 @@ mod tests {
                     let results: Vec<_> = body["ops"].as_array().unwrap().iter().map(|op| r.op(op)).collect();
                     (200, serde_json::json!({"results": results}))
                 }
-                ("POST", "/api/skills/batch") => {
-                    let results: Vec<_> = body["ops"].as_array().unwrap().iter().map(|op| r.skill_op(op)).collect();
-                    (200, serde_json::json!({"results": results}))
-                }
+                ("POST", "/api/skills/v2/batch") => crate::memory::fake_station_skills::batch(body, |op| r.skill_op(op)),
                 ("GET", "/api/memory") => (200, r.page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
-                ("GET", "/api/skills") => (200, r.skill_page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
+                ("GET", "/api/skills/v2") => (200, r.skill_page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
                 _ => panic!("unexpected request {m} {p}"),
             }
         })
@@ -2274,10 +2283,143 @@ mod tests {
         let (base, _log) = stub_relay(Box::new(|_, _, _| (404, serde_json::json!("404 page not found")))).await;
         let c = client(&base, "ast-a");
         let err = restore_skill(&s, &c, "m1", Scope::Global, "", "demo", 4).await.unwrap_err();
-        assert_eq!(err.to_string(), SKILL_HISTORY_UNSUPPORTED);
+        assert_eq!(err.to_string(), SKILL_WIRE_V2_MISSING);
         let err = c.skill_versions(Scope::Global, "", "demo").await.map_err(|e| skill_history_error(e, "demo", None)).unwrap_err();
-        assert_eq!(err.to_string(), SKILL_HISTORY_UNSUPPORTED);
+        assert_eq!(err.to_string(), SKILL_WIRE_V2_MISSING);
         assert_eq!(s.pending_count().unwrap(), 0);
+    }
+
+    // ─────────────── skill wire v2 (F8) ───────────────
+
+    /// Queues a push of skill `name` (as `atem skill add` does).
+    fn queue_skill(s: &Store, name: &str) {
+        let skill = skill_v1(name, "# deploy steps", "m1");
+        s.put_skill(&skill).unwrap();
+        s.enqueue(&PendingOp::PushSkill { skill, base_version: 0 }).unwrap();
+    }
+
+    /// A stub relay's log of (method, path and query, body).
+    type RelayLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    /// The skill requests of `log`, as (method, path without the query).
+    fn skill_requests(log: &RelayLog) -> Vec<(String, String)> {
+        log.lock().unwrap().iter()
+            .filter(|(_, p, _)| p.starts_with("/api/skills"))
+            .map(|(m, p, _)| (m.clone(), p.split('?').next().unwrap().to_string()))
+            .collect()
+    }
+
+    /// A Station from before skill wire v2: a 404 on every v2 route, the
+    /// legacy routes still answering. The push, the pull, history and
+    /// restore stop with the clear error; nothing is written, nothing is
+    /// acked, and no request goes to a legacy route.
+    #[tokio::test]
+    async fn a_station_without_skill_wire_v2_is_a_clear_error_never_a_fallback() {
+        let s = Store::open_in_memory().unwrap();
+        queue_skill(&s, "deploy");
+        let (base, log) = stub_relay(Box::new(|m, p, body| {
+            if p.starts_with("/api/skills/v2") {
+                return (404, serde_json::json!("404 page not found"));
+            }
+            if let Some(r) = empty_pulls(m, p) {
+                return r;
+            }
+            // The legacy routes, never to be used.
+            if m == "POST" {
+                return (200, ok_results(p, body));
+            }
+            (200, serde_json::json!({"skills": [], "versions": []}))
+        })).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert_eq!(out.notes, vec![SKILL_WIRE_V2_MISSING.to_string()]);
+        assert!(out.relay_error);
+        assert_eq!((out.pushed, s.pending_count().unwrap()), (0, 1));
+        assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        let c = client(&base, "ast-a");
+        let err = restore_skill(&s, &c, "m1", Scope::Global, "", "deploy", 1).await.unwrap_err();
+        assert_eq!(err.to_string(), SKILL_WIRE_V2_MISSING);
+        let err = c.skill_versions(Scope::Global, "", "deploy").await.map_err(|e| skill_history_error(e, "deploy", None)).unwrap_err();
+        assert_eq!(err.to_string(), SKILL_WIRE_V2_MISSING);
+        assert_eq!(s.pending_count().unwrap(), 1);
+        assert_eq!(skill_requests(&log), [
+            ("POST", "/api/skills/v2/batch"), ("GET", "/api/skills/v2"), ("GET", "/api/skills/v2/version"), ("GET", "/api/skills/v2/versions"),
+        ].map(|(m, p)| (m.to_string(), p.to_string())));
+    }
+
+    /// Every other failure of a v2 skill request is an error as before and
+    /// never a switch of format: one POST to the v2 batch and one GET of the
+    /// v2 collection, no legacy route, the push still queued, the cursor
+    /// where it was.
+    #[tokio::test]
+    async fn skill_wire_v2_failures_never_switch_format() {
+        let ok = |wire_version: serde_json::Value| (200, serde_json::json!({"wire_version": wire_version, "results": [{"ok": true, "version": 1, "seq": 1}], "skills": []}));
+        let cases: Vec<(&str, (u16, serde_json::Value), &str)> = vec![
+            ("401", (401, serde_json::json!({"error": "invalid or unbound session"})), RELAY_UNAUTHORIZED_NOTE),
+            ("403", (403, serde_json::json!({"error": "forbidden"})), "relay returned 403"),
+            ("400", (400, serde_json::json!({"error": "invalid skill files encoding"})), "relay returned 400"),
+            ("500", (500, serde_json::json!({"error": "boom"})), "relay returned 500"),
+            ("503", (503, serde_json::json!({"error": "temporarily unavailable"})), RELAY_UNAVAILABLE_NOTE),
+            ("no wire_version", (200, serde_json::json!({"results": [{"ok": true, "version": 1, "seq": 1}], "skills": []})), "unexpected relay response"),
+            ("wire_version 3", ok(serde_json::json!(3)), "unexpected relay response"),
+            ("not JSON", (200, serde_json::json!("<html>")), "unexpected relay response"),
+        ];
+        for (label, answer, note) in cases {
+            let s = Store::open_in_memory().unwrap();
+            queue_skill(&s, "deploy");
+            let (base, log) = stub_relay(Box::new(move |m, p, _| {
+                if p.starts_with("/api/skills") {
+                    return answer.clone();
+                }
+                empty_pulls(m, p).unwrap()
+            })).await;
+            let (_td, ctx) = test_ctx();
+            let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+            assert!(out.relay_error && !out.notes.is_empty() && out.notes.iter().all(|n| n.contains(note)), "{label}: {:?}", out.notes);
+            assert_eq!((out.pushed, s.pending_count().unwrap()), (0, 1), "{label}");
+            assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), 0, "{label}");
+            assert_eq!(skill_requests(&log), [("POST", "/api/skills/v2/batch"), ("GET", "/api/skills/v2")]
+                .map(|(m, p)| (m.to_string(), p.to_string())), "{label}");
+        }
+    }
+
+    /// A pulled row that breaks the v2 rules is refused, by the client too:
+    /// the page is not applied and the cursor stays.
+    #[tokio::test]
+    async fn a_pulled_skill_row_that_breaks_the_wire_rules_is_refused() {
+        let envelope = |marker: u8| format!("e1.0123abcd.{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [marker; 40]));
+        let row = |encoding: serde_json::Value, files: serde_json::Value| {
+            let mut row = serde_json::to_value(skill_v1("deploy", "# x", "m2")).unwrap();
+            row["seq"] = serde_json::json!(5);
+            row["files"] = files;
+            if !encoding.is_null() {
+                row["files_encoding"] = encoding;
+            }
+            row
+        };
+        let pages = [
+            ("a non-empty value that isn't sealed", serde_json::json!({"wire_version": 2, "skills": [row("e1-text".into(), serde_json::json!({envelope(1): "plaintext"}))]})),
+            ("a plain path", serde_json::json!({"wire_version": 2, "skills": [row("e1-text".into(), serde_json::json!({"SKILL.md": envelope(2)}))]})),
+            ("a malformed envelope", serde_json::json!({"wire_version": 2, "skills": [row("e1-text".into(), serde_json::json!({envelope(1): "e1.0123abcd.bad"}))]})),
+            ("no files_encoding", serde_json::json!({"wire_version": 2, "skills": [row(serde_json::Value::Null, serde_json::json!({"SKILL.md": "IyB4"}))]})),
+            ("an unknown files_encoding", serde_json::json!({"wire_version": 2, "skills": [row("guess".into(), serde_json::json!({"SKILL.md": "IyB4"}))]})),
+            ("invalid base64", serde_json::json!({"wire_version": 2, "skills": [row("base64".into(), serde_json::json!({"SKILL.md": "not base64!"}))]})),
+            ("no wire_version", serde_json::json!({"skills": [row("base64".into(), serde_json::json!({"SKILL.md": "IyB4"}))]})),
+        ];
+        for (label, page) in pages {
+            let s = Store::open_in_memory().unwrap();
+            let (base, _log) = stub_relay(Box::new(move |m, p, _| {
+                if m == "GET" && p.starts_with("/api/skills/v2?") {
+                    return (200, page.clone());
+                }
+                empty_pulls(m, p).unwrap()
+            })).await;
+            let (_td, ctx) = test_ctx();
+            let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+            assert!(out.relay_error && out.notes.len() == 1 && out.notes[0].contains("unexpected relay response"), "{label}: {:?}", out.notes);
+            assert!(s.all_skills().unwrap().is_empty(), "{label}");
+            assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), 0, "{label}");
+        }
     }
 }
 

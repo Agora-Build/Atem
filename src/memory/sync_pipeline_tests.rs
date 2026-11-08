@@ -838,7 +838,7 @@ async fn a_page_that_fails_to_open_drops_the_page_fetched_meanwhile() {
         !log.lock()
             .unwrap()
             .iter()
-            .any(|(_, p, _)| p.starts_with("/api/skills?"))
+            .any(|(_, p, _)| p.starts_with("/api/skills/v2?"))
     );
 
     // The next sync starts from the committed cursor.
@@ -2411,4 +2411,222 @@ async fn an_op_whose_project_hash_is_named_after_it_was_sealed_is_sealed_again()
         }
         assert_eq!(s.pending_count().unwrap(), 0);
     }
+}
+
+// ─────────────── skill wire v2 (F8) ───────────────
+
+/// A skill with `SKILL.md` and an empty `.gitkeep`.
+fn skill_with_an_empty_file(machine: &str) -> Skill {
+    let mut skill = super::tests::skill_v1("deploy", "# deploy steps", machine);
+    skill.files.insert(".gitkeep".into(), Vec::new());
+    skill.content_hash = skill_hash(&skill.files);
+    skill
+}
+
+/// The skill requests of `log`, as (method, path without the query).
+fn skill_requests(log: &Log) -> Vec<(String, String)> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, p, _)| p.starts_with("/api/skills"))
+        .map(|(m, p, _)| (m.clone(), p.split('?').next().unwrap().to_string()))
+        .collect()
+}
+
+/// A sealed skill goes out as `e1-text`: each file's `e1.` text as it is
+/// (encoded once), an empty file as `""` (never sealed). The Station stores
+/// it as the old wire did, and another machine pulls it back whole.
+#[tokio::test]
+async fn a_skill_with_an_empty_file_travels_as_e1_text_and_comes_back_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    let skill = skill_with_an_empty_file("m1");
+    s.put_skill(&skill).unwrap();
+    s.enqueue(&PendingOp::PushSkill {
+        skill: skill.clone(),
+        base_version: 0,
+    })
+    .unwrap();
+    let client = client_with(&base, &device, device.agent.clone());
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pushed, 1);
+    let posts = posted_ops(&log);
+    let sent = &posts[0][0]["skill"];
+    assert_eq!(sent["files_encoding"], "e1-text");
+    let envelope = format!("e1.{KID}.");
+    let files = sent["files"].as_object().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(files.keys().all(|path| path.starts_with(&envelope)));
+    let mut values: Vec<&str> = files.values().map(|v| v.as_str().unwrap()).collect();
+    values.sort();
+    assert!(values[0].is_empty() && values[1].starts_with(&envelope));
+    // Stored as the old wire stored it: the same e1 text, "" for the empty
+    // file (base64 of nothing is nothing).
+    let stored = relay
+        .lock()
+        .unwrap()
+        .skills
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(stored.files.len(), 2);
+    for (path, value) in files {
+        assert_eq!(stored.files[path], value.as_str().unwrap().as_bytes());
+    }
+    assert_eq!(
+        crate::memory::fake_station_skills::row(&stored)["files_encoding"],
+        "e1-text"
+    );
+
+    // Another machine pulls it back whole: the same files and hash.
+    let other = Store::open_in_memory().unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&other, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    let pulled = other
+        .get_skill(Scope::Global, "", "deploy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pulled.files, skill.files);
+    assert_eq!(pulled.content_hash, skill_hash(&skill.files));
+    assert!(
+        skill_requests(&log)
+            .iter()
+            .all(|(_, p)| p.starts_with("/api/skills/v2"))
+    );
+}
+
+/// A skill push whose outcome is unknown (the connection closed with no
+/// answer) stays queued and goes again by the same v2 route in the same
+/// format: never in another format. (The Station here hadn't applied it; a
+/// sealed push it had applied would come back as a concurrent version.)
+#[tokio::test]
+async fn an_uncertain_skill_push_goes_again_in_the_same_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let first = AtomicBool::new(true);
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            return (0, serde_json::Value::Null);
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    let skill = skill_with_an_empty_file("m1");
+    s.put_skill(&skill).unwrap();
+    s.enqueue(&PendingOp::PushSkill {
+        skill,
+        base_version: 0,
+    })
+    .unwrap();
+    let client = client_with(&base, &device, device.agent.clone());
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.offline, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 1);
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.offline && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert_eq!(relay.lock().unwrap().skills.len(), 1);
+    let posts = posted_ops(&log);
+    assert_eq!(posts.len(), 2);
+    for post in &posts {
+        assert_eq!(post[0]["skill"]["files_encoding"], "e1-text");
+    }
+    let requests = skill_requests(&log);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, p)| p.starts_with("/api/skills/v2")),
+        "{requests:?}"
+    );
+    assert_eq!(
+        requests.iter().filter(|(m, _)| m == "POST").count(),
+        2,
+        "{requests:?}"
+    );
+}
+
+/// A migration rewrites a skill with an empty file as `e1-text` (the empty
+/// file `""`) while enabling, and back as `base64` while disabling: the
+/// stored row ends as it started, and both read-backs pass.
+#[tokio::test]
+async fn a_migration_rewrites_an_empty_skill_file_as_e1_text_and_back_as_base64() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = device(dir.path(), EncryptionMode::Enabling);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let skill = skill_with_an_empty_file("m2");
+    relay.lock().unwrap().put_skill(skill.clone());
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let client = client_with(&base, &device, device.agent.clone());
+    client.migrate_encryption().await.unwrap();
+    let rewrite = posted_ops(&log)[0][0].clone();
+    assert_eq!(rewrite["op"], "rewrite");
+    assert_eq!(rewrite["files_encoding"], "e1-text");
+    let envelope = format!("e1.{KID}.");
+    let mut values: Vec<&str> = rewrite["files"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    values.sort();
+    assert!(values[0].is_empty() && values[1].starts_with(&envelope));
+    client.verify_encryption_migration().await.unwrap();
+    let sealed = relay
+        .lock()
+        .unwrap()
+        .skills
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(sealed.files.values().any(Vec::is_empty));
+
+    device.state(EncryptionMode::Disabling, Some(KID));
+    client.migrate_encryption().await.unwrap();
+    let posts = posted_ops(&log);
+    let rewrite = &posts.last().unwrap()[0];
+    assert_eq!(rewrite["files_encoding"], "base64");
+    client.verify_encryption_migration().await.unwrap();
+    let plain = relay
+        .lock()
+        .unwrap()
+        .skills
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        Skill {
+            seq: skill.seq,
+            ..plain
+        },
+        Skill {
+            seq: skill.seq,
+            ..skill
+        }
+    );
+    assert!(
+        skill_requests(&log)
+            .iter()
+            .all(|(_, p)| p.starts_with("/api/skills/v2"))
+    );
 }

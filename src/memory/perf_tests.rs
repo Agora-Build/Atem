@@ -20,6 +20,7 @@ use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
 use crate::memory::fake_astation::{
     ACCOUNT, ASTATION_ID, DEVICE_ID, UnlockedDevice, pin, set_state,
 };
+use crate::memory::fake_station_skills;
 use crate::memory::grant::seal_k_grant;
 use crate::memory::model::{Memory, Scope, Skill, content_hash, skill_hash};
 use crate::memory::statements::FakeAstation;
@@ -627,9 +628,14 @@ fn handle(
         ("GET", "/api/memory") => {
             json!({"memories": data.memories.range(since + 1..).take(limit).map(|(_, m)| m).collect::<Vec<_>>()})
         }
-        ("GET", "/api/skills") => {
-            json!({"skills": data.skills.range(since + 1..).take(limit).map(|(_, s)| s).collect::<Vec<_>>()})
-        }
+        // Skills through the v2 routes only, as the Station's adapter serves
+        // them (`fake_station_skills`), the rows kept in their stored form.
+        ("GET", "/api/skills/v2") => fake_station_skills::page(
+            data.skills
+                .range(since + 1..)
+                .take(limit)
+                .map(|(_, s)| s),
+        ),
         ("POST", "/api/memory/batch") => {
             let mut results = Vec::new();
             for op in body["ops"].as_array().unwrap() {
@@ -655,41 +661,39 @@ fn handle(
             }
             json!({"results": results})
         }
-        ("POST", "/api/skills/batch") => {
-            let mut results = Vec::new();
-            for op in body["ops"].as_array().unwrap() {
-                match op["op"].as_str().unwrap() {
-                    "push" => {
-                        if let Some(value) = op["skill"]["files"]
-                            .as_object()
-                            .and_then(|files| files.values().next())
-                            .and_then(Value::as_str)
-                        {
-                            data.last_file_value = value.len();
-                        }
-                        let skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
-                        let version = skill.version;
-                        let seq = data.put_skill(skill);
-                        results.push(json!({"ok": true, "version": version, "seq": seq}));
-                    }
-                    "rewrite" => {
-                        let key = (
-                            op["name"].as_str().unwrap().to_string(),
-                            op["version"].as_i64().unwrap(),
-                        );
-                        let old = data.skill_seq[&key];
-                        let mut skill = data.skills.remove(&old).unwrap();
-                        skill.project = op["project"].as_str().unwrap().into();
-                        skill.files = serde_json::from_value(op["files"].clone()).unwrap();
-                        skill.content_hash = op["content_hash"].as_str().unwrap().into();
-                        let version = skill.version;
-                        let seq = data.put_skill(skill);
-                        results.push(json!({"ok": true, "version": version, "seq": seq}));
-                    }
-                    _ => results.push(json!({"ok": true})),
-                }
+        ("POST", "/api/skills/v2/batch") => {
+            // The file's value as sent, before the Station stores it.
+            if let Some(value) = body["ops"][0]["skill"]["files"]
+                .as_object()
+                .and_then(|files| files.values().next())
+                .and_then(Value::as_str)
+            {
+                data.last_file_value = value.len();
             }
-            json!({"results": results})
+            let data = &mut *data;
+            fake_station_skills::batch_ok(body, |op| match op["op"].as_str().unwrap() {
+                "push" => {
+                    let skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
+                    let version = skill.version;
+                    let seq = data.put_skill(skill);
+                    json!({"ok": true, "version": version, "seq": seq})
+                }
+                "rewrite" => {
+                    let key = (
+                        op["name"].as_str().unwrap().to_string(),
+                        op["version"].as_i64().unwrap(),
+                    );
+                    let old = data.skill_seq[&key];
+                    let mut skill = data.skills.remove(&old).unwrap();
+                    skill.project = op["project"].as_str().unwrap().into();
+                    skill.files = crate::memory::model::b64map::deserialize(&op["files"]).unwrap();
+                    skill.content_hash = op["content_hash"].as_str().unwrap().into();
+                    let version = skill.version;
+                    let seq = data.put_skill(skill);
+                    json!({"ok": true, "version": version, "seq": seq})
+                }
+                _ => json!({"ok": true}),
+            })
         }
         ("POST", "/api/vault") => {
             let id = format!("v-{}", data.vaults.len() + 1);

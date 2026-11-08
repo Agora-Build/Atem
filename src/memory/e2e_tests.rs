@@ -3,6 +3,7 @@ use crate::memory::api::KnowledgeClient;
 use crate::memory::account_keys::CryptOp;
 use crate::memory::crypto::{EncryptionContext, EncryptionMode};
 use crate::memory::fake_astation::UnlockedDevice;
+use crate::memory::fake_station_skills;
 use crate::memory::cred_agent::{CredAgent, CredAgentApi, Reply, Request, error_of, test_agent};
 use crate::paths::CredPaths;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -207,10 +208,11 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
         let page: Vec<&Memory> = state.memories.iter().filter(|row| row.seq > since).collect();
         return json!({"memories": page});
     }
-    if method == "GET" && path.starts_with("/api/skills?") {
+    // Skills through the v2 routes only, as the Station's adapter serves
+    // them (`fake_station_skills`), the rows kept in their stored form.
+    if method == "GET" && path.starts_with("/api/skills/v2?") {
         let since = since(path);
-        let page: Vec<&Skill> = state.skills.iter().filter(|row| row.seq > since).collect();
-        return json!({"skills": page});
+        return fake_station_skills::page(state.skills.iter().filter(|row| row.seq > since));
     }
     if method == "POST" && path.starts_with("/api/memory/batch?") {
         let mut results = Vec::new();
@@ -248,9 +250,9 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
         }
         return json!({"results": results});
     }
-    if method == "POST" && path.starts_with("/api/skills/batch?") {
-        let mut results = Vec::new();
-        for op in body["ops"].as_array().unwrap() {
+    if method == "POST" && path.starts_with("/api/skills/v2/batch?") {
+        let state = &mut *state;
+        return fake_station_skills::batch_ok(body, |op| {
             assert_eq!(op["op"], "rewrite");
             let seq = state.next_seq;
             state.next_seq += 1;
@@ -262,12 +264,11 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
                 .find(|row| row.name == name && row.version == version)
                 .unwrap();
             skill.project = op["project"].as_str().unwrap().into();
-            skill.files = serde_json::from_value(op["files"].clone()).unwrap();
+            skill.files = crate::memory::model::b64map::deserialize(&op["files"]).unwrap();
             skill.content_hash = op["content_hash"].as_str().unwrap().into();
             skill.seq = seq;
-            results.push(json!({"ok": true, "version": version, "seq": state.next_seq}));
-        }
-        return json!({"results": results});
+            json!({"ok": true, "version": version, "seq": state.next_seq})
+        });
     }
     if method == "GET" && path.starts_with("/api/vault?") {
         return json!([{"vault_id": "v-test", "summary": state.vault_summary}]);
