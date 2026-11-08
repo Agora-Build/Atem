@@ -37,3 +37,5 @@ mod kat_tests;
 pub(crate) mod fake_astation;
 #[cfg(test)]
 mod k_agent_tests;
+#[cfg(test)]
+mod perf_tests;
