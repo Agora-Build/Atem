@@ -694,14 +694,14 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
             let skills = store.live_skills()?;
             println!("Memories:   {} valid, {} outdated (kept as history)", valid, outdated);
             println!("Skills:     {} live", skills.len());
-            let elsewhere = (
-                live.iter().filter(|m| m.project_unresolved()).count(),
-                skills.iter().filter(|s| s.project_unresolved()).count(),
+            let unknown = (
+                live.iter().filter(|m| m.has_unresolved_project()).count(),
+                skills.iter().filter(|s| s.has_unresolved_project()).count(),
             );
-            if elsewhere != (0, 0) {
+            if unknown != (0, 0) {
                 println!(
-                    "Not here:   {} memories, {} skills of projects not on this machine (kept, not applied until this machine uses the project)",
-                    elsewhere.0, elsewhere.1
+                    "Not known:  {} memories, {} skills of projects this machine doesn't know yet (kept, not applied; `atem sync` in a project's checkout applies its own)",
+                    unknown.0, unknown.1
                 );
             }
             println!("Pending:    {} change(s) waiting to sync", store.pending_count()?);

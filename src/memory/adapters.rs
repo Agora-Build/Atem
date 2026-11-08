@@ -140,11 +140,11 @@ fn line(mark: Mark, target: String, detail: impl Into<String>) -> ReportLine {
     ReportLine { mark, target, detail: detail.into() }
 }
 
-/// Facts of a project this Atem can't name (`Memory::project_unresolved`)
+/// Facts of a project this Atem can't name (`Memory::has_unresolved_project`)
 /// are never written anywhere, whatever their scope.
 pub fn apply_memory(agent: Agent, ctx: &Ctx, mems: &[Memory]) -> Vec<ReportLine> {
     let visible: Vec<Memory> = mems.iter()
-        .filter(|m| m.is_valid() && !m.project_unresolved() && !agent.skips_echo(m, ctx))
+        .filter(|m| m.is_valid() && !m.has_unresolved_project() && !agent.skips_echo(m, ctx))
         .cloned().collect();
     let global: Vec<Memory> = visible.iter()
         .filter(|m| m.scope == Scope::Global || (m.scope == Scope::Machine && m.machine == ctx.atem_id))
@@ -236,7 +236,7 @@ fn write_block(path: &Path, repo_root: Option<&Path>, mems: &[Memory], agent: Ag
 pub fn apply_skills(agent: Agent, ctx: &Ctx, skills: &[Skill]) -> Vec<ReportLine> {
     let mut report = Vec::new();
     for s in skills {
-        if s.project_unresolved()
+        if s.has_unresolved_project()
             || (s.scope == Scope::Project && ctx.repo.as_ref().map(|r| r.key != s.project).unwrap_or(true)) {
             continue;
         }
@@ -519,14 +519,19 @@ mod tests {
             // A relay can't route an unnamed fact into the global block either.
             m(Scope::Global, unnamed, "", "Global but unnamed", "cli", "x"),
         ];
-        apply_memory(Agent::Claude, &ctx, &mems);
-        let repo = ctx.repo.as_ref().unwrap();
-        let text = read(ctx.home.join(".claude/CLAUDE.md")) + &read(repo.root.join("CLAUDE.local.md"));
-        assert!(!text.contains("Fridays") && !text.contains("unnamed"), "{text}");
         let skills = vec![sk(Scope::Project, unnamed, "ship", 1, "# ship"), sk(Scope::Global, unnamed, "lint", 1, "# lint")];
-        assert!(apply_skills(Agent::Claude, &ctx, &skills).is_empty());
-        assert!(!ctx.home.join(".claude/skills/lint").exists());
-        assert!(!repo.root.join(".claude/skills/ship").exists());
+        for agent in Agent::all() {
+            apply_memory(agent, &ctx, &mems);
+            assert!(apply_skills(agent, &ctx, &skills).is_empty(), "{}", agent.name());
+        }
+        let repo = ctx.repo.as_ref().unwrap();
+        let text = [ctx.home.join(".claude/CLAUDE.md"), ctx.home.join(".codex/AGENTS.md"), repo.root.join("CLAUDE.local.md"), repo.root.join("AGENTS.md")]
+            .into_iter().map(read).collect::<String>();
+        assert!(text.contains("<!-- atem:memory"), "the blocks were written: {text}");
+        assert!(!text.contains("Fridays") && !text.contains("unnamed"), "{text}");
+        for dir in [".claude/skills", ".agents/skills"] {
+            assert!(!ctx.home.join(dir).join("lint").exists() && !repo.root.join(dir).join("ship").exists(), "{dir}");
+        }
     }
 
     #[test]

@@ -488,25 +488,19 @@ async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 }
 
 /// Names the projects of rows pulled as hashes this Atem had no name for
-/// (`model::project_unresolved`), once it has one: recorded since in
-/// project_names.json, or the checkout this sync runs in. Rows it still
-/// can't name stay unresolved: kept, listed, never applied. A failure only
-/// leaves them unresolved (a note).
-async fn resolve_projects(store: &Store, client: &KnowledgeClient, ctx: &Ctx, out: &mut SyncOutcome) -> Result<()> {
+/// (`model::is_unresolved_project`), once it has one: recorded since in
+/// project_names.json, or learned now (the checkout this sync runs in, and
+/// after a rotation the projects it already knows). Skills under a hash it
+/// can never name are dropped (see `Store::resolve_projects`). Rows it
+/// still can't name stay unresolved: kept, listed, never applied.
+async fn resolve_projects(store: &Store, client: &KnowledgeClient, ctx: &Ctx) -> Result<()> {
     let hashes = store.unresolved_projects()?;
     if hashes.is_empty() {
         return Ok(());
     }
     let current = ctx.repo.as_ref().map(|repo| repo.key.clone());
-    match client.project_names(hashes, current).await {
-        Ok(names) => {
-            for (hash, name) in names {
-                store.resolve_project(&hash, &name)?;
-            }
-        }
-        Err(e) => out.note(format!("facts and skills of projects not on this machine stay unapplied: {}", e)),
-    }
-    Ok(())
+    let naming = client.learn_project_names(hashes, current).await?;
+    store.resolve_projects(&naming.named, &naming.stale)
 }
 
 /// `client = None` means offline: harvest and apply still run locally.
@@ -524,7 +518,10 @@ pub async fn run_sync(store: &Store, client: Option<&KnowledgeClient>, ctx: &Ctx
             if !out.offline {
                 pull_all(store, c, &mut out).await?;
             }
-            resolve_projects(store, c, ctx, &mut out).await?;
+            // A failure only leaves those rows unresolved.
+            if let Err(e) = resolve_projects(store, c, ctx).await {
+                out.note(format!("rows of projects this machine doesn't know yet stay unapplied: {:#}", e));
+            }
             // Only a sync where push and pull both finished cleanly counts.
             if !out.offline && !out.relay_error {
                 store.set_state(LAST_SYNC_AT, now_secs())?;

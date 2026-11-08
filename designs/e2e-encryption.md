@@ -942,10 +942,13 @@ data becomes readable on the server again):
   per-project filtering working; atem keeps the hash → name mapping
   locally. A pulled memory or skill whose hash has no name on this device
   (a project it never used) doesn't fail the page: it is kept unresolved
-  under the hash, never applied, resolved once the device has the name, and
-  pushed back with the same hash (designs/atem-memory.md "Projects not on
-  this machine"). A malformed `h1.` value or a non-`h1.` project while on
-  still fails it, and migration still needs every name.
+  under the hash, never applied, resolved once the device has the name
+  (after a rotation, the device hashes the projects it knows under the new
+  key), and pushed back with the same hash unless the device has named it
+  since; skills under another key's hash, or under any hash while off, are
+  dropped, since the migration delivers them again (designs/atem-memory.md
+  "Projects not on this machine"). A malformed `h1.` value or a non-`h1.`
+  project while on still fails it, and migration still needs every name.
 - **`content_hash`** is what the relay dedupes on. A plain SHA-256 of a
   short fact can be guessed; a keyed HMAC can't.
 - The local `knowledge.db` stays plain text (mode 0600), so search and

@@ -73,18 +73,19 @@ impl Memory {
         self.valid_at.unwrap_or(self.created_at)
     }
 
-    /// Its project is one this Atem can't name yet; see `project_unresolved`.
-    pub fn project_unresolved(&self) -> bool {
-        project_unresolved(&self.project)
+    /// Its project is one this Atem can't name yet; see `is_unresolved_project`.
+    pub fn has_unresolved_project(&self) -> bool {
+        is_unresolved_project(&self.project)
     }
 }
 
 /// A project pulled as the relay's `h1.` keyed hash that this Atem has no
 /// name for yet (encryption on, the project never used here). The row keeps
 /// the hash until the name is known, and is never applied meanwhile (see
-/// designs/atem-memory.md "Projects not on this machine"). No remote's
-/// project key has this shape: a DNS label is at most 63 characters.
-pub fn project_unresolved(project: &str) -> bool {
+/// designs/atem-memory.md "Projects not on this machine"). A project key
+/// never has this shape: it is `<host>/<path>` (a `/` is neither hex nor a
+/// kid character) or `local:<folder>`.
+pub fn is_unresolved_project(project: &str) -> bool {
     atem_client::project::is_project_hash(project)
 }
 
@@ -166,9 +167,9 @@ pub struct Skill {
 }
 
 impl Skill {
-    /// Its project is one this Atem can't name yet; see `project_unresolved`.
-    pub fn project_unresolved(&self) -> bool {
-        project_unresolved(&self.project)
+    /// Its project is one this Atem can't name yet; see `is_unresolved_project`.
+    pub fn has_unresolved_project(&self) -> bool {
+        is_unresolved_project(&self.project)
     }
 }
 

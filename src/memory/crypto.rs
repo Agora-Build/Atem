@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::CredAgentApi;
-use crate::memory::model::{content_hash, project_unresolved, skill_hash, Memory, Skill};
+use crate::memory::model::{content_hash, is_unresolved_project, skill_hash, Memory, Skill};
 use crate::paths::CredPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +236,18 @@ const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 const MALFORMED_PROJECT: &str = "relay sent a malformed project hash; refusing it";
 
+/// What `EncryptionContext::learn_project_names` found for pulled project
+/// hashes this Atem couldn't name.
+#[derive(Debug, Default, PartialEq)]
+pub struct ProjectNaming {
+    /// `(hash, name)` for the hashes it can name now.
+    pub named: Vec<(String, String)>,
+    /// Unnamed hashes it can never name: another kid's (a rotation), or any
+    /// while not encrypting. A migration delivers what is still live under
+    /// them again, with a fresh seq, under the current key or in plain.
+    pub stale: Vec<String>,
+}
+
 /// One Astation's encryption mode, and a handle on the cred agent, which
 /// holds `K` and does every seal, open and keyed hash: this process never
 /// sees `K`. Mode and kid come from the latest signed account state; off
@@ -350,23 +362,23 @@ impl EncryptionContext {
 
     /// Project keys as the relay sees them (`h1.` hashes while encrypting),
     /// remembered in project_names.json. Empty stays empty, and a project
-    /// this Atem can't name (`project_unresolved`) stays the hash it came as.
+    /// this Atem can't name (`is_unresolved_project`) stays the hash it came as.
     pub fn wire_projects(&self, projects: &[String]) -> Result<Vec<String>> {
         if !self.should_encrypt() {
             if self.remember_off_projects {
-                let _ = self.remember(projects.iter().filter(|project| !project.is_empty() && !project_unresolved(project)).map(|project| (project.clone(), project.clone())).collect());
+                let _ = self.remember(projects.iter().filter(|project| !project.is_empty() && !is_unresolved_project(project)).map(|project| (project.clone(), project.clone())).collect());
             }
             return Ok(projects.to_vec());
         }
         let ops = projects.iter()
-            .filter(|project| !project.is_empty() && !project_unresolved(project))
+            .filter(|project| !project.is_empty() && !is_unresolved_project(project))
             .map(|project| CryptOp::keyed_hash(project.as_bytes()))
             .collect();
         let mut results = self.run(ops)?.into_iter();
         let mut names = Vec::new();
         let wire = projects.iter()
             .map(|project| {
-                if project.is_empty() || project_unresolved(project) { return Ok(project.clone()); }
+                if project.is_empty() || is_unresolved_project(project) { return Ok(project.clone()); }
                 let hash = next_text(&mut results)?;
                 names.push((hash.clone(), project.clone()));
                 Ok(hash)
@@ -425,7 +437,7 @@ impl EncryptionContext {
     /// for a project never used here) goes back as the hash it came as.
     pub fn encrypt_memories(&self, memories: Vec<Memory>) -> Result<Vec<Memory>> {
         if !self.should_encrypt() { return Ok(memories); }
-        let hashed = |memory: &Memory| !memory.project.is_empty() && !memory.project_unresolved();
+        let hashed = |memory: &Memory| !memory.project.is_empty() && !memory.has_unresolved_project();
         let mut ops = Vec::new();
         for memory in &memories {
             if hashed(memory) { ops.push(CryptOp::keyed_hash(memory.project.as_bytes())); }
@@ -523,7 +535,7 @@ impl EncryptionContext {
     /// Atem can't name goes back as the hash it came as.
     pub fn encrypt_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
         if !self.should_encrypt() { return Ok(skills); }
-        let hashed = |skill: &Skill| !skill.project.is_empty() && !skill.project_unresolved();
+        let hashed = |skill: &Skill| !skill.project.is_empty() && !skill.has_unresolved_project();
         let mut ops = Vec::new();
         for skill in &skills {
             let record = skill_record(skill);
@@ -640,25 +652,63 @@ impl EncryptionContext {
         match names.and_then(|names| names.name(&self.data_account, &hash)) {
             Some(name) => Ok(name.to_string()),
             None if !keep_unresolved => bail!(UNKNOWN_PROJECT),
-            None if !project_unresolved(&hash) => bail!(MALFORMED_PROJECT),
+            None if !is_unresolved_project(&hash) => bail!(MALFORMED_PROJECT),
             None => Ok(hash),
         }
     }
 
-    /// The names this Atem has for the project hashes `hashes` (from
-    /// project_names.json), as `(hash, name)`. While encrypting, `current`
-    /// (the checkout a sync runs in) is hashed and recorded first, so facts
-    /// pulled for it resolve there; best effort: a locked agent leaves them
-    /// for a later sync.
-    pub fn known_project_names(&self, hashes: &[String], current: Option<&str>) -> Result<Vec<(String, String)>> {
-        if let Some(project) = current.filter(|project| !project.is_empty())
-            && self.should_encrypt() {
-            let _ = self.wire_project(project);
+    /// Names what it can of the pulled project hashes `hashes`, learning
+    /// first: when one under the current kid has no name, it hashes under
+    /// that kid, and records in project_names.json (which also feeds the
+    /// credential-project reports), `current` (the checkout a sync runs in)
+    /// and every project key it knows only under another kid (after a
+    /// rotation). Best effort: a locked agent leaves them for a later sync.
+    /// While not encrypting nothing is hashed.
+    pub fn learn_project_names(&self, hashes: &[String], current: Option<&str>) -> Result<ProjectNaming> {
+        let mut names = self.names()?;
+        let account = self.data_account.as_str();
+        let unnamed_current = hashes.iter().any(|hash| {
+            names.name(account, hash).is_none()
+                && self.kid.is_some()
+                && atem_client::project::kid_of_project_hash(hash) == self.kid.as_deref()
+        });
+        if let Some(kid) = self.kid.as_deref()
+            && self.should_encrypt()
+            && unnamed_current {
+            let learn: std::collections::BTreeSet<String> = names.projects(account).into_iter()
+                .chain(current.map(str::to_string))
+                .filter(|project| !project.is_empty() && !is_unresolved_project(project) && !names.hashed_under(account, kid, project))
+                .collect();
+            if !learn.is_empty() && self.wire_projects(&learn.into_iter().collect::<Vec<_>>()).is_ok() {
+                names = self.names()?;
+            }
         }
+        let mut naming = ProjectNaming::default();
+        for hash in hashes {
+            match names.name(account, hash) {
+                Some(name) => naming.named.push((hash.clone(), name.to_string())),
+                None if !self.should_encrypt()
+                    || atem_client::project::kid_of_project_hash(hash) != self.kid.as_deref() => naming.stale.push(hash.clone()),
+                None => {}
+            }
+        }
+        Ok(naming)
+    }
+
+    /// Puts every project that is a hash this Atem has named since it was
+    /// pulled back under its name, so a push sends it like any other (hashed
+    /// under the current kid while encrypting, plain while not). One it
+    /// still can't name stays the hash it came as.
+    pub fn name_hashes<'a>(&self, projects: impl IntoIterator<Item = &'a mut String>) -> Result<()> {
+        let hashes: Vec<&mut String> = projects.into_iter().filter(|project| is_unresolved_project(project)).collect();
+        if hashes.is_empty() { return Ok(()); }
         let names = self.names()?;
-        Ok(hashes.iter()
-            .filter_map(|hash| names.name(&self.data_account, hash).map(|name| (hash.clone(), name.to_string())))
-            .collect())
+        for project in hashes {
+            if let Some(name) = names.name(&self.data_account, project) {
+                *project = name.to_string();
+            }
+        }
+        Ok(())
     }
 
     fn remember(&self, names: Vec<(String, String)>) -> Result<()> {
@@ -854,7 +904,7 @@ mod tests {
         let pulled = context.decrypt_pulled_memories(vec![known, unnamed.clone()]).unwrap();
         assert_eq!(pulled[0].project, "github.com/agora/atem");
         assert_eq!((pulled[1].project.as_str(), pulled[1].content.as_str()), (hash.as_str(), "elsewhere"));
-        assert!(pulled[1].project_unresolved());
+        assert!(pulled[1].has_unresolved_project());
         // Migration and its read-back must name every project.
         let error = context.decrypt_memories(vec![unnamed.clone()]).unwrap_err().to_string();
         assert!(error.contains("unknown on this Atem"), "{error}");
