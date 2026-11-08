@@ -572,6 +572,59 @@ impl Store {
         Ok(self.all_skills()?.into_iter().filter(|s| !s.deleted).collect())
     }
 
+    // ── projects not known here yet (`model::is_unresolved_project`) ──────
+    /// The project hashes memories and skills are stored under because this
+    /// Atem had no name for them when they were pulled.
+    pub fn unresolved_projects(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project FROM memories WHERE project LIKE 'h1.%' UNION SELECT project FROM skills WHERE project LIKE 'h1.%' ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let projects = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(projects.into_iter().filter(|p| crate::memory::model::is_unresolved_project(p)).collect())
+    }
+
+    /// Applies what `EncryptionContext::learn_project_names` found, in one
+    /// transaction. Each named hash's memories and skills move to its name,
+    /// like rows pulled with it. A skill already stored under the name stays
+    /// unless the moved one is later: a higher version, or the same version
+    /// with a higher seq (a purge rewrites its version in place). A local
+    /// unpushed edit (seq 0) always has the higher version. Skills under a
+    /// `stale` hash are dropped: it can never be named here, and a migration
+    /// delivers what is still live again. Memories are kept: the migration
+    /// rewrites each one by id.
+    pub fn resolve_projects(&self, named: &[(String, String)], stale: &[String]) -> Result<()> {
+        self.in_transaction(|| {
+            for (hash, name) in named {
+                self.conn.execute("UPDATE memories SET project = ?2 WHERE project = ?1", params![hash, name])?;
+                for mut s in self.skills_under(hash)? {
+                    match self.get_skill(s.scope, name, &s.name)? {
+                        Some(cur) if (s.version, s.seq) <= (cur.version, cur.seq) => {}
+                        _ => {
+                            s.project = name.clone();
+                            self.put_skill(&s)?;
+                        }
+                    }
+                }
+                self.conn.execute("DELETE FROM skills WHERE project = ?1", params![hash])?;
+            }
+            for hash in stale {
+                self.conn.execute("DELETE FROM skills WHERE project = ?1", params![hash])?;
+            }
+            Ok(())
+        })
+    }
+
+    fn skills_under(&self, project: &str) -> Result<Vec<Skill>> {
+        let mut stmt = self.conn.prepare("SELECT data FROM skills WHERE project = ?1")?;
+        let rows = stmt.query_map(params![project], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
     // ── pending ops ─────────────────────────────────────────────────────
     pub fn enqueue(&self, op: &PendingOp) -> Result<()> {
         self.conn.execute("INSERT INTO pending_ops (payload) VALUES (?1)", params![serde_json::to_string(op)?])?;
@@ -1017,6 +1070,42 @@ mod tests {
         s.put_skill(&d).unwrap();
         assert_eq!(s.all_skills().unwrap().len(), 2);
         assert_eq!(s.live_skills().unwrap().len(), 1);
+    }
+
+    /// A hash this Atem can't name (well-formed `h1.<kid>.<64 hex>`).
+    const UNNAMED: &str = "h1.0123abcd.abababababababababababababababababababababababababababababababab";
+
+    /// Another key's hash, never nameable here.
+    const STALE: &str = "h1.89abcdef.cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+    #[test]
+    fn rows_of_an_unnamed_project_move_to_its_name_once_known() {
+        let s = Store::open_in_memory().unwrap();
+        let fact = Memory { scope: Scope::Project, project: UNNAMED.into(), ..mem("mem_a", "A") };
+        s.upsert_memory(&fact).unwrap();
+        s.upsert_memory(&Memory { scope: Scope::Project, project: "h1.not-a-hash".into(), ..mem("mem_b", "B") }).unwrap();
+        s.upsert_memory(&Memory { scope: Scope::Project, project: STALE.into(), ..mem("mem_c", "C") }).unwrap();
+        let at = |version, seq, project: &str| Skill { scope: Scope::Project, project: project.into(), seq, ..skill("ship", version) };
+        s.put_skill(&at(3, 9, UNNAMED)).unwrap();
+        s.put_skill(&Skill { name: "lint".into(), ..at(2, 4, UNNAMED) }).unwrap();
+        // Pushed here meanwhile under the name, at a later version: it stays.
+        s.put_skill(&Skill { name: "lint".into(), ..at(5, 0, "github.com/a/b") }).unwrap();
+        // Purged since and pulled under the name: the same version, a later seq.
+        let purged = Skill { name: "deploy".into(), deleted: true, files: BTreeMap::new(), content_hash: String::new(), ..at(1, 12, "github.com/a/b") };
+        s.put_skill(&Skill { name: "deploy".into(), ..at(1, 6, UNNAMED) }).unwrap();
+        s.put_skill(&purged).unwrap();
+        s.put_skill(&Skill { name: "old".into(), ..at(1, 2, STALE) }).unwrap();
+        assert_eq!(s.unresolved_projects().unwrap(), vec![UNNAMED.to_string(), STALE.to_string()], "well-formed hashes only");
+
+        s.resolve_projects(&[(UNNAMED.to_string(), "github.com/a/b".to_string())], &[STALE.to_string()]).unwrap();
+        assert_eq!(s.get_memory("mem_a").unwrap().unwrap().project, "github.com/a/b");
+        assert_eq!(s.get_memory("mem_c").unwrap().unwrap().project, STALE, "a fact is kept: a migration rewrites it by id");
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "ship").unwrap().unwrap().version, 3);
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "lint").unwrap().unwrap().version, 5);
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "deploy").unwrap().unwrap(), purged, "the purge stays");
+        assert!(s.get_skill(Scope::Project, STALE, "old").unwrap().is_none(), "a stale hash's skill is dropped");
+        assert!(s.all_skills().unwrap().iter().all(|skill| skill.project == "github.com/a/b"));
+        assert_eq!(s.unresolved_projects().unwrap(), vec![STALE.to_string()]);
     }
 
     #[test]

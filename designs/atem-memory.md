@@ -102,6 +102,54 @@ What atem **shows** keeps the remote's own spelling:
 other than the one you're in has no remote to read, so it shows its stored
 (lowercase) key's last segment.
 
+### Projects not known here yet
+
+With end-to-end encryption on, the relay only sees a project's keyed hash
+(`h1.<kid>.<hex>`; see designs/e2e-encryption.md "What gets encrypted"), and
+each atem keeps the hash → key names it computed itself in
+`cred/project_names.json`. A machine that never used a project has no name
+for its hash, so a pulled fact or skill of that project is **unresolved**:
+
+- The pull keeps it as it is, under the hash, and moves the cursor on. One
+  fact from a repo this machine never opened never stops Memory or skill
+  sync, and skills are still pulled after memories.
+- It is never applied: no managed block and no skill directory, whatever its
+  scope. (A project key never has the hash's shape: it is `<host>/<path>`,
+  and `/` is neither hex nor a kid character, or `local:<folder>`.)
+- `memory list --all`, `memory search` and `skill list` show it as
+  `project:(not known here yet)`, also inside that project's checkout until
+  a sync runs there; `memory status` counts these under "Not known".
+- Once this machine has the name, the next `atem sync` resolves it: the row
+  moves to the project key and is applied like any other. When a hash under
+  the current key has no name, the sync first hashes under that key, and
+  records, the checkout it runs in and every project key this machine knows
+  only under an earlier key (after a rotation), so running `atem sync` (or
+  any command that syncs) in that checkout is enough; a push or skill
+  history there records it too. A skill already stored under the key stays
+  unless the resolved one is later: a higher version, or the same version
+  with a higher seq (a purge rewrites its version in place, so a purge
+  pulled under the name wins over the older copy).
+- A hash this machine can never name is dropped for skills: another key's
+  (after a rotation), or any while encryption is off or being turned off
+  (`disabling`). The migration that
+  rotated or turned off encryption delivered every live row again, with a
+  fresh seq, under the current key or in plain text. Facts are kept: that
+  migration rewrites each one by id.
+- Pushing it back never changes the project: a replacement inherits the
+  hash. At push time a hash this machine has named since goes out under its
+  name (hashed under the current key, or plain while encryption is off);
+  one it still can't name goes out exactly as it came, never hashed again,
+  so devices that know the project read it under its name. One narrow case:
+  an old-key hash pushed after a rotation's migration snapshot is never
+  rewritten, so a later migration stops unless the device running it still
+  knows that project's name.
+
+Only a well-formed hash is kept this way. Anything else still fails the page
+as before: a project that isn't `h1.` while encryption is on, a malformed
+`h1.` value, or a field that doesn't open. Migration (turning encryption on
+or off, rotation) and its read-back still need every project's name: a
+device that can't name one can't migrate the account.
+
 ## Identity & auth
 
 **Astation is the control plane.** Atem Memory works only on machines paired
@@ -494,7 +542,8 @@ atem skill purge <name> [--version <n> | --all-versions]
 
 atem memory status                  # account, machine, pending ops, last sync, targets,
                                     # held-back memories, credential findings,
-                                    # facts with more than one valid successor
+                                    # facts with more than one valid successor,
+                                    # rows of projects not known here yet
 ```
 
 - `<date>` is `YYYY-MM-DD` (midnight UTC) or unix seconds. `<id>` for `replace`, `invalidate`, `rm`, `purge` and `list --history` is a full id or a unique prefix, with or without `mem_` (the Codex block's short id works), or the listing form `<head>…<tail>` (`..` works in place of `…`).
@@ -531,12 +580,20 @@ atem memory status                  # account, machine, pending ops, last sync, 
    "Last sync" is recorded only when push and pull both finish with no
    network or HTTP error. Pulled invalidations set `invalid_at` and
    `superseded_by` locally (a local invalidation not yet on the relay is
-   kept); the search index follows through triggers.
-4. **Apply** memory blocks and skills to every discovered agent, and print
-   the report. Invalid facts are skipped. **Planned (owner decision
-   2026-11-08), not implemented:** only while the account's encryption is on,
-   a transition measure until encryption is the only mode (next section).
-
+   kept); the search index follows through triggers. A row of a project this
+   machine can't name is kept unresolved (see "Projects not known
+   here yet"); it never stops the pull.
+4. **Resolve** unresolved rows whose project name is now known (recorded in
+   `project_names.json`, or learned now: the checkout the sync runs in, and
+   after a rotation the projects this machine already knows), and drop
+   skills under a hash it can never name. Any failure here (the name
+   lookup, the cred agent or the store) only leaves them unresolved, with a
+   note.
+5. **Apply** memory blocks and skills to every discovered agent, and print
+   the report. Invalid facts and unresolved rows are skipped. **Planned
+   (owner decision 2026-11-08), not implemented:** only while the account's
+   encryption is on, a transition measure until encryption is the only mode
+   (next section).
 ## Injection into agents requires encryption On (planned)
 
 **Planned (owner decision 2026-11-08), not implemented.** This is a
@@ -742,6 +799,16 @@ lives.
   3. B runs `atem sync` in the same project's checkout.
   4. The fact appears in B's `CLAUDE.local.md` and in B's Codex target.
   5. A skill pushed from B appears under A's `~/.claude/skills/`.
+- **Projects not known here yet** (`src/memory/e2e_tests.rs`, encryption
+  on, two devices of one account): a page with one fact and one skill of a
+  project B never used applies the rest, keeps both unresolved and
+  unapplied (Claude and Codex, global-scope rows too), moves both cursors,
+  and the next sync goes on; they resolve and are applied once B records
+  the name or syncs from that checkout; a purge pulled under the name wins
+  over the older unresolved copy; after a rotation or turning encryption
+  off, skills under the old hash are dropped and known projects resolve; a
+  replacement pushed from B keeps the original hash, or goes out under the
+  name B learned since.
 - Phase 1.1 (Fact validity, Search, Skill history):
   - **Pure/local:** `replace` queues add then invalidate; invalidation is
     final (a second invalidate changes nothing); invalid facts are left out
