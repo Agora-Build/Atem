@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::memory::crypto::{EncryptionMode, valid_kid};
 use crate::memory::device_keys::decode32;
+use crate::memory::encoding::SecretBytes;
 
 /// The error every caller treats as "no `K` yet": sync keeps its changes
 /// queued, and atem asks Astation for the key.
@@ -176,27 +177,20 @@ impl AccountKeys {
                     record,
                     field,
                     plain,
-                } => {
-                    let plain = decode_bytes(&plain, "plain text")?;
-                    Ok(CryptOut::Sealed(seal_field(
-                        &ring.current,
-                        &record,
-                        &field,
-                        &plain,
-                    )?))
-                }
+                } => Ok(CryptOut::Sealed(seal_field(
+                    &ring.current,
+                    &record,
+                    &field,
+                    &plain,
+                )?)),
                 CryptOp::Open {
                     record,
                     field,
                     value,
-                } => {
-                    let plain = open_field(ring, mode, &record, &field, &value)?;
-                    Ok(CryptOut::Opened(Zeroizing::new(
-                        STANDARD.encode(&plain[..]),
-                    )))
-                }
+                } => Ok(CryptOut::Opened(open_field(
+                    ring, mode, &record, &field, &value,
+                )?)),
                 CryptOp::KeyedHash { value, kid } => {
-                    let value = decode_bytes(&value, "hash input")?;
                     let key = match kid.as_deref() {
                         None => &ring.current,
                         Some(kid) if kid == ring.current.kid => &ring.current,
@@ -279,25 +273,66 @@ fn key_from_wire(kid: String, key: &str) -> Result<AccountKey> {
     })
 }
 
-fn decode_bytes(value: &str, what: &str) -> Result<Zeroizing<Vec<u8>>> {
-    Ok(Zeroizing::new(
-        STANDARD
-            .decode(value)
-            .with_context(|| format!("{what} is not base64"))?,
-    ))
+/// Secret bytes as base64 text on a v2 JSON line (`Crypt` ops and results);
+/// binary frames carry them raw (agent_frame.rs). Encoded into, and decoded
+/// straight from the line into, `SecretBytes`: no unwiped copy.
+mod secret_base64 {
+    use super::SecretBytes;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    pub fn serialize<S: serde::Serializer>(
+        bytes: &SecretBytes,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut text = SecretBytes::zeroed(super::base64_len(bytes.len()));
+        let written = STANDARD
+            .encode_slice(&bytes[..], &mut text[..])
+            .map_err(serde::ser::Error::custom)?;
+        text.truncate(written);
+        serializer.serialize_str(std::str::from_utf8(&text).map_err(serde::ser::Error::custom)?)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<SecretBytes, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = SecretBytes;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("base64 text")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<SecretBytes, E> {
+                let mut bytes = SecretBytes::zeroed(base64::decoded_len_estimate(text.len()));
+                let len = STANDARD
+                    .decode_slice(text, &mut bytes[..])
+                    .map_err(|_| E::custom("a field is not base64"))?;
+                bytes.truncate(len);
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
+/// The length of standard, padded base64 of `len` bytes.
+fn base64_len(len: usize) -> usize {
+    len.div_ceil(3) * 4
 }
 
 /// One operation of a `Crypt` request. Externally tagged
 /// (`{"seal": {...}}`): serde reads it straight into its fields, never
-/// through an unwiped buffer, so plain text stays in `Zeroizing` memory.
+/// through an unwiped buffer, so plain text stays in `SecretBytes`.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CryptOp {
-    /// `plain` is base64 of the bytes to seal.
+    /// The bytes to seal (base64 on a JSON line).
     Seal {
         record: String,
         field: String,
-        plain: Zeroizing<String>,
+        #[serde(with = "secret_base64")]
+        plain: SecretBytes,
     },
     /// `value` is an `e1.` field (empty stays empty).
     Open {
@@ -305,11 +340,12 @@ pub enum CryptOp {
         field: String,
         value: String,
     },
-    /// `value` is base64 of the bytes to HMAC; under the current key, or
-    /// the retained key `kid` names (a service scope's `h1.<kid>.` entry,
-    /// §R9.6).
+    /// The bytes to HMAC (base64 on a JSON line); under the current key,
+    /// or the retained key `kid` names (a service scope's `h1.<kid>.`
+    /// entry, §R9.6).
     KeyedHash {
-        value: Zeroizing<String>,
+        #[serde(with = "secret_base64")]
+        value: SecretBytes,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kid: Option<String>,
     },
@@ -320,7 +356,7 @@ impl CryptOp {
         Self::Seal {
             record: record.into(),
             field: field.into(),
-            plain: Zeroizing::new(STANDARD.encode(plain)),
+            plain: SecretBytes::copy_of(plain),
         }
     }
 
@@ -334,7 +370,7 @@ impl CryptOp {
 
     pub fn keyed_hash(value: &[u8]) -> Self {
         Self::KeyedHash {
-            value: Zeroizing::new(STANDARD.encode(value)),
+            value: SecretBytes::copy_of(value),
             kid: None,
         }
     }
@@ -343,7 +379,7 @@ impl CryptOp {
     /// previous).
     pub fn keyed_hash_under(value: &[u8], kid: &str) -> Self {
         Self::KeyedHash {
-            value: Zeroizing::new(STANDARD.encode(value)),
+            value: SecretBytes::copy_of(value),
             kid: Some(kid.to_string()),
         }
     }
@@ -351,32 +387,29 @@ impl CryptOp {
     /// The size of the field itself, in bytes (for error messages): the
     /// plain text to seal or hash, or the `e1.` value to open.
     pub fn field_len(&self) -> usize {
-        let decoded = |b64: &str| {
-            let padding = b64.bytes().rev().take_while(|byte| *byte == b'=').count();
-            (b64.len() / 4 * 3).saturating_sub(padding)
-        };
         match self {
-            Self::Seal { plain, .. } => decoded(plain),
+            Self::Seal { plain, .. } => plain.len(),
             Self::Open { value, .. } => value.len(),
-            Self::KeyedHash { value, .. } => decoded(value),
+            Self::KeyedHash { value, .. } => value.len(),
         }
     }
 
-    /// Roughly what this op adds to a request line and its reply, for batching.
+    /// Roughly what this op adds to a request line and its reply, for
+    /// batching (with the plain text as base64, as on a JSON line).
     pub fn wire_len(&self) -> usize {
         match self {
             Self::Seal {
                 record,
                 field,
                 plain,
-            } => record.len() + field.len() + plain.len() * 2 + 96,
+            } => record.len() + field.len() + base64_len(plain.len()) * 2 + 96,
             Self::Open {
                 record,
                 field,
                 value,
             } => record.len() + field.len() + value.len() * 2 + 96,
             Self::KeyedHash { value, kid } => {
-                value.len() + 160 + kid.as_ref().map_or(0, |k| k.len() + 8)
+                base64_len(value.len()) + 160 + kid.as_ref().map_or(0, |k| k.len() + 8)
             }
         }
     }
@@ -388,8 +421,8 @@ impl CryptOp {
 pub enum CryptOut {
     /// An `e1.` field (empty for empty plain text).
     Sealed(String),
-    /// Base64 of the opened bytes.
-    Opened(Zeroizing<String>),
+    /// The opened bytes (base64 on a JSON line).
+    Opened(#[serde(with = "secret_base64")] SecretBytes),
     /// An `h1.` keyed hash.
     Hashed(String),
 }
@@ -404,9 +437,9 @@ impl CryptOut {
         }
     }
 
-    pub fn into_plain(self) -> Result<Zeroizing<Vec<u8>>> {
+    pub fn into_plain(self) -> Result<SecretBytes> {
         match self {
-            Self::Opened(encoded) => decode_bytes(&encoded, "an opened field"),
+            Self::Opened(plain) => Ok(plain),
             _ => bail!("the cred agent answered a seal or hash where an open was asked"),
         }
     }
@@ -464,9 +497,9 @@ fn open_field(
     record: &str,
     field: &str,
     value: &str,
-) -> Result<Zeroizing<Vec<u8>>> {
+) -> Result<SecretBytes> {
     if value.is_empty() {
-        return Ok(Zeroizing::new(Vec::new()));
+        return Ok(SecretBytes::default());
     }
     let rest = value
         .strip_prefix("e1.")
@@ -499,7 +532,7 @@ fn open_field(
                 aad: &field_aad(record, field),
             },
         )
-        .map(Zeroizing::new)
+        .map(SecretBytes::from_vec)
         .map_err(|_| anyhow!("encrypted field authentication failed"))
 }
 

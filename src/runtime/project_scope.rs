@@ -182,7 +182,6 @@ impl crate::memory::cred_agent::CredAgentApi for TableAgent {
     ) -> Result<crate::memory::cred_agent::Reply> {
         use crate::memory::account_keys::CryptOut;
         use crate::memory::cred_agent::{Reply, Request};
-        use base64::Engine as _;
         *self.requests.lock().unwrap() += 1;
         let Request::Crypt { ops, .. } = request else {
             anyhow::bail!("not a crypt request");
@@ -198,9 +197,7 @@ impl crate::memory::cred_agent::CredAgentApi for TableAgent {
             .into_iter()
             .map(|op| match op {
                 CryptOp::KeyedHash { value, kid } => {
-                    let key = String::from_utf8(
-                        base64::engine::general_purpose::STANDARD.decode(value.as_bytes())?,
-                    )?;
+                    let key = String::from_utf8(value.to_vec())?;
                     let kid = kid.ok_or_else(|| anyhow!("no kid"))?;
                     table
                         .get(&(key, kid.clone()))

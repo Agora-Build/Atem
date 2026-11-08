@@ -25,7 +25,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::daemon::{
     self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, recorded_socket,
@@ -34,7 +34,7 @@ use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::{
     CredAgent, CredAgentApi, PROTOCOL_VERSION, Reply, Request, build_id,
 };
-use crate::memory::encoding::WipingBuf;
+use crate::memory::encoding::{SecretBytes, WipingBuf, wipe, wipe_uninit};
 use crate::paths::CredPaths;
 
 /// Bounds a misbehaving peer. A `Crypt` batch is kept under 2 MiB of input by
@@ -747,7 +747,7 @@ impl Lines {
     }
 
     /// The next whole line read (with its newline), if one has arrived.
-    fn next_line(&mut self) -> Option<Zeroizing<Vec<u8>>> {
+    fn next_line(&mut self) -> Option<SecretBytes> {
         let Some(offset) = self.pending.0[self.scanned..]
             .iter()
             .position(|byte| *byte == b'\n')
@@ -757,7 +757,9 @@ impl Lines {
         };
         let end = self.scanned + offset;
         self.scanned = 0;
-        Some(Zeroizing::new(self.pending.0.drain(..=end).collect()))
+        Some(SecretBytes::from_vec(
+            self.pending.0.drain(..=end).collect(),
+        ))
     }
 
     /// Where the next read goes.
@@ -787,13 +789,13 @@ impl Lines {
                 self.written = 0;
             }
         } else {
-            self.pending.0.spare_capacity_mut().zeroize();
+            wipe_uninit(self.pending.0.spare_capacity_mut());
             #[cfg(test)]
             {
                 self.written = self.pending.0.capacity();
             }
         }
-        self.chunk.zeroize();
+        wipe(&mut self.chunk[..]);
     }
 
     /// Tests: everything this connection holds in user space whose bytes
