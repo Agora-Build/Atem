@@ -2069,3 +2069,346 @@ async fn vaults_are_sealed_while_the_one_before_is_posted_and_all_read_back() {
     let err = vault.verify_encryption_migration().await.unwrap_err();
     assert!(err.to_string().contains("unmigrated field"), "{err}");
 }
+
+// ─────────────── projects not known here yet (#132) in the pipeline ───────────────
+
+/// A project this device never used: it has no name for its hash.
+const ELSEWHERE: &str = "github.com/agora/elsewhere";
+
+/// `ELSEWHERE`'s hash under this device's key, recorded nowhere.
+fn unnamed(device: &UnlockedDevice) -> String {
+    context(device).keyed_hash(ELSEWHERE.as_bytes()).unwrap()
+}
+
+/// The relay's rows `ids` moved to the project `hash`.
+fn move_to(relay: &Mutex<KeepingRelay>, ids: &[&str], hash: &str) {
+    let mut r = relay.lock().unwrap();
+    for id in ids {
+        let row = r.rows.get_mut(*id).unwrap();
+        row.scope = Scope::Project;
+        row.project = hash.into();
+    }
+}
+
+/// Records every row a pulled page applies, in a temp table the page's own
+/// transaction writes: a page rolled back leaves nothing there.
+fn count_applied(s: &Store) {
+    s.test_conn()
+        .execute_batch(
+            "CREATE TEMP TABLE applied (id TEXT NOT NULL);
+             CREATE TEMP TRIGGER count_applied BEFORE INSERT ON memories BEGIN INSERT INTO applied VALUES (new.id); END;",
+        )
+        .unwrap();
+}
+
+/// Rows applied by committed pages, and how many of them are distinct.
+fn applied(s: &Store) -> (i64, i64) {
+    s.test_conn()
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT id) FROM applied",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// A recorder that also collects the records every `Crypt` request opens.
+fn recording_opens(device: &UnlockedDevice) -> (Arc<Recorder>, Arc<Mutex<Vec<String>>>) {
+    let opened: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = opened.clone();
+    let recorder = Recorder::with_hook(
+        device.agent.clone(),
+        Box::new(move |_, ops, _| {
+            seen.lock()
+                .unwrap()
+                .extend(ops.iter().filter_map(|op| match op {
+                    CryptOp::Open { record, .. } => Some(record.clone()),
+                    _ => None,
+                }));
+        }),
+    );
+    (recorder, opened)
+}
+
+/// Pages 2 and 3 carry rows of a project this device can't name, and each is
+/// opened while the page before it is applied: those rows are kept as they
+/// came (unresolved, content opened), committed with their page and its
+/// cursor; no page is fetched again, and every row is applied once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unresolved_rows_on_a_page_opened_ahead_commit_with_their_page() {
+    use rusqlite::functions::FunctionFlags;
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    seed_sealed(&relay, &device, 450);
+    let hash = unnamed(&device);
+    // The first and last rows of page 2, and the first of page 3.
+    let moved = ["mem_r0201", "mem_r0400", "mem_r0401"];
+    move_to(&relay, &moved, &hash);
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let (recorder, opened) = recording_opens(&device);
+    let s = Store::open_in_memory().unwrap();
+    count_applied(&s);
+    // The last insert of pages 1 and 2 waits (bounded) for the next page's
+    // open to reach the agent.
+    let overlaps = Arc::new(AtomicUsize::new(0));
+    let (counted, opens) = (overlaps.clone(), opened.clone());
+    s.test_conn()
+        .create_scalar_function("wait_for_open", 1, FunctionFlags::SQLITE_UTF8, move |f| {
+            let id: String = f.get(0)?;
+            if wait_for(Duration::from_secs(2), || {
+                opens.lock().unwrap().contains(&id)
+            }) {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(0i64)
+        })
+        .unwrap();
+    s.test_conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER page_one_last BEFORE INSERT ON memories WHEN new.id = 'mem_r0200' BEGIN SELECT wait_for_open('mem_r0201'); END;
+             CREATE TEMP TRIGGER page_two_last BEFORE INSERT ON memories WHEN new.id = 'mem_r0400' BEGIN SELECT wait_for_open('mem_r0401'); END;",
+        )
+        .unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(
+        overlaps.load(Ordering::SeqCst),
+        2,
+        "pages 2 and 3 weren't opened while the page before them was applied"
+    );
+    assert_eq!(out.pulled, 450);
+    assert_eq!(memory_gets(&log), vec![0, 200, 400]);
+    assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 450);
+    assert_eq!(
+        applied(&s),
+        (450, 450),
+        "a row applied twice, or not at all"
+    );
+    // Every row as a pull opens it: the moved ones under the hash.
+    let want = context(&device)
+        .decrypt_pulled_memories(relay.lock().unwrap().rows.values().cloned().collect())
+        .unwrap();
+    assert_eq!(s.history_memories().unwrap().len(), 450);
+    for row in want {
+        assert_eq!(
+            s.get_memory(&row.id).unwrap().as_ref(),
+            Some(&row),
+            "{}",
+            row.id
+        );
+    }
+    for id in moved {
+        let kept = s.get_memory(id).unwrap().unwrap();
+        assert!(
+            kept.has_unresolved_project() && kept.project == hash,
+            "{id}"
+        );
+        assert!(kept.content.starts_with("remote fact"), "{id}");
+    }
+    // Still unresolved after the sync's resolve step: one open per page,
+    // nothing else asked of the agent.
+    assert_eq!(s.unresolved_projects().unwrap(), vec![hash]);
+    let (seals, page_opens) = recorder.seals_and_opens();
+    assert!(seals.is_empty(), "{seals:?}");
+    assert_eq!(page_opens.len(), 3);
+}
+
+/// Page 2's transaction fails after page 3, which carries rows of a project
+/// this device can't name, was opened: page 3 is dropped unapplied (none of
+/// its rows stored, unresolved or not), the cursor stays at page 1, and the
+/// next sync applies pages 2 and 3 once, the rows kept unresolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_that_fails_after_the_next_with_unresolved_rows_was_opened_drops_it() {
+    use rusqlite::functions::FunctionFlags;
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    seed_sealed(&relay, &device, 600);
+    let hash = unnamed(&device);
+    let moved = ["mem_r0401", "mem_r0450", "mem_r0600"];
+    move_to(&relay, &moved, &hash);
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let (recorder, opened) = recording_opens(&device);
+    let s = Store::open_in_memory().unwrap();
+    count_applied(&s);
+    let opened_three = Arc::new(AtomicBool::new(false));
+    let (seen, calls) = (opened_three.clone(), recorder.clone());
+    s.test_conn()
+        .create_scalar_function(
+            "stop_after_page_three",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| -> rusqlite::Result<i64> {
+                seen.store(
+                    wait_for(Duration::from_secs(2), || calls.calls().len() >= 3),
+                    Ordering::SeqCst,
+                );
+                Err(rusqlite::Error::UserFunctionError("injected stop".into()))
+            },
+        )
+        .unwrap();
+    s.test_conn()
+        .execute_batch("CREATE TEMP TRIGGER stop_mid_page BEFORE INSERT ON memories WHEN new.id = 'mem_r0300' BEGIN SELECT stop_after_page_three(); END;")
+        .unwrap();
+    let (_home, ctx) = test_ctx();
+    let client = client_with(&base, &device, recorder.clone());
+    let err = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("injected stop"), "{err:#}");
+    assert!(
+        opened_three.load(Ordering::SeqCst)
+            && opened.lock().unwrap().iter().any(|id| id == "mem_r0401"),
+        "page 3 wasn't opened during page 2's transaction"
+    );
+    assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 200);
+    assert_eq!(s.history_memories().unwrap().len(), 200);
+    assert!(s.history_memories().unwrap().iter().all(|m| m.seq <= 200));
+    assert!(
+        s.unresolved_projects().unwrap().is_empty(),
+        "page 3 left a row"
+    );
+    assert_eq!(applied(&s), (200, 200));
+
+    s.test_conn()
+        .execute_batch("DROP TRIGGER stop_mid_page;")
+        .unwrap();
+    log.lock().unwrap().clear();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pulled, 400);
+    assert_eq!(memory_gets(&log), vec![200, 400, 600]);
+    assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 600);
+    assert_eq!(s.history_memories().unwrap().len(), 600);
+    assert_eq!(
+        applied(&s),
+        (600, 600),
+        "a row applied twice, or not at all"
+    );
+    for id in moved {
+        let kept = s.get_memory(id).unwrap().unwrap();
+        assert!(
+            kept.has_unresolved_project() && kept.project == hash,
+            "{id}"
+        );
+    }
+    assert_eq!(s.unresolved_projects().unwrap(), vec![hash]);
+}
+
+/// A fact queued under a project hash this device couldn't name (a
+/// replacement of an unresolved fact) is sealed ahead as it came. While the
+/// chunk before it is in flight, resolution names that hash (the name
+/// recorded, the row moved to it by another writer): the fact is sealed again
+/// under its name, never sent under the hash it was sealed with. Under on the
+/// queued hash is an earlier key's and the name is hashed under the current
+/// key; under off the name goes plain. A fact under a hash still unknown is
+/// sent as sealed ahead, exactly as it came.
+#[tokio::test]
+async fn an_op_whose_project_hash_is_named_after_it_was_sealed_is_sealed_again() {
+    let named = format!("h1.89abcdef.{}", "cd".repeat(32));
+    let unknown = format!("h1.89abcdef.{}", "ef".repeat(32));
+    for mode in [EncryptionMode::On, EncryptionMode::Off] {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("knowledge.db");
+        let mut device = device(td.path(), EncryptionMode::On);
+        if mode == EncryptionMode::Off {
+            device.state(EncryptionMode::Off, None);
+        }
+        let recorder = Recorder::new(device.agent.clone());
+        let s = Store::open(&db).unwrap();
+        // Chunk 1: 50 facts. Chunk 2: 8 facts, then one fact under each hash.
+        queue(&s, (0..58).map(|i| fact(i, false)));
+        let under = |id: &str, project: &str| {
+            let mut m = valid(id, &format!("{id} deploys on mondays"));
+            m.scope = Scope::Project;
+            m.project = project.into();
+            m
+        };
+        queue(
+            &s,
+            [under("mem_named", &named), under("mem_unknown", &unknown)],
+        );
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        let keeping = keeping_relay(relay.clone());
+        let (sealed, names, account) = (
+            recorder.clone(),
+            device.paths.project_names.clone(),
+            context(&device).data_account,
+        );
+        let (other_writer, hash, first) = (db.clone(), named.clone(), AtomicBool::new(true));
+        let (base, log) = stub_relay(Box::new(move |m, p, body| {
+            if m == "POST" && first.swap(false, Ordering::SeqCst) {
+                // Chunk 2 is sealed first: under on, its request has come
+                // back; under off it needed no agent and was sealed in the
+                // same poll that sent chunk 1.
+                if mode == EncryptionMode::On {
+                    assert!(wait_for(Duration::from_secs(2), || sealed.calls().len() == 2));
+                }
+                let resolved = [(hash.clone(), ELSEWHERE.to_string())];
+                crate::memory::project_names::remember(&names, &account, resolved.clone()).unwrap();
+                Store::open(&other_writer)
+                    .unwrap()
+                    .resolve_projects(&resolved, &[])
+                    .unwrap();
+            }
+            keeping(m, p, body)
+        }))
+        .await;
+        let (_home, ctx) = test_ctx();
+        let client = client_with(&base, &device, recorder.clone());
+        let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap();
+        assert_eq!(out.pushed, 60, "{mode:?}: {:?}", out.notes);
+        let posts = posted_ops(&log);
+        assert_eq!(
+            posts.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![50, 10],
+            "{mode:?}"
+        );
+        let sent = |id: &str| {
+            posts[1].iter().find(|op| op["memory"]["id"] == id).unwrap()["memory"]["project"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let want = if mode == EncryptionMode::On {
+            context(&device).wire_project(ELSEWHERE).unwrap()
+        } else {
+            ELSEWHERE.to_string()
+        };
+        assert_eq!(sent("mem_named"), want, "{mode:?}");
+        assert_eq!(
+            sent("mem_unknown"),
+            unknown,
+            "{mode:?}: an unknown hash goes as it came"
+        );
+        assert!(
+            !serde_json::to_string(&posts).unwrap().contains(&named),
+            "{mode:?}: sent under the hash it was sealed with"
+        );
+        if mode == EncryptionMode::On {
+            // Chunk 1, chunk 2 ahead (no project hashed), then the named fact
+            // alone again (its project, content hash and content); the
+            // others of chunk 2 went as sealed ahead, its seal showing the
+            // agent unlocked.
+            let seals: Vec<usize> = recorder.seals_and_opens().0.iter().map(|c| c.ops).collect();
+            assert_eq!(seals, vec![100, 20, 3]);
+            assert_eq!(recorder.statuses(), 0);
+        } else {
+            assert_eq!(recorder.requests(), 0, "off never asks the agent");
+        }
+        assert_eq!(s.pending_count().unwrap(), 0);
+    }
+}

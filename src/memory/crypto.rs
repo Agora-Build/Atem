@@ -1525,13 +1525,17 @@ mod tests {
         let take = || std::mem::take(&mut *sizes.seen.lock().unwrap());
         let sum = |costs: Vec<Cost>| costs.into_iter().fold(Cost::default(), |a, b| a + b);
 
+        // A project pulled as a hash this Atem can't name goes out as it
+        // came: no keyed hash, in the cost as in the requests.
+        let unnamed = format!("h1.89abcdef.{}", "ab".repeat(32));
         let memories: Vec<Memory> = (0..40).map(|i| {
-            let project = if i % 2 == 0 { "github.com/agora/atem" } else { "" };
+            let project = match i % 4 { 0 | 2 => "github.com/agora/atem", 1 => unnamed.as_str(), _ => "" };
             memory(&format!("mem-{i}"), project, &"fact ".repeat(i + 1))
         }).collect();
         let sealed = context.encrypt_memories(memories.clone()).unwrap();
         assert_eq!(take(), vec![sum(memories.iter().map(memory_seal_cost).collect())]);
-        context.decrypt_memories(sealed.clone()).unwrap();
+        assert!(sealed.iter().zip(&memories).all(|(sealed, plain)| plain.project != unnamed || sealed.project == unnamed));
+        context.decrypt_pulled_memories(sealed.clone()).unwrap();
         assert_eq!(take(), vec![sum(sealed.iter().map(memory_open_cost).collect())]);
 
         let skills: Vec<Skill> = (0..5).map(|i| {
@@ -1540,24 +1544,26 @@ mod tests {
             files.insert(format!("ref/part-{i}.md"), vec![b'x'; 100 * i]);
             files.insert("empty.md".to_string(), Vec::new());
             Skill {
-                scope: crate::memory::model::Scope::Project, project: if i % 2 == 0 { "github.com/agora/atem".into() } else { String::new() },
+                scope: crate::memory::model::Scope::Project,
+                project: match i % 3 { 0 => "github.com/agora/atem".into(), 1 => unnamed.clone(), _ => String::new() },
                 name: format!("skill-{i}"), version: 3, content_hash: skill_hash(&files), files,
                 source_agent: "test".into(), source_machine: "mac".into(), created_at: 1, deleted: false, seq: 0,
             }
         }).collect();
-        let projects = vec!["github.com/agora/atem".to_string(), String::new(), "github.com/agora/other".to_string()];
+        let projects = vec!["github.com/agora/atem".to_string(), String::new(), unnamed.clone(), "github.com/agora/other".to_string()];
         let (sealed, wire) = context.encrypt_skills_with_projects(skills.clone(), &projects).unwrap();
         let [first, files] = skills.iter().map(skill_seal_cost)
             .fold([Cost::default(); 2], |[a, b], [c, d]| [a + c, b + d]);
         let first = first + sum(projects.iter().map(|p| project_hash_cost(p)).collect());
         assert_eq!(take(), vec![first, files]);
         assert_eq!(wire, context.wire_projects(&projects).unwrap());
+        assert_eq!(wire[2], unnamed);
         take();
-        context.decrypt_skills(sealed.clone()).unwrap();
+        context.decrypt_pulled_skills(sealed.clone()).unwrap();
         assert_eq!(take(), vec![sum(sealed.iter().map(skill_open_cost).collect())]);
         // The same skills sealed with and without the projects.
-        let alone = context.decrypt_skills(context.encrypt_skills(skills.clone()).unwrap()).unwrap();
-        assert_eq!(alone, context.decrypt_skills(sealed).unwrap());
+        let alone = context.decrypt_pulled_skills(context.encrypt_skills(skills.clone()).unwrap()).unwrap();
+        assert_eq!(alone, context.decrypt_pulled_skills(sealed).unwrap());
         assert_eq!(alone, skills);
     }
 }

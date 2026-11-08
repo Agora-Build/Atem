@@ -837,7 +837,11 @@ lives.
   contacting the agent),
   a page that fails to open or apply, or a crash, with the next one fetched
   or opened, a cursor moved by another writer, and what another connection
-  sees of the queue and cursor at each relay request.
+  sees of the queue and cursor at each relay request. Rows of a project not
+  known here on a page opened ahead are kept unresolved, committed once with
+  their page (dropped unapplied with it when the page before fails), and an
+  op whose project hash is named after it was sealed is sealed again under
+  its name.
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge
