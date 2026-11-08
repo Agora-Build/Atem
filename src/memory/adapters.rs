@@ -140,8 +140,12 @@ fn line(mark: Mark, target: String, detail: impl Into<String>) -> ReportLine {
     ReportLine { mark, target, detail: detail.into() }
 }
 
+/// Facts of a project this Atem can't name (`Memory::project_unresolved`)
+/// are never written anywhere, whatever their scope.
 pub fn apply_memory(agent: Agent, ctx: &Ctx, mems: &[Memory]) -> Vec<ReportLine> {
-    let visible: Vec<Memory> = mems.iter().filter(|m| m.is_valid() && !agent.skips_echo(m, ctx)).cloned().collect();
+    let visible: Vec<Memory> = mems.iter()
+        .filter(|m| m.is_valid() && !m.project_unresolved() && !agent.skips_echo(m, ctx))
+        .cloned().collect();
     let global: Vec<Memory> = visible.iter()
         .filter(|m| m.scope == Scope::Global || (m.scope == Scope::Machine && m.machine == ctx.atem_id))
         .cloned().collect();
@@ -228,10 +232,12 @@ fn write_block(path: &Path, repo_root: Option<&Path>, mems: &[Memory], agent: Ag
     line(Mark::Applied, target, format!("{} memories", sel.entries.len()))
 }
 
+/// Like facts, a skill of a project this Atem can't name is never installed.
 pub fn apply_skills(agent: Agent, ctx: &Ctx, skills: &[Skill]) -> Vec<ReportLine> {
     let mut report = Vec::new();
     for s in skills {
-        if s.scope == Scope::Project && ctx.repo.as_ref().map(|r| r.key != s.project).unwrap_or(true) {
+        if s.project_unresolved()
+            || (s.scope == Scope::Project && ctx.repo.as_ref().map(|r| r.key != s.project).unwrap_or(true)) {
             continue;
         }
         let Some(root) = agent.skills_root(ctx, s.scope) else { continue };
@@ -502,6 +508,25 @@ mod tests {
             .chain(std::fs::read_dir(ctx.home.join(".claude")).unwrap().flatten())
             .filter(|e| e.file_name().to_string_lossy().contains("atem-tmp")).collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn rows_of_a_project_not_on_this_machine_are_never_applied() {
+        let (_td, ctx) = setup();
+        let unnamed = "h1.0123abcd.abababababababababababababababababababababababababababababababab";
+        let mems = vec![
+            m(Scope::Project, unnamed, "", "Elsewhere deploys on Fridays", "cli", "x"),
+            // A relay can't route an unnamed fact into the global block either.
+            m(Scope::Global, unnamed, "", "Global but unnamed", "cli", "x"),
+        ];
+        apply_memory(Agent::Claude, &ctx, &mems);
+        let repo = ctx.repo.as_ref().unwrap();
+        let text = read(ctx.home.join(".claude/CLAUDE.md")) + &read(repo.root.join("CLAUDE.local.md"));
+        assert!(!text.contains("Fridays") && !text.contains("unnamed"), "{text}");
+        let skills = vec![sk(Scope::Project, unnamed, "ship", 1, "# ship"), sk(Scope::Global, unnamed, "lint", 1, "# lint")];
+        assert!(apply_skills(Agent::Claude, &ctx, &skills).is_empty());
+        assert!(!ctx.home.join(".claude/skills/lint").exists());
+        assert!(!repo.root.join(".claude/skills/ship").exists());
     }
 
     #[test]

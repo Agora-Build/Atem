@@ -572,6 +572,42 @@ impl Store {
         Ok(self.all_skills()?.into_iter().filter(|s| !s.deleted).collect())
     }
 
+    // ── projects not on this machine (`model::project_unresolved`) ──────
+    /// The project hashes memories and skills are stored under because this
+    /// Atem had no name for them when they were pulled.
+    pub fn unresolved_projects(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project FROM memories WHERE project LIKE 'h1.%' UNION SELECT project FROM skills WHERE project LIKE 'h1.%' ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let projects = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(projects.into_iter().filter(|p| crate::memory::model::project_unresolved(p)).collect())
+    }
+
+    /// The project hashed as `hash` is `name`: its memories and skills move
+    /// to it, like rows pulled with a name. A skill already stored under
+    /// `name` keeps the higher version (an equal one is replaced, as in
+    /// `apply_pulled_skills`). One transaction.
+    pub fn resolve_project(&self, hash: &str, name: &str) -> Result<()> {
+        self.in_transaction(|| {
+            self.conn.execute("UPDATE memories SET project = ?2 WHERE project = ?1", params![hash, name])?;
+            for mut s in self.all_skills()?.into_iter().filter(|s| s.project == hash) {
+                self.conn.execute(
+                    "DELETE FROM skills WHERE scope = ?1 AND project = ?2 AND name = ?3",
+                    params![s.scope.as_str(), hash, s.name],
+                )?;
+                match self.get_skill(s.scope, name, &s.name)? {
+                    Some(cur) if s.version < cur.version => {}
+                    _ => {
+                        s.project = name.to_string();
+                        self.put_skill(&s)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     // ── pending ops ─────────────────────────────────────────────────────
     pub fn enqueue(&self, op: &PendingOp) -> Result<()> {
         self.conn.execute("INSERT INTO pending_ops (payload) VALUES (?1)", params![serde_json::to_string(op)?])?;
@@ -1017,6 +1053,30 @@ mod tests {
         s.put_skill(&d).unwrap();
         assert_eq!(s.all_skills().unwrap().len(), 2);
         assert_eq!(s.live_skills().unwrap().len(), 1);
+    }
+
+    /// A hash this Atem can't name (well-formed `h1.<kid>.<64 hex>`).
+    const UNNAMED: &str = "h1.0123abcd.abababababababababababababababababababababababababababababababab";
+
+    #[test]
+    fn rows_of_an_unnamed_project_move_to_its_name_once_known() {
+        let s = Store::open_in_memory().unwrap();
+        let fact = Memory { scope: Scope::Project, project: UNNAMED.into(), ..mem("mem_a", "A") };
+        s.upsert_memory(&fact).unwrap();
+        s.upsert_memory(&Memory { scope: Scope::Project, project: "h1.not-a-hash".into(), ..mem("mem_b", "B") }).unwrap();
+        let at = |version, project: &str| Skill { scope: Scope::Project, project: project.into(), ..skill("ship", version) };
+        s.put_skill(&at(3, UNNAMED)).unwrap();
+        s.put_skill(&Skill { name: "lint".into(), ..at(2, UNNAMED) }).unwrap();
+        // Pushed here meanwhile under the name, at a later version: it stays.
+        s.put_skill(&Skill { name: "lint".into(), ..at(5, "github.com/a/b") }).unwrap();
+        assert_eq!(s.unresolved_projects().unwrap(), vec![UNNAMED.to_string()], "well-formed hashes only");
+
+        s.resolve_project(UNNAMED, "github.com/a/b").unwrap();
+        assert_eq!(s.get_memory("mem_a").unwrap().unwrap().project, "github.com/a/b");
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "ship").unwrap().unwrap().version, 3);
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "lint").unwrap().unwrap().version, 5);
+        assert!(s.all_skills().unwrap().iter().all(|skill| skill.project == "github.com/a/b"));
+        assert!(s.unresolved_projects().unwrap().is_empty());
     }
 
     #[test]

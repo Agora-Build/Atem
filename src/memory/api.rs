@@ -277,14 +277,22 @@ impl KnowledgeClient {
         let req = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: MemoryPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_memories(page.memories)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_memories(page.memories)).await.map_err(ApiError::from)
     }
 
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let req = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_skills(page.skills)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_skills(page.skills)).await.map_err(ApiError::from)
+    }
+
+    /// The names this Atem knows for the pulled project hashes `hashes`, as
+    /// `(hash, name)`; `current` (the checkout a sync runs in) is hashed and
+    /// recorded first. See `EncryptionContext::known_project_names`.
+    pub async fn project_names(&self, hashes: Vec<String>, current: Option<String>) -> Result<Vec<(String, String)>, ApiError> {
+        let encryption = self.encryption()?;
+        encryption.blocking(move |encryption| encryption.known_project_names(&hashes, current.as_deref())).await.map_err(ApiError::from)
     }
 
     /// A skill's history, newest first (no files).

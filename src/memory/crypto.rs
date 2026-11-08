@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::CredAgentApi;
-use crate::memory::model::{content_hash, skill_hash, Memory, Skill};
+use crate::memory::model::{content_hash, project_unresolved, skill_hash, Memory, Skill};
 use crate::paths::CredPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +234,7 @@ const CRYPT_BATCH_OPS: usize = 1024;
 const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
+const MALFORMED_PROJECT: &str = "relay sent a malformed project hash; refusing it";
 
 /// One Astation's encryption mode, and a handle on the cred agent, which
 /// holds `K` and does every seal, open and keyed hash: this process never
@@ -348,23 +349,24 @@ impl EncryptionContext {
     }
 
     /// Project keys as the relay sees them (`h1.` hashes while encrypting),
-    /// remembered in project_names.json. Empty stays empty.
+    /// remembered in project_names.json. Empty stays empty, and a project
+    /// this Atem can't name (`project_unresolved`) stays the hash it came as.
     pub fn wire_projects(&self, projects: &[String]) -> Result<Vec<String>> {
         if !self.should_encrypt() {
             if self.remember_off_projects {
-                let _ = self.remember(projects.iter().filter(|project| !project.is_empty()).map(|project| (project.clone(), project.clone())).collect());
+                let _ = self.remember(projects.iter().filter(|project| !project.is_empty() && !project_unresolved(project)).map(|project| (project.clone(), project.clone())).collect());
             }
             return Ok(projects.to_vec());
         }
         let ops = projects.iter()
-            .filter(|project| !project.is_empty())
+            .filter(|project| !project.is_empty() && !project_unresolved(project))
             .map(|project| CryptOp::keyed_hash(project.as_bytes()))
             .collect();
         let mut results = self.run(ops)?.into_iter();
         let mut names = Vec::new();
         let wire = projects.iter()
             .map(|project| {
-                if project.is_empty() { return Ok(String::new()); }
+                if project.is_empty() || project_unresolved(project) { return Ok(project.clone()); }
                 let hash = next_text(&mut results)?;
                 names.push((hash.clone(), project.clone()));
                 Ok(hash)
@@ -419,12 +421,14 @@ impl EncryptionContext {
     }
 
     /// Every memory's project and content hash and sealed content, in one
-    /// batch of agent requests.
+    /// batch of agent requests. A project this Atem can't name (a fact pulled
+    /// for a project never used here) goes back as the hash it came as.
     pub fn encrypt_memories(&self, memories: Vec<Memory>) -> Result<Vec<Memory>> {
         if !self.should_encrypt() { return Ok(memories); }
+        let hashed = |memory: &Memory| !memory.project.is_empty() && !memory.project_unresolved();
         let mut ops = Vec::new();
         for memory in &memories {
-            if !memory.project.is_empty() { ops.push(CryptOp::keyed_hash(memory.project.as_bytes())); }
+            if hashed(memory) { ops.push(CryptOp::keyed_hash(memory.project.as_bytes())); }
             if !memory.content.is_empty() {
                 ops.push(CryptOp::keyed_hash(memory.content.as_bytes()));
                 ops.push(CryptOp::seal(&memory.id, "content", memory.content.as_bytes()));
@@ -434,7 +438,7 @@ impl EncryptionContext {
         let mut names = Vec::new();
         let mut encrypted = Vec::with_capacity(memories.len());
         for mut memory in memories {
-            if !memory.project.is_empty() {
+            if hashed(&memory) {
                 let hash = next_text(&mut results)?;
                 names.push((hash.clone(), std::mem::replace(&mut memory.project, hash)));
             }
@@ -466,7 +470,21 @@ impl EncryptionContext {
         one(self.decrypt_memories(vec![memory])?)
     }
 
+    /// Plain memories from relay rows; every project must have a name here
+    /// (migration and its read-back, which must write each project back).
     pub fn decrypt_memories(&self, memories: Vec<Memory>) -> Result<Vec<Memory>> {
+        self.open_memories(memories, false)
+    }
+
+    /// A pulled page: like `decrypt_memories`, except that a well-formed
+    /// project hash this Atem has no name for stays as it is (unresolved:
+    /// kept, never applied, named once this Atem learns it), so one fact
+    /// from a project never used here can't stop the pull.
+    pub fn decrypt_pulled_memories(&self, memories: Vec<Memory>) -> Result<Vec<Memory>> {
+        self.open_memories(memories, true)
+    }
+
+    fn open_memories(&self, memories: Vec<Memory>, keep_unresolved: bool) -> Result<Vec<Memory>> {
         if self.mode == EncryptionMode::Off { return Ok(memories); }
         for memory in &memories {
             self.require_sealed(&memory.content, "e1.", "memory content")?;
@@ -481,10 +499,7 @@ impl EncryptionContext {
         memories.into_iter()
             .map(|mut memory| {
                 if memory.project.starts_with("h1.") {
-                    memory.project = names.as_ref()
-                        .and_then(|names| names.name(&self.data_account, &memory.project))
-                        .map(str::to_string)
-                        .ok_or_else(|| anyhow!(UNKNOWN_PROJECT))?;
+                    memory.project = self.project_name(names.as_ref(), memory.project, keep_unresolved)?;
                 }
                 if memory.content.starts_with("e1.") {
                     memory.content = String::from_utf8(next_plain(&mut results)?)
@@ -504,16 +519,18 @@ impl EncryptionContext {
     }
 
     /// Two batches: every file path with the project and content hashes,
-    /// then every file's bytes bound to its encrypted path.
+    /// then every file's bytes bound to its encrypted path. A project this
+    /// Atem can't name goes back as the hash it came as.
     pub fn encrypt_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
         if !self.should_encrypt() { return Ok(skills); }
+        let hashed = |skill: &Skill| !skill.project.is_empty() && !skill.project_unresolved();
         let mut ops = Vec::new();
         for skill in &skills {
             let record = skill_record(skill);
             for path in skill.files.keys() {
                 if !path.is_empty() { ops.push(CryptOp::seal(&record, "path", path.as_bytes())); }
             }
-            if !skill.project.is_empty() { ops.push(CryptOp::keyed_hash(skill.project.as_bytes())); }
+            if hashed(skill) { ops.push(CryptOp::keyed_hash(skill.project.as_bytes())); }
             ops.push(CryptOp::keyed_hash(skill_hash(&skill.files).as_bytes()));
         }
         let mut results = self.run(ops)?.into_iter();
@@ -523,8 +540,8 @@ impl EncryptionContext {
             let paths = skill.files.keys()
                 .map(|path| if path.is_empty() { Ok(String::new()) } else { next_text(&mut results) })
                 .collect::<Result<Vec<_>>>()?;
-            let project = if skill.project.is_empty() {
-                String::new()
+            let project = if !hashed(&skill) {
+                skill.project.clone()
             } else {
                 let hash = next_text(&mut results)?;
                 names.push((hash.clone(), skill.project.clone()));
@@ -561,7 +578,19 @@ impl EncryptionContext {
         self.decrypt_skills(vec![skill])?.into_iter().next().ok_or_else(|| anyhow!("decryption returned nothing"))
     }
 
+    /// Plain skills from relay rows; every project must have a name here
+    /// (migration, its read-back, and a restored version).
     pub fn decrypt_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
+        self.open_skills(skills, false)
+    }
+
+    /// A pulled page: a well-formed project hash this Atem has no name for
+    /// stays as it is (see `decrypt_pulled_memories`).
+    pub fn decrypt_pulled_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
+        self.open_skills(skills, true)
+    }
+
+    fn open_skills(&self, skills: Vec<Skill>, keep_unresolved: bool) -> Result<Vec<Skill>> {
         if self.mode == EncryptionMode::Off { return Ok(skills); }
         for skill in &skills {
             self.require_sealed(&skill.project, "h1.", "skill project")?;
@@ -584,10 +613,7 @@ impl EncryptionContext {
         skills.into_iter()
             .map(|mut skill| {
                 if skill.project.starts_with("h1.") {
-                    skill.project = names.as_ref()
-                        .and_then(|names| names.name(&self.data_account, &skill.project))
-                        .map(str::to_string)
-                        .ok_or_else(|| anyhow!(UNKNOWN_PROJECT))?;
+                    skill.project = self.project_name(names.as_ref(), skill.project, keep_unresolved)?;
                 }
                 if sealed(&skill) {
                     let mut files = std::collections::BTreeMap::new();
@@ -605,6 +631,34 @@ impl EncryptionContext {
                 Ok(skill)
             })
             .collect()
+    }
+
+    /// The name of the `h1.` project `hash` from `names`. Without one, a
+    /// well-formed hash stays as it is when `keep_unresolved`; anything else
+    /// fails the page.
+    fn project_name(&self, names: Option<&crate::memory::project_names::ProjectNames>, hash: String, keep_unresolved: bool) -> Result<String> {
+        match names.and_then(|names| names.name(&self.data_account, &hash)) {
+            Some(name) => Ok(name.to_string()),
+            None if !keep_unresolved => bail!(UNKNOWN_PROJECT),
+            None if !project_unresolved(&hash) => bail!(MALFORMED_PROJECT),
+            None => Ok(hash),
+        }
+    }
+
+    /// The names this Atem has for the project hashes `hashes` (from
+    /// project_names.json), as `(hash, name)`. While encrypting, `current`
+    /// (the checkout a sync runs in) is hashed and recorded first, so facts
+    /// pulled for it resolve there; best effort: a locked agent leaves them
+    /// for a later sync.
+    pub fn known_project_names(&self, hashes: &[String], current: Option<&str>) -> Result<Vec<(String, String)>> {
+        if let Some(project) = current.filter(|project| !project.is_empty())
+            && self.should_encrypt() {
+            let _ = self.wire_project(project);
+        }
+        let names = self.names()?;
+        Ok(hashes.iter()
+            .filter_map(|hash| names.name(&self.data_account, hash).map(|name| (hash.clone(), name.to_string())))
+            .collect())
     }
 
     fn remember(&self, names: Vec<(String, String)>) -> Result<()> {
@@ -785,6 +839,60 @@ mod tests {
         let unknown = Memory { id: "mem-9".into(), project: "h1.0123abcd.ff".into(), ..Memory::default() };
         let error = context.decrypt_memory(unknown).unwrap_err().to_string();
         assert!(error.contains("unknown on this Atem"), "{error}");
+    }
+
+    /// A pulled page keeps a project hash this Atem can't name (unresolved)
+    /// instead of failing; everything else still fails the page.
+    #[test]
+    fn pulled_rows_keep_a_project_hash_this_atem_cannot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_device, context) = device(dir.path(), EncryptionMode::On);
+        let known = context.encrypt_memory(memory("mem-1", "github.com/agora/atem", "known")).unwrap();
+        // `keyed_hash` records no name: this Atem never used the project.
+        let hash = context.keyed_hash(b"github.com/agora/elsewhere").unwrap();
+        let unnamed = Memory { project: hash.clone(), ..context.encrypt_memory(memory("mem-2", "", "elsewhere")).unwrap() };
+        let pulled = context.decrypt_pulled_memories(vec![known, unnamed.clone()]).unwrap();
+        assert_eq!(pulled[0].project, "github.com/agora/atem");
+        assert_eq!((pulled[1].project.as_str(), pulled[1].content.as_str()), (hash.as_str(), "elsewhere"));
+        assert!(pulled[1].project_unresolved());
+        // Migration and its read-back must name every project.
+        let error = context.decrypt_memories(vec![unnamed.clone()]).unwrap_err().to_string();
+        assert!(error.contains("unknown on this Atem"), "{error}");
+        // Not a well-formed hash, plain text, or content that doesn't open.
+        let malformed = Memory { project: "h1.0123abcd.ff".into(), ..unnamed.clone() };
+        let error = context.decrypt_pulled_memories(vec![malformed]).unwrap_err().to_string();
+        assert!(error.contains("malformed project hash"), "{error}");
+        let plain = Memory { project: "github.com/x/y".into(), ..unnamed.clone() };
+        assert!(context.decrypt_pulled_memories(vec![plain]).unwrap_err().to_string().contains("plain-text"));
+        let moved = Memory { id: "mem-3".into(), ..unnamed.clone() };
+        assert!(context.decrypt_pulled_memories(vec![moved]).is_err(), "sealed for another record");
+        // Pushed back (a replacement inherits it), the hash is never hashed again.
+        let successor = Memory { content: "elsewhere, again".into(), ..pulled[1].clone() };
+        assert_eq!(context.encrypt_memory(successor).unwrap().project, hash);
+        assert_eq!(context.wire_project(&hash).unwrap(), hash);
+
+        // Skills the same way.
+        let files = BTreeMap::from([("SKILL.md".to_string(), b"# ship".to_vec())]);
+        let skill = Skill {
+            scope: crate::memory::model::Scope::Project,
+            project: String::new(),
+            name: "ship".into(),
+            version: 1,
+            content_hash: skill_hash(&files),
+            files,
+            source_agent: "test".into(),
+            source_machine: "mac".into(),
+            created_at: 1,
+            deleted: false,
+            seq: 1,
+        };
+        let sealed = Skill { project: hash.clone(), ..context.encrypt_skill(skill.clone()).unwrap() };
+        let pulled = context.decrypt_pulled_skills(vec![sealed.clone()]).unwrap().remove(0);
+        assert_eq!(pulled, Skill { project: hash.clone(), ..skill });
+        assert_eq!(context.encrypt_skill(pulled).unwrap().project, hash);
+        assert!(context.decrypt_skills(vec![sealed.clone()]).unwrap_err().to_string().contains("unknown on this Atem"));
+        let malformed = Skill { project: "h1.0123abcd.ff".into(), ..sealed };
+        assert!(context.decrypt_pulled_skills(vec![malformed]).is_err());
     }
 
     #[test]

@@ -72,6 +72,20 @@ impl Memory {
     pub fn valid_from(&self) -> i64 {
         self.valid_at.unwrap_or(self.created_at)
     }
+
+    /// Its project is one this Atem can't name yet; see `project_unresolved`.
+    pub fn project_unresolved(&self) -> bool {
+        project_unresolved(&self.project)
+    }
+}
+
+/// A project pulled as the relay's `h1.` keyed hash that this Atem has no
+/// name for yet (encryption on, the project never used here). The row keeps
+/// the hash until the name is known, and is never applied meanwhile (see
+/// designs/atem-memory.md "Projects not on this machine"). No remote's
+/// project key has this shape: a DNS label is at most 63 characters.
+pub fn project_unresolved(project: &str) -> bool {
+    atem_client::project::is_project_hash(project)
 }
 
 /// The wire/queue shape of `Memory`. Rows without the 1.1 fields (an older
@@ -149,6 +163,13 @@ pub struct Skill {
     pub deleted: bool,
     #[serde(default)]
     pub seq: i64,
+}
+
+impl Skill {
+    /// Its project is one this Atem can't name yet; see `project_unresolved`.
+    pub fn project_unresolved(&self) -> bool {
+        project_unresolved(&self.project)
+    }
 }
 
 /// Trim, collapse runs of whitespace, lowercase. Used only for hashing.
