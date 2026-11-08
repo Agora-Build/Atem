@@ -1178,6 +1178,98 @@ fn vault_context_with_a_credential_value_is_refused() {
     });
 }
 
+/// The `n`th prompt (from 1) pasted into the agent of `fake`, as it arrived
+/// between the bracketed-paste markers.
+fn pasted(fake: &Path, n: usize) -> Option<String> {
+    let input = std::fs::read_to_string(fake.join("input")).unwrap_or_default();
+    let paste = input.split("\u{1b}[200~").nth(n)?;
+    paste
+        .split_once("\u{1b}[201~")
+        .map(|(text, _)| text.to_string())
+}
+
+/// The prompt of task `id` as `runtime/host-work.sqlite` stores it.
+fn stored_prompt(rig: &Rig, id: &str) -> String {
+    let db =
+        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
+    let record: String = db
+        .query_row("SELECT record FROM work WHERE id=?1", [id], |r| r.get(0))
+        .unwrap();
+    serde_json::from_str::<Value>(&record).unwrap()["task"]["prompt"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+/// Atem's lines around a local task's text and a delivered reply are
+/// rendered when the task is dispatched, from the records: each agent reads
+/// the prompt it read before, byte for byte, while the records keep only the
+/// sender's text and the reply.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_CONTEXT_DIR hook"
+)]
+fn local_task_and_result_prompts_are_rendered_from_the_records() {
+    use sha2::{Digest, Sha256};
+    let digest = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
+    let mut rig = Rig::new();
+    rig.context_hook = true;
+    rig.config = rig.config.replace(
+        "labels = [\"tag:a\"]",
+        "labels = [\"tag:a\"]\nresults = true",
+    );
+    rig.restart();
+    let (a_sid, a) = rig.launch("a", "sender");
+    let (b_sid, b) = rig.launch("b", "recipient");
+    let (request, context) = ("Review the API contract", "The contract,  exactly.");
+    vault_snapshot(&rig, "v-ask:1@1", context);
+    let id = rig.send_with(&a, 1, &["--to", "tag:b", "--vault", "v-ask:1@1", request]);
+    let task = await_task(&rig, &id, &b);
+    let workflow = rig.status(&id)["workflow_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        pasted(&b, 1).unwrap(),
+        format!(
+            "[Atem task {task} / workflow {workflow}]\n[Message {id} from local session {a_sid}]\n\
+             {request}\n\nReply with: atem message reply --task {task} <text>\n\n\
+             [Context Vault:v-ask:1 version 1 sha256 {}]\n{context}",
+            digest(context)
+        )
+    );
+    assert_eq!(stored_prompt(&rig, &task), request);
+    let (answer, result) = ("contract verified", "The checked contract.");
+    vault_snapshot(&rig, "v-answer:1@1", result);
+    let reply = rig.agent(
+        &b,
+        1,
+        &[
+            "message",
+            "reply",
+            "--task",
+            &task,
+            "--vault",
+            "v-answer:1@1",
+            answer,
+        ],
+    );
+    assert_eq!(reply["code"], 0, "{reply}");
+    within("result as data", || pasted(&a, 1).is_some());
+    assert_eq!(
+        pasted(&a, 1).unwrap(),
+        format!(
+            "[atem] result of task {task} from {b_sid}, as data:\n{answer}\n\n\
+             Complete it with: atem message complete {task}\n\n\
+             [Context Vault:v-answer:1 version 1 sha256 {}]\n{result}",
+            digest(result)
+        )
+    );
+    let delivery = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("delivery:{task}").as_bytes(),
+    );
+    assert_eq!(stored_prompt(&rig, &delivery.to_string()), answer);
+}
+
 fn await_task(rig: &Rig, message: &str, fake: &Path) -> String {
     within("task input", || {
         std::fs::read_to_string(fake.join("input"))

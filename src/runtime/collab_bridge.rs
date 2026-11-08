@@ -420,7 +420,8 @@ impl HostBridge {
             reply,
             context,
         );
-        collab::task_problem(&carrier, &self.work_host())
+        let frame = results::delivery_frame(&task.task.task_id, reply);
+        collab::task_problem(&carrier, Some(&frame), &self.work_host())
     }
 
     /// Publishes the context of replies (spec section 8) against the binding
@@ -548,7 +549,8 @@ impl HostBridge {
             row.reply.context.clone(),
         );
         let tx = store.db.unchecked_transaction()?;
-        if let Some(problem) = collab::task_problem(&task, &self.work_host()) {
+        let frame = results::delivery_frame(&grant.task_id, &row.reply);
+        if let Some(problem) = collab::task_problem(&task, Some(&frame), &self.work_host()) {
             let trace = format!("{}{problem}", results::UNDELIVERED);
             tx.execute(
                 "UPDATE results SET detail=?2 WHERE task_id=?1",
@@ -613,6 +615,23 @@ impl HostBridge {
         let grant =
             results::grant(store, row.task_id())?.ok_or_else(|| anyhow!("missing return grant"))?;
         Ok(Some((grant, row)))
+    }
+
+    /// Atem's lines around a local task's text (`collab::Frame`), from its
+    /// records: a result delivery's from the reply it carries, a local
+    /// message's from the message and the session that sent it. None for
+    /// any other task: a remote sender's prompt is rendered as it came.
+    pub(super) fn collab_frame(&self, record: &WorkRecord) -> Result<Option<collab::Frame>> {
+        if record.principal != "local" {
+            return Ok(None);
+        }
+        if let Some((_, row)) = self.collab_result_delivery(record)? {
+            return Ok(Some(results::delivery_frame(row.task_id(), &row.reply)));
+        }
+        match self.work.store.as_ref() {
+            Some(store) => collab::message_frame(store, &record.task.task_id),
+            None => Ok(None),
+        }
     }
 
     /// The reply to `task_id`, if any.
@@ -1207,7 +1226,7 @@ impl HostBridge {
             process_gen: uuid::Uuid::new_v4().to_string(),
         };
         let task = local_task(message, &uuid::Uuid::new_v4().to_string(), target);
-        collab::task_problem(&task, &host)
+        collab::task_problem(&task, Some(&collab::Frame::message(message)), &host)
     }
 
     pub(super) fn collab_candidates(
@@ -1785,18 +1804,15 @@ impl HostBridge {
 }
 
 /// The task one recipient of a local request gets: the sender's text and
-/// context, and how to answer.
+/// context. Who sent it and how to answer (`Frame::Message`) are rendered
+/// when it is dispatched.
 fn local_task(message: &Message, task_id: &str, target: wire::Target) -> hw::WorkTask {
-    let from = message.from_session.as_deref().unwrap_or_default();
     hw::WorkTask {
         task_id: task_id.into(),
         workflow_id: message.workflow_id.clone(),
         target,
         expires_at: message.expires_at,
-        prompt: format!(
-            "[Message {} from local session {}]\n{}\n\nReply with: atem message reply --task {} <text>",
-            message.message_id, from, message.text, task_id
-        ),
+        prompt: message.text.clone(),
         context: message.context.clone(),
         attachments: vec![],
     }

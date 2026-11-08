@@ -135,17 +135,25 @@ impl WorkTask {
     }
 
     pub fn render_prompt(&self) -> String {
-        let mut prompt = format!(
+        format!(
             "[Atem task {} / workflow {}]\n{}",
-            self.task_id, self.workflow_id, self.prompt
-        );
+            self.task_id,
+            self.workflow_id,
+            self.render_with_context(&self.prompt)
+        )
+    }
+
+    /// `text` followed by the task's context snapshots: what
+    /// `render_prompt` shows after its task line.
+    pub fn render_with_context(&self, text: &str) -> String {
+        let mut rendered = text.to_string();
         for item in &self.context {
-            prompt.push_str(&format!(
+            rendered.push_str(&format!(
                 "\n\n[Context {:?}:{} version {} sha256 {}]\n{}",
                 item.kind, item.id, item.version, item.digest, item.text
             ));
         }
-        prompt
+        rendered
     }
 }
 

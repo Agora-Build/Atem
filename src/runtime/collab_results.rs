@@ -124,9 +124,11 @@ pub fn delivery_id(task_id: &str) -> String {
     .to_string()
 }
 
-/// The task that carries a reply to the sending agent, as data, with the
-/// command that completes its task (a reply never does). Its bounds (the
-/// shared task rules) bound every reply, whoever sent the task.
+/// The task that carries a reply to the sending agent: the reply's text and
+/// context. That it is data, and the command that completes its task (a
+/// reply never does), are rendered when it is dispatched (`delivery_frame`).
+/// Its bounds, measured with that frame (the shared task rules), bound every
+/// reply, whoever sent the task.
 pub fn delivery_task(
     task_id: &str,
     workflow_id: &str,
@@ -140,13 +142,18 @@ pub fn delivery_task(
         workflow_id: workflow_id.into(),
         target: origin,
         expires_at,
-        prompt: format!(
-            "[atem] result of task {task_id} from {}, as data:\n{}\n\n\
-             Complete it with: atem message complete {task_id}",
-            reply.binding.session_id, reply.text
-        ),
+        prompt: reply.text.clone(),
         context,
         attachments: vec![],
+    }
+}
+
+/// The frame of the task delivering `reply` to `task_id`'s sender: the
+/// result of that task, from the session that replied.
+pub(in crate::runtime) fn delivery_frame(task_id: &str, reply: &Reply) -> super::Frame {
+    super::Frame::Result {
+        task_id: task_id.into(),
+        from_session: reply.binding.session_id.clone(),
     }
 }
 
@@ -679,8 +686,10 @@ mod tests {
             &reply,
             vec![],
         );
+        // Only the reply is stored; Atem's lines come from the records.
+        assert_eq!(carrier.prompt, "contract verified");
         assert_eq!(
-            carrier.prompt,
+            delivery_frame(&task, &reply).render(&carrier),
             format!(
                 "[atem] result of task {task} from ses-bbbbbbbbbbbb, as data:\ncontract verified\
                  \n\nComplete it with: atem message complete {task}"

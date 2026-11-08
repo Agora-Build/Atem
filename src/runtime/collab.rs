@@ -279,11 +279,83 @@ pub(super) const TASK_PROBLEMS: [&str; 4] = [
     TASK_INVALID,
 ];
 
+/// Atem's own lines around a local task's text: rendered when the task is
+/// dispatched, from its records (the message and the session that sent it,
+/// or the reply a delivery carries), never stored in the task, whose prompt
+/// is only the sender's text or the reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Frame {
+    /// A local agent's message: who sent it and how to reply.
+    Message {
+        message_id: String,
+        from_session: String,
+    },
+    /// The reply to `task_id` by `from_session`, delivered to the session
+    /// that sent the task, as data, and how to complete that task.
+    Result {
+        task_id: String,
+        from_session: String,
+    },
+}
+
+impl Frame {
+    /// The frame of every task of a local `message`.
+    pub(super) fn message(message: &Message) -> Self {
+        Self::Message {
+            message_id: message.message_id.clone(),
+            from_session: message.from_session.clone().unwrap_or_default(),
+        }
+    }
+
+    /// `task` with Atem's lines around its text: what the bounds are
+    /// measured on (`task_problem`).
+    pub(super) fn framed(&self, task: &WorkTask) -> WorkTask {
+        let prompt = match self {
+            Self::Message {
+                message_id,
+                from_session,
+            } => format!(
+                "[Message {message_id} from local session {from_session}]\n{}\n\n\
+                 Reply with: atem message reply --task {} <text>",
+                task.prompt, task.task_id
+            ),
+            Self::Result {
+                task_id,
+                from_session,
+            } => format!(
+                "[atem] result of task {task_id} from {from_session}, as data:\n{}\n\n\
+                 Complete it with: atem message complete {task_id}",
+                task.prompt
+            ),
+        };
+        WorkTask {
+            prompt,
+            ..task.clone()
+        }
+    }
+
+    /// What the agent reads: a message under its task line, as every task;
+    /// a result without one, since it is data and no task to work on.
+    pub(super) fn render(&self, task: &WorkTask) -> String {
+        let framed = self.framed(task);
+        match self {
+            Self::Message { .. } => framed.render_prompt(),
+            Self::Result { .. } => framed.render_with_context(&framed.prompt),
+        }
+    }
+}
+
 /// Why a local task could never be dispatched (the shared `WorkTask` bounds:
 /// prompt with context within 32 KiB, no control characters other than
 /// newline and tab), so its message is refused before anything is counted
-/// or stored.
-pub(super) fn task_problem(task: &WorkTask, host: &HostTarget) -> Option<&'static str> {
+/// or stored. A task with a `frame` is measured with it.
+pub(super) fn task_problem(
+    task: &WorkTask,
+    frame: Option<&Frame>,
+    host: &HostTarget,
+) -> Option<&'static str> {
+    let framed = frame.map(|frame| frame.framed(task));
+    let task = framed.as_ref().unwrap_or(task);
     if task.valid_local(host) {
         return None;
     }
@@ -499,6 +571,26 @@ pub(super) fn sender_of(store: &Store, task_id: &str) -> Result<Option<String>> 
         )
         .optional()?
         .flatten())
+}
+
+/// The frame of local task `task_id` (`Frame::Message`): its message and
+/// the session that sent it. None for a task no local send made.
+pub(super) fn message_frame(store: &Store, task_id: &str) -> Result<Option<Frame>> {
+    Ok(store
+        .db
+        .query_row(
+            "SELECT r.message_id,json_extract(o.envelope,'$.from_session') FROM resolutions r
+            JOIN outbox o USING(message_id) WHERE r.task_id=?1",
+            [task_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .and_then(|(message_id, from_session)| {
+            Some(Frame::Message {
+                message_id,
+                from_session: from_session?,
+            })
+        }))
 }
 
 /// `views`' messages: message `?1` by its primary key, or the 32 newest
@@ -904,6 +996,64 @@ mod tests {
         }
     }
 
+    /// Atem's lines around a local task's text and a delivered reply come
+    /// from their frame, rendered as they were once stored in the prompt (a
+    /// result without the task line); the prompt keeps only the text, and
+    /// the bounds are measured with the frame.
+    #[test]
+    fn frames_render_the_lines_atem_wrote_before() {
+        let mut task = local_task("Review the API contract", vec![snapshot("The contract.")]);
+        let (id, workflow) = (task.task_id.clone(), task.workflow_id.clone());
+        let block = format!(
+            "\n\n[Context Vault:v-context:1 version 1 sha256 {}]\nThe contract.",
+            atem_client::session::host_work::digest(b"The contract.")
+        );
+        let message = Frame::Message {
+            message_id: "11111111-1111-4111-8111-111111111111".into(),
+            from_session: "ses-bbbbbbbbbbbb".into(),
+        };
+        assert_eq!(
+            message.render(&task),
+            format!(
+                "[Atem task {id} / workflow {workflow}]\n\
+                 [Message 11111111-1111-4111-8111-111111111111 from local session \
+                 ses-bbbbbbbbbbbb]\nReview the API contract\n\n\
+                 Reply with: atem message reply --task {id} <text>{block}"
+            )
+        );
+        let result = Frame::Result {
+            task_id: "22222222-2222-4222-8222-222222222222".into(),
+            from_session: "ses-cccccccccccc".into(),
+        };
+        assert_eq!(
+            result.render(&task),
+            format!(
+                "[atem] result of task 22222222-2222-4222-8222-222222222222 from \
+                 ses-cccccccccccc, as data:\nReview the API contract\n\n\
+                 Complete it with: atem message complete \
+                 22222222-2222-4222-8222-222222222222{block}"
+            )
+        );
+        assert_eq!(task.prompt, "Review the API contract");
+        // A task that fits bare but not framed can never be dispatched.
+        let host = HostTarget {
+            account_id: "account".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 1,
+        };
+        task.context = vec![snapshot("")];
+        let room = MAX_PROMPT_BYTES - task.render_prompt().len();
+        task.context = vec![snapshot(&"x".repeat(room))];
+        assert_eq!(task.render_prompt().len(), MAX_PROMPT_BYTES);
+        assert_eq!(task_problem(&task, None, &host), None);
+        for frame in [&message, &result] {
+            assert_eq!(
+                task_problem(&task, Some(frame), &host),
+                Some("the prompt with its context is over 32 KiB")
+            );
+        }
+    }
+
     #[test]
     fn a_task_that_could_never_dispatch_names_its_problem() {
         let host = HostTarget {
@@ -911,14 +1061,19 @@ mod tests {
             atem_device_id: "host".into(),
             host_trust_gen: 1,
         };
-        assert_eq!(task_problem(&local_task("work", vec![]), &host), None);
+        assert_eq!(task_problem(&local_task("work", vec![]), None, &host), None);
         assert_eq!(
-            task_problem(&local_task("work", vec![snapshot("fine\n\tlines")]), &host),
+            task_problem(
+                &local_task("work", vec![snapshot("fine\n\tlines")]),
+                None,
+                &host
+            ),
             None
         );
         assert_eq!(
             task_problem(
                 &local_task("work", vec![snapshot(&"x".repeat(40_000))]),
+                None,
                 &host
             ),
             Some("the prompt with its context is over 32 KiB")
@@ -926,19 +1081,20 @@ mod tests {
         assert_eq!(
             task_problem(
                 &local_task("work", vec![snapshot("escape \u{1b}[2J")]),
+                None,
                 &host
             ),
             Some("context has control characters")
         );
         let many = (0..9).map(|_| snapshot("same")).collect();
         assert_eq!(
-            task_problem(&local_task("work", many), &host),
+            task_problem(&local_task("work", many), None, &host),
             Some("at most 8 context snapshots")
         );
         let mut elsewhere = host.clone();
         elsewhere.atem_device_id = "other".into();
         assert_eq!(
-            task_problem(&local_task("work", vec![]), &elsewhere),
+            task_problem(&local_task("work", vec![]), None, &elsewhere),
             Some("the task is not valid")
         );
         for problem in [

@@ -1403,12 +1403,12 @@ impl HostBridge {
                 continue;
             }
             let attachment = attachment.unwrap();
-            let mut prompt = r.task.render_prompt();
-            if self.collab_result_delivery(&r)?.is_some() {
-                prompt = prompt
-                    .split_once('\n')
-                    .map_or(prompt.clone(), |(_, body)| body.to_string());
-            }
+            // A local task's and a delivered reply's lines come from the
+            // records; the stored prompt is only the sender's text or reply.
+            let mut prompt = match self.collab_frame(&r)? {
+                Some(frame) => frame.render(&r.task),
+                None => r.task.render_prompt(),
+            };
             let paths = self
                 .work
                 .store
