@@ -1,6 +1,7 @@
 //! Performance measurements of the end-to-end encrypted path
-//! (designs/e2e-encryption.md). Measurement code only: never run by default
-//! (every test is `#[ignore]`), never committed.
+//! (designs/e2e-encryption.md "Performance"). Measurement code only: never
+//! run by default (every test is `#[ignore]`), and it asserts no budget: the
+//! tests print their numbers, and a person compares them with the budgets.
 //!
 //! Temp profiles only: the in-process test agent (`UnlockedDevice`), or a
 //! real `atem cred-agent` process (the release binary beside the test
@@ -1453,8 +1454,48 @@ async fn perf_2b_sync_cycle_in_memory_store() {
     .await;
 }
 
+/// The 1-minute load average (Linux; `None` elsewhere).
+fn load_1min() -> Option<f64> {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A quiet host: a 1-minute load average under this.
+const QUIET_LOAD: f64 = 1.5;
+/// The longest wait for a quiet host before measuring anyway.
+const QUIET_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// Waits until the host is quiet (`QUIET_LOAD`), at most `QUIET_WAIT`: the
+/// 1-minute load average then (`None` off Linux), and whether it was quiet.
+async fn quiet_host() -> (Option<f64>, bool) {
+    let start = Instant::now();
+    loop {
+        let Some(load) = load_1min() else {
+            return (None, true);
+        };
+        if load < QUIET_LOAD {
+            return (Some(load), true);
+        }
+        if start.elapsed() >= QUIET_WAIT {
+            return (Some(load), false);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The `at` quantile (0 to 1) of sorted `values`, nearest rank.
+fn quantile(values: &[f64], at: f64) -> f64 {
+    values[((values.len() - 1) as f64 * at).round() as usize]
+}
+
 /// The sync against a relay with a fixed round trip: what encryption adds
 /// to the wall time once the network, not the loopback, sets the pace.
+/// Each pair (off and on, back to back, the order alternating) starts on a
+/// quiet host (`quiet_host`); every pair is printed with its load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn perf_2c_sync_against_a_relay_with_latency() {
@@ -1462,12 +1503,13 @@ async fn perf_2c_sync_against_a_relay_with_latency() {
     let relay = Relay::start();
     let profiles = Profiles::new(EncryptionMode::On);
     let scratch = tempfile::tempdir().unwrap();
-    const REPS: usize = 7;
+    const REPS: usize = 15;
+    let mut summary = Vec::new();
     println!(
-        "\n## 2c. Sync cycle against a relay that answers each request after a fixed latency, file store; {REPS} reps, off and on interleaved; medians, and the median of the paired differences (on − off, same rep)"
+        "\n## 2c. Sync cycle against a relay that answers each request after a fixed latency, file store; {REPS} pairs, off and on back to back (order alternating), each pair started with the 1-minute load under {QUIET_LOAD}"
     );
     println!(
-        "| latency ms | scenario | N | off ms | on (production) ms | added ms (median of pairs) | added % | agent ms | Crypt reqs (seal / open) | HTTP reqs |"
+        "| latency ms | scenario | N | pair | load 1 min | quiet | order | off ms | on ms | on − off ms |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|");
     for latency in [5u64, 20] {
@@ -1478,46 +1520,70 @@ async fn perf_2c_sync_against_a_relay_with_latency() {
             (Scenario::Pull, 1000),
             (Scenario::Pull, 5000),
         ] {
-            let (mut offs, mut ons, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
-            for rep in 0..REPS {
-                let work = scratch.path().join(format!("{rep}"));
-                let off = sync_run(&relay, &profiles, Mode::Off, n, scenario, &work, true).await;
-                let on = sync_run(
-                    &relay,
-                    &profiles,
-                    Mode::Production,
-                    n,
-                    scenario,
-                    &work,
-                    true,
-                )
-                .await;
-                pairs.push(on.total.as_secs_f64() - off.total.as_secs_f64());
-                offs.push(off);
-                ons.push(on);
-            }
-            pairs.sort_by(f64::total_cmp);
-            let added = pairs[REPS / 2];
-            let (off, on) = (median_run(offs), median_run(ons));
             let label = match scenario {
                 Scenario::PushPull => "push+pull+apply",
                 _ => "pull+apply (other device's facts)",
             };
-            println!(
-                "| {latency} | {label} | {n} | {:.1} | {:.1} | {:.1} | {:.1}% | {:.1} | {} ({} / {}) | {} |",
+            let (mut offs, mut ons, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+            for rep in 0..REPS {
+                let (load, quiet) = quiet_host().await;
+                let work = scratch.path().join(format!("{rep}"));
+                let off_first = rep % 2 == 0;
+                let mut runs = Vec::new();
+                for mode in if off_first {
+                    [Mode::Off, Mode::Production]
+                } else {
+                    [Mode::Production, Mode::Off]
+                } {
+                    runs.push(sync_run(&relay, &profiles, mode, n, scenario, &work, true).await);
+                }
+                let (off, on) = if off_first {
+                    (runs.remove(0), runs.remove(0))
+                } else {
+                    let on = runs.remove(0);
+                    (runs.remove(0), on)
+                };
+                let added = on.total.as_secs_f64() - off.total.as_secs_f64();
+                println!(
+                    "| {latency} | {label} | {n} | {rep} | {} | {} | {} | {:.1} | {:.1} | {:+.1} |",
+                    load.map_or("n/a".into(), |load| format!("{load:.2}")),
+                    if quiet { "yes" } else { "no" },
+                    if off_first { "off, on" } else { "on, off" },
+                    ms(off.total),
+                    ms(on.total),
+                    added * 1e3
+                );
+                pairs.push(added);
+                offs.push(off);
+                ons.push(on);
+            }
+            pairs.sort_by(f64::total_cmp);
+            let (off, on) = (median_run(offs), median_run(ons));
+            summary.push(format!(
+                "| {latency} | {label} | {n} | {:.1} | {:.1} | {:+.1} | {:+.1}% | {:+.1} / {:+.1} | {} of {REPS} | {:.1} | {} ({} / {}) | {} |",
                 ms(off.total),
                 ms(on.total),
-                added * 1e3,
-                added / off.total.as_secs_f64() * 100.0,
+                quantile(&pairs, 0.5) * 1e3,
+                quantile(&pairs, 0.5) / off.total.as_secs_f64() * 100.0,
+                quantile(&pairs, 0.25) * 1e3,
+                quantile(&pairs, 0.75) * 1e3,
+                pairs.iter().filter(|&&added| added > 0.05 * off.total.as_secs_f64()).count(),
                 ms(on.agent),
                 on.crypts,
                 on.crypts - on.open_crypts,
                 on.open_crypts,
                 on.http
-            );
+            ));
         }
     }
     relay.set_latency(Duration::ZERO);
+    println!(
+        "\n| latency ms | scenario | N | off ms (median) | on (production) ms (median) | added ms (median of pairs) | added % | pairs' quartiles ms | pairs over 5% | agent ms | Crypt reqs (seal / open) | HTTP reqs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for row in summary {
+        println!("{row}");
+    }
 }
 
 // ───────────────────────── 3. Vault ─────────────────────────
