@@ -147,6 +147,8 @@ fn skill(i: usize, files: usize, file_bytes: usize) -> Skill {
 struct Counts {
     calls: AtomicUsize,
     crypts: AtomicUsize,
+    /// `Crypt` requests that open (pull, read-back); the others seal or hash.
+    open_crypts: AtomicUsize,
     ops: AtomicUsize,
     nanos: AtomicU64,
 }
@@ -155,6 +157,7 @@ impl Counts {
     fn reset(&self) {
         self.calls.store(0, Ordering::SeqCst);
         self.crypts.store(0, Ordering::SeqCst);
+        self.open_crypts.store(0, Ordering::SeqCst);
         self.ops.store(0, Ordering::SeqCst);
         self.nanos.store(0, Ordering::SeqCst);
     }
@@ -174,6 +177,9 @@ impl CredAgentApi for Meter {
         self.counts.calls.fetch_add(1, Ordering::SeqCst);
         if let Request::Crypt { ops, .. } = &request {
             self.counts.crypts.fetch_add(1, Ordering::SeqCst);
+            if ops.iter().any(|op| matches!(op, CryptOp::Open { .. })) {
+                self.counts.open_crypts.fetch_add(1, Ordering::SeqCst);
+            }
             self.counts.ops.fetch_add(ops.len(), Ordering::SeqCst);
         }
         let start = Instant::now();
@@ -418,6 +424,8 @@ impl RelayData {
 struct Relay {
     base: String,
     data: Arc<Mutex<RelayData>>,
+    /// Added to every response, in µs: a real relay's round trip.
+    latency: Arc<AtomicU64>,
 }
 
 impl Relay {
@@ -425,8 +433,10 @@ impl Relay {
     /// client's), HTTP/1.1 keep-alive like the real one behind Cloudflare.
     fn start() -> Self {
         let data = Arc::new(Mutex::new(RelayData::default()));
+        let latency = Arc::new(AtomicU64::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
         let served = data.clone();
+        let delay = latency.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -442,8 +452,9 @@ impl Relay {
                         return;
                     };
                     let data = served.clone();
+                    let delay = delay.clone();
                     tokio::spawn(async move {
-                        let _ = serve_http(socket, data).await;
+                        let _ = serve_http(socket, data, delay).await;
                     });
                 }
             });
@@ -451,7 +462,14 @@ impl Relay {
         Self {
             base: rx.recv().unwrap(),
             data,
+            latency,
         }
+    }
+
+    /// Every later response waits `latency` first.
+    fn set_latency(&self, latency: Duration) {
+        self.latency
+            .store(latency.as_micros() as u64, Ordering::SeqCst);
     }
 
     fn reset(&self) {
@@ -500,6 +518,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 async fn serve_http(
     mut socket: tokio::net::TcpStream,
     data: Arc<Mutex<RelayData>>,
+    latency: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.set_nodelay(true)?;
@@ -558,6 +577,10 @@ async fn serve_http(
         };
         buffer.drain(..header_end + length);
         let response = handle(&data, &method, &target, &body, length);
+        let delay = latency.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_micros(delay)).await;
+        }
         let bytes = serde_json::to_vec(&response).unwrap();
         data.lock().unwrap().down_bytes += bytes.len();
         // One write (and TCP_NODELAY): a separate head and body would meet
@@ -1210,6 +1233,7 @@ struct SyncRun {
     apply: Duration,
     agent: Duration,
     crypts: usize,
+    open_crypts: usize,
     ops: usize,
     round_trips: usize,
     connections: usize,
@@ -1307,6 +1331,7 @@ async fn sync_run(
         apply,
         agent: counts.agent_time(),
         crypts: counts.crypts.load(Ordering::SeqCst),
+        open_crypts: counts.open_crypts.load(Ordering::SeqCst),
         ops: counts.ops.load(Ordering::SeqCst),
         round_trips: traffic_after.0 - traffic_before.0,
         connections: traffic_after.1 - traffic_before.1,
@@ -1357,7 +1382,7 @@ async fn sync_table(file_store: bool, sizes: &[usize], reps_for: impl Fn(usize) 
         }
     );
     println!(
-        "| scenario | N | mode | total ms | added vs off ms | added % | agent ms | apply ms | Crypt reqs | agent socket round trips | agent connections | ops | HTTP reqs | up KiB | down KiB |"
+        "| scenario | N | mode | total ms | added vs off ms | added % | agent ms | apply ms | Crypt reqs (seal / open) | agent socket round trips | agent connections | ops | HTTP reqs | up KiB | down KiB |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (scenario, n) in scenarios {
@@ -1382,13 +1407,15 @@ async fn sync_table(file_store: bool, sizes: &[usize], reps_for: impl Fn(usize) 
                 }
             };
             println!(
-                "| {label} | {n} | {mode:?} | {:.1} | {:.1} | {:.1}% | {:.1} | {:.1} | {} | {} | {} | {} | {} | {:.0} | {:.0} |",
+                "| {label} | {n} | {mode:?} | {:.1} | {:.1} | {:.1}% | {:.1} | {:.1} | {} ({} / {}) | {} | {} | {} | {} | {:.0} | {:.0} |",
                 ms(run.total),
                 added * 1e3,
                 added / off_total.as_secs_f64() * 100.0,
                 ms(run.agent),
                 ms(run.apply),
                 run.crypts,
+                run.crypts - run.open_crypts,
+                run.open_crypts,
                 run.round_trips,
                 run.connections,
                 run.ops,
@@ -1424,6 +1451,62 @@ async fn perf_2b_sync_cycle_in_memory_store() {
         }
     })
     .await;
+}
+
+/// The sync against a relay with a fixed round trip: what encryption adds
+/// to the wall time once the network, not the loopback, sets the pace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn perf_2c_sync_against_a_relay_with_latency() {
+    let (_profile, _scope) = crate::test_profile::temp();
+    let relay = Relay::start();
+    let profiles = Profiles::new(EncryptionMode::On);
+    let scratch = tempfile::tempdir().unwrap();
+    println!(
+        "\n## 2c. Sync cycle against a relay that answers each request after a fixed latency, file store, median of 3"
+    );
+    println!(
+        "| latency ms | scenario | N | mode | total ms | added vs off ms | added % | agent ms | Crypt reqs (seal / open) | HTTP reqs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for latency in [5u64, 20] {
+        relay.set_latency(Duration::from_millis(latency));
+        for (scenario, n) in [
+            (Scenario::PushPull, 1000usize),
+            (Scenario::Pull, 1000),
+            (Scenario::Pull, 5000),
+        ] {
+            let mut off_total = Duration::ZERO;
+            for mode in [Mode::Off, Mode::Production] {
+                let mut runs = Vec::new();
+                for rep in 0..3 {
+                    let work = scratch.path().join(format!("{rep}"));
+                    runs.push(sync_run(&relay, &profiles, mode, n, scenario, &work, true).await);
+                }
+                let run = median_run(runs);
+                if mode == Mode::Off {
+                    off_total = run.total;
+                }
+                let added = run.total.as_secs_f64() - off_total.as_secs_f64();
+                let label = match scenario {
+                    Scenario::PushPull => "push+pull+apply",
+                    _ => "pull+apply (other device's facts)",
+                };
+                println!(
+                    "| {latency} | {label} | {n} | {mode:?} | {:.1} | {:.1} | {:.1}% | {:.1} | {} ({} / {}) | {} |",
+                    ms(run.total),
+                    added * 1e3,
+                    added / off_total.as_secs_f64() * 100.0,
+                    ms(run.agent),
+                    run.crypts,
+                    run.crypts - run.open_crypts,
+                    run.open_crypts,
+                    run.http
+                );
+            }
+        }
+    }
+    relay.set_latency(Duration::ZERO);
 }
 
 // ───────────────────────── 3. Vault ─────────────────────────
@@ -1497,6 +1580,9 @@ struct MigrationRun {
     vault: Duration,
     verify: Duration,
     calls: usize,
+    /// `Crypt` requests of the memory+skills rewrite, the vault rewrite and
+    /// the read-back.
+    crypts: (usize, usize, usize),
     http: usize,
 }
 
@@ -1546,12 +1632,15 @@ async fn migrate_run(
     let knowledge = relay.knowledge(paths, agent.clone());
     let vault = relay.vault(paths, agent);
     relay.reset_counters();
+    let crypts = || counts.crypts.load(Ordering::SeqCst);
     let start = Instant::now();
     knowledge.migrate_encryption().await.unwrap();
     let knowledge_t = start.elapsed();
+    let rewrite_crypts = crypts();
     let start = Instant::now();
     vault.migrate_encryption().await.unwrap();
     let vault_t = start.elapsed();
+    let vault_crypts = crypts() - rewrite_crypts;
     let start = Instant::now();
     knowledge.verify_encryption_migration().await.unwrap();
     vault.verify_encryption_migration().await.unwrap();
@@ -1561,6 +1650,11 @@ async fn migrate_run(
         vault: vault_t,
         verify,
         calls: counts.calls.load(Ordering::SeqCst),
+        crypts: (
+            rewrite_crypts,
+            vault_crypts,
+            crypts() - rewrite_crypts - vault_crypts,
+        ),
         http: relay.traffic().0,
     }
 }
@@ -1582,9 +1676,9 @@ async fn perf_4_migration() {
         "\n## 4. Migration off → on (enabling): rewrite every row, then the read-back pass; median of 3"
     );
     println!(
-        "| facts | skills (10×4 KiB files) | vault entries (1 KiB) | mode | memory+skills rewrite ms | vault rewrite ms | read-back ms | total ms | added vs no-crypto ms | records/s | agent calls | HTTP reqs |"
+        "| facts | skills (10×4 KiB files) | vault entries (1 KiB) | mode | memory+skills rewrite ms | vault rewrite ms | read-back ms | total ms | added vs no-crypto ms | records/s | agent calls | Crypt reqs (rewrite / vault / read-back) | HTTP reqs |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (n, skills, entries) in [
         (10usize, 1usize, 10usize),
         (100, 10, 100),
@@ -1629,7 +1723,7 @@ async fn perf_4_migration() {
             }
             let records = n + skills + entries;
             println!(
-                "| {n} | {skills} | {entries} | {name} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {} | {} |",
+                "| {n} | {skills} | {entries} | {name} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {} | {} / {} / {} | {} |",
                 ms(run.knowledge),
                 ms(run.vault),
                 ms(run.verify),
@@ -1637,10 +1731,63 @@ async fn perf_4_migration() {
                 total - base_total,
                 records as f64 / (total / 1e3),
                 run.calls,
+                run.crypts.0,
+                run.crypts.1,
+                run.crypts.2,
                 run.http
             );
         }
     }
+    // The same against a relay with a round trip: what encryption adds once
+    // the network sets the pace.
+    println!(
+        "\n### 4''. Migration against a relay that answers each request after 20 ms, median of 3"
+    );
+    println!(
+        "| facts | skills | vault entries | mode | total ms | added vs no-crypto ms | added % | Crypt reqs (rewrite / vault / read-back) | HTTP reqs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
+    relay.set_latency(Duration::from_millis(20));
+    for (n, skills, entries) in [(1000usize, 10usize, 1000usize), (5000, 10, 1000)] {
+        let mut base_total = 0.0;
+        let modes: Vec<(&str, CredPaths, Arc<dyn CredAgentApi>)> = vec![
+            (
+                "no crypto (disabling over plain rows)",
+                baseline.paths.clone(),
+                baseline.agent.clone() as Arc<dyn CredAgentApi>,
+            ),
+            (
+                "socket, production (one client per process)",
+                real.paths.clone(),
+                real.production() as Arc<dyn CredAgentApi>,
+            ),
+        ];
+        for (name, paths, agent) in modes {
+            let mut runs = Vec::new();
+            for _ in 0..3 {
+                runs.push(
+                    migrate_run(&relay, &paths, agent.clone(), n, skills, entries, None).await,
+                );
+            }
+            runs.sort_by_key(|run| run.knowledge + run.vault + run.verify);
+            let run = runs.remove(1);
+            let total = ms(run.knowledge + run.vault + run.verify);
+            if base_total == 0.0 {
+                base_total = total;
+            }
+            println!(
+                "| {n} | {skills} | {entries} | {name} | {:.1} | {:.1} | {:.1}% | {} / {} / {} | {} |",
+                total,
+                total - base_total,
+                (total - base_total) / base_total * 100.0,
+                run.crypts.0,
+                run.crypts.1,
+                run.crypts.2,
+                run.http
+            );
+        }
+    }
+    relay.set_latency(Duration::ZERO);
     // Key rotation: every row already sealed under the old kid, re-sealed under the new one.
     println!(
         "\n### 4'. Rotation (enabling with a new kid over rows sealed under the old one), in-process agent"
