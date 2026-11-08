@@ -187,30 +187,55 @@ pub(crate) async fn stub_relay(state: Arc<Mutex<RelayState>>) -> String {
     base
 }
 
+/// The `since` cursor of a pull request (0 without one).
+fn since(path: &str) -> i64 {
+    path.split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("since="))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
 fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body: &Value) -> Value {
     let mut state = state.lock().unwrap();
     if method == "GET" && path.starts_with("/api/memory?") {
-        return json!({"memories": state.memories});
+        let since = since(path);
+        let page: Vec<&Memory> = state.memories.iter().filter(|row| row.seq > since).collect();
+        return json!({"memories": page});
     }
     if method == "GET" && path.starts_with("/api/skills?") {
-        return json!({"skills": state.skills});
+        let since = since(path);
+        let page: Vec<&Skill> = state.skills.iter().filter(|row| row.seq > since).collect();
+        return json!({"skills": page});
     }
     if method == "POST" && path.starts_with("/api/memory/batch?") {
         let mut results = Vec::new();
         for op in body["ops"].as_array().unwrap() {
             match op["op"].as_str().unwrap() {
+                // A rewrite takes a fresh seq, as on the relay.
                 "rewrite" => {
+                    let seq = state.next_seq;
+                    state.next_seq += 1;
                     let id = op["id"].as_str().unwrap();
                     let memory = state.memories.iter_mut().find(|row| row.id == id).unwrap();
                     memory.project = op["project"].as_str().unwrap().into();
                     memory.content = op["content"].as_str().unwrap().into();
                     memory.content_hash = op["content_hash"].as_str().unwrap().into();
+                    memory.seq = seq;
                 }
                 "add" => {
                     let mut memory: Memory = serde_json::from_value(op["memory"].clone()).unwrap();
                     memory.seq = state.next_seq;
                     state.next_seq += 1;
                     state.memories.push(memory);
+                }
+                "invalidate" => {
+                    let seq = state.next_seq;
+                    state.next_seq += 1;
+                    let id = op["id"].as_str().unwrap();
+                    let memory = state.memories.iter_mut().find(|row| row.id == id).unwrap();
+                    memory.invalid_at = op["invalid_at"].as_i64();
+                    memory.superseded_by = op["superseded_by"].as_str().map(str::to_string);
+                    memory.seq = seq;
                 }
                 other => panic!("unexpected memory operation {other}"),
             }
@@ -222,6 +247,8 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
         let mut results = Vec::new();
         for op in body["ops"].as_array().unwrap() {
             assert_eq!(op["op"], "rewrite");
+            let seq = state.next_seq;
+            state.next_seq += 1;
             let version = op["version"].as_i64().unwrap();
             let name = op["name"].as_str().unwrap();
             let skill = state
@@ -232,6 +259,7 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
             skill.project = op["project"].as_str().unwrap().into();
             skill.files = serde_json::from_value(op["files"].clone()).unwrap();
             skill.content_hash = op["content_hash"].as_str().unwrap().into();
+            skill.seq = seq;
             results.push(json!({"ok": true, "version": version, "seq": state.next_seq}));
         }
         return json!({"results": results});
@@ -489,6 +517,400 @@ async fn relay_injected_plain_text_is_rejected_while_on() {
 
     let vault_error = vault.list().await.unwrap_err().to_string();
     assert!(vault_error.contains("plain-text"), "{vault_error}");
+}
+
+const ATEM_PROJECT: &str = "github.com/agora/atem";
+const ELSEWHERE: &str = "github.com/agora/elsewhere";
+
+fn fact(id: &str, scope: Scope, project: &str, content: &str, seq: i64) -> Memory {
+    Memory {
+        id: id.into(),
+        scope,
+        project: project.into(),
+        content: content.into(),
+        content_hash: content_hash(content),
+        confidence: "high".into(),
+        source_agent: "test".into(),
+        source_machine: "other-mac".into(),
+        created_at: seq,
+        seq,
+        ..Memory::default()
+    }
+}
+
+fn skill_row(name: &str, scope: Scope, project: &str, body: &str, seq: i64) -> Skill {
+    let files = BTreeMap::from([("SKILL.md".to_string(), body.as_bytes().to_vec())]);
+    Skill {
+        scope,
+        project: project.into(),
+        name: name.into(),
+        version: 1,
+        content_hash: skill_hash(&files),
+        files,
+        source_agent: "test".into(),
+        source_machine: "other-mac".into(),
+        created_at: seq,
+        deleted: false,
+        seq,
+    }
+}
+
+/// Two devices of one account (encryption on, the same `K`) and a relay
+/// holding what `other` sealed: a global fact, a fact for ATEM_PROJECT, one
+/// for ELSEWHERE, a global skill, a skill for ELSEWHERE, then a global fact
+/// and a global skill that carry ELSEWHERE as their project (only the
+/// unresolved filter keeps those out of the global targets). This device
+/// used ATEM_PROJECT only, so it can't name ELSEWHERE's hash. Claude and
+/// Codex are both installed.
+struct Elsewhere {
+    dir: tempfile::TempDir,
+    device: UnlockedDevice,
+    other: UnlockedDevice,
+    relay: Arc<Mutex<RelayState>>,
+    base: String,
+    knowledge: KnowledgeClient,
+    store: Store,
+}
+
+impl Elsewhere {
+    async fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = dir.path().canonicalize().unwrap();
+        let mut other = UnlockedDevice::new(&base_dir.join("other"));
+        other.set_key(EncryptionMode::On, OLD_KID, [7; 32]);
+        let mut device = UnlockedDevice::new(&base_dir.join("this"));
+        device.set_key(EncryptionMode::On, OLD_KID, [7; 32]);
+        EncryptionContext::for_astation_with(ASTATION, &device.paths, device.agent.clone())
+            .unwrap()
+            .wire_project(ATEM_PROJECT)
+            .unwrap();
+        let sealer = EncryptionContext::for_astation_with(ASTATION, &other.paths, other.agent.clone()).unwrap();
+        let memories = sealer
+            .encrypt_memories(vec![
+                fact("mem-global", Scope::Global, "", "run the tests before committing", 1),
+                fact("mem-atem", Scope::Project, ATEM_PROJECT, "atem listens on port 27183", 2),
+                fact("mem-elsewhere", Scope::Project, ELSEWHERE, "elsewhere deploys on fridays", 3),
+                fact("mem-stray", Scope::Global, ELSEWHERE, "a stray global fact", 6),
+            ])
+            .unwrap();
+        let skills = sealer
+            .encrypt_skills(vec![
+                skill_row("lint", Scope::Global, "", "# lint everything", 4),
+                skill_row("ship", Scope::Project, ELSEWHERE, "# ship elsewhere", 5),
+                skill_row("stray", Scope::Global, ELSEWHERE, "# a stray global skill", 7),
+            ])
+            .unwrap();
+        let relay = Arc::new(Mutex::new(RelayState {
+            memories,
+            skills,
+            vault_summary: String::new(),
+            vault_entries: Vec::new(),
+            next_seq: 8,
+        }));
+        let base = stub_relay(relay.clone()).await;
+        let (knowledge, _) = clients(&base, &device);
+        std::fs::create_dir_all(base_dir.join("home/.claude")).unwrap();
+        std::fs::create_dir_all(base_dir.join("home/.codex")).unwrap();
+        Self { dir, device, other, relay, base, knowledge, store: Store::open_in_memory().unwrap() }
+    }
+
+    fn path(&self, rel: &str) -> std::path::PathBuf {
+        self.dir.path().canonicalize().unwrap().join(rel)
+    }
+
+    /// A git checkout of `project` (created the first time).
+    fn checkout(&self, project: &str) -> crate::memory::project::RepoInfo {
+        let root = self.path(project.rsplit('/').next().unwrap());
+        if !root.exists() {
+            std::fs::create_dir_all(&root).unwrap();
+            let init = std::process::Command::new("git").arg("-C").arg(&root).args(["init", "-q"]).status();
+            assert!(init.unwrap().success());
+        }
+        crate::memory::project::RepoInfo { root, key: project.into(), label: project.into() }
+    }
+
+    /// One `atem sync`, from `repo` (or outside any checkout).
+    async fn sync(&self, repo: Option<crate::memory::project::RepoInfo>) -> crate::memory::sync::SyncOutcome {
+        let ctx = Ctx { home: self.path("home"), repo, atem_id: "this-mac".into(), allow_tracked: false };
+        run_sync(&self.store, Some(&self.knowledge), &ctx, &SyncOptions { harvest: false }).await.unwrap()
+    }
+
+    /// One `atem sync` from `project`'s checkout.
+    async fn sync_in(&self, project: &str) -> crate::memory::sync::SyncOutcome {
+        self.sync(Some(self.checkout(project))).await
+    }
+
+    fn read(&self, path: std::path::PathBuf) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// Every managed block Claude and Codex read in `project`'s checkout,
+    /// global ones included, joined.
+    fn applied(&self, project: &str) -> String {
+        let root = self.checkout(project).root;
+        [self.path("home/.claude/CLAUDE.md"), self.path("home/.codex/AGENTS.md"), root.join("CLAUDE.local.md"), root.join("AGENTS.md")]
+            .into_iter()
+            .map(|file| self.read(file))
+            .collect()
+    }
+
+    /// The skill directories Claude and Codex have in `project`'s checkout,
+    /// global ones included.
+    fn installed(&self, project: &str) -> Vec<String> {
+        let root = self.checkout(project).root;
+        let mut names = Vec::new();
+        for dir in [self.path("home/.claude/skills"), self.path("home/.agents/skills"), root.join(".claude/skills"), root.join(".agents/skills")] {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                names.extend(entries.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()));
+            }
+        }
+        names.sort();
+        names
+    }
+
+    fn project_file(&self, project: &str) -> String {
+        self.read(self.checkout(project).root.join("CLAUDE.local.md"))
+    }
+
+    fn context(&self, device: &UnlockedDevice) -> EncryptionContext {
+        EncryptionContext::for_astation_with(ASTATION, &device.paths, device.agent.clone()).unwrap()
+    }
+
+    /// `other` seals and publishes one more row.
+    fn publish(&self, memory: Memory) {
+        let mut sealed = self.context(&self.other).encrypt_memories(vec![memory]).unwrap().remove(0);
+        let mut relay = self.relay.lock().unwrap();
+        sealed.seq = relay.next_seq;
+        relay.next_seq += 1;
+        relay.memories.push(sealed);
+    }
+
+    /// A key rotation: both devices get `K` = [8; 32] (NEW_KID), `other`
+    /// migrates every relay row to it (each takes a fresh seq), then the
+    /// account is on with it.
+    async fn rotate(&mut self) {
+        self.other.set_key(EncryptionMode::Enabling, NEW_KID, [8; 32]);
+        self.device.set_key(EncryptionMode::Enabling, NEW_KID, [8; 32]);
+        let (theirs, _) = clients(&self.base, &self.other);
+        theirs.migrate_encryption().await.unwrap();
+        theirs.verify_encryption_migration().await.unwrap();
+        self.other.state(EncryptionMode::On, Some(NEW_KID));
+        self.device.state(EncryptionMode::On, Some(NEW_KID));
+    }
+
+    /// Encryption turned off: `other` migrates every relay row to plain text
+    /// (each takes a fresh seq), then the account is off.
+    async fn turn_off(&mut self) {
+        self.other.state(EncryptionMode::Disabling, Some(OLD_KID));
+        self.device.state(EncryptionMode::Disabling, Some(OLD_KID));
+        let (theirs, _) = clients(&self.base, &self.other);
+        theirs.migrate_encryption().await.unwrap();
+        theirs.verify_encryption_migration().await.unwrap();
+        self.other.state(EncryptionMode::Off, None);
+        self.device.state(EncryptionMode::Off, None);
+    }
+
+    fn skills_named(&self, name: &str) -> Vec<Skill> {
+        self.store.all_skills().unwrap().into_iter().filter(|skill| skill.name == name).collect()
+    }
+}
+
+/// A fact for a project this device can't name doesn't stop the pull: the
+/// rest of the page applies, the fact is kept under its hash and never
+/// applied (not even the stray global rows), both cursors move, and later
+/// syncs go on.
+#[tokio::test]
+async fn a_fact_for_a_project_this_device_cannot_name_is_kept_and_the_pull_goes_on() {
+    use crate::memory::store::{memory_cursor_key, skill_cursor_key};
+    let world = Elsewhere::new().await;
+    let outcome = world.sync_in(ATEM_PROJECT).await;
+    assert!(!outcome.relay_error && !outcome.offline, "{:?}", outcome.notes);
+    assert_eq!(outcome.pulled, 7, "four facts and three skills");
+    let hash = world.relay.lock().unwrap().memories[2].project.clone();
+    let kept = world.store.get_memory("mem-elsewhere").unwrap().expect("the fact is kept");
+    assert_eq!(kept.project, hash, "under the relay's hash: unresolved");
+    assert!(kept.has_unresolved_project());
+    assert_eq!(kept.content, "elsewhere deploys on fridays");
+    assert_eq!(world.store.get_memory("mem-atem").unwrap().unwrap().project, ATEM_PROJECT);
+    assert_eq!(world.store.get_state(&memory_cursor_key(ASTATION)).unwrap(), 6);
+    assert_eq!(world.store.get_state(&skill_cursor_key(ASTATION)).unwrap(), 7, "skills are pulled after memories");
+    let applied = world.applied(ATEM_PROJECT);
+    assert!(applied.contains("run the tests before committing"), "{applied}");
+    assert!(applied.contains("atem listens on port 27183"), "{applied}");
+    assert!(!applied.contains("fridays") && !applied.contains("stray"), "an unresolved fact is never applied: {applied}");
+    let installed = world.installed(ATEM_PROJECT);
+    assert_eq!(installed, ["lint", "lint"], "Claude's and Codex's global skill, nothing unresolved");
+
+    // The next sync doesn't stop on that page: a later fact arrives.
+    world.publish(fact("mem-later", Scope::Global, "", "a later fact", 0));
+    let again = world.sync_in(ATEM_PROJECT).await;
+    assert!(!again.relay_error, "{:?}", again.notes);
+    assert_eq!(world.store.get_state(&memory_cursor_key(ASTATION)).unwrap(), 8);
+    assert!(world.applied(ATEM_PROJECT).contains("a later fact"));
+    assert!(world.store.get_memory("mem-elsewhere").unwrap().unwrap().has_unresolved_project());
+}
+
+/// Once this device records the project's name (as a push or a skill
+/// history there would), the fact resolves and is applied for that project
+/// only.
+#[tokio::test]
+async fn an_unresolved_fact_resolves_once_this_device_records_its_project() {
+    let world = Elsewhere::new().await;
+    world.sync_in(ATEM_PROJECT).await;
+    assert!(world.store.get_memory("mem-elsewhere").unwrap().expect("kept").has_unresolved_project());
+    world.context(&world.device).wire_project(ELSEWHERE).unwrap();
+    let outcome = world.sync_in(ATEM_PROJECT).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    assert_eq!(world.store.get_memory("mem-elsewhere").unwrap().unwrap().project, ELSEWHERE);
+    assert!(!world.project_file(ATEM_PROJECT).contains("fridays"), "only for its own project");
+    world.sync_in(ELSEWHERE).await;
+    assert!(world.project_file(ELSEWHERE).contains("elsewhere deploys on fridays"));
+}
+
+/// A skill for a project this device can't name is kept the same way:
+/// never installed, the skills cursor moves on. A sync from that project's
+/// checkout names the project: the skill is installed there, and the fact
+/// applied.
+#[tokio::test]
+async fn a_skill_for_a_project_this_device_cannot_name_is_kept_until_it_is_named() {
+    use crate::memory::store::skill_cursor_key;
+    let world = Elsewhere::new().await;
+    let outcome = world.sync_in(ATEM_PROJECT).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    let hash = world.relay.lock().unwrap().skills[1].project.clone();
+    let kept = world.store.get_skill(Scope::Project, &hash, "ship").unwrap().expect("the skill is kept under its hash");
+    assert_eq!(kept.files["SKILL.md"], b"# ship elsewhere");
+    assert!(kept.has_unresolved_project());
+    assert_eq!(world.store.get_state(&skill_cursor_key(ASTATION)).unwrap(), 7);
+    assert_eq!(world.installed(ATEM_PROJECT), ["lint", "lint"], "never installed");
+
+    let outcome = world.sync_in(ELSEWHERE).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    assert!(world.store.get_skill(Scope::Project, &hash, "ship").unwrap().is_none());
+    assert_eq!(world.store.get_skill(Scope::Project, ELSEWHERE, "ship").unwrap().unwrap().version, 1);
+    assert_eq!(world.read(world.checkout(ELSEWHERE).root.join(".claude/skills/ship/SKILL.md")), "# ship elsewhere");
+    assert_eq!(world.read(world.checkout(ELSEWHERE).root.join(".agents/skills/ship/SKILL.md")), "# ship elsewhere");
+    assert_eq!(world.store.get_memory("mem-elsewhere").unwrap().unwrap().project, ELSEWHERE);
+    assert!(world.project_file(ELSEWHERE).contains("elsewhere deploys on fridays"));
+    assert!(world.store.unresolved_projects().unwrap().is_empty());
+}
+
+/// A purge rewrites a skill's version in place with a new seq. Pulled
+/// under its name (the name was recorded first), it wins over the older
+/// unresolved copy: the skill stays purged and is never installed.
+#[tokio::test]
+async fn a_purge_pulled_under_the_name_wins_over_the_unresolved_copy() {
+    let world = Elsewhere::new().await;
+    world.sync_in(ATEM_PROJECT).await;
+    {
+        let mut relay = world.relay.lock().unwrap();
+        let seq = relay.next_seq;
+        relay.next_seq += 1;
+        let row = &mut relay.skills[1];
+        row.files.clear();
+        row.content_hash.clear();
+        row.deleted = true;
+        row.seq = seq;
+    }
+    world.context(&world.device).wire_project(ELSEWHERE).unwrap();
+    let outcome = world.sync_in(ELSEWHERE).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    let stored = world.skills_named("ship");
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert!(stored[0].deleted && stored[0].files.is_empty() && stored[0].project == ELSEWHERE, "{stored:?}");
+    assert!(!world.installed(ELSEWHERE).contains(&"ship".to_string()));
+}
+
+/// After a key rotation the relay delivers every row again under the new
+/// key. Skills still stored under the old key's hash, which this device can
+/// never name, are dropped; projects it already knew are hashed under the
+/// new key, so their facts resolve without a sync in their checkout.
+#[tokio::test]
+async fn after_a_rotation_old_key_rows_go_and_known_projects_resolve() {
+    let mut world = Elsewhere::new().await;
+    world.sync_in(ATEM_PROJECT).await;
+    let old_hash = world.relay.lock().unwrap().skills[1].project.clone();
+    assert!(world.store.unresolved_projects().unwrap().contains(&old_hash));
+    world.rotate().await;
+    let new_hash = world.relay.lock().unwrap().skills[1].project.clone();
+    assert!(new_hash.starts_with(&format!("h1.{NEW_KID}.")) && new_hash != old_hash);
+
+    let outcome = world.sync(None).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    assert_eq!(world.store.unresolved_projects().unwrap(), std::slice::from_ref(&new_hash), "nothing under the old key is left");
+    assert_eq!(world.skills_named("ship").len(), 1);
+    assert_eq!(world.store.get_memory("mem-elsewhere").unwrap().unwrap().project, new_hash);
+    assert_eq!(world.store.get_memory("mem-atem").unwrap().unwrap().project, ATEM_PROJECT, "a known project is hashed again");
+
+    world.sync_in(ELSEWHERE).await;
+    assert!(world.store.unresolved_projects().unwrap().is_empty());
+    assert_eq!(world.read(world.checkout(ELSEWHERE).root.join(".claude/skills/ship/SKILL.md")), "# ship elsewhere");
+    assert!(world.project_file(ELSEWHERE).contains("elsewhere deploys on fridays"));
+}
+
+/// Turning encryption off delivers every row again in plain text. Skills
+/// stored under a hash this device couldn't name are dropped: an off
+/// device never names a hash.
+#[tokio::test]
+async fn turning_encryption_off_drops_skill_rows_under_an_unnamed_hash() {
+    let mut world = Elsewhere::new().await;
+    world.sync_in(ATEM_PROJECT).await;
+    world.turn_off().await;
+    let outcome = world.sync_in(ATEM_PROJECT).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    assert!(world.store.unresolved_projects().unwrap().is_empty());
+    let ship = world.skills_named("ship");
+    assert_eq!((ship.len(), ship[0].project.as_str()), (1, ELSEWHERE));
+    assert_eq!(world.store.get_memory("mem-elsewhere").unwrap().unwrap().project, ELSEWHERE);
+    assert!(!world.installed(ATEM_PROJECT).contains(&"ship".to_string()));
+    assert!(!world.applied(ATEM_PROJECT).contains("fridays"));
+}
+
+/// Replacing an unresolved fact pushes its successor with the project hash
+/// it came with, never hashed again: the device that knows the project
+/// reads it under its name.
+#[tokio::test]
+async fn a_push_after_pulling_an_unresolved_fact_keeps_its_project_hash() {
+    let world = Elsewhere::new().await;
+    world.sync_in(ATEM_PROJECT).await;
+    let old = world.store.get_memory("mem-elsewhere").unwrap().expect("kept");
+    let hash = old.project.clone();
+    let new_id = crate::memory::sync::replace_memory(&world.store, &old, "elsewhere deploys on mondays", None, "cli", "this-mac").unwrap();
+    let outcome = world.sync_in(ATEM_PROJECT).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    assert_eq!(outcome.pushed, 2, "the successor and the invalidation");
+    {
+        let relay = world.relay.lock().unwrap();
+        let added = relay.memories.iter().find(|row| row.id == new_id).unwrap();
+        assert_eq!(added.project, hash, "the hash goes back as it came");
+        let replaced = relay.memories.iter().find(|row| row.id == "mem-elsewhere").unwrap();
+        assert_eq!(replaced.project, hash);
+        assert_eq!(replaced.superseded_by.as_deref(), Some(new_id.as_str()));
+    }
+    let (theirs, _) = clients(&world.base, &world.other);
+    let pulled = theirs.pull_memories(0).await.unwrap();
+    let new = pulled.iter().find(|row| row.id == new_id).unwrap();
+    assert_eq!((new.project.as_str(), new.content.as_str()), (ELSEWHERE, "elsewhere deploys on mondays"));
+    assert!(world.store.get_memory(&new_id).unwrap().unwrap().has_unresolved_project(), "still unresolved here");
+    assert!(!world.applied(ATEM_PROJECT).contains("mondays"));
+}
+
+/// A replacement queued while its fact was unresolved goes out under the
+/// name this device learned since: here plain, after encryption was turned
+/// off, never as a hash nobody off can name.
+#[tokio::test]
+async fn a_replacement_queued_while_unresolved_goes_out_under_the_name_learned_since() {
+    let mut world = Elsewhere::new().await;
+    world.sync_in(ATEM_PROJECT).await;
+    let old = world.store.get_memory("mem-elsewhere").unwrap().expect("kept");
+    let new_id = crate::memory::sync::replace_memory(&world.store, &old, "elsewhere deploys on mondays", None, "cli", "this-mac").unwrap();
+    world.context(&world.device).wire_project(ELSEWHERE).unwrap();
+    world.turn_off().await;
+    let outcome = world.sync_in(ATEM_PROJECT).await;
+    assert!(!outcome.relay_error, "{:?}", outcome.notes);
+    let added = world.relay.lock().unwrap().memories.iter().find(|row| row.id == new_id).cloned().unwrap();
+    assert_eq!((added.project.as_str(), added.content.as_str()), (ELSEWHERE, "elsewhere deploys on mondays"));
+    assert_eq!(world.store.get_memory(&new_id).unwrap().unwrap().project, ELSEWHERE);
 }
 
 /// Counts the `Crypt` requests that reach the agent.

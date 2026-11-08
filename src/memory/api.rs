@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::store::PendingOp;
-use crate::memory::crypto::{EncryptionContext, EncryptionMode};
+use crate::memory::crypto::{EncryptionContext, EncryptionMode, ProjectNaming};
 
 pub const PULL_LIMIT: u32 = 200;
 const MEMORY_MIGRATION_CHUNK: usize = 64;
@@ -174,9 +174,25 @@ pub struct KnowledgeClient {
     encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
 }
 
+/// `ops` with every project pulled as a hash this Atem has named since put
+/// back under its name (`EncryptionContext::name_hashes`): a replacement
+/// queued while its fact was unresolved goes out like any other once the
+/// name is known, never with a stale hash.
+fn named_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<PendingOp>> {
+    let mut ops = ops.to_vec();
+    encryption.name_hashes(ops.iter_mut().filter_map(|op| match op {
+        PendingOp::AddMemory { memory } => Some(&mut memory.project),
+        PendingOp::PushSkill { skill, .. } => Some(&mut skill.project),
+        PendingOp::DeleteSkill { project, .. } | PendingOp::PurgeSkill { project, .. } => Some(project),
+        PendingOp::DeleteMemory { .. } | PendingOp::InvalidateMemory { .. } => None,
+    }))?;
+    Ok(ops)
+}
+
 /// The wire form of `ops`, encrypted when the account is: every memory,
 /// skill and project hash of the batch in a few cred-agent round trips.
 fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<Value>> {
+    let ops = &named_ops(encryption, ops)?;
     if !encryption.should_encrypt() {
         return Ok(ops.iter().map(op_to_wire).collect());
     }
@@ -277,14 +293,22 @@ impl KnowledgeClient {
         let req = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: MemoryPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_memories(page.memories)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_memories(page.memories)).await.map_err(ApiError::from)
     }
 
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let req = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_skills(page.skills)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_skills(page.skills)).await.map_err(ApiError::from)
+    }
+
+    /// Names what it can of the pulled project hashes `hashes`, hashing and
+    /// recording `current` (the checkout a sync runs in) and the projects it
+    /// knows first. See `EncryptionContext::learn_project_names`.
+    pub async fn learn_project_names(&self, hashes: Vec<String>, current: Option<String>) -> Result<ProjectNaming, ApiError> {
+        let encryption = self.encryption()?;
+        encryption.blocking(move |encryption| encryption.learn_project_names(&hashes, current.as_deref())).await.map_err(ApiError::from)
     }
 
     /// A skill's history, newest first (no files).

@@ -82,6 +82,14 @@ impl ProjectNames {
             .map(String::as_str)
     }
 
+    /// Whether `account` records a hash of `project` under the key `kid`.
+    pub fn hashed_under(&self, account: &str, kid: &str, project: &str) -> bool {
+        let prefix = format!("h1.{kid}.");
+        self.accounts.get(account).is_some_and(|names| {
+            names.iter().any(|(hash, name)| name == project && hash.starts_with(&prefix))
+        })
+    }
+
     pub fn projects(&self, account: &str) -> Vec<String> {
         self.accounts.get(account).map(|names| names.values().cloned().collect()).unwrap_or_default()
     }
