@@ -6,7 +6,7 @@ validity**, **Search**, **Skill history and restore**): relay side (migrations
 (2026-09-30). **Not implemented:** Phases 2–4 ("Phasing") and the two
 "Future" sections.
 Spans two repos: **Atem** (CLI, local store, adapters, sync client) and
-**Astation** (relay-server `/api/memory`, `/api/skills` + Postgres).
+**Astation** (relay-server `/api/memory`, `/api/skills/v2` + Postgres).
 
 ## Goal
 
@@ -291,10 +291,11 @@ CREATE INDEX skill_versions_account_seq ON skill_versions (account_id, seq);
   a credential that slipped through"). If two machines push the same skill
   concurrently, the one with the higher `seq` wins. A skill is limited to
   1 MB total.
-- **Skills are text-only.** Every file must be UTF-8 text. Files are
-  base64-encoded in the JSON, but only so the wire format is uniform; no
-  binary file ever reaches it, because the secret check can't scan binary
-  and refuses it (see "Security").
+- **Skills are text-only.** Every file must be UTF-8 text; no binary file
+  ever reaches the relay, because the secret check can't scan binary and
+  refuses it (see "Security"). The server stores each file's bytes as
+  base64. On the wire (skill wire v2, below) a sealed file is its `e1.`
+  text and a plain one base64.
 
 ### Local (SQLite, each machine)
 
@@ -326,9 +327,43 @@ there's no window where it's readable by others:
 |---|---|
 | `POST /api/memory/batch` | Push memory ops (`add`, `delete`, `invalidate`). Returns per-op results. |
 | `GET /api/memory?since=<seq>&limit=<n>` | Pull memory rows (tombstones and invalidations included, with the validity fields) with `seq > since`. |
-| `POST /api/skills/batch` | Push skill ops (`push`, `delete`, `purge`). |
-| `GET /api/skills?since=<seq>&limit=<n>` | Pull skill versions with `seq > since`. |
-| `GET /api/skills/versions`, `GET /api/skills/version` | Skill history and one old version's files (see "Skill history and restore"). |
+| `POST /api/skills/v2/batch` | Push skill ops (`push`, `delete`, `purge`; `rewrite` during an encryption migration). Returns `{wire_version: 2, results}`. |
+| `GET /api/skills/v2?since=<seq>&limit=<n>` | Pull skill versions with `seq > since`: `{wire_version: 2, skills}`. |
+| `GET /api/skills/v2/versions`, `GET /api/skills/v2/version` | Skill history and one old version's files (see "Skill history and restore"). |
+
+**Skill wire v2** is the only skill transport atem uses. It is built for
+F8 of [Atem #130](https://github.com/Agora-Build/Atem/issues/130). The
+contract is Astation's `designs/protocol/skill-file-wire-v2.md` in draft
+[Astation PR #76](https://github.com/Agora-Build/Astation/pull/76), pinned
+at 963c74b; the vectors are in `designs/protocol/fixtures/skills-wire/`.
+The Station's legacy `/api/skills` routes stay for older clients, which see
+the same rows; atem never calls them. Owner decision on #130: v2 only, with
+no detection, fallback or switch.
+
+- **Files.** Every skill row a v2 route returns, every `push.skill` and every
+  `rewrite` carries `files_encoding` next to `files`:
+  - `e1-text`: every path is a sealed `e1.` envelope, and every value is
+    the envelope's own text (encoded once, not base64 of it). An empty file
+    is `""`, never sealed. atem sends this for a sealed skill.
+  - `base64`: standard padded base64 of the bytes. atem sends this for a
+    plain skill, and only while the account's mode permits plain text
+    (`off`, or `disabling`'s rewrite back).
+- **Refusals.** Missing or unknown encodings, malformed envelopes, and plain
+  entries in an `e1-text` row are refused by the Station (the whole batch,
+  400 `invalid skill files encoding`) and by atem: a pulled page with such a
+  row isn't applied, and atem never sends one. A success body must say
+  `wire_version: 2`.
+- **A Station without the v2 routes** (a 404 on them) gets "This Station
+  doesn't support skill wire v2; update it.", and skills stay queued. A
+  `/v2/version` 404 whose body is the Station's "no such skill version" is
+  still a missing version. Other errors are reported as before. No request
+  ever goes to a legacy route, and a POST whose outcome is unknown is sent
+  again only in the same format.
+- **Unchanged:** the stored rows (the Station keeps base64 of the same
+  bytes), ciphertext and associated data, `content_hash`, versions, `seq`,
+  the 16 MiB batch and 16-op limits, and quotas. A 1 MiB sealed file is
+  1.33× its size on the wire instead of 1.78× (see `designs/e2e-encryption.md`
+  "Performance").
 
 Rules:
 
@@ -1102,13 +1137,13 @@ Where the data comes from: the local store keeps only the latest version of
 each skill, so both commands ask the relay. They need a connection and say
 so plainly when offline.
 
-New relay endpoints, with the same auth and account isolation as the other
-skill routes:
+Relay endpoints, with the same auth and account isolation as the other
+skill routes (skill wire v2, above):
 
 | Method & path | Returns |
 |---|---|
-| `GET /api/skills/versions?scope=&project=&name=` | `{"versions":[{version, created_at, source_agent, source_machine, file_count, deleted, purged}]}`, newest first. No file contents. |
-| `GET /api/skills/version?scope=&project=&name=&version=<n>` | `{"skill": <skill row with files>}`. 404 for an unknown version; 410 for a purged one. |
+| `GET /api/skills/v2/versions?scope=&project=&name=` | `{"wire_version":2, "versions":[{version, created_at, source_agent, source_machine, file_count, deleted, purged}]}`, newest first. No file contents. |
+| `GET /api/skills/v2/version?scope=&project=&name=&version=<n>` | `{"wire_version":2, "skill": <skill row with files and files_encoding>}`. 404 `no such skill version` for an unknown version; 410 for a purged one. |
 
 `purged` comes from `skill_versions.purged` (migration 0005), set by
 `purge`. A purged version and a delete marker are otherwise stored the same
