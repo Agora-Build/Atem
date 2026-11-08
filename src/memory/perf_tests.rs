@@ -2411,7 +2411,7 @@ fn perf_6_ciphertext_sizes() {
     );
 
     println!(
-        "\n### 6b. One skill file (push op JSON; files are base64 on the wire, so a sealed file is base64 of the e1 text)"
+        "\n### 6b. One skill file (push op JSON, skill wire v2: a sealed file is its e1 text, a plain one base64)"
     );
     println!(
         "| file B | path B plain→sealed | stored file B (e1 text) | ratio | push JSON off B | push JSON on B | wire ratio |"
@@ -2432,7 +2432,7 @@ fn perf_6_ciphertext_sizes() {
         .len();
         let sealed = context.encrypt_skills(vec![skill]).unwrap().remove(0);
         let (path, bytes) = sealed.files.iter().next().unwrap();
-        let on = serde_json::to_vec(&json!({"op": "push", "skill": sealed, "base_version": 0}))
+        let on = serde_json::to_vec(&json!({"op": "push", "skill": crate::memory::skill_wire::sealed_skill(&sealed).unwrap(), "base_version": 0}))
             .unwrap()
             .len();
         println!(
@@ -2560,6 +2560,66 @@ async fn perf_7_skill_file_wire() {
                 ms(median(pulls)),
             );
         }
+    }
+
+    // The client's own cost of each representation of one sealed skill,
+    // side by side in this process: the push body built and serialized, the
+    // pulled row parsed into a `Skill`. Legacy is `Skill`'s own serde
+    // (base64 of the e1 text), what the client sent and read before F8.
+    let context =
+        EncryptionContext::for_astation_with(ASTATION_ID, &on.paths, on.agent.clone()).unwrap();
+    println!("\n### 7b. The client's cost per sealed skill, v2 against legacy (median µs)");
+    println!("| file B | build push body v2 | legacy | parse pulled row v2 | legacy |");
+    println!("|---|---|---|---|---|");
+    for size in [1usize << 10, 64 << 10, 1 << 20] {
+        let files = BTreeMap::from([("SKILL.md".to_string(), text(size, 7).into_bytes())]);
+        let sealed = context
+            .encrypt_skills(vec![Skill {
+                content_hash: skill_hash(&files),
+                files,
+                ..skill(0, 1, 1)
+            }])
+            .unwrap()
+            .remove(0);
+        let reps = if size >= 1 << 20 { 31 } else { 201 };
+        let push_v2 = bench(reps, || {
+            let skill = crate::memory::skill_wire::sealed_skill(&sealed).unwrap();
+            std::hint::black_box(
+                serde_json::to_vec(&json!({"ops": [{"op": "push", "skill": skill, "base_version": 0}]}))
+                    .unwrap(),
+            );
+        });
+        let push_legacy = bench(reps, || {
+            std::hint::black_box(
+                serde_json::to_vec(&json!({"ops": [{"op": "push", "skill": &sealed, "base_version": 0}]}))
+                    .unwrap(),
+            );
+        });
+        let v2_page = serde_json::to_vec(&fake_station_skills::page([&sealed])).unwrap();
+        let legacy_page = serde_json::to_vec(&json!({"skills": [&sealed]})).unwrap();
+        // Parsed straight from the body, as `KnowledgeClient` does.
+        #[derive(serde::Deserialize)]
+        struct Page<T> {
+            skills: Vec<T>,
+        }
+        let pull_v2 = bench(reps, || {
+            let page: Page<crate::memory::skill_wire::WireSkill> =
+                serde_json::from_slice(&v2_page).unwrap();
+            for row in page.skills {
+                std::hint::black_box(row.into_skill().unwrap());
+            }
+        });
+        let pull_legacy = bench(reps, || {
+            let page: Page<Skill> = serde_json::from_slice(&legacy_page).unwrap();
+            std::hint::black_box(page.skills);
+        });
+        println!(
+            "| {size} | {:.1} | {:.1} | {:.1} | {:.1} |",
+            us(push_v2),
+            us(push_legacy),
+            us(pull_v2),
+            us(pull_legacy)
+        );
     }
 }
 
