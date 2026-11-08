@@ -1898,8 +1898,9 @@ impl HostBridge {
         self.local.as_ref().map_or("", |(attachment, _)| attachment)
     }
 
-    /// `local` still has the authority of a verified host: paired, a usable
-    /// session journal, a device list that is neither frozen nor faulted.
+    /// `local` still has the authority of a verified host: paired, a pinned
+    /// device list (so r8 is refused) that is neither frozen nor faulted, a
+    /// usable session journal.
     /// Without it `sync_local` fences `local`. A new host identity, an
     /// unpairing or a device list that went unusable is a real change of
     /// authority; a plain session-journal halt fences `local` in memory
@@ -1908,6 +1909,7 @@ impl HostBridge {
     /// The switches in `runtime.toml` are not part of it (`collab_paused`).
     pub(super) fn local_authorized(&self) -> bool {
         self.host.context().account_id != UNPAIRED
+            && self.host.refuses_r8()
             && !self.host.journal_halted()
             && self.membership_error.is_none()
             && self

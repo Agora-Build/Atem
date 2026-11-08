@@ -1122,13 +1122,18 @@ impl HostBridge {
     }
 
     /// What `local` lacks of a verified host's authority, in the owner's
-    /// words: the pairing, the device list, the session journal.
+    /// words: the pairing, the device list, the session journal. A host
+    /// without a pinned device list still serves r8 sessions over a link that
+    /// is neither end to end nor authenticated at Atem's end (design section
+    /// 6), so collaboration doesn't run there.
     fn collab_unauthorized(&self) -> Vec<String> {
         let mut missing = Vec::new();
         if self.host.context().account_id == UNPAIRED {
             missing.push("pair and verify this device with Astation (`atem pair`)".into());
         } else if let Some(error) = &self.membership_error {
             missing.push(format!("the device list is unusable ({error})"));
+        } else if !self.host.refuses_r8() {
+            missing.push("collaboration needs a pinned device list: run `atem pair verify`".into());
         } else if let Some(m) = &self.membership {
             if m.is_frozen() {
                 missing

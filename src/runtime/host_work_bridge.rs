@@ -1629,6 +1629,9 @@ mod local_tests {
             let app = App::new();
             let mut bridge =
                 HostBridge::open(&root.join("runtime/journal"), None, Clock::default()).unwrap();
+            // A host with a pinned device list, which refuses r8: collaboration
+            // runs nowhere else.
+            bridge.host.set_refuse_r8(true);
             let cwd = root.join("project");
             std::fs::create_dir_all(&cwd).unwrap();
             let fake = root.join("fake");
@@ -3189,6 +3192,51 @@ principals = ["local"]
             assert_eq!(
                 error.to_string(),
                 "collaboration unavailable: pair and verify this device with Astation (`atem pair`)"
+            );
+        });
+    }
+
+    /// A host whose session host still serves r8 (no pinned device list)
+    /// runs no collaboration: `local` loses its authority, so a queued local
+    /// task fails and is never dispatched, and a new send is refused with the
+    /// fix.
+    #[test]
+    fn collaboration_needs_a_pinned_device_list() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let first = rig.message();
+            rig.publish(&first);
+            rig.until(|r| r.work(&first).status.state == WorkState::Submitted)
+                .await;
+            let mut second = rig.message();
+            second.text = "QUEUED_BEHIND_THE_FIRST".into();
+            rig.publish(&second);
+            rig.bridge.host.set_refuse_r8(false);
+            rig.until(|r| r.work(&second).status.state == WorkState::Failed)
+                .await;
+            assert_eq!(
+                rig.work(&second).status.detail,
+                "sender's authority changed"
+            );
+            std::fs::write(rig.fake.join("complete"), "").unwrap();
+            let error = rig
+                .bridge
+                .collab_send(
+                    "atem-host",
+                    &rig.sid,
+                    send_request(&["tag:ok"]),
+                    &rig.sessions,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "collaboration unavailable: collaboration needs a pinned device list: \
+                 run `atem pair verify`"
+            );
+            assert!(
+                !std::fs::read_to_string(rig.fake.join("input"))
+                    .unwrap_or_default()
+                    .contains("QUEUED_BEHIND_THE_FIRST")
             );
         });
     }
@@ -4820,6 +4868,8 @@ principals = ["browser:b"]
             let mut bridge =
                 HostBridge::open(&dir.path().join("runtime/journal"), None, Clock::default())
                     .unwrap();
+            // A host with a pinned device list (it refuses r8).
+            bridge.host.set_refuse_r8(true);
             let identity = Identity {
                 account_id: "acct-local".into(),
                 atem_device_id: "host-local".into(),
@@ -4868,6 +4918,8 @@ principals = ["browser:b"]
             let mut bridge =
                 HostBridge::open(&dir.path().join("runtime/journal"), None, Clock::default())
                     .unwrap();
+            // A host with a pinned device list (it refuses r8).
+            bridge.host.set_refuse_r8(true);
             let identity = Identity {
                 account_id: "acct-local".into(),
                 atem_device_id: "host-local".into(),

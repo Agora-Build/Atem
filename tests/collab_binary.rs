@@ -41,13 +41,21 @@ impl Rig {
     /// The account's encryption is on: vault context needs it (spec
     /// section 8).
     fn unstarted() -> Self {
+        Self::unstarted_as(true)
+    }
+
+    /// `pinned: false`: a host verified by an earlier build that never
+    /// pinned a device list, so its session host still serves r8.
+    fn unstarted_as(pinned: bool) -> Self {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         write_encryption_mode(&sandbox.config(), "on");
-        let mut log = TestLog::genesis(ACCOUNT, &secret("collab astation"));
-        let seed = secret("collab host");
-        log.add_host(HOST, 1, &seed);
-        write_pin(&sandbox.config(), &log, HOST, 1, &seed);
+        if pinned {
+            let mut log = TestLog::genesis(ACCOUNT, &secret("collab astation"));
+            let seed = secret("collab host");
+            log.add_host(HOST, 1, &seed);
+            write_pin(&sandbox.config(), &log, HOST, 1, &seed);
+        }
         let mut config = "version = 1\nenabled = true\n[instance]\nlabels = [\"project:collab\"]\n[collab]\nsend = true\n".to_string();
         for route in ["a", "b", "c"] {
             let cwd = sandbox.home.join(route);
@@ -731,6 +739,30 @@ fn a_bad_selector_reports_its_own_reason() {
             .unwrap()
             .contains("selector 3: names are 1-32 of a-z, 0-9 and -"),
         "{output}"
+    );
+}
+
+/// Collaboration runs only where the remote properties hold: a host whose
+/// session host still serves r8 (no pinned device list) refuses sends and
+/// replies, and says how to pin one.
+#[test]
+fn collaboration_needs_a_pinned_device_list() {
+    const NEEDS_LIST: &str = "collaboration needs a pinned device list: run `atem pair verify`";
+    let mut rig = Rig::unstarted_as(false);
+    rig.start();
+    let (_, a) = rig.launch("a", "sender");
+    let _ = rig.launch("b", "recipient");
+    let refused = rig.agent(&a, 1, &["message", "send", "--to", "tag:b", "hello"]);
+    assert_ne!(refused["code"], 0, "{refused}");
+    assert!(
+        refused["stderr"].as_str().unwrap().contains(NEEDS_LIST),
+        "{refused}"
+    );
+    let reply = rig.agent(&a, 2, &["message", "reply", "an answer"]);
+    assert_ne!(reply["code"], 0, "{reply}");
+    assert!(
+        reply["stderr"].as_str().unwrap().contains(NEEDS_LIST),
+        "{reply}"
     );
 }
 
