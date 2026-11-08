@@ -206,6 +206,11 @@ pub enum Reply {
         escrowed: bool,
         /// The agent's `build_id`.
         build: String,
+        /// The binary frames the agent reads on this connection
+        /// (agent_frame.rs); set by the socket server, absent from an agent
+        /// older than them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frames: Option<u32>,
     },
     PublicKeys {
         device_pub: String,
@@ -656,6 +661,7 @@ impl CredAgent {
                 storage_kid: Some(unlocked.storage_kid.clone()),
                 escrowed: unlocked.escrowed,
                 build: build_id().to_string(),
+                frames: None,
             },
             None => Reply::Status {
                 unlocked: false,
@@ -666,6 +672,7 @@ impl CredAgent {
                     .map(|sealed| sealed.storage_kid),
                 escrowed: false,
                 build: build_id().to_string(),
+                frames: None,
             },
         }
     }
@@ -1454,6 +1461,7 @@ pub trait CredAgentApi: Send + Sync {
                 storage_kid,
                 escrowed,
                 build,
+                ..
             } => Ok(AgentStatus {
                 unlocked,
                 storage_kid,

@@ -492,6 +492,26 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   requests are answered the agent wipes everything they left in its read
   buffers (the whole allocation past any unread bytes); the client keeps no
   request or reply bytes between requests.
+- **Binary frames for `Crypt`.** An agent that reads them says
+  `"frames": 1` in its answer to a `status` (no released agent does) and
+  from then on reads them on that connection, beside JSON lines. A client
+  that checks the build sends each `Crypt` there as a frame: a 10-byte
+  header (0xFF, which never starts a JSON line, a kind, the op count and the
+  body length, little-endian), then fields with 4-byte lengths, the plain
+  text to seal or hash and the opened bytes raw (no base64, no JSON pass).
+  Every other request, and every connection without that answer (a
+  released agent, a client that checks no build), stays on JSON lines. A
+  request frame names 1 to 1,024 ops and at most 2 MiB, or 6 MiB for one op
+  alone (the batches `EncryptionContext` makes); a bigger request goes as a
+  line. Every length is checked before anything is allocated, each buffer
+  is allocated once at its declared length, and a malformed frame closes
+  the connection. A framed `Crypt` is the same request to the agent (every
+  check applies) and a refusal comes back as the same JSON response inside
+  a frame. Every buffer that held plain text, on either side, is wiped once
+  over its whole allocation with `memset` followed by a compiler barrier
+  (`asm!`, zeroize 1.9's `optimization_barrier`) that keeps the zeros,
+  instead of zeroize 1.8's byte-at-a-time loop. Layout:
+  `src/memory/agent_frame.rs`.
 - **The agent's cached trust state.** `Crypt`, `HeldKid` and the prune of
   retired keys read `cred/state.json` (and decode its signed states) only
   when the file changed since the last read: another device, inode, size,

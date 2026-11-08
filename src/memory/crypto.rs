@@ -226,12 +226,13 @@ pub(crate) fn valid_kid(kid: &str) -> bool {
 }
 
 /// Most bytes and operations one `Crypt` request carries; bigger batches are
-/// split. One skill (at most `MAX_SKILL_BYTES`, 1 MiB) always fits.
-const CRYPT_BATCH_BYTES: usize = 2 << 20;
-const CRYPT_BATCH_OPS: usize = 1024;
+/// split. One skill (at most `MAX_SKILL_BYTES`, 1 MiB) always fits. The
+/// agent's frames are bounded by the same numbers (agent_frame.rs).
+pub(crate) const CRYPT_BATCH_BYTES: usize = 2 << 20;
+pub(crate) const CRYPT_BATCH_OPS: usize = 1024;
 /// Most bytes one op may carry (`wire_len`, request and reply): well below
 /// the agent's 8 MiB line limit, so a field never makes the agent hang up.
-const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
+pub(crate) const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 

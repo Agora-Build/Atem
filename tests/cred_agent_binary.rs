@@ -183,3 +183,100 @@ fn the_real_agent_answers_several_requests_on_one_connection() {
         assert_eq!(reply["ok"], true, "{reply}");
     }
 }
+
+/// A `Crypt` frame by hand (src/memory/agent_frame.rs): 0xFF, kind 1, the op
+/// count and the body length (little-endian), then the body: the astation id
+/// and one keyed hash (tag 3) of `value`, each field a 4-byte length first.
+fn keyed_hash_frame(kind: u8, value: &[u8]) -> Vec<u8> {
+    let field = |bytes: &[u8]| [&(bytes.len() as u32).to_le_bytes()[..], bytes].concat();
+    let body = [field(b"astation-1"), vec![3], field(value)].concat();
+    let mut frame = vec![0xFF, kind];
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+#[test]
+fn the_real_agent_reads_crypt_frames_on_a_connection_whose_status_offered_them() {
+    use std::io::BufRead;
+    let dir = tempfile::Builder::new()
+        .prefix("atem-kb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let (home, runtime) = (dir.path().join("home"), dir.path().join("run"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::set_permissions(
+        &runtime,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let _agent = agent_process(&home, &runtime);
+    let socket = support::profile::agent_sock(&runtime);
+    assert!(
+        within(5, || status_at(&socket).is_some()),
+        "the agent didn't start"
+    );
+    let stream = UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut replies = std::io::BufReader::new(&stream);
+    let mut line = String::new();
+    // The build check's status offers frames on this connection.
+    (&stream)
+        .write_all(b"{\"op\":\"status\",\"v\":2}\n")
+        .unwrap();
+    replies.read_line(&mut line).unwrap();
+    let status: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(status["reply"]["frames"], 1, "{status}");
+    // A frame: the locked agent's refusal comes back as a JSON frame (kind
+    // 2, no results) worded as on a line.
+    (&stream)
+        .write_all(&keyed_hash_frame(1, b"SECRET"))
+        .unwrap();
+    let mut head = [0u8; 10];
+    replies.read_exact(&mut head).unwrap();
+    assert_eq!((head[0], head[1]), (0xFF, 2), "{head:?}");
+    assert_eq!(u32::from_le_bytes(head[2..6].try_into().unwrap()), 0);
+    let mut body = vec![0u8; u32::from_le_bytes(head[6..10].try_into().unwrap()) as usize];
+    replies.read_exact(&mut body).unwrap();
+    let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refusal["ok"], false, "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("locked"),
+        "{refusal}"
+    );
+    // JSON lines still go on the same connection.
+    line.clear();
+    (&stream)
+        .write_all(b"{\"op\":\"pending_rotation\",\"v\":2}\n")
+        .unwrap();
+    replies.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"), "{line}");
+    // A malformed frame (unknown kind) closes the connection unanswered.
+    (&stream).write_all(&keyed_hash_frame(9, b"x")).unwrap();
+    let mut byte = [0u8; 1];
+    assert!(matches!(replies.read(&mut byte), Ok(0) | Err(_)));
+    // A connection that never agreed reads the same bytes as a line.
+    let other = UnixStream::connect(&socket).unwrap();
+    other
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut frame = keyed_hash_frame(1, b"x");
+    frame.push(b'\n');
+    (&other).write_all(&frame).unwrap();
+    line.clear();
+    std::io::BufReader::new(&other)
+        .read_line(&mut line)
+        .unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(
+        reply["error"].as_str().unwrap().contains("not JSON"),
+        "{reply}"
+    );
+    // The agent still serves.
+    assert_eq!(status_at(&socket).unwrap()["ok"], true);
+}

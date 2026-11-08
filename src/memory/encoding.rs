@@ -98,7 +98,8 @@ unsafe fn wipe_raw(ptr: *mut u8, len: usize) {
 }
 
 /// Bytes that may be secret, wiped whole with [`wipe`] when dropped: made at
-/// their final size (`copy_of`, `zeroed`, `from_vec`), they
+/// their final size (`copy_of`, `zeroed`, `from_vec`, or
+/// `WipingBuf::into_secret`), they
 /// can be written in place but never grow, so no reallocation leaves an
 /// unwiped copy behind.
 #[derive(Default)]
@@ -183,6 +184,11 @@ impl WipingBuf {
             wipe_dropped(outgrown);
         }
         self.0.extend_from_slice(data);
+    }
+
+    /// Its bytes, as `SecretBytes` (the same allocation, wiped on drop).
+    pub(crate) fn into_secret(mut self) -> SecretBytes {
+        SecretBytes(std::mem::take(&mut *self.0))
     }
 }
 
@@ -279,6 +285,9 @@ mod tests {
         let all = unsafe { std::slice::from_raw_parts(ptr, capacity) };
         assert!(all.iter().all(|byte| *byte == 0));
         assert_eq!(SecretBytes::copy_of(b"abc").0.capacity(), 3, "exact size");
+        let mut buf = WipingBuf::with_capacity(8);
+        buf.append(b"abcdef");
+        assert_eq!(&buf.into_secret()[..], b"abcdef");
     }
 
     #[test]

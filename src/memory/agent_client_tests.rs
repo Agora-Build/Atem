@@ -11,7 +11,7 @@ use super::*;
 use std::io::{BufRead, BufReader, Write};
 
 /// Serves `agent` at `socket` on its own thread.
-fn serve_agent(socket: &Path, agent: Arc<Mutex<CredAgent>>) {
+pub(super) fn serve_agent(socket: &Path, agent: Arc<Mutex<CredAgent>>) {
     let (ready, started) = std::sync::mpsc::channel();
     let path = socket.to_path_buf();
     std::thread::spawn(move || {
@@ -30,7 +30,7 @@ fn serve_agent(socket: &Path, agent: Arc<Mutex<CredAgent>>) {
 
 /// A verified device whose agent holds `K` (mode on), served at the
 /// returned socket.
-fn served_device(dir: &Path) -> (crate::memory::fake_astation::UnlockedDevice, PathBuf) {
+pub(super) fn served_device(dir: &Path) -> (crate::memory::fake_astation::UnlockedDevice, PathBuf) {
     use crate::memory::crypto::EncryptionMode;
     let mut device = crate::memory::fake_astation::UnlockedDevice::new(&dir.join("device"));
     device.set_key(EncryptionMode::On, "0123abcd", [7; 32]);
@@ -47,31 +47,51 @@ fn seal_one(client: &dyn CredAgentApi) -> Result<Vec<CryptOut>> {
 }
 
 /// The `op` of a request line.
-fn op_of(line: &str) -> String {
+pub(super) fn op_of(line: &str) -> String {
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
         .and_then(|v| v["op"].as_str().map(str::to_string))
         .unwrap_or_default()
 }
 
+/// One message off `reader`, as the agent reads them: a frame (header and
+/// body) when it starts with the frame byte, else a line. `None` at the end.
+pub(super) fn read_message(reader: &mut impl BufRead) -> Option<(Vec<u8>, bool)> {
+    let first = *reader.fill_buf().ok()?.first()?;
+    if first != crate::memory::agent_frame::MAGIC {
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).ok()?;
+        return Some((line, false));
+    }
+    let mut frame = vec![0u8; crate::memory::agent_frame::HEADER];
+    reader.read_exact(&mut frame).ok()?;
+    let len = u32::from_le_bytes(frame[6..10].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).ok()?;
+    frame.extend_from_slice(&body);
+    Some((frame, true))
+}
+
 /// Sits between clients and the agent at `upstream`: counts the
-/// connections it accepts and the request lines it reads (by op), and on
-/// request closes every open client connection (as the agent does with
-/// idle ones) or swallows requests (the next one, or the next ones of an
-/// op): reads one, never passes it on, and closes that connection
-/// unanswered.
-struct Proxy {
-    socket: PathBuf,
+/// connections it accepts and the requests it reads (by op; a frame is a
+/// `crypt`), and on request closes every open client connection (as the
+/// agent does with idle ones) or swallows requests (the next one, or the
+/// next ones of an op): reads one, never passes it on, and closes that
+/// connection unanswered.
+pub(super) struct Proxy {
+    pub(super) socket: PathBuf,
     connections: Arc<std::sync::atomic::AtomicUsize>,
     seen: Arc<Mutex<Vec<String>>>,
     passed: Arc<Mutex<Vec<String>>>,
+    /// The requests that were frames.
+    frames: Arc<std::sync::atomic::AtomicUsize>,
     /// The op to swallow (any when `None`) and how many more.
     swallow: Arc<Mutex<(Option<String>, usize)>>,
     live: Arc<Mutex<Vec<UnixStream>>>,
 }
 
 impl Proxy {
-    fn start(dir: &Path, upstream: PathBuf) -> Self {
+    pub(super) fn start(dir: &Path, upstream: PathBuf) -> Self {
         use std::sync::atomic::Ordering::SeqCst;
         let socket = dir.join("proxy.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -80,13 +100,15 @@ impl Proxy {
             connections: Default::default(),
             seen: Default::default(),
             passed: Default::default(),
+            frames: Default::default(),
             swallow: Default::default(),
             live: Default::default(),
         };
-        let (connections, seen, passed, swallow, live) = (
+        let (connections, seen, passed, frames, swallow, live) = (
             proxy.connections.clone(),
             proxy.seen.clone(),
             proxy.passed.clone(),
+            proxy.frames.clone(),
             proxy.swallow.clone(),
             proxy.live.clone(),
         );
@@ -95,9 +117,10 @@ impl Proxy {
                 let Ok(client) = client else { return };
                 connections.fetch_add(1, SeqCst);
                 live.lock().unwrap().push(client.try_clone().unwrap());
-                let (seen, passed, swallow, upstream) = (
+                let (seen, passed, frames, swallow, upstream) = (
                     seen.clone(),
                     passed.clone(),
+                    frames.clone(),
                     swallow.clone(),
                     upstream.clone(),
                 );
@@ -108,15 +131,19 @@ impl Proxy {
                     let mut from_client = BufReader::new(&client);
                     let mut from_agent = BufReader::new(&agent);
                     loop {
-                        let mut line = String::new();
-                        if from_client.read_line(&mut line).unwrap_or(0) == 0 {
+                        let Some((request, framed)) = read_message(&mut from_client) else {
                             return;
-                        }
-                        seen.lock().unwrap().push(op_of(&line));
+                        };
+                        let op = if framed {
+                            frames.fetch_add(1, SeqCst);
+                            "crypt".to_string()
+                        } else {
+                            op_of(&String::from_utf8_lossy(&request))
+                        };
+                        seen.lock().unwrap().push(op.clone());
                         let swallowed = {
                             let mut rule = swallow.lock().unwrap();
-                            let hit =
-                                rule.1 > 0 && rule.0.as_deref().is_none_or(|op| op == op_of(&line));
+                            let hit = rule.1 > 0 && rule.0.as_deref().is_none_or(|want| want == op);
                             if hit {
                                 rule.1 -= 1;
                             }
@@ -126,12 +153,16 @@ impl Proxy {
                             let _ = client.shutdown(std::net::Shutdown::Both);
                             return;
                         }
-                        passed.lock().unwrap().push(op_of(&line));
-                        let mut reply = String::new();
-                        if (&agent).write_all(line.as_bytes()).is_err()
-                            || from_agent.read_line(&mut reply).unwrap_or(0) == 0
-                            || (&client).write_all(reply.as_bytes()).is_err()
-                        {
+                        passed.lock().unwrap().push(op);
+                        let reply = (&agent)
+                            .write_all(&request)
+                            .ok()
+                            .and_then(|_| read_message(&mut from_agent));
+                        let Some((reply, _)) = reply else {
+                            let _ = client.shutdown(std::net::Shutdown::Both);
+                            return;
+                        };
+                        if (&client).write_all(&reply).is_err() {
                             let _ = client.shutdown(std::net::Shutdown::Both);
                             return;
                         }
@@ -142,19 +173,24 @@ impl Proxy {
         proxy
     }
 
-    fn connections(&self) -> usize {
+    pub(super) fn connections(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn seen(&self) -> Vec<String> {
+    pub(super) fn seen(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
     }
 
-    fn passed(&self) -> Vec<String> {
+    pub(super) fn passed(&self) -> Vec<String> {
         self.passed.lock().unwrap().clone()
     }
 
-    fn count(ops: &[String], op: &str) -> usize {
+    /// The requests that went as frames.
+    pub(super) fn frames(&self) -> usize {
+        self.frames.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn count(ops: &[String], op: &str) -> usize {
         ops.iter().filter(|seen| *seen == op).count()
     }
 
@@ -172,7 +208,7 @@ impl Proxy {
 
     /// The next `count` request lines of `op` are each read and dropped
     /// with their connection.
-    fn swallow_ops(&self, op: &str, count: usize) {
+    pub(super) fn swallow_ops(&self, op: &str, count: usize) {
         *self.swallow.lock().unwrap() = (Some(op.to_string()), count);
     }
 }
@@ -611,15 +647,19 @@ fn an_agent_that_answers_one_request_per_connection_gets_a_connection_per_reques
 }
 
 /// Whether `needle` occurs in `bytes`.
-fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+pub(super) fn holds(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-/// Reads `bytes` into `lines` the way the agent does, a chunk at a time.
-fn feed(lines: &mut Lines, bytes: &[u8]) {
-    for part in bytes.chunks(4096) {
-        lines.chunk()[..part.len()].copy_from_slice(part);
-        lines.take(part.len());
+/// Reads `bytes` into `lines` the way the agent does: into the chunk, or
+/// the rest of the body of a frame being read, as much as it takes.
+pub(super) fn feed(lines: &mut Lines, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let buffer = lines.buffer();
+        let n = buffer.len().min(bytes.len());
+        buffer[..n].copy_from_slice(&bytes[..n]);
+        lines.take(n);
+        bytes = &bytes[n..];
     }
 }
 
@@ -682,7 +722,7 @@ fn a_big_answered_request_gives_its_buffer_back() {
 
 /// An agent for the key files in `dir`, served on its own thread, whose
 /// connections report what they hold once they have answered.
-fn start_reporting_agent(dir: &Path) -> (PathBuf, HeldLog) {
+pub(super) fn start_reporting_agent(dir: &Path) -> (PathBuf, HeldLog) {
     let socket = sock(&dir.join("run"));
     let paths = CredPaths::in_dir(dir);
     let held = Arc::new(Mutex::new(Vec::new()));

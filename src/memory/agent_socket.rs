@@ -1,8 +1,10 @@
 //! The cred agent's Unix socket: newline-delimited JSON, `"v": 2` on every
-//! request, same-user peers only. `atem cred-agent` serves it; commands that
-//! need keys connect, starting the agent when none is running. A process
-//! shares one client per agent (`shared`), which keeps one connection
-//! between requests (`CredAgentClient::call`).
+//! request, same-user peers only, and binary frames for `Crypt` on a
+//! connection that agreed to them in its build check (agent_frame.rs).
+//! `atem cred-agent` serves it; commands that need keys connect, starting
+//! the agent when none is running. A process shares one client per agent
+//! (`shared`), which keeps one connection between requests
+//! (`CredAgentClient::call`).
 //! See designs/e2e-encryption.md "Keys on disk (atem)".
 //!
 //! Both sides check who is on the other end: the agent refuses peers that
@@ -31,6 +33,7 @@ use crate::daemon::{
     self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, recorded_socket,
 };
 use crate::memory::account_keys::{CryptOp, CryptOut};
+use crate::memory::agent_frame::{self, Head};
 use crate::memory::cred_agent::{
     CredAgent, CredAgentApi, PROTOCOL_VERSION, Reply, Request, build_id,
 };
@@ -241,35 +244,73 @@ pub(crate) fn decode_response(line: &str) -> Result<Reply> {
         .ok_or_else(|| anyhow!("the cred agent sent an empty reply"))
 }
 
-/// The reply to `line`, and whether it was a lock that stops the agent.
-fn respond(agent: &Mutex<CredAgent>, line: &str) -> (WipingBuf, bool) {
+/// A refused request's response.
+fn refused(error: &anyhow::Error) -> Response {
+    Response {
+        v: PROTOCOL_VERSION,
+        ok: false,
+        error: Some(format!("{error:#}")),
+        reply: None,
+    }
+}
+
+const UNENCODABLE: &[u8] =
+    b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent could not encode its reply\"}";
+
+/// The reply to the line `line`; whether it was a lock that stops the agent;
+/// and whether it was a `status` that told the client this connection reads
+/// frames (only when this agent reads them: `frames`).
+fn respond(agent: &Mutex<CredAgent>, line: &str, frames: bool) -> (SecretBytes, bool, bool) {
     let mut stop = false;
+    let mut agreed = false;
     let response = match decode_request(line).and_then(|request| {
         stop = matches!(request, Request::Lock { stop: true });
         agent.call(request)
     }) {
-        Ok(reply) => Response {
-            v: PROTOCOL_VERSION,
-            ok: true,
-            error: None,
-            reply: Some(reply),
-        },
-        Err(error) => Response {
-            v: PROTOCOL_VERSION,
-            ok: false,
-            error: Some(format!("{error:#}")),
-            reply: None,
-        },
+        Ok(mut reply) => {
+            if let Reply::Status {
+                frames: offered, ..
+            } = &mut reply
+                && frames
+            {
+                *offered = Some(agent_frame::VERSION);
+                agreed = true;
+            }
+            Response {
+                v: PROTOCOL_VERSION,
+                ok: true,
+                error: None,
+                reply: Some(reply),
+            }
+        }
+        Err(error) => refused(&error),
     };
     let stop = stop && response.ok;
     let reply = to_wiping_json(&response).unwrap_or_else(|_| {
         let mut buf = WipingBuf::new();
-        buf.append(
-            b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent could not encode its reply\"}\n",
-        );
+        buf.append(UNENCODABLE);
+        buf.append(b"\n");
         buf
     });
-    (reply, stop)
+    (reply.into_secret(), stop, agreed)
+}
+
+/// The reply frame to the `Crypt` frame `body`: its results, or the refusal
+/// a JSON line would get, from the same `CredAgent::handle` (every check
+/// of a `Crypt` applies). `Err` for a malformed frame.
+fn respond_frame(agent: &Mutex<CredAgent>, head: Head, body: SecretBytes) -> Result<SecretBytes> {
+    let (astation_id, ops) = agent_frame::decode_crypt(head, &body)?;
+    // The ops hold their own copies.
+    drop(body);
+    Ok(match agent.call(Request::Crypt { astation_id, ops }) {
+        Ok(Reply::Crypted { results }) => agent_frame::crypted_reply(&results),
+        Ok(_) => agent_frame::json_reply(UNENCODABLE),
+        // A refusal carries no secret.
+        Err(error) => match serde_json::to_vec(&refused(&error)) {
+            Ok(json) => agent_frame::json_reply(&json),
+            Err(_) => agent_frame::json_reply(UNENCODABLE),
+        },
+    })
 }
 
 /// Another cred agent holds a lock or answers on the socket.
@@ -550,7 +591,19 @@ pub async fn serve(
     agent: Arc<Mutex<CredAgent>>,
     allowed_uid: u32,
 ) -> Result<()> {
-    serve_watched(listener, agent, allowed_uid, None).await
+    serve_with(listener, agent, allowed_uid, None, true).await
+}
+
+/// `serve` as a released agent (v0.6.11 to v0.8.3) would: its `status`
+/// offers no frames and it reads only JSON lines (a frame's first byte is
+/// the start of a line that isn't JSON).
+#[cfg(test)]
+pub(crate) async fn serve_without_frames(
+    listener: tokio::net::UnixListener,
+    agent: Arc<Mutex<CredAgent>>,
+    allowed_uid: u32,
+) -> Result<()> {
+    serve_with(listener, agent, allowed_uid, None, false).await
 }
 
 /// `serve`, and with a `watch`, checks every `watch.every` that clients can
@@ -563,6 +616,18 @@ pub(crate) async fn serve_watched(
     agent: Arc<Mutex<CredAgent>>,
     allowed_uid: u32,
     watch: Option<Watch>,
+) -> Result<()> {
+    serve_with(listener, agent, allowed_uid, watch, true).await
+}
+
+/// `serve_watched`, reading frames on connections that agree to them only
+/// with `frames`.
+async fn serve_with(
+    listener: tokio::net::UnixListener,
+    agent: Arc<Mutex<CredAgent>>,
+    allowed_uid: u32,
+    watch: Option<Watch>,
+    frames: bool,
 ) -> Result<()> {
     // The socket this listener is bound to, to remove it when stopping (only
     // while it is still the file bound here).
@@ -613,7 +678,9 @@ pub(crate) async fn serve_watched(
         };
         let (agent, stopping) = (agent.clone(), stopping.clone());
         connections.spawn(async move {
-            if let Err(error) = serve_connection(stream, &agent, allowed_uid, &stopping).await {
+            if let Err(error) =
+                serve_connection(stream, &agent, allowed_uid, &stopping, frames).await
+            {
                 eprintln!("cred agent: {error:#}");
             }
         });
@@ -650,11 +717,15 @@ pub(crate) async fn serve_watched(
     Ok(())
 }
 
+/// One connection: JSON lines, and frames once a `status` answered here
+/// offered them (only when this agent reads them: `frames`). A malformed
+/// frame closes it with an error.
 async fn serve_connection(
     stream: tokio::net::UnixStream,
     agent: &Mutex<CredAgent>,
     allowed_uid: u32,
     stopping: &tokio::sync::watch::Sender<bool>,
+    frames: bool,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let peer = stream.peer_cred()?.uid();
@@ -666,14 +737,24 @@ async fn serve_connection(
     let mut lines = Lines::new();
     loop {
         let mut answered = false;
-        while let Some(line) = lines.next_line() {
-            let end = line.len() - 1;
-            let (reply, stop) = match std::str::from_utf8(&line[..end]) {
-                Ok(text) => respond(agent, text),
-                Err(_) => respond(agent, ""),
+        while let Some(message) = lines.next_message()? {
+            let (reply, stop) = match message {
+                Message::Line(line) => {
+                    let end = line.len() - 1;
+                    let (reply, stop, agreed) = match std::str::from_utf8(&line[..end]) {
+                        Ok(text) => respond(agent, text, frames),
+                        Err(_) => respond(agent, "", frames),
+                    };
+                    drop(line);
+                    if agreed {
+                        lines.frames = true;
+                    }
+                    (reply, stop)
+                }
+                Message::Frame(head, body) => (respond_frame(agent, head, body)?, false),
             };
-            drop(line);
-            write.write_all(&reply.0).await?;
+            write.write_all(&reply).await?;
+            drop(reply);
             answered = true;
             if stop {
                 stopping.send_replace(true);
@@ -695,7 +776,7 @@ async fn serve_connection(
         // A stopping agent takes no further request; one only partly read
         // is dropped (its client sees the connection close).
         let n = tokio::select! {
-            read = tokio::time::timeout(IDLE_TIMEOUT, read.read(lines.chunk())) => {
+            read = tokio::time::timeout(IDLE_TIMEOUT, read.read(lines.buffer())) => {
                 read.map_err(|_| anyhow!("closed an idle connection"))??
             }
             _ = stopped.wait_for(|stop| *stop) => return Ok(()),
@@ -718,11 +799,29 @@ thread_local! {
     static SETTLED: std::cell::RefCell<Option<HeldLog>> = const { std::cell::RefCell::new(None) };
 }
 
-/// What an agent connection has read and not yet handled (`pending`), and
-/// the chunk it reads into. Requests carry secrets (device keys, plain text
-/// to seal) and clients keep their connection between requests, so once the
-/// lines read so far are answered, `settle` wipes every byte they left in
-/// either buffer. Both are wiped whole when the connection ends (`Zeroizing`).
+/// A message read on an agent connection.
+enum Message {
+    /// A JSON line, with its newline.
+    Line(SecretBytes),
+    /// A frame's header and body.
+    Frame(Head, SecretBytes),
+}
+
+/// The frame a connection is reading: its body is allocated at the length
+/// its header declared (within the bounds), and read straight into.
+struct Incoming {
+    head: Head,
+    body: SecretBytes,
+    filled: usize,
+}
+
+/// What an agent connection has read and not yet handled (`pending`, or the
+/// body of a frame being read: `frame`), and the chunk lines are read into.
+/// Requests carry secrets (device keys, plain text to seal) and clients keep
+/// their connection between requests, so once the messages read so far are
+/// answered, `settle` wipes every byte they left in `pending` and the chunk
+/// (a frame's body goes, wiped, with its answer). All of them are wiped
+/// whole when the connection ends.
 struct Lines {
     pending: WipingBuf,
     chunk: Zeroizing<[u8; 4096]>,
@@ -730,6 +829,9 @@ struct Lines {
     /// `Crypt` line arrives in 4 KiB reads, and rescanning it all each time
     /// would be quadratic.
     scanned: usize,
+    /// Frames are read on this connection: a `status` answered here said so.
+    frames: bool,
+    frame: Option<Incoming>,
     /// Tests: how much of `pending`'s allocation is known written.
     #[cfg(test)]
     written: usize,
@@ -741,9 +843,42 @@ impl Lines {
             pending: WipingBuf::new(),
             chunk: Zeroizing::new([0u8; 4096]),
             scanned: 0,
+            frames: false,
+            frame: None,
             #[cfg(test)]
             written: 0,
         }
+    }
+
+    /// The next whole message read, if one has arrived. `Err` for a frame
+    /// whose header is out of bounds: nothing is allocated for it.
+    fn next_message(&mut self) -> Result<Option<Message>> {
+        if self.frame.is_none()
+            && self.frames
+            && self.pending.0.first() == Some(&agent_frame::MAGIC)
+        {
+            let Some(head) = self.pending.0.first_chunk::<{ agent_frame::HEADER }>() else {
+                return Ok(None);
+            };
+            let head = agent_frame::request_head(head)?;
+            let mut body = SecretBytes::zeroed(head.len);
+            let read = &self.pending.0[agent_frame::HEADER..];
+            let filled = head.len.min(read.len());
+            body[..filled].copy_from_slice(&read[..filled]);
+            self.pending.0.drain(..agent_frame::HEADER + filled);
+            self.scanned = 0;
+            self.frame = Some(Incoming { head, body, filled });
+        }
+        if let Some(incoming) = &self.frame {
+            if incoming.filled < incoming.body.len() {
+                return Ok(None);
+            }
+            let Some(Incoming { head, body, .. }) = self.frame.take() else {
+                unreachable!("a frame is being read");
+            };
+            return Ok(Some(Message::Frame(head, body)));
+        }
+        Ok(self.next_line().map(Message::Line))
     }
 
     /// The next whole line read (with its newline), if one has arrived.
@@ -762,25 +897,31 @@ impl Lines {
         ))
     }
 
-    /// Where the next read goes.
-    fn chunk(&mut self) -> &mut [u8] {
-        &mut self.chunk[..]
+    /// Where the next read goes: the rest of a frame's body, else the chunk.
+    fn buffer(&mut self) -> &mut [u8] {
+        match &mut self.frame {
+            Some(incoming) => &mut incoming.body[incoming.filled..],
+            None => &mut self.chunk[..],
+        }
     }
 
-    /// Takes the `n` bytes just read into `chunk`.
+    /// Takes the `n` bytes just read into `buffer`.
     fn take(&mut self, n: usize) {
-        self.pending.append(&self.chunk[..n]);
+        match &mut self.frame {
+            Some(incoming) => incoming.filled += n,
+            None => self.pending.append(&self.chunk[..n]),
+        }
     }
 
     fn too_long(&self) -> bool {
         self.pending.0.len() > MAX_LINE
     }
 
-    /// Once the lines read so far are answered: wipes the whole of `pending`
-    /// past its unread bytes (the start of a next request, if any), so its
-    /// allocation holds nothing of an answered request, and the whole chunk.
-    /// A buffer that grew for a big request goes instead, wiped whole as it
-    /// is dropped.
+    /// Once the messages read so far are answered: wipes the whole of
+    /// `pending` past its unread bytes (the start of a next request, if any),
+    /// so its allocation holds nothing of an answered request, and the whole
+    /// chunk. A buffer that grew for a big request goes instead, wiped whole
+    /// as it is dropped.
     fn settle(&mut self) {
         if self.pending.0.is_empty() && self.pending.0.capacity() > KEPT_BUFFER {
             self.pending = WipingBuf::new();
@@ -807,7 +948,8 @@ impl Lines {
 
     /// The first `len` bytes of everything this connection holds in user
     /// space: `pending`'s allocation (its unread bytes, then the rest of its
-    /// capacity), then `chunk`. Only bytes that were written are read.
+    /// capacity), then `chunk`, then what a frame being read has of its body.
+    /// Only bytes that were written are read.
     #[cfg(test)]
     fn retained(&self, len: usize) -> Vec<u8> {
         let capacity = self.pending.0.capacity();
@@ -815,7 +957,11 @@ impl Lines {
         // SAFETY: the first `len` bytes of the allocation were all written
         // (read data or a wipe), and the allocation is `capacity` long.
         let pending = unsafe { std::slice::from_raw_parts(self.pending.0.as_ptr(), len) };
-        [pending, &self.chunk[..]].concat()
+        let frame = self
+            .frame
+            .as_ref()
+            .map_or(&[][..], |incoming| &incoming.body[..incoming.filled]);
+        [pending, &self.chunk[..], frame].concat()
     }
 }
 
@@ -904,14 +1050,16 @@ fn test_log(socket: &Path) -> PathBuf {
     CredPaths::in_dir(socket.parent().unwrap_or(Path::new("/"))).agent_log
 }
 
-/// What a client sent (tests): connections opened for requests, request
-/// lines written (the build checks' included) and build checks.
+/// What a client sent (tests): connections opened for requests, requests
+/// written (the build checks' included), build checks, and the requests
+/// that went as frames.
 #[cfg(test)]
 #[derive(Default, Debug)]
 pub(crate) struct Traffic {
     connections: std::sync::atomic::AtomicUsize,
     requests: std::sync::atomic::AtomicUsize,
     probes: std::sync::atomic::AtomicUsize,
+    frames: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -930,6 +1078,10 @@ impl Traffic {
 
     pub(crate) fn probes(&self) -> usize {
         self.probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn frames(&self) -> usize {
+        self.frames.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -957,6 +1109,9 @@ struct Conn {
     replies: u32,
     /// Its first exchange was the build check.
     checked: bool,
+    /// The build check's `status` said the agent reads frames here
+    /// (agent_frame.rs).
+    frames: bool,
 }
 
 impl Conn {
@@ -966,6 +1121,7 @@ impl Conn {
             idle_since: std::time::Instant::now(),
             replies: 0,
             checked: false,
+            frames: false,
         }
     }
 
@@ -988,17 +1144,52 @@ impl Conn {
         !(peeked < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock)
     }
 
-    /// Writes `line`, wipes it while the agent works, and reads the reply.
-    fn round_trip(&mut self, line: Zeroizing<String>) -> Result<Answer, Failed> {
+    /// Writes `out`, wipes it while the agent works, and reads the reply (a
+    /// frame to a frame).
+    fn round_trip(&mut self, out: Outgoing) -> Result<Answer, Failed> {
         (&self.stream)
-            .write_all(line.as_bytes())
+            .write_all(out.bytes())
             .map_err(|error| Failed::from_io(error, false))?;
-        drop(line);
-        let answer = read_answer(&self.stream)?;
+        let frame = match &out {
+            Outgoing::Line(_) => None,
+            Outgoing::Frame { count, .. } => Some(*count),
+        };
+        drop(out);
+        let answer = match frame {
+            None => read_answer(&self.stream)?,
+            Some(count) => read_frame(&self.stream, count)?,
+        };
         self.idle_since = std::time::Instant::now();
         self.replies += 1;
         Ok(answer)
     }
+}
+
+/// What goes on a connection: a JSON line, or a `Crypt` frame of `count` ops.
+enum Outgoing {
+    Line(Zeroizing<String>),
+    Frame { bytes: SecretBytes, count: usize },
+}
+
+impl Outgoing {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Line(line) => line.as_bytes(),
+            Self::Frame { bytes, .. } => bytes,
+        }
+    }
+}
+
+/// A reply as it was read.
+enum Received {
+    Line(WipingBuf),
+    /// A reply frame's results.
+    Results(Vec<CryptOut>),
+    /// A reply frame's JSON response (a refusal).
+    Json(SecretBytes),
+    /// A reply frame that doesn't read (out of bounds, or its body): the
+    /// connection goes with it.
+    Unreadable,
 }
 
 /// A client's kept connection, and what it learnt about its agent.
@@ -1013,10 +1204,11 @@ struct Link {
     one_per_connection: bool,
 }
 
-/// A reply, and whether it was exactly one line with nothing after it: only
-/// then is its connection used again.
+/// A reply, and whether it was exactly one line with nothing after it, or
+/// one whole frame: only then is its connection used again (anything the
+/// agent sent after a frame is found before the next request).
 struct Answer {
-    reply: WipingBuf,
+    reply: Received,
     in_step: bool,
 }
 
@@ -1067,7 +1259,7 @@ fn read_answer(mut stream: &UnixStream) -> Result<Answer, Failed> {
         };
         if n == 0 || line.0.len() > MAX_LINE {
             return Ok(Answer {
-                reply: line,
+                reply: Received::Line(line),
                 in_step: false,
             });
         }
@@ -1077,11 +1269,75 @@ fn read_answer(mut stream: &UnixStream) -> Result<Answer, Failed> {
         if chunk[..n].contains(&b'\n') {
             let first = chunk[..n].iter().position(|byte| *byte == b'\n');
             return Ok(Answer {
-                reply: line,
+                reply: Received::Line(line),
                 in_step: first == Some(n - 1),
             });
         }
     }
+}
+
+/// Reads the reply frame to a request of `count` ops: its header, then its
+/// body, once its length passed the bounds, straight into one buffer of
+/// that length, and parses it once. A header out of bounds (nothing more is
+/// read) or a body that doesn't parse is `Unreadable`.
+fn read_frame(stream: &UnixStream, count: usize) -> Result<Answer, Failed> {
+    let mut head = [0u8; agent_frame::HEADER];
+    read_full(stream, &mut head, false)?;
+    let Ok(head) = agent_frame::reply_head(&head, count) else {
+        return Ok(Answer {
+            reply: Received::Unreadable,
+            in_step: false,
+        });
+    };
+    let mut body = SecretBytes::zeroed(head.len);
+    read_full(stream, &mut body, true)?;
+    let reply = if head.kind == agent_frame::REPLY_JSON {
+        match std::str::from_utf8(&body) {
+            Ok(_) => Received::Json(body),
+            Err(_) => Received::Unreadable,
+        }
+    } else {
+        match agent_frame::decode_crypted(head, &body) {
+            Ok(results) => Received::Results(results),
+            Err(_) => Received::Unreadable,
+        }
+    };
+    let in_step = !matches!(reply, Received::Unreadable);
+    Ok(Answer { reply, in_step })
+}
+
+/// Fills `buf` from `stream`. Closed before any byte of the reply (none read
+/// yet: `replying` false): `Unanswered`; cut short later: `Broken`.
+fn read_full(mut stream: &UnixStream, buf: &mut [u8], mut replying: bool) -> Result<(), Failed> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) if !replying => return Err(Failed::Unanswered(None)),
+            Ok(0) => return Err(Failed::Broken(std::io::ErrorKind::UnexpectedEof.into())),
+            Ok(n) => {
+                filled += n;
+                replying = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Failed::from_io(error, replying)),
+        }
+    }
+    Ok(())
+}
+
+/// `request` as `conn` takes it: a `Crypt` as a frame where `conn` agreed to
+/// frames and it fits their bounds, anything else as a JSON line.
+fn outgoing(conn: &Conn, request: &Request) -> Result<Outgoing> {
+    if conn.frames
+        && let Request::Crypt { astation_id, ops } = request
+        && let Some(bytes) = agent_frame::crypt_request(astation_id, ops)
+    {
+        return Ok(Outgoing::Frame {
+            bytes,
+            count: ops.len(),
+        });
+    }
+    Ok(Outgoing::Line(encode_request(request)?))
 }
 
 /// Whether `request` may go once more on a new connection when its
@@ -1460,8 +1716,11 @@ impl CredAgentClient {
         stream.set_read_timeout(Some(CHECK_WAIT)).ok()?;
         stream.set_write_timeout(Some(CHECK_WAIT)).ok()?;
         let line = encode_request(&Request::Status).ok()?;
-        let answer = Conn::new(stream).round_trip(line).ok()?;
-        let text = std::str::from_utf8(&answer.reply.0).ok()?;
+        let answer = Conn::new(stream).round_trip(Outgoing::Line(line)).ok()?;
+        let Received::Line(reply) = answer.reply else {
+            return None;
+        };
+        let text = std::str::from_utf8(&reply.0).ok()?;
         serde_json::from_str::<ResponseHead>(text.trim())
             .ok()
             .map(|head| head.v)
@@ -1520,19 +1779,22 @@ impl CredAgentClient {
         conn.stream.set_read_timeout(Some(wait)).ok()?;
         #[cfg(test)]
         Traffic::add(&self.traffic.requests);
-        let answer = conn.round_trip(line).ok()?;
+        let answer = conn.round_trip(Outgoing::Line(line)).ok()?;
         conn.stream.set_read_timeout(Some(REPLY_WAIT)).ok()?;
-        if !answer.in_step {
-            return None;
+        match answer.reply {
+            Received::Line(reply) if answer.in_step => {
+                decode_response(std::str::from_utf8(&reply.0).ok()?).ok()
+            }
+            _ => None,
         }
-        decode_response(std::str::from_utf8(&answer.reply.0).ok()?).ok()
     }
 
     /// The build check on the new connection `conn`: the agent it reached
     /// must be this build. A locked agent of another build holds no keys, so
     /// it is asked to stop (`None`: the next connection starts this build's).
     /// An unlocked one is never restarted: it is used, with a warning. `None`
-    /// too when the agent didn't answer the check.
+    /// too when the agent didn't answer the check. Its answer also says
+    /// whether the agent reads frames on `conn` (agent_frame.rs).
     fn check_build(&self, mut conn: Conn, build: &str) -> Result<Option<Conn>> {
         use std::sync::atomic::Ordering;
         #[cfg(test)]
@@ -1540,11 +1802,13 @@ impl CredAgentClient {
         let Some(Reply::Status {
             unlocked,
             build: theirs,
+            frames,
             ..
         }) = self.ask(&mut conn, &Request::Status, CHECK_WAIT)
         else {
             return Ok(None);
         };
+        conn.frames = frames == Some(agent_frame::VERSION);
         if theirs == build {
             return Ok(Some(conn));
         }
@@ -1571,11 +1835,16 @@ impl CredAgentClient {
         )
     }
 
-    /// Writes `line` on `conn` and reads the reply.
-    fn send(&self, conn: &mut Conn, line: Zeroizing<String>) -> Result<Answer, Failed> {
+    /// Writes `out` on `conn` and reads the reply.
+    fn send(&self, conn: &mut Conn, out: Outgoing) -> Result<Answer, Failed> {
         #[cfg(test)]
-        Traffic::add(&self.traffic.requests);
-        conn.round_trip(line)
+        {
+            Traffic::add(&self.traffic.requests);
+            if matches!(out, Outgoing::Frame { .. }) {
+                Traffic::add(&self.traffic.frames);
+            }
+        }
+        conn.round_trip(out)
     }
 
     /// Drops the kept connection when it can't carry a request: idle for
@@ -1598,43 +1867,55 @@ impl CredAgentClient {
         }
     }
 
-    /// `line` on a connection of its own, closed after the reply; first,
-    /// unless it `checked` just now, the build check on a connection of its
-    /// own (an agent that closes connections after a reply can't take both).
-    fn alone(&self, line: Zeroizing<String>, checked: bool) -> Result<WipingBuf> {
+    /// The request (`line`, else `again` as a JSON line) on a connection of
+    /// its own, closed after the reply; first, unless it `checked` just now,
+    /// the build check on a connection of its own (an agent that closes
+    /// connections after a reply can't take both).
+    fn alone(
+        &self,
+        line: Option<Zeroizing<String>>,
+        again: Option<&Request>,
+        checked: bool,
+    ) -> Result<Received> {
+        let line = match line {
+            Some(line) => line,
+            None => encode_request(again.ok_or_else(unencoded)?)?,
+        };
         if let Some(build) = self.build.as_deref()
             && !checked
         {
             drop(self.check_build(self.connection()?, build)?);
         }
         let mut conn = self.connection()?;
-        match self.send(&mut conn, line) {
+        match self.send(&mut conn, Outgoing::Line(line)) {
             Ok(answer) => Ok(answer.reply),
             Err(failed) => Err(self.closed(failed.into_error())),
         }
     }
 
-    /// `line` on the kept connection (opened, and checked, when none is
-    /// kept). A request never goes where the agent might close the
-    /// connection under it when that would cost more than a resend: on a
-    /// connection with a single reply, a request that changes the agent
-    /// (`again` is `None`), a resend, or any request while the agent may
-    /// close connections after a reply (`Link::one_per_connection`) goes only
-    /// once the agent answered a `status` there (two replies prove it keeps
-    /// connections, and end that mode). An agent that closes it instead
-    /// gets the request on a connection of its own (`alone`).
+    /// The request on the kept connection (opened, and checked, when none
+    /// is kept): `line`, or without one, `again` encoded for the connection
+    /// (`outgoing`: a `Crypt` as a frame where it agreed to them). A request
+    /// never goes where the agent might close the connection under it when
+    /// that would cost more than a resend: on a connection with a single
+    /// reply, a request that changes the agent (`again` is `None`), a resend,
+    /// or any request while the agent may close connections after a reply
+    /// (`Link::one_per_connection`) goes only once the agent answered a
+    /// `status` there (two replies prove it keeps connections, and end that
+    /// mode). An agent that closes it instead gets the request on a
+    /// connection of its own (`alone`).
     ///
-    /// When the connection drops after `line` was written but before any
-    /// byte of the reply, the request in `again` (a `resendable` one) goes
-    /// once more, on a new connection; every other failure is the request's
-    /// error. A drop after a single reply means the agent may close
-    /// connections after a reply; after two, it stopped or restarted.
+    /// When the connection drops after the request was written but before
+    /// any byte of the reply, the request in `again` (a `resendable` one)
+    /// goes once more, on a new connection; every other failure is the
+    /// request's error. A drop after a single reply means the agent may
+    /// close connections after a reply; after two, it stopped or restarted.
     fn exchange(
         &self,
         link: &mut Link,
-        mut line: Zeroizing<String>,
+        mut line: Option<Zeroizing<String>>,
         again: Option<&Request>,
-    ) -> Result<WipingBuf> {
+    ) -> Result<Received> {
         let mut resent = false;
         loop {
             self.drop_unusable(link);
@@ -1645,7 +1926,7 @@ impl CredAgentClient {
             };
             if conn.replies == 1 && (again.is_none() || resent || link.one_per_connection) {
                 let status = encode_request(&Request::Status)?;
-                match self.send(conn, status) {
+                match self.send(conn, Outgoing::Line(status)) {
                     Ok(answer) if answer.in_step => link.one_per_connection = false,
                     Ok(_) => {
                         link.conn = None;
@@ -1655,7 +1936,7 @@ impl CredAgentClient {
                         let checked = opened && conn.checked;
                         link.conn = None;
                         link.one_per_connection = true;
-                        return self.alone(line, checked);
+                        return self.alone(line, again, checked);
                     }
                     Err(failed) => {
                         link.conn = None;
@@ -1663,27 +1944,36 @@ impl CredAgentClient {
                     }
                 }
             }
+            let out = match line.take() {
+                Some(line) => Outgoing::Line(line),
+                None => outgoing(conn, again.ok_or_else(unencoded)?)?,
+            };
             let replies = conn.replies;
-            let failed = match self.send(conn, line) {
+            let failed = match self.send(conn, out) {
                 Ok(answer) => return Ok(keep(link, answer)),
                 Err(failed) => failed,
             };
             link.conn = None;
             let resend = matches!(failed, Failed::Unanswered(_)) && replies > 0 && !resent;
-            let Some(request) = again.filter(|_| resend) else {
+            if !resend || again.is_none() {
                 return Err(self.closed(failed.into_error()));
-            };
+            }
             if replies == 1 {
                 link.one_per_connection = true;
             }
+            // `line` is taken: the new connection encodes `again` its way.
             resent = true;
-            line = encode_request(request)?;
         }
     }
 }
 
+/// A request that is neither encoded nor kept to be encoded.
+fn unencoded() -> anyhow::Error {
+    anyhow!("the cred agent request was not kept to be encoded")
+}
+
 /// `answer`'s reply; its connection stays kept only while in step.
-fn keep(link: &mut Link, answer: Answer) -> WipingBuf {
+fn keep(link: &mut Link, answer: Answer) -> Received {
     if !answer.in_step {
         link.conn = None;
     }
@@ -1710,10 +2000,15 @@ impl CredAgentApi for CredAgentClient {
 
     fn call(&self, request: Request) -> Result<Reply> {
         let stops = matches!(request, Request::Lock { stop: true });
-        let line = encode_request(&request)?;
-        // Kept to go once more if its connection drops unanswered (the
-        // line itself is wiped as soon as it is written); any other request
-        // is wiped now.
+        // A `Crypt` (resendable) is encoded once its connection is known, as
+        // a frame where that connection agreed to them; any other request is
+        // encoded now.
+        let line = match &request {
+            Request::Crypt { .. } => None,
+            _ => Some(encode_request(&request)?),
+        };
+        // Kept to go once more if its connection drops unanswered (what is
+        // written is wiped as soon as it is); any other request is wiped now.
         let again = resendable(&request).then_some(request);
         let reply = {
             let mut link = self.link.lock().unwrap_or_else(|poisoned| {
@@ -1731,17 +2026,29 @@ impl CredAgentApi for CredAgentClient {
             reply
         };
         drop(again);
-        let reply = reply?;
-        let text = std::str::from_utf8(&reply.0)
-            .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))?;
-        decode_response(text)
-            .map_err(|error| explain_unknown_request(error, self.older_build_text()))
+        let reply = match reply? {
+            Received::Line(reply) => {
+                let text = std::str::from_utf8(&reply.0)
+                    .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))?;
+                decode_response(text)
+            }
+            Received::Results(results) => Ok(Reply::Crypted { results }),
+            Received::Json(body) => std::str::from_utf8(&body)
+                .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))
+                .and_then(decode_response),
+            Received::Unreadable => Err(anyhow!("the cred agent sent an unreadable reply")),
+        };
+        reply.map_err(|error| explain_unknown_request(error, self.older_build_text()))
     }
 }
 
 #[cfg(test)]
 #[path = "agent_client_tests.rs"]
 mod client_tests;
+
+#[cfg(test)]
+#[path = "agent_frame_tests.rs"]
+mod frame_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2461,7 +2768,7 @@ mod tests {
 
     /// The atem binary next to the test binary (built because integration
     /// tests exist).
-    fn atem_binary() -> PathBuf {
+    pub(super) fn atem_binary() -> PathBuf {
         let exe = std::env::current_exe()
             .unwrap()
             .parent()
@@ -2477,7 +2784,7 @@ mod tests {
     }
 
     /// Kills the child when the test ends, however it ends.
-    pub(super) struct Reaped(std::process::Child);
+    pub(super) struct Reaped(pub(super) std::process::Child);
 
     impl Drop for Reaped {
         fn drop(&mut self) {
