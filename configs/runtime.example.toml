@@ -28,7 +28,13 @@ enabled = false
 #                         # channels. Whoever may reach an agent acts through
 #                         # it as you: its sends are "local" and reach every
 #                         # route that lists "local". The agent's own tool
-#                         # approvals still apply.
+#                         # approvals still apply. That holds with a pinned
+#                         # device list: a host without one still serves r8
+#                         # over its Astation link, which is neither end to
+#                         # end nor authenticated at Atem's end, so
+#                         # collaboration doesn't run there (run
+#                         # `atem pair verify`). Vault context needs your
+#                         # account's end-to-end encryption on.
 # per_hour = 30
 # per_workflow = 8        # messages per workflow, however many agents each reaches
 # result_timeout = "30m"  # 1s-24h; automatic status never completes a task

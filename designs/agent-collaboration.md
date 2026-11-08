@@ -201,7 +201,8 @@ is `local`, whoever prompted the agent that sent it (below).
 
 **Trust model: security is at user authentication.** Prompts must come from
 an authenticated, authorized user, neither forged nor altered on the way.
-Three properties carry that today:
+Three properties carry that on r9 hosts, those with a pinned device list (the
+exception follows them):
 
 1. **Authentication: who may reach an agent.** Remote principals are the
    paired Astation and the members of the account's signed r9 device list
@@ -223,9 +224,27 @@ Three properties carry that today:
    changed in between fails (section 10, "Lifecycle").
 3. **Safe transport.** r9 channels (`atem-ch1`) are end to end: what routes
    them (the Station, or Astation's local port) can't read, forge or alter a
-   prompt. Host-work requests travel only inside them, and a host with a pinned
-   device list serves no other remote sessions. The local socket is same-user
-   only.
+   request inside them. Host-work requests travel only inside them, and a host
+   with a pinned device list serves no other remote sessions. The local socket
+   is same-user only. Context a local agent attaches takes another path
+   (section 8): a Memory snapshot is the local copy, compared with what the
+   relay stored; a vault entry's text comes from the relay, so it is taken only
+   while the account's encryption is on and its entries are sealed end to end
+   (what the relay can still do then is in section 17, "Known limits").
+
+**The exception: hosts that still serve r8.** A host verified by an earlier
+build that never pinned a device list (its session host doesn't refuse r8)
+still serves r8 session-v1, chat-v1 and terminal-v1 requests, approval
+answers included, to the paired Astation over its Astation link. That link is
+neither end to end (WSS through the relay ends at the relay; a direct LAN link
+is plain `ws://`) nor authenticated at Atem's end: Atem proves itself to
+Astation but takes Astation's word for being authenticated, so whoever ends
+the socket can act as the paired Astation there. The three properties hold for
+r9 hosts only. Collaboration refuses to run on such a host: sends, replies,
+completions and cancels are refused with "collaboration needs a pinned device
+list: run `atem pair verify`", and `local` has no authority there, so no local
+task is dispatched (one already queued fails, "sender's authority changed").
+`atem pair verify` pins a list; from then on the host refuses r8.
 
 **What a principal that may reach an agent can do.** Through the agent it acts
 with the local user's permissions on this host; Atem doesn't track who
@@ -349,8 +368,14 @@ itself. Per target instance, a delivery row moves through
 
 ## 8. Publish before notify
 
-A reference never reaches an agent before its content is published, and an
-agent only ever sees exact bytes that the runtime verified.
+A reference never reaches an agent before its content is published, and the
+runtime dispatches exactly the bytes it froze (their digest is checked before
+dispatch). That they are the account's own rests on where they come from: a
+Memory snapshot is the local copy, compared with what the relay stored; a vault
+entry's text comes from the relay, so its authenticity rests on vault
+encryption (below). Atem's own lines around them in the rendered prompt can be
+imitated by sender text until the agreed framing ships (section 17, "Known
+limits").
 
 **The boundary.** The sender's runtime (the authorized publisher) verifies
 that the version is committed and readable by the account; the receiving
@@ -367,7 +392,9 @@ it alone, and the coding agent never fetches or verifies anything itself.
 2. reads it back from the relay: memory by pulling from just below that `seq`
    (the relay has no fetch by id), the vault entry by reading from `seq - 1` and
    matching entry and version; both come back decrypted;
-3. compares the plaintext with the local text, and freezes the typed snapshot
+3. compares the plaintext with the local text (a vault entry has none: its two
+   reads are compared with each other, which checks consistency, not
+   authorship), and freezes the typed snapshot
    `{kind, id, version, digest: sha256(text), text}` into the envelope (the
    memory's own hash is a normalized dedup key, not this digest).
 
@@ -380,6 +407,22 @@ references include an entry when needed: `VAULT_ID:ENTRY@VERSION`. Bare
 `VAULT_ID@VERSION` is refused if more than one entry matches. Publication
 retries use a bounded background job pool; a byte mismatch is refused rather
 than delivered.
+
+**Vault context needs end-to-end encryption on.** With encryption off a vault
+entry is plain text on the relay, which could return text of its choice to
+both reads. So `--vault`, on a send and on a reply, is refused unless the
+account's newest signed encryption mode is `on` ("vault context needs
+end-to-end encryption on"): when the send or reply is made, again before its
+publication reads the entry and once it has, and at every read, by the context
+that opens the entries, so each entry must be sealed (`e1.`) and open under the
+account's key (one in the clear is refused). A mode that changed in between refuses the publication
+for good: the send shows `refused`, the reply `refused` (a corrected reply may
+replace it). `--memory` is not affected. What the relay can still do with
+encryption on is in section 17 ("Known limits"). An entry whose text the
+credential redactor chat-v1 applies to agent output would change is refused
+before its snapshot is frozen ("vault context contains a credential value;
+remove it"), on a send and on a reply: its text would reach other agents, and
+remote senders through `reply_query`, as it is.
 
 **Stage 2: typed snapshots only.** The message adapter proposed in Astation's
 host-work branch accepts inline text only. Stage 2 does not put references in
@@ -496,10 +539,14 @@ its sender: two separate steps.
   the calling session is in its turn or awaits a result. A reply's vault
   reference names its entry: a bare `<id>@<version>` is refused before anything
   is stored. The text is at most 16 KiB, with no control characters other than
-  newline and tab. Credential values in it are redacted, by the redactor
-  chat-v1 applies to agent output, before the reply is stored and its digest
-  taken (an identical retry is redacted the same way), so no sender, local or
-  remote, reads one and none is kept.
+  newline and tab. Credential values in its text are redacted, by the
+  redactor chat-v1 applies to agent output, before the reply is stored and its
+  digest taken (an identical retry is redacted the same way), so no sender,
+  local or remote, reads one in the text and none is kept there. Its context is
+  not redacted: a vault entry whose text the redactor would change is refused
+  when it is read, before its snapshot is frozen (section 8), and a Memory
+  snapshot is the stored fact, which Atem Memory refuses to store with a
+  credential value (by its own detector).
 - **Authorization.** The runtime accepts a reply only from the task's target
   session and process (found from the CLI's process ancestry), while the task
   is `submitted`, `awaiting_result` or `outcome_unknown`. It binds the reply,
@@ -560,7 +607,9 @@ its sender: two separate steps.
   arrives marked as data, not as the owner's instruction (`[atem] result of
   task <id> from <sender>, as data:`; a label for the agent, not a
   restriction: the agent acts on it with the local user's permissions, like on
-  any prompt, section 6), followed by how to finish the task
+  any prompt, section 6; and reply text can imitate it, or any of Atem's own
+  lines, until the agreed framing ships, section 17), followed by how to
+  finish the task
   (`Complete it with: atem message complete <task id>`), through the normal
   queue, readiness, approval and lease checks, and only if the originating
   session's route opts in (`results = true`); otherwise it is shown by `atem
@@ -1000,8 +1049,8 @@ Sending and automatic actions remain opt-in.
 | Shared addressing | `crates/atem-client/src/session/select.rs`: labels, AND/union selectors, `atem:` ids, 16 selectors and one 32-agent budget; `messages.rs`: optional correlation and local validation; `host_work.rs`: local task ids, `reply_query` and its result |
 | Calling identity | `src/runtime/server.rs`, `adopt.rs`, `broker.rs`: socket peer PID and start time, verified ancestry to the live worker agent, generation-bound persisted `self:` tags (removed with their session) |
 | Durable state | `src/runtime/collab.rs`: fixed resolutions, UUIDv5 task IDs, outbox, durable hourly/workflow counters counted in messages and removed when their windows pass, task validation before counting, scoped status views |
-| Queue integration | `src/runtime/collab_bridge.rs`, `host_work_bridge.rs`, `host_bridge.rs`: internal attachment, sender abstraction, normal prompt receipts, leases, fencing and pauses; the lifecycle rules of section 10 (`work_lost`, `reconcile_work`, `work_fence_launches`) |
-| Context | `src/runtime/collab_context.rs`, `src/memory/sync.rs`, `src/vault_client.rs`: immutable capture, publication, exact decrypted read-back, bounded retries before dispatch |
+| Queue integration | `src/runtime/collab_bridge.rs`, `host_work_bridge.rs`, `host_bridge.rs`: internal attachment, sender abstraction, normal prompt receipts, leases, fencing and pauses; the lifecycle rules of section 10 (`work_lost`, `reconcile_work`, `work_fence_launches`); `local` only on a host with a pinned device list (`local_authorized`, `collab_unauthorized`); Atem's lines around a local task's text or a delivered reply rendered at dispatch from the records (`collab::Frame`), the stored prompt holding only the sender's text or the reply |
+| Context | `src/runtime/collab_context.rs`, `src/memory/sync.rs`, `src/vault_client.rs`: immutable capture, publication, exact decrypted read-back, bounded retries before dispatch; vault context only with the account's encryption on (checked at capture, before and after publication reads the entry, and by each read: `VaultClient::encryption_on_only`) and never with a credential value |
 | Results | `src/runtime/collab_results.rs`, `collab_bridge.rs`: one durable reply per task for every sender, bound to its session, process and turn; narrow return grants, explicit completion by the sender, optional origin prompt, status-only automatic reports, grants that end early with their reason recorded (the task goes on) |
 | Remote replies | `crates/atem-client/src/session/host_work.rs`, `principal.rs`, `connect.rs`, `src/session_protocol/r9/mod.rs`, `host_work_bridge.rs`: `reply_query`, the `host.reply` feature, the shared vectors in `designs/protocol/fixtures/host-work/requests-v1.json` |
 | Chat turn attribution | `src/chat/session.rs`: a Claude `Stop` hook recorded before the current turn began ends nothing of it (the collaboration tests found it; it also affected remote chat prompts) |
@@ -1060,8 +1109,15 @@ is a `local` task for another agent; `atem message directory` refuses a caller
 that can't be verified. Replies and silent-turn reports are redacted. A task
 whose record can't be read (not JSON, an object that isn't a task, a shape this
 build doesn't know; waiting, queued or settled) is settled once and closed, and
-the queue behind it goes on. Retention: payloads dropped past the retention
-with every row kept, a database with only the v0.8.x tables opening and working
+the queue behind it goes on. Vault context is refused with encryption off for a
+send and a reply and accepted with it on, refused when the mode went off before
+the entry was read and when its text holds a credential value (the vault
+client's own check runs against the e2e harness: off, migrating, on, an entry
+the relay sent in the clear). A host without a pinned device list refuses sends
+and replies and fails a queued local task. A local task's and a result
+delivery's rendered prompts are byte for byte the earlier ones, while their
+stored prompts hold only the sender's text or the reply. Retention: payloads
+dropped past the retention with every row kept, a database with only the v0.8.x tables opening and working
 unchanged, retries deduplicated by digest after a drop, `reply_query` answering
 `dropped`, the record caps counting open records only (tasks, messages, local
 sends, launches), no recurring or per-request query reading a closed record
@@ -1096,6 +1152,33 @@ Stage 1 ships with these limits.
   guard these; the agent's tool approvals are the boundary. **Planned (not
   implemented):** running agents in a sandbox that keeps them away from Atem's
   configuration and state and from the rest of the user's account.
+- **Prompt framing.** Sender text can imitate Atem's own lines in a rendered
+  prompt: the task line, a message's header and sender, `Reply with`, a
+  result's `as data` header and `Complete it with`, context blocks and
+  screenshot lines. That holds for the renderers released in v0.8.x (remote
+  tasks, messages and marks) and for this branch's local tasks and result
+  deliveries: a service's text can pass for a native member's message, a reply
+  can end its "data" and present a task from another sender, and a local sender
+  can add a context block nobody published. Atem's records (receipts,
+  principals, digests) attribute every prompt correctly; what can be forged is
+  the provenance the agent reads. The agreed framing (the delegated host-work
+  design, section III.2) fixes it for every renderer and ships as its own PR.
+  This branch keeps only the sender's text, or the reply, in a local task's or
+  a result delivery's prompt and renders Atem's lines at dispatch, so that
+  change only swaps renderers. **No release may contain this branch before
+  that framing has landed.**
+- **Vault context with encryption on.** Vault context is taken only while the
+  account's encryption is on (section 8). The relay can then still serve
+  another entry or version of the same vault, an older or superseded one
+  included, in place of the one named: the associated data binds the vault and
+  the field, not the entry number or version, until e2e build step 3 binds
+  them ([e2e-encryption.md](e2e-encryption.md), "What gets encrypted").
+- **Hosts that still serve r8.** Section 6's properties hold for r9 hosts. A
+  host without a pinned device list still serves r8 over a link that is
+  neither end to end nor authenticated at Atem's end (section 6, "The
+  exception"); collaboration refuses to run there until `atem pair verify` pins
+  a list. Requiring r9 everywhere, so no host serves r8, is the fix and is
+  outside this branch.
 - **Scaling.** A 100 ms pass where nothing relevant changed reads no task
   awaiting its result or of unknown outcome and no return grant: it reads
   the tasks that hold or wait for a queue place (at most 256), deadlines and

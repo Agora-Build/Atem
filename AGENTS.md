@@ -296,11 +296,17 @@ under the same-user model this owner fallback is no security boundary).
 route consent for `local` (a route's own `principals` replaces the
 paired-Astation default); defaults keep sending, result prompts and launch off.
 Security is at user authentication (design §6): who may reach an agent is the
-paired Astation and the signed r9 device list's members (routes and `control`
-authorize them), and locally same-user socket peers (an agent's commands tied to
-its session by PID, start time and ancestry); every request is bound to its
-sender and checked against current authority at acceptance and again before
-dispatch; host work travels only in end-to-end `atem-ch1` channels. A principal
+signed r9 device list's members (routes and `control` authorize them), and
+locally same-user socket peers (an agent's commands tied to its session by PID,
+start time and ancestry); every request is bound to its sender and checked
+against current authority at acceptance and again before dispatch; host work
+travels only in end-to-end `atem-ch1` channels. That holds on r9 hosts: a host
+without a pinned device list still serves r8 to the paired Astation over a link
+neither end to end nor authenticated at Atem's end, so collaboration refuses to
+run there (`local_authorized` needs `SessionHost::refuses_r8`; "collaboration
+needs a pinned device list: run `atem pair verify`"). Sender text can still
+imitate Atem's framing lines until the agreed §III.2 framing lands as its own
+PR; no release may contain this branch before it (design §17). A principal
 allowed to reach an agent acts through it with the local user's permissions
 (shell, files, Atem commands, Memory, skills, vault): Atem doesn't track who
 prompted an agent, so its `message send` is `local` and reaches every route that
@@ -334,6 +340,14 @@ a new host identity or a device-list freeze or fault. The agent commands connect
 only to the running runtime (none: "no Atem runtime is running; agents run
 inside one"; never started or replaced, whatever its build). Context jobs
 publish/read back exact decrypted Memory/Vault versions before dispatch.
+`--vault` (send and reply) needs the account's signed encryption mode `on`
+(checked at capture, before and after publication reads the entry, and by
+each read: `VaultClient::encryption_on_only`), since a vault entry's text comes from the
+relay; an entry whose text the credential redactor would change is refused
+before it is frozen. A local task's and a result delivery's stored prompt is the
+sender's text or the reply only; Atem's lines around it (`[Message … from local
+session …]`, `Reply with`, `[atem] result of task … as data:`, `Complete it
+with`) are rendered at dispatch from the records (`collab::Frame`).
 `message reply [--task ID] [--memory ID] [--vault ID:ENTRY@VERSION]` submits one
 durable reply for a task of any sender (local, member or service), bound to its
 task/session/process/turn, its text redacted of credential values before it is

@@ -366,17 +366,25 @@ messages one request starts) is limited to 8 messages (`per_workflow`); a
 message counts once however many agents it reaches, and replies count against
 nothing. `results = true` on the originating route also queues the reply into
 its agent; otherwise it remains visible through status. `--memory ID` and
-`--vault ID[:ENTRY]@VERSION` attach verified exact context to a message (a
-reply names its vault entry: `ID:ENTRY@VERSION`). The `atem message` and `atem
-agent tag` commands only connect to the running runtime: they never start or
-replace one.
+`--vault ID[:ENTRY]@VERSION` attach exact context to a message (a reply names
+its vault entry: `ID:ENTRY@VERSION`). A vault entry's text comes from the
+relay, so `--vault` works only while your account's end-to-end encryption is
+on, and an entry holding a credential value is refused. The `atem message` and
+`atem agent tag` commands only connect to the running runtime: they never start
+or replace one.
 
-Security is at user authentication. Remotely, only the paired Astation and the
-members of your signed device list (devices, services, and browser grants your
-devices issue) reach your agents, and locally only your own user's processes;
-each request is bound to its sender and checked against the sender's current
-permission when it is accepted and again before it runs; host work travels
-only in end-to-end encrypted r9 channels the Station can't read or alter.
+Security is at user authentication. Remotely, only the members of your signed
+device list (devices, services, and browser grants your devices issue) reach
+your agents, and locally only your own user's processes; each request is bound
+to its sender and checked against the sender's current permission when it is
+accepted and again before it runs; host work travels only in end-to-end
+encrypted r9 channels the Station can't read or alter. That holds on hosts with
+a pinned device list. A host verified by an earlier build that never pinned one
+still serves r8 sessions to the paired Astation over a link that is neither end
+to end nor authenticated at Atem's end; agent collaboration refuses to run
+there until `atem pair verify` pins a list. Until a coming change to how
+prompts are framed, text a sender writes can imitate Atem's own lines (a
+message header, a result's "as data" label) in what the agent reads.
 Whoever may reach an agent (a route that lists it, or `control` over its
 session) acts through it with your permissions on this machine: the agent's
 shell, files and Atem commands, including `atem message send` (its tasks are

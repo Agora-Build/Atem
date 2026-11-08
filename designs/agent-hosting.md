@@ -219,7 +219,15 @@ owner's local consent in `runtime.toml`.
   `local`), Memory, skills and the vault. Atem doesn't track who prompted an
   agent, so listing a principal, or granting it `control`, lets it act as you
   through your agents. The agent's own tool approvals still apply to each
-  command (agent collaboration, section 6).
+  command (agent collaboration, section 6). This holds for r9 hosts. A host
+  verified by an earlier build that never pinned a device list still serves
+  r8 sessions to the paired Astation over its Astation link, which is neither
+  end to end nor authenticated at Atem's end (Atem takes Astation's word for
+  being authenticated), so whoever ends that socket can act as the paired
+  Astation there; agent collaboration refuses to run on such a host until
+  `atem pair verify` pins a list. Sender text can imitate Atem's own lines in
+  a rendered prompt until the agreed prompt framing ships (agent
+  collaboration, section 17).
 
 ## 5. Remote launch
 
