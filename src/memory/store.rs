@@ -572,7 +572,7 @@ impl Store {
         Ok(self.all_skills()?.into_iter().filter(|s| !s.deleted).collect())
     }
 
-    // ── projects not on this machine (`model::is_unresolved_project`) ──────
+    // ── projects not known here yet (`model::is_unresolved_project`) ──────
     /// The project hashes memories and skills are stored under because this
     /// Atem had no name for them when they were pulled.
     pub fn unresolved_projects(&self) -> Result<Vec<String>> {

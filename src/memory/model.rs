@@ -82,7 +82,7 @@ impl Memory {
 /// A project pulled as the relay's `h1.` keyed hash that this Atem has no
 /// name for yet (encryption on, the project never used here). The row keeps
 /// the hash until the name is known, and is never applied meanwhile (see
-/// designs/atem-memory.md "Projects not on this machine"). A project key
+/// designs/atem-memory.md "Projects not known here yet"). A project key
 /// never has this shape: it is `<host>/<path>` (a `/` is neither hex nor a
 /// kid character) or `local:<folder>`.
 pub fn is_unresolved_project(project: &str) -> bool {

@@ -947,7 +947,7 @@ data becomes readable on the server again):
   key), and pushed back with the same hash unless the device has named it
   since; skills under another key's hash, or under any hash while off, are
   dropped, since the migration delivers them again (designs/atem-memory.md
-  "Projects not on this machine"). A malformed `h1.` value or a non-`h1.`
+  "Projects not known here yet"). A malformed `h1.` value or a non-`h1.`
   project while on still fails it, and migration still needs every name.
 - **`content_hash`** is what the relay dedupes on. A plain SHA-256 of a
   short fact can be guessed; a keyed HMAC can't.
