@@ -744,10 +744,10 @@ enum Mode {
     /// `on`, the agent in this process (crypto + agent logic, no socket).
     InProcess,
     /// `on`, a real agent process, one client reused (one connection, no
-    /// build check).
+    /// build check, so JSON lines).
     SocketReuse,
     /// `on`, a real agent process, a process's client as production makes
-    /// it (one connection, the build check on it).
+    /// it (one connection, the build check on it, which agrees to frames).
     Production,
 }
 
@@ -1029,16 +1029,22 @@ fn perf_1b_crypt_requests_in_process_and_over_the_socket() {
             "in-process agent (no socket)",
             device.agent.clone() as Arc<dyn CredAgentApi>,
         ),
-        ("socket, client reused (mlockall on)", real.reuse()),
         (
-            "socket, production: one client per process (mlockall on)",
+            "socket, client reused, no build check: JSON lines (mlockall on)",
+            real.reuse(),
+        ),
+        (
+            "socket, production: one client per process, frames (mlockall on)",
             real.production(),
         ),
         (
-            "socket, client reused (RLIMIT_MEMLOCK 8 MiB: no mlockall)",
+            "socket, client reused, JSON lines (RLIMIT_MEMLOCK 8 MiB: no mlockall)",
             real_nolock.reuse(),
         ),
-        ("socket, production (no mlockall)", real_nolock.production()),
+        (
+            "socket, production, frames (no mlockall)",
+            real_nolock.production(),
+        ),
     ];
     println!("\n## 1b. One Crypt request, by batch size (100-byte fields), median");
     println!(
@@ -2298,7 +2304,7 @@ fn perf_1d_large_field_breakdown() {
         ];
         let total: Duration = steps.iter().map(|(_, d)| *d).sum();
         println!(
-            "\n## 1d. A {} KiB seal through the socket path, step by step (median of {reps}; sum {:.2} ms; socket I/O and wake-ups not included)",
+            "\n## 1d. A {} KiB seal through the JSON line path, step by step (median of {reps}; sum {:.2} ms; socket I/O and wake-ups not included)",
             size >> 10,
             ms(total)
         );
