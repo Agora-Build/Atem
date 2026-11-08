@@ -3,7 +3,7 @@
 //! earlier chunk's rewrites, the prefetched page against a failure or a
 //! crash, a lock while a POST is in flight, and the order of commits.
 use super::tests::{
-    KeepingRelay, NO_HARVEST, arm_crash, keeping_relay, posted_ops, stub_relay, test_ctx, valid,
+    KeepingRelay, NO_HARVEST, keeping_relay, posted_ops, stub_relay, test_ctx, valid,
 };
 use super::*;
 use crate::memory::account_keys::CryptOp;
@@ -596,32 +596,52 @@ async fn a_page_is_opened_while_the_next_one_is_fetched() {
 
 // ─────────────── ruling 3: the prefetched page ───────────────
 
+/// Page 2's open fails (its ciphertext was tampered with) after page 3 came
+/// back: page 3 is dropped unapplied, and the next sync starts from page 1's
+/// cursor.
 #[tokio::test]
-async fn a_page_that_fails_to_open_discards_the_prefetched_one() {
+async fn a_page_that_fails_to_open_drops_the_page_fetched_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
     let device = device(dir.path(), EncryptionMode::On);
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     seed_sealed(&relay, &device, 600);
-    // Page 2 carries plain text while encryption is on.
     let sealed_300 = {
         let mut r = relay.lock().unwrap();
         let row = r.rows.get_mut("mem_r0300").unwrap();
-        std::mem::replace(&mut row.content, "relay-injected plain text".into())
+        let mut tampered = row.content.clone().into_bytes();
+        let last = tampered.len() - 3;
+        tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+        std::mem::replace(&mut row.content, String::from_utf8(tampered).unwrap())
     };
     let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let gets = log.clone();
+    // Page 2's open (the second request) waits until page 3 came back.
+    let recorder = Recorder::with_hook(
+        device.agent.clone(),
+        Box::new(move |index, _, _| {
+            if index == 1 {
+                assert!(wait_for(Duration::from_secs(2), || memory_gets(&gets).contains(&400)));
+            }
+        }),
+    );
     let s = Store::open_in_memory().unwrap();
     let (_home, ctx) = test_ctx();
-    let client = client_with(&base, &device, device.agent.clone());
-    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
-        .await
-        .unwrap();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, recorder.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
     assert!(out.relay_error, "{:?}", out.notes);
     assert!(
-        out.notes.iter().any(|n| n.contains("plain-text")),
+        out.notes
+            .iter()
+            .any(|n| n.contains("end-to-end encryption")),
         "{:?}",
         out.notes
     );
-    // Page 3 was fetched while page 2 was opened, and dropped unapplied.
     assert_eq!(memory_gets(&log), vec![0, 200, 400]);
     assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 200);
     assert_eq!(s.history_memories().unwrap().len(), 200);
@@ -644,9 +664,14 @@ async fn a_page_that_fails_to_open_discards_the_prefetched_one() {
         .unwrap()
         .content = sealed_300;
     log.lock().unwrap().clear();
-    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
-        .await
-        .unwrap();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, device.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
     assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
     assert_eq!(out.pulled, 400);
     assert_eq!(memory_gets(&log), vec![200, 400, 600]);
@@ -654,66 +679,154 @@ async fn a_page_that_fails_to_open_discards_the_prefetched_one() {
     assert_eq!(s.history_memories().unwrap().len(), 600);
 }
 
-#[tokio::test]
-async fn a_crash_while_a_page_is_applied_with_the_next_one_fetched_keeps_the_cursor() {
-    let td = tempfile::tempdir().unwrap();
-    let (db, image) = (
-        td.path().join("knowledge.db"),
-        td.path().join("crash/knowledge.db"),
-    );
-    let device = device(td.path(), EncryptionMode::On);
-    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
-    seed_sealed(&relay, &device, 450);
-    let s = Store::open(&db).unwrap();
-    // Half way through page 2.
-    arm_crash(
-        &s,
-        &db,
-        &image,
-        "CREATE TEMP TRIGGER crash_mid_page BEFORE INSERT ON memories WHEN new.id = 'mem_r0300' BEGIN SELECT crash(); END;",
-    );
-    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
-    let (_home, ctx) = test_ctx();
-    let client = client_with(&base, &device, device.agent.clone());
-    let err = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
-        .await
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
-    // Page 3 had been fetched when the process died applying page 2.
-    assert_eq!(memory_gets(&log), vec![0, 200, 400]);
-    drop(s);
+/// A stop inside page 2's transaction while page 3's request is in flight
+/// (the relay has it and holds its answer until the stop).
+#[derive(Default)]
+struct InFlight {
+    received: AtomicBool,
+    released: AtomicBool,
+    answered: AtomicBool,
+    seen: AtomicBool,
+}
 
-    let page_one_only = |s: &Store| {
-        assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 200);
-        let rows = s.history_memories().unwrap();
-        assert_eq!(rows.len(), 200);
-        assert!(rows.iter().all(|m| m.seq <= 200));
-        assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
-    };
-    page_one_only(&Store::open(&db).unwrap());
-    let s = Store::open(&image).unwrap();
-    page_one_only(&s);
+/// The relay, holding its answer to GET `since` until `flags.released`.
+fn holding(
+    relay: Arc<Mutex<KeepingRelay>>,
+    since_held: i64,
+    flags: Arc<InFlight>,
+) -> Box<super::tests::Handler> {
+    let keeping = keeping_relay(relay);
+    Box::new(move |m, p, body| {
+        if m == "GET" && p.starts_with("/api/memory?") && since(p) == since_held {
+            flags.received.store(true, Ordering::SeqCst);
+            wait_for(Duration::from_secs(2), || {
+                flags.released.load(Ordering::SeqCst)
+            });
+            flags.answered.store(true, Ordering::SeqCst);
+        }
+        keeping(m, p, body)
+    })
+}
 
-    // The next sync resumes at page 2 and completes.
-    log.lock().unwrap().clear();
-    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
-        .await
+/// Arms a stop in the store's next transaction, at the insert of row `id`:
+/// it waits until the relay holds the next page's request, records that,
+/// copies the store as a process killed then leaves it (with `image`), lets
+/// the relay answer and fails the statement.
+fn arm_stop_in_flight(s: &Store, db: &Path, image: Option<&Path>, id: &str, flags: Arc<InFlight>) {
+    use rusqlite::functions::FunctionFlags;
+    let (db, image) = (db.to_path_buf(), image.map(Path::to_path_buf));
+    s.test_conn()
+        .create_scalar_function(
+            "stop_in_flight",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| -> rusqlite::Result<i64> {
+                let received = wait_for(Duration::from_secs(2), || {
+                    flags.received.load(Ordering::SeqCst)
+                });
+                flags.seen.store(
+                    received && !flags.answered.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                if let Some(image) = &image {
+                    std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+                    for suffix in ["", "-journal"] {
+                        let (mut from, mut to) =
+                            (db.clone().into_os_string(), image.clone().into_os_string());
+                        from.push(suffix);
+                        to.push(suffix);
+                        if Path::new(&from).exists() {
+                            std::fs::copy(&from, &to).unwrap();
+                        }
+                    }
+                }
+                flags.released.store(true, Ordering::SeqCst);
+                Err(rusqlite::Error::UserFunctionError("injected stop".into()))
+            },
+        )
         .unwrap();
-    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
-    assert_eq!(out.pulled, 250);
-    assert_eq!(memory_gets(&log), vec![200, 400]);
-    assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 450);
-    let opened = context(&device)
-        .decrypt_memories(relay.lock().unwrap().rows.values().cloned().collect())
-        .unwrap();
-    assert_eq!(s.history_memories().unwrap().len(), 450);
-    for row in opened {
-        assert_eq!(
-            s.get_memory(&row.id).unwrap().as_ref(),
-            Some(&row),
-            "{}",
-            row.id
+    s.test_conn().execute_batch(&format!(
+        "CREATE TEMP TRIGGER stop_mid_page BEFORE INSERT ON memories WHEN new.id = '{id}' BEGIN SELECT stop_in_flight(); END;"
+    )).unwrap();
+}
+
+/// Page 2's transaction fails (an error, then a crash) while page 3's
+/// request is in flight: page 3 is never applied, the cursor stays at the end
+/// of page 1, and the next sync resumes there and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_that_fails_or_crashes_while_the_next_is_in_flight_keeps_the_cursor() {
+    for crash in [false, true] {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (
+            td.path().join("knowledge.db"),
+            td.path().join("crash/knowledge.db"),
         );
+        let device = device(td.path(), EncryptionMode::On);
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        seed_sealed(&relay, &device, 450);
+        let flags = Arc::new(InFlight::default());
+        let s = Store::open(&db).unwrap();
+        // Half way through page 2.
+        arm_stop_in_flight(
+            &s,
+            &db,
+            crash.then_some(image.as_path()),
+            "mem_r0300",
+            flags.clone(),
+        );
+        let (base, log) = stub_relay(holding(relay.clone(), 400, flags.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let client = client_with(&base, &device, device.agent.clone());
+        let err = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("injected stop"), "{err:#}");
+        assert!(
+            flags.seen.load(Ordering::SeqCst),
+            "page 3's request wasn't in flight during page 2's transaction"
+        );
+
+        let page_one_only = |s: &Store| {
+            assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 200);
+            let rows = s.history_memories().unwrap();
+            assert_eq!(rows.len(), 200);
+            assert!(rows.iter().all(|m| m.seq <= 200));
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        page_one_only(&s);
+        let s = if crash {
+            drop(s);
+            page_one_only(&Store::open(&db).unwrap());
+            Store::open(&image).unwrap()
+        } else {
+            s.test_conn()
+                .execute_batch("DROP TRIGGER stop_mid_page;")
+                .unwrap();
+            s
+        };
+        page_one_only(&s);
+
+        // The next sync resumes at page 2 and completes.
+        log.lock().unwrap().clear();
+        let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+        assert_eq!(out.pulled, 250);
+        assert_eq!(memory_gets(&log), vec![200, 400]);
+        assert_eq!(s.get_state(&memory_cursor_key(ASTATION_ID)).unwrap(), 450);
+        let opened = context(&device)
+            .decrypt_memories(relay.lock().unwrap().rows.values().cloned().collect())
+            .unwrap();
+        assert_eq!(s.history_memories().unwrap().len(), 450);
+        for row in opened {
+            assert_eq!(
+                s.get_memory(&row.id).unwrap().as_ref(),
+                Some(&row),
+                "{}",
+                row.id
+            );
+        }
     }
 }
 

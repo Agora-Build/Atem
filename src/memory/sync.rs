@@ -589,15 +589,41 @@ async fn push_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 /// Pull cursors are per account (the paired Astation id); see
 /// `memory_cursor_key`.
 async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome) -> Result<()> {
+    let fetch_memories = |since| {
+        let client = client.clone();
+        async move { client.fetch_memories(since).await }
+    };
     let memories = pull_pages(store, out, &memory_cursor_key(client.account()),
-        |since| client.fetch_memories(since), |rows| client.open_memories(rows),
+        fetch_memories, |rows| client.open_memories(rows),
         apply_pulled_memories, |m: &Memory| m.seq).await?;
     if memories {
+        let fetch_skills = |since| {
+            let client = client.clone();
+            async move { client.fetch_skills(since).await }
+        };
         pull_pages(store, out, &skill_cursor_key(client.account()),
-            |since| client.fetch_skills(since), |rows| client.open_skills(rows),
+            fetch_skills, |rows| client.open_skills(rows),
             apply_pulled_skills, |s: &Skill| s.seq).await?;
     }
     Ok(())
+}
+
+/// The next page's request, on a task of its own so it runs while this
+/// page is opened and applied. Dropped (the request aborted, its page never
+/// applied) unless the page before it commits.
+struct Prefetch<R>(tokio::task::JoinHandle<std::result::Result<Vec<R>, ApiError>>);
+
+impl<R> Prefetch<R> {
+    async fn page(mut self) -> std::result::Result<Vec<R>, ApiError> {
+        (&mut self.0).await
+            .unwrap_or_else(|e| Err(ApiError::Decode(format!("the page request didn't finish: {e}"))))
+    }
+}
+
+impl<R> Drop for Prefetch<R> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Pulls one kind's pages from its committed cursor `key`. Each page's rows
@@ -605,11 +631,11 @@ async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 /// cursor never passes a row that isn't stored, and a page cut short (an
 /// error, a crash) is pulled again whole (upserts are idempotent).
 ///
-/// Page k+1 is fetched while page k is opened (F2), from the cursor page k
-/// ends at, and is used only once page k is committed and the committed
-/// cursor is that one; a page that fails to open or apply discards it
-/// unapplied. No request is in flight while a page's transaction is open.
-/// `Ok(false)`: a request failed (noted); stop pulling.
+/// Page k+1 is fetched on its own task while page k is opened and applied
+/// (F2), from the cursor page k ends at. Page k's transaction never waits
+/// for it; it is used only once page k is committed and the committed
+/// cursor is that one, and a page that fails to open or apply drops it
+/// unapplied. `Ok(false)`: a request failed (noted); stop pulling.
 async fn pull_pages<R, F, FF, O, OF>(
     store: &Store,
     out: &mut SyncOutcome,
@@ -620,8 +646,9 @@ async fn pull_pages<R, F, FF, O, OF>(
     seq: fn(&R) -> i64,
 ) -> Result<bool>
 where
+    R: Send + 'static,
     F: Fn(i64) -> FF,
-    FF: Future<Output = std::result::Result<Vec<R>, ApiError>>,
+    FF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
     O: Fn(Vec<R>) -> OF,
     OF: Future<Output = std::result::Result<Vec<R>, ApiError>>,
 {
@@ -641,13 +668,8 @@ where
         let len = page.len();
         let page_max = page.iter().map(seq).fold(0, i64::max);
         let more = len >= PULL_LIMIT as usize && page_max > since;
-        let (opened, next) = if more {
-            let (opened, next) = tokio::join!(open(page), fetch(page_max));
-            (opened, Some(next))
-        } else {
-            (open(page).await, None)
-        };
-        let opened = match opened {
+        let next = more.then(|| Prefetch(tokio::spawn(fetch(page_max))));
+        let opened = match open(page).await {
             Ok(opened) => opened,
             Err(e) => {
                 out.failed(e, None);
@@ -670,7 +692,7 @@ where
         // The next page is the one after the committed cursor.
         let committed = store.get_state(key)?;
         fetched = match next {
-            Some(next) if committed == page_max => next,
+            Some(next) if committed == page_max => next.page().await,
             _ => fetch(committed).await,
         };
         since = committed;
@@ -1826,7 +1848,7 @@ mod tests {
     /// gets an error and its transaction rolls back). It copies the database
     /// and `-journal` only (the store's default rollback journal): a switch to
     /// WAL must also copy `-wal` and `-shm`.
-    pub(super) fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
+    fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
         use rusqlite::functions::FunctionFlags;
         let (db, image) = (db.to_path_buf(), image.to_path_buf());
         s.test_conn().create_scalar_function("crash", 0, FunctionFlags::SQLITE_UTF8, move |_| -> rusqlite::Result<i64> {

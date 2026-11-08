@@ -541,10 +541,10 @@ atem memory status                  # account, machine, pending ops, last sync, 
    apply tombstones locally. Advance `cursor` after each page, in the same
    local transaction as the page's rows (an interrupted page is pulled again
    whole; the cursor never passes a row that isn't stored). Page k+1 is
-   fetched while page k is opened (from the cursor page k ends at) and used
-   once page k is committed; a page that fails to open or apply discards it,
-   and the next sync starts from the committed cursor. No request is in
-   flight while a page's or a push request's transaction is open. Cursors are
+   fetched on a task of its own while page k is opened and applied (from the
+   cursor page k ends at) and used once page k is committed; a page that
+   fails to open or apply drops it unapplied, and the next sync starts from
+   the committed cursor. A transaction never waits for a request. Cursors are
    kept per account (`memory_cursor:<astation_id>`,
    `skill_cursor:<astation_id>`), so pairing with a different Astation
    pulls that account from 0; the legacy unkeyed cursor is ignored.

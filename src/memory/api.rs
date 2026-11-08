@@ -169,6 +169,9 @@ pub fn auth_header(session_id: &str) -> String {
     format!("session {}", session_id)
 }
 
+/// Cheap to clone (the HTTP client is shared): a pull fetches its next page
+/// on a task of its own.
+#[derive(Clone)]
 pub struct KnowledgeClient {
     base: String,
     client_id: String,
