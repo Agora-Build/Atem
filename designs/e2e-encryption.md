@@ -1123,11 +1123,14 @@ signed final state is useful delivery assurance, not an authorization rule.
    failed, incomplete or interrupted pass sends no completion. Writes and
    scans can be retried; a successful rewrite acknowledgment alone is not
    a successful verification pass. The rewrite opens and seals rows in groups
-   as large as one cred-agent request holds (1,024 ops, 2 MiB), the next
-   group while the POST before it is in flight (vaults: the next vault while
-   the previous one is POSTed), and POSTs them in the same 64-fact and
-   16-skill batches; the read-back checks each page while the next one is
-   fetched, and the first failure ends the pass.
+   of whole POSTs (the same 64-fact and 16-skill batches; at most four
+   cred-agent requests' worth of 1,024 ops and 2 MiB per step, and never more
+   requests than one POST at a time), the next group while the POST before
+   it is in flight (vaults: the next vault while the previous one is POSTed).
+   A POST of rows prepared by an earlier request first confirms that the
+   cred agent is still unlocked, so a lock stops the migration within one
+   POST. The read-back checks each page while the next one is fetched, and
+   the first failure ends the pass.
 3. **Authenticate before dispatch.** `encryptionMigrationComplete` carries
    `completion: SignedWire`, an Ed25519 `atem-migration-complete-v1` signed
    by the device's pinned device-signing key. Its fields are length-prefixed

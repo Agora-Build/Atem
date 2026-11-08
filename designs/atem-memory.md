@@ -527,16 +527,23 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - 413 on a chunk: its ops are retried one at a time. A single op that is
      still too large stays queued with a note and is never acked.
 
-   While the account is encrypted, the ops are sealed ahead of their requests
-   in groups of as many as one cred-agent `Crypt` request holds (1,024 ops,
-   2 MiB; skills need two dependent requests, paths then files), the next
-   group while the request before it is in flight. A request sends an op as
-   sealed ahead only while it is still exactly the queued op (an earlier
-   request's `canonical_id` rewrite, or another writer, may have changed or
-   removed it) and the account's mode, key and data account are unchanged;
-   otherwise it is sealed again first. A group that fails to seal (a locked
-   agent) switches that group to sealing each request just before it is sent,
-   so the push stops where it did before read-ahead.
+   While the account is encrypted, the ops are sealed ahead of their requests,
+   in groups of whole requests (at most four cred-agent `Crypt` requests'
+   worth per step: 1,024 ops and 2 MiB each; skills take two dependent
+   steps, paths then files), the next group while the request before it is
+   in flight. The agent splits each step of a group into as few requests as
+   its limits allow, and a group never takes more requests than sealing its
+   requests one at a time would; a request with an op over the agent's limit
+   for one op is a group of its own. A request sends an op as sealed ahead
+   only while it is still exactly the queued op (an earlier request's
+   `canonical_id` rewrite, or another writer, may have changed or removed it)
+   and the account's mode, key and data account are unchanged; otherwise it
+   is sealed again first. Before a request with ops sealed by an earlier
+   `Crypt` request is sent, the cred agent must still be unlocked (a status
+   on the agent connection), so `atem cred lock` stops the push within one
+   request, as when each request was sealed just before it was sent. A group
+   that fails to seal stops the push with that error, after the request in
+   flight (whose results are applied first); it is not retried.
 3. **Pull** memories and skills since `cursor`, page by page. Upsert rows and
    apply tombstones locally. Advance `cursor` after each page, in the same
    local transaction as the page's rows (an interrupted page is pulled again
@@ -750,11 +757,13 @@ lives.
   applied, the next sync completes it).
 - **Sealing ahead and prefetching** (`sync_pipeline_tests.rs`): `Crypt`
   requests per phase (a push in full groups, a pull and a read-back one per
-  page, a migration in full groups), an op rewritten, acked or under a new
-  mode after it was sealed (sealed again or dropped), a lock while the next
-  group is sealed, a page that fails to open or a crash while one is applied
-  with the next one fetched, and what another connection sees of the queue
-  and cursor at each relay request.
+  page, a migration in full groups; large skills never more requests than
+  one request at a time), an op rewritten, acked, or under a new mode or key
+  after it was sealed (sealed again or dropped), a lock between two seals or
+  during one (the push stops within one request; a refusal is not retried),
+  a page that fails to open or apply, or a crash, with the next one fetched
+  or opened, a cursor moved by another writer, and what another connection
+  sees of the queue and cursor at each relay request.
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge
