@@ -759,7 +759,7 @@ impl AstationClient {
     fn cred_agent(&self) -> std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi> {
         match &self.agent {
             Some(agent) => agent.clone(),
-            None => std::sync::Arc::from(crate::memory::cred_agent::default_agent()),
+            None => crate::memory::cred_agent::default_agent(),
         }
     }
 

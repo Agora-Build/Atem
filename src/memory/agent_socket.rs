@@ -1,6 +1,8 @@
 //! The cred agent's Unix socket: newline-delimited JSON, `"v": 2` on every
 //! request, same-user peers only. `atem cred-agent` serves it; commands that
-//! need keys connect, starting the agent when none is running.
+//! need keys connect, starting the agent when none is running. A process
+//! shares one client per agent (`shared`), which keeps one connection
+//! between requests (`CredAgentClient::call`).
 //! See designs/e2e-encryption.md "Keys on disk (atem)".
 //!
 //! Both sides check who is on the other end: the agent refuses peers that
@@ -39,6 +41,8 @@ use crate::paths::CredPaths;
 /// `EncryptionContext`, and one skill (at most 1 MiB, base64 on the wire)
 /// always fits.
 const MAX_LINE: usize = 8 << 20;
+/// The most read buffer an agent keeps for a connection between requests.
+const KEPT_BUFFER: usize = 64 << 10;
 /// A connection that says nothing for this long is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a stopping agent lets requests already in flight finish.
@@ -679,6 +683,12 @@ async fn serve_connection(
                 return Ok(());
             }
         }
+        // Clients keep their connection between requests: a big request's
+        // buffer goes (wiped) once it has been answered, not when the
+        // connection closes.
+        if pending.0.is_empty() && pending.0.capacity() > KEPT_BUFFER {
+            pending = WipingBuf::new();
+        }
         scanned = pending.0.len();
         if pending.0.len() > MAX_LINE {
             bail!("a request is too long");
@@ -783,9 +793,219 @@ fn test_log(socket: &Path) -> PathBuf {
     CredPaths::in_dir(socket.parent().unwrap_or(Path::new("/"))).agent_log
 }
 
+/// What a client sent (tests): connections opened for requests, request
+/// lines written (the build checks' included) and build checks.
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub(crate) struct Traffic {
+    connections: std::sync::atomic::AtomicUsize,
+    requests: std::sync::atomic::AtomicUsize,
+    probes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Traffic {
+    fn add(counter: &std::sync::atomic::AtomicUsize) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn probes(&self) -> usize {
+        self.probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// How a client starts an agent when none answers.
 type Launcher = Box<dyn Fn() -> Result<()> + Send + Sync>;
 
+/// A connection idle this long is replaced before it carries the next
+/// request. The agent drops connections idle for `IDLE_TIMEOUT`, and one it
+/// may be dropping must never carry a request: nothing would tell whether
+/// the agent read it.
+const REUSE_IDLE: Duration = Duration::from_secs(30);
+/// How long writing a request and getting its reply may take.
+const REPLY_WAIT: Duration = Duration::from_secs(30);
+/// How long the build check's `status` may take.
+const CHECK_WAIT: Duration = Duration::from_secs(5);
+
+/// The connection a client keeps between requests.
+struct Conn {
+    stream: UnixStream,
+    /// When the last reply arrived: the agent's idle timer starts then.
+    idle_since: std::time::Instant,
+}
+
+impl Conn {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            idle_since: std::time::Instant::now(),
+        }
+    }
+
+    /// Whether the next request may go on this connection: it hasn't been
+    /// idle for `reuse_idle`, and the agent hasn't closed it (nor sent
+    /// anything unasked). Nothing has been written on it when this says no.
+    fn reusable(&self, reuse_idle: Duration) -> bool {
+        if self.idle_since.elapsed() >= reuse_idle {
+            return false;
+        }
+        let mut byte = 0u8;
+        // SAFETY: peeks at most one byte into `byte`, without blocking.
+        let peeked = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        peeked < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+    }
+
+    /// Writes `line`, wipes it while the agent works, and reads the reply.
+    fn round_trip(&mut self, line: Zeroizing<String>) -> Result<Answer, Failed> {
+        (&self.stream)
+            .write_all(line.as_bytes())
+            .map_err(|error| Failed::from_io(error, false))?;
+        drop(line);
+        let answer = read_answer(&self.stream)?;
+        self.idle_since = std::time::Instant::now();
+        Ok(answer)
+    }
+}
+
+/// A reply, and whether it was exactly one line with nothing after it: only
+/// then is its connection used again.
+struct Answer {
+    reply: WipingBuf,
+    in_step: bool,
+}
+
+/// Why a request got no reply.
+enum Failed {
+    /// The agent closed (or reset) the connection before any byte of the
+    /// reply arrived.
+    Unanswered(Option<std::io::Error>),
+    /// Anything else: a timeout, or a reply cut short.
+    Broken(std::io::Error),
+}
+
+impl Failed {
+    fn from_io(error: std::io::Error, replying: bool) -> Self {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected};
+        if !replying
+            && matches!(
+                error.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected
+            )
+        {
+            Self::Unanswered(Some(error))
+        } else {
+            Self::Broken(error)
+        }
+    }
+
+    fn into_error(self) -> Option<std::io::Error> {
+        match self {
+            Self::Unanswered(error) => error,
+            Self::Broken(error) => Some(error),
+        }
+    }
+}
+
+/// Reads one reply line without a `BufReader`, so no unwiped copy stays
+/// behind. A reply cut short by the agent closing the connection is
+/// returned as it is (it won't decode).
+fn read_answer(mut stream: &UnixStream) -> Result<Answer, Failed> {
+    let mut line = WipingBuf::new();
+    let mut chunk = Zeroizing::new([0u8; 4096]);
+    loop {
+        let n = match stream.read(&mut chunk[..]) {
+            Ok(0) if line.0.is_empty() => return Err(Failed::Unanswered(None)),
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Failed::from_io(error, !line.0.is_empty())),
+        };
+        if n == 0 || line.0.len() > MAX_LINE {
+            return Ok(Answer {
+                reply: line,
+                in_step: false,
+            });
+        }
+        line.append(&chunk[..n]);
+        // `contains` is memchr; a byte loop over every chunk of a MiB reply
+        // would cost a millisecond.
+        if chunk[..n].contains(&b'\n') {
+            let first = chunk[..n].iter().position(|byte| *byte == b'\n');
+            return Ok(Answer {
+                reply: line,
+                in_step: first == Some(n - 1),
+            });
+        }
+    }
+}
+
+/// Whether `request` may go once more on a new connection when its
+/// connection dropped before any byte of the reply: only requests that
+/// leave the agent as they found them (reads, signatures over the current
+/// state, field operations; the prune `Crypt` and `HeldKid` run follows the
+/// signed states, so running it twice changes nothing more). A request that
+/// changes the agent never goes twice: a dropped connection is its error.
+fn resendable(request: &Request) -> bool {
+    match request {
+        Request::Status
+        | Request::PublicKeys
+        | Request::Crypt { .. }
+        | Request::HeldKid { .. }
+        | Request::PendingRotation
+        | Request::CheckGrant { .. }
+        | Request::MigrationComplete { .. } => true,
+        Request::CredentialProjects { .. }
+        | Request::LoadUnlocked { .. }
+        | Request::InstallGrant { .. }
+        | Request::BeginUnlock { .. }
+        | Request::FinishUnlock { .. }
+        | Request::BeginRotation { .. }
+        | Request::ConfirmRotation { .. }
+        | Request::AbandonPending { .. }
+        | Request::Lock { .. } => false,
+    }
+}
+
+/// The clients this process shares (`shared`).
+static SHARED: Mutex<Vec<Arc<CredAgentClient>>> = Mutex::new(Vec::new());
+
+/// The process-wide client of the agent `client` reaches: the one already
+/// shared for the same socket and key directory, else `client`, shared from
+/// now on. Every `EncryptionContext`, knowledge and vault client of a
+/// process then uses one connection, checked once. Keyed by the resolved
+/// paths, so clients of two agents (two tests' temp profiles) never share.
+/// Callers pass clients built the same way (`autostart`).
+pub(crate) fn shared(client: CredAgentClient) -> Arc<CredAgentClient> {
+    let mut shared = SHARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(known) = shared
+        .iter()
+        .find(|known| known.socket == client.socket && known.record == client.record)
+    {
+        return known.clone();
+    }
+    let client = Arc::new(client);
+    shared.push(client.clone());
+    client
+}
+
+/// A client of the cred agent: one request at a time over one connection,
+/// kept between requests.
 pub struct CredAgentClient {
     /// Where this session's agent would listen (from its runtime dir).
     socket: PathBuf,
@@ -802,36 +1022,55 @@ pub struct CredAgentClient {
     start_wait: Duration,
     /// The user the listener must run as (this user; settable in tests).
     expected_uid: u32,
-    /// With a build to compare (clients that may start an agent), the first
-    /// request first checks that the running agent is this build: a locked
-    /// agent of another build is replaced, an unlocked one kept with a
-    /// warning.
+    /// With a build to compare (clients that may start an agent), every new
+    /// connection first checks that the agent it reached is this build (a
+    /// new connection may reach a restarted agent): a locked agent of
+    /// another build is replaced, an unlocked one kept with a warning.
     build: Option<String>,
-    build_checked: std::sync::atomic::AtomicBool,
     /// `OLDER_BUILD`, once the check found an unlocked older agent.
     older_build: Mutex<Option<String>>,
     /// Look whether Atem's runtime is another build too, for the warning
     /// (this user's clients; never in tests).
     runtime_check: bool,
+    /// The connection kept between requests; holding it is holding the
+    /// right to send the next request.
+    conn: Mutex<Option<Conn>>,
+    /// How long a connection may sit idle and still carry a request.
+    reuse_idle: Duration,
+    #[cfg(test)]
+    traffic: Traffic,
 }
 
 impl CredAgentClient {
-    /// A client for the agent at `socket` that never starts one.
-    #[cfg(test)]
-    pub(crate) fn at(socket: PathBuf) -> Self {
+    fn new(
+        socket: PathBuf,
+        record: Option<PathBuf>,
+        launcher: Option<Launcher>,
+        log: PathBuf,
+        lock: Option<PathBuf>,
+    ) -> Self {
         Self {
-            log: test_log(&socket),
             socket,
-            record: None,
-            launcher: None,
-            lock: None,
+            record,
+            launcher,
+            log,
+            lock,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
             build: None,
-            build_checked: std::sync::atomic::AtomicBool::new(false),
             older_build: Mutex::new(None),
             runtime_check: false,
+            conn: Mutex::new(None),
+            reuse_idle: REUSE_IDLE,
+            #[cfg(test)]
+            traffic: Traffic::default(),
         }
+    }
+
+    /// A client for the agent at `socket` that never starts one.
+    #[cfg(test)]
+    pub(crate) fn at(socket: PathBuf) -> Self {
+        Self::new(socket.clone(), None, None, test_log(&socket), None)
     }
 
     /// A client for this user's agent that starts it when none answers.
@@ -891,38 +1130,25 @@ impl CredAgentClient {
         runtime_dir: Option<OsString>,
         launcher: Option<Launcher>,
     ) -> Self {
-        let paths = paths.clone();
-        Self {
-            socket: socket_path_for(&paths, runtime_dir),
-            record: Some(paths.agent_socket),
+        Self::new(
+            socket_path_for(paths, runtime_dir),
+            Some(paths.agent_socket.clone()),
             launcher,
-            log: paths.agent_log,
-            lock: Some(paths.agent_lock),
-            start_wait: START_WAIT,
-            expected_uid: own_uid(),
-            build: None,
-            build_checked: std::sync::atomic::AtomicBool::new(false),
-            older_build: Mutex::new(None),
-            runtime_check: false,
-        }
+            paths.agent_log.clone(),
+            Some(paths.agent_lock.clone()),
+        )
     }
 
     /// A client for the agent at `socket` that starts it with `launcher`.
     #[cfg(test)]
     pub(crate) fn with_launcher(socket: PathBuf, launcher: Launcher) -> Self {
-        Self {
-            log: test_log(&socket),
-            socket,
-            record: None,
-            launcher: Some(launcher),
-            lock: None,
-            start_wait: START_WAIT,
-            expected_uid: own_uid(),
-            build: None,
-            build_checked: std::sync::atomic::AtomicBool::new(false),
-            older_build: Mutex::new(None),
-            runtime_check: false,
-        }
+        Self::new(
+            socket.clone(),
+            None,
+            Some(launcher),
+            test_log(&socket),
+            None,
+        )
     }
 
     /// Names `log` when an agent doesn't come up.
@@ -939,7 +1165,7 @@ impl CredAgentClient {
         self
     }
 
-    /// Checks the running agent against `build` before the first request.
+    /// Checks the agent behind every new connection against `build`.
     #[cfg(test)]
     pub(crate) fn checking_build(mut self, build: &str) -> Self {
         self.build = Some(build.to_string());
@@ -950,6 +1176,19 @@ impl CredAgentClient {
     #[cfg(test)]
     pub(crate) fn older_build_warning(&self) -> Option<String> {
         self.older_build.lock().ok()?.clone()
+    }
+
+    /// What this client sent.
+    #[cfg(test)]
+    pub(crate) fn traffic(&self) -> &Traffic {
+        &self.traffic
+    }
+
+    /// Replaces a connection idle for `idle` before its next request.
+    #[cfg(test)]
+    pub(crate) fn reusing_for(mut self, idle: Duration) -> Self {
+        self.reuse_idle = idle;
+        self
     }
 
     /// Expects the listener to run as `uid` instead of this user.
@@ -1023,22 +1262,6 @@ impl CredAgentClient {
     }
 }
 
-/// Reads one reply line without a `BufReader`, so no unwiped copy stays behind.
-fn read_reply(mut stream: &UnixStream) -> std::io::Result<WipingBuf> {
-    let mut line = WipingBuf::new();
-    let mut chunk = Zeroizing::new([0u8; 4096]);
-    loop {
-        let n = stream.read(&mut chunk[..])?;
-        if n == 0 || line.0.len() > MAX_LINE {
-            return Ok(line);
-        }
-        line.append(&chunk[..n]);
-        if chunk[..n].contains(&b'\n') {
-            return Ok(line);
-        }
-    }
-}
-
 impl CredAgentClient {
     /// Why the agent hung up (or timed out). An agent of an older atem
     /// closes the connection on a request it can't read (a step-2a agent
@@ -1059,24 +1282,19 @@ impl CredAgentClient {
     }
 
     /// The protocol version the running agent answers a `status` in (no
-    /// autostart); `None` when it doesn't answer.
+    /// autostart, on a connection of its own); `None` when it doesn't answer.
     fn probe_version(&self) -> Option<u64> {
         let stream = self.dial().ok()?.ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .ok()?;
+        stream.set_read_timeout(Some(CHECK_WAIT)).ok()?;
+        stream.set_write_timeout(Some(CHECK_WAIT)).ok()?;
         let line = encode_request(&Request::Status).ok()?;
-        (&stream).write_all(line.as_bytes()).ok()?;
-        let reply = read_reply(&stream).ok()?;
-        let text = std::str::from_utf8(&reply.0).ok()?;
+        let answer = Conn::new(stream).round_trip(line).ok()?;
+        let text = std::str::from_utf8(&answer.reply.0).ok()?;
         serde_json::from_str::<ResponseHead>(text.trim())
             .ok()
             .map(|head| head.v)
     }
-}
 
-impl CredAgentClient {
     /// Waits up to `wait` for the agent to stop answering; true once it has.
     fn wait_gone(&self, wait: Duration) -> bool {
         let deadline = std::time::Instant::now() + wait;
@@ -1091,45 +1309,72 @@ impl CredAgentClient {
         }
     }
 
-    /// `request` to the running agent, never starting one; `None` when no
-    /// agent answers it.
-    fn ask_running(&self, request: &Request) -> Option<Reply> {
-        let stream = self.dial().ok()?.ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .ok()?;
-        let line = encode_request(request).ok()?;
-        (&stream).write_all(line.as_bytes()).ok()?;
-        let reply = read_reply(&stream).ok()?;
-        decode_response(std::str::from_utf8(&reply.0).ok()?).ok()
+    /// A new connection with this client's timeouts, unchecked; the agent
+    /// started first when none answers and this client may.
+    fn connection(&self) -> Result<Conn> {
+        let stream = self.connect()?;
+        let closed = |error: std::io::Error| self.closed(Some(error));
+        stream.set_read_timeout(Some(REPLY_WAIT)).map_err(closed)?;
+        stream.set_write_timeout(Some(REPLY_WAIT)).map_err(closed)?;
+        #[cfg(test)]
+        Traffic::add(&self.traffic.connections);
+        Ok(Conn::new(stream))
     }
 
-    /// Once per client (with a build to compare): the running agent must be
-    /// this build. A locked agent of another build holds no keys, so it is
-    /// asked to stop and the next request starts this build's. An unlocked one is never restarted: it is used,
-    /// with a warning.
-    fn check_build(&self) -> Result<()> {
-        use std::sync::atomic::Ordering;
+    /// A new connection, checked against this build first when the client
+    /// has one to compare (`check_build`): every new connection may reach
+    /// another agent process than the last one did.
+    fn open(&self) -> Result<Conn> {
+        let conn = self.connection()?;
         let Some(build) = self.build.as_deref() else {
-            return Ok(());
+            return Ok(conn);
         };
-        if self.build_checked.swap(true, Ordering::SeqCst) {
-            return Ok(());
+        match self.check_build(conn, build)? {
+            Some(conn) => Ok(conn),
+            // The check got no answer, or stopped a locked agent of another
+            // build: the request goes on a new connection, to the agent
+            // `connect` finds or starts, unchecked (as before).
+            None => self.connection(),
         }
+    }
+
+    /// `request` on `conn` within `wait`: its reply, `None` without a
+    /// readable one.
+    fn ask(&self, conn: &mut Conn, request: &Request, wait: Duration) -> Option<Reply> {
+        let line = encode_request(request).ok()?;
+        conn.stream.set_read_timeout(Some(wait)).ok()?;
+        #[cfg(test)]
+        Traffic::add(&self.traffic.requests);
+        let answer = conn.round_trip(line).ok()?;
+        conn.stream.set_read_timeout(Some(REPLY_WAIT)).ok()?;
+        if !answer.in_step {
+            return None;
+        }
+        decode_response(std::str::from_utf8(&answer.reply.0).ok()?).ok()
+    }
+
+    /// The build check on the new connection `conn`: the agent it reached
+    /// must be this build. A locked agent of another build holds no keys, so
+    /// it is asked to stop (`None`: the next connection starts this build's).
+    /// An unlocked one is never restarted: it is used, with a warning. `None`
+    /// too when the agent didn't answer the check.
+    fn check_build(&self, mut conn: Conn, build: &str) -> Result<Option<Conn>> {
+        use std::sync::atomic::Ordering;
+        #[cfg(test)]
+        Traffic::add(&self.traffic.probes);
         let Some(Reply::Status {
             unlocked,
             build: theirs,
             ..
-        }) = self.ask_running(&Request::Status)
+        }) = self.ask(&mut conn, &Request::Status, CHECK_WAIT)
         else {
-            return Ok(());
+            return Ok(None);
         };
         if theirs == build {
-            return Ok(());
+            return Ok(Some(conn));
         }
         if unlocked {
-            // Once per process, however many clients a command makes.
+            // Once per process, however many connections a command makes.
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             let text = self.older_build_text();
@@ -1139,16 +1384,75 @@ impl CredAgentClient {
             if let Ok(mut older) = self.older_build.lock() {
                 *older = Some(text.to_string());
             }
-            return Ok(());
+            return Ok(Some(conn));
         }
-        let _ = self.ask_running(&Request::Lock { stop: true });
+        let _ = self.ask(&mut conn, &Request::Lock { stop: true }, CHECK_WAIT);
+        drop(conn);
         if self.wait_gone(STOP_WAIT) {
-            return Ok(());
+            return Ok(None);
         }
         bail!(
             "the running cred agent is another atem build and didn't stop when asked; run `atem cred lock`, then retry (it is locked: its keys stay sealed on disk)"
         )
     }
+
+    /// Writes `line` on `conn` and reads the reply.
+    fn send(&self, conn: &mut Conn, line: Zeroizing<String>) -> Result<Answer, Failed> {
+        #[cfg(test)]
+        Traffic::add(&self.traffic.requests);
+        conn.round_trip(line)
+    }
+
+    /// `line` on the kept connection `slot`, replaced first when it can't
+    /// carry a request (`Conn::reusable`; nothing was written on it, so no
+    /// request goes twice). When a reused connection drops after `line` was
+    /// written but before any byte of the reply, the request in `again` (a
+    /// `resendable` one) goes once more on a new connection; every other
+    /// failure is the request's error, and its connection is dropped.
+    fn exchange(
+        &self,
+        slot: &mut Option<Conn>,
+        line: Zeroizing<String>,
+        again: Option<&Request>,
+    ) -> Result<WipingBuf> {
+        if slot
+            .as_ref()
+            .is_some_and(|conn| !conn.reusable(self.reuse_idle))
+        {
+            *slot = None;
+        }
+        let reused = slot.is_some();
+        let conn = match slot {
+            Some(conn) => conn,
+            None => slot.insert(self.open()?),
+        };
+        let mut failed = match self.send(conn, line) {
+            Ok(answer) => return Ok(keep(slot, answer)),
+            Err(failed) => failed,
+        };
+        *slot = None;
+        if let Some(request) = again
+            && reused
+            && matches!(failed, Failed::Unanswered(_))
+        {
+            let line = encode_request(request)?;
+            let conn = slot.insert(self.open()?);
+            failed = match self.send(conn, line) {
+                Ok(answer) => return Ok(keep(slot, answer)),
+                Err(failed) => failed,
+            };
+            *slot = None;
+        }
+        Err(self.closed(failed.into_error()))
+    }
+}
+
+/// `answer`'s reply; its connection stays in `slot` only while in step.
+fn keep(slot: &mut Option<Conn>, answer: Answer) -> WipingBuf {
+    if !answer.in_step {
+        *slot = None;
+    }
+    answer.reply
 }
 
 /// An agent from an older atem rejects a request it doesn't know as
@@ -1170,23 +1474,29 @@ impl CredAgentApi for CredAgentClient {
     }
 
     fn call(&self, request: Request) -> Result<Reply> {
+        let stops = matches!(request, Request::Lock { stop: true });
         let line = encode_request(&request)?;
-        drop(request);
-        self.check_build()?;
-        let stream = self.connect()?;
-        let closed = |error: std::io::Error| self.closed(Some(error));
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(closed)?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(30)))
-            .map_err(closed)?;
-        (&stream).write_all(line.as_bytes()).map_err(closed)?;
-        drop(line);
-        let reply = read_reply(&stream).map_err(closed)?;
-        if reply.0.is_empty() {
-            return Err(self.closed(None));
-        }
+        // Kept to go once more if its connection drops unanswered (the
+        // line itself is wiped as soon as it is written); any other request
+        // is wiped now.
+        let again = resendable(&request).then_some(request);
+        let reply = {
+            let mut slot = self.conn.lock().unwrap_or_else(|poisoned| {
+                // A request that panicked midway leaves no usable connection.
+                self.conn.clear_poison();
+                let mut slot = poisoned.into_inner();
+                *slot = None;
+                slot
+            });
+            let reply = self.exchange(&mut slot, line, again.as_ref());
+            if stops {
+                // The agent closes it once it has answered.
+                *slot = None;
+            }
+            reply
+        };
+        drop(again);
+        let reply = reply?;
         let text = std::str::from_utf8(&reply.0)
             .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))?;
         decode_response(text)
@@ -1195,20 +1505,24 @@ impl CredAgentApi for CredAgentClient {
 }
 
 #[cfg(test)]
+#[path = "agent_client_tests.rs"]
+mod client_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
 
     /// Unix socket paths are limited to ~100 bytes; keep them short.
-    fn short_dir() -> tempfile::TempDir {
+    pub(super) fn short_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("atem-ka")
             .tempdir_in("/tmp")
             .unwrap()
     }
 
-    fn own_uid() -> u32 {
+    pub(super) fn own_uid() -> u32 {
         unsafe { libc::getuid() }
     }
 
@@ -1226,20 +1540,20 @@ mod tests {
     }
 
     /// The agent socket under the runtime dir `run` (`CredPaths::agent_sock`).
-    fn sock(run: &Path) -> PathBuf {
+    pub(super) fn sock(run: &Path) -> PathBuf {
         CredPaths::in_dir(run).agent_sock(Some(run))
     }
 
     /// Creates `path` private, whatever the umask: the agent refuses a socket
     /// directory others can write to.
-    fn make_private(path: &Path) {
+    pub(super) fn make_private(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
     }
 
     /// Serves an agent for the key files in `dir` on its own thread.
-    fn start_agent(dir: &Path, allowed_uid: u32) -> PathBuf {
+    pub(super) fn start_agent(dir: &Path, allowed_uid: u32) -> PathBuf {
         let socket = sock(&dir.join("run"));
         let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
@@ -1928,7 +2242,7 @@ mod tests {
     }
 
     /// Kills the child when the test ends, however it ends.
-    struct Reaped(std::process::Child);
+    pub(super) struct Reaped(std::process::Child);
 
     impl Drop for Reaped {
         fn drop(&mut self) {
@@ -1938,7 +2252,7 @@ mod tests {
     }
 
     /// `atem cred-agent` for `home`, with its socket under `runtime`.
-    fn cred_agent_process(home: &Path, runtime: &Path, log: &Path) -> Reaped {
+    pub(super) fn cred_agent_process(home: &Path, runtime: &Path, log: &Path) -> Reaped {
         let log = std::fs::File::create(log).unwrap();
         Reaped(
             std::process::Command::new(atem_binary())
@@ -1954,7 +2268,7 @@ mod tests {
     }
 
     /// Polls `done` for up to five seconds.
-    fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    pub(super) fn eventually(mut done: impl FnMut() -> bool) -> bool {
         for _ in 0..50 {
             if done() {
                 return true;
@@ -2382,7 +2696,7 @@ mod tests {
     }
 
     /// `start_agent`, plus a receiver that fires once serving stops.
-    fn start_stoppable_agent(dir: &Path) -> (PathBuf, std::sync::mpsc::Receiver<()>) {
+    pub(super) fn start_stoppable_agent(dir: &Path) -> (PathBuf, std::sync::mpsc::Receiver<()>) {
         let socket = sock(&dir.join("run"));
         let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
@@ -2407,7 +2721,11 @@ mod tests {
 
     /// An agent of an older build: answers `status` with `status` (a JSON
     /// reply) and every other request with `other`, and never exits.
-    fn start_scripted_agent(dir: &Path, status: &'static str, other: &'static str) -> PathBuf {
+    pub(super) fn start_scripted_agent(
+        dir: &Path,
+        status: &'static str,
+        other: &'static str,
+    ) -> PathBuf {
         let socket = sock(&dir.join("run"));
         make_private(socket.parent().unwrap());
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -2439,7 +2757,7 @@ mod tests {
 
     /// A locked agent of another build that never stops when asked.
     const OTHER_LOCKED: &str = r#"{"v":2,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false,"build":"0.0.0+other"}}"#;
-    const OTHER_DONE: &str = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
+    pub(super) const OTHER_DONE: &str = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
 
     #[test]
     fn lock_wipes_the_agent_and_stops_it() {

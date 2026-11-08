@@ -280,7 +280,7 @@ impl EncryptionContext {
         Self::for_astation_with(
             astation_id,
             &CredPaths::default_paths(),
-            Arc::from(crate::memory::cred_agent::default_agent()),
+            crate::memory::cred_agent::default_agent(),
         )
     }
 

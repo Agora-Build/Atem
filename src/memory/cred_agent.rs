@@ -1671,18 +1671,21 @@ impl<T: CredAgentApi + ?Sized> CredAgentApi for std::sync::Arc<T> {
 }
 
 /// This user's agent, started on first use (lazily: nothing connects until
-/// a request is made).
-pub fn default_agent() -> Box<dyn CredAgentApi> {
+/// a request is made): the process-wide client, so every caller in a
+/// process shares one connection and one build check per connection.
+pub fn default_agent() -> std::sync::Arc<dyn CredAgentApi> {
     // Tests never reach the user's cred agent (src/test_profile.rs).
     #[cfg(test)]
-    return Box::new(crate::test_profile::Injected(crate::test_profile::agent()));
+    return crate::test_profile::agent();
     #[cfg(all(unix, not(test)))]
     {
-        Box::new(crate::memory::agent_socket::CredAgentClient::autostart())
+        crate::memory::agent_socket::shared(
+            crate::memory::agent_socket::CredAgentClient::autostart(),
+        )
     }
     #[cfg(not(unix))]
     {
-        Box::new(NoAgent)
+        std::sync::Arc::new(NoAgent)
     }
 }
 

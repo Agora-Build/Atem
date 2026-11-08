@@ -143,3 +143,43 @@ fn an_agent_whose_runtime_dir_was_removed_exits_and_a_new_one_starts() {
     assert_eq!(status_at(&socket_b).unwrap()["reply"]["unlocked"], false);
     assert!(second.0.try_wait().unwrap().is_none());
 }
+
+#[test]
+fn the_real_agent_answers_several_requests_on_one_connection() {
+    use std::io::BufRead;
+    let dir = tempfile::Builder::new()
+        .prefix("atem-kb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let (home, runtime) = (dir.path().join("home"), dir.path().join("run"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::set_permissions(
+        &runtime,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let _agent = agent_process(&home, &runtime);
+    let socket = support::profile::agent_sock(&runtime);
+    assert!(
+        within(5, || status_at(&socket).is_some()),
+        "the agent didn't start"
+    );
+    // Clients keep one connection for every request of a process.
+    let stream = UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut replies = std::io::BufReader::new(&stream);
+    for request in [
+        "{\"op\":\"status\",\"v\":2}\n",
+        "{\"op\":\"pending_rotation\",\"v\":2}\n",
+        "{\"op\":\"status\",\"v\":2}\n",
+    ] {
+        (&stream).write_all(request.as_bytes()).unwrap();
+        let mut line = String::new();
+        replies.read_line(&mut line).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["ok"], true, "{reply}");
+    }
+}

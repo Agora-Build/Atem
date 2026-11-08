@@ -468,6 +468,20 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
+- **One client and one connection per process.** Every caller in a process
+  (each `EncryptionContext`, the knowledge and vault clients, the runtime's
+  Astation link) shares one client per agent (keyed by its socket path and
+  key directory), which sends one request at a time over one connection kept
+  between requests; the agent serves any number of lines on a connection and
+  drops one idle for 60 s. The client checks the build (`status`) once per
+  connection, before its first request, since a new connection may reach a
+  restarted agent. A connection idle for 30 s, or one the agent has closed,
+  is replaced before anything is written on it. When a connection drops
+  after a request was written but before any byte of its reply, only a
+  request that leaves the agent as it was (`status`, `Crypt`, `HeldKid`,
+  `PublicKeys`, `PendingRotation`, `CheckGrant`, `MigrationComplete`) is sent
+  once more on a new connection; for every other request the dropped
+  connection is its error.
 - **The agent's cached trust state.** `Crypt`, `HeldKid` and the prune of
   retired keys read `cred/state.json` (and decode its signed states) only
   when the file changed since the last read: another device, inode, size,
