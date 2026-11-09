@@ -547,6 +547,23 @@ pub struct WorkRecord {
     /// it, whatever renews the grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_expires_at: Option<u64>,
+    /// The message a remote sender's task came from (`message_publish`):
+    /// Atem's lines around its text name it, and its mark is rendered with
+    /// it, at dispatch (delegated host-work design III.2). None for a
+    /// `work_enqueue` task and for the runtime's own local tasks, whose
+    /// lines come from the outbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageFrame>,
+}
+
+/// What a message's task renders around its text: the message's id and
+/// its mark. The sender is the task's own principal (a publisher can only
+/// send as itself).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageFrame {
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<atem_client::session::mark::MarkTask>,
 }
 
 /// What a task was accepted under: its sender's principal, control
@@ -579,13 +596,18 @@ impl WorkRecord {
     }
 
     /// Drops what the task carried (`Store::drop_payloads`): its prompt,
-    /// its context's text, and the copy of a reply its result is (a local
-    /// task's). Every id, digest, state and detail stays, the attachment
+    /// its context's text, its mark, and the copy of a reply its result is
+    /// (a local task's). Every id, digest, state and detail stays, the attachment
     /// descriptors too, and a remote sender's explicit result
     /// (`work_complete`), which `work_query` answers whole.
     fn drop_payload(&mut self) {
         self.task.prompt.clear();
         drop_context(&mut self.task.context);
+        // A mark's URL, title and annotations are the sender's text too
+        // (the message's record keeps them, as it keeps its mark).
+        if let Some(message) = self.message.as_mut() {
+            message.mark = None;
+        }
         if let Some(result) = self
             .status
             .result
@@ -1882,6 +1904,7 @@ mod tests {
             attachment_owner: String::new(),
             control_gen: 1,
             authorization_expires_at: None,
+            message: None,
             route_id: "backend".into(),
             route_revision: 1,
             profile_id: "backend".into(),
@@ -2548,7 +2571,20 @@ mod tests {
         // Settled, a day past its deadline: its payloads go, its reply's
         // too, and the upload only it names.
         let settled = put(
-            due(old, vec![gone_upload.clone(), kept_upload.clone()]),
+            WorkRecord {
+                // A message's task: its mark is the sender's text too.
+                message: Some(MessageFrame {
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    mark: Some(atem_client::session::mark::MarkTask {
+                        mark_id: "mark_1".into(),
+                        url: "http://localhost:3000/".into(),
+                        title: "the sender's title".into(),
+                        screenshot: gone_upload.clone(),
+                        annotations: vec![],
+                    }),
+                }),
+                ..due(old, vec![gone_upload.clone(), kept_upload.clone()])
+            },
             WorkState::Completed,
         );
         let id = settled.task.task_id.clone();
@@ -2732,6 +2768,14 @@ mod tests {
         // Every record stays.
         assert_eq!(rows, tables.iter().map(|t| count(t)).collect::<Vec<_>>());
         let work = |r: &WorkRecord| store.work(&r.task.task_id).unwrap().unwrap();
+        assert_eq!(
+            work(&settled).message,
+            Some(MessageFrame {
+                message_id: settled.message.as_ref().unwrap().message_id.clone(),
+                mark: None,
+            }),
+            "the mark goes, the message id stays"
+        );
         for gone in [&settled, &finished[0], &finished[1], &held[0]] {
             let kept = work(gone);
             assert_eq!(kept.task.prompt, "", "{}", gone.task.task_id);

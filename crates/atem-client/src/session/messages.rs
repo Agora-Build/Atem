@@ -188,7 +188,9 @@ impl Message {
                         }
                         Destination::Agent { target, .. } => {
                             r.host.contains(target)
-                                && self.task(r).is_some_and(|t| t.valid(&r.host))
+                                && self
+                                    .task(r)
+                                    .is_some_and(|t| t.valid_message(&r.host, self.mark.as_ref()))
                         }
                         _ => true,
                     }
@@ -223,6 +225,9 @@ impl Message {
             .collect())
     }
 
+    /// The task an agent recipient becomes: its prompt is the message's
+    /// text as sent. Who sent it, the message id and the mark are rendered
+    /// around it at dispatch (`framing::TaskPrompt`), never stored in it.
     pub fn task(&self, r: &Recipient) -> Option<WorkTask> {
         let Destination::Agent { target, .. } = &r.destination else {
             return None;
@@ -232,15 +237,7 @@ impl Message {
             workflow_id: self.workflow_id.clone(),
             target: target.clone(),
             expires_at: self.expires_at,
-            prompt: format!(
-                "[Message {} from {}]\n{}",
-                self.message_id,
-                self.sender,
-                self.mark.as_ref().map_or_else(
-                    || self.text.clone(),
-                    |m| format!("{}\n{}", self.text, m.render())
-                )
-            ),
+            prompt: self.text.clone(),
             context: self.context.clone(),
             attachments: self
                 .mark
@@ -631,7 +628,7 @@ mod tests {
         assert!(m.valid());
         let task = m.task(&m.recipients[0]).unwrap();
         assert!(task.valid(&host));
-        assert!(task.render_prompt().contains("from member:phone"));
+        assert_eq!(task.prompt, m.text, "only the sender's text is stored");
         let mut alias = m.recipients[0].clone();
         alias.recipient_id = new_id();
         if let Destination::Agent { route_id, .. } = &mut alias.destination {
@@ -681,7 +678,19 @@ mod tests {
         });
         assert!(m.valid());
         let task = m.task(&m.recipients[0]).unwrap();
-        assert!(task.prompt.contains("Make this red"));
+        assert_eq!(task.prompt, "", "the mark is rendered at dispatch");
+        assert!(task.valid_message(&host, m.mark.as_ref()));
+        assert!(
+            !task.valid(&host),
+            "a blank prompt isn't a work_enqueue task"
+        );
+        assert!(
+            m.mark
+                .as_ref()
+                .unwrap()
+                .block_text()
+                .contains("Make this red")
+        );
         assert_eq!(
             task.attachments,
             vec![m.mark.as_ref().unwrap().screenshot.clone()]

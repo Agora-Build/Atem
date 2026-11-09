@@ -1,13 +1,15 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
 use crate::runtime::host_work::{
-    AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, Profile, Store, WorkRecord,
+    AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, MessageFrame, Profile, Store,
+    WorkRecord,
 };
 use crate::session_protocol::r9::ProjectScope;
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::{
     self as hw, HostTarget, LaunchState, LaunchStatus, ResultBody, WorkState, WorkStatus,
 };
+use atem_client::session::framing;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
@@ -849,6 +851,7 @@ impl HostBridge {
                     principal,
                     control_gen: self.host.control_gen(&a.name()),
                     authorization_expires_at: a.remote().and_then(|a| a.expires_at),
+                    message: None,
                     route_id: route_id.clone(),
                     route_revision: *route_revision,
                     profile_id: profile.id.clone(),
@@ -1100,6 +1103,10 @@ impl HostBridge {
                     principal: a.name(),
                     control_gen: self.host.control_gen(&a.name()),
                     authorization_expires_at: a.remote().and_then(|a| a.expires_at),
+                    message: Some(MessageFrame {
+                        message_id: message.message_id.clone(),
+                        mark: message.mark.clone(),
+                    }),
                     route_id: route_id.clone(),
                     route_revision: *route_revision,
                     profile_id: profile.id.clone(),
@@ -1403,12 +1410,6 @@ impl HostBridge {
                 continue;
             }
             let attachment = attachment.unwrap();
-            // A local task's and a delivered reply's lines come from the
-            // records; the stored prompt is only the sender's text or reply.
-            let mut prompt = match self.collab_frame(&r)? {
-                Some(frame) => frame.render(&r.task),
-                None => r.task.render_prompt(),
-            };
             let paths = self
                 .work
                 .store
@@ -1424,24 +1425,58 @@ impl HostBridge {
                 }
                 continue;
             };
-            for (reference, path) in r.task.attachments.iter().zip(paths) {
-                prompt.push_str(&format!(
-                    "\n[Verified screenshot {} sha256 {}]\nRead this PNG: {}\n",
-                    reference.attachment_id,
-                    reference.digest,
-                    path.display()
-                ));
-            }
-            if prompt.len() > wire::MAX_PROMPT_BYTES
-                || prompt
+            // Rendered now, from the records, with a tag drawn for this
+            // attempt (delegated host-work design III.2): Atem's lines name
+            // the sender, route and message (a local task's and a delivered
+            // reply's come from the outbox and the reply); the stored prompt
+            // is only the sender's text or reply.
+            let frame = self.collab_frame(&r)?;
+            let paths: Option<Vec<String>> = paths
+                .iter()
+                .map(|p| p.to_str().map(str::to_string))
+                .collect();
+            let prompt: Result<String, String> = match &paths {
+                None => Err("a screenshot path is not UTF-8".into()),
+                Some(paths) => {
+                    let screenshots: Vec<framing::Screenshot> = r
+                        .task
+                        .attachments
+                        .iter()
+                        .zip(paths)
+                        .map(|(attachment, path)| framing::Screenshot { attachment, path })
+                        .collect();
+                    crate::runtime::collab::task_prompt(&r, frame.as_ref(), &screenshots)
+                        .render()
+                        .map_err(|e| format!("the prompt could not be rendered: {e}"))
+                }
+            };
+            // Checked at enqueue with the longest lines any frame gets; a
+            // record an earlier build accepted is checked here.
+            let prompt = prompt.and_then(|prompt| {
+                if prompt.len() > wire::MAX_PROMPT_BYTES {
+                    Err(if r.task.attachments.is_empty() {
+                        "the prompt is over 32 KiB once framed".into()
+                    } else {
+                        "attachment paths exceed the prompt bounds".into()
+                    })
+                } else if prompt
                     .chars()
                     .any(|c| c.is_control() && c != '\n' && c != '\t')
-            {
-                r.status.state = WorkState::Failed;
-                r.status.detail = "attachment paths exceed the prompt bounds".into();
-                self.work.store.as_ref().unwrap().save_work(&r)?;
-                continue;
-            }
+                {
+                    Err("the prompt has control characters".into())
+                } else {
+                    Ok(prompt)
+                }
+            });
+            let prompt = match prompt {
+                Ok(prompt) => prompt,
+                Err(detail) => {
+                    r.status.state = WorkState::Failed;
+                    r.status.detail = detail;
+                    self.work.store.as_ref().unwrap().save_work(&r)?;
+                    continue;
+                }
+            };
             let Some((binding, _)) = self.host.binding_for_work(&attachment, &r.task.target) else {
                 continue;
             };
@@ -2205,6 +2240,7 @@ principals = ["local"]
             task,
             turn_id: None,
             authorization_expires_at: None,
+            message: None,
         };
         rig.bridge
             .work
@@ -2725,6 +2761,7 @@ principals = ["local"]
                 task,
                 turn_id: None,
                 authorization_expires_at: None,
+                message: None,
             };
             store
                 .db
@@ -3970,6 +4007,7 @@ launch = "on_message"
                 task,
                 turn_id: Some("turn-0".into()),
                 authorization_expires_at: None,
+                message: None,
             };
             tx.execute(
                 "INSERT INTO work(id,record,state) VALUES(?1,?2,'awaiting_result')",
@@ -4745,6 +4783,7 @@ launch = "on_message"
                         },
                         turn_id: None,
                         authorization_expires_at: None,
+                        message: None,
                     })
                     .unwrap();
             }

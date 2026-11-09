@@ -21,6 +21,14 @@ ed25519-dalek = { version = "2", features = ["zeroize"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = "0.10"
 hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
+# Prompt framing (`session::framing`, delegated host-work design III.2):
+# NFKC and NFD, General_Category Cf and the UTS #39 confusables skeleton, all
+# of one pinned Unicode version (18.0.0; the framing's tests check that the
+# three agree). Pinned exactly: a new Unicode version changes which lines are
+# escaped, so it comes with new framing vectors.
+unicode-normalization = "=0.1.26"
+unicode-properties = { version = "=0.1.5", default-features = false, features = ["general-category"] }
+unicode-security = "=0.1.3"
 
 [features]
 # An in-memory `KeyProvider` (`SoftwareKeys`): for tests and for bots

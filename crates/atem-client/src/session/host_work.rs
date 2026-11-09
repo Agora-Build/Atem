@@ -93,67 +93,84 @@ pub struct WorkTask {
 }
 
 impl WorkTask {
+    /// A task its sender enqueued (`work_enqueue`): its prompt isn't blank.
     pub fn valid(&self, host: &HostTarget) -> bool {
-        self.valid_for(host, false)
+        !self.prompt.trim().is_empty() && self.valid_for(host, false, None)
     }
 
-    /// A task of the runtime's own `local` sender: its ids may be the
-    /// deterministic UUIDv5 of a selector's fixed resolution. Every bound
-    /// (prompt and context size, characters, snapshots) is the remote one.
+    /// A task of the runtime's own `local` sender: a local message's text
+    /// or a reply, which may be blank when context comes with it. Its ids
+    /// may be the deterministic UUIDv5 of a selector's fixed resolution.
+    /// Every bound (prompt and context size, characters, snapshots) is the
+    /// remote one.
     pub fn valid_local(&self, host: &HostTarget) -> bool {
-        self.valid_for(host, true)
+        (!self.prompt.trim().is_empty() || !self.context.is_empty())
+            && self.valid_for(host, true, None)
     }
 
-    fn valid_for(&self, host: &HostTarget, local: bool) -> bool {
+    /// The task a message's agent recipient becomes (`Message::task`): its
+    /// prompt is the message's text, which may be blank when the message
+    /// carries context or a mark; the mark is measured with it.
+    pub fn valid_message(&self, host: &HostTarget, mark: Option<&super::mark::MarkTask>) -> bool {
+        (!self.prompt.trim().is_empty() || !self.context.is_empty() || mark.is_some())
+            && self.valid_for(host, false, mark)
+    }
+
+    fn valid_for(
+        &self,
+        host: &HostTarget,
+        local: bool,
+        mark: Option<&super::mark::MarkTask>,
+    ) -> bool {
+        let clean = |text: &str| {
+            !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        };
         (is_uuid_v4(&self.task_id) || local && is_uuid_v5(&self.task_id))
             && is_uuid_v4(&self.workflow_id)
             && host.contains(&self.target)
             && is_session_id(&self.target.session_id)
             && is_uuid_v4(&self.target.process_gen)
             && self.expires_at <= MAX_SAFE_INTEGER
-            && !self.prompt.trim().is_empty()
             && self.prompt.len() <= 17 * 1024
             && !self.prompt.contains('\0')
-            && !self
-                .render_prompt()
-                .chars()
-                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            && clean(&self.prompt)
             && self.context.len() <= 8
-            && self.context.iter().all(|c| {
-                if local {
-                    c.valid_local()
-                } else {
-                    c.valid()
-                }
-            })
+            && self
+                .context
+                .iter()
+                .all(|c| (if local { c.valid_local() } else { c.valid() }) && clean(&c.text))
             && self.attachments.len() <= 4
-            && self.attachments.iter().all(super::attachments::Attachment::valid)
-            && self.attachments.iter().map(|a| &a.attachment_id).collect::<std::collections::BTreeSet<_>>().len() == self.attachments.len()
-            // Reserve space for receiver-generated paths appended at dispatch.
-            && (self.attachments.is_empty() || self.render_prompt().len() <= super::wire::MAX_PROMPT_BYTES - 4096)
-            && self.render_prompt().len() <= super::wire::MAX_PROMPT_BYTES
+            && self
+                .attachments
+                .iter()
+                .all(super::attachments::Attachment::valid)
+            && self
+                .attachments
+                .iter()
+                .map(|a| &a.attachment_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == self.attachments.len()
+            && self.checked_len(mark) <= self.prompt_bound()
     }
 
-    pub fn render_prompt(&self) -> String {
-        format!(
-            "[Atem task {} / workflow {}]\n{}",
-            self.task_id,
-            self.workflow_id,
-            self.render_with_context(&self.prompt)
-        )
+    /// The size its prompt is checked at (`framing::checked_len`): the
+    /// exact size of its framed text, mark and context, with the longest
+    /// first and last lines any sender, route or message gets.
+    pub fn checked_len(&self, mark: Option<&super::mark::MarkTask>) -> usize {
+        super::framing::checked_len(&self.prompt, mark, &self.context)
     }
 
-    /// `text` followed by the task's context snapshots: what
-    /// `render_prompt` shows after its task line.
-    pub fn render_with_context(&self, text: &str) -> String {
-        let mut rendered = text.to_string();
-        for item in &self.context {
-            rendered.push_str(&format!(
-                "\n\n[Context {:?}:{} version {} sha256 {}]\n{}",
-                item.kind, item.id, item.version, item.digest, item.text
-            ));
+    /// The bound on its rendered prompt: 32,768 bytes, 28,672 with
+    /// attachments (room for the screenshot lines added at dispatch).
+    pub fn prompt_bound(&self) -> usize {
+        if self.attachments.is_empty() {
+            super::wire::MAX_PROMPT_BYTES
+        } else {
+            super::wire::MAX_PROMPT_BYTES - super::framing::ATTACHMENT_RESERVE
         }
-        rendered
     }
 }
 

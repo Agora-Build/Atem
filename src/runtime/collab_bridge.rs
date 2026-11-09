@@ -420,8 +420,7 @@ impl HostBridge {
             reply,
             context,
         );
-        let frame = results::delivery_frame(&task.task.task_id, reply);
-        collab::task_problem(&carrier, Some(&frame), &self.work_host())
+        collab::task_problem(&carrier, &self.work_host())
     }
 
     /// Publishes the context of replies (spec section 8) against the binding
@@ -549,8 +548,7 @@ impl HostBridge {
             row.reply.context.clone(),
         );
         let tx = store.db.unchecked_transaction()?;
-        let frame = results::delivery_frame(&grant.task_id, &row.reply);
-        if let Some(problem) = collab::task_problem(&task, Some(&frame), &self.work_host()) {
+        if let Some(problem) = collab::task_problem(&task, &self.work_host()) {
             let trace = format!("{}{problem}", results::UNDELIVERED);
             tx.execute(
                 "UPDATE results SET detail=?2 WHERE task_id=?1",
@@ -587,6 +585,7 @@ impl HostBridge {
                 task,
                 turn_id: None,
                 authorization_expires_at: None,
+                message: None,
             })?;
             tx.execute(
                 "UPDATE results SET work_id=?2 WHERE task_id=?1",
@@ -1226,7 +1225,7 @@ impl HostBridge {
             process_gen: uuid::Uuid::new_v4().to_string(),
         };
         let task = local_task(message, &uuid::Uuid::new_v4().to_string(), target);
-        collab::task_problem(&task, Some(&collab::Frame::message(message)), &host)
+        collab::task_problem(&task, &host)
     }
 
     pub(super) fn collab_candidates(
@@ -1541,6 +1540,7 @@ impl HostBridge {
                 },
                 turn_id: None,
                 authorization_expires_at: None,
+                message: None,
             };
             if !(self.work_allowed(&record, &Sender::Local, sessions)
                 || r.launch_request_id.is_some()
