@@ -55,9 +55,22 @@ mod webhook_server;
 use anyhow::Result;
 use clap::Parser;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli_args = cli::Cli::parse();
+    // The cred agent runs on its own one-thread runtime, built after it has
+    // locked its memory: no worker threads to lock (designs/e2e-encryption.md,
+    // "Performance", F5).
+    #[cfg(unix)]
+    if !cli_args.version && matches!(cli_args.command, Some(cli::Commands::CredAgent)) {
+        return memory::agent_socket::cred_agent_main();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli_args))
+}
+
+async fn run(cli_args: cli::Cli) -> Result<()> {
     if cli_args.version {
         print!("{}", tokio::task::spawn_blocking(version::text).await?);
         return Ok(());

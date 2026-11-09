@@ -665,11 +665,26 @@ async fn serve_with(
             .map_or(Duration::from_secs(3600), |w| w.every),
     );
     checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Armed by each large request answered and each connection's end;
+    // fires once neither happened for `TRIM_IDLE`.
+    let trim_due = Arc::new(tokio::sync::Notify::new());
+    let mut trim = std::pin::pin!(tokio::time::sleep(TRIM_IDLE));
+    let mut trim_armed = false;
     loop {
         while connections.try_join_next().is_some() {}
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = stop_requested.wait_for(|stop| *stop) => break,
+            _ = trim_due.notified() => {
+                trim.as_mut().reset(tokio::time::Instant::now() + TRIM_IDLE);
+                trim_armed = true;
+                continue;
+            }
+            _ = trim.as_mut(), if trim_armed => {
+                trim_armed = false;
+                give_back_freed_memory();
+                continue;
+            }
             _ = checks.tick(), if watch.is_some() => {
                 if let Some(watch) = &watch
                     && let Some(why) = watch.orphaned()
@@ -700,13 +715,14 @@ async fn serve_with(
                 continue;
             }
         };
-        let (agent, stopping) = (agent.clone(), stopping.clone());
+        let (agent, stopping, trim_due) = (agent.clone(), stopping.clone(), trim_due.clone());
         connections.spawn(async move {
             if let Err(error) =
-                serve_connection(stream, &agent, allowed_uid, &stopping, frames).await
+                serve_connection(stream, &agent, allowed_uid, &stopping, &trim_due, frames).await
             {
                 eprintln!("cred agent: {error:#}");
             }
+            trim_due.notify_one();
         });
     }
     eprintln!("cred agent: locked by `atem cred lock`; exiting");
@@ -743,12 +759,14 @@ async fn serve_with(
 
 /// One connection: JSON lines, and frames once a `status` answered here
 /// offered them (only when this agent reads them: `frames`). A malformed
-/// frame closes it with an error.
+/// frame closes it with an error. Once a request or reply of `TRIM_BYTES`
+/// or more is answered, `trim_due` is told.
 async fn serve_connection(
     stream: tokio::net::UnixStream,
     agent: &Mutex<CredAgent>,
     allowed_uid: u32,
     stopping: &tokio::sync::watch::Sender<bool>,
+    trim_due: &tokio::sync::Notify,
     frames: bool,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -769,22 +787,25 @@ async fn serve_connection(
     let mut lines = Lines::new();
     loop {
         let mut answered = false;
+        let mut large = false;
         while let Some(message) = lines.next_message()? {
-            let (reply, stop) = match message {
+            let (reply, stop, size) = match message {
                 Message::Line(line) => {
                     let end = line.len() - 1;
                     let (reply, stop, agreed) = match std::str::from_utf8(&line[..end]) {
                         Ok(text) => respond(agent, text, frames),
                         Err(_) => respond(agent, "", frames),
                     };
+                    let size = line.len();
                     drop(line);
                     if agreed {
                         lines.frames = true;
                     }
-                    (reply, stop)
+                    (reply, stop, size)
                 }
-                Message::Frame(head, body) => (respond_frame(agent, head, body)?, false),
+                Message::Frame(head, body) => (respond_frame(agent, head, body)?, false, head.len),
             };
+            large |= size.max(reply.len()) >= TRIM_BYTES;
             write.write_all(&reply).await?;
             drop(reply);
             answered = true;
@@ -801,6 +822,9 @@ async fn serve_connection(
                     log.lock().unwrap().push(lines.held());
                 }
             });
+        }
+        if large {
+            trim_due.notify_one();
         }
         if lines.too_long() {
             bail!("a request is too long");
@@ -829,6 +853,10 @@ thread_local! {
     /// Tests: what the connections served on this thread hold once they
     /// have answered (`Lines::held`), when a test asks for it.
     static SETTLED: std::cell::RefCell<Option<HeldLog>> = const { std::cell::RefCell::new(None) };
+    /// Tests: how many times the agent served on this thread gave its freed
+    /// memory back (`give_back_freed_memory`), when a test asks for it.
+    static TRIMS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A message read on an agent connection.
@@ -1051,9 +1079,84 @@ fn harden_process() {
     }
 }
 
-/// `atem cred-agent`: serve this user's agent until the process exits.
-pub async fn run_cred_agent() -> Result<()> {
+/// The agent's heap: every block up to `HEAP_BLOCKS` comes from it, and
+/// it gives nothing back by itself until `HEAP_KEPT` is free at its top
+/// (glibc's `M_MMAP_THRESHOLD`, at its largest value, and
+/// `M_TRIM_THRESHOLD`). So the next large request reuses the pages the last
+/// one freed instead of faulting them in (and locking them) again: left to
+/// itself glibc gives big blocks back as they are freed, and a 2 MiB seal
+/// then took about 1.6 times as long. `give_back_freed_memory` returns
+/// what is free once the agent is idle.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HEAP_BLOCKS: libc::c_int = 32 << 20;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HEAP_KEPT: libc::c_int = 64 << 20;
+
+/// Sets the agent's heap (`HEAP_BLOCKS`). glibc only; elsewhere a no-op.
+fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only sets the allocator's parameters; called before
+    // the agent starts its runtime.
+    unsafe {
+        if libc::mallopt(libc::M_MMAP_THRESHOLD, HEAP_BLOCKS) != 1
+            || libc::mallopt(libc::M_TRIM_THRESHOLD, HEAP_KEPT) != 1
+        {
+            eprintln!("cred agent: could not set the allocator's thresholds");
+        }
+    }
+}
+
+/// A request or reply at least this big, or a connection's end, leaves
+/// freed memory in the heap (`HEAP_BLOCKS`); the agent gives it back once
+/// neither happened for `TRIM_IDLE`, so a burst of large requests reuses it.
+const TRIM_BYTES: usize = 128 << 10;
+#[cfg(not(test))]
+const TRIM_IDLE: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const TRIM_IDLE: Duration = Duration::from_millis(100);
+
+/// Gives the heap's free memory back to the system (glibc's `malloc_trim`):
+/// what requests' buffers left there once they were wiped and freed. Under
+/// `mlockall` only the free top of the heap can go (the kernel keeps locked
+/// pages, free or not, in the middle of it): a block still in use above
+/// freed ones, such as a connection opened while a large request was being
+/// read, keeps them until it is freed and the next trim. glibc only;
+/// elsewhere a no-op.
+fn give_back_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no pointer; the allocator locks itself.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(test)]
+    TRIMS.with(|trims| {
+        if let Some(trims) = &*trims.borrow() {
+            trims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+}
+
+/// `atem cred-agent`, called by `main` before any runtime exists: hardens
+/// the process (`mlockall` among it) and sets its heap, then serves on a
+/// current-thread runtime. The agent has no use for worker threads: every
+/// request already runs under the agent's one lock, and each thread would
+/// bring a 2 MiB stack and a malloc arena of its own
+/// (designs/e2e-encryption.md, "Performance", F5). Every connection's I/O
+/// waits without blocking the thread, so a client that stalls holds up
+/// nobody; a request's own work (within the request limits) runs to its
+/// end before another's starts.
+pub fn cred_agent_main() -> Result<()> {
     harden_process();
+    tune_allocator();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("could not start the cred agent's runtime")?
+        .block_on(run_cred_agent())
+}
+
+/// Serves this user's agent until the process exits (`cred_agent_main`).
+async fn run_cred_agent() -> Result<()> {
     // Taken now, before a rebuild can replace the executable on disk.
     let _ = build_id();
     let paths = CredPaths::default_paths();
@@ -2196,11 +2299,22 @@ mod tests {
 
     /// Serves an agent for the key files in `dir` on its own thread.
     pub(super) fn start_agent(dir: &Path, allowed_uid: u32) -> PathBuf {
+        start_agent_counting_trims(dir, allowed_uid, None)
+    }
+
+    /// `start_agent`, counting in `trims` the times it gives its freed
+    /// memory back.
+    fn start_agent_counting_trims(
+        dir: &Path,
+        allowed_uid: u32,
+        trims: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> PathBuf {
         let socket = sock(&dir.join("run"));
         let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
         let path = socket.clone();
         std::thread::spawn(move || {
+            TRIMS.with(|counter| *counter.borrow_mut() = trims);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2948,6 +3062,108 @@ mod tests {
         );
         let log = std::fs::read_to_string(dir.path().join("a.log")).unwrap();
         assert!(log.contains("exiting"), "{log}");
+    }
+
+    /// The agent process serves every connection on its one thread (F5,
+    /// designs/e2e-encryption.md "Performance"), and a client that stalls
+    /// mid-request (a frame or a line half sent) or never reads its replies
+    /// holds up no other client's request: all of its I/O waits without
+    /// blocking the thread.
+    #[test]
+    fn the_agent_runs_on_one_thread_and_a_stalled_client_holds_up_no_one() {
+        let dir = short_dir();
+        let home = dir.path().join("home");
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&home).unwrap();
+        make_private(&run);
+        let agent = cred_agent_process(&home, &run, &dir.path().join("a.log"));
+        let socket = sock(&run);
+        let client = CredAgentClient::at(socket.clone());
+        assert!(eventually(|| client.status().is_ok()));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            std::fs::read_dir(format!("/proc/{}/task", agent.0.id()))
+                .unwrap()
+                .count(),
+            1,
+            "the agent runs on one thread"
+        );
+        // A frame half sent, on a connection whose status agreed to frames.
+        let mut framed = UnixStream::connect(&socket).unwrap();
+        framed
+            .write_all(encode_request(&Request::Status).unwrap().as_bytes())
+            .unwrap();
+        let mut agreed = String::new();
+        BufReader::new(&framed).read_line(&mut agreed).unwrap();
+        assert!(agreed.contains("\"frames\":1"), "{agreed}");
+        let frame =
+            agent_frame::crypt_request("astation", &[CryptOp::seal("r", "f", &vec![1; 1 << 20])])
+                .unwrap();
+        framed.write_all(&frame[..frame.len() / 2]).unwrap();
+        // A line half sent.
+        let mut line = UnixStream::connect(&socket).unwrap();
+        line.write_all(&vec![b'x'; 1 << 20]).unwrap();
+        // Requests whose replies are never read, written until the agent
+        // stops reading them (its replies have filled the socket).
+        let mut deaf = UnixStream::connect(&socket).unwrap();
+        deaf.set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let requests = encode_request(&Request::Status).unwrap().repeat(1_000);
+        while deaf.write_all(requests.as_bytes()).is_ok() {}
+        let start = std::time::Instant::now();
+        let status = CredAgentClient::at(socket.clone()).status().unwrap();
+        assert!(!status.unlocked);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "another client waited {:?}",
+            start.elapsed()
+        );
+        drop((framed, line, deaf, agent));
+    }
+
+    /// After a request or reply of `TRIM_BYTES` or more, or a connection's
+    /// end, the agent gives its freed memory back once neither happened for
+    /// `TRIM_IDLE`; small requests never make it trim.
+    #[test]
+    fn the_agent_gives_freed_memory_back_once_idle_after_a_large_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let dir = short_dir();
+        let trims = Arc::new(AtomicUsize::new(0));
+        let socket = start_agent_counting_trims(dir.path(), own_uid(), Some(trims.clone()));
+        let client = CredAgentClient::at(socket.clone());
+        for _ in 0..20 {
+            client.status().unwrap();
+        }
+        std::thread::sleep(TRIM_IDLE * 3);
+        assert_eq!(trims.load(SeqCst), 0, "small requests never trim");
+        // Large lines (refused or not, each gets its reply), back to back.
+        let large = format!(
+            "{{\"v\":2,\"op\":\"status\",\"pad\":\"{}\"}}\n",
+            "x".repeat(TRIM_BYTES)
+        );
+        let stream = UnixStream::connect(&socket).unwrap();
+        for _ in 0..3 {
+            (&stream).write_all(large.as_bytes()).unwrap();
+            let mut reply = String::new();
+            BufReader::new(&stream).read_line(&mut reply).unwrap();
+            assert!(reply.ends_with('\n'), "{reply}");
+        }
+        assert!(eventually(|| trims.load(SeqCst) > 0), "it trims once idle");
+        let after = trims.load(SeqCst);
+        std::thread::sleep(TRIM_IDLE * 3);
+        assert_eq!(
+            trims.load(SeqCst),
+            after,
+            "and not again until another large request"
+        );
+        client.status().unwrap();
+        std::thread::sleep(TRIM_IDLE * 3);
+        assert_eq!(trims.load(SeqCst), after);
+        drop(stream);
+        assert!(
+            eventually(|| trims.load(SeqCst) > after),
+            "a connection's end makes it trim"
+        );
     }
 
     #[test]
