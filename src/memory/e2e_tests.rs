@@ -208,9 +208,9 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
         let page: Vec<&Memory> = state.memories.iter().filter(|row| row.seq > since).collect();
         return json!({"memories": page});
     }
-    // Skills through the v2 routes only, as the Station's adapter serves
+    // Skills as the Station's skill file transport serves
     // them (`fake_station_skills`), the rows kept in their stored form.
-    if method == "GET" && path.starts_with("/api/skills/v2?") {
+    if method == "GET" && path.starts_with("/api/skills?") {
         let since = since(path);
         return fake_station_skills::page(state.skills.iter().filter(|row| row.seq > since));
     }
@@ -250,7 +250,7 @@ fn handle_request(state: &Arc<Mutex<RelayState>>, method: &str, path: &str, body
         }
         return json!({"results": results});
     }
-    if method == "POST" && path.starts_with("/api/skills/v2/batch?") {
+    if method == "POST" && path.starts_with("/api/skills/batch?") {
         let state = &mut *state;
         return fake_station_skills::batch_ok(body, |op| {
             assert_eq!(op["op"], "rewrite");

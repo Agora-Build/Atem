@@ -838,7 +838,7 @@ async fn a_page_that_fails_to_open_drops_the_page_fetched_meanwhile() {
         !log.lock()
             .unwrap()
             .iter()
-            .any(|(_, p, _)| p.starts_with("/api/skills/v2?"))
+            .any(|(_, p, _)| p.starts_with("/api/skills?"))
     );
 
     // The next sync starts from the committed cursor.
@@ -2413,7 +2413,7 @@ async fn an_op_whose_project_hash_is_named_after_it_was_sealed_is_sealed_again()
     }
 }
 
-// ─────────────── skill wire v2 (F8) ───────────────
+// ─────────────── skill files on the wire (F8) ───────────────
 
 /// A skill with `SKILL.md` and an empty `.gitkeep`.
 fn skill_with_an_empty_file(machine: &str) -> Skill {
@@ -2502,15 +2502,14 @@ async fn a_skill_with_an_empty_file_travels_as_e1_text_and_comes_back_whole() {
     assert!(
         skill_requests(&log)
             .iter()
-            .all(|(_, p)| p.starts_with("/api/skills/v2"))
+            .all(|(_, p)| p.starts_with("/api/skills"))
     );
 }
 
-/// A sealed skill with an empty file stored before the empty-file rule (by
-/// a client of the legacy routes) is served by Astation's adapter at 963c74b
-/// as `base64`: its `encode_row` finds `""` isn't an envelope, so the whole
-/// row keeps the stored form. The client reads that row as the same bytes
-/// and opens it whole.
+/// A sealed skill with an empty file in a `base64` row (the stored form;
+/// the Station serves such a row as `e1-text`, but a `base64` row of any
+/// bytes is valid): the client reads it as the same bytes and opens it
+/// whole.
 #[tokio::test]
 async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
     let dir = tempfile::tempdir().unwrap();
@@ -2524,13 +2523,13 @@ async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let keeping = keeping_relay(relay);
     let (base, _log) = stub_relay(Box::new(move |m, p, body| {
-        if m == "GET" && p.starts_with("/api/skills/v2?") {
+        if m == "GET" && p.starts_with("/api/skills?") {
             let rows = if since(p) < 5 {
                 vec![row.clone()]
             } else {
                 Vec::new()
             };
-            return (200, serde_json::json!({"wire_version": 2, "skills": rows}));
+            return (200, serde_json::json!({"skills": rows}));
         }
         keeping(m, p, body)
     }))
@@ -2549,11 +2548,11 @@ async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
 }
 
 /// A skill push whose outcome is unknown (the connection closed with no
-/// answer) stays queued and goes again by the same v2 route in the same
+/// answer) stays queued and goes again by the same route in the same
 /// format: never in another format.
 ///
 /// Here the Station hadn't applied the first POST. A known pre-existing
-/// bug (not skill wire v2's; the legacy wire had it too) makes the other
+/// bug (not F8's; the legacy wire had it too) makes the other
 /// case unreadable: the Station stores every push as `max(version) + 1`,
 /// but a sealed skill's associated data names the version it was sealed
 /// under (`scope:name:version`). A sealed push the Station had already
@@ -2605,9 +2604,7 @@ async fn an_uncertain_skill_push_goes_again_in_the_same_format() {
     }
     let requests = skill_requests(&log);
     assert!(
-        requests
-            .iter()
-            .all(|(_, p)| p.starts_with("/api/skills/v2")),
+        requests.iter().all(|(_, p)| p.starts_with("/api/skills")),
         "{requests:?}"
     );
     assert_eq!(
@@ -2680,7 +2677,7 @@ async fn a_migration_rewrites_an_empty_skill_file_as_e1_text_and_back_as_base64(
     assert!(
         skill_requests(&log)
             .iter()
-            .all(|(_, p)| p.starts_with("/api/skills/v2"))
+            .all(|(_, p)| p.starts_with("/api/skills"))
     );
 }
 
@@ -2763,10 +2760,10 @@ async fn an_applied_push_whose_answer_was_lost_is_acked_once_its_conflict_is_che
     assert_eq!(
         skill_requests(&log),
         [
-            ("POST", "/api/skills/v2/batch"),
-            ("POST", "/api/skills/v2/batch"),
-            ("GET", "/api/skills/v2/version"),
-            ("GET", "/api/skills/v2"),
+            ("POST", "/api/skills/batch"),
+            ("POST", "/api/skills/batch"),
+            ("GET", "/api/skills/version"),
+            ("GET", "/api/skills"),
         ]
         .map(|(m, p)| (m.to_string(), p.to_string()))
     );
@@ -2904,7 +2901,10 @@ async fn a_conflicted_push_superseded_by_a_later_one_in_the_batch_is_acked() {
 
 /// A conflict in chunk 1 re-bases a push of the same skill that chunk 2
 /// had sealed ahead: only that op is sealed again (its paths and hash, then
-/// its file); chunk 2's other op goes as sealed ahead.
+/// its file); chunk 2's other op goes as sealed ahead. That push's base is
+/// the re-based first edit, which hasn't landed, so the Station answers it
+/// `version_conflict` too (above its latest version: no GET); both land in
+/// order at the next sync.
 #[tokio::test]
 async fn a_conflict_mid_group_reseals_only_the_op_it_rebases() {
     let dir = tempfile::tempdir().unwrap();
@@ -2958,14 +2958,22 @@ async fn a_conflict_mid_group_reseals_only_the_op_it_rebases() {
         vec![16, 8, 4, 2, 2, 1],
         "{seals:?}"
     );
-    // The second edit landed as v3; the first, re-based to v2, waits.
-    assert_eq!(versions(&relay, "deploy"), vec![1, 3]);
-    let queued = s.pending().unwrap();
-    assert_eq!(queued.len(), 1);
-    assert!(
-        matches!(&queued[0].1, PendingOp::PushSkill { skill, base_version: 1 } if skill.version == 2),
-        "{queued:?}"
-    );
+    // Both edits wait, re-based onto v1 in order.
+    assert_eq!(versions(&relay, "deploy"), vec![1]);
+    assert_eq!(versions(&relay, "last"), vec![1]);
+    let queued: Vec<(i64, i64)> = s
+        .pending()
+        .unwrap()
+        .into_iter()
+        .map(|(_, op)| match op {
+            PendingOp::PushSkill {
+                skill,
+                base_version,
+            } => (base_version, skill.version),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(queued, vec![(1, 2), (2, 3)]);
     clean(
         &run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
             .await
@@ -2976,7 +2984,7 @@ async fn a_conflict_mid_group_reseals_only_the_op_it_rebases() {
     assert_eq!((local.version, local.files), (3, second.files));
 }
 
-/// A Station that renumbers pushes (963c74b) stores a concurrent push under
+/// A Station that renumbers pushes (before Astation PR #76) stores a concurrent push under
 /// a version its envelopes don't name. Every device holds that row (never
 /// applied, reported once) and the pull goes on: later skills apply and the
 /// cursor moves. Once the Station keeps versions, the next edit is re-based
@@ -3117,13 +3125,13 @@ async fn a_malformed_skill_row_still_refuses_the_page() {
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let keeping = keeping_relay(relay);
     let (base, _log) = stub_relay(Box::new(move |m, p, body| {
-        if m == "GET" && p.starts_with("/api/skills/v2?") {
+        if m == "GET" && p.starts_with("/api/skills?") {
             let rows = if since(p) < 2 {
                 vec![good.clone(), bad.clone()]
             } else {
                 Vec::new()
             };
-            return (200, serde_json::json!({"wire_version": 2, "skills": rows}));
+            return (200, serde_json::json!({"skills": rows}));
         }
         keeping(m, p, body)
     }))
@@ -3145,4 +3153,105 @@ async fn a_malformed_skill_row_still_refuses_the_page() {
     assert!(s.all_skills().unwrap().is_empty());
     assert!(s.held_skills().unwrap().is_empty());
     assert_eq!(s.get_state(&skill_cursor_key(ASTATION_ID)).unwrap(), 0);
+}
+
+/// The Station's compare-and-set counts tombstones: a push's base is the
+/// skill's latest version, a tombstone included. After a delete here (its
+/// tombstone at the next version, as the Station appends it) and after one
+/// pulled from another machine, the next push builds on the tombstone and
+/// lands with no conflict.
+#[tokio::test]
+async fn a_push_after_a_delete_builds_on_the_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Kept);
+    let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+    let client = client_with(&base, &device, device.agent.clone());
+    let (a, b) = (
+        Store::open_in_memory().unwrap(),
+        Store::open_in_memory().unwrap(),
+    );
+    let ((_ha, ctx_a), (_hb, ctx_b)) = (test_ctx(), test_ctx());
+    queue_skill(&a, super::tests::skill_v1("deploy", "# deploy", "m1"), 0);
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    // A removes it (as `atem skill rm`) and adds it again (as `atem skill
+    // add`, on the local tombstone's version).
+    let mut tombstone = a.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    tombstone.version += 1;
+    tombstone.deleted = true;
+    tombstone.files.clear();
+    tombstone.content_hash.clear();
+    a.put_skill(&tombstone).unwrap();
+    a.enqueue(&PendingOp::DeleteSkill {
+        scope: Scope::Global,
+        project: String::new(),
+        name: "deploy".into(),
+    })
+    .unwrap();
+    let mut again = super::tests::skill_v1("deploy", "# deploy again", "m1");
+    again.version = 3;
+    again.content_hash = skill_hash(&again.files);
+    queue_skill(&a, again.clone(), 2);
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2, 3]);
+    // B pulls the tombstone and the new version; its next edit builds on v3.
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    let local = b.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((local.version, local.files), (3, again.files));
+    // A removes it again; B pulls only that tombstone and adds on it.
+    let mut tombstone = a.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    tombstone.version += 1;
+    tombstone.deleted = true;
+    tombstone.files.clear();
+    tombstone.content_hash.clear();
+    a.put_skill(&tombstone).unwrap();
+    a.enqueue(&PendingOp::DeleteSkill {
+        scope: Scope::Global,
+        project: String::new(),
+        name: "deploy".into(),
+    })
+    .unwrap();
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    let base_version = b
+        .get_skill(Scope::Global, "", "deploy")
+        .unwrap()
+        .unwrap()
+        .version;
+    assert_eq!(base_version, 4);
+    let mut from_b = super::tests::skill_v1("deploy", "# deploy from b", "m2");
+    from_b.version = base_version + 1;
+    from_b.content_hash = skill_hash(&from_b.files);
+    queue_skill(&b, from_b, base_version);
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2, 3, 4, 5]);
 }

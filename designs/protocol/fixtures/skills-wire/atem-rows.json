@@ -105,7 +105,7 @@
     },
     {
       "expect": "accept",
-      "name": "base64: a sealed row with an empty file, as 963c74b serves it",
+      "name": "base64: a sealed row with an empty file",
       "row": {
         "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "created_at": 1700000000,
@@ -230,6 +230,7 @@
       }
     },
     {
+      "error": "unsupported skill files encoding; update Atem",
       "expect": "refuse",
       "name": "no files_encoding",
       "row": {
@@ -249,6 +250,7 @@
       }
     },
     {
+      "error": "unsupported skill files encoding; update Atem",
       "expect": "refuse",
       "name": "an unknown files_encoding",
       "row": {
@@ -269,6 +271,7 @@
       }
     },
     {
+      "error": "unsupported skill files encoding; update Atem",
       "expect": "refuse",
       "name": "files_encoding not a string",
       "row": {
@@ -289,6 +292,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "e1-text: a non-empty value that isn't sealed (mixed)",
       "row": {
@@ -310,6 +314,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "e1-text: a plain path (mixed)",
       "row": {
@@ -331,6 +336,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "e1-text: an empty path",
       "row": {
@@ -351,6 +357,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "e1-text: a malformed envelope",
       "row": {
@@ -371,6 +378,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "e1-text: an envelope shorter than a nonce and a tag",
       "row": {
@@ -391,6 +399,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "e1-text: an uppercase kid",
       "row": {
@@ -411,6 +420,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "e1-text: base64 of an envelope (encoded twice)",
       "row": {
@@ -431,6 +441,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "base64: invalid base64",
       "row": {
@@ -451,6 +462,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "base64: unpadded base64",
       "row": {
@@ -471,6 +483,7 @@
       }
     },
     {
+      "error": "invalid skill files encoding",
       "expect": "refuse",
       "name": "a file value that isn't a string",
       "row": {
@@ -491,5 +504,5 @@
       }
     }
   ],
-  "description": "Atem's synthetic skill rows: what the client and the Station accept (and store, in the legacy form) or refuse (`invalid skill files encoding`). Envelopes are structural only, not valid ciphertext."
+  "description": "Atem's synthetic skill rows: what the client and the Station accept (and store, in the legacy form) or refuse (`error`: the Station's 400). Envelopes are structural only, not valid ciphertext."
 }

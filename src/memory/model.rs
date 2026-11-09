@@ -147,7 +147,7 @@ impl From<Memory> for MemoryWire {
 
 /// One skill version. `files` maps a relative path to raw bytes and is
 /// serialized as `{path: base64}`: the form the local store and queue keep
-/// (and the Station stores). The relay's skill wire v2 is `skill_wire`.
+/// (and the Station stores). The skill file transport on the wire is `skill_wire`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Skill {
     pub scope: Scope,

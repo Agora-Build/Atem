@@ -628,15 +628,15 @@ fn handle(
         ("GET", "/api/memory") => {
             json!({"memories": data.memories.range(since + 1..).take(limit).map(|(_, m)| m).collect::<Vec<_>>()})
         }
-        // Skills through the v2 routes only, as the Station's adapter serves
+        // Skills as the Station's skill file transport serves
         // them (`fake_station_skills`), the rows kept in their stored form.
-        ("GET", "/api/skills/v2") => fake_station_skills::page(
+        ("GET", "/api/skills") => fake_station_skills::page(
             data.skills
                 .range(since + 1..)
                 .take(limit)
                 .map(|(_, s)| s),
         ),
-        ("GET", "/api/skills/v2/version") => {
+        ("GET", "/api/skills/version") => {
             let name = query(target, "name").unwrap_or_default();
             let version: i64 = query(target, "version")
                 .and_then(|v| v.parse().ok())
@@ -676,7 +676,7 @@ fn handle(
             }
             json!({"results": results})
         }
-        ("POST", "/api/skills/v2/batch") => {
+        ("POST", "/api/skills/batch") => {
             // The file's value as sent, before the Station stores it.
             if let Some(value) = body["ops"][0]["skill"]["files"]
                 .as_object()
@@ -2434,7 +2434,7 @@ fn perf_6_ciphertext_sizes() {
     );
 
     println!(
-        "\n### 6b. One skill file (push op JSON, skill wire v2: a sealed file is its e1 text, a plain one base64)"
+        "\n### 6b. One skill file (push op JSON: a sealed file is its e1 text, a plain one base64)"
     );
     println!(
         "| file B | path B plain→sealed | stored file B (e1 text) | ratio | push JSON off B | push JSON on B | wire ratio |"
@@ -2591,8 +2591,8 @@ async fn perf_7_skill_file_wire() {
     // (base64 of the e1 text), what the client sent and read before F8.
     let context =
         EncryptionContext::for_astation_with(ASTATION_ID, &on.paths, on.agent.clone()).unwrap();
-    println!("\n### 7b. The client's cost per sealed skill, v2 against legacy (median µs)");
-    println!("| file B | build push body v2 | legacy | parse pulled row v2 | legacy |");
+    println!("\n### 7b. The client's cost per sealed skill, e1-text against legacy base64 (median µs)");
+    println!("| file B | build push body e1-text | legacy | parse pulled row e1-text | legacy |");
     println!("|---|---|---|---|---|");
     for size in [1usize << 10, 64 << 10, 1 << 20] {
         let files = BTreeMap::from([("SKILL.md".to_string(), text(size, 7).into_bytes())]);
@@ -2605,7 +2605,7 @@ async fn perf_7_skill_file_wire() {
             .unwrap()
             .remove(0);
         let reps = if size >= 1 << 20 { 31 } else { 201 };
-        let push_v2 = bench(reps, || {
+        let push_e1 = bench(reps, || {
             let skill = crate::memory::skill_wire::sealed_skill(&sealed).unwrap();
             std::hint::black_box(
                 serde_json::to_vec(&json!({"ops": [{"op": "push", "skill": skill, "base_version": 0}]}))
@@ -2618,16 +2618,16 @@ async fn perf_7_skill_file_wire() {
                     .unwrap(),
             );
         });
-        let v2_page = serde_json::to_vec(&fake_station_skills::page([&sealed])).unwrap();
+        let e1_page = serde_json::to_vec(&fake_station_skills::page([&sealed])).unwrap();
         let legacy_page = serde_json::to_vec(&json!({"skills": [&sealed]})).unwrap();
         // Parsed straight from the body, as `KnowledgeClient` does.
         #[derive(serde::Deserialize)]
         struct Page<T> {
             skills: Vec<T>,
         }
-        let pull_v2 = bench(reps, || {
+        let pull_e1 = bench(reps, || {
             let page: Page<crate::memory::skill_wire::WireSkill> =
-                serde_json::from_slice(&v2_page).unwrap();
+                serde_json::from_slice(&e1_page).unwrap();
             for row in page.skills {
                 std::hint::black_box(row.into_skill().unwrap());
             }
@@ -2638,9 +2638,9 @@ async fn perf_7_skill_file_wire() {
         });
         println!(
             "| {size} | {:.1} | {:.1} | {:.1} | {:.1} |",
-            us(push_v2),
+            us(push_e1),
             us(push_legacy),
-            us(pull_v2),
+            us(pull_e1),
             us(pull_legacy)
         );
     }

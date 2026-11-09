@@ -1,6 +1,5 @@
-//! Relay client for /api/memory and /api/skills/v2 (skill wire v2,
-//! `skill_wire`: the only skill routes it calls; a Station without them is
-//! `ApiError::NoSkillWireV2`). Request building is pure (unit-tested);
+//! Relay client for /api/memory and /api/skills (skill rows in the skill
+//! file transport, `skill_wire`). Request building is pure (unit-tested);
 //! `KnowledgeClient` only sends. Auth = the Astation pairing session: the
 //! paired Astation is the account, so any machine paired with it (and
 //! approved by it) can sync.
@@ -17,10 +16,6 @@ use crate::memory::crypto::{
 };
 
 pub const PULL_LIMIT: u32 = 200;
-
-/// A Station without the skill wire v2 routes (a 404 on them): skills are
-/// never sent or read any other way.
-pub const SKILL_WIRE_V2_MISSING: &str = "This Station doesn't support skill wire v2; update it.";
 
 /// What an encryption migration rewrites on the relay, per batch POST.
 #[derive(Clone, Copy)]
@@ -74,7 +69,6 @@ pub fn op_to_wire(op: &PendingOp) -> Value {
     }
 }
 
-/// `route` is `memory` or `skills/v2`.
 fn pull(base: &str, client_id: &str, route: &str, since: i64, limit: u32) -> ApiRequest {
     ApiRequest {
         method: "GET",
@@ -87,7 +81,7 @@ pub fn memory_pull_request(base: &str, client_id: &str, since: i64, limit: u32) 
     pull(base, client_id, "memory", since, limit)
 }
 pub fn skills_pull_request(base: &str, client_id: &str, since: i64, limit: u32) -> ApiRequest {
-    pull(base, client_id, "skills/v2", since, limit)
+    pull(base, client_id, "skills", since, limit)
 }
 
 fn skill_key_query(scope: Scope, project: &str, name: &str) -> String {
@@ -97,7 +91,7 @@ fn skill_key_query(scope: Scope, project: &str, name: &str) -> String {
 pub fn skill_versions_request(base: &str, client_id: &str, scope: Scope, project: &str, name: &str) -> ApiRequest {
     ApiRequest {
         method: "GET",
-        url: format!("{}/api/skills/v2/versions?id={}&{}", base_trim(base), enc(client_id), skill_key_query(scope, project, name)),
+        url: format!("{}/api/skills/versions?id={}&{}", base_trim(base), enc(client_id), skill_key_query(scope, project, name)),
         body: None,
     }
 }
@@ -105,12 +99,12 @@ pub fn skill_versions_request(base: &str, client_id: &str, scope: Scope, project
 pub fn skill_version_request(base: &str, client_id: &str, scope: Scope, project: &str, name: &str, version: i64) -> ApiRequest {
     ApiRequest {
         method: "GET",
-        url: format!("{}/api/skills/v2/version?id={}&{}&version={}", base_trim(base), enc(client_id), skill_key_query(scope, project, name), version),
+        url: format!("{}/api/skills/version?id={}&{}&version={}", base_trim(base), enc(client_id), skill_key_query(scope, project, name), version),
         body: None,
     }
 }
 
-/// One entry of `GET /api/skills/v2/versions` (no files).
+/// One entry of `GET /api/skills/versions` (no files).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SkillVersionInfo {
     pub version: i64,
@@ -129,20 +123,17 @@ pub struct SkillVersionInfo {
 
 #[derive(Deserialize)]
 struct VersionsPage {
-    #[serde(default)]
-    wire_version: Option<u64>,
     versions: Vec<SkillVersionInfo>,
 }
 #[derive(Deserialize)]
 struct VersionPage {
-    #[serde(default)]
-    wire_version: Option<u64>,
     skill: WireSkill,
 }
 
-/// The per-op answer to a skill push whose version the Station already
-/// has (it stores each push at the version it was sealed under, never
-/// renumbered: owner decision on Atem #130, comment 6726291208).
+/// The per-op answer to a skill push whose base isn't the skill's latest
+/// version on the Station, tombstones and purged records included: the
+/// Station stores each push at the version it was sealed under or not at
+/// all (compare-and-set; Astation PR #76 at 89a2d50, Atem #130).
 pub const VERSION_CONFLICT: &str = "version_conflict";
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -162,7 +153,7 @@ pub struct OpResult {
     pub error: Option<String>,
     /// With a `version_conflict`: the skill's latest version on the Station.
     #[serde(default)]
-    pub current: Option<i64>,
+    pub current_version: Option<i64>,
     /// Set by the client, never on the wire: the conflict was checked and
     /// the version holds another write (a concurrent edit), not this
     /// Atem's own earlier one (`sync::check_conflicts`).
@@ -178,9 +169,6 @@ impl OpResult {
 
 #[derive(Deserialize)]
 struct BatchResponse {
-    /// Skills only (skill wire v2).
-    #[serde(default)]
-    wire_version: Option<u64>,
     results: Vec<OpResult>,
 }
 #[derive(Deserialize)]
@@ -189,35 +177,27 @@ struct MemoryPage {
 }
 #[derive(Deserialize)]
 struct SkillPage {
-    #[serde(default)]
-    wire_version: Option<u64>,
     skills: Vec<WireSkill>,
 }
 
-/// A v2 response's `wire_version` (`skill_wire::check_version`).
-fn check_v2(wire_version: Option<u64>) -> Result<(), ApiError> {
-    skill_wire::check_version(wire_version).map_err(|e| ApiError::Decode(format!("{e:#}")))
-}
-
-/// A v2 skill row as a `Skill`, or the page's refusal.
+/// A skill row as a `Skill`, or the page's refusal.
 fn skill_of(row: WireSkill) -> Result<Skill, ApiError> {
     row.into_skill().map_err(|e| ApiError::Decode(format!("{e:#}")))
 }
 
-/// The outcome of a request to a skill wire v2 route. A 404 is a Station
-/// without the v2 routes (`ApiError::NoSkillWireV2`, never a fallback),
-/// except on `/v2/version` when its body is the Station's own "no such
-/// skill version" (`version_route`).
-fn v2_route<T>(sent: Result<T, ApiError>, version_route: bool) -> Result<T, ApiError> {
-    match sent {
-        Err(ApiError::Http(404, body)) if version_route && missing_version(&body) => Err(ApiError::Http(404, body)),
-        Err(ApiError::Http(404, _)) => Err(ApiError::NoSkillWireV2),
-        other => other,
-    }
+/// One stored skill version (`KnowledgeClient::stored_skill`).
+#[derive(Debug)]
+pub enum StoredVersion {
+    Row(Skill),
+    /// 410 `skill version purged`: its content is gone.
+    Purged,
+    /// 404 `no such skill version`: it never existed.
+    Missing,
 }
 
-/// The Station's answer for a skill version it doesn't have.
-fn missing_version(body: &str) -> bool {
+/// Whether a 404 body is the Station's answer for a skill version it never
+/// had (`/api/skills/version`), not a route it doesn't have.
+pub fn is_missing_version(body: &str) -> bool {
     serde_json::from_str::<Value>(body).is_ok_and(|body| body["error"] == "no such skill version")
 }
 
@@ -228,8 +208,6 @@ pub enum ApiError {
     Http(u16, String),
     Decode(String),
     Encryption(String),
-    /// A 404 on a skill wire v2 route (`SKILL_WIRE_V2_MISSING`).
-    NoSkillWireV2,
 }
 
 impl std::fmt::Display for ApiError {
@@ -239,7 +217,6 @@ impl std::fmt::Display for ApiError {
             ApiError::Http(code, body) => write!(f, "relay returned {}: {}", code, body),
             ApiError::Decode(e) => write!(f, "unexpected relay response: {}", e),
             ApiError::Encryption(e) => write!(f, "end-to-end encryption: {}", e),
-            ApiError::NoSkillWireV2 => f.write_str(SKILL_WIRE_V2_MISSING),
         }
     }
 }
@@ -468,18 +445,13 @@ impl KnowledgeClient {
         self.post_batch(memory, wire).await
     }
 
-    /// One batch POST: memory to `/api/memory/batch`, skills to
-    /// `/api/skills/v2/batch` only. Whatever its outcome, nothing is sent
-    /// again in another format.
+    /// One batch POST, to `/api/memory/batch` or `/api/skills/batch`.
+    /// Whatever its outcome, nothing is sent again in another format.
     async fn post_batch(&self, memory: bool, ops: &[Value]) -> Result<Vec<OpResult>, ApiError> {
-        let route = if memory { "memory" } else { "skills/v2" };
-        let url = format!("{}/api/{route}/batch?id={}", base_trim(&self.base), enc(&self.client_id));
-        let sent = self.finish(self.http.post(&url).json(&Batch { ops })).await;
-        let sent = if memory { sent } else { v2_route(sent, false) };
-        let resp: BatchResponse = sent?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        if !memory {
-            check_v2(resp.wire_version)?;
-        }
+        let kind = if memory { "memory" } else { "skills" };
+        let url = format!("{}/api/{kind}/batch?id={}", base_trim(&self.base), enc(&self.client_id));
+        let resp: BatchResponse = self.finish(self.http.post(&url).json(&Batch { ops })).await?
+            .json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(resp.results)
     }
 
@@ -512,12 +484,11 @@ impl KnowledgeClient {
         self.open_memories(rows).await
     }
 
-    /// The page of skill rows after `since`, as the relay sent it (skill
-    /// wire v2: a row that breaks its rules refuses the page).
+    /// The page of skill rows after `since`, as the relay sent it (a row
+    /// that breaks the skill file transport's rules refuses the page).
     pub async fn fetch_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let req = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
-        let page: SkillPage = v2_route(self.send(req).await, false)?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        check_v2(page.wire_version)?;
+        let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         page.skills.into_iter().map(skill_of).collect()
     }
 
@@ -542,17 +513,16 @@ impl KnowledgeClient {
     }
 
     /// One stored version as the Station serves it, not opened: what a
-    /// `version_conflict` is checked against (`project` as sent). `None`:
-    /// it was purged (410), so its content is gone.
-    pub async fn stored_skill(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<Option<Skill>, ApiError> {
+    /// `version_conflict` is checked against (`project` as sent).
+    pub async fn stored_skill(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<StoredVersion, ApiError> {
         let req = skill_version_request(&self.base, &self.client_id, scope, project, name, version);
-        let sent = match v2_route(self.send(req).await, true) {
-            Err(ApiError::Http(410, _)) => return Ok(None),
+        let sent = match self.send(req).await {
+            Err(ApiError::Http(410, _)) => return Ok(StoredVersion::Purged),
+            Err(ApiError::Http(404, body)) if is_missing_version(&body) => return Ok(StoredVersion::Missing),
             sent => sent?,
         };
         let page: VersionPage = sent.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        check_v2(page.wire_version)?;
-        skill_of(page.skill).map(Some)
+        skill_of(page.skill).map(StoredVersion::Row)
     }
 
     /// Names what it can of the pulled project hashes `hashes`, hashing and
@@ -569,8 +539,7 @@ impl KnowledgeClient {
         let project = project.to_string();
         let project = encryption.blocking(move |encryption| encryption.wire_project(&project)).await.map_err(ApiError::from)?;
         let req = skill_versions_request(&self.base, &self.client_id, scope, &project, name);
-        let page: VersionsPage = v2_route(self.send(req).await, false)?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        check_v2(page.wire_version)?;
+        let page: VersionsPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(page.versions)
     }
 
@@ -581,8 +550,7 @@ impl KnowledgeClient {
         let project = project.to_string();
         let project = encryption.blocking(move |encryption| encryption.wire_project(&project)).await.map_err(ApiError::from)?;
         let req = skill_version_request(&self.base, &self.client_id, scope, &project, name, version);
-        let page: VersionPage = v2_route(self.send(req).await, true)?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        check_v2(page.wire_version)?;
+        let page: VersionPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         let skill = skill_of(page.skill)?;
         encryption.blocking(move |encryption| encryption.decrypt_skill(skill)).await.map_err(ApiError::from)
     }
@@ -847,7 +815,7 @@ mod tests {
         assert_eq!(r.method, "GET");
         assert_eq!(r.url, "https://relay.example/api/memory?id=inst%201&since=42&limit=200");
         assert!(r.body.is_none());
-        assert_eq!(skills_pull_request("https://relay.example", "i", 0, 5).url, "https://relay.example/api/skills/v2?id=i&since=0&limit=5");
+        assert_eq!(skills_pull_request("https://relay.example", "i", 0, 5).url, "https://relay.example/api/skills?id=i&since=0&limit=5");
     }
 
     #[test]
@@ -904,11 +872,11 @@ mod tests {
     fn skill_history_request_urls() {
         let r = skill_versions_request("https://relay.example/", "inst 1", Scope::Project, "github.com/a/b", "deploy check");
         assert_eq!(r.method, "GET");
-        assert_eq!(r.url, "https://relay.example/api/skills/v2/versions?id=inst%201&scope=project&project=github.com%2Fa%2Fb&name=deploy%20check");
+        assert_eq!(r.url, "https://relay.example/api/skills/versions?id=inst%201&scope=project&project=github.com%2Fa%2Fb&name=deploy%20check");
         assert!(r.body.is_none());
         assert_eq!(
             skill_version_request("https://relay.example", "i", Scope::Global, "", "demo", 4).url,
-            "https://relay.example/api/skills/v2/version?id=i&scope=global&project=&name=demo&version=4"
+            "https://relay.example/api/skills/version?id=i&scope=global&project=&name=demo&version=4"
         );
         let info: SkillVersionInfo = serde_json::from_value(json!({"version": 2, "created_at": 5})).unwrap();
         assert_eq!((info.file_count, info.deleted, info.purged, info.source_agent.as_str()), (0, false, false, ""));
