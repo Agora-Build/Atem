@@ -975,6 +975,19 @@ If the detector misses a credential and it syncs:
   files of those versions on the server. Other machines delete the skill
   directory on their next sync, unless it was edited locally; in that case
   they report the directory instead of deleting it.
+  - **A version number waits for this machine's edits.** While the skill
+    has an edit here that hasn't synced (a queued push, which is also what
+    a conflict leaves, coalesced or unsettled), `--version <n>` is refused:
+    until that edit syncs, its version can still change (coalesced past
+    another machine's version), so `n` could name another machine's version
+    and leave the one meant in place. The refusal says to run `atem sync`,
+    then check `atem skill history <name>` before purging a version. It is
+    checked again in the transaction that queues the purge, so an edit
+    queued while the question waited counts too. `--all-versions` names no
+    number and always goes.
+  - **The question names the version** with the machine that pushed it and
+    when (UTC), from the relay's history (`atem skill history`), when it can
+    be read; a version the history doesn't list says so.
 - Both commands end with a warning: **rotate the credential.** It may already
   have been copied to other machines' disks or backups, so treat it as
   exposed.
@@ -1046,6 +1059,10 @@ lives.
   at its version at the next; a refusal for good is acked with its note;
   what lands after a refusal for now in the same batch (a delete or purge
   withdraws it, an invalidation of its memory follows it).
+- **Version purges:** `skill purge --version` is refused while the skill has
+  a queued push or an unsettled or coalesced conflict, and goes once a sync
+  settled it; `--all-versions` is never held up; the question names the
+  version's author machine and time.
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge

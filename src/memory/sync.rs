@@ -1481,6 +1481,24 @@ pub fn skill_history_error(e: ApiError, name: &str, version: Option<i64>) -> any
     }
 }
 
+/// Whether `atem skill purge` of `versions` (`None`: every version) may go
+/// now. A purge that names versions waits while the skill has a queued push:
+/// until it syncs, its version numbers can still move (a concurrent edit
+/// coalesces this machine's pushes past another machine's version, and an
+/// unsettled conflict stays queued too), so `--version N` could erase
+/// another machine's version and leave the one meant, maybe a leaked
+/// credential, in place. Purging every version needs no number and always
+/// goes.
+pub fn check_purge(store: &Store, scope: Scope, project: &str, name: &str, versions: Option<&[i64]>) -> Result<()> {
+    if versions.is_none() || !store.has_queued_push(scope, project, name)? {
+        return Ok(());
+    }
+    let scope_flag = if scope == Scope::Project { " --scope project" } else { "" };
+    bail!(
+        "Skill {name} has an edit on this machine that hasn't synced yet, so its version numbers can still change (a concurrent edit moves it past another machine's version). Run `atem sync`, then check `atem skill history {name}{scope_flag}` before purging a version. Nothing was purged; `--all-versions` purges every version now."
+    )
+}
+
 /// Push the files of version `version` as a new version on top of the
 /// current latest (the relay's newest, or this machine's if it has an
 /// unpushed newer one). History is never rewritten. Refuses purged versions
@@ -3480,6 +3498,62 @@ mod tests {
             .filter(|(_, p, _)| p.starts_with("/api/skills"))
             .map(|(m, p, _)| (m.clone(), p.split('?').next().unwrap().to_string()))
             .collect()
+    }
+
+    /// `atem skill purge <name> --version N` waits while the skill has an
+    /// edit that hasn't synced: a queued push, which is also what a conflict
+    /// leaves (coalesced past another machine's version, or unsettled).
+    /// Version numbers may still move then, so N could name another
+    /// machine's version and miss the one meant. A sync that settles it lets
+    /// the purge go; `--all-versions` always goes.
+    #[tokio::test]
+    async fn a_version_purge_waits_until_the_skills_edits_have_synced() {
+        let refused = |s: &Store, scope: Scope, project: &str, name: &str| {
+            check_purge(s, scope, project, name, Some(&[1])).map(|()| String::new()).unwrap_or_else(|e| e.to_string())
+        };
+        let s = Store::open_in_memory().unwrap();
+        queue_skill(&s, "deploy");
+        let project = Skill { scope: Scope::Project, project: "github.com/acme/dialf".into(), ..skill_v1("lint", "# lint", "m1") };
+        s.put_skill(&project).unwrap();
+        s.enqueue(&PendingOp::PushSkill { skill: project, base_version: 0 }).unwrap();
+        assert_eq!(
+            refused(&s, Scope::Global, "", "deploy"),
+            "Skill deploy has an edit on this machine that hasn't synced yet, so its version numbers can still change (a concurrent edit moves it past another machine's version). Run `atem sync`, then check `atem skill history deploy` before purging a version. Nothing was purged; `--all-versions` purges every version now."
+        );
+        assert!(refused(&s, Scope::Project, "github.com/acme/dialf", "lint").contains("`atem skill history lint --scope project`"));
+        // Another skill, and every version, are not held up.
+        assert_eq!(refused(&s, Scope::Global, "", "other"), "");
+        assert!(check_purge(&s, Scope::Global, "", "deploy", None).is_ok());
+
+        // A conflict that stays unsettled keeps the push queued: still refused.
+        let (base, _log) = stub_relay(Box::new(|m, p, _| {
+            if m == "POST" && p.starts_with("/api/skills/batch?") {
+                let n = 2;
+                return (200, serde_json::json!({"results": vec![serde_json::json!({"ok": false, "error": "version_conflict", "current_version": 1}); n]}));
+            }
+            if p.starts_with("/api/skills/version?") {
+                return (503, serde_json::json!({"error": "temporarily unavailable"}));
+            }
+            empty_pulls(m, p).unwrap()
+        })).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.relay_error, "{:?}", out.notes);
+        assert_ne!(refused(&s, Scope::Global, "", "deploy"), "");
+
+        // Coalesced past another machine's v1: the edit goes as v2 next sync.
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        relay.lock().unwrap().put_skill(skill_v1("deploy", "# deploy from m2", "m2"));
+        relay.lock().unwrap().put_skill(Skill { scope: Scope::Project, project: "github.com/acme/dialf".into(), ..skill_v1("lint", "# lint from m2", "m2") });
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.rebased == 2, "{:?}", out.notes);
+        assert_ne!(refused(&s, Scope::Global, "", "deploy"), "");
+        // Once it has synced, the history is final: the purge may go.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(!out.relay_error && s.pending_count().unwrap() == 0, "{:?}", out.notes);
+        assert_eq!(refused(&s, Scope::Global, "", "deploy"), "");
+        assert_eq!(refused(&s, Scope::Project, "github.com/acme/dialf", "lint"), "");
     }
 
     /// A failed skill request is an error as before and is never sent

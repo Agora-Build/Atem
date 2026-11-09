@@ -834,9 +834,19 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             } else {
                 Some(vec![version.ok_or_else(|| anyhow!("Pass --version <n> or --all-versions"))?])
             };
+            sync::check_purge(&store, scope, &project, &name, versions.as_deref())?;
             let which = match &versions {
                 None => "every version".to_string(),
-                Some(v) => format!("version {}", v[0]),
+                Some(v) if yes => format!("version {}", v[0]),
+                // Who pushed it and when, as `atem skill history` shows it
+                // (best effort: without the relay the question goes without).
+                Some(v) => {
+                    let history = match client().await {
+                        Ok(c) => c.skill_versions(scope, &project, &name).await.ok(),
+                        Err(_) => None,
+                    };
+                    purged_version_label(v[0], history.as_deref())
+                }
             };
             if !crate::cli::confirm_destructive(
                 &format!("Erase {which} of skill '{name}' ({}) from the relay and every machine? This can't be undone.", scope.as_str()),
@@ -845,23 +855,40 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
                 println!("Cancelled; nothing was purged.");
                 return Ok(());
             }
-            if let Some(cur) = store.get_skill(scope, &project, &name)? {
-                let hits_latest = versions.as_ref().map(|v| v.contains(&cur.version)).unwrap_or(true);
-                if hits_latest {
-                    let mut t = cur.clone();
-                    t.deleted = true;
-                    t.files.clear();
-                    t.content_hash.clear();
-                    store.put_skill(&t)?;
+            // Checked again with the queue it is added to: an edit queued
+            // while the question waited holds it up too.
+            store.in_transaction(|| {
+                sync::check_purge(&store, scope, &project, &name, versions.as_deref())?;
+                if let Some(cur) = store.get_skill(scope, &project, &name)? {
+                    let hits_latest = versions.as_ref().map(|v| v.contains(&cur.version)).unwrap_or(true);
+                    if hits_latest {
+                        let mut t = cur.clone();
+                        t.deleted = true;
+                        t.files.clear();
+                        t.content_hash.clear();
+                        store.put_skill(&t)?;
+                    }
                 }
-            }
-            store.enqueue(&PendingOp::PurgeSkill { scope, project, name: name.clone(), versions })?;
+                store.enqueue(&PendingOp::PurgeSkill { scope, project: project.clone(), name: name.clone(), versions: versions.clone() })
+            })?;
             println!("Purged skill {}. Other machines remove it at their next sync (locally edited copies are reported, not deleted).", name);
             println!("{}", ROTATE_WARNING);
             best_effort_sync(&store, &ctx).await;
         }
     }
     Ok(())
+}
+
+/// `skill purge --version <n>`'s name for the version in its question: with
+/// the machine that pushed it and when (UTC), as `atem skill history` shows
+/// them, when `history` (the relay's, if it could be read) lists it.
+fn purged_version_label(version: i64, history: Option<&[crate::memory::api::SkillVersionInfo]>) -> String {
+    match history.map(|history| history.iter().find(|v| v.version == version)) {
+        Some(Some(v)) if v.source_machine.is_empty() => format!("version {version} (pushed {} UTC)", format_datetime(v.created_at)),
+        Some(Some(v)) => format!("version {version} (pushed by {}, {} UTC)", v.source_machine, format_datetime(v.created_at)),
+        Some(None) => format!("version {version} (not in the relay's history of this skill)"),
+        None => format!("version {version}"),
+    }
 }
 
 /// `atem memory status`'s line for skill versions held because they don't
@@ -1184,6 +1211,17 @@ mod tests {
         assert!(!lines[1].contains("latest") && lines[1].contains("2026-10-03 14:09") && lines[1].ends_with("1 file"), "{}", lines[1]);
         assert!(lines[2].contains("deleted") && !lines[2].contains("file"), "{}", lines[2]);
         assert!(lines[3].contains("purged") && !lines[3].contains("deleted"), "{}", lines[3]);
+    }
+
+    /// The purge question names the version's author machine and time when
+    /// the relay's history has them.
+    #[test]
+    fn the_version_purge_question_names_who_pushed_it_and_when() {
+        let history = [info(5, "mac-mini", "claude", 4, false, false, 1_791_036_600), info(4, "", "codex", 1, false, false, 1_791_036_540)];
+        assert_eq!(purged_version_label(5, Some(&history)), "version 5 (pushed by mac-mini, 2026-10-03 14:10 UTC)");
+        assert_eq!(purged_version_label(4, Some(&history)), "version 4 (pushed 2026-10-03 14:09 UTC)");
+        assert_eq!(purged_version_label(3, Some(&history)), "version 3 (not in the relay's history of this skill)");
+        assert_eq!(purged_version_label(3, None), "version 3");
     }
 
     #[test]
