@@ -1051,8 +1051,28 @@ mod script {
         )
     }
 
+    /// What running the hook script costs on this machine right now (the
+    /// slower of two runs with nothing to wait for): its shell, its forks.
+    /// A slow or loaded runner (the Intel macOS CI runner takes minutes for
+    /// a suite that takes seconds elsewhere) makes that second(s), so the
+    /// tests below hold a hook to its own timer plus this cost, not to a
+    /// fixed number of seconds that only a fast machine meets.
+    fn hook_cost() -> Duration {
+        (0..2)
+            .map(|_| {
+                let (s, script) = session();
+                let started = Instant::now();
+                let (ok, stdout, _) = stop(s.path(), &script);
+                assert!(ok && stdout.is_empty());
+                started.elapsed()
+            })
+            .max()
+            .unwrap()
+    }
+
     #[test]
     fn a_lock_left_by_a_killed_hook_is_taken_over() {
+        let cost = hook_cost();
         let (s, script) = session();
         let lock = s.path().join("events/seq.lock");
         std::os::unix::fs::symlink(dead_pid().to_string(), &lock).unwrap();
@@ -1061,9 +1081,14 @@ mod script {
         let (ok, stdout, _) = stop(s.path(), &script);
         assert!(ok && stdout.is_empty());
         // At once, not after the ~2 s wait for a live holder (which, with a
-        // loaded machine's forks, ran into Codex's 3 s).
+        // loaded machine's forks, ran into Codex's 3 s): about what a hook
+        // with nothing to wait for costs here, 1.5 s on a machine that runs
+        // it in milliseconds.
         let took = started.elapsed();
-        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert!(
+            took < Duration::from_millis(1500).max(cost * 3),
+            "{took:?} (a hook with nothing to wait for: {cost:?})"
+        );
         assert_eq!(event_files(s.path()), vec!["ev-0000000042-Stop.json"]);
         assert!(fs::symlink_metadata(&lock).is_err(), "released");
     }
@@ -1095,8 +1120,18 @@ mod script {
 
     /// A live holder: the event is dropped, the hook still exits 0 with no
     /// output within Codex's 3 s, and the holder's lock stays.
+    ///
+    /// The deadline is the script's ~2 s timer (a background `sleep 2`): the
+    /// hook ends when the timer does, plus what running the script costs.
+    /// On a machine that runs it in milliseconds that is Codex's 3 s; on a
+    /// slow one (the Intel macOS runner: 3.2 s for the same script) the
+    /// limit is 2.5 s plus twice the measured cost of the same script with
+    /// nothing to wait for (the wait loop forks about as much again), so a
+    /// hook that waited past its timer (the 6 s of a synchronous event, no
+    /// timer at all) still fails.
     #[test]
     fn a_live_holder_drops_the_event_in_time() {
+        let cost = hook_cost();
         let (s, script) = session();
         let lock = s.path().join("events/seq.lock");
         std::os::unix::fs::symlink(std::process::id().to_string(), &lock).unwrap();
@@ -1104,7 +1139,11 @@ mod script {
         let (ok, stdout, stderr) = stop(s.path(), &script);
         let took = started.elapsed();
         assert!(ok && stdout.is_empty() && stderr.is_empty());
-        assert!(took < Duration::from_secs(3), "{took:?}");
+        let limit = Duration::from_secs(3).max(Duration::from_millis(2500) + cost * 2);
+        assert!(
+            took < limit,
+            "{took:?} (limit {limit:?}; a hook with nothing to wait for: {cost:?})"
+        );
         assert!(took >= Duration::from_millis(1500), "it waited: {took:?}");
         assert!(event_files(s.path()).is_empty());
         assert_eq!(

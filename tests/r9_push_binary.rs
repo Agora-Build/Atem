@@ -28,7 +28,10 @@ use support::{Sandbox, within};
 
 const ACCOUNT: &str = "acct-push";
 const HOST: &str = "host-push";
-const WAIT: Duration = Duration::from_secs(20);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 
 /// The device list's host clock (`ATEM_TEST_HOST_CLOCK`): the real wall
 /// clock plus an offset the test moves, the real monotonic clock and boot

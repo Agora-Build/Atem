@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
+
 /// Unix socket paths are limited to ~100 bytes; keep them short.
 fn short_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -127,7 +132,7 @@ impl Runtime {
 
     async fn shutdown(mut self) {
         let _ = self.stop.take().unwrap().send(());
-        tokio::time::timeout(Duration::from_secs(10), &mut self.server)
+        tokio::time::timeout(WAIT, &mut self.server)
             .await
             .expect("the server stops")
             .unwrap()
@@ -155,9 +160,9 @@ impl Runtime {
     }
 }
 
-/// The next message `pick` accepts (others skipped), within ten seconds.
+/// The next message `pick` accepts (others skipped), within `WAIT`.
 async fn expect<T>(client: &mut RuntimeClient, mut pick: impl FnMut(RuntimeMsg) -> Option<T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(WAIT, async {
         loop {
             let message = client.recv().await.unwrap().expect("the runtime closed");
             if let Some(value) = pick(message) {
@@ -236,7 +241,7 @@ impl View {
     }
 
     async fn until(&mut self, client: &mut RuntimeClient, text: &str) {
-        let found = tokio::time::timeout(Duration::from_secs(10), async {
+        let found = tokio::time::timeout(WAIT, async {
             while !self.screen.screen().contents().contains(text) {
                 let message = client.recv().await.unwrap().expect("the runtime closed");
                 self.apply(&message);
@@ -420,7 +425,10 @@ fn a_second_attach_moves_the_session_and_stop_reports_the_exit() {
         assert_eq!(sessions[0].state, "exited");
         // The broker released the worker: it removed its record.
         let record = record_file(&runtime, &session.id);
-        assert!(within(10, || !record.exists()).await, "the record stayed");
+        assert!(
+            within(WAIT.as_secs(), || !record.exists()).await,
+            "the record stayed"
+        );
         runtime.shutdown().await;
     });
 }
@@ -524,7 +532,7 @@ fn input_is_never_dropped_while_the_pty_queue_is_full() {
             }
             client
         };
-        let mut client = tokio::time::timeout(Duration::from_secs(30), writer)
+        let mut client = tokio::time::timeout(WAIT, writer)
             .await
             .expect("the runtime kept reading");
         // Until the agent has read as much as was sent (bounded), the
@@ -565,7 +573,7 @@ async fn raw_exchange(socket: &Path, lines: &[&str]) -> Vec<RuntimeMsg> {
     }
     let mut reader = BufReader::new(read);
     let mut replies = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(WAIT, async {
         let mut line = String::new();
         while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
             replies.push(decode_runtime(&line).unwrap());
@@ -625,7 +633,7 @@ fn another_protocol_restarts_a_runtime_without_sessions() {
             matches!(&replies[..], [RuntimeMsg::Error { text, .. }] if text.contains(super::client::RESTARTING)),
             "{replies:?}"
         );
-        tokio::time::timeout(Duration::from_secs(5), &mut runtime.server)
+        tokio::time::timeout(WAIT, &mut runtime.server)
             .await
             .expect("the runtime exits for the restart")
             .unwrap()
@@ -660,7 +668,7 @@ fn an_idle_runtime_exits_and_a_client_keeps_it_up() {
         );
         drop(client);
         let started = Instant::now();
-        tokio::time::timeout(Duration::from_secs(5), &mut runtime.server)
+        tokio::time::timeout(WAIT, &mut runtime.server)
             .await
             .expect("the idle runtime didn't exit")
             .unwrap()
@@ -900,7 +908,10 @@ fn a_new_broker_adopts_the_running_session_and_attach_restores_it() {
         })
         .await;
         let record = record_file(&second, &session.id);
-        assert!(within(10, || !record.exists()).await, "the record stayed");
+        assert!(
+            within(WAIT.as_secs(), || !record.exists()).await,
+            "the record stayed"
+        );
         second.shutdown().await;
     });
 }
@@ -933,7 +944,7 @@ fn an_adopted_worker_whose_agent_exited_is_released_and_its_record_removed() {
         // The agent exits with no broker: the worker records it and waits.
         let record = super::worker::record_path(&dir.path().join("state"), &session.id);
         assert!(
-            within(10, || super::worker::read_record(&record)
+            within(WAIT.as_secs(), || super::worker::read_record(&record)
                 .is_ok_and(|r| r.exited.is_some()))
             .await,
             "the exit was never recorded"
@@ -946,7 +957,10 @@ fn an_adopted_worker_whose_agent_exited_is_released_and_its_record_removed() {
         assert_eq!(sessions[0].id, session.id);
         assert!(sessions[0].exited.is_some());
         // Released: the worker removed its record and ended.
-        assert!(within(10, || !record.exists()).await, "the record stayed");
+        assert!(
+            within(WAIT.as_secs(), || !record.exists()).await,
+            "the record stayed"
+        );
         second.shutdown().await;
     });
 }
@@ -1176,9 +1190,9 @@ impl FakeWorker {
         let _ = self.lines.send(Vec::new());
     }
 
-    /// The broker's next message with `op` (others skipped), within 10 s.
+    /// The broker's next message with `op` (others skipped), within `WAIT`.
     async fn heard(&mut self, op: &str) -> serde_json::Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(WAIT, async {
             loop {
                 let message = self.heard.recv().await.expect("the broker closed");
                 if message["op"] == op {
@@ -1299,7 +1313,7 @@ fn stop_after_the_worker_went_away_names_a_worker_that_still_runs() {
         let mut client = runtime.client().await;
         fake.heard("request_screen").await;
         fake.close();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT;
         while list(&mut client).await[0].state != "interrupted" {
             assert!(Instant::now() < deadline, "never interrupted");
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1345,16 +1359,12 @@ fn an_undecodable_worker_line_is_an_error_and_reading_goes_on() {
             .unwrap();
         fake.lines.send(b"\xff\xfe not text\n".to_vec()).unwrap();
         fake.output("still here", 0);
-        let first = tokio::time::timeout(Duration::from_secs(5), handle.recv())
-            .await
-            .unwrap();
+        let first = tokio::time::timeout(WAIT, handle.recv()).await.unwrap();
         assert!(
             matches!(first, Some(super::worker_protocol::WorkerMsg::Error { .. })),
             "{first:?}"
         );
-        let second = tokio::time::timeout(Duration::from_secs(5), handle.recv())
-            .await
-            .unwrap();
+        let second = tokio::time::timeout(WAIT, handle.recv()).await.unwrap();
         assert!(
             matches!(
                 second,
@@ -1441,7 +1451,7 @@ fn a_passive_client_never_keeps_the_runtime_up() {
         let _menu = RuntimeClient::connect_passive_at(&runtime.socket)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), &mut runtime.server)
+        tokio::time::timeout(WAIT, &mut runtime.server)
             .await
             .expect("a passive client kept the idle runtime up")
             .unwrap()
@@ -1692,7 +1702,7 @@ fn a_runtime_of_another_build_is_replaced_and_its_sessions_kept() {
                 client.welcome.build, client.welcome.build
             )]
         );
-        tokio::time::timeout(Duration::from_secs(5), first.server)
+        tokio::time::timeout(WAIT, first.server)
             .await
             .expect("the old broker exited")
             .unwrap()
@@ -1939,7 +1949,7 @@ fn a_restarting_runtime_starts_nothing_new_and_tells_the_frontends() {
             matches!(m, RuntimeMsg::Restarting).then_some(())
         })
         .await;
-        tokio::time::timeout(Duration::from_secs(5), &mut runtime.server)
+        tokio::time::timeout(WAIT, &mut runtime.server)
             .await
             .expect("the runtime exits for the restart")
             .unwrap()

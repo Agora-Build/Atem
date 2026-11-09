@@ -14,6 +14,10 @@ use support::r9::{Router, client_ms, write_pin};
 use support::r9log::{MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const ACCOUNT: &str = "acct-station-selection";
 const HOST: &str = "host-station-selection";
 
@@ -62,7 +66,7 @@ fn request(router: &mut Router<'_>) -> Request {
 }
 
 fn accepted(router: &mut Router<'_>, offer: &Offer, blocked: bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         assert!(
             Instant::now() < deadline,
@@ -88,7 +92,7 @@ fn wait_data(
     handle: &str,
     accept: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     let mut seen = Vec::new();
     loop {
         assert!(
@@ -181,7 +185,7 @@ fn selected_relay_switch_preserves_worker_input_receipts_and_pairing() {
     let mut attached = router.connect("before", &log, HOST, &identity).unwrap();
     assert_eq!(router.list("before", &mut attached), [sid.clone()]);
     let process_gen = attached.target(&sid).unwrap().process_gen.clone();
-    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    let ready_deadline = Instant::now() + WAIT;
     loop {
         let conversation = uuid::Uuid::new_v4().to_string();
         let frame = attached.send(&json!({"type":"agentChat", "data": {"v":1,"op":"open",
@@ -245,7 +249,7 @@ fn selected_relay_switch_preserves_worker_input_receipts_and_pairing() {
         .host_policy_set(true, &uuid::Uuid::new_v4().to_string(), client_ms())
         .unwrap();
     router.frame("before", &frame);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         assert!(
             Instant::now() < deadline,
@@ -335,7 +339,7 @@ fn selected_relay_switch_preserves_worker_input_receipts_and_pairing() {
     // An unchanged true keeps the policy aligned before a newer false.
     let (_, frame) = attached.host_policy_get(false, client_ms()).unwrap();
     migrated.frame("custom", &frame);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         assert!(
             Instant::now() < deadline,
@@ -350,7 +354,7 @@ fn selected_relay_switch_preserves_worker_input_receipts_and_pairing() {
             .host_policy_set(relay_only, &uuid::Uuid::new_v4().to_string(), client_ms())
             .unwrap();
         migrated.frame("custom", &frame);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT;
         loop {
             assert!(Instant::now() < deadline, "policy result was not delivered");
             if migrated.events("custom", &mut attached).unwrap().iter().any(|e|

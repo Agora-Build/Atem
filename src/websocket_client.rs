@@ -2708,6 +2708,11 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// The longest a "wait until" helper waits. A passing run never gets near
+    /// it; a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of
+    /// tests) needs the slack, and a hung test still ends.
+    const WAIT: Duration = Duration::from_secs(60);
+
     /// §R9.9: the relay's `push_ack` (any `{"type":"relay",…}`) is kept
     /// raw for the runtime's r9 push; nothing else is taken for one.
     #[test]
@@ -2972,7 +2977,7 @@ mod tests {
         });
         let mut client = AstationClient::new();
         client.connect_raw(&format!("ws://{address}")).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(WAIT, async {
             while !client.is_ws_closed() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -3000,7 +3005,7 @@ mod tests {
         });
         let mut client = AstationClient::new();
         client.connect_raw(&format!("ws://{address}")).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(WAIT, async {
             while !client.is_ws_closed() {
                 tokio::task::yield_now().await;
             }
@@ -3027,7 +3032,7 @@ mod tests {
             completion: crate::memory::statements::SignedWire { statement: "c3RhdGVtZW50".into(), signature: "c2lnbmF0dXJl".into() },
         }).await.unwrap();
         drop(client);
-        let frame = tokio::time::timeout(Duration::from_secs(2), received).await.unwrap().unwrap();
+        let frame = tokio::time::timeout(WAIT, received).await.unwrap().unwrap();
         assert_eq!(frame["type"], "encryptionMigrationComplete");
         assert_eq!(frame["data"]["completion"]["statement"], "c3RhdGVtZW50");
     }
@@ -3506,7 +3511,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            let frame = tokio::time::timeout(WAIT, socket.next())
                 .await
                 .expect("timed out waiting for pairing request")
                 .expect("Atem closed before pairing request")
@@ -3595,7 +3600,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            tokio::time::timeout(Duration::from_secs(1), socket.next())
+            tokio::time::timeout(WAIT, socket.next())
                 .await
                 .expect("timed out waiting for pairing request")
                 .expect("Atem closed before pairing request")
@@ -3669,7 +3674,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let request = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            let request = tokio::time::timeout(WAIT, socket.next())
                 .await
                 .expect("timed out waiting for session proof")
                 .expect("Atem closed before session proof")
@@ -3906,7 +3911,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let request = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            let request = tokio::time::timeout(WAIT, socket.next())
                 .await
                 .expect("timed out waiting for authentication request")
                 .expect("Atem closed before authentication request")

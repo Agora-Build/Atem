@@ -5,13 +5,27 @@
 # what create produced).
 #
 # Usage:
-#   ./scripts/smoke-test.sh                              # uses active project
-#   APP_ID=... APP_CERT=... ./scripts/smoke-test.sh      # without active project
+#   ./scripts/run-local-dev-tests.sh                              # uses active project
+#   APP_ID=... APP_CERT=... ./scripts/run-local-dev-tests.sh      # without active project
 #
 # Requires: cargo build (uses ./target/debug/atem by default; override with ATEM=...)
 #
+# It runs against the profile of the HOME it is started in (~/.config/atem).
+# To keep your own profile out of it, give it a throwaway one (and the dummy
+# credentials the token and server checks need):
+#   T=$(mktemp -d); mkdir -p "$T/home" "$T/run"; chmod 700 "$T/run"
+#   env -u XDG_CONFIG_HOME HOME="$T/home" XDG_RUNTIME_DIR="$T/run" \
+#       APP_ID=0123456789abcdef0123456789abcdef APP_CERT=fedcba9876543210fedcba9876543210 \
+#       ./scripts/run-local-dev-tests.sh
+#
+# The `atem serv` pages need the access code each server prints in its URLs
+# (`?t=<code>`; web_server/access.rs): the checks read it from the server's
+# output, present it once to get the cookie and then send the cookie. A
+# request without either is a 404, which is checked too.
+#
 # Skips (interactive / network / external):
-#   atem login, atem logout, atem pair, atem unpair, atem repl
+#   atem login, atem logout, atem pair, atem unpair, atem repl, and
+#   `atem project list` when there is no login
 
 set -u
 
@@ -20,6 +34,43 @@ PASS=0
 FAIL=0
 SKIP=0
 FAILED_NAMES=()
+
+# The `atem serv` servers and temp files this run made, so an interrupted run
+# (Ctrl-C, SIGTERM, hang-up, an early exit) does not leave servers on their
+# ports for the next run to trip over. The normal paths stop each server
+# themselves (stop_serv) and remove their files; the trap covers the rest.
+SERV_PIDS=()
+SMOKE_TMP=()
+
+# stop_serv <pid>: stops a server this run started and waits for it, so its
+# tunnels are reaped too.
+stop_serv() {
+    local pid="$1" p
+    local keep=()
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    for p in ${SERV_PIDS[@]+"${SERV_PIDS[@]}"}; do
+        [[ "$p" != "$pid" ]] && keep+=("$p")
+    done
+    SERV_PIDS=(${keep[@]+"${keep[@]}"})
+}
+
+cleanup() {
+    local pid f
+    for pid in ${SERV_PIDS[@]+"${SERV_PIDS[@]}"}; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in ${SERV_PIDS[@]+"${SERV_PIDS[@]}"}; do
+        wait "$pid" 2>/dev/null || true
+    done
+    for f in ${SMOKE_TMP[@]+"${SMOKE_TMP[@]}"}; do
+        rm -f "$f"
+    done
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Allow overriding via env so token commands work even with no active project.
 if [[ -n "${APP_ID:-}" ]]; then
@@ -90,6 +141,69 @@ skip() {
     SKIP=$((SKIP + 1))
 }
 
+# run_needs_login <name> -- <command...>
+#   Like `run`, but a command refused by the login gate (auth::login_gate_message:
+#   "<feature> requires `atem login` (your Agora account).") is a SKIP: there is
+#   no login on this machine, which is not what the check is about.
+run_needs_login() {
+    local name="$1"; shift
+    [[ "$1" == "--" ]] && shift
+
+    local output
+    output="$("$@" 2>&1)"
+    local rc=$?
+
+    if [[ "$rc" != 0 && "$output" == *'requires `atem login`'* ]]; then
+        skip "$name" "no login — run atem login first"
+        return
+    fi
+
+    printf "  %s ... " "$(dim "$name")"
+    if [[ "$rc" == 0 ]]; then
+        green "PASS"; echo
+        PASS=$((PASS + 1))
+    else
+        red "FAIL"; echo " (exit=$rc, expected=0)"
+        echo "$output" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("$name")
+    fi
+}
+
+# ── `atem serv` access codes (web_server/access.rs) ──────────────────
+# Every server makes a code at each start and prints its URLs with `?t=<code>`.
+# A request carrying it gets a cookie for that port and a 302 to the same URL
+# without the code; every later request (page or API) needs the cookie;
+# anything else is a plain 404.
+
+# printed_code <log> <port> <pid>: the code in the "Local:" URL the server
+# (process <pid>) printed to <log>; empty when there is none. `serv rtc` and
+# `serv convo` print their URLs only after their tunnels started (each may
+# take 15 s, tunnels.rs START_TIMEOUT), so this waits up to 30 s, and stops
+# at once when the server died.
+printed_code() {
+    local log="$1" port="$2" pid="$3" code=""
+    for _ in $(seq 1 60); do
+        code="$(sed -n "s|.*:$port/?t=\([A-Za-z0-9_-]\{1,\}\).*|\1|p" "$log" 2>/dev/null | head -n 1)"
+        [[ -n "$code" ]] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    printf '%s' "$code"
+}
+
+# serv_access <label> <base-url> <code> <cookie-jar>
+#   Three checks of one server's gate; the last one leaves its cookie in the
+#   jar (curl -b <jar>) for the checks that follow.
+serv_access() {
+    local label="$1" base="$2" code="$3" jar="$4"
+    run "$label — prints an access code in its URL" -- test -n "$code"
+    run_contains "$label — without the access code is 404" "404" \
+        -- curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "$base/"
+    run_contains "$label — the printed link (?t=code) sets the cookie and opens the page" "200" \
+        -- curl -sk --max-time 5 -L -c "$jar" -b "$jar" -o /dev/null -w '%{http_code}' "$base/?t=$code"
+}
+
 # ── Pre-flight ───────────────────────────────────────────────────────
 echo "$(green "atem smoke test") — binary: $ATEM"
 if [[ ! -x "$ATEM" ]]; then
@@ -131,13 +245,10 @@ echo
 
 # ── List (requires SSO login or cache) ───────────────────────────────
 echo "$(yellow "List (requires SSO login)")"
-if [[ -f "$HOME/.config/atem/login.enc" || -f "$HOME/.config/atem/pairing/pairing.enc" ]]; then
-    run "atem project list"                      -- "$ATEM" project list
-    run "atem project list --show-certificates"  -- "$ATEM" project list --show-certificates
-else
-    skip "atem project list"                    "no login.enc or pairing — run atem login first"
-    skip "atem project list --show-certificates" "needs SSO"
-fi
+# The login gate is a local check (no network): without a login both commands
+# are refused with its message, which run_needs_login reports as a SKIP.
+run_needs_login "atem project list"                      -- "$ATEM" project list
+run_needs_login "atem project list --show-certificates"  -- "$ATEM" project list --show-certificates
 echo
 
 # ── Token: RTC create + decode round-trip ───────────────────────────
@@ -317,11 +428,13 @@ echo "$(yellow "RTC test server (/api/token)")"
 RTC_PORT=18443
 RTC_PID=""
 RTC_LOG="$(mktemp -t atem-rtc.XXXXXX.log)"
+SMOKE_TMP+=("$RTC_LOG")
 
 # Only attempt if we have credentials (active project or env vars)
 if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HOME/.config/atem/project_cache.enc" ]]; then
-    "$ATEM" serv rtc --channel smoketest --port "$RTC_PORT" >"$RTC_LOG" 2>&1 &
+    "$ATEM" serv rtc --channel smoketest --port "$RTC_PORT" --no-browser >"$RTC_LOG" 2>&1 &
     RTC_PID=$!
+    SERV_PIDS+=("$RTC_PID")
     # wait up to 10s for the TLS port to be accepting connections
     for _ in $(seq 1 20); do
         if curl -sk --max-time 1 "https://127.0.0.1:$RTC_PORT/" -o /dev/null 2>/dev/null; then
@@ -330,10 +443,15 @@ if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HO
         sleep 0.5
     done
 
+    RTC_CODE="$(printed_code "$RTC_LOG" "$RTC_PORT" "$RTC_PID")"
+    RTC_JAR="$(mktemp -t atem-rtc-jar.XXXXXX)"
+    SMOKE_TMP+=("$RTC_JAR")
+    serv_access "atem serv rtc" "https://127.0.0.1:$RTC_PORT" "$RTC_CODE" "$RTC_JAR"
+
     # ── Test 1: 50× POST /api/token, count non-200 responses
     printf "  %s ... " "$(dim "atem serv rtc — 50× /api/token (no 400s)")"
     counts="$(for i in $(seq 1 50); do
-        curl -sk --max-time 5 -X POST "https://127.0.0.1:$RTC_PORT/api/token" \
+        curl -sk --max-time 5 -b "$RTC_JAR" -X POST "https://127.0.0.1:$RTC_PORT/api/token" \
             -H 'Content-Type: application/json' \
             -d '{"channel":"smoketest","uid":"123"}' \
             -o /dev/null -w '%{http_code}\n'
@@ -364,6 +482,7 @@ try:
     headers = (
         f"POST /api/token HTTP/1.1\r\n"
         f"Host: localhost:$RTC_PORT\r\n"
+        f"Cookie: atem_access_$RTC_PORT=$RTC_CODE\r\n"
         f"Content-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\n\r\n"
     ).encode()
@@ -396,14 +515,13 @@ PY
 
     # cleanup
     if [[ -n "$RTC_PID" ]]; then
-        kill "$RTC_PID" 2>/dev/null || true
-        wait "$RTC_PID" 2>/dev/null || true
+        stop_serv "$RTC_PID"
     fi
 else
     skip "atem serv rtc — 50× /api/token"        "no AGORA_APP_ID / active project"
     skip "atem serv rtc — split-write POST"      "no AGORA_APP_ID / active project"
 fi
-rm -f "$RTC_LOG"
+rm -f "$RTC_LOG" "${RTC_JAR:-}"
 echo
 
 # ── Convo test server ───────────────────────────────────────────────
@@ -429,6 +547,7 @@ fi
 
 # Typo in [atem] section — deny_unknown_fields should reject it.
 TYPO_TOML="$(mktemp -t atem-typo.XXXXXX.toml)"
+SMOKE_TMP+=("$TYPO_TOML")
 cat > "$TYPO_TOML" <<'EOF'
 [atem]
 hippa = true
@@ -456,28 +575,34 @@ if [[ -f tests/fixtures/convo_full.toml ]] && {
 }; then
     CONVO_PORT=19911
     CONVO_LOG="$(mktemp -t atem-convo.XXXXXX.log)"
+    SMOKE_TMP+=("$CONVO_LOG")
     "$ATEM" serv convo --config tests/fixtures/convo_full.toml \
         --port "$CONVO_PORT" --no-browser >"$CONVO_LOG" 2>&1 &
     CONVO_PID=$!
+    SERV_PIDS+=("$CONVO_PID")
     # Wait up to 10s for TLS port
     for _ in $(seq 1 20); do
         curl -sk --max-time 1 "https://127.0.0.1:$CONVO_PORT/" -o /dev/null 2>/dev/null && break
         sleep 0.5
     done
 
+    CONVO_CODE="$(printed_code "$CONVO_LOG" "$CONVO_PORT" "$CONVO_PID")"
+    CONVO_JAR="$(mktemp -t atem-convo-jar.XXXXXX)"
+    SMOKE_TMP+=("$CONVO_JAR")
+    serv_access "atem serv convo" "https://127.0.0.1:$CONVO_PORT" "$CONVO_CODE" "$CONVO_JAR"
+
     run_contains "atem serv convo — GET /" "Welcome to Agora" \
-        -- curl -sk "https://127.0.0.1:$CONVO_PORT/"
+        -- curl -sk -b "$CONVO_JAR" "https://127.0.0.1:$CONVO_PORT/"
     run_contains "atem serv convo — GET /vendor/conversational-ai-api.js" "ConversationalAIAPI" \
-        -- curl -sk "https://127.0.0.1:$CONVO_PORT/vendor/conversational-ai-api.js"
+        -- curl -sk -b "$CONVO_JAR" "https://127.0.0.1:$CONVO_PORT/vendor/conversational-ai-api.js"
     run_contains "atem serv convo — POST /api/token" "007" \
-        -- bash -c "curl -sk -X POST https://127.0.0.1:$CONVO_PORT/api/token -H 'Content-Type: application/json' -d '{\"channel\":\"demo\",\"uid\":\"42\"}'"
+        -- bash -c "curl -sk -b '$CONVO_JAR' -X POST https://127.0.0.1:$CONVO_PORT/api/token -H 'Content-Type: application/json' -d '{\"channel\":\"demo\",\"uid\":\"42\"}'"
     run_contains "atem serv convo — GET /api/convo/status" "\"running\":false" \
-        -- curl -sk "https://127.0.0.1:$CONVO_PORT/api/convo/status"
+        -- curl -sk -b "$CONVO_JAR" "https://127.0.0.1:$CONVO_PORT/api/convo/status"
 
     # Cleanup
-    kill "$CONVO_PID" 2>/dev/null || true
-    wait "$CONVO_PID" 2>/dev/null || true
-    rm -f "$CONVO_LOG"
+    stop_serv "$CONVO_PID"
+    rm -f "$CONVO_LOG" "$CONVO_JAR"
 elif [[ ! -f tests/fixtures/convo_full.toml ]]; then
     skip "atem serv convo — GET /"                              "no tests/fixtures/convo_full.toml"
     skip "atem serv convo — GET /vendor/conversational-ai-api.js" "no tests/fixtures/convo_full.toml"
@@ -495,17 +620,26 @@ echo
 echo "$(yellow "Webhooks server")"
 WEBHOOK_PORT=19191
 WEBHOOK_LOG="$(mktemp -t atem-webhooks.XXXXXX.log)"
+SMOKE_TMP+=("$WEBHOOK_LOG")
 "$ATEM" serv webhooks --port "$WEBHOOK_PORT" --no-tunnel --no-browser >"$WEBHOOK_LOG" 2>&1 &
 WEBHOOK_PID=$!
+SERV_PIDS+=("$WEBHOOK_PID")
 # Wait up to 5s for HTTP listener
 for _ in $(seq 1 10); do
     curl -s --max-time 1 "http://127.0.0.1:$WEBHOOK_PORT/" -o /dev/null 2>/dev/null && break
     sleep 0.5
 done
 
-run_contains "atem serv webhooks — GET /" "atem serv webhooks" \
-    -- curl -s "http://127.0.0.1:$WEBHOOK_PORT/"
+WEBHOOK_CODE="$(printed_code "$WEBHOOK_LOG" "$WEBHOOK_PORT" "$WEBHOOK_PID")"
+WEBHOOK_JAR="$(mktemp -t atem-webhooks-jar.XXXXXX)"
+SMOKE_TMP+=("$WEBHOOK_JAR")
+serv_access "atem serv webhooks" "http://127.0.0.1:$WEBHOOK_PORT" "$WEBHOOK_CODE" "$WEBHOOK_JAR"
 
+run_contains "atem serv webhooks — GET /" "atem serv webhooks" \
+    -- curl -s -b "$WEBHOOK_JAR" "http://127.0.0.1:$WEBHOOK_PORT/"
+
+# POST /webhook is the one route that needs no code: Agora's registered URL
+# can't carry it (the signature guards it).
 run_contains "atem serv webhooks — POST /webhook (unsigned, 200)" '{"ok":true}' \
     -- bash -c "curl -s -X POST http://127.0.0.1:$WEBHOOK_PORT/webhook \
         -H 'Content-Type: application/json' \
@@ -513,7 +647,7 @@ run_contains "atem serv webhooks — POST /webhook (unsigned, 200)" '{"ok":true}
 
 # Unknown route should 404
 printf "  %s ... " "$(dim "atem serv webhooks — GET /no-such returns 404")"
-status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEBHOOK_PORT/no-such")
+status=$(curl -s -b "$WEBHOOK_JAR" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEBHOOK_PORT/no-such")
 if [[ "$status" == "404" ]]; then
     green "PASS"; echo
     PASS=$((PASS + 1))
@@ -538,9 +672,8 @@ else
     FAILED_NAMES+=("atem serv webhooks — log line")
 fi
 
-kill "$WEBHOOK_PID" 2>/dev/null || true
-wait "$WEBHOOK_PID" 2>/dev/null || true
-rm -f "$WEBHOOK_LOG"
+stop_serv "$WEBHOOK_PID"
+rm -f "$WEBHOOK_LOG" "$WEBHOOK_JAR"
 echo
 
 # ── Interactive / external commands (intentionally skipped) ─────────

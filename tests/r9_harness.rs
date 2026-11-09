@@ -61,7 +61,10 @@ use support::{Sandbox, within};
 
 const ACCOUNT: &str = "acct-harness";
 const HOST: &str = "host-harness";
-const WAIT: Duration = Duration::from_secs(20);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 
 fn count(var: &str, default: usize) -> usize {
     std::env::var(var)
