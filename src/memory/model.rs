@@ -72,6 +72,21 @@ impl Memory {
     pub fn valid_from(&self) -> i64 {
         self.valid_at.unwrap_or(self.created_at)
     }
+
+    /// Its project is one this Atem can't name yet; see `is_unresolved_project`.
+    pub fn has_unresolved_project(&self) -> bool {
+        is_unresolved_project(&self.project)
+    }
+}
+
+/// A project pulled as the relay's `h1.` keyed hash that this Atem has no
+/// name for yet (encryption on, the project never used here). The row keeps
+/// the hash until the name is known, and is never applied meanwhile (see
+/// designs/atem-memory.md "Projects not known here yet"). A project key
+/// never has this shape: it is `<host>/<path>` (a `/` is neither hex nor a
+/// kid character) or `local:<folder>`.
+pub fn is_unresolved_project(project: &str) -> bool {
+    atem_client::project::is_project_hash(project)
 }
 
 /// The wire/queue shape of `Memory`. Rows without the 1.1 fields (an older
@@ -131,7 +146,8 @@ impl From<Memory> for MemoryWire {
 }
 
 /// One skill version. `files` maps a relative path to raw bytes and is
-/// serialized as `{path: base64}`.
+/// serialized as `{path: base64}`: the form the local store and queue keep
+/// (and the Station stores). The skill file transport on the wire is `skill_wire`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Skill {
     pub scope: Scope,
@@ -149,6 +165,47 @@ pub struct Skill {
     pub deleted: bool,
     #[serde(default)]
     pub seq: i64,
+}
+
+impl Skill {
+    /// Its project is one this Atem can't name yet; see `is_unresolved_project`.
+    pub fn has_unresolved_project(&self) -> bool {
+        is_unresolved_project(&self.project)
+    }
+}
+
+/// A pulled skill version whose files don't open on this Atem (they fail to
+/// authenticate, name a key it doesn't hold, or are malformed inside a
+/// well-formed row): never applied, installed or injected; held and
+/// reported until a later version, a tombstone or a purge of that skill
+/// replaces it. It keeps no files and no plain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSkill {
+    pub scope: Scope,
+    /// As its readable versions are stored: the name when this Atem knows
+    /// it, else the hash it was pulled under.
+    pub project: String,
+    pub name: String,
+    pub version: i64,
+    pub seq: i64,
+    /// Why it doesn't open (the field error, never content).
+    pub reason: String,
+}
+
+/// A pulled skill row: opened (or, before it is opened, as fetched), or held.
+#[derive(Debug, Clone)]
+pub enum PulledSkill {
+    Row(Skill),
+    Held(HeldSkill),
+}
+
+impl PulledSkill {
+    pub fn seq(&self) -> i64 {
+        match self {
+            Self::Row(skill) => skill.seq,
+            Self::Held(held) => held.seq,
+        }
+    }
 }
 
 /// Trim, collapse runs of whitespace, lowercase. Used only for hashing.

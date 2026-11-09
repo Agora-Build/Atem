@@ -1,0 +1,35 @@
+{
+  "description": "A representative large skill file and its wire expansion: file_bytes bytes of `line` repeated, its path and file sealed under the synthetic key with the fixed nonces; the push bodies are one push op of `skill` with that file.",
+  "expect": {
+    "e1_text_value_bytes": 1398168,
+    "file_envelope_sha256": "5348e1cefda012db4f99bce66fea5591d332e60118a03231f60c81e71ed45b42",
+    "legacy_value_bytes": 1864224,
+    "push_body_e1_text_bytes": 1398603,
+    "push_body_legacy_bytes": 1864632,
+    "ratio_e1_text_value": "1.3334",
+    "ratio_legacy_value": "1.7779",
+    "ratio_push_body_e1_text": "1.3338",
+    "ratio_push_body_legacy": "1.7783"
+  },
+  "file_bytes": 1048576,
+  "file_nonce_hex": "555555555555555555555555555555555555555555555555",
+  "key_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "kid": "0123abcd",
+  "line": "a sealed skill file travels as its e1 text, encoded only once.\n",
+  "path": "reference/large.md",
+  "path_nonce_hex": "444444444444444444444444444444444444444444444444",
+  "record": "global:large:1",
+  "skill": {
+    "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "created_at": 1700000000,
+    "deleted": false,
+    "files": {},
+    "name": "large",
+    "project": "",
+    "scope": "global",
+    "seq": 7,
+    "source_agent": "test",
+    "source_machine": "synthetic",
+    "version": 1
+  }
+}

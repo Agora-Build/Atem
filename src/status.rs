@@ -683,6 +683,7 @@ pub(crate) mod tests {
                     storage_kid: Some("0a1b2c3d".into()),
                     escrowed: self.escrowed,
                     build: self.build.clone(),
+                    frames: None,
                 }),
                 _ => Err(anyhow!("not in this test")),
             }

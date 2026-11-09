@@ -161,7 +161,7 @@ impl OpEnv {
     pub fn for_user() -> Self {
         Self {
             profile: Arc::new(Sources::current),
-            agent: Arc::new(|| Ok(Arc::from(default_agent()))),
+            agent: Arc::new(|| Ok(default_agent())),
             link_wait: LINK_WAIT,
         }
     }

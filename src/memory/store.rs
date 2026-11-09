@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::memory::model::{Memory, Scope, Skill};
+use crate::memory::model::{HeldSkill, Memory, Scope, Skill};
 
 /// Legacy, unkeyed cursor names. Only the per-account keys below are read;
 /// a cursor stored under these bare names is ignored.
@@ -110,11 +110,16 @@ CREATE TABLE IF NOT EXISTS skills (
   scope TEXT NOT NULL, project TEXT NOT NULL, name TEXT NOT NULL,
   version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL,
   PRIMARY KEY (scope, project, name));
-CREATE TABLE IF NOT EXISTS pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL,
+  refused_for_now INTEGER NOT NULL DEFAULT 0, refused_since INTEGER, refused_run INTEGER, refused_state TEXT);
 CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS harvest_map (
   origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS replacements (new_id TEXT NOT NULL, old_id TEXT NOT NULL, PRIMARY KEY (new_id, old_id));
+CREATE TABLE IF NOT EXISTS held_skills (
+  scope TEXT NOT NULL, project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,
+  seq INTEGER NOT NULL, reason TEXT NOT NULL, noted INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (scope, project, name, version));
 ";
 
 /// Full-text index over `memories.content`: external content, and trigram
@@ -176,6 +181,43 @@ fn migrate_memories(conn: &Connection) -> Result<()> {
     }
     if has("deleted") {
         tx.execute_batch("ALTER TABLE memories DROP COLUMN deleted")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The columns of a run of refusals for now (`Store::refused_for_now`).
+const REFUSED_COLUMNS: [(&str, &str); 4] = [
+    ("refused_for_now", "INTEGER NOT NULL DEFAULT 0"),
+    ("refused_since", "INTEGER"),
+    ("refused_run", "INTEGER"),
+    ("refused_state", "TEXT"),
+];
+
+fn pending_ops_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(pending_ops)")?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(cols)
+}
+
+fn pending_ops_current(conn: &Connection) -> Result<bool> {
+    let cols = pending_ops_columns(conn)?;
+    Ok(REFUSED_COLUMNS.iter().all(|(c, _)| cols.iter().any(|x| x == c)))
+}
+
+/// Add the columns of a run of refusals for now (`Store::refused_for_now`)
+/// to an older `pending_ops`. Same IMMEDIATE pattern as `migrate_memories`.
+/// An older atem still reads and writes the table (it names its columns).
+fn migrate_pending_ops(conn: &Connection) -> Result<()> {
+    if pending_ops_current(conn)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let cols = pending_ops_columns(&tx)?;
+    for (c, ty) in REFUSED_COLUMNS {
+        if !cols.iter().any(|x| x == c) {
+            tx.execute_batch(&format!("ALTER TABLE pending_ops ADD COLUMN {c} {ty}"))?;
+        }
     }
     tx.commit()?;
     Ok(())
@@ -273,6 +315,22 @@ pub struct Store {
     conn: Connection,
 }
 
+/// The `sync_state` key counting syncs (`sync::run_sync`, one per run): a
+/// run of refusals for now is only "in a row" across consecutive runs.
+pub const SYNC_RUNS: &str = "sync_runs";
+
+/// A queued op's run of refusals for now (`Store::refused_for_now`): how
+/// many syncs in a row refused it, since when (unix seconds), at which sync
+/// (`SYNC_RUNS`) the last one was, and the state it was sealed under then
+/// (`api::SealState::fingerprint`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefusedRun {
+    pub count: i64,
+    pub since: Option<i64>,
+    pub run: Option<i64>,
+    pub state: Option<String>,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
@@ -310,6 +368,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrate_memories(&conn)?;
         migrate_replacements(&conn)?;
+        migrate_pending_ops(&conn)?;
         setup_fts(&conn)?;
         Ok(Store { conn })
     }
@@ -321,6 +380,12 @@ impl Store {
         let out = f()?; // an error drops `tx`, which rolls back
         tx.commit()?;
         Ok(out)
+    }
+
+    /// Tests only: the connection itself, for fault-injection triggers.
+    #[cfg(test)]
+    pub(crate) fn test_conn(&self) -> &Connection {
+        &self.conn
     }
 
     // ── memories ────────────────────────────────────────────────────────
@@ -519,7 +584,7 @@ impl Store {
         self.conn.execute("DELETE FROM replacements WHERE old_id = ?1", params![old])?;
         // Queued ops that still name the old id (e.g. replace's invalidate,
         // when a chunk boundary fell after its add).
-        for (n, op) in self.pending()? {
+        for (n, op) in self.pending_naming(old)? {
             let fixed = match op {
                 PendingOp::InvalidateMemory { id, invalid_at, superseded_by }
                     if id == old || superseded_by.as_deref() == Some(old) =>
@@ -572,6 +637,61 @@ impl Store {
         Ok(self.all_skills()?.into_iter().filter(|s| !s.deleted).collect())
     }
 
+    // ── projects not known here yet (`model::is_unresolved_project`) ──────
+    /// The project hashes memories and skills are stored under because this
+    /// Atem had no name for them when they were pulled.
+    pub fn unresolved_projects(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project FROM memories WHERE project LIKE 'h1.%' UNION SELECT project FROM skills WHERE project LIKE 'h1.%' ORDER BY 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let projects = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(projects.into_iter().filter(|p| crate::memory::model::is_unresolved_project(p)).collect())
+    }
+
+    /// Applies what `EncryptionContext::learn_project_names` found, in one
+    /// transaction. Each named hash's memories and skills move to its name,
+    /// like rows pulled with it. A skill already stored under the name stays
+    /// unless the moved one is later: a higher version, or the same version
+    /// with a higher seq (a purge rewrites its version in place). A local
+    /// unpushed edit (seq 0) always has the higher version. Skills under a
+    /// `stale` hash are dropped: it can never be named here, and a migration
+    /// delivers what is still live again. Memories are kept: the migration
+    /// rewrites each one by id. Held skill versions move and go the same way.
+    pub fn resolve_projects(&self, named: &[(String, String)], stale: &[String]) -> Result<()> {
+        self.in_transaction(|| {
+            for (hash, name) in named {
+                self.conn.execute("UPDATE memories SET project = ?2 WHERE project = ?1", params![hash, name])?;
+                for mut s in self.skills_under(hash)? {
+                    match self.get_skill(s.scope, name, &s.name)? {
+                        Some(cur) if (s.version, s.seq) <= (cur.version, cur.seq) => {}
+                        _ => {
+                            s.project = name.clone();
+                            self.put_skill(&s)?;
+                        }
+                    }
+                }
+                self.conn.execute("DELETE FROM skills WHERE project = ?1", params![hash])?;
+                self.conn.execute("UPDATE OR REPLACE held_skills SET project = ?2 WHERE project = ?1", params![hash, name])?;
+            }
+            for hash in stale {
+                self.conn.execute("DELETE FROM skills WHERE project = ?1", params![hash])?;
+                self.conn.execute("DELETE FROM held_skills WHERE project = ?1", params![hash])?;
+            }
+            Ok(())
+        })
+    }
+
+    fn skills_under(&self, project: &str) -> Result<Vec<Skill>> {
+        let mut stmt = self.conn.prepare("SELECT data FROM skills WHERE project = ?1")?;
+        let rows = stmt.query_map(params![project], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
     // ── pending ops ─────────────────────────────────────────────────────
     pub fn enqueue(&self, op: &PendingOp) -> Result<()> {
         self.conn.execute("INSERT INTO pending_ops (payload) VALUES (?1)", params![serde_json::to_string(op)?])?;
@@ -589,8 +709,74 @@ impl Store {
         Ok(out)
     }
 
+    /// Up to `limit` queued ops of one kind (memory ops when `memory`, else
+    /// skill ops) after op `after`, in queue order. `n` only grows
+    /// (AUTOINCREMENT), so a caller that walks the queue from the last `n` it
+    /// sent reads each op once, and still sees what changed since its last
+    /// read: ops queued meanwhile, and queued ops an earlier batch's results
+    /// rewrote. Rows are decoded only until `limit` ops are found.
+    pub fn pending_after(&self, after: i64, memory: bool, limit: usize) -> Result<Vec<(i64, PendingOp)>> {
+        let mut stmt = self.conn.prepare("SELECT n, payload FROM pending_ops WHERE n > ?1 ORDER BY n")?;
+        let mut rows = stmt.query(params![after])?;
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            let op: PendingOp = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            if op.is_memory() == memory {
+                out.push((row.get(0)?, op));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Queued op `n`, or `None` once it was acked.
+    pub fn pending_op(&self, n: i64) -> Result<Option<PendingOp>> {
+        let payload: Option<String> = self.conn
+            .query_row("SELECT payload FROM pending_ops WHERE n = ?1", params![n], |r| r.get(0))
+            .optional()?;
+        payload.map(|p| serde_json::from_str(&p).map_err(anyhow::Error::from)).transpose()
+    }
+
+    /// Queued ops whose payload contains `id` as a JSON string, in queue
+    /// order: every op with a field equal to `id` (serde_json writes a string
+    /// the same way each time), and possibly others that mention it, so
+    /// callers still compare the fields. Skips decoding the rest of the queue.
+    fn pending_naming(&self, id: &str) -> Result<Vec<(i64, PendingOp)>> {
+        let needle = serde_json::to_string(id)?;
+        let mut stmt = self.conn.prepare("SELECT n, payload FROM pending_ops WHERE instr(payload, ?1) > 0 ORDER BY n")?;
+        let rows = stmt.query_map(params![needle], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (n, p) = row?;
+            out.push((n, serde_json::from_str(&p)?));
+        }
+        Ok(out)
+    }
+
     pub fn ack(&self, n: i64) -> Result<()> {
         self.conn.execute("DELETE FROM pending_ops WHERE n = ?1", params![n])?;
+        Ok(())
+    }
+
+    /// Queued op `n`'s run of refusals for now (`sync::apply_batch`); the
+    /// default before any. It goes with the op when it is acked.
+    pub fn refused_for_now(&self, n: i64) -> Result<RefusedRun> {
+        Ok(self.conn
+            .query_row(
+                "SELECT refused_for_now, refused_since, refused_run, refused_state FROM pending_ops WHERE n = ?1",
+                params![n],
+                |r| Ok(RefusedRun { count: r.get(0)?, since: r.get(1)?, run: r.get(2)?, state: r.get(3)? }),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Records queued op `n`'s run of refusals for now.
+    pub fn set_refused_for_now(&self, n: i64, run: &RefusedRun) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pending_ops SET refused_for_now = ?2, refused_since = ?3, refused_run = ?4, refused_state = ?5 WHERE n = ?1",
+            params![n, run.count, run.since, run.run, run.state],
+        )?;
         Ok(())
     }
 
@@ -664,11 +850,115 @@ impl Store {
         let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM harvest_map WHERE status = 'held_back'", [], |r| r.get(0))?;
         Ok(n as usize)
     }
+
+    /// Valid memories on this machine only: never synced (no relay seq) and
+    /// not queued to be (refused by the relay for good, or added with
+    /// `--force` over a credential finding). Reads only the queued adds' ids.
+    pub fn local_only_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories m WHERE m.seq = 0 AND m.deleted_at IS NULL AND m.invalid_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM pending_ops p WHERE json_extract(p.payload, '$.op') = 'add_memory'
+                 AND json_extract(p.payload, '$.memory.id') = m.id)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Whether a push of the skill (scope, project, name) is queued. Reads
+    /// only the queued pushes' keys (`json_extract`), never their files.
+    pub fn has_queued_push(&self, scope: Scope, project: &str, name: &str) -> Result<bool> {
+        let found: Option<i64> = self.conn.query_row(
+            "SELECT 1 FROM pending_ops WHERE json_extract(payload, '$.op') = 'push_skill'
+               AND json_extract(payload, '$.skill.scope') = ?1
+               AND json_extract(payload, '$.skill.project') = ?2
+               AND json_extract(payload, '$.skill.name') = ?3 LIMIT 1",
+            params![scope.as_str(), project, name],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(found.is_some())
+    }
+
+    // ── held skill versions (`model::HeldSkill`) ────────────────────────
+    /// Records a pulled version that doesn't open here. Pulled again (a page
+    /// fetched twice), it stays reported once.
+    pub fn hold_skill(&self, held: &HeldSkill) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO held_skills (scope, project, name, version, seq, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(scope, project, name, version) DO UPDATE SET seq = excluded.seq, reason = excluded.reason",
+            params![held.scope.as_str(), held.project, held.name, held.version, held.seq, held.reason],
+        )?;
+        Ok(())
+    }
+
+    /// A readable version `through` of the skill arrived (a later version, a
+    /// tombstone, or the held version itself purged or rewritten): the holds
+    /// it replaces go.
+    pub fn clear_held_skills(&self, scope: Scope, project: &str, name: &str, through: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM held_skills WHERE scope = ?1 AND project = ?2 AND name = ?3 AND version <= ?4",
+            params![scope.as_str(), project, name, through],
+        )?;
+        Ok(())
+    }
+
+    pub fn held_skills(&self) -> Result<Vec<HeldSkill>> {
+        self.select_held("SELECT scope, project, name, version, seq, reason FROM held_skills ORDER BY scope, project, name, version")
+    }
+
+    /// The holds not reported yet, now marked reported (one sync note each).
+    pub fn take_new_held_skills(&self) -> Result<Vec<HeldSkill>> {
+        let held = self.select_held(
+            "SELECT scope, project, name, version, seq, reason FROM held_skills WHERE noted = 0 ORDER BY scope, project, name, version",
+        )?;
+        self.conn.execute("UPDATE held_skills SET noted = 1 WHERE noted = 0", [])?;
+        Ok(held)
+    }
+
+    fn select_held(&self, sql: &str) -> Result<Vec<HeldSkill>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?;
+        rows.map(|row| {
+            let (scope, project, name, version, seq, reason) = row?;
+            Ok(HeldSkill { scope: Scope::parse(&scope)?, project, name, version, seq, reason })
+        })
+        .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_skill_versions_are_reported_once_and_cleared_by_a_later_one() {
+        let s = Store::open_in_memory().unwrap();
+        let held = |name: &str, project: &str, version| HeldSkill {
+            scope: Scope::Project, project: project.into(), name: name.into(), version, seq: version * 10,
+            reason: "encrypted field authentication failed".into(),
+        };
+        s.hold_skill(&held("deploy", "github.com/a/b", 2)).unwrap();
+        s.hold_skill(&held("deploy", "github.com/a/b", 4)).unwrap();
+        s.hold_skill(&held("lint", "h1.0123abcd.ff", 1)).unwrap();
+        assert_eq!(s.take_new_held_skills().unwrap().len(), 3);
+        // Pulled again: still held, not reported again.
+        s.hold_skill(&held("deploy", "github.com/a/b", 2)).unwrap();
+        assert!(s.take_new_held_skills().unwrap().is_empty());
+        assert_eq!(s.held_skills().unwrap().len(), 3);
+        // A readable v3 replaces v2 only; another scope or project replaces nothing.
+        s.clear_held_skills(Scope::Project, "github.com/a/b", "deploy", 3).unwrap();
+        s.clear_held_skills(Scope::Global, "github.com/a/b", "deploy", 9).unwrap();
+        let left: Vec<(String, i64)> = s.held_skills().unwrap().into_iter().map(|h| (h.name, h.version)).collect();
+        assert_eq!(left, vec![("deploy".to_string(), 4), ("lint".to_string(), 1)]);
+        // A hash named since moves with its skills; a stale one goes.
+        s.resolve_projects(&[("h1.0123abcd.ff".into(), "github.com/c/d".into())], &[]).unwrap();
+        assert!(s.held_skills().unwrap().iter().any(|h| h.name == "lint" && h.project == "github.com/c/d"));
+        s.hold_skill(&held("old", "h1.89abcdef.ee", 1)).unwrap();
+        s.resolve_projects(&[], &["h1.89abcdef.ee".into()]).unwrap();
+        assert!(s.held_skills().unwrap().iter().all(|h| h.name != "old"));
+    }
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
 
@@ -837,6 +1127,31 @@ mod tests {
         assert_eq!(s.get_memory("mem_gone").unwrap().unwrap().deleted_at, gone.deleted_at);
         assert_eq!(ids(s.live_memories().unwrap()), vec!["mem_live"]);
         assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]);
+    }
+
+    /// An older queue (no run columns) gets them in place, its ops kept; a
+    /// run is kept with the op and goes when it is acked.
+    #[test]
+    fn refusals_for_now_are_counted_per_queued_op() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("knowledge.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(r#"CREATE TABLE pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);
+                INSERT INTO pending_ops (payload) VALUES ('{"op":"delete_memory","id":"mem_a"}');"#).unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        assert!(pending_ops_current(&s.conn).unwrap());
+        let n = s.pending().unwrap()[0].0;
+        assert_eq!(s.refused_for_now(n).unwrap(), RefusedRun::default());
+        let run = RefusedRun { count: 2, since: Some(100), run: Some(7), state: Some("on:0123abcd".into()) };
+        s.set_refused_for_now(n, &run).unwrap();
+        assert_eq!(s.refused_for_now(n).unwrap(), run);
+        drop(s);
+        let s = Store::open(&p).unwrap(); // idempotent
+        assert_eq!(s.refused_for_now(n).unwrap(), run);
+        s.ack(n).unwrap();
+        assert_eq!(s.refused_for_now(n).unwrap(), RefusedRun::default());
     }
 
     fn write_legacy_db(p: &Path) {
@@ -1019,6 +1334,42 @@ mod tests {
         assert_eq!(s.live_skills().unwrap().len(), 1);
     }
 
+    /// A hash this Atem can't name (well-formed `h1.<kid>.<64 hex>`).
+    const UNNAMED: &str = "h1.0123abcd.abababababababababababababababababababababababababababababababab";
+
+    /// Another key's hash, never nameable here.
+    const STALE: &str = "h1.89abcdef.cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+    #[test]
+    fn rows_of_an_unnamed_project_move_to_its_name_once_known() {
+        let s = Store::open_in_memory().unwrap();
+        let fact = Memory { scope: Scope::Project, project: UNNAMED.into(), ..mem("mem_a", "A") };
+        s.upsert_memory(&fact).unwrap();
+        s.upsert_memory(&Memory { scope: Scope::Project, project: "h1.not-a-hash".into(), ..mem("mem_b", "B") }).unwrap();
+        s.upsert_memory(&Memory { scope: Scope::Project, project: STALE.into(), ..mem("mem_c", "C") }).unwrap();
+        let at = |version, seq, project: &str| Skill { scope: Scope::Project, project: project.into(), seq, ..skill("ship", version) };
+        s.put_skill(&at(3, 9, UNNAMED)).unwrap();
+        s.put_skill(&Skill { name: "lint".into(), ..at(2, 4, UNNAMED) }).unwrap();
+        // Pushed here meanwhile under the name, at a later version: it stays.
+        s.put_skill(&Skill { name: "lint".into(), ..at(5, 0, "github.com/a/b") }).unwrap();
+        // Purged since and pulled under the name: the same version, a later seq.
+        let purged = Skill { name: "deploy".into(), deleted: true, files: BTreeMap::new(), content_hash: String::new(), ..at(1, 12, "github.com/a/b") };
+        s.put_skill(&Skill { name: "deploy".into(), ..at(1, 6, UNNAMED) }).unwrap();
+        s.put_skill(&purged).unwrap();
+        s.put_skill(&Skill { name: "old".into(), ..at(1, 2, STALE) }).unwrap();
+        assert_eq!(s.unresolved_projects().unwrap(), vec![UNNAMED.to_string(), STALE.to_string()], "well-formed hashes only");
+
+        s.resolve_projects(&[(UNNAMED.to_string(), "github.com/a/b".to_string())], &[STALE.to_string()]).unwrap();
+        assert_eq!(s.get_memory("mem_a").unwrap().unwrap().project, "github.com/a/b");
+        assert_eq!(s.get_memory("mem_c").unwrap().unwrap().project, STALE, "a fact is kept: a migration rewrites it by id");
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "ship").unwrap().unwrap().version, 3);
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "lint").unwrap().unwrap().version, 5);
+        assert_eq!(s.get_skill(Scope::Project, "github.com/a/b", "deploy").unwrap().unwrap(), purged, "the purge stays");
+        assert!(s.get_skill(Scope::Project, STALE, "old").unwrap().is_none(), "a stale hash's skill is dropped");
+        assert!(s.all_skills().unwrap().iter().all(|skill| skill.project == "github.com/a/b"));
+        assert_eq!(s.unresolved_projects().unwrap(), vec![STALE.to_string()]);
+    }
+
     #[test]
     fn pending_queue_is_fifo_and_ackable() {
         let s = Store::open_in_memory().unwrap();
@@ -1030,6 +1381,62 @@ mod tests {
         assert!(p[0].1.is_memory() && p[1].1.is_memory() && !p[2].1.is_memory());
         s.ack(p[0].0).unwrap();
         assert_eq!(s.pending_count().unwrap(), 2);
+    }
+
+    fn op_names(ops: &[(i64, PendingOp)]) -> Vec<String> {
+        ops.iter().map(|(_, op)| match op {
+            PendingOp::AddMemory { memory } => memory.id.clone(),
+            PendingOp::DeleteSkill { name, .. } => name.clone(),
+            other => panic!("{other:?}"),
+        }).collect()
+    }
+
+    #[test]
+    fn pending_after_reads_one_kind_after_the_cursor() {
+        let s = Store::open_in_memory().unwrap();
+        let add = |id: &str| PendingOp::AddMemory { memory: mem(id, id) };
+        let del = |name: &str| PendingOp::DeleteSkill { scope: Scope::Global, project: String::new(), name: name.into() };
+        for op in [add("mem_1"), del("s1"), add("mem_2"), add("mem_3"), del("s2"), add("mem_4")] {
+            s.enqueue(&op).unwrap();
+        }
+        let first = s.pending_after(i64::MIN, true, 2).unwrap();
+        assert_eq!(op_names(&first), ["mem_1", "mem_2"]);
+        // The next read sees what changed since: a queued op rewritten, one queued.
+        let n3 = s.pending().unwrap()[3].0;
+        s.replace_pending(n3, &add("mem_3b")).unwrap();
+        s.enqueue(&add("mem_5")).unwrap();
+        assert_eq!(op_names(&s.pending_after(first[1].0, true, 10).unwrap()), ["mem_3b", "mem_4", "mem_5"]);
+        assert_eq!(op_names(&s.pending_after(i64::MIN, false, 10).unwrap()), ["s1", "s2"]);
+        assert!(s.pending_after(s.pending().unwrap().last().unwrap().0, true, 10).unwrap().is_empty());
+        // By `n`, until it is acked.
+        let (n, op) = first[0].clone();
+        assert_eq!(s.pending_op(n).unwrap(), Some(op));
+        s.ack(n).unwrap();
+        assert_eq!(s.pending_op(n).unwrap(), None);
+    }
+
+    #[test]
+    fn a_rewrite_finds_queued_ops_whose_ids_need_escaping() {
+        let s = Store::open_in_memory().unwrap();
+        let old = "mem_\"q\\\u{1}é"; // a quote, a backslash, a control character, non-ASCII
+        s.upsert_memory(&mem(old, "A")).unwrap();
+        let other = mem("mem_z", old); // names `old` in its text only: left alone
+        for op in [
+            PendingOp::InvalidateMemory { id: old.into(), invalid_at: 5, superseded_by: Some("mem_x".into()) },
+            PendingOp::InvalidateMemory { id: "mem_y".into(), invalid_at: 6, superseded_by: Some(old.into()) },
+            PendingOp::DeleteMemory { id: old.into() },
+            PendingOp::AddMemory { memory: other.clone() },
+        ] {
+            s.enqueue(&op).unwrap();
+        }
+        s.rewrite_memory_id(old, "mem_new").unwrap();
+        let ops: Vec<PendingOp> = s.pending().unwrap().into_iter().map(|(_, op)| op).collect();
+        assert_eq!(ops, vec![
+            PendingOp::InvalidateMemory { id: "mem_new".into(), invalid_at: 5, superseded_by: Some("mem_x".into()) },
+            PendingOp::InvalidateMemory { id: "mem_y".into(), invalid_at: 6, superseded_by: Some("mem_new".into()) },
+            PendingOp::DeleteMemory { id: "mem_new".into() },
+            PendingOp::AddMemory { memory: other },
+        ]);
     }
 
     #[test]

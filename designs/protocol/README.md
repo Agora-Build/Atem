@@ -16,7 +16,7 @@ The local protocols run over same-user Unix sockets.
 
 | Protocol | Between | Version today | Specified in |
 |---|---|---|---|
-| atem-session (`session` messages) | Astation, phones, bots (services) and browsers ↔ the Atem host (`atem runtime`): session list, control leases, prompts, receipts, approvals | v1, revision **r9**; **r8** on a host without a device list | [atem-session-v1.md](atem-session-v1.md) |
+| atem-session (`session` messages) | Astation, phones, bots (services) and browsers ↔ the Atem host (`atem runtime`): session list, control leases, prompts, receipts, approvals | v1, revision **r9**; **r8** on a host without a device list (**Planned (owner decision 2026-11-08), not implemented:** r9 only) | [atem-session-v1.md](atem-session-v1.md) |
 | chat-v1 (`agentChat` messages) | the same clients ↔ an agent's chat; bound to atem-session sessions and leases | v1 | atem-session-v1.md, [../agent-chat-host.md](../agent-chat-host.md) |
 | terminal-v1 (`terminal` messages) | the same clients ↔ an agent's shared terminal: screen frames, input, resize | v1 | atem-session-v1.md, [../shared-terminal.md](../shared-terminal.md) |
 | atem-ch1 | one remote client ↔ the host: r9's end-to-end encrypted channel; atem-session runs inside it. The router (the relay or Astation's `:8080`) carries its frames in a `channel` envelope | 1 (in the name) | atem-session-v1.md §R9.7, §R9.7a; clients use atem-client ([atem-client-bindings.md](atem-client-bindings.md)) |
@@ -29,7 +29,9 @@ The local protocols run over same-user Unix sockets.
 | Cred agent socket | `atem` commands ↔ `atem cred-agent`, which holds the unlocked keys | v2 | [../e2e-encryption.md](../e2e-encryption.md) "Keys on disk (atem)"; `src/memory/agent_socket.rs` |
 
 An r8 host has no device list, so it sends no sealed hints: it sends
-`push_approval` and `push_resolved` relay messages instead. The other
+`push_approval` and `push_resolved` relay messages instead. **Planned (owner
+decision 2026-11-08), not implemented:** with r8 admission removed, those two
+messages go too. The other
 messages on the Astation link (authentication, `credentialSync`, device
 verification, key grants, unlock) carry no version number; they
 are listed in AGENTS.md ("WebSocket messages") and ../e2e-encryption.md.
@@ -103,6 +105,9 @@ are in git history.
   `host.attachments`). r8's
   operations run unchanged inside the channel. A host with a device list
   refuses r8. Atem and Astation passed joint live tests before the release.
+  **Planned (owner decision 2026-11-08), not implemented:** every host
+  refuses r8, so Atem serves remote sessions only over r9; a host without a
+  pinned device list serves none until `atem pair verify` pins one.
 
 Rules:
 
@@ -153,6 +158,10 @@ Notes:
   that starts passing fails the test until it is taken off. For r9 it is a
   few items (fixed handshake bytes, a stalled link writer, a host outside
   the vectors).
+- **Planned (owner decision 2026-11-08), not implemented:** with r8 admission
+  removed, the real-runtime r8 runner (a fake Astation sending a clear `hello`
+  on the link of a host with no device list) has no host to talk to; its
+  scenarios run inside r9 channels, as the r9 runner's do.
 - More r9 behavior in the real runtime, beyond the fixtures:
   `tests/r9_*_binary.rs` (admission, several devices, push, services,
   two enrolled hosts, revoked grants, host route proof) and

@@ -1130,6 +1130,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 .read-only-value {{ font-family: monospace; font-size: 13px; color: #c9d1d9; padding: 6px 0; }}
 .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
 #slogan {{ font-size: 13px; font-weight: 400; color: #7d8590; }}
+.header [data-atem-copy-link] {{ margin-left: auto; }}
 /* ConvoAI transcription + events */
 .convo-sub-title {{ padding: 8px 16px; background: #1c2128; border-top: 1px solid #30363d; border-bottom: 1px solid #30363d; font-size: 12px; font-weight: 500; color: #7d8590; text-transform: uppercase; letter-spacing: 0.5px; }}
 #transcript {{ max-height: 400px; overflow-y: auto; padding: 8px 16px; font-size: 13px; line-height: 1.5; color: #e6edf3; scroll-behavior: smooth; }}
@@ -1153,6 +1154,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, s
 
 <div class="header">
   <h1>Welcome to Agora, <span id="slogan">real-time is the only time</span></h1>
+  {copy}
 </div>
 
 <!-- ── General ─────────────────────────────────────────────────── -->
@@ -2451,8 +2453,11 @@ window.addEventListener('load', async () => {{
   }} catch (_) {{ /* ignore */ }}
 }});
 </script>
+{copy_link}
 </body>
 </html>"##,
+        copy           = crate::web_server::access::copy_link_button("copy-btn"),
+        copy_link      = crate::web_server::access::COPY_LINK,
         app_id_display = app_id_display,
         app_id_label   = app_id_label,
         app_id         = app_id,
@@ -2535,6 +2540,8 @@ mod tests {
             poll_interval_secs: 60,
         };
         let html = build_html_page("app", &resolved, false);
+        assert!(html.contains("data-atem-copy-link"), "Copy link missing");
+        assert!(html.contains(crate::web_server::access::LINK_PATH));
         assert!(html.contains(r#"const DEFAULT_ENV      = "hipaa";"#),
             "DEFAULT_ENV should be hipaa");
         assert!(html.contains(r#""name":"eap""#) && html.contains(r#""prefix":"preview/api""#),

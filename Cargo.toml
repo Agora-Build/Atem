@@ -1,6 +1,6 @@
 [package]
 name = "atem"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 
 [dependencies]
@@ -58,8 +58,10 @@ zeroize = { version = "1", features = ["serde"] }
 # (`Signed::finish`); never part of atem's build.
 atem-client = { path = "crates/atem-client", features = ["software-keys", "test-vectors"] }
 # Tests only: a unit test sees every statement the host-work passes run
-# (`Connection::trace`) to check their query plans.
-rusqlite = { version = "0.32", features = ["bundled", "trace"] }
+# (`Connection::trace`) to check their query plans; the sync crash tests
+# inject a fault (an SQL function a trigger calls) in the middle of a store
+# transaction.
+rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
 
 [features]
 real_rtm = []

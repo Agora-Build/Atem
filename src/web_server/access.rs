@@ -10,6 +10,11 @@
 //!
 //! A `--background` server passes its code to the daemon it starts in
 //! [`ENV`] (never on the command line, which `ps` shows to every user).
+//!
+//! Since the code leaves the address bar, every page has a **Copy link**
+//! button ([`copy_link_button`], [`COPY_LINK`]): it asks [`LINK_PATH`] for the
+//! code (only with the cookie, never cached) and copies the page's URL with
+//! the code added back, on whichever host the page was opened.
 
 use base64::Engine;
 use rand::RngCore;
@@ -19,6 +24,10 @@ pub const ENV: &str = "ATEM_SERV_ACCESS_CODE";
 
 /// The query parameter carrying the code.
 const PARAM: &str = "t";
+
+/// The path a page's Copy link asks for the code (answered for every server
+/// by [`admit`], only with the cookie).
+pub const LINK_PATH: &str = "/__atem/link";
 
 /// What a request may do.
 #[derive(Debug, PartialEq, Eq)]
@@ -30,6 +39,9 @@ pub enum Gate {
     Enter(Vec<u8>),
     /// Neither: answer with these bytes (a plain 404).
     Closed(Vec<u8>),
+    /// It carries the cookie and asks for [`LINK_PATH`]: answer with these
+    /// bytes (the code as JSON, never cached).
+    Link(Vec<u8>),
 }
 
 /// One server's access code.
@@ -81,10 +93,13 @@ impl AccessCode {
             .next()
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
         if self.has_cookie(head) {
+            if path == LINK_PATH {
+                return Gate::Link(self.link());
+            }
             return Gate::Open;
         }
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let mut carried = false;
         let rest: Vec<&str> = query
             .split('&')
@@ -120,6 +135,15 @@ impl AccessCode {
             .any(|(name, value)| name == self.cookie && same(value, &self.code))
     }
 
+    fn link(&self) -> Vec<u8> {
+        let body = format!("{{\"{PARAM}\":\"{}\"}}", self.code);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
     fn enter(&self, location: &str) -> Vec<u8> {
         let secure = if self.secure { "; Secure" } else { "" };
         format!(
@@ -139,12 +163,53 @@ where
     use tokio::io::AsyncWriteExt;
     let bytes = match access.gate(head) {
         Gate::Open => return Ok(true),
-        Gate::Enter(bytes) | Gate::Closed(bytes) => bytes,
+        Gate::Enter(bytes) | Gate::Closed(bytes) | Gate::Link(bytes) => bytes,
     };
     stream.write_all(&bytes).await?;
     stream.flush().await?;
     Ok(false)
 }
+
+/// A page's Copy link button; the page also includes [`COPY_LINK`].
+pub fn copy_link_button(class: &str) -> String {
+    format!(r#"<button type="button" class="{class}" data-atem-copy-link>Copy link</button>"#)
+}
+
+/// The script behind every Copy link button: it asks [`LINK_PATH`] for the
+/// code, adds it to this page's URL (its host, path, other parameters and
+/// fragment kept) and copies the link. When clipboard access is unavailable
+/// or denied, the link is shown to copy instead.
+pub const COPY_LINK: &str = r#"<script>
+(function () {
+  async function copyLink(button) {
+    const label = button.textContent;
+    try {
+      const answer = await fetch('/__atem/link', { cache: 'no-store', credentials: 'same-origin' });
+      if (!answer.ok) throw new Error('HTTP ' + answer.status);
+      const url = new URL(location.href);
+      url.searchParams.set('t', (await answer.json()).t);
+      const link = url.toString();
+      if (window.isSecureContext && navigator.clipboard) {
+        try {
+          await navigator.clipboard.writeText(link);
+          button.textContent = 'Copied';
+          setTimeout(function () { button.textContent = label; }, 1500);
+          return;
+        } catch (_) { /* A browser may deny clipboard access after the fetch. */ }
+      }
+      window.prompt('Copy this link (it includes the access code):', link);
+    } catch (err) {
+      console.warn('Copy link failed', err);
+      button.textContent = 'Copy failed';
+    }
+    setTimeout(function () { button.textContent = label; }, 1500);
+  }
+  document.addEventListener('click', function (event) {
+    const button = event.target.closest('[data-atem-copy-link]');
+    if (button) { event.preventDefault(); copyLink(button); }
+  });
+})();
+</script>"#;
 
 #[cfg(test)]
 thread_local! {
@@ -204,9 +269,45 @@ mod tests {
 
     fn text(gate: Gate) -> String {
         match gate {
-            Gate::Enter(b) | Gate::Closed(b) => String::from_utf8(b).unwrap(),
+            Gate::Enter(b) | Gate::Closed(b) | Gate::Link(b) => String::from_utf8(b).unwrap(),
             Gate::Open => "open".into(),
         }
+    }
+
+    #[test]
+    fn a_page_with_the_cookie_gets_its_code_for_copy_link() {
+        let code = code();
+        let cookie = format!("Cookie: atem_access_9443={CODE}\r\n");
+        let Gate::Link(bytes) = code.gate(&get(LINK_PATH, &cookie)) else {
+            panic!("not answered with the link code");
+        };
+        let answer = String::from_utf8(bytes).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+        assert!(
+            answer.contains("Content-Type: application/json\r\n"),
+            "{answer}"
+        );
+        assert!(answer.contains("Cache-Control: no-store\r\n"), "{answer}");
+        assert!(
+            answer.ends_with(&format!("{{\"t\":\"{CODE}\"}}")),
+            "{answer}"
+        );
+        // Without the cookie: the same 404 as any unknown request.
+        assert_eq!(
+            text(code.gate(&get(LINK_PATH, ""))),
+            String::from_utf8(not_found()).unwrap()
+        );
+        // Other pages are still served by the server itself.
+        assert_eq!(code.gate(&get("/", &cookie)), Gate::Open);
+    }
+
+    #[test]
+    fn copy_link_asks_for_the_code_and_adds_it_to_this_page() {
+        assert!(COPY_LINK.contains(LINK_PATH));
+        assert!(COPY_LINK.contains("searchParams.set('t'"));
+        assert!(COPY_LINK.contains("[data-atem-copy-link]"));
+        assert!(COPY_LINK.contains("isSecureContext"));
+        assert!(copy_link_button("x").contains("data-atem-copy-link"));
     }
 
     #[test]

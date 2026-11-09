@@ -23,7 +23,9 @@ use crate::memory::storage_key::{
     check_storage_ack, check_unlock_grant, new_storage_key, new_storage_kid, promote_next,
 };
 use crate::memory::trust::{AstationTrust, TrustStore};
-use crate::memory::verification::{effective_state, newest_states};
+use crate::memory::verification::{
+    NewestStates, effective_state, effective_state_with, newest_states,
+};
 use crate::paths::CredPaths;
 
 /// Every request carries `"v": PROTOCOL_VERSION`; the agent answers any
@@ -204,6 +206,11 @@ pub enum Reply {
         escrowed: bool,
         /// The agent's `build_id`.
         build: String,
+        /// The binary frames the agent reads on this connection
+        /// (agent_frame.rs); set by the socket server, absent from an agent
+        /// older than them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frames: Option<u32>,
     },
     PublicKeys {
         device_pub: String,
@@ -342,6 +349,92 @@ pub struct CredAgent {
     /// How often a prune failure was logged.
     #[cfg(test)]
     pub(crate) prune_failures_logged: usize,
+    /// cred/state.json as last read, kept while the file is unchanged
+    /// (`trust_view`). Dropped with the keys.
+    trust_cache: Option<TrustCache>,
+    /// `RACY_WINDOW`, settable in tests.
+    #[cfg(test)]
+    racy_window: std::time::Duration,
+    /// How often cred/state.json was read and parsed.
+    #[cfg(test)]
+    trust_loads: usize,
+}
+
+/// How long after its last change cred/state.json may be served from the
+/// agent's cache. File times have a granularity (a clock tick, or a second
+/// on some filesystems), so two writes within it can leave the same size and
+/// times, and the same inode number when the first file's was freed and
+/// reused. A file changed within this window of the moment it was looked at
+/// is read again at every request, until it is older.
+pub(crate) const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What tells one version of cred/state.json from another without reading
+/// it: its device, inode, size, and modification and change times with
+/// nanoseconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateFileKey {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl StateFileKey {
+    /// The key of `path` now; `None` (read the file, keep nothing) when its
+    /// metadata can't be read or it changed within `window` of now.
+    fn of(path: &std::path::Path, window: std::time::Duration) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        // Taken before looking: a change after it gets a later time.
+        let now = std::time::SystemTime::now();
+        let meta = std::fs::metadata(path).ok()?;
+        let key = Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        };
+        key.settled(now, window).then_some(key)
+    }
+
+    /// Whether both times are at least `window` before `now` (a time after
+    /// `now`, or a clock before 1970, never is).
+    fn settled(&self, now: std::time::SystemTime, window: std::time::Duration) -> bool {
+        let Ok(now) = now.duration_since(std::time::UNIX_EPOCH) else {
+            return false;
+        };
+        let nanos = |(secs, nsec): (i64, i64)| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
+        let changed = nanos(self.mtime).max(nanos(self.ctime));
+        now.as_nanos() as i128 - changed >= window.as_nanos() as i128
+    }
+}
+
+/// cred/state.json parsed, with the newest signed state of every account it
+/// names (`newest_states`; its error, if a stored state doesn't decode).
+struct TrustView {
+    trust: TrustStore,
+    newest: std::result::Result<NewestStates, String>,
+}
+
+impl TrustView {
+    fn newest(&self) -> Result<&NewestStates> {
+        self.newest.as_ref().map_err(|error| anyhow!("{error}"))
+    }
+}
+
+/// A `TrustView` and the file version it was read from.
+struct TrustCache {
+    key: StateFileKey,
+    view: std::sync::Arc<TrustView>,
+}
+
+/// The latest signed mode and kid of every account, from `newest_states`.
+fn modes_of(newest: &NewestStates) -> SignedModes {
+    newest
+        .iter()
+        .map(|(account, state)| (account.clone(), state.as_ref().map(|state| (state.mode, state.kid.clone()))))
+        .collect()
 }
 
 /// Opens a sealed device-keys file only when its header names the device and
@@ -393,6 +486,11 @@ impl CredAgent {
             last_prune_error: None,
             #[cfg(test)]
             prune_failures_logged: 0,
+            trust_cache: None,
+            #[cfg(test)]
+            racy_window: RACY_WINDOW,
+            #[cfg(test)]
+            trust_loads: 0,
         };
         if let Err(error) = agent.migrate_plain_keys() {
             eprintln!("cred agent: {error:#}");
@@ -402,6 +500,61 @@ impl CredAgent {
             agent.prune_retired();
         }
         Ok(agent)
+    }
+
+    /// Serves cred/state.json from the cache once it is `window` old.
+    #[cfg(test)]
+    pub(crate) fn set_racy_window(&mut self, window: std::time::Duration) {
+        self.racy_window = window;
+    }
+
+    /// Whether a parsed cred/state.json is kept.
+    #[cfg(test)]
+    pub(crate) fn trust_cached(&self) -> bool {
+        self.trust_cache.is_some()
+    }
+
+    /// How often cred/state.json was read and parsed so far.
+    #[cfg(test)]
+    pub(crate) fn trust_loads(&self) -> usize {
+        self.trust_loads
+    }
+
+    fn racy_window(&self) -> std::time::Duration {
+        #[cfg(test)]
+        return self.racy_window;
+        #[cfg(not(test))]
+        RACY_WINDOW
+    }
+
+    /// cred/state.json parsed (with the newest signed states), from the cache
+    /// while the file is the version it was read from (`StateFileKey`) and
+    /// had settled then (`RACY_WINDOW`). A metadata error reads it again; a
+    /// read that fails leaves nothing cached. Read by `Crypt`, `HeldKid` and
+    /// the prune of retired keys; requests that install keys, sign over the
+    /// trust state or change it read the file themselves.
+    fn trust_view(&mut self) -> Result<std::sync::Arc<TrustView>> {
+        let key = StateFileKey::of(&self.paths.trust, self.racy_window());
+        if let (Some(key), Some(cache)) = (&key, &self.trust_cache)
+            && cache.key == *key
+        {
+            return Ok(cache.view.clone());
+        }
+        self.trust_cache = None;
+        #[cfg(test)]
+        {
+            self.trust_loads += 1;
+        }
+        let trust = TrustStore::load_from(&self.paths.trust)?;
+        let newest = newest_states(&trust).map_err(|error| format!("{error:#}"));
+        let view = std::sync::Arc::new(TrustView { trust, newest });
+        if let Some(key) = key {
+            self.trust_cache = Some(TrustCache {
+                key,
+                view: view.clone(),
+            });
+        }
+        Ok(view)
     }
 
     pub fn handle(&mut self, request: Request) -> Result<Reply> {
@@ -494,6 +647,7 @@ impl CredAgent {
         self.unlocked = None;
         self.pending_unlock = None;
         self.pending_rotation = None;
+        self.trust_cache = None;
     }
 
     fn unlocked(&self) -> Result<&Unlocked> {
@@ -507,6 +661,7 @@ impl CredAgent {
                 storage_kid: Some(unlocked.storage_kid.clone()),
                 escrowed: unlocked.escrowed,
                 build: build_id().to_string(),
+                frames: None,
             },
             None => Reply::Status {
                 unlocked: false,
@@ -517,6 +672,7 @@ impl CredAgent {
                     .map(|sealed| sealed.storage_kid),
                 escrowed: false,
                 build: build_id().to_string(),
+                frames: None,
             },
         }
     }
@@ -571,7 +727,8 @@ impl CredAgent {
         // The newest signed state of the account (any verified Astation
         // naming it), not just this Astation's: a stale one can't install
         // an older key over the current one.
-        let state = effective_state(&trust, astation_id)?
+        let newest = newest_states(&trust)?;
+        let state = effective_state_with(&trust, &newest, astation_id)
             .and_then(|(_, state)| state)
             .ok_or_else(|| anyhow!("received an encryption key before the account mode"))?;
         if state.kid.as_deref() != Some(opened.kid.as_str()) {
@@ -580,7 +737,7 @@ impl CredAgent {
         let kid = opened.kid.clone();
         let mut accounts = unlocked.accounts.clone();
         accounts.install(&entry.data_account, &kid, opened.key);
-        accounts.reconcile(&self.signed_modes()?);
+        accounts.reconcile(&modes_of(&newest));
         // Another verified Astation naming this account may have signed a
         // newer state: a key it retires is never reported as installed.
         if accounts.current_kid(&entry.data_account) != Some(kid.as_str()) {
@@ -597,8 +754,13 @@ impl CredAgent {
     fn crypt(&mut self, astation_id: &str, ops: Vec<CryptOp>) -> Result<Reply> {
         self.unlocked()?;
         self.prune_retired();
-        let trust = TrustStore::load_from(&self.paths.trust)?;
-        let (account, state) = effective_state(&trust, astation_id)?
+        let view = self.trust_view()?;
+        // Unverified first, as before the cache: even when a stored state
+        // doesn't decode (which still fails a verified Astation's request).
+        if view.trust.verified(astation_id).is_none() {
+            bail!("this device isn't verified with Astation {astation_id}");
+        }
+        let (account, state) = effective_state_with(&view.trust, view.newest()?, astation_id)
             .ok_or_else(|| anyhow!("this device isn't verified with Astation {astation_id}"))?;
         let state = state.ok_or_else(|| {
             anyhow!("waiting for Astation's signed encryption state; reconnect to Astation")
@@ -613,8 +775,8 @@ impl CredAgent {
     fn held_kid(&mut self, astation_id: &str) -> Result<Reply> {
         self.unlocked()?;
         self.prune_retired();
-        let trust = TrustStore::load_from(&self.paths.trust)?;
-        let kid = trust.verified(astation_id).and_then(|entry| {
+        let view = self.trust_view()?;
+        let kid = view.trust.verified(astation_id).and_then(|entry| {
             self.unlocked
                 .as_ref()?
                 .accounts
@@ -645,12 +807,8 @@ impl CredAgent {
 
     /// The latest signed state of every account a verified Astation names
     /// (the highest epoch when two name one account).
-    fn signed_modes(&self) -> Result<SignedModes> {
-        let trust = TrustStore::load_from(&self.paths.trust)?;
-        Ok(newest_states(&trust)?
-            .into_iter()
-            .map(|(account, state)| (account, state.map(|state| (state.mode, state.kid))))
-            .collect())
+    fn signed_modes(&mut self) -> Result<SignedModes> {
+        Ok(modes_of(self.trust_view()?.newest()?))
     }
 
     /// Drops the account keys the signed states retired (`off`, or previous
@@ -1303,6 +1461,7 @@ pub trait CredAgentApi: Send + Sync {
                 storage_kid,
                 escrowed,
                 build,
+                ..
             } => Ok(AgentStatus {
                 unlocked,
                 storage_kid,
@@ -1525,18 +1684,21 @@ impl<T: CredAgentApi + ?Sized> CredAgentApi for std::sync::Arc<T> {
 }
 
 /// This user's agent, started on first use (lazily: nothing connects until
-/// a request is made).
-pub fn default_agent() -> Box<dyn CredAgentApi> {
+/// a request is made): the process-wide client, so every caller in a
+/// process shares one connection and one build check per connection.
+pub fn default_agent() -> std::sync::Arc<dyn CredAgentApi> {
     // Tests never reach the user's cred agent (src/test_profile.rs).
     #[cfg(test)]
-    return Box::new(crate::test_profile::Injected(crate::test_profile::agent()));
+    return crate::test_profile::agent();
     #[cfg(all(unix, not(test)))]
     {
-        Box::new(crate::memory::agent_socket::CredAgentClient::autostart())
+        crate::memory::agent_socket::shared(
+            crate::memory::agent_socket::CredAgentClient::autostart(),
+        )
     }
     #[cfg(not(unix))]
     {
-        Box::new(NoAgent)
+        std::sync::Arc::new(NoAgent)
     }
 }
 
@@ -1573,9 +1735,17 @@ pub fn look(paths: &CredPaths, timeout: std::time::Duration) -> AgentLook {
     );
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let found = client
-            .is_running()
-            .then(|| client.status().map_err(|e| format!("{e:#}")));
+        // Only a proven absence is "none running"; an agent that can't be
+        // reached is reported as not answering.
+        let found = match client.probe() {
+            Ok(true) => Some(client.status().map_err(|e| format!("{e:#}"))),
+            // Nothing answers: none runs, unless one holds the key files
+            // (it may run unlocked; the status names it).
+            Ok(false) => client
+                .answers()
+                .then(|| client.status().map_err(|e| format!("{e:#}"))),
+            Err(error) => Some(Err(format!("{error:#}"))),
+        };
         let _ = tx.send(found);
     });
     let found = match rx.recv_timeout(timeout) {
@@ -1598,8 +1768,15 @@ pub fn running_agent() -> Option<Box<dyn CredAgentApi>> {
     {
         #[cfg(unix)]
         {
-            let client = crate::memory::agent_socket::CredAgentClient::existing();
-            if client.is_running() {
+            // The process-wide client that never starts an agent (it has no
+            // launcher and runs no build check, like a new `existing()`).
+            // `None` only when no agent is proven to run: one that can't be
+            // reached is returned, so the caller's request says why (`atem
+            // cred lock` must never report a running agent as none).
+            let client = crate::memory::agent_socket::shared(
+                crate::memory::agent_socket::CredAgentClient::existing(),
+            );
+            if client.answers() {
                 return Some(Box::new(client));
             }
         }
@@ -1652,6 +1829,35 @@ mod tests {
 
     fn agent(paths: &CredPaths) -> Mutex<CredAgent> {
         test_agent(paths)
+    }
+
+    #[test]
+    fn a_state_file_is_cached_only_once_both_its_times_have_settled() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let key = |mtime: i64, ctime: i64| StateFileKey { dev: 1, ino: 2, size: 3, mtime: (mtime, 500), ctime: (ctime, 500) };
+        let now = UNIX_EPOCH + Duration::new(1_000, 500);
+        let window = Duration::from_secs(3);
+        assert!(key(997, 997).settled(now, window));
+        assert!(key(990, 996).settled(now, Duration::from_secs(4)));
+        // Either time inside the window, or after now (a clock set back).
+        assert!(!key(998, 990).settled(now, window));
+        assert!(!key(990, 998).settled(now, window));
+        assert!(!key(1_001, 990).settled(now, window));
+        assert!(!key(990, 990).settled(UNIX_EPOCH - Duration::from_secs(1), window));
+        // Nanoseconds count: 2.999999999 s is not 3 s.
+        let almost = StateFileKey { mtime: (997, 501), ctime: (990, 0), ..key(0, 0) };
+        assert!(!almost.settled(now, window));
+        // Every field tells two versions apart.
+        let base = key(990, 990);
+        for other in [
+            StateFileKey { dev: 9, ..base.clone() },
+            StateFileKey { ino: 9, ..base.clone() },
+            StateFileKey { size: 9, ..base.clone() },
+            StateFileKey { mtime: (990, 501), ..base.clone() },
+            StateFileKey { ctime: (990, 501), ..base.clone() },
+        ] {
+            assert_ne!(other, base);
+        }
     }
 
     #[test]

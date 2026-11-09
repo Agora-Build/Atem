@@ -26,8 +26,11 @@ pub mod project_names;
 pub mod credential_projects;
 pub mod unlock;
 pub mod migration;
+pub mod skill_wire;
 #[cfg(unix)]
 pub mod agent_socket;
+#[cfg(unix)]
+pub(crate) mod agent_frame;
 
 #[cfg(test)]
 pub(crate) mod e2e_tests;
@@ -37,3 +40,7 @@ mod kat_tests;
 pub(crate) mod fake_astation;
 #[cfg(test)]
 mod k_agent_tests;
+#[cfg(test)]
+mod perf_tests;
+#[cfg(test)]
+pub(crate) mod fake_station_skills;

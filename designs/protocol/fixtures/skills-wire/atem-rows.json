@@ -1,0 +1,508 @@
+{
+  "cases": [
+    {
+      "expect": "accept",
+      "name": "e1-text: sealed paths and files",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=="
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "stored": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0="
+        },
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "expect": "accept",
+      "name": "e1-text: an empty file is \"\" (the empty-file rule)",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "stored": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0=",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "expect": "accept",
+      "name": "e1-text: a tombstone has no files",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {},
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "stored": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {},
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "expect": "accept",
+      "name": "base64: a sealed row with an empty file",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0=",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "files_encoding": "base64",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "served": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "stored": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0=",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "expect": "accept",
+      "name": "base64: a plain file",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "SKILL.md": "IyBwbGFpbgo="
+        },
+        "files_encoding": "base64",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "stored": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "SKILL.md": "IyBwbGFpbgo="
+        },
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "expect": "accept",
+      "name": "base64: a binary file and an empty one",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "asset.bin": "AJ+S/w==",
+          "empty.md": ""
+        },
+        "files_encoding": "base64",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      },
+      "stored": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "asset.bin": "AJ+S/w==",
+          "empty.md": ""
+        },
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "unsupported skill files encoding; update Atem",
+      "expect": "refuse",
+      "name": "no files_encoding",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=="
+        },
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "unsupported skill files encoding; update Atem",
+      "expect": "refuse",
+      "name": "an unknown files_encoding",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=="
+        },
+        "files_encoding": "guess",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "unsupported skill files encoding; update Atem",
+      "expect": "refuse",
+      "name": "files_encoding not a string",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=="
+        },
+        "files_encoding": true,
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "e1-text: a non-empty value that isn't sealed (mixed)",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": "plaintext"
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "e1-text: a plain path (mixed)",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "SKILL.md": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==",
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=="
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "e1-text: an empty path",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "": ""
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "e1-text: a malformed envelope",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.bad"
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "e1-text: an envelope shorter than a nonce and a tag",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "e1-text: an uppercase kid",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123ABCD.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=="
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "e1-text: base64 of an envelope (encoded twice)",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0="
+        },
+        "files_encoding": "e1-text",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "base64: invalid base64",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "SKILL.md": "not base64!"
+        },
+        "files_encoding": "base64",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "base64: unpadded base64",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "SKILL.md": "aGVsbG8"
+        },
+        "files_encoding": "base64",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    },
+    {
+      "error": "invalid skill files encoding",
+      "expect": "refuse",
+      "name": "a file value that isn't a string",
+      "row": {
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "created_at": 1700000000,
+        "deleted": false,
+        "files": {
+          "SKILL.md": 5
+        },
+        "files_encoding": "base64",
+        "name": "demo",
+        "project": "",
+        "scope": "global",
+        "seq": 7,
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "version": 1
+      }
+    }
+  ],
+  "description": "Atem's synthetic skill rows: what the client and the Station accept (and store, in the legacy form) or refuse (`error`: the Station's 400). Envelopes are structural only, not valid ciphertext."
+}

@@ -1,6 +1,10 @@
 //! The cred agent's Unix socket: newline-delimited JSON, `"v": 2` on every
-//! request, same-user peers only. `atem cred-agent` serves it; commands that
-//! need keys connect, starting the agent when none is running.
+//! request, same-user peers only, and binary frames for `Crypt` on a
+//! connection that agreed to them in its build check (agent_frame.rs).
+//! `atem cred-agent` serves it; commands that need keys connect, starting
+//! the agent when none is running. A process shares one client per agent
+//! (`shared`), which keeps one connection between requests
+//! (`CredAgentClient::call`).
 //! See designs/e2e-encryption.md "Keys on disk (atem)".
 //!
 //! Both sides check who is on the other end: the agent refuses peers that
@@ -29,16 +33,20 @@ use crate::daemon::{
     self, check_parent_dir, lock_is_held, peer_uid, prepare_socket_dir, recorded_socket,
 };
 use crate::memory::account_keys::{CryptOp, CryptOut};
+use crate::memory::agent_frame::{self, Head};
 use crate::memory::cred_agent::{
     CredAgent, CredAgentApi, PROTOCOL_VERSION, Reply, Request, build_id,
 };
-use crate::memory::encoding::WipingBuf;
+use crate::memory::encoding::{SecretBytes, WipingBuf, wipe, wipe_uninit};
 use crate::paths::CredPaths;
 
 /// Bounds a misbehaving peer. A `Crypt` batch is kept under 2 MiB of input by
 /// `EncryptionContext`, and one skill (at most 1 MiB, base64 on the wire)
 /// always fits.
 const MAX_LINE: usize = 8 << 20;
+/// The read buffer an agent keeps for a connection between requests (what
+/// `WipingBuf::new` allocates): a bigger one goes once its request is answered.
+const KEPT_BUFFER: usize = 4 << 10;
 /// A connection that says nothing for this long is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a stopping agent lets requests already in flight finish.
@@ -236,35 +244,74 @@ pub(crate) fn decode_response(line: &str) -> Result<Reply> {
         .ok_or_else(|| anyhow!("the cred agent sent an empty reply"))
 }
 
-/// The reply to `line`, and whether it was a lock that stops the agent.
-fn respond(agent: &Mutex<CredAgent>, line: &str) -> (WipingBuf, bool) {
+/// A refused request's response.
+fn refused(error: &anyhow::Error) -> Response {
+    Response {
+        v: PROTOCOL_VERSION,
+        ok: false,
+        error: Some(format!("{error:#}")),
+        reply: None,
+    }
+}
+
+const UNENCODABLE: &[u8] =
+    b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent could not encode its reply\"}";
+const NOT_CRYPTED: &[u8] = b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent answered a Crypt request with another kind of reply\"}";
+
+/// The reply to the line `line`; whether it was a lock that stops the agent;
+/// and whether it was a `status` that told the client this connection reads
+/// frames (only when this agent reads them: `frames`).
+fn respond(agent: &Mutex<CredAgent>, line: &str, frames: bool) -> (SecretBytes, bool, bool) {
     let mut stop = false;
+    let mut agreed = false;
     let response = match decode_request(line).and_then(|request| {
         stop = matches!(request, Request::Lock { stop: true });
         agent.call(request)
     }) {
-        Ok(reply) => Response {
-            v: PROTOCOL_VERSION,
-            ok: true,
-            error: None,
-            reply: Some(reply),
-        },
-        Err(error) => Response {
-            v: PROTOCOL_VERSION,
-            ok: false,
-            error: Some(format!("{error:#}")),
-            reply: None,
-        },
+        Ok(mut reply) => {
+            if let Reply::Status {
+                frames: offered, ..
+            } = &mut reply
+                && frames
+            {
+                *offered = Some(agent_frame::VERSION);
+                agreed = true;
+            }
+            Response {
+                v: PROTOCOL_VERSION,
+                ok: true,
+                error: None,
+                reply: Some(reply),
+            }
+        }
+        Err(error) => refused(&error),
     };
     let stop = stop && response.ok;
     let reply = to_wiping_json(&response).unwrap_or_else(|_| {
         let mut buf = WipingBuf::new();
-        buf.append(
-            b"{\"v\":2,\"ok\":false,\"error\":\"the cred agent could not encode its reply\"}\n",
-        );
+        buf.append(UNENCODABLE);
+        buf.append(b"\n");
         buf
     });
-    (reply, stop)
+    (reply.into_secret(), stop, agreed)
+}
+
+/// The reply frame to the `Crypt` frame `body`: its results, or the refusal
+/// a JSON line would get, from the same `CredAgent::handle` (every check
+/// of a `Crypt` applies). `Err` for a malformed frame.
+fn respond_frame(agent: &Mutex<CredAgent>, head: Head, body: SecretBytes) -> Result<SecretBytes> {
+    let (astation_id, ops) = agent_frame::decode_crypt(head, &body)?;
+    // The ops hold their own copies.
+    drop(body);
+    Ok(match agent.call(Request::Crypt { astation_id, ops }) {
+        Ok(Reply::Crypted { results }) => agent_frame::crypted_reply(&results),
+        Ok(_) => agent_frame::json_reply(NOT_CRYPTED),
+        // A refusal carries no secret.
+        Err(error) => match serde_json::to_vec(&refused(&error)) {
+            Ok(json) => agent_frame::json_reply(&json),
+            Err(_) => agent_frame::json_reply(UNENCODABLE),
+        },
+    })
 }
 
 /// Another cred agent holds a lock or answers on the socket.
@@ -329,6 +376,22 @@ const CLAIM_WAIT: Duration = Duration::from_secs(8);
 const ORPHAN_CHECK: Duration = Duration::from_secs(5);
 /// How long a client waits for an agent it started.
 const START_WAIT: Duration = Duration::from_secs(10);
+
+/// The pauses before a client's polls of an agent it just started, in ms. A
+/// started agent listens within about 15 ms (its budget is 25), so the first
+/// look is at 5 ms and the next ones stay close, then back off; a pause
+/// after the last entry is `START_POLL_MAX`.
+const START_POLLS_MS: [u64; 16] = [5, 5, 5, 5, 5, 5, 5, 5, 10, 10, 10, 20, 20, 20, 50, 50];
+/// The pause between polls once an agent is slow to start (what every poll
+/// used to be).
+const START_POLL_MAX: Duration = Duration::from_millis(100);
+
+/// The pause before poll number `poll` (from 0) of a started agent.
+fn start_poll_pause(poll: usize) -> Duration {
+    START_POLLS_MS
+        .get(poll)
+        .map_or(START_POLL_MAX, |ms| Duration::from_millis(*ms))
+}
 
 /// Another agent holds the key directory's lock but answers on no socket
 /// (e.g. its runtime dir was removed while it kept running).
@@ -545,7 +608,19 @@ pub async fn serve(
     agent: Arc<Mutex<CredAgent>>,
     allowed_uid: u32,
 ) -> Result<()> {
-    serve_watched(listener, agent, allowed_uid, None).await
+    serve_with(listener, agent, allowed_uid, None, true).await
+}
+
+/// `serve` as a released agent (v0.6.11 to v0.8.3) would: its `status`
+/// offers no frames and it reads only JSON lines (a frame's first byte is
+/// the start of a line that isn't JSON).
+#[cfg(test)]
+pub(crate) async fn serve_without_frames(
+    listener: tokio::net::UnixListener,
+    agent: Arc<Mutex<CredAgent>>,
+    allowed_uid: u32,
+) -> Result<()> {
+    serve_with(listener, agent, allowed_uid, None, false).await
 }
 
 /// `serve`, and with a `watch`, checks every `watch.every` that clients can
@@ -558,6 +633,18 @@ pub(crate) async fn serve_watched(
     agent: Arc<Mutex<CredAgent>>,
     allowed_uid: u32,
     watch: Option<Watch>,
+) -> Result<()> {
+    serve_with(listener, agent, allowed_uid, watch, true).await
+}
+
+/// `serve_watched`, reading frames on connections that agree to them only
+/// with `frames`.
+async fn serve_with(
+    listener: tokio::net::UnixListener,
+    agent: Arc<Mutex<CredAgent>>,
+    allowed_uid: u32,
+    watch: Option<Watch>,
+    frames: bool,
 ) -> Result<()> {
     // The socket this listener is bound to, to remove it when stopping (only
     // while it is still the file bound here).
@@ -599,6 +686,13 @@ pub(crate) async fn serve_watched(
         };
         let stream = match accepted {
             Ok((stream, _)) => stream,
+            // A client that left before it was accepted (macOS can say so
+            // here): nothing to serve, nothing to wait for.
+            Err(error)
+                if peer_gone(&error) || error.kind() == std::io::ErrorKind::ConnectionAborted =>
+            {
+                continue;
+            }
             Err(error) => {
                 // e.g. out of file descriptors: keep serving once there is room.
                 eprintln!("cred agent: accept failed: {error}");
@@ -608,7 +702,9 @@ pub(crate) async fn serve_watched(
         };
         let (agent, stopping) = (agent.clone(), stopping.clone());
         connections.spawn(async move {
-            if let Err(error) = serve_connection(stream, &agent, allowed_uid, &stopping).await {
+            if let Err(error) =
+                serve_connection(stream, &agent, allowed_uid, &stopping, frames).await
+            {
                 eprintln!("cred agent: {error:#}");
             }
         });
@@ -645,48 +741,74 @@ pub(crate) async fn serve_watched(
     Ok(())
 }
 
+/// One connection: JSON lines, and frames once a `status` answered here
+/// offered them (only when this agent reads them: `frames`). A malformed
+/// frame closes it with an error.
 async fn serve_connection(
     stream: tokio::net::UnixStream,
     agent: &Mutex<CredAgent>,
     allowed_uid: u32,
     stopping: &tokio::sync::watch::Sender<bool>,
+    frames: bool,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let peer = stream.peer_cred()?.uid();
+    let peer = match stream.peer_cred() {
+        Ok(cred) => cred.uid(),
+        // The client left before it was served (a liveness check such as
+        // `is_running`): nothing to answer and nothing to report. macOS says
+        // so here (its peer pid needs a connected peer: ENOTCONN), Linux
+        // only at the first read.
+        Err(error) if peer_gone(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     if peer != allowed_uid {
         bail!("refused a connection from uid {peer}");
     }
     let mut stopped = stopping.subscribe();
     let (mut read, mut write) = stream.into_split();
-    let mut pending = WipingBuf::new();
-    let mut chunk = Zeroizing::new([0u8; 4096]);
-    // Bytes of `pending` already known to hold no newline: a multi-MiB
-    // `Crypt` line arrives in 4 KiB reads, and rescanning it all each time
-    // would be quadratic.
-    let mut scanned = 0;
+    let mut lines = Lines::new();
     loop {
-        while let Some(offset) = pending.0[scanned..].iter().position(|byte| *byte == b'\n') {
-            let end = scanned + offset;
-            scanned = 0;
-            let line = Zeroizing::new(pending.0.drain(..=end).collect::<Vec<u8>>());
-            let (reply, stop) = match std::str::from_utf8(&line[..end]) {
-                Ok(text) => respond(agent, text),
-                Err(_) => respond(agent, ""),
+        let mut answered = false;
+        while let Some(message) = lines.next_message()? {
+            let (reply, stop) = match message {
+                Message::Line(line) => {
+                    let end = line.len() - 1;
+                    let (reply, stop, agreed) = match std::str::from_utf8(&line[..end]) {
+                        Ok(text) => respond(agent, text, frames),
+                        Err(_) => respond(agent, "", frames),
+                    };
+                    drop(line);
+                    if agreed {
+                        lines.frames = true;
+                    }
+                    (reply, stop)
+                }
+                Message::Frame(head, body) => (respond_frame(agent, head, body)?, false),
             };
-            write.write_all(&reply.0).await?;
+            write.write_all(&reply).await?;
+            drop(reply);
+            answered = true;
             if stop {
                 stopping.send_replace(true);
                 return Ok(());
             }
         }
-        scanned = pending.0.len();
-        if pending.0.len() > MAX_LINE {
+        if answered {
+            lines.settle();
+            #[cfg(test)]
+            SETTLED.with(|log| {
+                if let Some(log) = &*log.borrow() {
+                    log.lock().unwrap().push(lines.held());
+                }
+            });
+        }
+        if lines.too_long() {
             bail!("a request is too long");
         }
         // A stopping agent takes no further request; one only partly read
         // is dropped (its client sees the connection close).
         let n = tokio::select! {
-            read = tokio::time::timeout(IDLE_TIMEOUT, read.read(&mut chunk[..])) => {
+            read = tokio::time::timeout(IDLE_TIMEOUT, read.read(lines.buffer())) => {
                 read.map_err(|_| anyhow!("closed an idle connection"))??
             }
             _ = stopped.wait_for(|stop| *stop) => return Ok(()),
@@ -694,7 +816,207 @@ async fn serve_connection(
         if n == 0 {
             return Ok(());
         }
-        pending.append(&chunk[..n]);
+        lines.take(n);
+    }
+}
+
+/// Tests: what connections held once they had answered, one entry each time.
+#[cfg(test)]
+type HeldLog = Arc<Mutex<Vec<Vec<u8>>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: what the connections served on this thread hold once they
+    /// have answered (`Lines::held`), when a test asks for it.
+    static SETTLED: std::cell::RefCell<Option<HeldLog>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A message read on an agent connection.
+enum Message {
+    /// A JSON line, with its newline.
+    Line(SecretBytes),
+    /// A frame's header and body.
+    Frame(Head, SecretBytes),
+}
+
+/// The frame a connection is reading: its body is allocated at the length
+/// its header declared (within the bounds), and read straight into.
+struct Incoming {
+    head: Head,
+    body: SecretBytes,
+    filled: usize,
+}
+
+/// Whether `error` says the other end of a connection has gone (closed or
+/// reset). macOS reports a peer that closed as ENOTCONN or ECONNRESET in
+/// places where Linux reports EOF.
+fn peer_gone(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotConnected | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Whether `error`, from connecting to an agent's socket path, proves that
+/// no agent listens there: the path is missing, or nothing listens on it
+/// (refused). Nothing else does: a reset or not-connected socket (how macOS
+/// reports a listener that is closing, or a peer that closed), a permission
+/// error or anything unexpected may hide a running, unlocked agent, so it is
+/// an error, never "not running".
+fn proves_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// What an agent connection has read and not yet handled (`pending`, or the
+/// body of a frame being read: `frame`), and the chunk lines are read into.
+/// Requests carry secrets (device keys, plain text to seal) and clients keep
+/// their connection between requests, so once the messages read so far are
+/// answered, `settle` wipes every byte they left in `pending` and the chunk
+/// (a frame's body goes, wiped, with its answer). All of them are wiped
+/// whole when the connection ends.
+struct Lines {
+    pending: WipingBuf,
+    chunk: Zeroizing<[u8; 4096]>,
+    /// Bytes of `pending` already known to hold no newline: a multi-MiB
+    /// `Crypt` line arrives in 4 KiB reads, and rescanning it all each time
+    /// would be quadratic.
+    scanned: usize,
+    /// Frames are read on this connection: a `status` answered here said so.
+    frames: bool,
+    frame: Option<Incoming>,
+    /// Tests: how much of `pending`'s allocation is known written.
+    #[cfg(test)]
+    written: usize,
+}
+
+impl Lines {
+    fn new() -> Self {
+        Self {
+            pending: WipingBuf::new(),
+            chunk: Zeroizing::new([0u8; 4096]),
+            scanned: 0,
+            frames: false,
+            frame: None,
+            #[cfg(test)]
+            written: 0,
+        }
+    }
+
+    /// The next whole message read, if one has arrived. `Err` for a frame
+    /// whose header is out of bounds: nothing is allocated for it.
+    fn next_message(&mut self) -> Result<Option<Message>> {
+        if self.frame.is_none()
+            && self.frames
+            && self.pending.0.first() == Some(&agent_frame::MAGIC)
+        {
+            let Some(head) = self.pending.0.first_chunk::<{ agent_frame::HEADER }>() else {
+                return Ok(None);
+            };
+            let head = agent_frame::request_head(head)?;
+            let mut body = SecretBytes::zeroed(head.len);
+            let read = &self.pending.0[agent_frame::HEADER..];
+            let filled = head.len.min(read.len());
+            body[..filled].copy_from_slice(&read[..filled]);
+            self.pending.0.drain(..agent_frame::HEADER + filled);
+            self.scanned = 0;
+            self.frame = Some(Incoming { head, body, filled });
+        }
+        if let Some(incoming) = &self.frame {
+            if incoming.filled < incoming.body.len() {
+                return Ok(None);
+            }
+            let Some(Incoming { head, body, .. }) = self.frame.take() else {
+                unreachable!("a frame is being read");
+            };
+            return Ok(Some(Message::Frame(head, body)));
+        }
+        Ok(self.next_line().map(Message::Line))
+    }
+
+    /// The next whole line read (with its newline), if one has arrived.
+    fn next_line(&mut self) -> Option<SecretBytes> {
+        let Some(offset) = self.pending.0[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        else {
+            self.scanned = self.pending.0.len();
+            return None;
+        };
+        let end = self.scanned + offset;
+        self.scanned = 0;
+        Some(SecretBytes::from_vec(
+            self.pending.0.drain(..=end).collect(),
+        ))
+    }
+
+    /// Where the next read goes: the rest of a frame's body, else the chunk.
+    fn buffer(&mut self) -> &mut [u8] {
+        match &mut self.frame {
+            Some(incoming) => &mut incoming.body[incoming.filled..],
+            None => &mut self.chunk[..],
+        }
+    }
+
+    /// Takes the `n` bytes just read into `buffer`.
+    fn take(&mut self, n: usize) {
+        match &mut self.frame {
+            Some(incoming) => incoming.filled += n,
+            None => self.pending.append(&self.chunk[..n]),
+        }
+    }
+
+    fn too_long(&self) -> bool {
+        self.pending.0.len() > MAX_LINE
+    }
+
+    /// Once the messages read so far are answered: wipes the whole of
+    /// `pending` past its unread bytes (the start of a next request, if any),
+    /// so its allocation holds nothing of an answered request, and the whole
+    /// chunk. A buffer that grew for a big request goes instead, wiped whole
+    /// as it is dropped.
+    fn settle(&mut self) {
+        if self.pending.0.is_empty() && self.pending.0.capacity() > KEPT_BUFFER {
+            self.pending = WipingBuf::new();
+            #[cfg(test)]
+            {
+                self.written = 0;
+            }
+        } else {
+            wipe_uninit(self.pending.0.spare_capacity_mut());
+            #[cfg(test)]
+            {
+                self.written = self.pending.0.capacity();
+            }
+        }
+        wipe(&mut self.chunk[..]);
+    }
+
+    /// Tests: everything this connection holds in user space whose bytes
+    /// are known written (`retained`).
+    #[cfg(test)]
+    fn held(&self) -> Vec<u8> {
+        self.retained(self.written)
+    }
+
+    /// The first `len` bytes of everything this connection holds in user
+    /// space: `pending`'s allocation (its unread bytes, then the rest of its
+    /// capacity), then `chunk`, then what a frame being read has of its body.
+    /// Only bytes that were written are read.
+    #[cfg(test)]
+    fn retained(&self, len: usize) -> Vec<u8> {
+        let capacity = self.pending.0.capacity();
+        let len = len.min(capacity);
+        // SAFETY: the first `len` bytes of the allocation were all written
+        // (read data or a wipe), and the allocation is `capacity` long.
+        let pending = unsafe { std::slice::from_raw_parts(self.pending.0.as_ptr(), len) };
+        let frame = self
+            .frame
+            .as_ref()
+            .map_or(&[][..], |incoming| &incoming.body[..incoming.filled]);
+        [pending, &self.chunk[..], frame].concat()
     }
 }
 
@@ -745,6 +1067,7 @@ pub async fn run_cred_agent() -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    // Bound: a poll may connect from here; if the agent dies before serving, `open()` may relaunch it (rare, accepted).
     let watch = Watch::new(&socket, &paths.agent_socket, ORPHAN_CHECK)?;
     // A key-file error never stops the agent: it starts locked and says why
     // on `atem status` (see CredAgent::new).
@@ -783,9 +1106,349 @@ fn test_log(socket: &Path) -> PathBuf {
     CredPaths::in_dir(socket.parent().unwrap_or(Path::new("/"))).agent_log
 }
 
+/// What a client sent (tests): connections opened for requests, requests
+/// written (the build checks' included), build checks, and the requests
+/// that went as frames.
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub(crate) struct Traffic {
+    connections: std::sync::atomic::AtomicUsize,
+    requests: std::sync::atomic::AtomicUsize,
+    probes: std::sync::atomic::AtomicUsize,
+    frames: std::sync::atomic::AtomicUsize,
+    /// Looks for an agent this client started (`connect`).
+    polls: std::sync::atomic::AtomicUsize,
+    /// The pause slept before each of those looks.
+    pauses: Mutex<Vec<Duration>>,
+}
+
+#[cfg(test)]
+impl Traffic {
+    fn add(counter: &std::sync::atomic::AtomicUsize) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn probes(&self) -> usize {
+        self.probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn frames(&self) -> usize {
+        self.frames.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn polls(&self) -> usize {
+        self.polls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn pauses(&self) -> Vec<Duration> {
+        self.pauses.lock().unwrap().clone()
+    }
+}
+
 /// How a client starts an agent when none answers.
 type Launcher = Box<dyn Fn() -> Result<()> + Send + Sync>;
 
+/// A connection idle this long is replaced before it carries the next
+/// request. The agent drops connections idle for `IDLE_TIMEOUT`, and one it
+/// may be dropping must never carry a request: nothing would tell whether
+/// the agent read it.
+const REUSE_IDLE: Duration = Duration::from_secs(30);
+/// How long writing a request and getting its reply may take.
+const REPLY_WAIT: Duration = Duration::from_secs(30);
+/// How long the build check's `status` may take.
+const CHECK_WAIT: Duration = Duration::from_secs(5);
+
+/// The connection a client keeps between requests.
+struct Conn {
+    stream: UnixStream,
+    /// When the last reply arrived: the agent's idle timer starts then.
+    idle_since: std::time::Instant,
+    /// Replies read on it: a request dropped unanswered goes once more only
+    /// when its connection had answered before (a kept or checked one).
+    replies: u32,
+    /// The build check's `status` said the agent reads frames here
+    /// (agent_frame.rs).
+    frames: bool,
+}
+
+impl Conn {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            idle_since: std::time::Instant::now(),
+            replies: 0,
+            frames: false,
+        }
+    }
+
+    fn idle(&self, reuse_idle: Duration) -> bool {
+        self.idle_since.elapsed() >= reuse_idle
+    }
+
+    /// Whether the agent has closed it (or sent anything unasked).
+    fn closed(&self) -> bool {
+        let mut byte = 0u8;
+        // SAFETY: peeks at most one byte into `byte`, without blocking.
+        let peeked = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        !(peeked < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock)
+    }
+
+    /// Writes `out`, wipes it while the agent works, and reads the reply (a
+    /// frame to a frame).
+    fn round_trip(&mut self, out: Outgoing) -> Result<Answer, Failed> {
+        (&self.stream)
+            .write_all(out.bytes())
+            .map_err(|error| Failed::from_io(error, false))?;
+        let frame = match &out {
+            Outgoing::Line(_) => None,
+            Outgoing::Frame { count, .. } => Some(*count),
+        };
+        drop(out);
+        let answer = match frame {
+            None => read_answer(&self.stream)?,
+            Some(count) => read_frame(&self.stream, count)?,
+        };
+        self.idle_since = std::time::Instant::now();
+        self.replies += 1;
+        Ok(answer)
+    }
+}
+
+/// What goes on a connection: a JSON line, or a `Crypt` frame of `count` ops.
+enum Outgoing {
+    Line(Zeroizing<String>),
+    Frame { bytes: SecretBytes, count: usize },
+}
+
+impl Outgoing {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Line(line) => line.as_bytes(),
+            Self::Frame { bytes, .. } => bytes,
+        }
+    }
+}
+
+/// A reply as it was read.
+enum Received {
+    Line(WipingBuf),
+    /// A reply frame's results.
+    Results(Vec<CryptOut>),
+    /// A reply frame's JSON response (a refusal).
+    Json(SecretBytes),
+    /// A reply frame that doesn't read (out of bounds, or its body): the
+    /// connection goes with it.
+    Unreadable,
+}
+
+/// A reply, and whether it was exactly one line with nothing after it, or
+/// one whole frame: only then is its connection used again (anything the
+/// agent sent after a frame is found before the next request).
+struct Answer {
+    reply: Received,
+    in_step: bool,
+}
+
+/// Why a request got no reply.
+enum Failed {
+    /// The agent closed (or reset) the connection before any byte of the
+    /// reply arrived.
+    Unanswered(Option<std::io::Error>),
+    /// Anything else: a timeout, or a reply cut short.
+    Broken(std::io::Error),
+}
+
+impl Failed {
+    fn from_io(error: std::io::Error, replying: bool) -> Self {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected};
+        if !replying
+            && matches!(
+                error.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected
+            )
+        {
+            Self::Unanswered(Some(error))
+        } else {
+            Self::Broken(error)
+        }
+    }
+
+    fn into_error(self) -> Option<std::io::Error> {
+        match self {
+            Self::Unanswered(error) => error,
+            Self::Broken(error) => Some(error),
+        }
+    }
+}
+
+/// Reads one reply line without a `BufReader`, so no unwiped copy stays
+/// behind. A reply cut short by the agent closing the connection is
+/// returned as it is (it won't decode).
+fn read_answer(mut stream: &UnixStream) -> Result<Answer, Failed> {
+    let mut line = WipingBuf::new();
+    let mut chunk = Zeroizing::new([0u8; 4096]);
+    loop {
+        let n = match stream.read(&mut chunk[..]) {
+            Ok(0) if line.0.is_empty() => return Err(Failed::Unanswered(None)),
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Failed::from_io(error, !line.0.is_empty())),
+        };
+        if n == 0 || line.0.len() > MAX_LINE {
+            return Ok(Answer {
+                reply: Received::Line(line),
+                in_step: false,
+            });
+        }
+        line.append(&chunk[..n]);
+        // `contains` is memchr; a byte loop over every chunk of a MiB reply
+        // would cost a millisecond.
+        if chunk[..n].contains(&b'\n') {
+            let first = chunk[..n].iter().position(|byte| *byte == b'\n');
+            return Ok(Answer {
+                reply: Received::Line(line),
+                in_step: first == Some(n - 1),
+            });
+        }
+    }
+}
+
+/// Reads the reply frame to a request of `count` ops: its header, then its
+/// body, once its length passed the bounds, straight into one buffer of
+/// that length, and parses it once. A header out of bounds (nothing more is
+/// read) or a body that doesn't parse is `Unreadable`.
+fn read_frame(stream: &UnixStream, count: usize) -> Result<Answer, Failed> {
+    let mut head = [0u8; agent_frame::HEADER];
+    read_full(stream, &mut head, false)?;
+    let Ok(head) = agent_frame::reply_head(&head, count) else {
+        return Ok(Answer {
+            reply: Received::Unreadable,
+            in_step: false,
+        });
+    };
+    let mut body = SecretBytes::zeroed(head.len);
+    read_full(stream, &mut body, true)?;
+    let reply = if head.kind == agent_frame::REPLY_JSON {
+        match std::str::from_utf8(&body) {
+            Ok(_) => Received::Json(body),
+            Err(_) => Received::Unreadable,
+        }
+    } else {
+        match agent_frame::decode_crypted(head, &body) {
+            Ok(results) => Received::Results(results),
+            Err(_) => Received::Unreadable,
+        }
+    };
+    let in_step = !matches!(reply, Received::Unreadable);
+    Ok(Answer { reply, in_step })
+}
+
+/// Fills `buf` from `stream`. Closed before any byte of the reply (none read
+/// yet: `replying` false): `Unanswered`; cut short later: `Broken`.
+fn read_full(mut stream: &UnixStream, buf: &mut [u8], mut replying: bool) -> Result<(), Failed> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) if !replying => return Err(Failed::Unanswered(None)),
+            Ok(0) => return Err(Failed::Broken(std::io::ErrorKind::UnexpectedEof.into())),
+            Ok(n) => {
+                filled += n;
+                replying = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Failed::from_io(error, replying)),
+        }
+    }
+    Ok(())
+}
+
+/// `request` as `conn` takes it: a `Crypt` as a frame where `conn` agreed to
+/// frames and it fits their bounds, anything else as a JSON line.
+fn outgoing(conn: &Conn, request: &Request) -> Result<Outgoing> {
+    if conn.frames
+        && let Request::Crypt { astation_id, ops } = request
+        && let Some(bytes) = agent_frame::crypt_request(astation_id, ops)
+    {
+        return Ok(Outgoing::Frame {
+            bytes,
+            count: ops.len(),
+        });
+    }
+    Ok(Outgoing::Line(encode_request(request)?))
+}
+
+/// Whether `request` may go once more on a new connection when its
+/// connection dropped before any byte of the reply: only requests that
+/// leave the agent as they found them (reads, signatures over the current
+/// state, field operations; the prune `Crypt` and `HeldKid` run follows the
+/// signed states, so running it twice changes nothing more). A request that
+/// changes the agent never goes twice: a dropped connection is its error.
+fn resendable(request: &Request) -> bool {
+    match request {
+        Request::Status
+        | Request::PublicKeys
+        | Request::Crypt { .. }
+        | Request::HeldKid { .. }
+        | Request::PendingRotation
+        | Request::CheckGrant { .. }
+        | Request::MigrationComplete { .. } => true,
+        Request::CredentialProjects { .. }
+        | Request::LoadUnlocked { .. }
+        | Request::InstallGrant { .. }
+        | Request::BeginUnlock { .. }
+        | Request::FinishUnlock { .. }
+        | Request::BeginRotation { .. }
+        | Request::ConfirmRotation { .. }
+        | Request::AbandonPending { .. }
+        | Request::Lock { .. } => false,
+    }
+}
+
+/// The clients this process shares (`shared`).
+static SHARED: Mutex<Vec<Arc<CredAgentClient>>> = Mutex::new(Vec::new());
+
+/// The process-wide client of the agent `client` reaches, built the way
+/// `client` is: the one already shared for the same socket and key
+/// directory, the same ability to start an agent and the same build to
+/// check, else `client`, shared from now on. Every `EncryptionContext`,
+/// knowledge and vault client of a process then uses one connection, checked
+/// once (`autostart`), and `running_agent` callers another that never starts
+/// an agent (`existing`). Keyed by the resolved paths, so clients of two
+/// agents (two tests' temp profiles) never share.
+pub(crate) fn shared(client: CredAgentClient) -> Arc<CredAgentClient> {
+    let mut shared = SHARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(known) = shared.iter().find(|known| {
+        known.socket == client.socket
+            && known.record == client.record
+            && known.launcher.is_some() == client.launcher.is_some()
+            && known.build == client.build
+    }) {
+        return known.clone();
+    }
+    let client = Arc::new(client);
+    shared.push(client.clone());
+    client
+}
+
+/// A client of the cred agent: one request at a time over one connection,
+/// kept between requests.
 pub struct CredAgentClient {
     /// Where this session's agent would listen (from its runtime dir).
     socket: PathBuf,
@@ -802,36 +1465,52 @@ pub struct CredAgentClient {
     start_wait: Duration,
     /// The user the listener must run as (this user; settable in tests).
     expected_uid: u32,
-    /// With a build to compare (clients that may start an agent), the first
-    /// request first checks that the running agent is this build: a locked
-    /// agent of another build is replaced, an unlocked one kept with a
-    /// warning.
+    /// With a build to compare (clients that may start an agent), every new
+    /// connection first checks that the agent it reached is this build (a
+    /// new connection may reach a restarted agent): a locked agent of
+    /// another build is replaced, an unlocked one kept with a warning.
     build: Option<String>,
-    build_checked: std::sync::atomic::AtomicBool,
     /// `OLDER_BUILD`, once the check found an unlocked older agent.
     older_build: Mutex<Option<String>>,
     /// Look whether Atem's runtime is another build too, for the warning
     /// (this user's clients; never in tests).
     runtime_check: bool,
+    /// The connection kept between requests; holding it is holding the
+    /// right to send the next request.
+    conn: Mutex<Option<Conn>>,
+    #[cfg(test)]
+    traffic: Traffic,
 }
 
 impl CredAgentClient {
-    /// A client for the agent at `socket` that never starts one.
-    #[cfg(test)]
-    pub(crate) fn at(socket: PathBuf) -> Self {
+    fn new(
+        socket: PathBuf,
+        record: Option<PathBuf>,
+        launcher: Option<Launcher>,
+        log: PathBuf,
+        lock: Option<PathBuf>,
+    ) -> Self {
         Self {
-            log: test_log(&socket),
             socket,
-            record: None,
-            launcher: None,
-            lock: None,
+            record,
+            launcher,
+            log,
+            lock,
             start_wait: START_WAIT,
             expected_uid: own_uid(),
             build: None,
-            build_checked: std::sync::atomic::AtomicBool::new(false),
             older_build: Mutex::new(None),
             runtime_check: false,
+            conn: Mutex::new(None),
+            #[cfg(test)]
+            traffic: Traffic::default(),
         }
+    }
+
+    /// A client for the agent at `socket` that never starts one.
+    #[cfg(test)]
+    pub(crate) fn at(socket: PathBuf) -> Self {
+        Self::new(socket.clone(), None, None, test_log(&socket), None)
     }
 
     /// A client for this user's agent that starts it when none answers.
@@ -891,38 +1570,25 @@ impl CredAgentClient {
         runtime_dir: Option<OsString>,
         launcher: Option<Launcher>,
     ) -> Self {
-        let paths = paths.clone();
-        Self {
-            socket: socket_path_for(&paths, runtime_dir),
-            record: Some(paths.agent_socket),
+        Self::new(
+            socket_path_for(paths, runtime_dir),
+            Some(paths.agent_socket.clone()),
             launcher,
-            log: paths.agent_log,
-            lock: Some(paths.agent_lock),
-            start_wait: START_WAIT,
-            expected_uid: own_uid(),
-            build: None,
-            build_checked: std::sync::atomic::AtomicBool::new(false),
-            older_build: Mutex::new(None),
-            runtime_check: false,
-        }
+            paths.agent_log.clone(),
+            Some(paths.agent_lock.clone()),
+        )
     }
 
     /// A client for the agent at `socket` that starts it with `launcher`.
     #[cfg(test)]
     pub(crate) fn with_launcher(socket: PathBuf, launcher: Launcher) -> Self {
-        Self {
-            log: test_log(&socket),
-            socket,
-            record: None,
-            launcher: Some(launcher),
-            lock: None,
-            start_wait: START_WAIT,
-            expected_uid: own_uid(),
-            build: None,
-            build_checked: std::sync::atomic::AtomicBool::new(false),
-            older_build: Mutex::new(None),
-            runtime_check: false,
-        }
+        Self::new(
+            socket.clone(),
+            None,
+            Some(launcher),
+            test_log(&socket),
+            None,
+        )
     }
 
     /// Names `log` when an agent doesn't come up.
@@ -939,7 +1605,7 @@ impl CredAgentClient {
         self
     }
 
-    /// Checks the running agent against `build` before the first request.
+    /// Checks the agent behind every new connection against `build`.
     #[cfg(test)]
     pub(crate) fn checking_build(mut self, build: &str) -> Self {
         self.build = Some(build.to_string());
@@ -952,6 +1618,39 @@ impl CredAgentClient {
         self.older_build.lock().ok()?.clone()
     }
 
+    /// What this client sent.
+    #[cfg(test)]
+    pub(crate) fn traffic(&self) -> &Traffic {
+        &self.traffic
+    }
+
+    /// Unread bytes queued on the kept connection; `None` when none is kept.
+    #[cfg(test)]
+    pub(crate) fn kept_unread(&self) -> Option<usize> {
+        let kept = self.conn.lock().ok()?;
+        let conn = kept.as_ref()?;
+        let mut bytes = [0u8; 256];
+        // SAFETY: peeks at most `bytes.len()` bytes into `bytes`, without blocking.
+        let peeked = unsafe {
+            libc::recv(
+                conn.stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        Some(usize::try_from(peeked).unwrap_or(0))
+    }
+
+    /// Moves the kept connection's last reply `by` into the past, as if it
+    /// had sat idle that much longer (tests move the clock, never wait).
+    #[cfg(test)]
+    pub(crate) fn idle_for(&self, by: Duration) {
+        if let Some(conn) = &mut *self.conn.lock().unwrap() {
+            conn.idle_since = conn.idle_since.checked_sub(by).unwrap();
+        }
+    }
+
     /// Expects the listener to run as `uid` instead of this user.
     #[cfg(test)]
     pub(crate) fn expecting_uid(mut self, uid: u32) -> Self {
@@ -960,15 +1659,44 @@ impl CredAgentClient {
     }
 
     /// Connects to the recorded socket, else this session's, and refuses a
-    /// listener that isn't `expected_uid`.
+    /// listener that isn't `expected_uid`. When neither answers, the error
+    /// proves no agent (`proves_absent`) only if both paths prove it; one
+    /// that doesn't names its path.
     fn dial(&self) -> std::io::Result<Result<UnixStream>> {
-        if let Some(recorded) = self.record.as_deref().and_then(recorded_socket)
+        let unproven_at = |socket: &Path, error: std::io::Error| {
+            if proves_absent(&error) {
+                error
+            } else {
+                std::io::Error::new(error.kind(), format!("{}: {error}", socket.display()))
+            }
+        };
+        let mut unproven = None;
+        if let Some(record) = self.record.as_deref()
+            && let Some(recorded) = recorded_socket(record)
             && recorded != self.socket
-            && let Ok(checked) = self.dial_at(&recorded)
         {
-            return Ok(checked);
+            match self.dial_at(&recorded) {
+                Ok(checked) => return Ok(checked),
+                Err(error) if !proves_absent(&error) => {
+                    unproven = Some(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{} (named by {}; remove that file if no cred agent runs): {error}",
+                            recorded.display(),
+                            record.display()
+                        ),
+                    ));
+                }
+                Err(_) => {}
+            }
         }
-        self.dial_at(&self.socket)
+        match self.dial_at(&self.socket) {
+            Ok(checked) => Ok(checked),
+            Err(error) => Err(match unproven {
+                Some(unproven) if proves_absent(&error) => unproven,
+                _ => unproven_at(&self.socket, error),
+            }),
+        }
     }
 
     fn dial_at(&self, socket: &Path) -> std::io::Result<Result<UnixStream>> {
@@ -983,26 +1711,95 @@ impl CredAgentClient {
         Ok(Ok(stream))
     }
 
-    pub fn is_running(&self) -> bool {
-        matches!(self.dial(), Ok(Ok(_)))
+    /// Whether an agent answers on its socket: `Ok(false)` only when that
+    /// is proven (a missing path, or refused: `proves_absent`). A listener
+    /// of another user, or any other error, may hide a running agent:
+    /// `Err`, never "not running". Starts nothing.
+    pub fn probe(&self) -> Result<bool> {
+        match self.dial() {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(other_user)) => Err(other_user),
+            Err(error) if proves_absent(&error) => Ok(false),
+            Err(error) => Err(anyhow!(error).context("could not reach the cred agent")),
+        }
+    }
+
+    /// Whether an agent answers now (tests; callers use `probe`, which
+    /// tells "not running" from "can't tell").
+    #[cfg(test)]
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.probe(), Ok(true))
+    }
+
+    /// Whether an agent may answer: the kept connection is open (when no
+    /// request holds it), else anything but a proven absence (`probe`) of
+    /// an agent that doesn't hold the key files either (`key_dir_held`), so
+    /// a caller's request reports what is wrong with an agent it can't
+    /// reach instead of taking it for none. Starts nothing.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn answers(&self) -> bool {
+        if let Ok(mut kept) = self.conn.try_lock() {
+            drop_unusable(&mut kept);
+            if kept.is_some() {
+                return true;
+            }
+        }
+        match self.probe() {
+            Ok(false) => self.key_dir_held(),
+            _ => true,
+        }
+    }
+
+    /// Whether an agent holds the key files (`agent.lock`): a live agent
+    /// holds it for its whole life, from before it listens, so one that
+    /// answers on no socket (starting, stopping, orphaned, or behind a full
+    /// accept queue, which macOS refuses like a missing listener) may still
+    /// run unlocked.
+    fn key_dir_held(&self) -> bool {
+        self.lock
+            .as_deref()
+            .is_some_and(|lock| lock_is_held(lock) == Some(true))
     }
 
     fn connect(&self) -> Result<UnixStream> {
         match self.dial() {
             Ok(checked) => checked,
+            // No agent (proven), or something that proves nothing while no
+            // agent holds the key files (a stale record, say): start one. It
+            // takes the key files' lock and records its socket, and gives way
+            // to an agent that took them first.
             Err(error)
                 if self.launcher.is_some()
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                    ) =>
+                    && (proves_absent(&error)
+                        || self
+                            .lock
+                            .as_deref()
+                            .is_some_and(|lock| lock_is_held(lock) == Some(false))) =>
             {
                 if let Some(launch) = &self.launcher {
                     launch()?;
                 }
+                // Ready is a same-user agent accepting a connection on the
+                // expected socket (`dial`); a missing or stale socket is "not
+                // yet" until `start_wait` has passed, and a listener of
+                // another user is the error it always was.
                 let deadline = std::time::Instant::now() + self.start_wait;
-                while std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(100));
+                let mut polls = 0;
+                loop {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let pause = start_poll_pause(polls).min(left);
+                    #[cfg(test)]
+                    self.traffic.pauses.lock().unwrap().push(pause);
+                    std::thread::sleep(pause);
+                    polls += 1;
+                    #[cfg(test)]
+                    Traffic::add(&self.traffic.polls);
+                    // Any io error is "not yet" while the agent starts: a
+                    // missing or refused socket, or a reset / not-connected
+                    // one (macOS, a listener coming up).
                     if let Ok(checked) = self.dial() {
                         return checked;
                     }
@@ -1015,26 +1812,26 @@ impl CredAgentClient {
                 }
                 bail!("the cred agent didn't start; see {}", self.log.display())
             }
-            Err(error) => Err(anyhow!(error).context(format!(
-                "the cred agent isn't running at {}",
-                self.socket.display()
-            ))),
-        }
-    }
-}
-
-/// Reads one reply line without a `BufReader`, so no unwiped copy stays behind.
-fn read_reply(mut stream: &UnixStream) -> std::io::Result<WipingBuf> {
-    let mut line = WipingBuf::new();
-    let mut chunk = Zeroizing::new([0u8; 4096]);
-    loop {
-        let n = stream.read(&mut chunk[..])?;
-        if n == 0 || line.0.len() > MAX_LINE {
-            return Ok(line);
-        }
-        line.append(&chunk[..n]);
-        if chunk[..n].contains(&b'\n') {
-            return Ok(line);
+            // No agent was started. One that holds the key files may run
+            // unlocked, whatever its socket said (nothing, or something that
+            // proves nothing): it is named, with what the socket said.
+            Err(error) => {
+                if let Some(lock) = self.lock.as_deref()
+                    && lock_is_held(lock) == Some(true)
+                {
+                    return Err(anyhow!(error).context(StuckAgent(stuck_message(lock))));
+                }
+                if proves_absent(&error) {
+                    Err(anyhow!(error).context(format!(
+                        "the cred agent isn't running at {}",
+                        self.socket.display()
+                    )))
+                } else {
+                    // A reset or not-connected socket, a permission error: no
+                    // agent is started beside one that may be running.
+                    Err(anyhow!(error).context("could not reach the cred agent"))
+                }
+            }
         }
     }
 }
@@ -1059,29 +1856,30 @@ impl CredAgentClient {
     }
 
     /// The protocol version the running agent answers a `status` in (no
-    /// autostart); `None` when it doesn't answer.
+    /// autostart, on a connection of its own); `None` when it doesn't answer.
     fn probe_version(&self) -> Option<u64> {
         let stream = self.dial().ok()?.ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .ok()?;
+        stream.set_read_timeout(Some(CHECK_WAIT)).ok()?;
+        stream.set_write_timeout(Some(CHECK_WAIT)).ok()?;
         let line = encode_request(&Request::Status).ok()?;
-        (&stream).write_all(line.as_bytes()).ok()?;
-        let reply = read_reply(&stream).ok()?;
+        let answer = Conn::new(stream).round_trip(Outgoing::Line(line)).ok()?;
+        let Received::Line(reply) = answer.reply else {
+            return None;
+        };
         let text = std::str::from_utf8(&reply.0).ok()?;
         serde_json::from_str::<ResponseHead>(text.trim())
             .ok()
             .map(|head| head.v)
     }
-}
 
-impl CredAgentClient {
-    /// Waits up to `wait` for the agent to stop answering; true once it has.
+    /// Waits up to `wait` for the agent to be gone; true once that is
+    /// proven (`probe`: its socket is missing or refused) and it no longer
+    /// holds the key files (`key_dir_held`). An agent that can't be reached
+    /// for another reason is not gone.
     fn wait_gone(&self, wait: Duration) -> bool {
         let deadline = std::time::Instant::now() + wait;
         loop {
-            if !self.is_running() {
+            if matches!(self.probe(), Ok(false)) && !self.key_dir_held() {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -1091,45 +1889,81 @@ impl CredAgentClient {
         }
     }
 
-    /// `request` to the running agent, never starting one; `None` when no
-    /// agent answers it.
-    fn ask_running(&self, request: &Request) -> Option<Reply> {
-        let stream = self.dial().ok()?.ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .ok()?;
-        let line = encode_request(request).ok()?;
-        (&stream).write_all(line.as_bytes()).ok()?;
-        let reply = read_reply(&stream).ok()?;
-        decode_response(std::str::from_utf8(&reply.0).ok()?).ok()
+    /// A new connection with this client's timeouts, unchecked; the agent
+    /// started first when none answers and this client may.
+    fn connection(&self) -> Result<Conn> {
+        let stream = self.connect()?;
+        let closed = |error: std::io::Error| self.closed(Some(error));
+        stream.set_read_timeout(Some(REPLY_WAIT)).map_err(closed)?;
+        stream.set_write_timeout(Some(REPLY_WAIT)).map_err(closed)?;
+        #[cfg(test)]
+        Traffic::add(&self.traffic.connections);
+        Ok(Conn::new(stream))
     }
 
-    /// Once per client (with a build to compare): the running agent must be
-    /// this build. A locked agent of another build holds no keys, so it is
-    /// asked to stop and the next request starts this build's. An unlocked one is never restarted: it is used,
-    /// with a warning.
-    fn check_build(&self) -> Result<()> {
-        use std::sync::atomic::Ordering;
+    /// A new connection, checked against this build first when the client
+    /// has one to compare (`check_build`): every new connection may reach
+    /// another agent process than the last one did.
+    fn open(&self) -> Result<Conn> {
+        let conn = self.connection()?;
         let Some(build) = self.build.as_deref() else {
-            return Ok(());
+            return Ok(conn);
         };
-        if self.build_checked.swap(true, Ordering::SeqCst) {
-            return Ok(());
+        match self.check_build(conn, build)? {
+            Some(conn) => Ok(conn),
+            // The check got no answer, or stopped a locked agent of another
+            // build: the request goes on a new connection, to the agent
+            // `connect` finds or starts, unchecked (as before).
+            None => self.connection(),
         }
+    }
+
+    /// `request` on `conn` within `wait`: its reply, `None` without a
+    /// readable one.
+    fn ask(&self, conn: &mut Conn, request: &Request, wait: Duration) -> Option<Reply> {
+        let line = encode_request(request).ok()?;
+        conn.stream.set_read_timeout(Some(wait)).ok()?;
+        #[cfg(test)]
+        Traffic::add(&self.traffic.requests);
+        let answer = conn.round_trip(Outgoing::Line(line)).ok()?;
+        // Back to the reply wait for the requests that follow. macOS refuses
+        // this (EINVAL) once the agent has closed the connection: the answer
+        // still counts, and the next request on the connection fails as it
+        // does on Linux (its error, or a resend of a stateless one).
+        let _ = conn.stream.set_read_timeout(Some(REPLY_WAIT));
+        match answer.reply {
+            Received::Line(reply) if answer.in_step => {
+                decode_response(std::str::from_utf8(&reply.0).ok()?).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// The build check on the new connection `conn`: the agent it reached
+    /// must be this build. A locked agent of another build holds no keys, so
+    /// it is asked to stop (`None`: the next connection starts this build's).
+    /// An unlocked one is never restarted: it is used, with a warning. `None`
+    /// too when the agent didn't answer the check. Its answer also says
+    /// whether the agent reads frames on `conn` (agent_frame.rs).
+    fn check_build(&self, mut conn: Conn, build: &str) -> Result<Option<Conn>> {
+        use std::sync::atomic::Ordering;
+        #[cfg(test)]
+        Traffic::add(&self.traffic.probes);
         let Some(Reply::Status {
             unlocked,
             build: theirs,
+            frames,
             ..
-        }) = self.ask_running(&Request::Status)
+        }) = self.ask(&mut conn, &Request::Status, CHECK_WAIT)
         else {
-            return Ok(());
+            return Ok(None);
         };
+        conn.frames = frames == Some(agent_frame::VERSION);
         if theirs == build {
-            return Ok(());
+            return Ok(Some(conn));
         }
         if unlocked {
-            // Once per process, however many clients a command makes.
+            // Once per process, however many connections a command makes.
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             let text = self.older_build_text();
@@ -1139,16 +1973,98 @@ impl CredAgentClient {
             if let Ok(mut older) = self.older_build.lock() {
                 *older = Some(text.to_string());
             }
-            return Ok(());
+            return Ok(Some(conn));
         }
-        let _ = self.ask_running(&Request::Lock { stop: true });
+        let _ = self.ask(&mut conn, &Request::Lock { stop: true }, CHECK_WAIT);
+        drop(conn);
         if self.wait_gone(STOP_WAIT) {
-            return Ok(());
+            return Ok(None);
         }
         bail!(
             "the running cred agent is another atem build and didn't stop when asked; run `atem cred lock`, then retry (it is locked: its keys stay sealed on disk)"
         )
     }
+
+    /// Writes `out` on `conn` and reads the reply.
+    fn send(&self, conn: &mut Conn, out: Outgoing) -> Result<Answer, Failed> {
+        #[cfg(test)]
+        {
+            Traffic::add(&self.traffic.requests);
+            if matches!(out, Outgoing::Frame { .. }) {
+                Traffic::add(&self.traffic.frames);
+            }
+        }
+        conn.round_trip(out)
+    }
+
+    /// The request on the kept connection (opened, and checked, when none
+    /// is kept, or when the kept one can't carry it: `drop_unusable`):
+    /// `line`, or without one, `again` encoded for the connection
+    /// (`outgoing`: a `Crypt` as a frame where it agreed to them).
+    ///
+    /// When the connection drops after the request was written but before
+    /// any byte of the reply, the request in `again` (a `resendable` one)
+    /// goes once more, on a new connection, when the dropped one had
+    /// answered before (the agent stopped or restarted meanwhile); every
+    /// other failure is the request's error. Every released agent serves
+    /// several requests per connection; one that closed a connection after
+    /// a reply would only make the next request on it fail this way.
+    fn exchange(
+        &self,
+        kept: &mut Option<Conn>,
+        mut line: Option<Zeroizing<String>>,
+        again: Option<&Request>,
+    ) -> Result<Received> {
+        let mut resent = false;
+        loop {
+            drop_unusable(kept);
+            let conn = match kept {
+                Some(conn) => conn,
+                None => kept.insert(self.open()?),
+            };
+            let out = match line.take() {
+                Some(line) => Outgoing::Line(line),
+                None => outgoing(conn, again.ok_or_else(unencoded)?)?,
+            };
+            let replies = conn.replies;
+            let failed = match self.send(conn, out) {
+                Ok(answer) => return Ok(keep(kept, answer)),
+                Err(failed) => failed,
+            };
+            *kept = None;
+            let resend = matches!(failed, Failed::Unanswered(_)) && replies > 0 && !resent;
+            if !resend || again.is_none() {
+                return Err(self.closed(failed.into_error()));
+            }
+            // `line` is taken: the new connection encodes `again` its way.
+            resent = true;
+        }
+    }
+}
+
+/// Drops the kept connection when it can't carry a request: idle for
+/// `REUSE_IDLE`, or closed by the agent (it stopped or restarted). Nothing
+/// has been written on it, so no request goes twice.
+fn drop_unusable(kept: &mut Option<Conn>) {
+    if kept
+        .as_ref()
+        .is_some_and(|conn| conn.idle(REUSE_IDLE) || conn.closed())
+    {
+        *kept = None;
+    }
+}
+
+/// A request that is neither encoded nor kept to be encoded.
+fn unencoded() -> anyhow::Error {
+    anyhow!("the cred agent request was not kept to be encoded")
+}
+
+/// `answer`'s reply; its connection stays kept only while in step.
+fn keep(kept: &mut Option<Conn>, answer: Answer) -> Received {
+    if !answer.in_step {
+        *kept = None;
+    }
+    answer.reply
 }
 
 /// An agent from an older atem rejects a request it doesn't know as
@@ -1163,6 +2079,19 @@ fn explain_unknown_request(error: anyhow::Error, older: &str) -> anyhow::Error {
 
 impl CredAgentApi for CredAgentClient {
     fn lock_and_stop(&self) -> Result<bool> {
+        // Nothing answers, yet an agent holds the key files: one starting
+        // (not listening yet) or stopping (draining). Up to `STOP_WAIT` for
+        // it to answer, or to go (an agent's keys go with its process).
+        // Still neither: the request below names it, never "locked".
+        if matches!(self.probe(), Ok(false)) && self.key_dir_held() {
+            let deadline = std::time::Instant::now() + STOP_WAIT;
+            while matches!(self.probe(), Ok(false)) && std::time::Instant::now() < deadline {
+                if !self.key_dir_held() {
+                    return Ok(true);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         match self.call(Request::Lock { stop: true })? {
             Reply::Done => Ok(self.wait_gone(STOP_WAIT)),
             _ => bail!("the cred agent sent an unexpected reply"),
@@ -1170,29 +2099,56 @@ impl CredAgentApi for CredAgentClient {
     }
 
     fn call(&self, request: Request) -> Result<Reply> {
-        let line = encode_request(&request)?;
-        drop(request);
-        self.check_build()?;
-        let stream = self.connect()?;
-        let closed = |error: std::io::Error| self.closed(Some(error));
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(closed)?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(30)))
-            .map_err(closed)?;
-        (&stream).write_all(line.as_bytes()).map_err(closed)?;
-        drop(line);
-        let reply = read_reply(&stream).map_err(closed)?;
-        if reply.0.is_empty() {
-            return Err(self.closed(None));
-        }
-        let text = std::str::from_utf8(&reply.0)
-            .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))?;
-        decode_response(text)
-            .map_err(|error| explain_unknown_request(error, self.older_build_text()))
+        let stops = matches!(request, Request::Lock { stop: true });
+        // A `Crypt` (resendable) is encoded once its connection is known, as
+        // a frame where that connection agreed to them; any other request is
+        // encoded now.
+        let line = match &request {
+            Request::Crypt { .. } => None,
+            _ => Some(encode_request(&request)?),
+        };
+        // Kept to go once more if its connection drops unanswered (what is
+        // written is wiped as soon as it is); any other request is wiped now.
+        let again = resendable(&request).then_some(request);
+        let reply = {
+            let mut kept = self.conn.lock().unwrap_or_else(|poisoned| {
+                // A request that panicked midway leaves no usable connection.
+                self.conn.clear_poison();
+                let mut kept = poisoned.into_inner();
+                *kept = None;
+                kept
+            });
+            let reply = self.exchange(&mut kept, line, again.as_ref());
+            if stops {
+                // The agent closes it once it has answered.
+                *kept = None;
+            }
+            reply
+        };
+        drop(again);
+        let reply = match reply? {
+            Received::Line(reply) => {
+                let text = std::str::from_utf8(&reply.0)
+                    .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))?;
+                decode_response(text)
+            }
+            Received::Results(results) => Ok(Reply::Crypted { results }),
+            Received::Json(body) => std::str::from_utf8(&body)
+                .map_err(|_| anyhow!("the cred agent sent a non-UTF-8 reply"))
+                .and_then(decode_response),
+            Received::Unreadable => Err(anyhow!("the cred agent sent an unreadable reply")),
+        };
+        reply.map_err(|error| explain_unknown_request(error, self.older_build_text()))
     }
 }
+
+#[cfg(test)]
+#[path = "agent_client_tests.rs"]
+mod client_tests;
+
+#[cfg(test)]
+#[path = "agent_frame_tests.rs"]
+mod frame_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1201,14 +2157,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// Unix socket paths are limited to ~100 bytes; keep them short.
-    fn short_dir() -> tempfile::TempDir {
+    pub(super) fn short_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("atem-ka")
             .tempdir_in("/tmp")
             .unwrap()
     }
 
-    fn own_uid() -> u32 {
+    pub(super) fn own_uid() -> u32 {
         unsafe { libc::getuid() }
     }
 
@@ -1226,20 +2182,20 @@ mod tests {
     }
 
     /// The agent socket under the runtime dir `run` (`CredPaths::agent_sock`).
-    fn sock(run: &Path) -> PathBuf {
+    pub(super) fn sock(run: &Path) -> PathBuf {
         CredPaths::in_dir(run).agent_sock(Some(run))
     }
 
     /// Creates `path` private, whatever the umask: the agent refuses a socket
     /// directory others can write to.
-    fn make_private(path: &Path) {
+    pub(super) fn make_private(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
     }
 
     /// Serves an agent for the key files in `dir` on its own thread.
-    fn start_agent(dir: &Path, allowed_uid: u32) -> PathBuf {
+    pub(super) fn start_agent(dir: &Path, allowed_uid: u32) -> PathBuf {
         let socket = sock(&dir.join("run"));
         let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
@@ -1912,7 +2868,7 @@ mod tests {
 
     /// The atem binary next to the test binary (built because integration
     /// tests exist).
-    fn atem_binary() -> PathBuf {
+    pub(super) fn atem_binary() -> PathBuf {
         let exe = std::env::current_exe()
             .unwrap()
             .parent()
@@ -1928,7 +2884,7 @@ mod tests {
     }
 
     /// Kills the child when the test ends, however it ends.
-    struct Reaped(std::process::Child);
+    pub(super) struct Reaped(pub(super) std::process::Child);
 
     impl Drop for Reaped {
         fn drop(&mut self) {
@@ -1938,7 +2894,7 @@ mod tests {
     }
 
     /// `atem cred-agent` for `home`, with its socket under `runtime`.
-    fn cred_agent_process(home: &Path, runtime: &Path, log: &Path) -> Reaped {
+    pub(super) fn cred_agent_process(home: &Path, runtime: &Path, log: &Path) -> Reaped {
         let log = std::fs::File::create(log).unwrap();
         Reaped(
             std::process::Command::new(atem_binary())
@@ -1954,7 +2910,7 @@ mod tests {
     }
 
     /// Polls `done` for up to five seconds.
-    fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    pub(super) fn eventually(mut done: impl FnMut() -> bool) -> bool {
         for _ in 0..50 {
             if done() {
                 return true;
@@ -2270,10 +3226,10 @@ mod tests {
 
     /// Makes `dir` unreadable until dropped (then 0700 again, so the temp
     /// dir can be removed).
-    struct Unreadable(PathBuf);
+    pub(super) struct Unreadable(PathBuf);
 
     impl Unreadable {
-        fn new(dir: &Path) -> Self {
+        pub(super) fn new(dir: &Path) -> Self {
             std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o000))
                 .unwrap();
             Self(dir.to_path_buf())
@@ -2382,7 +3338,7 @@ mod tests {
     }
 
     /// `start_agent`, plus a receiver that fires once serving stops.
-    fn start_stoppable_agent(dir: &Path) -> (PathBuf, std::sync::mpsc::Receiver<()>) {
+    pub(super) fn start_stoppable_agent(dir: &Path) -> (PathBuf, std::sync::mpsc::Receiver<()>) {
         let socket = sock(&dir.join("run"));
         let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
@@ -2407,7 +3363,11 @@ mod tests {
 
     /// An agent of an older build: answers `status` with `status` (a JSON
     /// reply) and every other request with `other`, and never exits.
-    fn start_scripted_agent(dir: &Path, status: &'static str, other: &'static str) -> PathBuf {
+    pub(super) fn start_scripted_agent(
+        dir: &Path,
+        status: &'static str,
+        other: &'static str,
+    ) -> PathBuf {
         let socket = sock(&dir.join("run"));
         make_private(socket.parent().unwrap());
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -2439,7 +3399,7 @@ mod tests {
 
     /// A locked agent of another build that never stops when asked.
     const OTHER_LOCKED: &str = r#"{"v":2,"ok":true,"reply":{"kind":"status","unlocked":false,"storage_kid":null,"escrowed":false,"build":"0.0.0+other"}}"#;
-    const OTHER_DONE: &str = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
+    pub(super) const OTHER_DONE: &str = r#"{"v":2,"ok":true,"reply":{"kind":"done"}}"#;
 
     #[test]
     fn lock_wipes_the_agent_and_stops_it() {

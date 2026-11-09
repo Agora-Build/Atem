@@ -30,6 +30,9 @@ Recovery Kit (`crates/atem-client`, Atem v0.8.0; "Recovery kit").
 memory writes and bound associated data, the revocation list, credentials
 (scope and index keys, `atem cred get|list|add`), auto-unlock and ticket
 rolling (`atem cred unlock|lock|projects` are built).
+**Planned (owner decision 2026-11-08), not implemented:** encryption of memory, skills and
+vault notes stops being optional (see "Encryption becomes the only mode"), with
+performance requirements (see "Performance").
 Owner: Brent G
 
 ## Goal
@@ -49,11 +52,28 @@ content. Two kinds of data, one foundation:
 
 | Data | Key | Encryption | Who writes |
 |---|---|---|---|
-| Memory, skills, vault notes | account key `K` | **optional**, off by default, switched in Astation's settings | any verified atem, each write signed by its device signing key |
+| Memory, skills, vault notes | account key `K` | **optional**, off by default, switched in Astation's settings (**Planned (owner decision 2026-11-08), not implemented:** the only mode, see "Encryption becomes the only mode") | any verified atem; each write signed by its device signing key (**Not implemented:** build step 3, writes are unsigned today) |
 | Credentials (`atem cred`) | one scope key per project, plus global | **always on**, no plain-text mode | Astation only, with Touch ID |
 
 Both share the same trust root (Astation), device verification, sealed
 device key, unlock policy and recovery kit, described once below.
+
+**Current versus target.** Built: with the mode `on` the relay cannot read
+memory, skill or vault content and cannot inject plain text, and Atem refuses
+key swaps and unsigned mode changes. Not built: the relay is still able to
+forge, swap or roll back what atems use, because memory and skill writes are
+unsigned (build step 3) and pulled rows are not checked against what Atem
+already holds (see "Anti-rollback check on pulled rows"). The claims below that
+say otherwise describe the target; the rows that depend on step 3 or step 5 say
+so.
+
+**Planned (owner decision 2026-11-08), not implemented:** encryption of memory, skills and
+vault notes becomes the only mode: no plain-text option, no `off`
+([below](#encryption-becomes-the-only-mode-planned)). Until then, as a
+transition measure for accounts still off, Atem injects relay-synced Memory
+facts and skills into agents (the managed blocks and the skill directories)
+only while the signed mode is `on`; see "Injection into agents by mode" and
+[atem-memory.md](atem-memory.md#injection-into-agents-requires-encryption-on-planned).
 
 ## Non-goals
 
@@ -66,8 +86,10 @@ device key, unlock policy and recovery kit, described once below.
   can read everything it was granted and write memory as that device.
   Grants per project and revocation limit the damage.
 - **Availability.** The relay can withhold data, including recent memory
-  writes and invalidations. It can't read, forge or reorder it without
-  detection (see "Threat model" for what withholding can still do).
+  writes and invalidations. It can't read it. Detecting forged, swapped or
+  reordered rows needs signed writes and the anti-rollback check, which are
+  **Planned (owner decision 2026-11-08), not implemented** (see "Threat model"
+  for what the relay can still do).
 - Encrypting Astation's own relay traffic (pairing, voice, tasks). This
   covers stored data and the key exchanges below.
 
@@ -75,13 +97,14 @@ device key, unlock policy and recovery kit, described once below.
 
 | Attacker | Result | Why |
 |---|---|---|
-| Relay database dump, stolen backup | protected | Rows hold only ciphertext, keys sealed to devices, signatures and HMAC'd names. No key that decrypts anything is on the server. |
-| Relay operator or Cloudflare, actively malicious | protected (can deny service) | Key swaps fail the commit-then-reveal safety code. Every key grant, mode change, credential row, manifest and memory write is signed. Older credential values fail the signed counters and epoch floor. Plain text is rejected while encryption is on. |
-| Relay hides an invalidation or a recent memory write | partial | atem never accepts an older state of a record it already has, but a device that never saw the newer write can be shown the older one. This is withholding, not forgery. |
-| Valid pairing session on an unverified device | protected | Astation seals keys only to verified device keys, and other devices drop writes without a certified device signature. |
+| Relay database dump, stolen backup | protected | Rows hold only ciphertext, keys sealed to devices, signed grants and statements, and HMAC'd names. No key that decrypts anything is on the server. |
+| Relay operator or Cloudflare, actively malicious | partial (can deny service) | Built: key swaps fail the commit-then-reveal safety code; every key grant and mode change is signed; plain text is rejected while encryption is on, so the relay can't read content or inject plain text. **Not implemented:** signatures on memory and skill writes (step 3) and on credential rows and manifests (step 5), and the signed counters and epoch floor that make older credential values fail (step 5). See the rows on replay and rollback. |
+| Relay hides an invalidation or a recent memory write | partial | A device that never saw the newer write can be shown the older one. This is withholding, not forgery, and it stays partial. Built: a local invalidation is kept when a pulled row lacks it, and a skill's lower version is skipped. **Not implemented:** refusing an older state of other memory fields and of deletions (see "Anti-rollback check on pulled rows"). |
+| Relay serves an older ciphertext of a record again, or changes its unsigned metadata (scope, project hash, validity), while encryption is on | exposed until signed writes (build step 3) and the anti-rollback check | The associated data binds a ciphertext to its record id and field only (`account_keys::field_aad`); nothing signs the metadata or the version, and pulled memory rows overwrite local ones without a version check (`sync::apply_pulled_memories`; see "Anti-rollback check on pulled rows"). **Planned (owner decision 2026-11-08), not implemented:** both are required, since agents read injected memory and skills. |
+| Valid pairing session on an unverified device | protected | Astation seals keys only to verified device keys. **Not implemented:** other devices dropping writes without a certified device signature (step 3). Today an unverified device can't read, and its plain text is rejected while encryption is on. |
 | Another non-root user on the box | protected | Files are 0600. The cred agent socket is 0600 and checks the caller's UID (`SO_PEERCRED`). |
 | Copied disk, VM snapshot or backup of a box | protected with Touch ID unlock; mostly protected with auto-unlock | The device keys are sealed (`device_keys.sealed`) by a storage key only Astation holds, and the storage key changes at every unlock, so copies older than the last unlock can't be opened. See "Unlock policy". |
-| Revoked device | partial | Its pairing session is killed; `K`, the index key and its scope keys are rotated; its writes are rejected by every device. It keeps what it already read. Every value in its scopes is listed for rotation at the provider. |
+| Revoked device | partial | Its pairing session is killed and `K` is rotated by Astation (the index key and scope keys belong to credentials, step 5, not implemented). **Not implemented:** its writes being rejected by every device (signed writes and the revocation list, step 3). It keeps what it already read. Every value in its scopes is listed for rotation at the provider. |
 | Root or malware on a granted device | exposed | Out of scope. Limited to what that device was granted. |
 | Stolen Mac | protected | Keys are in the Keychain and Secure Enclave behind Touch ID. Restore on a new Mac from the recovery kit. |
 | Stolen recovery kit + control of the relay | delayed and visible | A recovery enrollment takes effect only 24 hours after each host first sees it (on the host's clock), every host lists it in its `welcome` and shows it locally, and any manager device can veto it from any host. |
@@ -91,7 +114,10 @@ device key, unlock policy and recovery kit, described once below.
 
 | Topic | Decision |
 |---|---|
-| Memory encryption | Optional, off by default, switched in Astation. Mode changes are signed by Astation; atem never moves toward plain text without one. Turning off goes through `disabling`. |
+| Memory encryption | Optional, off by default, switched in Astation. Mode changes are signed by Astation; atem never moves toward plain text without one. Turning off goes through `disabling`. **Planned (owner decision 2026-11-08), not implemented:** the only mode: no `off`, no `disabling`; new accounts start on, accounts still off are migrated, the relay refuses plain text, Astation's switch becomes a status display. |
+| Injection into agents | **Planned (owner decision 2026-11-08), not implemented:** a transition measure until `off` is removed: relay-synced memory facts and skills reach agents (managed blocks, skill directories) only while the signed mode is `on`. Sync, search and list work in every mode. |
+| Rollback and forgery of memory and skills | **Planned (owner decision 2026-11-08), not implemented:** signed writes (build step 3) and an anti-rollback check on pulled rows, together. |
+| Performance | Owner decision 2026-11-08: a requirement with budgets, set from measurements; a change that breaks one doesn't ship. Built: the fixes F1, F2, F3, F6, F7 and F8 (F8 released together with the Station's skill file transport, Astation PR #76); F4 and F5 are not approved. See "Performance". |
 | Credentials encryption | Always on. |
 | Offline credential reads | Grants per device. A device decrypts on its own while Astation is offline. |
 | Credential grant granularity | Per project scope. `global` is a scope. |
@@ -116,7 +142,9 @@ log and `atem cred add`) and on auto-unlock; see the status line.
 ## Keys
 
 Astation is the root of trust and holds every shared key. Astation never
-shows memories, skills or vault notes; it stores keys and hands them to
+shows memories, skills or vault notes (**Planned (owner decision 2026-11-08), not implemented:** except the review list
+for held content, see "Quarantine of relay-sourced content at the migration");
+it stores keys and hands them to
 verified devices. Credentials get keys of their own, separate from `K`, so
 holding `K` never opens a credential.
 
@@ -440,6 +468,75 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
+- **One client and one connection per process.** Every caller in a process
+  (each `EncryptionContext`, the knowledge and vault clients, the runtime's
+  Astation link) shares one client per agent (keyed by its socket path and
+  key directory), which sends one request at a time over one connection kept
+  between requests; `running_agent` callers share another that never starts
+  an agent. Every released agent (v0.6.11, the first, to v0.8.3) serves any
+  number of lines on a connection and drops one idle for 60 s. The client
+  checks the build (`status`) once per connection, before its first request,
+  since a new connection may reach a restarted agent. A connection idle for
+  30 s, or one the agent has closed, is replaced before anything is written
+  on it. There is no fallback for an agent that closes a connection after
+  a reply (none was released): the request after such a connection's build
+  check fails with the error of a dropped connection, below, at once, and
+  is never sent twice when it changes the agent. When a connection that had
+  already answered at least once (the build check's `status` counts) drops
+  after a request was written but before any byte of its reply, only a
+  request that leaves the agent as it was (`status`, `Crypt`, `HeldKid`,
+  `PublicKeys`, `PendingRotation`, `CheckGrant`, `MigrationComplete`) is
+  sent once more on a new connection, at most once; for every other
+  request, and for any request on a connection that never answered, the
+  dropped connection is its error. Requests carry secrets, so once a
+  connection's requests are answered the agent wipes everything they left
+  in its read buffers (the whole allocation past any unread bytes); the
+  client keeps no request or reply bytes between requests.
+- **No needless wait for an agent the client started.** A client that may
+  start the agent (`autostart`) polls the new agent instead of sleeping a
+  fixed 100 ms: short pauses at first, growing to the old 100 ms for an agent
+  slow to start (the schedule is `START_POLLS_MS` in `agent_socket.rs`), up
+  to the same 10 s overall wait. Ready is what it always was: a connection accepted
+  on the expected socket (the recorded one first), by a listener running as
+  this user. A missing socket, a stale socket file (connection refused) and
+  an agent still starting are "not yet"; a listener of another user is the
+  error it always was; no agent within the wait is the same error ("the cred
+  agent didn't start"; a held key-directory lock is named as before). The
+  spawn is unchanged (detached, no extra descriptor: a readiness pipe was
+  not used, since it would change what the agent inherits). A client that
+  finds an agent running, and every `existing()` client, spawns and waits
+  for nothing.
+- **Binary frames for `Crypt`.** An agent that reads them says
+  `"frames": 1` in its answer to a `status` (no released agent does) and
+  from then on reads them on that connection, beside JSON lines. A client
+  that checks the build sends each `Crypt` there as a frame: a 10-byte
+  header (0xFF, which never starts a JSON line, a kind, the op count and the
+  body length, little-endian), then fields with 4-byte lengths, the plain
+  text to seal or hash and the opened bytes raw (no base64, no JSON pass).
+  Every other request, and every connection without that answer (a
+  released agent, a client that checks no build), stays on JSON lines. A
+  request frame names 1 to 1,024 ops and at most 2 MiB, or 6 MiB for one op
+  alone (the batches `EncryptionContext` makes); a bigger request goes as a
+  line. Every length is checked before anything is allocated, each buffer
+  is allocated once at its declared length, and a malformed frame closes
+  the connection. A framed `Crypt` is the same request to the agent (every
+  check applies) and a refusal comes back as the same JSON response inside
+  a frame. On the agent socket path, every buffer that held plain text, on
+  either side, is wiped once over its whole allocation with `memset`
+  followed by a compiler barrier (`asm!`, zeroize 1.9's
+  `optimization_barrier`) that keeps the zeros, instead of zeroize 1.8's
+  byte-at-a-time loop. Past the socket nothing changed: what a caller makes
+  of an opened value is not wiped, as before (a fact or skill opened into a
+  `String`, a queued op held while it is sealed ahead, a JSON body sent to
+  the relay). Layout: `src/memory/agent_frame.rs`.
+- **The agent's cached trust state.** `Crypt`, `HeldKid` and the prune of
+  retired keys read `cred/state.json` (and decode its signed states) only
+  when the file changed since the last read: another device, inode, size,
+  or modification or change time (with nanoseconds). A file changed less
+  than 3 s before it was looked at is read again at every request (file
+  times have a granularity, and a freed inode number can be reused by the
+  next write), as is one whose metadata can't be read; a lock drops the
+  cache with the keys.
 - **Private writes.** Every key file and `cred/state.json` is written to a
   temp file with a name of its own (`.<name>.<pid>.<counter>.<random>.tmp`,
   0600, `O_NOFOLLOW`), fsynced and renamed. A writer that crashes leaves
@@ -884,6 +981,11 @@ Encryption Key…**; the status line shows the mode and the key id (e.g. "On
 since … — key <kid>", or "Turning on — N plaintext, N encrypted…" while
 migrating).
 
+**Planned (owner decision 2026-11-08), not implemented:** the setting becomes a
+status display (mode, key id, migration progress, the Recovery Kit). There is
+no Turn On or Turn Off, and "Turning it off" below goes ("Encryption becomes
+the only mode").
+
 **Turning it on:**
 1. Astation creates `K` (if needed) and asks for Touch ID or the Mac
    password.
@@ -912,6 +1014,39 @@ data becomes readable on the server again):
    relay deletes the ciphertext rows.
 3. When no ciphertext remains, Astation signs `off`, and atems delete `K`.
 
+### Injection into agents by mode
+
+What each signed mode means for the memory and skill rows an atem pulls, and
+for what it writes into agents' files (the managed blocks in
+`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `<repo>/CLAUDE.local.md`, and the
+skill directories). The plain-text, upload and "injected today" columns are as
+built (`crypto.rs`: `should_encrypt`, `require_sealed`, `decrypt_memories`;
+`sync::apply_all`). The last two columns are planned.
+
+| Mode | Plain text from the relay | Uploads | Injected today | Injected, transition measure | After encryption is the only mode |
+|---|---|---|---|---|---|
+| `off` | accepted | plain | yes | no | removed |
+| `enabling` | accepted (rows are mixed while migrating) | encrypted | yes | no | kept as the migration state only |
+| `on` | refused (`e1.`/`h1.` required) | encrypted | yes | yes | the only steady mode |
+| `disabling` | accepted | plain | yes | no | removed |
+
+**Planned (owner decision 2026-11-08), not implemented:** the "transition measure" column. The gate is
+the mode in the newest signed account state across the account's verified
+Astations (`verification::account_mode`); a device that isn't verified, has no
+signed state yet, or can't read it counts as not `on`. In every other mode
+Memory and skills still sync and stay searchable and listable; nothing from the
+store is written into agents' files, and `atem status` and the managed block
+say why. The store has no origin per row, so the gate covers local facts too
+(see [atem-memory.md](atem-memory.md#injection-into-agents-requires-encryption-on-planned)).
+The cost stays stated: until an account is migrated to `on`, it loses all
+injection, its own facts included. That cost is why the gate is a transition
+measure and not the design: it ends when `off` is removed ("Encryption becomes
+the only mode"), and the last column replaces the table. Until signed writes
+and the anti-rollback check exist, `on` still leaves the relay able to replay
+or retarget ciphertext (threat model). Vault content is not injected: it
+reaches an agent only when the agent runs `atem vault read`, so the gate
+doesn't cover it; it is covered by encryption becoming the only mode.
+
 ### What gets encrypted
 
 | Data | Encrypted | Stays plain (the relay needs it) |
@@ -926,10 +1061,73 @@ data becomes readable on the server again):
   under `K` with a random 24-byte nonce. As built, the associated data is
   `"<record id>\n<field>"` (`account_keys::field_aad`), so the relay can't
   move a ciphertext to another record or field.
+- **Skill versions (owner decisions on
+  [Atem #130](https://github.com/Agora-Build/Atem/issues/130), comment
+  6726291208; contract: Astation PR #76 at 89a2d50).** A skill file's record
+  id is `scope:name:version` (`crypto::skill_record`), so its version is part
+  of what each path and file is bound to. A row stored under another version
+  can't be opened by any device.
+  - **The Station keeps the version.** A push carries `skill.version =
+    base_version + 1`. The Station stores it at exactly that version only if
+    the base equals the skill's maximum stored version, tombstones and purged
+    records included. Otherwise it answers the op `{"ok": false, "error":
+    "version_conflict", "current_version": N}`, inserts nothing, allocates no
+    seq, and compares no content.
+  - **Atem fetches its attempted version once.** The same content hash and
+    metadata mean its own earlier write: applied, but the answer was lost or
+    a crash came before the local commit. That push is acked.
+  - **A concurrent edit**: the skill's queued pushes are coalesced into its
+    newest edit at `N + 1`. Nothing more of that skill goes out in that
+    sync. It is sealed again under the new version at the next one. Atem
+    never re-uses an envelope under another version and never falls back to
+    plain text. A `current_version` below the push's base (the Station
+    behind the local copy) is settled the same way. A delete or purge of the
+    skill that lands after the conflicted push in the same batch withdraws
+    the push, so purged content never goes back.
+  - **Unpushed edits win locally.** While a push of a skill is queued, a
+    pulled row never replaces the local copy; the push then settles through
+    the conflict (the last writer wins, both versions kept).
+  - **A Station that renumbered** (the Station before Astation PR #76:
+    `max + 1`) produced exactly the unreadable rows this rule prevents.
+  - **Held rows.** A pulled skill row whose files fail to authenticate or
+    are malformed is held: never applied, reported, and the pull goes on
+    (designs/atem-memory.md "Skill versions that don't open here").
+    - A row under a key id this device doesn't hold stops the pull instead,
+      with the way to get the key.
+    - A fact that doesn't open still fails its page.
+    - A migration or read-back that meets such a row names it and the
+      command that removes it (`atem skill purge <name> --version <n>`).
+- **Skill files on the wire (F8; Atem #130).** The contract is Astation's
+  `designs/protocol/skill-file-wire.md` in Astation PR #76, pinned at
+  89a2d50; the vectors are in `designs/protocol/fixtures/skills-wire/`. It
+  uses the existing skill routes. Owner decision: the Station and Atem ship
+  together, with no `wire_version`, no compatibility path, probing or
+  fallback.
+  - A sealed file travels as its `e1.` text, a JSON string encoded once
+    (`files_encoding: "e1-text"`), so a large file is about 1.33× its size.
+    A sealed path is its `e1.` text too.
+  - An empty file is exactly `""`: it is never sealed, so it takes no
+    `Crypt` op and has no associated data, and its filename is still sealed.
+  - Plain files travel as base64 (`"base64"`), only while the account's mode
+    permits plain text.
+  - Every row, push and `rewrite` names its encoding. A missing, unknown or
+    non-string encoding gets 400 `unsupported skill files encoding; update
+    Atem`. A malformed envelope, or plain entries in an `e1-text` row, get 400
+    `invalid skill files encoding`. Atem refuses the same rows in a pulled
+    page and never sends one.
+  - Only the HTTP representation changed. The Station still stores base64 of
+    the same bytes, so the ciphertext, its associated data, the hashes,
+    versions, `seq` and the `Crypt` requests are unchanged.
+  - A POST whose outcome is unknown is never sent again in another format,
+    and there is never a plain-text fallback.
+  - See `designs/atem-memory.md` "Relay API".
 - **Not implemented:** binding the scope, project HMAC and version or vault
   entry number into the associated data (build step 3), so a ciphertext
   can't move to another project or entry either.
-- **Not implemented:** **Signed writes** (build step 3). Every write, including an invalidation or replacement,
+- **Not implemented:** **Signed writes** (build step 3). **Planned (owner
+  decision 2026-11-08):** required, to close the replay and swap residual of
+  `on` once the injection gate makes agents read only `on` content. Every
+  write, including an invalidation or replacement,
   carries an `atem-mem-write-v1` signature from the writer's device signing
   key over the record's plain metadata, its validity fields and the hash of
   each encrypted field. Readers check the signature, the writer's
@@ -937,10 +1135,23 @@ data becomes readable on the server again):
   anything that fails. So the relay can't change validity to bring back an
   invalidated fact, and a revoked device can't write.
 - **No going back.** atem never replaces a record it holds with an older
-  version or an earlier validity state.
+  version or an earlier validity state. **Current:** only partly built. A
+  local invalidation is kept when a pulled row lacks it, and a skill's lower
+  version is skipped; a pulled memory row otherwise overwrites the local one
+  (`sync::apply_pulled_memories`), a local deletion included, and vault reads
+  keep no local state. **Planned (owner decision 2026-11-08), not implemented:** the full rule, see
+  "Anti-rollback check on pulled rows".
 - **Project keys** would reveal repo names. `HMAC-SHA256(K, key)` keeps
   per-project filtering working; atem keeps the hash → name mapping
-  locally.
+  locally. A pulled memory or skill whose hash has no name on this device
+  (a project it never used) doesn't fail the page: it is kept unresolved
+  under the hash, never applied, resolved once the device has the name
+  (after a rotation, the device hashes the projects it knows under the new
+  key), and pushed back with the same hash unless the device has named it
+  since; skills under another key's hash, or under any hash while off, are
+  dropped, since the migration delivers them again (designs/atem-memory.md
+  "Projects not known here yet"). A malformed `h1.` value or a non-`h1.`
+  project while on still fails it, and migration still needs every name.
 - **`content_hash`** is what the relay dedupes on. A plain SHA-256 of a
   short fact can be guessed; a keyed HMAC can't.
 - The local `knowledge.db` stays plain text (mode 0600), so search and
@@ -956,7 +1167,9 @@ build step 3) of every memory and skill it has (in chunks) and asks the relay to
 plain-text versions, including skill history and old vault entry versions.
 This is the one place the append-only history rule bends. Database backups
 taken before the purge still hold the plain text; the purge can't reach
-them.
+them. **Planned (owner decision 2026-11-08), not implemented:** a device pushes only the rows it wrote
+itself; content it only pulled from the relay is held back from agents (see
+"Quarantine of relay-sourced content at the migration").
 
 ### Rotation
 
@@ -987,12 +1200,28 @@ signed final state is useful delivery assurance, not an authorization rule.
    start pending modes, but cannot bypass completion to create final modes.
 2. **Migrate and verify.** An unlocked, verified Atem rewrites memories,
    skill versions, vault summaries and all vault entry versions, then reads
-   them back. Enabling/rotation requires every nonempty protected field to
+   them back. **Planned (owner decision 2026-11-08), not implemented:** a device rewrites only the rows it
+   authored; held rows are counted apart, not as remaining ("Quarantine of
+   relay-sourced content at the migration"). Enabling/rotation requires every nonempty protected field to
    use the approved kid and every ciphertext to authenticate under `K`.
    Disabling requires no encrypted/keyed protected fields to remain. A
    failed, incomplete or interrupted pass sends no completion. Writes and
    scans can be retried; a successful rewrite acknowledgment alone is not
-   a successful verification pass.
+   a successful verification pass. The rewrite opens and seals rows in groups
+   of whole POSTs (the same 64-fact and 16-skill batches; at most four
+   cred-agent requests' worth of 1,024 ops and 2 MiB per step, and never more
+   requests than one POST at a time; the first group is the first POST
+   alone), the next group while the POST before it is in flight (vaults: the
+   next vault while the previous one is POSTed).
+   A POST of rows prepared by an earlier request first confirms that the
+   cred agent is still unlocked (a `status`, not a `Crypt` request), so a
+   lock stops the migration within one POST. While disabling, the rows
+   prepared ahead are opened plain text: up to one group (about four
+   requests' worth, some 4,096 rows or 8 MiB) of rewrite bodies is held,
+   unwiped, ahead of its POSTs, against one 64-row POST before. They are
+   written to the relay as plain text anyway, and disabling goes away once
+   encryption is the only mode. The read-back checks each page while the
+   next one is fetched, and the first failure ends the pass.
 3. **Authenticate before dispatch.** `encryptionMigrationComplete` carries
    `completion: SignedWire`, an Ed25519 `atem-migration-complete-v1` signed
    by the device's pinned device-signing key. Its fields are length-prefixed
@@ -1081,6 +1310,347 @@ state. All failure paths retain enough durable state for safe recovery.
   rows.
 - Every device must be verified before it syncs memory, even with
   encryption off.
+
+## Encryption becomes the only mode (planned)
+
+**Planned (owner decision 2026-11-08), not implemented:** encryption of memory, skills and
+vault notes stops being optional. Tracked in Atem issue #130. It needs
+Astation's agreement: Astation owns the encryption switch, the relay and
+onboarding.
+
+**Today.** Encryption is an account option, off by default, switched in
+Astation. Atem handles four signed modes (table in "Injection into agents by
+mode"). With `off` the relay stores memory facts, skills and vault notes as
+plain text. Memory and skills reach every paired machine's agents as
+instructions (`sync::apply_all`), so a relay operator can alter what agents are
+told. The transition gate closes that by injecting nothing for accounts still
+off, which costs those accounts all injection, their own facts included,
+because the store cannot tell them from synced ones
+([atem-memory.md](atem-memory.md#injection-into-agents-requires-encryption-on-planned)).
+Making `on` the only mode removes the cost and the plain-text paths.
+
+**Planned sequence** (every step needs Astation):
+
+1. **New accounts start with encryption on.** Onboarding creates `K` and
+   grants it at the first verification, and the Recovery Kit is hard to skip
+   (without it `K` cannot be restored).
+2. **Accounts still off get a notice, then a forced migration** to `on`: the
+   existing signed `enabling` migration with its verified completion
+   ("Migration completion lifecycle"), run for every such account. Each device
+   re-pushes only what it wrote itself, and content that only came from the
+   relay is held back from agents ("Quarantine of relay-sourced content at the
+   migration"). It is tested live, end to end, before it runs on any account.
+   The timeline is Astation's.
+3. **The relay refuses plain-text writes** for every account. Then `off` and
+   `disabling` are removed: from the signed account state (a state with either
+   mode is refused as invalid), from Atem's `EncryptionMode` and every branch
+   that exists for plain text (`should_encrypt`, `require_sealed`, the `off`
+   pass-through of `decrypt_memories`, `decrypt_skills` and the vault), and
+   from this design ("Turning it off", the `disabling` migration). `enabling`
+   stays only as the migration state of a key change (rotation). With no `off`
+   to fall back on, a device with no verified Astation or no signed state
+   syncs nothing, instead of being treated as `off` as `account_mode` does
+   today. Astation's settings switch becomes a status display (mode, key id,
+   migration progress, the Recovery Kit) with no Turn Off.
+4. **Alongside:** signed writes (build step 3), which carry the per-row author
+   and ship before step 2's migration runs, and the anti-rollback check
+   ("Anti-rollback check on pulled rows"); together they close what `on` still
+   leaves to a hostile relay.
+5. **During the transition** the injection gate applies to accounts not yet
+   on. It goes with the `off` mode.
+
+Removed with it: the plain-text code paths, the migration kept for the off
+direction, the gate, and the text elsewhere that says encryption is optional.
+Performance is a requirement of this change ("Performance").
+
+### Quarantine of relay-sourced content at the migration (planned)
+
+**Planned (owner decision 2026-11-08), not implemented:** at the forced migration, content that only came
+from the relay is held back from agents.
+
+Today "Moving existing data over" re-pushes every memory and skill a device
+holds, encrypted. A row the relay planted while the account was off sits in
+`knowledge.db` like any other (the store records no author: `source_machine` is
+a string the writer or the relay supplies), so the migration would encrypt it,
+it would look genuine, and the injection rule would put it in front of agents.
+
+Planned:
+
+- **Each device re-pushes only what it wrote itself.** The migration rewrites,
+  signs and pushes only the rows whose recorded author is this device. A row
+  the device only ever pulled from the relay while the account was off is not
+  re-pushed.
+- **Such content is held back from agents.** A held row is never injected into
+  an instruction block or a skill directory, and never used as context for an
+  agent (message or task context).
+- **It stays held** until its author device republishes it, or the owner
+  approves it in an Astation review list. Republishing is a signed write by the
+  recorded author for the same record, from a verified, unrevoked device.
+  Approving is a statement Astation signs under its pinned key, naming the
+  row's id and state hash; a device releases a row only on a verifiable
+  approval, never on the relay's word.
+- **Held content stays visible to explicit reads** (`memory list`,
+  `memory search`, `skill list`), each item marked "held: from the relay before
+  encryption; approve in Astation or republish". `atem memory status` counts
+  them.
+- **Per-row author tracking comes first.** Every row carries its authoring
+  device's id (the verified `device_id`), written locally when the row is
+  created and carried encrypted and inside the signed write
+  (`atem-mem-write-v1`), so the relay can neither set nor change it. It is added
+  before the migration ships, which means signed writes (build step 3) ship
+  before the forced migration. A row with no recorded author is treated as
+  relay-sourced and held. That is every row written before author tracking
+  ships, and every plain-text row pulled while the account was off. For such a
+  row there is no author device to republish it, so only the Astation review
+  releases it.
+- **After the migration** no plain text exists: a pulled row is accepted only
+  with a verified signed author, and the injection rule is "not held". The
+  transition gate ends with `off`.
+
+To settle with Astation, as part of the same agreement:
+
+- The review list shows memory content to the owner for approval, which "Keys"
+  says Astation never does; Astation would decrypt it like a verified device.
+- At the first migration the list holds every row an account had, so it must
+  support bulk approval (all, per device, per project).
+- Once the relay's plain-text copies are purged, a held row exists only in the
+  local stores that pulled it. Those devices report their held rows to Astation
+  (encrypted to it and device-signed, like the credential-project report)
+  rather than re-pushing them.
+- The signed migration completion does not count held rows as "remaining": it
+  reports their number separately.
+
+### Anti-rollback check on pulled rows (planned)
+
+**Planned (owner decision 2026-11-08), not implemented:** a check that a pulled row never lowers what
+Atem already holds, built next to signed writes (build step 3).
+
+Today the relay chooses what each pulled page holds, and Atem mostly accepts
+it:
+
+- **Memory rows.** `apply_pulled_memories` (`sync.rs`) passes each row to
+  `Store::upsert_memory`, which overwrites the local row: content, scope,
+  project, machine, `deleted_at` and `seq`. Only `valid_at`, `invalid_at` and
+  the matching `superseded_by` are kept when the incoming row lacks them. So
+  the relay can serve an older genuine version of a fact, or of its scope or
+  project hash, and a row without `deleted_at` brings back a fact deleted
+  locally. `seq` is the relay's number.
+- **Skills.** `apply_pulled_skills` skips a lower version and accepts an equal
+  or higher one. The version is relay-supplied and unsigned, so an older
+  genuine skill sent under a higher number replaces the newer one.
+- **Vault.** Reads keep no local state, so nothing is compared.
+- **Ciphertext.** The associated data binds a ciphertext to its record id and
+  field only (`field_aad`), so an older ciphertext of the same record still
+  opens.
+
+Planned:
+
+- Each record state carries a revision `rev` inside the signed write
+  (`atem-mem-write-v1`, step 3), so the relay can neither forge nor lower it.
+  A writer sets `rev` one above the highest it has seen for that record.
+- Atem keeps, per record (a memory id, a skill's scope, project and name, a
+  vault entry), the highest `rev` it accepted and a hash of that state, in
+  `knowledge.db` (vault gets a small table too, since it keeps no local copy).
+- A pulled row is applied only if its `rev` is higher, or equal with the same
+  state hash. A lower `rev`, or an equal one with a different state, is dropped
+  and reported ("relay served an older version of <id>"); the pull goes on.
+- Deletion and invalidation are final: a tombstone stays whatever later rows
+  say. This part needs no signature and can ship before step 3. The `rev` part
+  is only as strong as the signature that carries it; before step 3 it would
+  only be advisory.
+- Open: a deterministic tie-break when two devices write the same `rev`.
+- Not covered: withholding. A device that never saw a newer write can be shown
+  the older state, and a relay serving an old state of the whole account is
+  withholding every newer write. Detecting that needs a signed head the
+  devices compare, which is not planned here.
+
+## Performance
+
+**Owner decision 2026-11-08:** the owner requires good performance. Once
+encryption is the only mode, the encrypted path is the path every sync, vault
+read and write, migration and cold command takes, and it must be fast enough
+that nobody has a reason to want plain text back. The budgets below were
+proposed from measurements of the encrypted path on `main` (b56dcd4); a budget
+moved since then only by an owner decision, cited in its row. **Built:** the
+fixes F1, F2, F3, F6, F7 and F8 (below; F8, issue #130, is released together
+with the Station's skill file transport, Astation PR #76, after a joint
+dev test). **Not approved:** F4 and F5. "Today" is the production path as built with
+those fixes, measured on 2026-11-08 (each number names its source: the task
+that built a fix, or the final run after the last one).
+
+**What is measured, and how.** `#[ignore]` performance tests in
+`src/memory/perf_tests.rs` measure each item against temp profiles, a fake
+relay (a local HTTP server with the relay's batch and pagination shape) and the
+real `atem cred-agent` binary holding a test `K`; they touch no real profile and
+no network. Run them with `cargo build --release`, then
+`cargo test --release --bin atem perf_ -- --ignored --nocapture --test-threads=1`.
+They print their numbers and assert no budget: whoever runs them compares the
+numbers with the table below (a wall-time assertion would fail at random on a
+shared CI host). They measure:
+
+1. **Agent `Crypt` cost and round trips:** seal, open and keyed-hash cost by
+   field size, inside the agent and over the socket (a reused client, and the
+   production path: one client and one connection per process, the build check
+   on it, binary frames), and round trips per sync phase and per command.
+2. **Sync:** the time encryption adds to a push, pull and apply of 10, 100,
+   1,000 and 5,000 facts (and of skills), against the same sync with no
+   encryption, with a file store as shipped and with an in-memory store; and
+   against a relay that answers each request after a fixed 5 or 20 ms
+   (`perf_2c`: 15 pairs of the same sync off and on, back to back with the
+   order alternating, each pair started only once the host's 1-minute load is
+   under 1.5; the added time is the median of the pairs' differences).
+3. **Vault:** write and read-back latency by entry size (1 KiB, 64 KiB, 1 MiB).
+4. **Migration:** records per second of the off-to-on rewrite plus read-back,
+   and of a rotation to a new key.
+5. **Cold command:** agent startup and first contact, the agent-side cost of
+   unlock, and the agent's memory with and without `mlockall`.
+6. **Ciphertext overhead:** bytes per field, per row, per request, and on the
+   agent socket.
+7. **A skill file on the wire** (`perf_7`): one skill with a 1 KiB, 64 KiB
+   or 1 MiB file pushed and pulled through the client, encryption off and on:
+   the HTTP bodies, the file's value, the times, and the client's own cost of
+   each representation (`e1-text` against the legacy base64 of the `e1.` text).
+
+Loopback numbers: a real relay's round trip adds the same latency per HTTP
+request with or without encryption, so the encryption share there is smaller,
+which is why overlapping crypto with the network (F2) matters more than raw
+speed. The host was a 2020 desktop CPU without SHA-NI, so the budgets are
+conservative for Apple silicon. Not measured: real relay latency and TLS,
+Touch ID and the network in unlock, a truly cold boot, macOS, concurrent
+clients, and signed writes (build step 3; they need a budget of about 50 ms more per
+1,000 facts once they land, with batched verification and cached certificate
+checks).
+
+**Budgets** ("Today" is the production path as built):
+
+| Area | Budget | Today | Status |
+|---|---|---|---|
+| Agent field ops | seal or open of a field of at most 1 KiB in at most 10 µs in the agent; at least 200 MiB/s for large fields | 2.2 to 9 µs; 250 to 300 MiB/s (keyed hash 160 MiB/s) (measured on `main`; the fixes don't change the cipher) | met |
+| Agent round trips | **Pull and read-back:** at most 1 `Crypt` request per relay page, overlapped with the next GET (owner decision 2026-11-08, "one per page", Task 4 measurements). Exceptions, on the failure path only: a skill page whose request fails because of a row's content is bisected to find the rows to hold, about 2·log₂(n) requests more per such row (about 16 for a page of 200), and only after that failure (designs/atem-memory.md "Skill versions that don't open here"); a migration rewrite or read-back whose request fails that way is bisected the same way to name the first such row in its error. **Push and migration:** at most 1 `Crypt` request per 1,024 ops / 2 MiB, plus one for the first chunk so its POST starts at once (owner decision 2026-11-08, "allow +1 to start", Task 4 measurements), and a small overhead above that, understood and bounded (owner decision 2026-11-08): exactly the planner's bound below the table, ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉ for a push of facts and ⌈ops / 1,024⌉ + S·G − 1 in general. **Status checks:** one per connection (the build check), and one before each POST of ops sealed by an earlier `Crypt` request, so a lock stops the push or migration within one POST (owner decision 2026-11-08, "allow lock checks", an exception to "no status probe after the first"; Task 4 measurements); they are not `Crypt` requests. One connection per process | `Crypt` requests per 1,000 / 5,000 facts: push 4 / 14, pull 5 / 25 (one per page), migration rewrite 6 / 16, read-back 9 / 29. A 1,000 / 5,000-fact push and pull is 29 / 139 socket round trips on one connection: the build check, the `Crypt` requests and about one status per POST of ops sealed ahead (Task 4) | met (the push within the planner's bound; it is "1 per 1,024 plus one" exactly up to about 4,500 facts) |
+| One request | at most 100 µs p50 for a batch-1 request; at most 4 µs per 100 B op over the socket | 15 to 17 µs p50 (100 B seal, open or keyed hash); 2.5 to 3.3 µs per op (Task 3) | met |
+| Large fields | at most 8 ms per MiB through the socket (seal or open) | 2.3 ms per MiB (Task 3) | met |
+| Sync | encryption adds at most 30 ms per 1,000 facts pushed, pulled and applied (at most 10 ms per 1,000 pulled) on loopback, and at most 5% of the wall time against the real relay | Loopback (in-memory store): push and pull +22 ms per 1,000 facts (+86 ms at 5,000), pull +2.9 ms per 1,000 (+35.5 ms at 5,000) (final run, `perf_2b`). Against a relay that answers after 20 ms: push and pull +0.8% (1,000 facts) and +0.6% (5,000), pull +3.2% and +2.8%; after 5 ms: +2.7%, +3.8%, +2.7% and +4.1% (final runs, `perf_2c`: medians of 45 quiet-host pairs in three runs of 15; one run gave +6.2% for the 5,000-fact pull at 20 ms, the other two +1.5% and +0.3%) | met on loopback, and against the relay with latency over the 45 pairs; a 5,000-fact pull is near the line in a single run (see "Where a sync's added time goes"); the real relay is not measured |
+| Apply and injection | encryption adds 0 ms to apply; the planned injection gate at most 0.1 ms per apply | 0 ms; `account_mode` 6.4 µs | met |
+| Vault | write plus read-back adds at most 0.5 ms for entries up to 4 KiB, at most 3 ms at 64 KiB, at most 15 ms per MiB | +0.10 ms at 1 KiB; +0.46 ms at 64 KiB; +6.0 ms at 1 MiB (Task 3) | met |
+| Migration | off to on including the read-back at least 10,000 records/s; at most 1 `Crypt` request per 64-record rewrite batch (the statuses before POSTs of rows prepared by an earlier request are counted apart: owner decision 2026-11-08, "allow lock checks", Task 4 measurements) | about 21,900 records/s (6,010 records in 274 ms; 14,800 records/s for 2,010). `Crypt` requests for 1,000 / 5,000 facts and 10 skills: rewrite 6 / 16 for 17 / 80 POSTs, vault 2, read-back 9 / 29; and 15 / 78 statuses before POSTs prepared ahead. Against a 20 ms relay the migration adds 1.3% / 2.9% (no budget row) (final run, `perf_4`) | met |
+| Cold command | first agent contact at most 50 ms after spawn; agent startup at most 25 ms; unlock at most 10 ms on the agent side (Touch ID and the network excluded); `atem memory search` and the apply never touch the agent | 15.6 to 16 ms; 12.6 to 13.3 ms (about 10 ms of it `mlockall`; 2.7 ms without); about 5 ms; 0 (Task 5; final run) | met |
+| Agent memory | at most 16 MiB RSS at rest unlocked without mlock and at most 48 MiB peak; at most 48 MiB when `mlockall` applies | 13.6 MiB at rest unlocked and 37.6 MiB peak without mlock; 71.1 MiB at rest and 105.5 MiB peak with it (final run, `perf_5`) | the locked case misses; its fix (F5) is not approved |
+| Wire size | at most 52 B + 1.34x per field; skill files at most 1.4x raw on the wire | memory and vault met. Skill files with F8 (`perf_7`): a sealed file's value is 1.333x at 64 KiB and 1 MiB and 1.398x at 1 KiB (was 1.78x and 1.87x); a 1 MiB push or pull body is 1.334x (was 1.778x). A 1 KiB skill's push body is 1.81x (was 2.26x), mostly the fixed part (sealed path, hashes, names, JSON) | met with F8 (released together with the Station's skill file transport, #130) |
+
+**The push and migration bound, as built** (owner decision 2026-11-08: a
+small overhead above "1 per 1,024 ops plus one for the first chunk" is
+accepted when it is understood and bounded). A push of one kind, or a
+migration's rewrite of one kind, goes to the relay in chunks: 50 memory ops,
+8 skill ops, 64 memory or 16 skill rewrite rows. The planner
+(`crypto::Planner`, the same for both) seals the first chunk alone, so its POST
+starts as soon as that is answered, then groups of whole chunks, each at most
+four requests' worth per step (4,096 `Crypt` ops and 8 MiB) and 4,096 queued
+ops; `run` splits each step of a group at 1,024 ops or 2 MiB. With `ops` the
+`Crypt` ops of the push, G its groups, S its dependent steps (memory 1; skills
+2: the paths and hashes, then the files sealed under the sealed paths; a
+rewrite up to 3: open, seal, files) and k the most `Crypt` ops one chunk
+carries (50 facts: at most 150), for ops of at most 2 KiB on the wire (so only
+the 1,024-op limit splits a request):
+
+- requests ≤ ⌈ops / 1,024⌉ + S·G − 1. The extra requests are each group's
+  partly filled last request per step: a group holds whole chunks, and a
+  skill group's files are a request of their own after its paths.
+- A push of facts (one step, an op in every queued item): requests ≤
+  ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉. A group ends only when the
+  next chunk would pass 4,096 ops, so it leaves fewer than k slots unused,
+  and every group but the first and the last holds more than 4,096 − k ops
+  (G − 2 < ops / (4,097 − k)). Deletes and invalidations carry no op but
+  count toward the 4,096 queued ops, so they can end a group early; that
+  costs at most one partly filled request per such group (the first bound).
+- At any size: never more requests than sealing each chunk alone (before F2).
+- Groups are planned by the ops as queued. A fact queued under a project hash
+  this device names only later (a replacement of a fact it couldn't name, see
+  "Projects not known here yet" in [atem-memory.md](atem-memory.md)) is
+  hashed under that name when sealed, one op more than planned: a group
+  holding u such facts can take up to ⌈u / 1,024⌉ requests more than the
+  second bound. The first and the last bound hold as stated.
+- **Re-seals on a skill version conflict** (see "Skill versions" under "What
+  gets encrypted"). A concurrent edit's skill is coalesced into one queued
+  push and held back for the rest of the sync, so nothing is sealed again in
+  that sync. Its ops sealed ahead are dropped unsent. The coalesced push is
+  sealed at the next sync as an op queued then. With no conflict, nothing
+  changes.
+
+For uniform facts this is exactly "1 per 1,024 plus one" up to 4,562 facts of
+two ops and 5,791 of three, and then one request more now and then, as the
+unused slots add up: a group of three-op facts (27 chunks, 4,050 ops) leaves
+46, about one request more per 22 groups (about 90,000 ops); a group of
+two-op facts (40 chunks, 4,000 ops) leaves 96, about one more per 11 groups
+(about 43,000 ops). 30,000 three-op facts take 90 requests against 89 (bound
+93), 100,000 take 298 against 294 (bound 305), and 100,000 two-op facts take
+201 against 197 (bound 202). For facts in general at most about
+(k − 1) / (4,097 − k) more, plus one: 3.8% at k = 150 (149 / 3,947). Pinned by
+`planned_requests_stay_within_the_documented_bound`
+(both bounds, the group sizes, these examples) and
+`planned_groups_never_take_more_requests_than_their_chunks_alone`.
+
+**Where a sync's added time goes** (final run, 2026-11-08). Against a relay
+with latency, a pull opens each page while the page before it is applied;
+the apply (about 31 ms a page in the file store) sets the pace at 5,000
+facts, and the opens (25 `Crypt` requests, about 44 ms of client and agent
+work for 5,000 facts) stay behind it. What remains on the path is the first
+page's open, about 2 ms, which has nothing to overlap. The rest of the
+difference is the applies' own spread (fsync): one run of 15 pairs measured
++6.2% for a 5,000-fact pull at 20 ms, the next two +1.5% and +0.3% on the same
+code (+2.8% over the 45 pairs). A push seals each group while one POST is in
+flight; at 5 ms a group's seal (up to four requests) outlasts that POST, so a
+5,000-fact push and pull adds 3.5 to 5% there (+3.8% over 45 pairs), and at
+20 ms the POST covers it (+0.6%).
+
+**The local store dominated a sync before F6.** On `main`, a sync did one
+autocommit and fsync per acked op and per pulled row (about 1.9 ms each) and
+reread the whole pending queue for every 50-op chunk, so 1,000 facts took
+5.65 s and encryption was only about 1% of that. F6 commits each push batch's
+results and each pulled page in one transaction and reads each chunk from the
+queue after the last op sent: a 1,000-fact push and pull takes 0.25 s
+(0.30 s encrypted) and 5,000 facts 1.34 s (1.54 s) (Task 1), so the
+percentage budget is now the measure. Most of the rest at 5,000 facts is the
+plain SQLite apply and full-text index (the plan's estimate of 0.8 s was not a
+budget).
+
+**Rule: a change that breaks a budget doesn't ship.** The `#[ignore]`
+performance tests in `src/memory/perf_tests.rs` are the measurement. They run
+before a release and on any change to the crypto path (`crypto.rs`, the cred
+agent's `Crypt` and socket, the sync, vault and migration clients), and a result
+over budget blocks the change (a person compares the printed numbers with the
+table; the tests assert nothing). A budget moves only by an owner decision
+that cites the measurement. A missed budget is fixed in the design (the fixes
+below), never by a plain-text fallback.
+
+**Fixes** (F1, F2, F3, F6, F7 and F8 built as described; gains measured before
+and after each, in the task that built it):
+
+| # | Fix | State | Gain |
+|---|---|---|---|
+| F1 | Binary `Crypt` frames on the agent socket: a 10-byte header and length-prefixed raw fields (no base64 of the plain text, no JSON pass), agreed per connection in the build check's `status`; each buffer allocated once and wiped once over its allocation (`memset` and a compiler barrier) | built | 1 MiB seal / open 16.1 / 15.0 to 2.3 / 2.3 ms; 100 B op 5.1 to 2.5 to 3.3 µs; vault 1 MiB write plus read-back +36.3 to +6.0 ms (Task 3) |
+| F2 | Full-size, overlapped batches. Push and migration seal groups of whole relay chunks, up to four `Crypt` requests' worth per step: the first chunk alone, then each group while the POST before it is in flight; a chunk sends an op as sealed ahead only while it is unchanged under the same mode, key and data account, and a status goes before each POST of ops sealed by an earlier request (the lock bound). Pull and read-back open one `Crypt` request per page, the next page fetched and opened while the one before it is applied (one page ahead) | built | `Crypt` requests per 1,000 facts: push 20 to 4, pull 5 (one per page), migration rewrite 18 to 6; added wall time of a 1,000-fact push and pull against a 20 ms relay +5.5% and +3.3% before (two runs) to +0.8% (45 pairs); both modes about 40% faster (a 5,000-fact pull at 20 ms with no encryption: 1.48 to 0.87 s) (Task 4; final run) |
+| F3 | One client and one connection per process: a process-wide agent client, the build check once per connection, a connection kept between requests (no fallback for an agent that closes connections after a reply: every released agent serves several requests per connection); the agent keeps the parsed trust state while `cred/state.json` is unchanged | built | batch-1 request 114 to 26 µs (16 µs with F1); socket round trips per 1,000-fact push and pull 50 on 50 connections to 26 on one (Task 2) |
+| F4 | Remove redundant ops: deduplicate keyed hashes within a batch, build the HMAC once per request, cache `project_names.json` per context | not approved | (estimate) one third fewer push ops; keyed hash about 40% cheaper for short inputs |
+| F5 | A lighter agent: a current-thread runtime (or 1 to 2 workers), a cap on the largest request, optionally `malloc_trim` after a large one | not approved | (estimate) locked RSS 72 to about 40 MiB; peak without the lock about 20 MiB |
+| F6 | The local store: one transaction per push batch's results and per pulled page (rows and cursor together), each chunk read from the queue after the last op sent | built | 1,000-fact push and pull 5.64 to 0.25 s (0.30 s encrypted); 5,000 facts 30.5 to 1.34 s (1.54 s) (Task 1) |
+| F7 | Faster cold autostart: poll a started agent after short pauses that grow to the old 100 ms (`START_POLLS_MS`), within the same 10 s | built | first contact 101 to 16 ms (Task 5) |
+| F8 | Skill files encoded once (the skill file transport, Astation PR #76 at 89a2d50; owner decision on #130: one set of routes, no compatibility path). A sealed file travels as its `e1.` text in a JSON string (`files_encoding: "e1-text"`; an empty file `""`); plain files travel as `base64`, only while the mode permits plain text. Same ciphertext, associated data, hashes and `Crypt` requests | built; released together with the Station's change (Astation PR #76) after a joint dev test | Sealed file on the wire 1.78x to 1.33x raw (1 MiB push body 1,864,621 to 1,398,592 B). The client's own cost per 1 MiB file: push body built in 2.0 to 1.6 ms, pulled row parsed in 1.2 to 0.9 ms (at 1 KiB, 4.3 to 6.4 µs and 2.2 to 2.4 µs). Loopback against the fake Station: a 1 MiB push takes 12.3 to 15.1 ms and a pull 11.8 to 12.6 ms (64 KiB +0.05 ms), because the fake relay now also does the Station adapter's conversion to and from its stored base64 (`perf_7`, medians of three A/B rounds) |
+
+**Fixed (#132): a pulled fact with an unknown project no longer stops Memory
+sync.** A project-scoped fact or skill whose `h1.` project hash this device has
+never computed used to fail its whole pulled page, so the cursor never moved
+and every later sync failed on that page. It is now kept under its hash,
+unresolved: never injected or installed, shown in explicit reads as
+`project:(not known here yet)`, and the cursor moves on. It resolves when the
+device learns the project name ("Projects not known here yet" in
+[atem-memory.md](atem-memory.md)). The performance test
+`perf_x_an_unknown_project_hash_no_longer_stops_the_pull` checks it. In the
+overlapped pull (F2) the rule applies as each page is opened: an unresolved
+row is committed with its page and the page's cursor, like any other row,
+and the resolve step runs once the pull's last page has committed, outside
+any page's transaction. A push compares an op sealed ahead as it would be
+sealed now, its project hash named since or not, so an op whose hash was
+named after it was sealed is sealed again, never sent under that hash.
 
 ## Credentials (`atem cred`)
 
@@ -1823,7 +2393,8 @@ Suggested build order:
    agent.
 3. **Not implemented:** Device-signed memory writes, bound associated data,
    revocation list, `K` subkeys. (Rotating `K` works: the agent keeps the
-   previous keys, see "Rotation".)
+   previous keys, see "Rotation".) **Planned (owner decision 2026-11-08), not implemented:** required, together with the
+   anti-rollback check on pulled rows ("Anti-rollback check on pulled rows").
 4. Recovery secret `R`, versioned backup blob, Secure Enclave signing key,
    rotation with delay and veto. Built as r9's Recovery Kit (Atem v0.8.0):
    `atem-k-backup-v2`, `recovery_add` with the 24-hour wait and approve/veto,
@@ -1834,3 +2405,7 @@ Suggested build order:
    today is a local Keychain store, see `docs/credentials.md`).
 7. **Not implemented:** Auto-unlock, its checks and ticket rolling.
 8. **Not implemented:** `atem cred add` (optional).
+9. **Planned (owner decision 2026-11-08), not implemented:** encryption as the only mode (forced migration of
+   accounts still off, plain text refused by the relay, `off` and `disabling`
+   removed) and the performance budgets ("Encryption becomes the only mode",
+   "Performance").
