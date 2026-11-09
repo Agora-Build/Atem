@@ -37,6 +37,22 @@ pub const NOT_RETAINED: &str = "no retained key";
 /// it (fail closed, as a fresh runtime would leave those sessions out).
 pub const ENCRYPTION_OFF: &str = "encryption is off for this account";
 
+/// Why a field doesn't open: its content, never the agent's or the
+/// account's state. A pulled skill row failing with one of these is held
+/// (`EncryptionContext::open_pulled_skills`), not the whole page.
+pub const FIELD_MALFORMED: &str = "encrypted field is malformed";
+pub const FIELD_UNAVAILABLE_KID: &str = "encrypted field uses an unavailable key id";
+pub const FIELD_INVALID: &str = "invalid encrypted field";
+pub const FIELD_TOO_SHORT: &str = "encrypted field is too short";
+pub const FIELD_AUTH_FAILED: &str = "encrypted field authentication failed";
+pub const FIELD_FAILURES: [&str; 5] = [
+    FIELD_MALFORMED,
+    FIELD_UNAVAILABLE_KID,
+    FIELD_INVALID,
+    FIELD_TOO_SHORT,
+    FIELD_AUTH_FAILED,
+];
+
 #[derive(Clone)]
 pub struct AccountKey {
     pub kid: String,
@@ -529,25 +545,23 @@ fn open_field(
     }
     let rest = value
         .strip_prefix("e1.")
-        .ok_or_else(|| anyhow!("encrypted field is malformed"))?;
+        .ok_or_else(|| anyhow!(FIELD_MALFORMED))?;
     let (kid, encoded) = rest
         .split_once('.')
-        .ok_or_else(|| anyhow!("encrypted field is malformed"))?;
+        .ok_or_else(|| anyhow!(FIELD_MALFORMED))?;
     let key = if ring.current.kid == kid {
         &ring.current
     } else if mode != EncryptionMode::On {
         ring.previous
             .iter()
             .find(|key| key.kid == kid)
-            .ok_or_else(|| anyhow!("encrypted field uses an unavailable key id"))?
+            .ok_or_else(|| anyhow!(FIELD_UNAVAILABLE_KID))?
     } else {
-        bail!("encrypted field uses an unavailable key id");
+        bail!(FIELD_UNAVAILABLE_KID);
     };
-    let payload = STANDARD
-        .decode(encoded)
-        .context("invalid encrypted field")?;
+    let payload = STANDARD.decode(encoded).context(FIELD_INVALID)?;
     if payload.len() < 40 {
-        bail!("encrypted field is too short");
+        bail!(FIELD_TOO_SHORT);
     }
     let cipher = XChaCha20Poly1305::new((&*key.key).into());
     cipher
@@ -559,7 +573,7 @@ fn open_field(
             },
         )
         .map(SecretBytes::from_vec)
-        .map_err(|_| anyhow!("encrypted field authentication failed"))
+        .map_err(|_| anyhow!(FIELD_AUTH_FAILED))
 }
 
 /// `h1.<kid>.<hex HMAC-SHA256(K, value)>`.

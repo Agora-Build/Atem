@@ -636,6 +636,21 @@ fn handle(
                 .take(limit)
                 .map(|(_, s)| s),
         ),
+        ("GET", "/api/skills/v2/version") => {
+            let name = query(target, "name").unwrap_or_default();
+            let version: i64 = query(target, "version")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let stored = data
+                .skill_seq
+                .get(&(name, version))
+                .and_then(|seq| data.skills.get(seq));
+            // This relay answers 200 only: a version it lacks panics.
+            match fake_station_skills::version_answer(stored, false) {
+                (200, row) => row,
+                (_, error) => panic!("the perf relay has no such skill version: {error}"),
+            }
+        }
         ("POST", "/api/memory/batch") => {
             let mut results = Vec::new();
             for op in body["ops"].as_array().unwrap() {
@@ -674,9 +689,17 @@ fn handle(
             fake_station_skills::batch_ok(body, |op| match op["op"].as_str().unwrap() {
                 "push" => {
                     let skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
-                    let version = skill.version;
-                    let seq = data.put_skill(skill);
-                    json!({"ok": true, "version": version, "seq": seq})
+                    // At the version it was sealed under (compare-and-set).
+                    let existing = data.skills.values().filter(|s| s.name == skill.name);
+                    let existing = existing.map(|s| (s.version, s.deleted)).collect::<Vec<_>>();
+                    match fake_station_skills::push_version(Default::default(), op, existing) {
+                        Ok(_) => {
+                            let version = skill.version;
+                            let seq = data.put_skill(skill);
+                            json!({"ok": true, "version": version, "seq": seq})
+                        }
+                        Err(conflict) => conflict,
+                    }
                 }
                 "rewrite" => {
                     let key = (

@@ -7,6 +7,13 @@
 //! routes, as the Station does. Written apart from the client's
 //! `skill_wire` (its own envelope check), so each side checks the other.
 //!
+//! Versions: by default a push is stored at exactly the version it was
+//! sealed under, or answered with a per-op `version_conflict` when that
+//! version exists (`Versioning::Kept`, the compare-and-set the owner
+//! decided on Atem #130, comment 6726291208; Astation's pin is pending).
+//! `Versioning::Renumbered` models the Station at 963c74b, which stores
+//! every push as `max(version) + 1` (the regression case).
+//!
 //! A batch is refused as the Station refuses it, in its order: `ops` not
 //! an array (400 `invalid batch`), more than 16 ops (413), a refused files
 //! encoding (400), a normalized body over 16 MiB (413), then an unknown op
@@ -25,6 +32,56 @@ pub(crate) const INVALID: &str = "invalid skill files encoding";
 /// `SKILLS_BATCH_MAX_OPS`).
 pub(crate) const BODY_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OPS: usize = 16;
+
+/// How the Station numbers a skill push.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Versioning {
+    /// At exactly the version the push carries (sealed under), or a
+    /// `version_conflict` when that version exists: nothing stored.
+    #[default]
+    Kept,
+    /// As the Station at 963c74b: `max(version) + 1`, whatever the push
+    /// carries, with `superseded_concurrent` when its base is behind.
+    Renumbered,
+}
+
+/// Where a push of the skill whose stored versions are `existing`
+/// (`(version, deleted)`) goes: `Ok((version, superseded_concurrent))`, or
+/// `Err` with the per-op answer (`version_conflict`, and the current
+/// version).
+pub(crate) fn push_version(
+    versioning: Versioning,
+    push: &Value,
+    existing: impl IntoIterator<Item = (i64, bool)>,
+) -> Result<(i64, bool), Value> {
+    let (mut current, mut live) = (0, 0);
+    let mut taken = false;
+    let sealed = push["skill"]["version"].as_i64().unwrap();
+    for (version, deleted) in existing {
+        current = current.max(version);
+        if !deleted {
+            live = live.max(version);
+        }
+        taken |= version == sealed;
+    }
+    match versioning {
+        Versioning::Kept if taken => Err(json!({
+            "ok": false, "error": "version_conflict", "current": current,
+        })),
+        Versioning::Kept => Ok((sealed, false)),
+        Versioning::Renumbered => Ok((current + 1, push["base_version"].as_i64().unwrap() < live)),
+    }
+}
+
+/// The Station's `/v2/version` answer for `stored` (one stored row, if
+/// any): the row as v2 serves it, 410 for a purged one, else 404.
+pub(crate) fn version_answer(stored: Option<&Skill>, purged: bool) -> (u16, Value) {
+    match stored {
+        Some(_) if purged => (410, json!({"error": "skill version purged"})),
+        Some(skill) => (200, json!({"wire_version": 2, "skill": row(skill)})),
+        None => (404, json!({"error": "no such skill version"})),
+    }
+}
 
 /// Astation's `envelope_kid`: `e1`, a kid of 8 lowercase hex digits, and
 /// standard base64 of at least a nonce and a tag (40 bytes).

@@ -7,7 +7,7 @@ use crate::memory::adapters::{skill_targets, valid_skill_name, Agent, Ctx, Repor
 use crate::memory::api::KnowledgeClient;
 use crate::memory::block::{contains_reserved, one_line};
 use crate::memory::harvest::claude_memory_dir;
-use crate::memory::model::{content_hash, display_id, format_date, format_datetime, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, Memory, Scope, Skill};
+use crate::memory::model::{content_hash, display_id, format_date, format_datetime, new_memory_id, now_secs, parse_confidence, parse_date, skill_hash, HeldSkill, Memory, Scope, Skill};
 use crate::memory::project::{detect_repo, project_name, RepoInfo};
 use crate::memory::secrets::{find_secrets, SecretFinding};
 use crate::memory::skills_fs::{self, DirState, SkillMarker};
@@ -704,6 +704,9 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                     unknown.0, unknown.1
                 );
             }
+            if let Some(line) = held_skills_line(&store.held_skills()?) {
+                println!("{}", line);
+            }
             println!("Pending:    {} change(s) waiting to sync", store.pending_count()?);
             println!("Last sync:  {}", if last == 0 { "never".to_string() } else { format!("{}s ago", now_secs() - last) });
             println!("Held back:  {} harvested memory file(s) (possible credentials)", store.held_back_count()?);
@@ -853,9 +856,35 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
     Ok(())
 }
 
+/// `atem memory status`'s line for skill versions held because they don't
+/// open here (`model::HeldSkill`): how many, and which.
+pub fn held_skills_line(held: &[HeldSkill]) -> Option<String> {
+    if held.is_empty() {
+        return None;
+    }
+    let which: Vec<String> = held.iter().map(|h| format!("{} v{}", h.name, h.version)).collect();
+    Some(format!(
+        "Unreadable: {} skill version(s) that don't open on this machine ({}); held, never installed, until a later version replaces them",
+        held.len(), which.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_names_the_held_skill_versions() {
+        assert_eq!(held_skills_line(&[]), None);
+        let held = |name: &str, version| HeldSkill {
+            scope: Scope::Global, project: String::new(), name: name.into(), version, seq: 9,
+            reason: "encrypted field authentication failed".into(),
+        };
+        assert_eq!(
+            held_skills_line(&[held("deploy", 2), held("lint", 5)]).unwrap(),
+            "Unreadable: 2 skill version(s) that don't open on this machine (deploy v2, lint v5); held, never installed, until a later version replaces them"
+        );
+    }
 
     fn hist(id: &str, content: &str, created: i64, invalid_at: Option<i64>, superseded_by: Option<&str>) -> Memory {
         Memory {

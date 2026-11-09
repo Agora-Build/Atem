@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::future::Future;
-use crate::memory::model::{Memory, Scope, Skill};
+use crate::memory::model::{Memory, PulledSkill, Scope, Skill};
 use crate::memory::skill_wire::{self, WireSkill};
 use crate::memory::store::PendingOp;
 use crate::memory::crypto::{
@@ -140,6 +140,11 @@ struct VersionPage {
     skill: WireSkill,
 }
 
+/// The per-op answer to a skill push whose version the Station already
+/// has (it stores each push at the version it was sealed under, never
+/// renumbered: owner decision on Atem #130, comment 6726291208).
+pub const VERSION_CONFLICT: &str = "version_conflict";
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OpResult {
     pub ok: bool,
@@ -155,6 +160,20 @@ pub struct OpResult {
     pub superseded_concurrent: bool,
     #[serde(default)]
     pub error: Option<String>,
+    /// With a `version_conflict`: the skill's latest version on the Station.
+    #[serde(default)]
+    pub current: Option<i64>,
+    /// Set by the client, never on the wire: the conflict was checked and
+    /// the version holds another write (a concurrent edit), not this
+    /// Atem's own earlier one (`sync::check_conflicts`).
+    #[serde(skip)]
+    pub concurrent: bool,
+}
+
+impl OpResult {
+    pub fn is_version_conflict(&self) -> bool {
+        !self.ok && self.error.as_deref() == Some(VERSION_CONFLICT)
+    }
 }
 
 #[derive(Deserialize)]
@@ -502,17 +521,38 @@ impl KnowledgeClient {
         page.skills.into_iter().map(skill_of).collect()
     }
 
-    /// A pulled page's skill rows opened (`decrypt_pulled_skills`): as
-    /// `open_memories`.
-    pub async fn open_skills(&self, rows: Vec<Skill>) -> Result<Vec<Skill>, ApiError> {
+    /// A pulled page's skill rows opened (`open_pulled_skills`): as
+    /// `open_memories`, and a row whose files don't open here is held, not
+    /// the page.
+    pub async fn open_skills(&self, rows: Vec<Skill>) -> Result<Vec<PulledSkill>, ApiError> {
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_pulled_skills(rows)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.open_pulled_skills(rows)).await.map_err(ApiError::from)
     }
 
+    /// A page's rows opened; one that would be held is an error here.
     #[cfg(test)]
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let rows = self.fetch_skills(since).await?;
-        self.open_skills(rows).await
+        self.open_skills(rows).await?.into_iter()
+            .map(|row| match row {
+                PulledSkill::Row(skill) => Ok(skill),
+                PulledSkill::Held(held) => Err(ApiError::Encryption(format!("{} v{} held: {}", held.name, held.version, held.reason))),
+            })
+            .collect()
+    }
+
+    /// One stored version as the Station serves it, not opened: what a
+    /// `version_conflict` is checked against (`project` as sent). `None`:
+    /// it was purged (410), so its content is gone.
+    pub async fn stored_skill(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<Option<Skill>, ApiError> {
+        let req = skill_version_request(&self.base, &self.client_id, scope, project, name, version);
+        let sent = match v2_route(self.send(req).await, true) {
+            Err(ApiError::Http(410, _)) => return Ok(None),
+            sent => sent?,
+        };
+        let page: VersionPage = sent.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        check_v2(page.wire_version)?;
+        skill_of(page.skill).map(Some)
     }
 
     /// Names what it can of the pulled project hashes `hashes`, hashing and

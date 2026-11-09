@@ -174,6 +174,40 @@ impl Skill {
     }
 }
 
+/// A pulled skill version whose files don't open on this Atem (they fail to
+/// authenticate, name a key it doesn't hold, or are malformed inside a
+/// well-formed row): never applied, installed or injected; held and
+/// reported until a later version, a tombstone or a purge of that skill
+/// replaces it. It keeps no files and no plain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSkill {
+    pub scope: Scope,
+    /// As its readable versions are stored: the name when this Atem knows
+    /// it, else the hash it was pulled under.
+    pub project: String,
+    pub name: String,
+    pub version: i64,
+    pub seq: i64,
+    /// Why it doesn't open (the field error, never content).
+    pub reason: String,
+}
+
+/// A pulled skill row: opened (or, before it is opened, as fetched), or held.
+#[derive(Debug, Clone)]
+pub enum PulledSkill {
+    Row(Skill),
+    Held(HeldSkill),
+}
+
+impl PulledSkill {
+    pub fn seq(&self) -> i64 {
+        match self {
+            Self::Row(skill) => skill.seq,
+            Self::Held(held) => held.seq,
+        }
+    }
+}
+
 /// Trim, collapse runs of whitespace, lowercase. Used only for hashing.
 pub fn normalize_content(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()

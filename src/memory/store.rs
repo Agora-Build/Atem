@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::memory::model::{Memory, Scope, Skill};
+use crate::memory::model::{HeldSkill, Memory, Scope, Skill};
 
 /// Legacy, unkeyed cursor names. Only the per-account keys below are read;
 /// a cursor stored under these bare names is ignored.
@@ -115,6 +115,10 @@ CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT N
 CREATE TABLE IF NOT EXISTS harvest_map (
   origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS replacements (new_id TEXT NOT NULL, old_id TEXT NOT NULL, PRIMARY KEY (new_id, old_id));
+CREATE TABLE IF NOT EXISTS held_skills (
+  scope TEXT NOT NULL, project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,
+  seq INTEGER NOT NULL, reason TEXT NOT NULL, noted INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (scope, project, name, version));
 ";
 
 /// Full-text index over `memories.content`: external content, and trigram
@@ -598,7 +602,7 @@ impl Store {
     /// unpushed edit (seq 0) always has the higher version. Skills under a
     /// `stale` hash are dropped: it can never be named here, and a migration
     /// delivers what is still live again. Memories are kept: the migration
-    /// rewrites each one by id.
+    /// rewrites each one by id. Held skill versions move and go the same way.
     pub fn resolve_projects(&self, named: &[(String, String)], stale: &[String]) -> Result<()> {
         self.in_transaction(|| {
             for (hash, name) in named {
@@ -613,9 +617,11 @@ impl Store {
                     }
                 }
                 self.conn.execute("DELETE FROM skills WHERE project = ?1", params![hash])?;
+                self.conn.execute("UPDATE OR REPLACE held_skills SET project = ?2 WHERE project = ?1", params![hash, name])?;
             }
             for hash in stale {
                 self.conn.execute("DELETE FROM skills WHERE project = ?1", params![hash])?;
+                self.conn.execute("DELETE FROM held_skills WHERE project = ?1", params![hash])?;
             }
             Ok(())
         })
@@ -767,11 +773,87 @@ impl Store {
         let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM harvest_map WHERE status = 'held_back'", [], |r| r.get(0))?;
         Ok(n as usize)
     }
+
+    // ── held skill versions (`model::HeldSkill`) ────────────────────────
+    /// Records a pulled version that doesn't open here. Pulled again (a page
+    /// fetched twice), it stays reported once.
+    pub fn hold_skill(&self, held: &HeldSkill) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO held_skills (scope, project, name, version, seq, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(scope, project, name, version) DO UPDATE SET seq = excluded.seq, reason = excluded.reason",
+            params![held.scope.as_str(), held.project, held.name, held.version, held.seq, held.reason],
+        )?;
+        Ok(())
+    }
+
+    /// A readable version `through` of the skill arrived (a later version, a
+    /// tombstone, or the held version itself purged or rewritten): the holds
+    /// it replaces go.
+    pub fn clear_held_skills(&self, scope: Scope, project: &str, name: &str, through: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM held_skills WHERE scope = ?1 AND project = ?2 AND name = ?3 AND version <= ?4",
+            params![scope.as_str(), project, name, through],
+        )?;
+        Ok(())
+    }
+
+    pub fn held_skills(&self) -> Result<Vec<HeldSkill>> {
+        self.select_held("SELECT scope, project, name, version, seq, reason FROM held_skills ORDER BY scope, project, name, version")
+    }
+
+    /// The holds not reported yet, now marked reported (one sync note each).
+    pub fn take_new_held_skills(&self) -> Result<Vec<HeldSkill>> {
+        let held = self.select_held(
+            "SELECT scope, project, name, version, seq, reason FROM held_skills WHERE noted = 0 ORDER BY scope, project, name, version",
+        )?;
+        self.conn.execute("UPDATE held_skills SET noted = 1 WHERE noted = 0", [])?;
+        Ok(held)
+    }
+
+    fn select_held(&self, sql: &str) -> Result<Vec<HeldSkill>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?;
+        rows.map(|row| {
+            let (scope, project, name, version, seq, reason) = row?;
+            Ok(HeldSkill { scope: Scope::parse(&scope)?, project, name, version, seq, reason })
+        })
+        .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_skill_versions_are_reported_once_and_cleared_by_a_later_one() {
+        let s = Store::open_in_memory().unwrap();
+        let held = |name: &str, project: &str, version| HeldSkill {
+            scope: Scope::Project, project: project.into(), name: name.into(), version, seq: version * 10,
+            reason: "encrypted field authentication failed".into(),
+        };
+        s.hold_skill(&held("deploy", "github.com/a/b", 2)).unwrap();
+        s.hold_skill(&held("deploy", "github.com/a/b", 4)).unwrap();
+        s.hold_skill(&held("lint", "h1.0123abcd.ff", 1)).unwrap();
+        assert_eq!(s.take_new_held_skills().unwrap().len(), 3);
+        // Pulled again: still held, not reported again.
+        s.hold_skill(&held("deploy", "github.com/a/b", 2)).unwrap();
+        assert!(s.take_new_held_skills().unwrap().is_empty());
+        assert_eq!(s.held_skills().unwrap().len(), 3);
+        // A readable v3 replaces v2 only; another scope or project replaces nothing.
+        s.clear_held_skills(Scope::Project, "github.com/a/b", "deploy", 3).unwrap();
+        s.clear_held_skills(Scope::Global, "github.com/a/b", "deploy", 9).unwrap();
+        let left: Vec<(String, i64)> = s.held_skills().unwrap().into_iter().map(|h| (h.name, h.version)).collect();
+        assert_eq!(left, vec![("deploy".to_string(), 4), ("lint".to_string(), 1)]);
+        // A hash named since moves with its skills; a stale one goes.
+        s.resolve_projects(&[("h1.0123abcd.ff".into(), "github.com/c/d".into())], &[]).unwrap();
+        assert!(s.held_skills().unwrap().iter().any(|h| h.name == "lint" && h.project == "github.com/c/d"));
+        s.hold_skill(&held("old", "h1.89abcdef.ee", 1)).unwrap();
+        s.resolve_projects(&[], &["h1.89abcdef.ee".into()]).unwrap();
+        assert!(s.held_skills().unwrap().iter().all(|h| h.name != "old"));
+    }
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
 
