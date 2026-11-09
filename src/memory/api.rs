@@ -136,6 +136,27 @@ struct VersionPage {
 /// all (compare-and-set; Astation PR #76 at 89a2d50, Atem #130).
 pub const VERSION_CONFLICT: &str = "version_conflict";
 
+/// The per-op refusals Atem treats as temporary (an owner decision, not the
+/// Station's: its route header at 9eb5320 calls every per-op refusal
+/// permanent, and `designs/protocol/skill-file-wire.md` at 89a2d50 says only
+/// "Policy and store refusals remain per operation; transient failures remain
+/// HTTP 503"). Each says an op's protected fields don't match the encryption
+/// mode or key the Station has for the account: the route checks each op
+/// against the state it read for the batch (`memory …` / `skill does not
+/// match the account encryption mode`), and the store repeats the check
+/// inside its write transaction (`content does not match …`); Astation
+/// `relay-server/src/knowledge_routes.rs` and `knowledge_store.rs` at
+/// 9eb5320. That is a race (a mode change, a key rotation, a migration, or a
+/// device behind the account's state) unless the op's own value can never
+/// pass, which `sync::judge_mode_refusals` finds (`ModeRefusal::Own`). Every
+/// other per-op refusal, and any text not listed here, is permanent. Atem
+/// asked Astation for a stable retry flag (Atem #130).
+pub const TEMPORARY_REFUSALS: [&str; 3] = [
+    "memory does not match the account encryption mode",
+    "skill does not match the account encryption mode",
+    "content does not match the account encryption mode",
+];
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OpResult {
     pub ok: bool,
@@ -158,6 +179,32 @@ pub struct OpResult {
     /// `version_conflict` found (`sync::check_conflicts`).
     #[serde(skip)]
     pub check: ConflictCheck,
+    /// Set by the client, never on the wire: for a refusal in
+    /// `TEMPORARY_REFUSALS`, what the op as it went out makes of it
+    /// (`sync::judge_mode_refusals`).
+    #[serde(skip)]
+    pub mode_refusal: ModeRefusal,
+}
+
+/// What a refusal in `TEMPORARY_REFUSALS` means for the op as it went out
+/// (`sync::judge_mode_refusals`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ModeRefusal {
+    /// Not judged (its batch's wire wasn't at hand): for now.
+    #[default]
+    NotJudged,
+    /// Sealed, or sent plain under a signed off or disabling state: the
+    /// account's mode or key on the Station isn't the one Atem sealed under
+    /// (a mode change, a rotation, a migration racing the push). For now.
+    Changing,
+    /// Sent plain by a device that isn't verified, to an account the Station
+    /// encrypts. For now: it goes sealed once this device is verified.
+    Unverified,
+    /// The op's own value can never pass while the state lasts (a plain
+    /// value that starts like a sealed one while the account is off, or a
+    /// project kept under an earlier key's hash): refused for good, why
+    /// given.
+    Own(String),
 }
 
 /// What checking a push's `version_conflict` found (`sync::check_conflicts`).
@@ -189,6 +236,14 @@ pub const MAX_SKILL_VERSION: i64 = 9_007_199_254_740_991;
 impl OpResult {
     pub fn is_version_conflict(&self) -> bool {
         !self.ok && self.error.as_deref() == Some(VERSION_CONFLICT)
+    }
+
+    /// A refusal for now (`TEMPORARY_REFUSALS`, unless the op's own value
+    /// causes it: `ModeRefusal::Own`): the op stays queued.
+    pub fn is_temporary_refusal(&self) -> bool {
+        !self.ok
+            && self.error.as_deref().is_some_and(|error| TEMPORARY_REFUSALS.contains(&error))
+            && !matches!(self.mode_refusal, ModeRefusal::Own(_))
     }
 }
 
@@ -272,6 +327,42 @@ pub struct KnowledgeClient {
     astation_id: String,
     http: reqwest::Client,
     encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
+    /// Set for one sync (`for_sync`), shared by its clones.
+    sync_floor: Option<std::sync::Arc<std::sync::Mutex<SyncFloor>>>,
+}
+
+/// Why a sync that started encrypted stops when the account's state would
+/// have it send or accept plain text.
+pub const NO_PLAIN_AFTER_SEALED: &str = "this sync started end-to-end encrypted, and the account's encryption state changed during it (encryption turned off, this device's verification removed, or another data account), so nothing more is sent or accepted in plain text this sync; the rest stays queued. Check `atem status`, then sync again.";
+
+/// What one sync has seen of the account's encryption (`for_sync`): the
+/// data account it encrypted for, once it read an encrypting state (at its
+/// start, or at any seal or open since).
+#[derive(Debug, Default)]
+struct SyncFloor {
+    encrypted_for: Option<String>,
+}
+
+impl SyncFloor {
+    /// Admits a state just read (whether it encrypts, and its data account),
+    /// or refuses one that would switch the sync to plain text: not
+    /// encrypting (off, disabling, an unverified device), or another data
+    /// account. A state with no signed account state never gets here (it is
+    /// an error already).
+    fn admit(&mut self, encrypts: bool, data_account: &str) -> Result<(), ApiError> {
+        match &self.encrypted_for {
+            Some(account) if !encrypts || account != data_account => {
+                Err(ApiError::Encryption(NO_PLAIN_AFTER_SEALED.into()))
+            }
+            Some(_) => Ok(()),
+            None => {
+                if encrypts {
+                    self.encrypted_for = Some(data_account.to_string());
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// `ops` with every project pulled as a hash this Atem has named since put
@@ -349,17 +440,47 @@ pub struct SealState {
     mode: EncryptionMode,
     kid: Option<String>,
     data_account: String,
+    verified: bool,
 }
 
 impl SealState {
     fn of(encryption: &EncryptionContext) -> Self {
-        Self { mode: encryption.mode, kid: encryption.kid.clone(), data_account: encryption.data_account.clone() }
+        Self {
+            mode: encryption.mode,
+            kid: encryption.kid.clone(),
+            data_account: encryption.data_account.clone(),
+            verified: encryption.verified(),
+        }
     }
 
     /// Whether ops are sealed under this state (the account encrypts): only
     /// then does sealing an op with a protected field ask the cred agent.
     pub fn encrypts(&self) -> bool {
         matches!(self.mode, EncryptionMode::Enabling | EncryptionMode::On)
+    }
+
+    /// Whether this device is verified with the account's Astation (an
+    /// unverified one is `off` whatever the account's mode).
+    pub fn verified(&self) -> bool {
+        self.verified
+    }
+
+    /// The state as one string (mode, key, data account, verification), to
+    /// tell whether two refusals for now came under the same state
+    /// (`sync::apply_batch`).
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "{:?}:{}:{}:{}",
+            self.mode,
+            self.kid.as_deref().unwrap_or_default(),
+            self.data_account,
+            if self.verified { "verified" } else { "unverified" }
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(mode: EncryptionMode, kid: Option<&str>, verified: bool) -> Self {
+        Self { mode, kid: kid.map(str::to_string), data_account: "acct-1".into(), verified }
     }
 }
 
@@ -381,7 +502,25 @@ impl KnowledgeClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             encryption_with: None,
+            sync_floor: None,
         }
+    }
+
+    /// This client for one sync, which never switches from sealed to plain
+    /// text: once the sync has read the account's state as encrypting (`on`
+    /// or `enabling`: at its start, here, or at any seal or open since),
+    /// every later read of a state that would send or accept plain text
+    /// (off, disabling, this device unverified, another data account) fails
+    /// with `NO_PLAIN_AFTER_SEALED`, so nothing more is sealed, sent, opened
+    /// or acked. The state is read again at each chunk and page as before
+    /// (a new key is followed). A sync that starts with encryption off, and
+    /// never sees it encrypting, is unchanged.
+    pub fn for_sync(&self) -> Self {
+        let client = Self { sync_floor: Some(Default::default()), ..self.clone() };
+        // The state it starts under; one that can't be read latches nothing
+        // (every later read fails the same way).
+        let _ = client.encryption();
+        client
     }
 
     
@@ -418,13 +557,20 @@ impl KnowledgeClient {
         Ok(resp)
     }
 
+    /// The account's encryption state now (read at every seal and open);
+    /// during a sync, admitted by its `SyncFloor` first.
     fn encryption(&self) -> Result<EncryptionContext, ApiError> {
-        if let Some((paths, agent)) = &self.encryption_with {
-            return EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone())
-                .map_err(ApiError::from);
+        let encryption = if let Some((paths, agent)) = &self.encryption_with {
+            EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone())
+        } else {
+            EncryptionContext::for_astation(&self.astation_id)
         }
-        EncryptionContext::for_astation(&self.astation_id)
-            .map_err(ApiError::from)
+        .map_err(ApiError::from)?;
+        if let Some(floor) = &self.sync_floor {
+            floor.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .admit(encryption.should_encrypt(), &encryption.data_account)?;
+        }
+        Ok(encryption)
     }
 
     /// The state ops sealed now would be sealed under, and `ops` as they
@@ -874,6 +1020,29 @@ mod tests {
         assert_eq!(purge_all["versions"], serde_json::Value::Null);
         let purge_one = op_to_wire(&PendingOp::PurgeSkill { scope: Scope::Global, project: String::new(), name: "demo".into(), versions: Some(vec![2]) });
         assert_eq!(purge_one["versions"], json!([2]));
+    }
+
+    /// Once a sync read an encrypting state, a state that isn't (off,
+    /// disabling, unverified) or names another data account is refused; a
+    /// new key under the same account is not a switch. Before that, a sync
+    /// that started off goes on as it did.
+    #[test]
+    fn a_sync_never_switches_from_sealed_to_plain_text() {
+        let refused = |floor: &mut SyncFloor, encrypts, account| match floor.admit(encrypts, account) {
+            Err(ApiError::Encryption(note)) => note == NO_PLAIN_AFTER_SEALED,
+            _ => false,
+        };
+        let mut floor = SyncFloor::default();
+        assert!(floor.admit(false, "acct-1").is_ok());
+        assert!(floor.admit(false, "acct-1").is_ok());
+        assert!(floor.admit(true, "acct-1").is_ok());
+        assert!(floor.admit(true, "acct-1").is_ok());
+        assert!(refused(&mut floor, false, "acct-1"));
+        assert!(refused(&mut floor, true, "acct-2"));
+        assert!(refused(&mut floor, false, "astation-id-when-unverified"));
+        // Still refused later: the floor never lowers.
+        assert!(refused(&mut floor, false, "acct-1"));
+        assert!(floor.admit(true, "acct-1").is_ok());
     }
 
     #[test]

@@ -716,6 +716,10 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 println!("{}", line);
             }
             println!("Pending:    {} change(s) waiting to sync", store.pending_count()?);
+            let local_only = store.local_only_count()?;
+            if local_only > 0 {
+                println!("Local only: {} memories never synced (refused by the relay, or added with --force); kept on this machine", local_only);
+            }
             println!("Last sync:  {}", if last == 0 { "never".to_string() } else { format!("{}s ago", now_secs() - last) });
             println!("Held back:  {} harvested memory file(s) (possible credentials)", store.held_back_count()?);
             let forks = store.multi_successors()?;
@@ -834,34 +838,89 @@ pub async fn handle_skill(command: SkillCommands) -> Result<()> {
             } else {
                 Some(vec![version.ok_or_else(|| anyhow!("Pass --version <n> or --all-versions"))?])
             };
-            let which = match &versions {
-                None => "every version".to_string(),
-                Some(v) => format!("version {}", v[0]),
+            // Who pushed the version and when, as `atem skill history` shows
+            // it (best effort: without the relay the question goes without;
+            // not asked with --yes).
+            let history = || async {
+                if yes {
+                    return None;
+                }
+                match client().await {
+                    Ok(c) => c.skill_versions(scope, &project, &name).await.ok(),
+                    Err(_) => None,
+                }
             };
-            if !crate::cli::confirm_destructive(
-                &format!("Erase {which} of skill '{name}' ({}) from the relay and every machine? This can't be undone.", scope.as_str()),
-                yes,
-            )? {
+            let confirm = |question: &str| crate::cli::confirm_destructive(question, yes);
+            if !purge_skill(&store, scope, &project, &name, versions, history, confirm).await? {
                 println!("Cancelled; nothing was purged.");
                 return Ok(());
             }
-            if let Some(cur) = store.get_skill(scope, &project, &name)? {
-                let hits_latest = versions.as_ref().map(|v| v.contains(&cur.version)).unwrap_or(true);
-                if hits_latest {
-                    let mut t = cur.clone();
-                    t.deleted = true;
-                    t.files.clear();
-                    t.content_hash.clear();
-                    store.put_skill(&t)?;
-                }
-            }
-            store.enqueue(&PendingOp::PurgeSkill { scope, project, name: name.clone(), versions })?;
             println!("Purged skill {}. Other machines remove it at their next sync (locally edited copies are reported, not deleted).", name);
             println!("{}", ROTATE_WARNING);
             best_effort_sync(&store, &ctx).await;
         }
     }
     Ok(())
+}
+
+/// `atem skill purge`: a purge of named versions is refused while the skill
+/// has an edit here that hasn't synced (`sync::check_purge`), before the
+/// question and again in the transaction that queues it (an edit queued
+/// while the question waited counts too). `history` gives the relay's
+/// history for the question (`purged_version_label`); `confirm` asks it.
+/// Queues the purge with the local tombstone (when it hits the local
+/// copy's version); `Ok(false)` when it was declined.
+async fn purge_skill<H, HF>(
+    store: &Store,
+    scope: Scope,
+    project: &str,
+    name: &str,
+    versions: Option<Vec<i64>>,
+    history: H,
+    confirm: impl FnOnce(&str) -> Result<bool>,
+) -> Result<bool>
+where
+    H: FnOnce() -> HF,
+    HF: std::future::Future<Output = Option<Vec<crate::memory::api::SkillVersionInfo>>>,
+{
+    sync::check_purge(store, scope, project, name, versions.as_deref())?;
+    let which = match &versions {
+        None => "every version".to_string(),
+        Some(v) => purged_version_label(v[0], history().await.as_deref()),
+    };
+    if !confirm(&format!("Erase {which} of skill '{name}' ({}) from the relay and every machine? This can't be undone.", scope.as_str()))? {
+        return Ok(false);
+    }
+    store.in_transaction(|| {
+        sync::check_purge(store, scope, project, name, versions.as_deref())?;
+        if let Some(cur) = store.get_skill(scope, project, name)? {
+            let hits_latest = versions.as_ref().map(|v| v.contains(&cur.version)).unwrap_or(true);
+            if hits_latest {
+                let mut t = cur.clone();
+                t.deleted = true;
+                t.files.clear();
+                t.content_hash.clear();
+                store.put_skill(&t)?;
+            }
+        }
+        store.enqueue(&PendingOp::PurgeSkill { scope, project: project.to_string(), name: name.to_string(), versions: versions.clone() })
+    })?;
+    Ok(true)
+}
+
+/// `skill purge --version <n>`'s name for the version in its question: with
+/// the machine that pushed it and when (UTC), as `atem skill history` shows
+/// them, when `history` (the relay's, if it could be read) lists it; an
+/// already purged version or a delete marker says so instead.
+fn purged_version_label(version: i64, history: Option<&[crate::memory::api::SkillVersionInfo]>) -> String {
+    match history.map(|history| history.iter().find(|v| v.version == version)) {
+        Some(Some(v)) if v.purged => format!("version {version} (already purged)"),
+        Some(Some(v)) if v.deleted => format!("version {version} (a delete marker, no files)"),
+        Some(Some(v)) if v.source_machine.is_empty() => format!("version {version} (pushed {} UTC)", format_datetime(v.created_at)),
+        Some(Some(v)) => format!("version {version} (pushed by {}, {} UTC)", v.source_machine, format_datetime(v.created_at)),
+        Some(None) => format!("version {version} (not in the relay's history of this skill)"),
+        None => format!("version {version}"),
+    }
 }
 
 /// `atem memory status`'s line for skill versions held because they don't
@@ -1184,6 +1243,92 @@ mod tests {
         assert!(!lines[1].contains("latest") && lines[1].contains("2026-10-03 14:09") && lines[1].ends_with("1 file"), "{}", lines[1]);
         assert!(lines[2].contains("deleted") && !lines[2].contains("file"), "{}", lines[2]);
         assert!(lines[3].contains("purged") && !lines[3].contains("deleted"), "{}", lines[3]);
+    }
+
+    /// The purge question names the version's author machine and time when
+    /// the relay's history has them.
+    #[test]
+    fn the_version_purge_question_names_who_pushed_it_and_when() {
+        let history = [info(5, "mac-mini", "claude", 4, false, false, 1_791_036_600), info(4, "", "codex", 1, false, false, 1_791_036_540)];
+        assert_eq!(purged_version_label(5, Some(&history)), "version 5 (pushed by mac-mini, 2026-10-03 14:10 UTC)");
+        assert_eq!(purged_version_label(4, Some(&history)), "version 4 (pushed 2026-10-03 14:09 UTC)");
+        assert_eq!(purged_version_label(3, Some(&history)), "version 3 (not in the relay's history of this skill)");
+        assert_eq!(purged_version_label(3, None), "version 3");
+        // Already purged, or a delete marker: no author or files to show.
+        let gone = [info(2, "mac-mini", "cli", 0, true, false, 1_790_000_000), info(1, "genie", "claude", 0, true, true, 1_789_000_000)];
+        assert_eq!(purged_version_label(2, Some(&gone)), "version 2 (a delete marker, no files)");
+        assert_eq!(purged_version_label(1, Some(&gone)), "version 1 (already purged)");
+    }
+
+    fn global_skill(name: &str, version: i64) -> Skill {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("SKILL.md".to_string(), b"# s".to_vec());
+        Skill {
+            scope: Scope::Global, project: String::new(), name: name.into(), version,
+            content_hash: skill_hash(&files), files,
+            source_agent: "cli".into(), source_machine: "m".into(), created_at: 1, deleted: false, seq: 1,
+        }
+    }
+
+    fn purges(s: &Store) -> Vec<PendingOp> {
+        s.pending().unwrap().into_iter().map(|(_, op)| op).filter(|op| matches!(op, PendingOp::PurgeSkill { .. })).collect()
+    }
+
+    /// The handler's checks: a version purge is refused before the question
+    /// while the skill has a queued push (nothing asked, nothing fetched),
+    /// and again after it when an edit was queued while it waited (nothing
+    /// queued, the local copy untouched); `--all-versions` goes either way;
+    /// a version purge with nothing unsynced goes, with the question naming
+    /// the version, and tombstones the local copy when it is that version.
+    #[tokio::test]
+    async fn the_purge_command_checks_before_and_after_its_question() {
+        let no_history = || async { panic!("the history was read for a refused purge") };
+        let never = |_: &str| -> Result<bool> { panic!("asked for a refused purge") };
+        // A queued push: refused before anything.
+        let s = Store::open_in_memory().unwrap();
+        let mine = global_skill("deploy", 2);
+        s.put_skill(&mine).unwrap();
+        s.enqueue(&PendingOp::PushSkill { skill: mine.clone(), base_version: 1 }).unwrap();
+        let err = purge_skill(&s, Scope::Global, "", "deploy", Some(vec![1]), no_history, never).await.unwrap_err();
+        assert!(err.to_string().contains("Run `atem sync`, then check `atem skill history deploy`"), "{err}");
+        assert!(purges(&s).is_empty());
+        // --all-versions goes.
+        let asked = std::cell::RefCell::new(String::new());
+        let yes = |question: &str| -> Result<bool> {
+            *asked.borrow_mut() = question.to_string();
+            Ok(true)
+        };
+        assert!(purge_skill(&s, Scope::Global, "", "deploy", None, no_history, yes).await.unwrap());
+        assert!(asked.borrow().starts_with("Erase every version of skill 'deploy' (global)"), "{}", asked.borrow());
+        assert_eq!(purges(&s).len(), 1);
+
+        // Nothing unsynced, but another process queues an edit while the
+        // question waits: refused after it, nothing queued or changed.
+        let s = Store::open_in_memory().unwrap();
+        s.put_skill(&global_skill("deploy", 2)).unwrap();
+        let history = || async { Some(vec![crate::memory::api::SkillVersionInfo {
+            version: 2, created_at: 1_791_036_600, source_agent: "cli".into(), source_machine: "genie".into(), file_count: 1, deleted: false, purged: false,
+        }]) };
+        let edit_meanwhile = |question: &str| -> Result<bool> {
+            assert!(question.starts_with("Erase version 2 (pushed by genie, 2026-10-03 14:10 UTC) of skill 'deploy'"), "{question}");
+            let edit = global_skill("deploy", 3);
+            s.enqueue(&PendingOp::PushSkill { skill: edit, base_version: 2 }).unwrap();
+            Ok(true)
+        };
+        let err = purge_skill(&s, Scope::Global, "", "deploy", Some(vec![2]), history, edit_meanwhile).await.unwrap_err();
+        assert!(err.to_string().contains("hasn't synced yet"), "{err}");
+        assert!(purges(&s).is_empty());
+        assert!(!s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap().deleted);
+
+        // Nothing unsynced: the version purge is queued, the local copy
+        // (that version) tombstoned; declining changes nothing.
+        let s = Store::open_in_memory().unwrap();
+        s.put_skill(&global_skill("deploy", 2)).unwrap();
+        assert!(!purge_skill(&s, Scope::Global, "", "deploy", Some(vec![2]), || async { None }, |_: &str| Ok(false)).await.unwrap());
+        assert!(purges(&s).is_empty());
+        assert!(purge_skill(&s, Scope::Global, "", "deploy", Some(vec![2]), || async { None }, |_: &str| Ok(true)).await.unwrap());
+        assert_eq!(purges(&s), vec![PendingOp::PurgeSkill { scope: Scope::Global, project: String::new(), name: "deploy".into(), versions: Some(vec![2]) }]);
+        assert!(s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap().deleted);
     }
 
     #[test]
