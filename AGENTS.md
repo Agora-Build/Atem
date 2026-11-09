@@ -317,7 +317,9 @@ renders around sender text (remote tasks, messages and marks, local tasks,
 result deliveries) uses the agreed §III.2 framing (`atem_client::session::framing`):
 a CSPRNG tag per rendered prompt, drawn after the sender's text is fixed, on
 every line of Atem's (the guarantee: no sender line can carry it), the rule
-line, and counted blocks; as an extra layer, a `|` before any sender line that
+line (narrowed by the owner on 2026-11-09: only this prompt's tagged lines
+are Atem's; nothing the agent reads later is, whatever tag it carries, since
+`view` holders can read the tag), and counted blocks; as an extra layer, a `|` before any sender line that
 folds to `[atem` after leading White_Space (Cf removed, NFKC, then the
 lowercased line, its UTS #39 skeleton, or the skeleton taken before
 lowercasing, lowercased and skeletonized again; all Unicode 18.0.0, the

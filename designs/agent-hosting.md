@@ -229,7 +229,11 @@ owner's local consent in `runtime.toml`.
   framed (a tag per prompt, counted blocks, look-alikes of its marker escaped;
   the delegated host-work design, III.2, and host-work v1 §4 "Rendering"), so
   sender text can't imitate them; a principal with `control` can still write
-  anything directly (agent collaboration, section 17).
+  anything directly (agent collaboration, section 17). A principal with
+  `view` can read a prompt's tag in chat history and on the terminal during
+  the turn; the rule line tells the agent that nothing it reads after the
+  prompt is Atem's, whatever tag it carries. The tag isn't yet withheld from
+  principals without `control` (an open item).
 
 ## 5. Remote launch
 

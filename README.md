@@ -398,12 +398,14 @@ there until `atem pair verify` pins a list. In every prompt Atem builds
 around a sender's text, each of Atem's own lines starts with a tag drawn at
 random for that prompt once the sender's text is fixed, and the sender's text
 sits in counted blocks. The tag is the guarantee: a line without it, or
-inside a block, is never Atem's, so text a sender writes can't pass for
-Atem's lines (a message header, a result's "as data" label), earlier tags
-included. As an extra, a sender's line that starts like Atem's marker
+inside a block, is never Atem's, and nothing the agent reads later (tool
+output, files, pages, messages) is, whatever tag it carries. So text a sender
+writes can't pass for Atem's lines (a message header, a result's "as data"
+label), earlier tags included. As an extra, a sender's line that starts like Atem's marker
 `[atem` gets a `|` in front: in any case or width, after white space or
-invisible characters, or spelled with look-alike letters of other scripts
-that Unicode's confusables list (Unicode 18.0.0). Look-alikes that list
+invisible format characters (Unicode's Cf and Default_Ignorable), or spelled
+with look-alike letters of other scripts that Unicode's confusables list
+(Unicode 18.0.0). Look-alikes that list
 doesn't have, or `[atem` after other text on the line, get no `|` and rely
 on the tag. The framing tells the agent where text came from; it doesn't
 stop the agent from acting on it.
