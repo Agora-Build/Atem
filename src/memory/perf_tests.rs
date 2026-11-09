@@ -10,12 +10,12 @@
 //!
 //!   CARGO_TARGET_DIR=<dir> cargo build --release
 //!   CARGO_TARGET_DIR=<dir> cargo test --release --bin atem perf_ -- --ignored --nocapture --test-threads=1
-use crate::memory::account_keys::{AccountKey, AccountKeys, CryptOp};
+use crate::memory::account_keys::{AccountKey, AccountKeys, CryptOp, sealed_len};
 use crate::memory::adapters::Ctx;
 use crate::memory::agent_socket::{CredAgentClient, encode_request};
 use crate::memory::api::{KnowledgeClient, op_to_wire};
 use crate::memory::cred_agent::{CredAgentApi, Reply, Request, build_unlock_request};
-use crate::memory::crypto::{EncryptionContext, EncryptionMode};
+use crate::memory::crypto::{CRYPT_OP_MAX_BYTES, EncryptionContext, EncryptionMode};
 use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
 use crate::memory::fake_astation::{
     ACCOUNT, ASTATION_ID, DEVICE_ID, UnlockedDevice, pin, set_state,
@@ -237,17 +237,6 @@ fn private_dir(path: &Path) {
 /// `atem cred-agent` with only HOME, XDG_RUNTIME_DIR and PATH set (temp
 /// dirs), optionally with `RLIMIT_MEMLOCK` lowered to `memlock` bytes.
 fn spawn_agent(home: &Path, run: &Path, log: &Path, memlock: Option<u64>) -> std::process::Child {
-    spawn_agent_with(home, run, log, memlock, &[])
-}
-
-/// [`spawn_agent`] with `extra` variables added (e.g. TOKIO_WORKER_THREADS).
-fn spawn_agent_with(
-    home: &Path,
-    run: &Path,
-    log: &Path,
-    memlock: Option<u64>,
-    extra: &[(&str, &str)],
-) -> std::process::Child {
     use std::os::unix::process::CommandExt;
     let log = std::fs::File::create(log).unwrap();
     let mut command = std::process::Command::new(atem_binary());
@@ -257,7 +246,6 @@ fn spawn_agent_with(
         .env("HOME", home)
         .env("XDG_RUNTIME_DIR", run)
         .env("PATH", "/usr/bin:/bin")
-        .envs(extra.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().unwrap())
         .stderr(log);
@@ -289,6 +277,48 @@ fn rss_kib(pid: u32) -> (u64, u64) {
             .unwrap_or(0)
     };
     (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// The process's locked memory (VmLck, KiB): the size of the mappings
+/// `mlockall` covers, resident or not.
+fn locked_kib(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_default()
+        .lines()
+        .find(|line| line.starts_with("VmLck:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The largest `n` up to `CRYPT_OP_MAX_BYTES` for which `fits(n)` (true
+/// up to some size, false beyond it).
+fn largest_fitting(fits: impl Fn(usize) -> bool) -> usize {
+    let (mut fits_up_to, mut too_big) = (0, CRYPT_OP_MAX_BYTES + 1);
+    while too_big - fits_up_to > 1 {
+        let middle = (fits_up_to + too_big) / 2;
+        if fits(middle) {
+            fits_up_to = middle;
+        } else {
+            too_big = middle;
+        }
+    }
+    fits_up_to
+}
+
+/// The largest plain text a client seals and then opens again as one op
+/// of `record`'s `field`: both within `CRYPT_OP_MAX_BYTES` (`wire_len`).
+fn largest_sealed_field(record: &str, field: &str) -> usize {
+    largest_fitting(|plain| {
+        CryptOp::seal_wire_len(record.len(), field.len(), plain) <= CRYPT_OP_MAX_BYTES
+            && CryptOp::open_wire_len(record.len(), field.len(), sealed_len(plain))
+                <= CRYPT_OP_MAX_BYTES
+    })
+}
+
+/// The largest value a client hashes as one op.
+fn largest_keyed_hash() -> usize {
+    largest_fitting(|value| CryptOp::keyed_hash_wire_len(value) <= CRYPT_OP_MAX_BYTES)
 }
 
 /// A verified device whose real agent process started unlocked (from a
@@ -2134,8 +2164,14 @@ fn perf_5_cold_start_unlock_and_memory() {
         println!("- {phase}: {:.2} ms", ms(median(samples)));
     }
 
-    // (e) Memory of the agent process.
+    // (e) Memory of the agent process, through JSON lines (a client that
+    // checks no build) and through production's frames. Each RSS is read
+    // after a short pause once the reply is in: the agent frees a request's
+    // buffers after writing its reply, so a look the instant the reply
+    // arrives can still see them (VmHWM keeps the peak either way).
     println!("\n### 5''. Agent process memory (VmRSS / VmHWM, KiB)");
+    let largest = largest_sealed_field("v", "content");
+    let largest_hash = largest_keyed_hash();
     for (label, memlock) in [
         (
             "mlockall on (this machine's RLIMIT_MEMLOCK ≥ 512 MiB)",
@@ -2161,49 +2197,82 @@ fn perf_5_cold_start_unlock_and_memory() {
         let idle_locked = rss_kib(child.id());
         let _ = child.kill();
         let _ = child.wait();
-        let real = RealAgent::start(EncryptionMode::On, memlock);
-        std::thread::sleep(Duration::from_millis(50));
-        let with_k = rss_kib(real.pid());
-        let client = real.reuse();
-        let plain = text(100, 1).into_bytes();
-        client
-            .crypt(
-                ASTATION_ID,
-                (0..1024)
-                    .map(|_| CryptOp::seal("m", "content", &plain))
-                    .collect(),
-            )
-            .unwrap();
-        let after_batch = rss_kib(real.pid());
-        let big = text(1 << 20, 2).into_bytes();
-        let sealed = client
-            .crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &big)])
-            .unwrap()
-            .remove(0)
-            .into_text()
-            .unwrap();
-        client
-            .crypt(ASTATION_ID, vec![CryptOp::open("v", "content", &sealed)])
-            .unwrap();
-        let after_mib = rss_kib(real.pid());
-        let huge = text(2 << 20, 3).into_bytes();
-        client
-            .crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &huge)])
-            .unwrap();
-        let after_2mib = rss_kib(real.pid());
-        for _ in 0..20 {
+        println!("- {label}: idle locked {idle_locked:?}");
+        for (transport, framed) in [("JSON lines", false), ("production, frames", true)] {
+            let real = RealAgent::start(EncryptionMode::On, memlock);
+            std::thread::sleep(Duration::from_millis(50));
+            let with_k = rss_kib(real.pid());
+            let client = if framed {
+                real.production()
+            } else {
+                real.reuse()
+            };
+            let at_rest = || {
+                std::thread::sleep(Duration::from_millis(20));
+                rss_kib(real.pid())
+            };
+            let plain = text(100, 1).into_bytes();
             client
-                .crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &big)])
+                .crypt(
+                    ASTATION_ID,
+                    (0..1024)
+                        .map(|_| CryptOp::seal("m", "content", &plain))
+                        .collect(),
+                )
                 .unwrap();
+            let after_batch = at_rest();
+            let big = text(1 << 20, 2).into_bytes();
+            let sealed = client
+                .crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &big)])
+                .unwrap()
+                .remove(0)
+                .into_text()
+                .unwrap();
+            client
+                .crypt(ASTATION_ID, vec![CryptOp::open("v", "content", &sealed)])
+                .unwrap();
+            let after_mib = at_rest();
+            let huge = text(2 << 20, 3).into_bytes();
+            client
+                .crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &huge)])
+                .unwrap();
+            let after_2mib = at_rest();
+            for _ in 0..20 {
+                client
+                    .crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &big)])
+                    .unwrap();
+            }
+            let after_20 = at_rest();
+            // The largest field a client seals and opens again (a vault
+            // entry can be this big), and the largest keyed hash a client
+            // allows (none is sent: hashes are of names and paths).
+            let field = text(largest, 4).into_bytes();
+            let sealed = client
+                .crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &field)])
+                .unwrap()
+                .remove(0)
+                .into_text()
+                .unwrap();
+            client
+                .crypt(ASTATION_ID, vec![CryptOp::open("v", "content", &sealed)])
+                .unwrap();
+            let after_largest = at_rest();
+            let value = text(largest_hash, 5).into_bytes();
+            client
+                .crypt(ASTATION_ID, vec![CryptOp::keyed_hash(&value)])
+                .unwrap();
+            let after_hash = at_rest();
+            // Idle: past the agent's wait before it gives freed memory back.
+            std::thread::sleep(Duration::from_millis(1500));
+            let idle = rss_kib(real.pid());
+            let threads = std::fs::read_dir(format!("/proc/{}/task", real.pid()))
+                .map(|d| d.count())
+                .unwrap_or(0);
+            println!(
+                "  - {transport}: unlocked with K {with_k:?}; after a 1024-op batch {after_batch:?}; after 1 MiB seal+open {after_mib:?}; after a 2 MiB seal {after_2mib:?}; after 20 more 1 MiB seals {after_20:?}; after the largest seal+open a client sends ({largest} B) {after_largest:?}; after the largest keyed hash a client allows ({largest_hash} B) {after_hash:?}; idle 1.5 s later {idle:?}; VmLck {} KiB; {threads} threads",
+                locked_kib(real.pid())
+            );
         }
-        let after_20 = rss_kib(real.pid());
-        let threads = std::fs::read_dir(format!("/proc/{}/task", real.pid()))
-            .map(|d| d.count())
-            .unwrap_or(0);
-        println!(
-            "- {label}: idle locked {:?}; unlocked with K {:?}; after a 1024-op batch {:?}; after 1 MiB seal+open {:?}; after a 2 MiB seal {:?}; after 20 more 1 MiB seals {:?}; {threads} threads",
-            idle_locked, with_k, after_batch, after_mib, after_2mib, after_20
-        );
     }
 
     // (f) A cold `atem memory search` touches no agent: the local FTS query alone.
@@ -3005,41 +3074,114 @@ fn perf_z_pull_page_client_costs() {
     );
 }
 
-/// The agent's memory by tokio worker count: what a current-thread agent
-/// would save (TOKIO_WORKER_THREADS only sizes the multi-thread runtime).
+/// F5: the agent serves every connection on its one thread. What a
+/// batch-1 seal (100 B) on one connection waits while another connection
+/// sends the largest seals back to back (frames or JSON lines), or stalls
+/// (a frame and a line half sent, a stream of requests whose replies it
+/// never reads). Real agent, mlockall on, production clients.
 #[test]
 #[ignore]
-fn perf_5b_agent_memory_by_worker_threads() {
-    println!("\n### 5b. Locked agent at rest by worker threads (VmRSS/VmHWM KiB, threads)");
-    for workers in ["16 (default here)", "2", "1"] {
-        for (label, memlock) in [("mlockall on", None), ("no mlockall", Some(8u64 << 20))] {
-            let dir = short_dir();
-            let home = dir.path().join("h");
-            let run = dir.path().join("r");
-            std::fs::create_dir_all(&home).unwrap();
-            private_dir(&run);
-            let paths = CredPaths::in_dir(&home.join(".config").join("atem"));
-            let count = workers.split(' ').next().unwrap();
-            let extra: Vec<(&str, &str)> = if count == "16" {
-                vec![]
-            } else {
-                vec![("TOKIO_WORKER_THREADS", count)]
-            };
-            let mut child =
-                spawn_agent_with(&home, &run, &dir.path().join("a.log"), memlock, &extra);
-            let client =
-                CredAgentClient::for_paths(&paths, Some(run.clone().into_os_string()), None);
-            while client.status().is_err() {
-                std::thread::sleep(Duration::from_millis(1));
+fn perf_5b_a_request_while_another_connection_is_busy_or_stalled() {
+    use std::io::{BufRead, Write};
+    use std::sync::atomic::AtomicBool;
+    println!(
+        "\n### 5b. A batch-1 seal (100 B) while another connection is busy or stalled (real agent, mlockall on; µs)"
+    );
+    println!("| the other connection | p50 | p90 | p99 | max | the other's request, median ms |");
+    println!("|---|---|---|---|---|---|");
+    let real = RealAgent::start(EncryptionMode::On, None);
+    let plain = text(100, 1).into_bytes();
+    let largest = text(largest_sealed_field("v", "content"), 2).into_bytes();
+    let probe = || {
+        let client = real.production();
+        let seal = || {
+            client
+                .crypt(ASTATION_ID, vec![CryptOp::seal("m", "content", &plain)])
+                .unwrap();
+        };
+        seal();
+        let mut samples: Vec<f64> = (0..400)
+            .map(|_| {
+                std::thread::sleep(Duration::from_micros(2500));
+                let t = Instant::now();
+                seal();
+                us(t.elapsed())
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+        samples
+    };
+    let row = |label: &str, samples: &[f64], other: Option<Duration>| {
+        println!(
+            "| {label} | {:.0} | {:.0} | {:.0} | {:.0} | {} |",
+            quantile(samples, 0.5),
+            quantile(samples, 0.9),
+            quantile(samples, 0.99),
+            samples[samples.len() - 1],
+            other.map_or("-".to_string(), |d| format!("{:.2}", ms(d)))
+        );
+    };
+    row("none", &probe(), None);
+    for (label, framed) in [
+        ("sends the largest seal back to back, frames", true),
+        ("sends the largest seal back to back, JSON lines", false),
+    ] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let busy = if framed {
+            real.production()
+        } else {
+            real.reuse()
+        };
+        let (field, stopping) = (largest.clone(), stop.clone());
+        let other = std::thread::spawn(move || {
+            let mut times = Vec::new();
+            while !stopping.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                busy.crypt(ASTATION_ID, vec![CryptOp::seal("v", "content", &field)])
+                    .unwrap();
+                times.push(t.elapsed());
             }
-            std::thread::sleep(Duration::from_millis(50));
-            let rss = rss_kib(child.id());
-            let threads = std::fs::read_dir(format!("/proc/{}/task", child.id()))
-                .map(|d| d.count())
-                .unwrap_or(0);
-            println!("- workers {workers}, {label}: {:?}, {threads} threads", rss);
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+            times
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let samples = probe();
+        stop.store(true, Ordering::Relaxed);
+        row(label, &samples, Some(median(other.join().unwrap())));
     }
+    // Stalled: a frame half sent (after a status that agreed to frames), a
+    // line half sent, and requests whose replies are never read, written
+    // until the agent stops reading them.
+    let socket = real.paths.agent_sock(Some(real.run.as_path()));
+    let mut framed = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    framed
+        .write_all(encode_request(&Request::Status).unwrap().as_bytes())
+        .unwrap();
+    let mut agreed = String::new();
+    std::io::BufReader::new(&framed).read_line(&mut agreed).unwrap();
+    assert!(agreed.contains("\"frames\":1"), "{agreed}");
+    let frame = crate::memory::agent_frame::crypt_request(
+        ASTATION_ID,
+        &[CryptOp::seal("v", "content", &largest)],
+    )
+    .unwrap();
+    framed.write_all(&frame[..frame.len() / 2]).unwrap();
+    let mut line = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    line.write_all(&vec![b'x'; 1 << 20]).unwrap();
+    let mut deaf = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    deaf.set_write_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let requests = encode_request(&Request::Status).unwrap().repeat(2_000);
+    let mut written = 0;
+    while deaf.write_all(requests.as_bytes()).is_ok() {
+        written += requests.len();
+    }
+    row(
+        &format!(
+            "stalled: a frame and a line half sent, {} KiB of requests whose replies it never reads",
+            written >> 10
+        ),
+        &probe(),
+        None,
+    );
+    drop((framed, line, deaf));
 }

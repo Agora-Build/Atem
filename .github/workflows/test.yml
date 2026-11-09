@@ -38,7 +38,36 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Run tests (release build, as the release workflow does)
+        if: runner.os != 'Linux'
         run: cargo test --release --target ${{ matrix.target }} --no-fail-fast
+
+      # Linux: the cred agent locks its memory only when RLIMIT_MEMLOCK is
+      # unlimited or at least 512 MiB (runners default to 8 MiB), so raise it
+      # for this shell and everything it starts, then run the tests with the
+      # real mlockall path: ATEM_TEST_REQUIRE_MLOCK makes the lock test fail
+      # instead of skipping if the limit didn't take, and its rerun with
+      # --nocapture shows in the log that it ran.
+      - name: Run tests (release build, memory locking allowed)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          echo "RLIMIT_MEMLOCK: $(ulimit -l) (soft), $(ulimit -H -l) (hard)"
+          if [ "$(ulimit -l)" != unlimited ] || [ "$(ulimit -H -l)" != unlimited ]; then
+            echo "::error::RLIMIT_MEMLOCK was not raised for this shell"
+            exit 1
+          fi
+          export ATEM_TEST_REQUIRE_MLOCK=1
+          status=0
+          cargo test --release --target ${{ matrix.target }} --no-fail-fast || status=$?
+          cargo test --release --target ${{ matrix.target }} --bin atem -- --nocapture --exact \
+            memory::agent_socket::tests::a_locked_agent_reads_in_only_the_pages_it_touches \
+            | tee lock-test.log || status=1
+          if ! grep -q 'a_locked_agent_reads_in_only_the_pages_it_touches: ran' lock-test.log; then
+            echo "::error::the memory lock test did not run"
+            status=1
+          fi
+          exit $status
 
       # Every test binary with debug-only `#[ignore]` tests (they need the
       # test hooks in src/runtime/test_hooks.rs and the r9 host clock, which

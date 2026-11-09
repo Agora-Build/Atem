@@ -95,8 +95,23 @@ jobs:
           fi
 
       - name: Run tests
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
         run: cargo test --release --target ${{ matrix.target }}
+
+      # Linux: with RLIMIT_MEMLOCK raised, so the cred agent's real mlockall
+      # path runs; ATEM_TEST_REQUIRE_MLOCK fails the lock test instead of
+      # skipping it (see test.yml).
+      - name: Run tests (memory locking allowed)
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          echo "RLIMIT_MEMLOCK: $(ulimit -l) (soft), $(ulimit -H -l) (hard)"
+          if [ "$(ulimit -l)" != unlimited ] || [ "$(ulimit -H -l)" != unlimited ]; then
+            echo "::error::RLIMIT_MEMLOCK was not raised for this shell"
+            exit 1
+          fi
+          ATEM_TEST_REQUIRE_MLOCK=1 cargo test --release --target ${{ matrix.target }}
 
       # The shared session fixtures need the debug-only test hooks (fixture
       # clock, PTY faults; src/runtime/test_hooks.rs): the release run above
