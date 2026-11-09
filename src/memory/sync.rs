@@ -3526,6 +3526,128 @@ mod tests {
         }
     }
 
+    /// v0.8.3's `knowledge.db` schema, verbatim (`git show
+    /// v0.8.3:src/memory/store.rs`, `SCHEMA` then `FTS_SCHEMA`; v0.8.3
+    /// applied no other migration to a database it created).
+    const V0_8_3_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY, scope TEXT NOT NULL, project TEXT NOT NULL, machine TEXT NOT NULL,
+  content TEXT NOT NULL, content_hash TEXT NOT NULL, confidence TEXT NOT NULL,
+  source_agent TEXT NOT NULL, source_machine TEXT NOT NULL, created_at INTEGER NOT NULL,
+  deleted_at INTEGER, valid_at INTEGER, invalid_at INTEGER, superseded_by TEXT,
+  seq INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS skills (
+  scope TEXT NOT NULL, project TEXT NOT NULL, name TEXT NOT NULL,
+  version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL,
+  PRIMARY KEY (scope, project, name));
+CREATE TABLE IF NOT EXISTS pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS harvest_map (
+  origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS replacements (new_id TEXT NOT NULL, old_id TEXT NOT NULL, PRIMARY KEY (new_id, old_id));
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  content, content='memories', content_rowid='rowid', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+";
+
+    /// Every v0.8.4 user upgrades a `knowledge.db` v0.8.3 wrote: its queue
+    /// (a memory add, a replace's add and invalidation, a skill push, a
+    /// delete), in v0.8.3's exact schema and payloads, opens with the new
+    /// columns, every op readable in its order, opens again unchanged, and
+    /// one sync sends and acks all of it.
+    #[tokio::test]
+    async fn a_v0_8_3_queue_upgrades_in_place_and_syncs() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("knowledge.db");
+        let (alpha, new, old) = (content_hash("alpha fact"), content_hash("port 9000"), content_hash("port 8765"));
+        let skill_md = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"# deploy steps");
+        let deploy_hash = skill_v1("deploy", "# deploy steps", "m1").content_hash;
+        // As v0.8.3 wrote them (`PendingOp`, `Memory` and `Skill` serde are
+        // unchanged since; literal here so a later change can't follow).
+        let payloads = [
+            format!(r#"{{"op":"add_memory","memory":{{"id":"mem_alpha","scope":"global","project":"","machine":"","content":"alpha fact","content_hash":"{alpha}","confidence":"high","source_agent":"cli","source_machine":"m1","created_at":1,"valid_at":null,"invalid_at":null,"superseded_by":null,"seq":0}}}}"#),
+            format!(r#"{{"op":"add_memory","memory":{{"id":"mem_new","scope":"global","project":"","machine":"","content":"port 9000","content_hash":"{new}","confidence":"high","source_agent":"cli","source_machine":"m1","created_at":2,"valid_at":null,"invalid_at":null,"superseded_by":null,"seq":0}}}}"#),
+            r#"{"op":"invalidate_memory","id":"mem_old","invalid_at":1790000000,"superseded_by":"mem_new"}"#.to_string(),
+            format!(r#"{{"op":"push_skill","skill":{{"scope":"global","project":"","name":"deploy","version":1,"files":{{"SKILL.md":"{skill_md}"}},"content_hash":"{deploy_hash}","source_agent":"cli","source_machine":"m1","created_at":1,"deleted":false,"seq":0}},"base_version":0}}"#),
+            r#"{"op":"delete_memory","id":"mem_gone"}"#.to_string(),
+        ];
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute_batch(V0_8_3_SCHEMA).unwrap();
+            let row = "INSERT INTO memories (id, scope, project, machine, content, content_hash, confidence, source_agent, source_machine, created_at, deleted_at, valid_at, invalid_at, superseded_by, seq)
+                       VALUES (?1, 'global', '', '', ?2, ?3, 'high', 'cli', 'm1', 1, ?4, NULL, ?5, ?6, ?7)";
+            for (id, content, hash, deleted_at, invalid_at, superseded_by, seq) in [
+                ("mem_old", "port 8765", old.as_str(), None, Some(1_790_000_000i64), Some("mem_new"), 1),
+                ("mem_gone", "", "", Some(5i64), None, None, 2),
+                ("mem_alpha", "alpha fact", alpha.as_str(), None, None, None, 0),
+                ("mem_new", "port 9000", new.as_str(), None, None, None, 0),
+            ] {
+                c.execute(row, rusqlite::params![id, content, hash, deleted_at, invalid_at, superseded_by, seq]).unwrap();
+            }
+            let skill = serde_json::to_string(&skill_v1("deploy", "# deploy steps", "m1")).unwrap();
+            c.execute("INSERT INTO skills (scope, project, name, version, deleted, data) VALUES ('global', '', 'deploy', 1, 0, ?1)", [skill]).unwrap();
+            for payload in &payloads {
+                c.execute("INSERT INTO pending_ops (payload) VALUES (?1)", [payload]).unwrap();
+            }
+        }
+        let want: Vec<PendingOp> = payloads.iter().map(|p| serde_json::from_str(p).unwrap()).collect();
+        assert!(matches!(&want[3], PendingOp::PushSkill { skill, base_version: 0 } if skill.files["SKILL.md"] == b"# deploy steps"));
+        let columns = |s: &Store| -> Vec<String> {
+            let mut stmt = s.test_conn().prepare("PRAGMA table_info(pending_ops)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
+        };
+        let opened = |s: &Store| {
+            assert_eq!(columns(s), ["n", "payload", "refused_for_now", "refused_since", "refused_run", "refused_state"]);
+            let queued = s.pending().unwrap();
+            assert_eq!(queued.iter().map(|(_, op)| op.clone()).collect::<Vec<_>>(), want);
+            assert!(queued.windows(2).all(|w| w[0].0 < w[1].0));
+            assert!(queued.iter().all(|(n, _)| s.refused_for_now(*n).unwrap() == RefusedRun::default()));
+            assert!(s.held_skills().unwrap().is_empty());
+            queued
+        };
+        let s = Store::open(&db).unwrap();
+        let queued = opened(&s);
+        drop(s);
+        // Opened again: nothing changes.
+        let s = Store::open(&db).unwrap();
+        assert_eq!(opened(&s), queued);
+        assert_eq!(s.search_memories(&crate::memory::store::SearchQuery { text: "alpha".into(), scope: None, project: None, history: false, limit: 10 }).unwrap().len(), 1);
+
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        {
+            let mut r = relay.lock().unwrap();
+            r.put(valid("mem_old", "port 8765"));
+            r.put(valid("mem_gone", "gone"));
+        }
+        let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error && out.pushed == 5, "{:?}", out.notes);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        let posted: Vec<usize> = posted_ops(&log).iter().map(Vec::len).collect();
+        assert_eq!(posted, vec![4, 1]);
+        let r = relay.lock().unwrap();
+        assert!(r.rows.contains_key("mem_alpha") && r.rows.contains_key("mem_new"));
+        assert_eq!((r.rows["mem_old"].invalid_at, r.rows["mem_old"].superseded_by.as_deref()), (Some(1_790_000_000), Some("mem_new")));
+        assert_eq!(r.latest_skill("deploy").unwrap().files["SKILL.md"], b"# deploy steps");
+        drop(r);
+        drop(s);
+        assert_eq!(opened_count(&db), 0);
+    }
+
+    fn opened_count(db: &Path) -> usize {
+        Store::open(db).unwrap().pending_count().unwrap()
+    }
+
     pub(super) fn skill_v1(name: &str, body: &str, machine: &str) -> Skill {
         let mut files = BTreeMap::new();
         files.insert("SKILL.md".to_string(), body.as_bytes().to_vec());
