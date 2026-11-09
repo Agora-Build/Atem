@@ -132,8 +132,16 @@ impl Box_ {
         self.mark("carry.json", &json!({ "entries": entries }).to_string());
     }
 
+    /// Moves the host clock the runtime reads (`ATEM_TEST_HOST_CLOCK`). The
+    /// file is replaced atomically: the runtime reads it on every pass, and
+    /// a read between `write`'s truncate and its data is no clock at all, so
+    /// the hook answers with the real one (another boot, another wall time):
+    /// the wait's accounting then loses the step just made, and the test
+    /// below timed out (about 1 run in 150 under load).
     fn set_clock(&self, wall: u64, mono: u64, boot: &str) {
-        std::fs::write(&self.clock, format!("{wall} {mono} {boot}")).unwrap();
+        let tmp = self.clock.with_extension("tmp");
+        std::fs::write(&tmp, format!("{wall} {mono} {boot}")).unwrap();
+        std::fs::rename(&tmp, &self.clock).unwrap();
     }
 
     fn log(&self) -> String {

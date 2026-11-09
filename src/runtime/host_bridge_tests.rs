@@ -3038,6 +3038,13 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         let from = peer.seen.len();
         send(peer, &r4, "remote four");
         peer.wait_from(from, accepted(r4.clone())).await;
+        // `accepted` is the receipt's durable acceptance: the paste may not
+        // have reached the agent yet. The tool call asks for permission
+        // inside this turn, so wait until the agent has started it. (Asked
+        // earlier, a slow runner let the request open before the prompt
+        // reached the agent; the prompt, newer than the request, then closed
+        // it with no decision, and the answer below was `stale_target`.)
+        agent_event(&fake, "prompt turn-4 remote four").await;
         ask(
             &fake,
             1,
