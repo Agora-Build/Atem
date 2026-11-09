@@ -838,7 +838,7 @@ async fn a_page_that_fails_to_open_drops_the_page_fetched_meanwhile() {
         !log.lock()
             .unwrap()
             .iter()
-            .any(|(_, p, _)| p.starts_with("/api/skills/v2?"))
+            .any(|(_, p, _)| p.starts_with("/api/skills?"))
     );
 
     // The next sync starts from the committed cursor.
@@ -2413,7 +2413,7 @@ async fn an_op_whose_project_hash_is_named_after_it_was_sealed_is_sealed_again()
     }
 }
 
-// ─────────────── skill wire v2 (F8) ───────────────
+// ─────────────── skill files on the wire (F8) ───────────────
 
 /// A skill with `SKILL.md` and an empty `.gitkeep`.
 fn skill_with_an_empty_file(machine: &str) -> Skill {
@@ -2502,15 +2502,14 @@ async fn a_skill_with_an_empty_file_travels_as_e1_text_and_comes_back_whole() {
     assert!(
         skill_requests(&log)
             .iter()
-            .all(|(_, p)| p.starts_with("/api/skills/v2"))
+            .all(|(_, p)| p.starts_with("/api/skills"))
     );
 }
 
-/// A sealed skill with an empty file stored before the empty-file rule (by
-/// a client of the legacy routes) is served by Astation's adapter at 963c74b
-/// as `base64`: its `encode_row` finds `""` isn't an envelope, so the whole
-/// row keeps the stored form. The client reads that row as the same bytes
-/// and opens it whole.
+/// A sealed skill with an empty file in a `base64` row (the stored form;
+/// the Station serves such a row as `e1-text`, but a `base64` row of any
+/// bytes is valid): the client reads it as the same bytes and opens it
+/// whole.
 #[tokio::test]
 async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
     let dir = tempfile::tempdir().unwrap();
@@ -2524,13 +2523,13 @@ async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
     let keeping = keeping_relay(relay);
     let (base, _log) = stub_relay(Box::new(move |m, p, body| {
-        if m == "GET" && p.starts_with("/api/skills/v2?") {
+        if m == "GET" && p.starts_with("/api/skills?") {
             let rows = if since(p) < 5 {
                 vec![row.clone()]
             } else {
                 Vec::new()
             };
-            return (200, serde_json::json!({"wire_version": 2, "skills": rows}));
+            return (200, serde_json::json!({"skills": rows}));
         }
         keeping(m, p, body)
     }))
@@ -2549,11 +2548,11 @@ async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
 }
 
 /// A skill push whose outcome is unknown (the connection closed with no
-/// answer) stays queued and goes again by the same v2 route in the same
+/// answer) stays queued and goes again by the same route in the same
 /// format: never in another format.
 ///
 /// Here the Station hadn't applied the first POST. A known pre-existing
-/// bug (not skill wire v2's; the legacy wire had it too) makes the other
+/// bug (not F8's; the legacy wire had it too) makes the other
 /// case unreadable: the Station stores every push as `max(version) + 1`,
 /// but a sealed skill's associated data names the version it was sealed
 /// under (`scope:name:version`). A sealed push the Station had already
@@ -2605,9 +2604,7 @@ async fn an_uncertain_skill_push_goes_again_in_the_same_format() {
     }
     let requests = skill_requests(&log);
     assert!(
-        requests
-            .iter()
-            .all(|(_, p)| p.starts_with("/api/skills/v2")),
+        requests.iter().all(|(_, p)| p.starts_with("/api/skills")),
         "{requests:?}"
     );
     assert_eq!(
@@ -2680,6 +2677,6 @@ async fn a_migration_rewrites_an_empty_skill_file_as_e1_text_and_back_as_base64(
     assert!(
         skill_requests(&log)
             .iter()
-            .all(|(_, p)| p.starts_with("/api/skills/v2"))
+            .all(|(_, p)| p.starts_with("/api/skills"))
     );
 }

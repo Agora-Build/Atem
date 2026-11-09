@@ -1,5 +1,5 @@
-//! Skill wire v2: the client's reader and writer against Astation's
-//! transport vector (pinned at 963c74b), Atem's synthetic vectors
+//! The skill file transport: the client's reader and writer against Astation's
+//! transport vector (pinned at 89a2d50), Atem's synthetic vectors
 //! (`designs/protocol/fixtures/skills-wire/`, see its README) and the fake
 //! Station adapter (`fake_station_skills`).
 use super::*;
@@ -159,14 +159,6 @@ fn plain_files_are_standard_padded_base64() {
     );
 }
 
-#[test]
-fn a_response_must_say_wire_version_2() {
-    assert!(check_version(Some(2)).is_ok());
-    assert!(check_version(Some(1)).is_err());
-    assert!(check_version(Some(3)).is_err());
-    assert!(check_version(None).is_err());
-}
-
 /// Ruling 2: the same sealed skill is the same stored row under both
 /// encodings (what the old wire carried), and reads back as the same
 /// bytes, so its hash, version and sequence don't change.
@@ -248,25 +240,29 @@ fn a_tombstone_has_no_files_in_either_encoding() {
     }
 }
 
-// ─────────────── Astation's vector (963c74b) ───────────────
+// ─────────────── Astation's vector (89a2d50) ───────────────
 
 #[test]
 fn astations_vector_maps_both_representations() {
-    let vector = fixture("skill-file-wire-v2.json");
-    assert_eq!(vector["wire_version"], 2);
-    let (legacy_row, v2_row) = (&vector["legacy_skill"], &vector["v2_skill"]);
-    // The client reads the v2 row as the bytes the legacy row carries…
-    let skill = read(v2_row).unwrap();
-    assert_eq!(&legacy(&skill), legacy_row);
-    assert_eq!(
-        serde_json::from_value::<Skill>(legacy_row.clone()).unwrap(),
-        skill
-    );
-    // …and writes the same skill as the v2 row.
-    assert_eq!(&sealed_skill(&skill).unwrap(), v2_row);
-    // The fake Station agrees both ways.
-    assert_eq!(&stored(v2_row).unwrap(), legacy_row);
-    assert_eq!(&served(legacy_row), v2_row);
+    let vector = fixture("skill-file-wire.json");
+    let cases = vector["cases"].as_array().unwrap();
+    // A sealed row, and one with an empty file.
+    assert_eq!(cases.len(), 2);
+    for case in cases {
+        let (wire, stored_row) = (&case["wire_skill"], &case["stored_skill"]);
+        // The client reads the wire row as the bytes the stored row carries…
+        let skill = read(wire).unwrap();
+        assert_eq!(&legacy(&skill), stored_row);
+        assert_eq!(
+            serde_json::from_value::<Skill>(stored_row.clone()).unwrap(),
+            skill
+        );
+        // …and writes the same skill as the wire row.
+        assert_eq!(&sealed_skill(&skill).unwrap(), wire);
+        // The fake Station agrees both ways.
+        assert_eq!(&stored(wire).unwrap(), stored_row);
+        assert_eq!(&served(stored_row), wire);
+    }
 }
 
 // ─────────────── Atem's vectors ───────────────
@@ -293,17 +289,16 @@ fn atems_envelope_vector_opens_and_maps_both_representations() {
     }
     let path = vector["path"]["envelope"].as_str().unwrap();
     assert_eq!(vector["file"]["field"], format!("file:{path}"));
-    for (legacy_name, v2_name) in [
-        ("legacy_skill", "v2_skill"),
-        // The empty-file rule: pending Astation's next pin (see README).
-        ("empty_file_legacy_skill", "empty_file_v2_skill"),
+    for (stored_name, wire_name) in [
+        ("stored_skill", "wire_skill"),
+        ("empty_file_stored_skill", "empty_file_wire_skill"),
     ] {
-        let (legacy_row, v2_row) = (&vector[legacy_name], &vector[v2_name]);
-        let skill = read(v2_row).unwrap();
-        assert_eq!(&legacy(&skill), legacy_row, "{v2_name}");
-        assert_eq!(&sealed_skill(&skill).unwrap(), v2_row, "{v2_name}");
-        assert_eq!(&stored(v2_row).unwrap(), legacy_row, "{v2_name}");
-        assert_eq!(&served(legacy_row), v2_row, "{v2_name}");
+        let (stored_row, wire) = (&vector[stored_name], &vector[wire_name]);
+        let skill = read(wire).unwrap();
+        assert_eq!(&legacy(&skill), stored_row, "{wire_name}");
+        assert_eq!(&sealed_skill(&skill).unwrap(), wire, "{wire_name}");
+        assert_eq!(&stored(wire).unwrap(), stored_row, "{wire_name}");
+        assert_eq!(&served(stored_row), wire, "{wire_name}");
     }
 }
 
@@ -363,7 +358,7 @@ fn atems_large_file_vector_shows_the_wire_expansion() {
     assert_eq!(
         (v2, old),
         (
-            expect("push_body_v2_bytes"),
+            expect("push_body_e1_text_bytes"),
             expect("push_body_legacy_bytes")
         )
     );
@@ -398,12 +393,16 @@ fn atems_row_vectors_are_read_and_stored_alike() {
                 assert_eq!(read(served_row).unwrap(), skill, "{name}");
             }
             "refuse" => {
+                // The Station's refusal, and the client's of the same kind.
+                let station_error = case["error"].as_str().unwrap();
+                let kind = if station_error == station::UNSUPPORTED {
+                    UNSUPPORTED_ENCODING
+                } else {
+                    INVALID_ENCODING
+                };
                 let error = read(row).expect_err(name);
-                assert!(
-                    format!("{error:#}").contains(INVALID_ENCODING),
-                    "{name}: {error:#}"
-                );
-                assert_eq!(stored(row), Err(station::INVALID), "{name}");
+                assert!(format!("{error:#}").contains(kind), "{name}: {error:#}");
+                assert_eq!(stored(row), Err(station_error), "{name}");
             }
             other => panic!("{name}: unknown expectation {other}"),
         }
@@ -453,16 +452,16 @@ fn print_skill_wire_vectors() {
         (empty_path, Vec::new()),
     ]));
     let envelope = json!({
-        "description": "Atem's synthetic skill wire v2 vector: a real XChaCha20-Poly1305 e1 envelope under a synthetic key and fixed nonces, its legacy base64 form, and a skill row in both representations; the empty-file rows need the empty-file rule (see README).",
+        "description": "Atem's synthetic skill file transport vector: a real XChaCha20-Poly1305 e1 envelope under a synthetic key and fixed nonces, its legacy base64 form, and a skill row as it travels (wire) and as the Station stores it, also with an empty file.",
         "key_hex": hex(&key),
         "kid": kid,
         "record": record,
         "path": {"plain": "SKILL.md", "field": "path", "nonce_hex": hex(&path_nonce), "envelope": path, "legacy_base64": STANDARD.encode(&path)},
         "file": {"plain": plain_file, "field": file_field, "nonce_hex": hex(&file_nonce), "envelope": file, "legacy_base64": STANDARD.encode(&file)},
-        "legacy_skill": legacy(&skill),
-        "v2_skill": sealed_skill(&skill).unwrap(),
-        "empty_file_legacy_skill": legacy(&empty),
-        "empty_file_v2_skill": sealed_skill(&empty).unwrap(),
+        "stored_skill": legacy(&skill),
+        "wire_skill": sealed_skill(&skill).unwrap(),
+        "empty_file_stored_skill": legacy(&empty),
+        "empty_file_wire_skill": sealed_skill(&empty).unwrap(),
     });
     println!(
         "--- atem-envelope.json\n{}",
@@ -478,7 +477,7 @@ fn print_skill_wire_vectors() {
         "path_nonce_hex": hex(&[0x44u8; 24]),
         "file_nonce_hex": hex(&[0x55u8; 24]),
         "file_bytes": 1 << 20,
-        "line": "skill wire v2 carries a sealed file as its e1 text, encoded once.\n",
+        "line": "a sealed skill file travels as its e1 text, encoded only once.\n",
         "skill": legacy(&Skill { name: "large".into(), ..skill_row(BTreeMap::new()) }),
     });
     let (raw, sealed) = large_file(&large);
@@ -493,11 +492,11 @@ fn print_skill_wire_vectors() {
         "file_envelope_sha256": hex(&Sha256::digest(&value)),
         "e1_text_value_bytes": value.len(),
         "legacy_value_bytes": STANDARD.encode(&value).len(),
-        "push_body_v2_bytes": v2,
+        "push_body_e1_text_bytes": v2,
         "push_body_legacy_bytes": old,
         "ratio_e1_text_value": format!("{:.4}", value.len() as f64 / raw.len() as f64),
         "ratio_legacy_value": format!("{:.4}", STANDARD.encode(&value).len() as f64 / raw.len() as f64),
-        "ratio_push_body_v2": format!("{:.4}", v2 as f64 / raw.len() as f64),
+        "ratio_push_body_e1_text": format!("{:.4}", v2 as f64 / raw.len() as f64),
         "ratio_push_body_legacy": format!("{:.4}", old as f64 / raw.len() as f64),
     });
     println!(
@@ -517,7 +516,10 @@ fn print_skill_wire_vectors() {
         let stored = stored(&row).unwrap();
         json!({"name": name, "expect": "accept", "row": row, "stored": stored})
     };
-    let refuse = |name: &str, row: Value| json!({"name": name, "expect": "refuse", "row": row});
+    let refuse = |name: &str, row: Value| {
+        let error = stored(&row).unwrap_err();
+        json!({"name": name, "expect": "refuse", "row": row, "error": error})
+    };
     let (p1, p2, f1) = (shape(1, 40), shape(3, 40), shape(2, 40));
     let cases = vec![
         accept(
@@ -536,11 +538,10 @@ fn print_skill_wire_vectors() {
             base(Some("e1-text"), json!({})),
         ),
         {
-            // How Astation's adapter at 963c74b serves a stored sealed row
-            // with an empty file (`envelope_kid("")` fails, so the whole row
-            // is `base64`); with the empty-file rule it is `e1-text`.
+            // A sealed row with an empty file sent as `base64`: the same
+            // bytes, which the Station serves as `e1-text`.
             let mut case = accept(
-                "base64: a sealed row with an empty file, as 963c74b serves it",
+                "base64: a sealed row with an empty file",
                 base(
                     Some("base64"),
                     json!({p1.clone(): STANDARD.encode(&f1), p2.clone(): ""}),
@@ -630,7 +631,7 @@ fn print_skill_wire_vectors() {
         ),
     ];
     let rows = json!({
-        "description": "Atem's synthetic skill rows: what the client and the Station accept (and store, in the legacy form) or refuse (`invalid skill files encoding`). Envelopes are structural only, not valid ciphertext.",
+        "description": "Atem's synthetic skill rows: what the client and the Station accept (and store, in the legacy form) or refuse (`error`: the Station's 400). Envelopes are structural only, not valid ciphertext.",
         "cases": cases,
     });
     println!(

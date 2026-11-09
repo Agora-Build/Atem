@@ -1,24 +1,27 @@
-//! Test only: the Station's skill transport v2 adapter, as Astation's
-//! `designs/protocol/skill-file-wire-v2.md` (commit 963c74b, Astation
-//! PR #76) defines it, plus the empty-file rule that Astation's next pin
-//! adds: in an `e1-text` row a value is a sealed envelope or `""` (an
-//! empty file, never sealed). Fake relays keep their rows in the stored
-//! form (`Skill`'s own serde: base64 files) and translate at the v2
-//! routes, as the Station does. Written apart from the client's
-//! `skill_wire` (its own envelope check), so each side checks the other.
+//! Test only: the Station's skill file transport, as Astation's
+//! `designs/protocol/skill-file-wire.md` (Astation PR #76 at 89a2d50)
+//! defines it: in an `e1-text` row every path is a sealed envelope and
+//! every value one or `""` (an empty file, never sealed); `base64` rows
+//! carry the bytes. Fake relays keep their rows in the stored form
+//! (`Skill`'s own serde: base64 files) and translate at the skill routes,
+//! as the Station does. Written apart from the client's `skill_wire` (its
+//! own envelope check), so each side checks the other.
 //!
 //! A batch is refused as the Station refuses it, in its order: `ops` not
-//! an array (400 `invalid batch`), more than 16 ops (413), a refused files
-//! encoding (400), a normalized body over 16 MiB (413), then an unknown op
-//! or one missing a field (400 `invalid batch`). Not modelled: the 16 MiB
-//! bound on the body as received (the fake relays get it parsed), and
-//! authentication.
+//! an array (400 `invalid batch`), more than 16 ops (413), a missing,
+//! unknown or non-string files encoding (400 `UNSUPPORTED`), malformed
+//! files (400 `INVALID`), a normalized body over 16 MiB (413), then an
+//! unknown op or one missing a field (400 `invalid batch`). Not modelled:
+//! the 16 MiB bound on the body as received (the fake relays get it
+//! parsed), and authentication.
 
 use crate::memory::model::Skill;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 
-/// The Station's answer (HTTP 400) to a batch with a refused encoding.
+/// The Station's answers (HTTP 400) to a batch whose files encoding is
+/// missing, unknown or not a string, or whose files are malformed.
+pub(crate) const UNSUPPORTED: &str = "unsupported skill files encoding; update Atem";
 pub(crate) const INVALID: &str = "invalid skill files encoding";
 
 /// The Station's bounds on a skills batch (`SKILLS_BATCH_BODY_LIMIT`,
@@ -45,13 +48,14 @@ pub(crate) fn envelope(text: &str) -> bool {
         })
 }
 
-/// A v2 `push.skill` or `rewrite` in its stored form: `files` as base64,
-/// `files_encoding` gone. `Err(INVALID)` refuses the whole batch.
+/// A `push.skill` or `rewrite` in its stored form: `files` as base64,
+/// `files_encoding` gone. `Err` (`UNSUPPORTED` or `INVALID`) refuses the
+/// whole batch.
 pub(crate) fn normalize_files(row: &mut Value) -> Result<(), &'static str> {
     let sealed = match row.get("files_encoding").and_then(Value::as_str) {
         Some("e1-text") => true,
         Some("base64") => false,
-        _ => return Err(INVALID),
+        _ => return Err(UNSUPPORTED),
     };
     let files = row
         .get_mut("files")
@@ -72,7 +76,7 @@ pub(crate) fn normalize_files(row: &mut Value) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Every op of a v2 batch in its stored form; one refusal refuses all.
+/// Every op of a batch in its stored form; one refusal refuses all.
 pub(crate) fn normalize_ops(ops: &mut [Value]) -> Result<(), &'static str> {
     for op in ops {
         match op["op"].as_str() {
@@ -84,7 +88,7 @@ pub(crate) fn normalize_ops(ops: &mut [Value]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A stored row as v2 serves it: `e1-text` when every path is an envelope
+/// A stored row as the Station serves it: `e1-text` when every path is an envelope
 /// and every value one or empty, else `base64` (plain, binary, partly
 /// migrated history).
 pub(crate) fn encode_row(row: &mut Value) {
@@ -111,16 +115,16 @@ pub(crate) fn encode_row(row: &mut Value) {
     }
 }
 
-/// `skill` (stored form) as v2 serves it.
+/// `skill` (stored form) as the Station serves it.
 pub(crate) fn row(skill: &Skill) -> Value {
     let mut row = serde_json::to_value(skill).unwrap();
     encode_row(&mut row);
     row
 }
 
-/// A v2 collection page of stored rows.
+/// A collection page of stored rows.
 pub(crate) fn page<'a>(rows: impl IntoIterator<Item = &'a Skill>) -> Value {
-    json!({"wire_version": 2, "skills": rows.into_iter().map(row).collect::<Vec<_>>()})
+    json!({"skills": rows.into_iter().map(row).collect::<Vec<_>>()})
 }
 
 /// Bytes written, none kept: a serialized size without the copy.
@@ -150,7 +154,7 @@ fn known_op(op: &Value) -> bool {
     }
 }
 
-/// A v2 batch: every op is checked first, in the Station's order (a
+/// A batch: every op is checked first, in the Station's order (a
 /// refusal applies nothing), then `apply` gets each op in its stored form.
 pub(crate) fn batch(body: &Value, mut apply: impl FnMut(&Value) -> Value) -> (u16, Value) {
     let refused = |status: u16, error: &str| (status, json!({"error": error}));
@@ -161,8 +165,8 @@ pub(crate) fn batch(body: &Value, mut apply: impl FnMut(&Value) -> Value) -> (u1
         return refused(413, "too many ops");
     }
     let mut ops = ops.clone();
-    if normalize_ops(&mut ops).is_err() {
-        return refused(400, INVALID);
+    if let Err(error) = normalize_ops(&mut ops) {
+        return refused(400, error);
     }
     // Compact transport must not bypass the stored form's bound.
     let mut normalized = Counted(0);
@@ -174,7 +178,7 @@ pub(crate) fn batch(body: &Value, mut apply: impl FnMut(&Value) -> Value) -> (u1
         return refused(400, "invalid batch");
     }
     let results: Vec<Value> = ops.iter().map(&mut apply).collect();
-    (200, json!({"wire_version": 2, "results": results}))
+    (200, json!({"results": results}))
 }
 
 /// `batch` for a fake relay that can't answer 400: a refusal panics.
@@ -208,6 +212,8 @@ mod tests {
     fn a_batch_is_refused_as_the_station_refuses_it() {
         let valid = push(json!({envelope_of(1, 40): envelope_of(2, 40)}));
         let unsealed = push(json!({envelope_of(1, 40): "plaintext"}));
+        let mut unencoded = valid.clone();
+        unencoded["skill"]["files_encoding"] = json!("guess");
         let huge = push(json!({envelope_of(1, 40): envelope_of(2, 9_800_000)}));
         let cases = [
             (json!({}), 400, "invalid batch"),
@@ -218,6 +224,7 @@ mod tests {
                 "too many ops",
             ),
             (json!({"ops": [valid.clone(), unsealed]}), 400, INVALID),
+            (json!({"ops": [valid.clone(), unencoded]}), 400, UNSUPPORTED),
             // An unknown op is refused only after the encodings passed.
             (
                 json!({"ops": [valid.clone(), {"op": "unknown"}]}),
@@ -249,6 +256,6 @@ mod tests {
             json!({"ok": true})
         });
         assert_eq!(answer.0, 200);
-        assert_eq!(answer.1["wire_version"], 2);
+        assert_eq!(answer.1["results"].as_array().unwrap().len(), MAX_OPS);
     }
 }

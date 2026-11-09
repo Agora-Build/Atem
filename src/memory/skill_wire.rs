@@ -1,7 +1,8 @@
-//! Skill wire v2: a skill row as the Station's `/api/skills/v2` routes carry
-//! it (Astation `designs/protocol/skill-file-wire-v2.md`, Atem #130, F8).
-//! A sealed skill file is already the ASCII text of its `e1.` envelope, so
-//! it travels as that text (`e1-text`), not base64 of it a second time;
+//! The skill file transport: a skill row as the Station's `/api/skills`
+//! routes carry it (Astation `designs/protocol/skill-file-wire.md`,
+//! Astation PR #76 at 89a2d50; Atem #130, F8). A sealed skill file is
+//! already the ASCII text of its `e1.` envelope, so it travels as that
+//! text (`e1-text`, an empty file `""`), not base64 of it a second time;
 //! plain files travel as base64 (`base64`), only while the account's mode
 //! permits plain text. Every row and every `rewrite` says which.
 //!
@@ -18,10 +19,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
-/// The `wire_version` of every successful v2 response.
-pub const WIRE_VERSION: u64 = 2;
-
-/// Why a row's files are refused (the Station's own words for it).
+/// Why a row is refused: its files encoding is missing, unknown or not a
+/// string (the Station's 400 adds "; update Atem"), or its files are
+/// malformed (the Station's own words for both).
+pub const UNSUPPORTED_ENCODING: &str = "unsupported skill files encoding";
 pub const INVALID_ENCODING: &str = "invalid skill files encoding";
 
 /// How a row's `files` values are carried.
@@ -46,8 +47,8 @@ impl FilesEncoding {
         match value {
             Some(Value::String(text)) if text == "e1-text" => Ok(Self::E1Text),
             Some(Value::String(text)) if text == "base64" => Ok(Self::Base64),
-            Some(_) => bail!("{INVALID_ENCODING}: unknown files_encoding"),
-            None => bail!("{INVALID_ENCODING}: no files_encoding"),
+            Some(_) => bail!("{UNSUPPORTED_ENCODING}: unknown files_encoding"),
+            None => bail!("{UNSUPPORTED_ENCODING}: no files_encoding"),
         }
     }
 }
@@ -100,7 +101,7 @@ pub fn plain_files(files: &BTreeMap<String, Vec<u8>>) -> Value {
     )
 }
 
-/// `skill` as a v2 row with `files` (`sealed_files` or `plain_files`).
+/// `skill` as a row with `files` (`sealed_files` or `plain_files`).
 fn row(skill: &Skill, encoding: FilesEncoding, files: Value) -> Value {
     // Every field named: a field added to `Skill` must be added here too.
     let Skill {
@@ -148,7 +149,7 @@ pub fn plain_skill(skill: &Skill) -> Value {
     row(skill, FilesEncoding::Base64, plain_files(&skill.files))
 }
 
-/// The files of a v2 row or `rewrite` as bytes: an `e1-text` value is the
+/// The files of a row or `rewrite` as bytes: an `e1-text` value is the
 /// envelope's own text (`""` an empty file); a `base64` value is decoded.
 /// Missing or unknown encodings, values that aren't strings, malformed
 /// envelopes and plain entries in an `e1-text` row are refused.
@@ -179,7 +180,7 @@ pub fn files_from_wire(
         .collect()
 }
 
-/// A skill row as a v2 response carries it (`skills[]`, `skill`).
+/// A skill row as a response carries it (`skills[]`, `skill`).
 #[derive(Debug, Deserialize)]
 pub struct WireSkill {
     scope: Scope,
@@ -232,15 +233,6 @@ impl WireSkill {
             deleted,
             seq,
         })
-    }
-}
-
-/// A successful v2 response must say `wire_version: 2`.
-pub fn check_version(version: Option<u64>) -> Result<()> {
-    match version {
-        Some(WIRE_VERSION) => Ok(()),
-        Some(other) => bail!("skill wire version {other}, where 2 was expected"),
-        None => bail!("not a skill wire v2 response (no wire_version)"),
     }
 }
 

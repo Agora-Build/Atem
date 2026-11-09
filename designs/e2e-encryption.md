@@ -117,7 +117,7 @@ only while the signed mode is `on`; see "Injection into agents by mode" and
 | Memory encryption | Optional, off by default, switched in Astation. Mode changes are signed by Astation; atem never moves toward plain text without one. Turning off goes through `disabling`. **Planned (owner decision 2026-11-08), not implemented:** the only mode: no `off`, no `disabling`; new accounts start on, accounts still off are migrated, the relay refuses plain text, Astation's switch becomes a status display. |
 | Injection into agents | **Planned (owner decision 2026-11-08), not implemented:** a transition measure until `off` is removed: relay-synced memory facts and skills reach agents (managed blocks, skill directories) only while the signed mode is `on`. Sync, search and list work in every mode. |
 | Rollback and forgery of memory and skills | **Planned (owner decision 2026-11-08), not implemented:** signed writes (build step 3) and an anti-rollback check on pulled rows, together. |
-| Performance | Owner decision 2026-11-08: a requirement with budgets, set from measurements; a change that breaks one doesn't ship. Built: the fixes F1, F2, F3, F6, F7 and F8 (F8 released together with the Station's skill wire v2 adapter, Astation PR #76); F4 and F5 are not approved. See "Performance". |
+| Performance | Owner decision 2026-11-08: a requirement with budgets, set from measurements; a change that breaks one doesn't ship. Built: the fixes F1, F2, F3, F6, F7 and F8 (F8 released together with the Station's skill file transport, Astation PR #76); F4 and F5 are not approved. See "Performance". |
 | Credentials encryption | Always on. |
 | Offline credential reads | Grants per device. A device decrypts on its own while Astation is offline. |
 | Credential grant granularity | Per project scope. `global` is a scope. |
@@ -1061,29 +1061,29 @@ doesn't cover it; it is covered by encryption becoming the only mode.
   under `K` with a random 24-byte nonce. As built, the associated data is
   `"<record id>\n<field>"` (`account_keys::field_aad`), so the relay can't
   move a ciphertext to another record or field.
-- **Skill files on the wire (skill wire v2, F8; Atem #130).** Atem calls only
-  the Station's `/api/skills/v2` routes. The contract is Astation's
-  `designs/protocol/skill-file-wire-v2.md` in draft Astation PR #76, pinned at
-  963c74b; the vectors are in `designs/protocol/fixtures/skills-wire/`.
+- **Skill files on the wire (F8; Atem #130).** The contract is Astation's
+  `designs/protocol/skill-file-wire.md` in Astation PR #76, pinned at
+  89a2d50; the vectors are in `designs/protocol/fixtures/skills-wire/`. It
+  uses the existing skill routes. Owner decision: the Station and Atem ship
+  together, with no `wire_version`, no compatibility path, probing or
+  fallback.
   - A sealed file travels as its `e1.` text, a JSON string encoded once
     (`files_encoding: "e1-text"`), so a large file is about 1.33× its size.
     A sealed path is its `e1.` text too.
-  - An empty file is `""`: it is never sealed, so it takes no `Crypt` op and
-    has no associated data. This empty-file rule is pending Astation's next
-    pin.
+  - An empty file is exactly `""`: it is never sealed, so it takes no
+    `Crypt` op and has no associated data, and its filename is still sealed.
   - Plain files travel as base64 (`"base64"`), only while the account's mode
     permits plain text.
-  - Every row, push and `rewrite` names its encoding. Atem and the Station
-    both refuse a missing or unknown encoding, a malformed envelope, and plain
-    entries in an `e1-text` row. A success body must say `wire_version: 2`.
+  - Every row, push and `rewrite` names its encoding. A missing, unknown or
+    non-string encoding gets 400 `unsupported skill files encoding; update
+    Atem`. A malformed envelope, or plain entries in an `e1-text` row, get 400
+    `invalid skill files encoding`. Atem refuses the same rows in a pulled
+    page and never sends one.
   - Only the HTTP representation changed. The Station still stores base64 of
     the same bytes, so the ciphertext, its associated data, the hashes,
-    versions, `seq` and the `Crypt` requests are unchanged, and the legacy
-    routes serve the same rows to older clients.
-  - A Station without the v2 routes gets "This Station doesn't support skill
-    wire v2; update it."; skills stay queued, with no fallback. A POST whose
-    outcome is unknown is never sent again in another format, and there is
-    never a plain-text fallback.
+    versions, `seq` and the `Crypt` requests are unchanged.
+  - A POST whose outcome is unknown is never sent again in another format,
+    and there is never a plain-text fallback.
   - See `designs/atem-memory.md` "Relay API".
 - **Not implemented:** binding the scope, project HMAC and version or vault
   entry number into the associated data (build step 3), so a ciphertext
@@ -1437,7 +1437,7 @@ that nobody has a reason to want plain text back. The budgets below were
 proposed from measurements of the encrypted path on `main` (b56dcd4); a budget
 moved since then only by an owner decision, cited in its row. **Built:** the
 fixes F1, F2, F3, F6, F7 and F8 (below; F8, issue #130, is released together
-with the Station's skill wire v2 adapter, draft Astation PR #76, after a joint
+with the Station's skill file transport, Astation PR #76, after a joint
 dev test). **Not approved:** F4 and F5. "Today" is the production path as built with
 those fixes, measured on 2026-11-08 (each number names its source: the task
 that built a fix, or the final run after the last one).
@@ -1473,7 +1473,7 @@ shared CI host). They measure:
 7. **A skill file on the wire** (`perf_7`): one skill with a 1 KiB, 64 KiB
    or 1 MiB file pushed and pulled through the client, encryption off and on:
    the HTTP bodies, the file's value, the times, and the client's own cost of
-   each representation (v2 against the legacy base64 of the `e1.` text).
+   each representation (`e1-text` against the legacy base64 of the `e1.` text).
 
 Loopback numbers: a real relay's round trip adds the same latency per HTTP
 request with or without encryption, so the encryption share there is smaller,
@@ -1499,7 +1499,7 @@ checks).
 | Migration | off to on including the read-back at least 10,000 records/s; at most 1 `Crypt` request per 64-record rewrite batch (the statuses before POSTs of rows prepared by an earlier request are counted apart: owner decision 2026-11-08, "allow lock checks", Task 4 measurements) | about 21,900 records/s (6,010 records in 274 ms; 14,800 records/s for 2,010). `Crypt` requests for 1,000 / 5,000 facts and 10 skills: rewrite 6 / 16 for 17 / 80 POSTs, vault 2, read-back 9 / 29; and 15 / 78 statuses before POSTs prepared ahead. Against a 20 ms relay the migration adds 1.3% / 2.9% (no budget row) (final run, `perf_4`) | met |
 | Cold command | first agent contact at most 50 ms after spawn; agent startup at most 25 ms; unlock at most 10 ms on the agent side (Touch ID and the network excluded); `atem memory search` and the apply never touch the agent | 15.6 to 16 ms; 12.6 to 13.3 ms (about 10 ms of it `mlockall`; 2.7 ms without); about 5 ms; 0 (Task 5; final run) | met |
 | Agent memory | at most 16 MiB RSS at rest unlocked without mlock and at most 48 MiB peak; at most 48 MiB when `mlockall` applies | 13.6 MiB at rest unlocked and 37.6 MiB peak without mlock; 71.1 MiB at rest and 105.5 MiB peak with it (final run, `perf_5`) | the locked case misses; its fix (F5) is not approved |
-| Wire size | at most 52 B + 1.34x per field; skill files at most 1.4x raw on the wire | memory and vault met. Skill files with F8 (`perf_7`): a sealed file's value is 1.333x at 64 KiB and 1 MiB and 1.398x at 1 KiB (was 1.78x and 1.87x); a 1 MiB push or pull body is 1.334x (was 1.778x). A 1 KiB skill's push body is 1.81x (was 2.26x), mostly the fixed part (sealed path, hashes, names, JSON) | met with F8 (released together with the Station's v2 adapter, #130) |
+| Wire size | at most 52 B + 1.34x per field; skill files at most 1.4x raw on the wire | memory and vault met. Skill files with F8 (`perf_7`): a sealed file's value is 1.333x at 64 KiB and 1 MiB and 1.398x at 1 KiB (was 1.78x and 1.87x); a 1 MiB push or pull body is 1.334x (was 1.778x). A 1 KiB skill's push body is 1.81x (was 2.26x), mostly the fixed part (sealed path, hashes, names, JSON) | met with F8 (released together with the Station's skill file transport, #130) |
 
 **The push and migration bound, as built** (owner decision 2026-11-08: a
 small overhead above "1 per 1,024 ops plus one for the first chunk" is
@@ -1592,7 +1592,7 @@ and after each, in the task that built it):
 | F5 | A lighter agent: a current-thread runtime (or 1 to 2 workers), a cap on the largest request, optionally `malloc_trim` after a large one | not approved | (estimate) locked RSS 72 to about 40 MiB; peak without the lock about 20 MiB |
 | F6 | The local store: one transaction per push batch's results and per pulled page (rows and cursor together), each chunk read from the queue after the last op sent | built | 1,000-fact push and pull 5.64 to 0.25 s (0.30 s encrypted); 5,000 facts 30.5 to 1.34 s (1.54 s) (Task 1) |
 | F7 | Faster cold autostart: poll a started agent after short pauses that grow to the old 100 ms (`START_POLLS_MS`), within the same 10 s | built | first contact 101 to 16 ms (Task 5) |
-| F8 | Skill files encoded once (skill wire v2, owner decision on #130: the `/api/skills/v2` routes only). A sealed file travels as its `e1.` text in a JSON string (`files_encoding: "e1-text"`; an empty file `""`); plain files travel as `base64`, only while the mode permits plain text. Same ciphertext, associated data, hashes and `Crypt` requests | built; released together with the Station's adapter (draft Astation PR #76) after a joint dev test | Sealed file on the wire 1.78x to 1.33x raw (1 MiB push body 1,864,621 to 1,398,592 B). The client's own cost per 1 MiB file: push body built in 2.0 to 1.6 ms, pulled row parsed in 1.2 to 0.9 ms (at 1 KiB, 4.3 to 6.4 µs and 2.2 to 2.4 µs). Loopback against the fake Station: a 1 MiB push takes 12.3 to 15.1 ms and a pull 11.8 to 12.6 ms (64 KiB +0.05 ms), because the fake relay now also does the Station adapter's conversion to and from its stored base64 (`perf_7`, medians of three A/B rounds) |
+| F8 | Skill files encoded once (the skill file transport, Astation PR #76 at 89a2d50; owner decision on #130: one set of routes, no compatibility path). A sealed file travels as its `e1.` text in a JSON string (`files_encoding: "e1-text"`; an empty file `""`); plain files travel as `base64`, only while the mode permits plain text. Same ciphertext, associated data, hashes and `Crypt` requests | built; released together with the Station's change (Astation PR #76) after a joint dev test | Sealed file on the wire 1.78x to 1.33x raw (1 MiB push body 1,864,621 to 1,398,592 B). The client's own cost per 1 MiB file: push body built in 2.0 to 1.6 ms, pulled row parsed in 1.2 to 0.9 ms (at 1 KiB, 4.3 to 6.4 µs and 2.2 to 2.4 µs). Loopback against the fake Station: a 1 MiB push takes 12.3 to 15.1 ms and a pull 11.8 to 12.6 ms (64 KiB +0.05 ms), because the fake relay now also does the Station adapter's conversion to and from its stored base64 (`perf_7`, medians of three A/B rounds) |
 
 **Fixed (#132): a pulled fact with an unknown project no longer stops Memory
 sync.** A project-scoped fact or skill whose `h1.` project hash this device has
