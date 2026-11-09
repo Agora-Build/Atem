@@ -686,6 +686,13 @@ async fn serve_with(
         };
         let stream = match accepted {
             Ok((stream, _)) => stream,
+            // A client that left before it was accepted (macOS can say so
+            // here): nothing to serve, nothing to wait for.
+            Err(error)
+                if peer_gone(&error) || error.kind() == std::io::ErrorKind::ConnectionAborted =>
+            {
+                continue;
+            }
             Err(error) => {
                 // e.g. out of file descriptors: keep serving once there is room.
                 eprintln!("cred agent: accept failed: {error}");
@@ -745,7 +752,15 @@ async fn serve_connection(
     frames: bool,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let peer = stream.peer_cred()?.uid();
+    let peer = match stream.peer_cred() {
+        Ok(cred) => cred.uid(),
+        // The client left before it was served (a liveness check such as
+        // `is_running`): nothing to answer and nothing to report. macOS says
+        // so here (its peer pid needs a connected peer: ENOTCONN), Linux
+        // only at the first read.
+        Err(error) if peer_gone(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     if peer != allowed_uid {
         bail!("refused a connection from uid {peer}");
     }
@@ -830,6 +845,29 @@ struct Incoming {
     head: Head,
     body: SecretBytes,
     filled: usize,
+}
+
+/// Whether `error` says the other end of a connection has gone (closed or
+/// reset). macOS reports a peer that closed as ENOTCONN or ECONNRESET in
+/// places where Linux reports EOF.
+fn peer_gone(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotConnected | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Whether `error`, from connecting to an agent's socket path, proves that
+/// no agent listens there: the path is missing, or nothing listens on it
+/// (refused). Nothing else does: a reset or not-connected socket (how macOS
+/// reports a listener that is closing, or a peer that closed), a permission
+/// error or anything unexpected may hide a running, unlocked agent, so it is
+/// an error, never "not running".
+fn proves_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 /// What an agent connection has read and not yet handled (`pending`, or the
@@ -1078,6 +1116,8 @@ pub(crate) struct Traffic {
     requests: std::sync::atomic::AtomicUsize,
     probes: std::sync::atomic::AtomicUsize,
     frames: std::sync::atomic::AtomicUsize,
+    /// Looks for an agent this client started (`connect`).
+    polls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1100,6 +1140,10 @@ impl Traffic {
 
     pub(crate) fn frames(&self) -> usize {
         self.frames.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn polls(&self) -> usize {
+        self.polls.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1609,15 +1653,36 @@ impl CredAgentClient {
     }
 
     /// Connects to the recorded socket, else this session's, and refuses a
-    /// listener that isn't `expected_uid`.
+    /// listener that isn't `expected_uid`. When neither answers, the error
+    /// proves no agent (`proves_absent`) only if both paths prove it; one
+    /// that doesn't names its path.
     fn dial(&self) -> std::io::Result<Result<UnixStream>> {
+        let unproven_at = |socket: &Path, error: std::io::Error| {
+            if proves_absent(&error) {
+                error
+            } else {
+                std::io::Error::new(error.kind(), format!("{}: {error}", socket.display()))
+            }
+        };
+        let mut unproven = None;
         if let Some(recorded) = self.record.as_deref().and_then(recorded_socket)
             && recorded != self.socket
-            && let Ok(checked) = self.dial_at(&recorded)
         {
-            return Ok(checked);
+            match self.dial_at(&recorded) {
+                Ok(checked) => return Ok(checked),
+                Err(error) if !proves_absent(&error) => {
+                    unproven = Some(unproven_at(&recorded, error));
+                }
+                Err(_) => {}
+            }
         }
-        self.dial_at(&self.socket)
+        match self.dial_at(&self.socket) {
+            Ok(checked) => Ok(checked),
+            Err(error) => Err(match unproven {
+                Some(unproven) if proves_absent(&error) => unproven,
+                _ => unproven_at(&self.socket, error),
+            }),
+        }
     }
 
     fn dial_at(&self, socket: &Path) -> std::io::Result<Result<UnixStream>> {
@@ -1632,12 +1697,30 @@ impl CredAgentClient {
         Ok(Ok(stream))
     }
 
-    pub fn is_running(&self) -> bool {
-        matches!(self.dial(), Ok(Ok(_)))
+    /// Whether an agent answers on its socket: `Ok(false)` only when that
+    /// is proven (a missing path, or refused: `proves_absent`). A listener
+    /// of another user, or any other error, may hide a running agent:
+    /// `Err`, never "not running". Starts nothing.
+    pub fn probe(&self) -> Result<bool> {
+        match self.dial() {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(other_user)) => Err(other_user),
+            Err(error) if proves_absent(&error) => Ok(false),
+            Err(error) => Err(anyhow!(error).context("could not reach the cred agent")),
+        }
     }
 
-    /// Whether an agent answers: the kept connection is open (when no
-    /// request holds it), else a dial succeeds. Starts nothing.
+    /// Whether an agent answers now (tests; callers use `probe`, which
+    /// tells "not running" from "can't tell").
+    #[cfg(test)]
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.probe(), Ok(true))
+    }
+
+    /// Whether an agent may answer: the kept connection is open (when no
+    /// request holds it), else anything but a proven absence (`probe`), so
+    /// a caller's request reports what is wrong with an agent it can't
+    /// reach instead of taking it for none. Starts nothing.
     #[cfg_attr(test, allow(dead_code))]
     pub fn answers(&self) -> bool {
         if let Ok(mut kept) = self.conn.try_lock() {
@@ -1646,7 +1729,7 @@ impl CredAgentClient {
                 return true;
             }
         }
-        self.is_running()
+        !matches!(self.probe(), Ok(false))
     }
 
     fn connect(&self) -> Result<UnixStream> {
@@ -1675,6 +1758,11 @@ impl CredAgentClient {
                     }
                     std::thread::sleep(start_poll_pause(polls).min(left));
                     polls += 1;
+                    #[cfg(test)]
+                    Traffic::add(&self.traffic.polls);
+                    // Any io error is "not yet" while the agent starts: a
+                    // missing or refused socket, or a reset / not-connected
+                    // one (macOS, a listener coming up).
                     if let Ok(checked) = self.dial() {
                         return checked;
                     }
@@ -1687,10 +1775,22 @@ impl CredAgentClient {
                 }
                 bail!("the cred agent didn't start; see {}", self.log.display())
             }
-            Err(error) => Err(anyhow!(error).context(format!(
+            Err(error) if proves_absent(&error) => Err(anyhow!(error).context(format!(
                 "the cred agent isn't running at {}",
                 self.socket.display()
             ))),
+            // Something answers in a way that proves nothing (a reset or
+            // not-connected socket, a permission error): no agent is started
+            // beside one that may be running. One that holds the key files
+            // is named.
+            Err(error) => {
+                if let Some(lock) = self.lock.as_deref()
+                    && lock_is_held(lock) == Some(true)
+                {
+                    return Err(StuckAgent(stuck_message(lock)).into());
+                }
+                Err(anyhow!(error).context("could not reach the cred agent"))
+            }
         }
     }
 }
@@ -1731,11 +1831,13 @@ impl CredAgentClient {
             .map(|head| head.v)
     }
 
-    /// Waits up to `wait` for the agent to stop answering; true once it has.
+    /// Waits up to `wait` for the agent to be gone; true once that is
+    /// proven (`probe`: its socket is missing or refused). An agent that
+    /// can't be reached for another reason is not gone.
     fn wait_gone(&self, wait: Duration) -> bool {
         let deadline = std::time::Instant::now() + wait;
         loop {
-            if !self.is_running() {
+            if matches!(self.probe(), Ok(false)) {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -1782,7 +1884,11 @@ impl CredAgentClient {
         #[cfg(test)]
         Traffic::add(&self.traffic.requests);
         let answer = conn.round_trip(Outgoing::Line(line)).ok()?;
-        conn.stream.set_read_timeout(Some(REPLY_WAIT)).ok()?;
+        // Back to the reply wait for the requests that follow. macOS refuses
+        // this (EINVAL) once the agent has closed the connection: the answer
+        // still counts, and the next request on the connection fails as it
+        // does on Linux (its error, or a resend of a stateless one).
+        let _ = conn.stream.set_read_timeout(Some(REPLY_WAIT));
         match answer.reply {
             Received::Line(reply) if answer.in_step => {
                 decode_response(std::str::from_utf8(&reply.0).ok()?).ok()
@@ -3065,10 +3171,10 @@ mod tests {
 
     /// Makes `dir` unreadable until dropped (then 0700 again, so the temp
     /// dir can be removed).
-    struct Unreadable(PathBuf);
+    pub(super) struct Unreadable(PathBuf);
 
     impl Unreadable {
-        fn new(dir: &Path) -> Self {
+        pub(super) fn new(dir: &Path) -> Self {
             std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o000))
                 .unwrap();
             Self(dir.to_path_buf())
