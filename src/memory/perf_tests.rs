@@ -237,17 +237,6 @@ fn private_dir(path: &Path) {
 /// `atem cred-agent` with only HOME, XDG_RUNTIME_DIR and PATH set (temp
 /// dirs), optionally with `RLIMIT_MEMLOCK` lowered to `memlock` bytes.
 fn spawn_agent(home: &Path, run: &Path, log: &Path, memlock: Option<u64>) -> std::process::Child {
-    spawn_agent_with(home, run, log, memlock, &[])
-}
-
-/// [`spawn_agent`] with `extra` variables added (e.g. TOKIO_WORKER_THREADS).
-fn spawn_agent_with(
-    home: &Path,
-    run: &Path,
-    log: &Path,
-    memlock: Option<u64>,
-    extra: &[(&str, &str)],
-) -> std::process::Child {
     use std::os::unix::process::CommandExt;
     let log = std::fs::File::create(log).unwrap();
     let mut command = std::process::Command::new(atem_binary());
@@ -257,7 +246,6 @@ fn spawn_agent_with(
         .env("HOME", home)
         .env("XDG_RUNTIME_DIR", run)
         .env("PATH", "/usr/bin:/bin")
-        .envs(extra.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().unwrap())
         .stderr(log);
