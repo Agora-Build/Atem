@@ -2817,13 +2817,16 @@ async fn two_machines_pushing_the_same_skill_keep_both_versions_readable() {
     let out = run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
         .await
         .unwrap();
+    // What is true now: A's v1 is the latest; B's edit goes on top next.
     assert_eq!(
         out.notes,
         vec![format!(
-            "skill deploy: {CONCURRENT}; both versions are kept and v2 is now the latest. See them with `atem skill history deploy`."
+            "skill deploy: {CONCURRENT}; its v1 is the latest for now, and this machine's edit will be pushed on top as v2 at the next sync. Both versions are kept: see them with `atem skill history deploy`."
         )]
     );
     assert!(!out.relay_error && !out.offline);
+    // The conflicted push wasn't acked: not counted as pushed.
+    assert_eq!((out.pushed, out.rebased), (0, 1));
     let queued = b.pending().unwrap();
     assert_eq!(queued.len(), 1);
     match &queued[0].1 {
@@ -2947,9 +2950,11 @@ async fn a_conflict_holds_the_skill_back_and_coalesces_its_pushes() {
     assert_eq!(
         out.notes,
         vec![format!(
-            "skill deploy: {CONCURRENT}; both versions are kept and v2 is now the latest. See them with `atem skill history deploy`."
+            "skill deploy: {CONCURRENT}; its v1 is the latest for now, and this machine's edit will be pushed on top as v2 at the next sync. Both versions are kept: see them with `atem skill history deploy`."
         )]
     );
+    // Seven of chunk 1 and `last` were acked; deploy's two pushes wait as one.
+    assert_eq!((out.pushed, out.rebased), (8, 1));
     // Chunk 1 (8 skills: 8 paths and 8 hashes, then 8 files), chunk 2
     // sealed ahead (2 and 2, then 2); nothing sealed again.
     let (seals, _) = recorder.seals_and_opens();

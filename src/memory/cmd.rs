@@ -171,10 +171,18 @@ fn sync_status_line(out: &SyncOutcome, problem: Option<&PairingProblem>, paired:
         Some(PairingProblem::NotPaired) => not_paired_msg(paired),
         None if out.offline => "Relay unreachable — changes stay queued and sync next time.".to_string(),
         None if out.relay_error => format!(
-            "Sync incomplete — pushed {} change(s), pulled {} update(s); the rest stay queued (see notes).",
-            out.pushed, out.pulled
+            "Sync incomplete — pushed {} change(s), pulled {} update(s){}; the rest stay queued (see notes).",
+            out.pushed, out.pulled, rebased_clause(out)
         ),
-        None => format!("Pushed {} change(s), pulled {} update(s).", out.pushed, out.pulled),
+        None => format!("Pushed {} change(s), pulled {} update(s){}.", out.pushed, out.pulled, rebased_clause(out)),
+    }
+}
+
+/// The skills re-based onto the Station's latest version this sync, if any.
+fn rebased_clause(out: &SyncOutcome) -> String {
+    match out.rebased {
+        0 => String::new(),
+        n => format!("; {n} skill edit(s) re-based, to be pushed at the next sync (see notes)"),
     }
 }
 
@@ -1128,6 +1136,11 @@ mod tests {
         assert!(sync_status_line(&offline, None, false).starts_with("Relay unreachable"));
         let done = SyncOutcome { pushed: 2, pulled: 3, ..Default::default() };
         assert_eq!(sync_status_line(&done, None, false), "Pushed 2 change(s), pulled 3 update(s).");
+        let rebased = SyncOutcome { pushed: 0, pulled: 1, rebased: 1, ..Default::default() };
+        assert_eq!(
+            sync_status_line(&rebased, None, false),
+            "Pushed 0 change(s), pulled 1 update(s); 1 skill edit(s) re-based, to be pushed at the next sync (see notes)."
+        );
         let partial = SyncOutcome { pushed: 1, relay_error: true, ..Default::default() };
         assert!(sync_status_line(&partial, None, false).starts_with("Sync incomplete — pushed 1 change(s)"));
     }

@@ -279,11 +279,24 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
     Ok(notes)
 }
 
+/// The note for a concurrent edit where this machine's edit already
+/// landed as `version` (the latest now).
 fn concurrent_note(skill: &Skill, version: i64) -> String {
     let scope_flag = if skill.scope == Scope::Project { " --scope project" } else { "" };
     format!(
         "skill {}: another machine pushed an edit at the same time; both versions are kept and v{} is now the latest. See them with `atem skill history {}{}`.",
         skill.name, version, skill.name, scope_flag
+    )
+}
+
+/// The note for a concurrent edit settled by coalescing: what is true now
+/// is that the other machine's `current` is the latest, and this machine's
+/// edit goes on top as `next` at the next sync.
+fn concurrent_pending_note(skill: &Skill, current: i64, next: i64) -> String {
+    let scope_flag = if skill.scope == Scope::Project { " --scope project" } else { "" };
+    format!(
+        "skill {}: another machine pushed an edit at the same time; its v{current} is the latest for now, and this machine's edit will be pushed on top as v{next} at the next sync. Both versions are kept: see them with `atem skill history {}{}`.",
+        skill.name, skill.name, scope_flag
     )
 }
 
@@ -427,7 +440,7 @@ fn settle_skills(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult],
                 let ahead = conflicts.iter()
                     .filter(|(j, s)| **s == Settled::Rebased && same(j))
                     .all(|(j, _)| results[*j].check == ConflictCheck::Ahead);
-                notes.push(if ahead { ahead_note(skill, current, latest) } else { concurrent_note(skill, latest) });
+                notes.push(if ahead { ahead_note(skill, current, latest) } else { concurrent_pending_note(skill, current, latest) });
             }
             Settled::Superseded => {
                 let latest = (i + 1..sent.len()).filter(|j| same(j) && results[*j].ok)
@@ -622,6 +635,9 @@ pub struct SyncOptions {
 pub struct SyncOutcome {
     pub harvest: Option<HarvestSummary>,
     pub pushed: usize,
+    /// Skills whose conflicted push was re-based onto the Station's latest
+    /// version this sync; they go out at the next one.
+    pub rebased: usize,
     pub pulled: usize,
     pub notes: Vec<String>,
     pub offline: bool,
@@ -669,7 +685,13 @@ fn finish_chunk(store: &Store, chunk: &[(i64, PendingOp)], posted: std::result::
                 out.relay_error = true;
                 return Ok(Ok(false));
             }
-            out.pushed += chunk.len();
+            // Only the acked ops count as pushed: a conflicted push that stays
+            // queued (re-based, or unsettled) doesn't; the skills re-based
+            // are counted apart.
+            let conflicts = settle_conflicts(chunk, &results);
+            let waiting = conflicts.values().filter(|s| matches!(s, Settled::Rebased | Settled::Unchecked)).count();
+            out.pushed += chunk.len() - waiting;
+            out.rebased += rebased_skills(chunk, &Ok(results)).into_iter().collect::<HashSet<_>>().len();
             Ok(Ok(true))
         }
         Err(e) => Ok(Err(e)),
