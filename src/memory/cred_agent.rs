@@ -1739,7 +1739,11 @@ pub fn look(paths: &CredPaths, timeout: std::time::Duration) -> AgentLook {
         // reached is reported as not answering.
         let found = match client.probe() {
             Ok(true) => Some(client.status().map_err(|e| format!("{e:#}"))),
-            Ok(false) => None,
+            // Nothing answers: none runs, unless one holds the key files
+            // (it may run unlocked; the status names it).
+            Ok(false) => client
+                .answers()
+                .then(|| client.status().map_err(|e| format!("{e:#}"))),
             Err(error) => Some(Err(format!("{error:#}"))),
         };
         let _ = tx.send(found);

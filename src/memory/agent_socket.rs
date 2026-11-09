@@ -1118,6 +1118,8 @@ pub(crate) struct Traffic {
     frames: std::sync::atomic::AtomicUsize,
     /// Looks for an agent this client started (`connect`).
     polls: std::sync::atomic::AtomicUsize,
+    /// The pause slept before each of those looks.
+    pauses: Mutex<Vec<Duration>>,
 }
 
 #[cfg(test)]
@@ -1144,6 +1146,10 @@ impl Traffic {
 
     pub(crate) fn polls(&self) -> usize {
         self.polls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn pauses(&self) -> Vec<Duration> {
+        self.pauses.lock().unwrap().clone()
     }
 }
 
@@ -1665,13 +1671,21 @@ impl CredAgentClient {
             }
         };
         let mut unproven = None;
-        if let Some(recorded) = self.record.as_deref().and_then(recorded_socket)
+        if let Some(record) = self.record.as_deref()
+            && let Some(recorded) = recorded_socket(record)
             && recorded != self.socket
         {
             match self.dial_at(&recorded) {
                 Ok(checked) => return Ok(checked),
                 Err(error) if !proves_absent(&error) => {
-                    unproven = Some(unproven_at(&recorded, error));
+                    unproven = Some(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{} (named by {}; remove that file if no cred agent runs): {error}",
+                            recorded.display(),
+                            record.display()
+                        ),
+                    ));
                 }
                 Err(_) => {}
             }
@@ -1718,7 +1732,8 @@ impl CredAgentClient {
     }
 
     /// Whether an agent may answer: the kept connection is open (when no
-    /// request holds it), else anything but a proven absence (`probe`), so
+    /// request holds it), else anything but a proven absence (`probe`) of
+    /// an agent that doesn't hold the key files either (`key_dir_held`), so
     /// a caller's request reports what is wrong with an agent it can't
     /// reach instead of taking it for none. Starts nothing.
     #[cfg_attr(test, allow(dead_code))]
@@ -1729,18 +1744,37 @@ impl CredAgentClient {
                 return true;
             }
         }
-        !matches!(self.probe(), Ok(false))
+        match self.probe() {
+            Ok(false) => self.key_dir_held(),
+            _ => true,
+        }
+    }
+
+    /// Whether an agent holds the key files (`agent.lock`): a live agent
+    /// holds it for its whole life, from before it listens, so one that
+    /// answers on no socket (starting, stopping, orphaned, or behind a full
+    /// accept queue, which macOS refuses like a missing listener) may still
+    /// run unlocked.
+    fn key_dir_held(&self) -> bool {
+        self.lock
+            .as_deref()
+            .is_some_and(|lock| lock_is_held(lock) == Some(true))
     }
 
     fn connect(&self) -> Result<UnixStream> {
         match self.dial() {
             Ok(checked) => checked,
+            // No agent (proven), or something that proves nothing while no
+            // agent holds the key files (a stale record, say): start one. It
+            // takes the key files' lock and records its socket, and gives way
+            // to an agent that took them first.
             Err(error)
                 if self.launcher.is_some()
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                    ) =>
+                    && (proves_absent(&error)
+                        || self
+                            .lock
+                            .as_deref()
+                            .is_some_and(|lock| lock_is_held(lock) == Some(false))) =>
             {
                 if let Some(launch) = &self.launcher {
                     launch()?;
@@ -1756,7 +1790,10 @@ impl CredAgentClient {
                     if left.is_zero() {
                         break;
                     }
-                    std::thread::sleep(start_poll_pause(polls).min(left));
+                    let pause = start_poll_pause(polls).min(left);
+                    #[cfg(test)]
+                    self.traffic.pauses.lock().unwrap().push(pause);
+                    std::thread::sleep(pause);
                     polls += 1;
                     #[cfg(test)]
                     Traffic::add(&self.traffic.polls);
@@ -1775,21 +1812,25 @@ impl CredAgentClient {
                 }
                 bail!("the cred agent didn't start; see {}", self.log.display())
             }
-            Err(error) if proves_absent(&error) => Err(anyhow!(error).context(format!(
-                "the cred agent isn't running at {}",
-                self.socket.display()
-            ))),
-            // Something answers in a way that proves nothing (a reset or
-            // not-connected socket, a permission error): no agent is started
-            // beside one that may be running. One that holds the key files
-            // is named.
+            // No agent was started. One that holds the key files may run
+            // unlocked, whatever its socket said (nothing, or something that
+            // proves nothing): it is named, with what the socket said.
             Err(error) => {
                 if let Some(lock) = self.lock.as_deref()
                     && lock_is_held(lock) == Some(true)
                 {
-                    return Err(StuckAgent(stuck_message(lock)).into());
+                    return Err(anyhow!(error).context(StuckAgent(stuck_message(lock))));
                 }
-                Err(anyhow!(error).context("could not reach the cred agent"))
+                if proves_absent(&error) {
+                    Err(anyhow!(error).context(format!(
+                        "the cred agent isn't running at {}",
+                        self.socket.display()
+                    )))
+                } else {
+                    // A reset or not-connected socket, a permission error: no
+                    // agent is started beside one that may be running.
+                    Err(anyhow!(error).context("could not reach the cred agent"))
+                }
             }
         }
     }
@@ -1832,12 +1873,13 @@ impl CredAgentClient {
     }
 
     /// Waits up to `wait` for the agent to be gone; true once that is
-    /// proven (`probe`: its socket is missing or refused). An agent that
-    /// can't be reached for another reason is not gone.
+    /// proven (`probe`: its socket is missing or refused) and it no longer
+    /// holds the key files (`key_dir_held`). An agent that can't be reached
+    /// for another reason is not gone.
     fn wait_gone(&self, wait: Duration) -> bool {
         let deadline = std::time::Instant::now() + wait;
         loop {
-            if matches!(self.probe(), Ok(false)) {
+            if matches!(self.probe(), Ok(false)) && !self.key_dir_held() {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -2037,6 +2079,19 @@ fn explain_unknown_request(error: anyhow::Error, older: &str) -> anyhow::Error {
 
 impl CredAgentApi for CredAgentClient {
     fn lock_and_stop(&self) -> Result<bool> {
+        // Nothing answers, yet an agent holds the key files: one starting
+        // (not listening yet) or stopping (draining). Up to `STOP_WAIT` for
+        // it to answer, or to go (an agent's keys go with its process).
+        // Still neither: the request below names it, never "locked".
+        if matches!(self.probe(), Ok(false)) && self.key_dir_held() {
+            let deadline = std::time::Instant::now() + STOP_WAIT;
+            while matches!(self.probe(), Ok(false)) && std::time::Instant::now() < deadline {
+                if !self.key_dir_held() {
+                    return Ok(true);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         match self.call(Request::Lock { stop: true })? {
             Reply::Done => Ok(self.wait_gone(STOP_WAIT)),
             _ => bail!("the cred agent sent an unexpected reply"),
