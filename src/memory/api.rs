@@ -1,12 +1,14 @@
-//! Relay client for /api/memory and /api/skills. Request building is pure
-//! (unit-tested); `KnowledgeClient` only sends. Auth = the Astation pairing
-//! session: the paired Astation is the account, so any machine paired with
-//! it (and approved by it) can sync.
+//! Relay client for /api/memory and /api/skills (skill rows in the skill
+//! file transport, `skill_wire`). Request building is pure (unit-tested);
+//! `KnowledgeClient` only sends. Auth = the Astation pairing session: the
+//! paired Astation is the account, so any machine paired with it (and
+//! approved by it) can sync.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::future::Future;
-use crate::memory::model::{Memory, Scope, Skill};
+use crate::memory::model::{Memory, PulledSkill, Scope, Skill};
+use crate::memory::skill_wire::{self, WireSkill};
 use crate::memory::store::PendingOp;
 use crate::memory::crypto::{
     memory_open_cost, memory_seal_cost, plan_groups, project_hash_cost, skill_open_cost, skill_seal_cost, Cost,
@@ -23,8 +25,8 @@ enum Rewrite {
 }
 
 impl Rewrite {
-    fn kind(self) -> &'static str {
-        match self { Self::Memory => "memory", Self::Skills => "skills" }
+    fn memory(self) -> bool {
+        matches!(self, Self::Memory)
     }
 
     /// Rows per POST.
@@ -60,16 +62,17 @@ pub fn op_to_wire(op: &PendingOp) -> Value {
         PendingOp::AddMemory { memory } => json!({"op": "add", "memory": memory}),
         PendingOp::DeleteMemory { id } => json!({"op": "delete", "id": id}),
         PendingOp::InvalidateMemory { id, invalid_at, superseded_by } => json!({"op": "invalidate", "id": id, "invalid_at": invalid_at, "superseded_by": superseded_by}),
-        PendingOp::PushSkill { skill, base_version } => json!({"op": "push", "skill": skill, "base_version": base_version}),
+        // Plain: sent as it is only while the account's mode permits it.
+        PendingOp::PushSkill { skill, base_version } => json!({"op": "push", "skill": skill_wire::plain_skill(skill), "base_version": base_version}),
         PendingOp::DeleteSkill { scope, project, name } => json!({"op": "delete", "scope": scope, "project": project, "name": name}),
         PendingOp::PurgeSkill { scope, project, name, versions } => json!({"op": "purge", "scope": scope, "project": project, "name": name, "versions": versions}),
     }
 }
 
-fn pull(base: &str, client_id: &str, kind: &str, since: i64, limit: u32) -> ApiRequest {
+fn pull(base: &str, client_id: &str, route: &str, since: i64, limit: u32) -> ApiRequest {
     ApiRequest {
         method: "GET",
-        url: format!("{}/api/{}?id={}&since={}&limit={}", base_trim(base), kind, enc(client_id), since, limit),
+        url: format!("{}/api/{}?id={}&since={}&limit={}", base_trim(base), route, enc(client_id), since, limit),
         body: None,
     }
 }
@@ -124,8 +127,14 @@ struct VersionsPage {
 }
 #[derive(Deserialize)]
 struct VersionPage {
-    skill: Skill,
+    skill: WireSkill,
 }
+
+/// The per-op answer to a skill push whose base isn't the skill's latest
+/// version on the Station, tombstones and purged records included: the
+/// Station stores each push at the version it was sealed under or not at
+/// all (compare-and-set; Astation PR #76 at 89a2d50, Atem #130).
+pub const VERSION_CONFLICT: &str = "version_conflict";
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OpResult {
@@ -142,6 +151,45 @@ pub struct OpResult {
     pub superseded_concurrent: bool,
     #[serde(default)]
     pub error: Option<String>,
+    /// With a `version_conflict`: the skill's latest version on the Station.
+    #[serde(default)]
+    pub current_version: Option<i64>,
+    /// Set by the client, never on the wire: what checking a
+    /// `version_conflict` found (`sync::check_conflicts`).
+    #[serde(skip)]
+    pub check: ConflictCheck,
+}
+
+/// What checking a push's `version_conflict` found (`sync::check_conflicts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConflictCheck {
+    /// No check ran (not a push, or not a conflict).
+    #[default]
+    NotChecked,
+    /// Another write holds the attempted version, or it was purged or never
+    /// stored: a concurrent edit.
+    Concurrent,
+    /// The Station's latest version is below the push's base: the local
+    /// copy is ahead of it (a push it refused was acked, or a delete of a
+    /// skill it didn't have). Settled like a concurrent edit.
+    Ahead,
+    /// Reading the attempted version failed.
+    ReadFailed,
+    /// The answer names no `current_version`.
+    NoCurrentVersion,
+    /// The answer's `current_version` is out of range (negative, or leaving
+    /// no room for the next version): a protocol error.
+    BadCurrentVersion,
+}
+
+/// The largest skill version the Station accepts (JavaScript's safe
+/// integers); a `current_version` at or above it can't be built on.
+pub const MAX_SKILL_VERSION: i64 = 9_007_199_254_740_991;
+
+impl OpResult {
+    pub fn is_version_conflict(&self) -> bool {
+        !self.ok && self.error.as_deref() == Some(VERSION_CONFLICT)
+    }
 }
 
 #[derive(Deserialize)]
@@ -154,7 +202,28 @@ struct MemoryPage {
 }
 #[derive(Deserialize)]
 struct SkillPage {
-    skills: Vec<Skill>,
+    skills: Vec<WireSkill>,
+}
+
+/// A skill row as a `Skill`, or the page's refusal.
+fn skill_of(row: WireSkill) -> Result<Skill, ApiError> {
+    row.into_skill().map_err(|e| ApiError::Decode(format!("{e:#}")))
+}
+
+/// One stored skill version (`KnowledgeClient::stored_skill`).
+#[derive(Debug)]
+pub enum StoredVersion {
+    Row(Skill),
+    /// 410 `skill version purged`: its content is gone.
+    Purged,
+    /// 404 `no such skill version`: it never existed.
+    Missing,
+}
+
+/// Whether a 404 body is the Station's answer for a skill version it never
+/// had (`/api/skills/version`), not a route it doesn't have.
+pub fn is_missing_version(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|body| body["error"] == "no such skill version")
 }
 
 #[derive(Debug)]
@@ -244,7 +313,7 @@ fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::R
     let missing = || anyhow::anyhow!("an encrypted field of the batch is missing");
     ops.iter().map(|op| Ok(match op {
         PendingOp::AddMemory { .. } => json!({"op": "add", "memory": memories.next().ok_or_else(missing)?}),
-        PendingOp::PushSkill { base_version, .. } => json!({"op": "push", "skill": skills.next().ok_or_else(missing)?, "base_version": base_version}),
+        PendingOp::PushSkill { base_version, .. } => json!({"op": "push", "skill": skill_wire::sealed_skill(&skills.next().ok_or_else(missing)?)?, "base_version": base_version}),
         PendingOp::DeleteSkill { scope, name, .. } => json!({"op": "delete", "scope": scope, "project": projects.next().ok_or_else(missing)?, "name": name}),
         PendingOp::PurgeSkill { scope, name, versions, .. } => json!({"op": "purge", "scope": scope, "project": projects.next().ok_or_else(missing)?, "name": name, "versions": versions}),
         // Listed, not a catch-all: a new op with a secret field must be
@@ -398,10 +467,13 @@ impl KnowledgeClient {
 
     /// POSTs ops in their wire form (`seal_ops`) as one batch.
     pub async fn post_ops(&self, wire: &[Value], memory: bool) -> Result<Vec<OpResult>, ApiError> {
-        self.post_batch(if memory { "memory" } else { "skills" }, wire).await
+        self.post_batch(memory, wire).await
     }
 
-    async fn post_batch(&self, kind: &str, ops: &[Value]) -> Result<Vec<OpResult>, ApiError> {
+    /// One batch POST, to `/api/memory/batch` or `/api/skills/batch`.
+    /// Whatever its outcome, nothing is sent again in another format.
+    async fn post_batch(&self, memory: bool, ops: &[Value]) -> Result<Vec<OpResult>, ApiError> {
+        let kind = if memory { "memory" } else { "skills" };
         let url = format!("{}/api/{kind}/batch?id={}", base_trim(&self.base), enc(&self.client_id));
         let resp: BatchResponse = self.finish(self.http.post(&url).json(&Batch { ops })).await?
             .json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
@@ -437,24 +509,45 @@ impl KnowledgeClient {
         self.open_memories(rows).await
     }
 
-    /// The page of skill rows after `since`, as the relay sent it.
+    /// The page of skill rows after `since`, as the relay sent it (a row
+    /// that breaks the skill file transport's rules refuses the page).
     pub async fn fetch_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let req = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        Ok(page.skills)
+        page.skills.into_iter().map(skill_of).collect()
     }
 
-    /// A pulled page's skill rows opened (`decrypt_pulled_skills`): as
-    /// `open_memories`.
-    pub async fn open_skills(&self, rows: Vec<Skill>) -> Result<Vec<Skill>, ApiError> {
+    /// A pulled page's skill rows opened (`open_pulled_skills`): as
+    /// `open_memories`, and a row whose files don't open here is held, not
+    /// the page. `names`: project_names.json, read once for the pull.
+    pub async fn open_skills(&self, rows: Vec<Skill>, names: std::sync::Arc<std::sync::OnceLock<crate::memory::project_names::ProjectNames>>) -> Result<Vec<PulledSkill>, ApiError> {
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_pulled_skills(rows)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.open_pulled_skills(rows, &names)).await.map_err(ApiError::from)
     }
 
+    /// A page's rows opened; one that would be held is an error here.
     #[cfg(test)]
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let rows = self.fetch_skills(since).await?;
-        self.open_skills(rows).await
+        self.open_skills(rows, Default::default()).await?.into_iter()
+            .map(|row| match row {
+                PulledSkill::Row(skill) => Ok(skill),
+                PulledSkill::Held(held) => Err(ApiError::Encryption(format!("{} v{} held: {}", held.name, held.version, held.reason))),
+            })
+            .collect()
+    }
+
+    /// One stored version as the Station serves it, not opened: what a
+    /// `version_conflict` is checked against (`project` as sent).
+    pub async fn stored_skill(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<StoredVersion, ApiError> {
+        let req = skill_version_request(&self.base, &self.client_id, scope, project, name, version);
+        let sent = match self.send(req).await {
+            Err(ApiError::Http(410, _)) => return Ok(StoredVersion::Purged),
+            Err(ApiError::Http(404, body)) if is_missing_version(&body) => return Ok(StoredVersion::Missing),
+            sent => sent?,
+        };
+        let page: VersionPage = sent.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        skill_of(page.skill).map(StoredVersion::Row)
     }
 
     /// Names what it can of the pulled project hashes `hashes`, hashing and
@@ -475,14 +568,16 @@ impl KnowledgeClient {
         Ok(page.versions)
     }
 
-    /// One version with its files. 404 unknown, 410 purged (as `ApiError::Http`).
+    /// One version with its files. 404 unknown (the Station's "no such skill
+    /// version"), 410 purged (as `ApiError::Http`).
     pub async fn skill_version(&self, scope: Scope, project: &str, name: &str, version: i64) -> Result<Skill, ApiError> {
         let encryption = self.encryption()?;
         let project = project.to_string();
         let project = encryption.blocking(move |encryption| encryption.wire_project(&project)).await.map_err(ApiError::from)?;
         let req = skill_version_request(&self.base, &self.client_id, scope, &project, name, version);
         let page: VersionPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        encryption.blocking(move |encryption| encryption.decrypt_skill(page.skill)).await.map_err(ApiError::from)
+        let skill = skill_of(page.skill)?;
+        encryption.blocking(move |encryption| encryption.decrypt_skill(skill)).await.map_err(ApiError::from)
     }
 
     /// Read every returned historical row back and authenticate its migrated
@@ -643,10 +738,10 @@ impl KnowledgeClient {
             let next = if ready.len() < chunk { groups.next() } else { None };
             let (posted, prepared) = match next {
                 Some(range) => {
-                    let (posted, prepared) = tokio::join!(self.post_batch(kind.kind(), &ops), seal(range));
+                    let (posted, prepared) = tokio::join!(self.post_batch(kind.memory(), &ops), seal(range));
                     (posted, Some(prepared))
                 }
-                None => (self.post_batch(kind.kind(), &ops).await, None),
+                None => (self.post_batch(kind.memory(), &ops).await, None),
             };
             let results = posted?;
             if results.len() != ops.len() || results.iter().any(|result| !result.ok) {
@@ -676,20 +771,30 @@ fn rewritten_memories(encryption: &EncryptionContext, raw: Vec<Memory>) -> anyho
 }
 
 /// The migration's rewrite ops for skill rows: opened, then sealed again
-/// while enabling.
+/// while enabling (`e1-text`); plain while disabling (`base64`, which the
+/// mode permits).
 fn rewritten_skills(encryption: &EncryptionContext, raw: Vec<Skill>) -> anyhow::Result<Vec<Value>> {
     let plain = encryption.decrypt_skills(raw.clone())?;
-    let desired = if encryption.mode == EncryptionMode::Enabling { encryption.encrypt_skills(plain)? } else { plain };
-    Ok(raw.iter().zip(desired).map(|(old, desired)| json!({
-        "op": "rewrite",
-        "scope": desired.scope,
-        "old_project": old.project,
-        "name": desired.name,
-        "version": desired.version,
-        "project": desired.project,
-        "files": desired.files,
-        "content_hash": desired.content_hash,
-    })).collect())
+    let enabling = encryption.mode == EncryptionMode::Enabling;
+    let desired = if enabling { encryption.encrypt_skills(plain)? } else { plain };
+    raw.iter().zip(desired).map(|(old, desired)| {
+        let (encoding, files) = if enabling {
+            (skill_wire::FilesEncoding::E1Text, skill_wire::sealed_files(&desired.files)?)
+        } else {
+            (skill_wire::FilesEncoding::Base64, skill_wire::plain_files(&desired.files))
+        };
+        Ok(json!({
+            "op": "rewrite",
+            "scope": desired.scope,
+            "old_project": old.project,
+            "name": desired.name,
+            "version": desired.version,
+            "project": desired.project,
+            "files_encoding": encoding.as_str(),
+            "files": files,
+            "content_hash": desired.content_hash,
+        }))
+    }).collect()
 }
 
 #[cfg(test)]
@@ -760,6 +865,8 @@ mod tests {
         let push = op_to_wire(&PendingOp::PushSkill { skill, base_version: 1 });
         assert_eq!(push["op"], "push");
         assert_eq!(push["base_version"], 1);
+        // Plain (the account's mode permits it): base64, said so.
+        assert_eq!(push["skill"]["files_encoding"], "base64");
         assert_eq!(push["skill"]["files"]["SKILL.md"], "aGVsbG8=");
         let del = op_to_wire(&PendingOp::DeleteSkill { scope: Scope::Global, project: String::new(), name: "demo".into() });
         assert_eq!(del, json!({"op": "delete", "scope": "global", "project": "", "name": "demo"}));

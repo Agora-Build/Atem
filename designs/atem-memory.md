@@ -145,10 +145,59 @@ for its hash, so a pulled fact or skill of that project is **unresolved**:
   knows that project's name.
 
 Only a well-formed hash is kept this way. Anything else still fails the page
-as before: a project that isn't `h1.` while encryption is on, a malformed
-`h1.` value, or a field that doesn't open. Migration (turning encryption on
-or off, rotation) and its read-back still need every project's name: a
+as before: a project that isn't `h1.` while encryption is on, or a malformed
+`h1.` value. A skill version whose files don't open is held (next section);
+a fact that doesn't open still fails its page. Migration (turning encryption
+on or off, rotation) and its read-back still need every project's name: a
 device that can't name one can't migrate the account.
+
+### Skill versions that don't open here (held)
+
+A sealed skill file is bound to `scope:name:version` (designs/e2e-encryption.md
+"What gets encrypted"), so a row stored under a version its files weren't
+sealed under can't be opened by any device. Since the Station keeps each
+push's version ("Relay API" below), that happens only with rows a Station
+renumbered before its compare-and-set, or a corrupted row. Owner decision on
+[Atem #130](https://github.com/Agora-Build/Atem/issues/130): hold it and
+keep pulling.
+
+- **Which rows.** A pulled skill row is held when its files fail to
+  authenticate, or are malformed inside a well-formed row. It is never
+  applied, installed or injected.
+  - A row that breaks the skill file transport's rules (encoding, envelope
+    shape) still refuses the page.
+  - The pull still stops, as before, on a locked cred agent, a missing key,
+    or a plain project or plain file path while encryption is on.
+  - A plain file value under a sealed path reaches the cred agent, fails
+    there as a malformed field, and the row is held.
+  - It also stops on a row under a key id this device doesn't hold: a
+    device that hasn't received a key rotation. The note says to run
+    `atem cred unlock` to receive the key. The row stays to be pulled again,
+    rather than being skipped.
+  - The cred agent gives no error kind, only text. The content failures are
+    matched against the constants the agent itself uses
+    (`account_keys::FIELD_CONTENT_FAILURES`). Anything else stops the pull:
+    it fails closed.
+  - A fact that doesn't open keeps today's behaviour: it fails its page.
+- **The pull goes on.** The held row commits with its page (`held_skills`
+  in `knowledge.db`: scope, project, name, version, seq and the reason; no
+  files and no plain text), and the cursor moves past it.
+  - A page opens in one `Crypt` request as before. Only when that request
+    fails because of a row's content is the page bisected, each half opened
+    again, to find the rows to hold. One such row among n costs about
+    2·log₂(n) requests more (about 16 for a page of 200), and only after a
+    failure.
+  - `project_names.json` is read once for the whole pull.
+  - A held version that a version this machine already read replaces isn't
+    recorded at all.
+- **Reported.** The sync prints one note per newly held version ("… can't
+  open on this machine and are held: deploy v2 (encrypted field
+  authentication failed) …"), once. `atem memory status` has an
+  `Unreadable:` line with the count and the versions while any is held.
+- **Cleared.** The hold goes when a readable version of that skill at or
+  above it is applied: a later version, a tombstone, or that version purged.
+  A held row's project moves with its skills when its hash is named, and goes
+  with them when the hash can never be named.
 
 ## Identity & auth
 
@@ -289,12 +338,14 @@ CREATE INDEX skill_versions_account_seq ON skill_versions (account_id, seq);
 - **Skills** are edited, unlike memories. Each push adds a version, and older
   versions are kept so nothing is lost, unless they're purged (see "Removing
   a credential that slipped through"). If two machines push the same skill
-  concurrently, the one with the higher `seq` wins. A skill is limited to
-  1 MB total.
-- **Skills are text-only.** Every file must be UTF-8 text. Files are
-  base64-encoded in the JSON, but only so the wire format is uniform; no
-  binary file ever reaches it, because the secret check can't scan binary
-  and refuses it (see "Security").
+  concurrently, both versions are kept and the later writer's is the latest
+  ("A skill push keeps its version" under "Relay API"). A skill is limited
+  to 1 MB total.
+- **Skills are text-only.** Every file must be UTF-8 text; no binary file
+  ever reaches the relay, because the secret check can't scan binary and
+  refuses it (see "Security"). The server stores each file's bytes as
+  base64. On the wire (the skill file transport, below) a sealed file is
+  its `e1.` text and a plain one base64.
 
 ### Local (SQLite, each machine)
 
@@ -326,9 +377,42 @@ there's no window where it's readable by others:
 |---|---|
 | `POST /api/memory/batch` | Push memory ops (`add`, `delete`, `invalidate`). Returns per-op results. |
 | `GET /api/memory?since=<seq>&limit=<n>` | Pull memory rows (tombstones and invalidations included, with the validity fields) with `seq > since`. |
-| `POST /api/skills/batch` | Push skill ops (`push`, `delete`, `purge`). |
+| `POST /api/skills/batch` | Push skill ops (`push`, `delete`, `purge`; `rewrite` during an encryption migration). |
 | `GET /api/skills?since=<seq>&limit=<n>` | Pull skill versions with `seq > since`. |
 | `GET /api/skills/versions`, `GET /api/skills/version` | Skill history and one old version's files (see "Skill history and restore"). |
+
+**The skill file transport** (F8 of
+[Atem #130](https://github.com/Agora-Build/Atem/issues/130)). The contract is
+Astation's `designs/protocol/skill-file-wire.md` in
+[Astation PR #76](https://github.com/Agora-Build/Astation/pull/76), pinned at
+89a2d50; the vectors are in `designs/protocol/fixtures/skills-wire/`. Owner
+decision: the Station and atem ship together, with one set of routes, no
+`wire_version`, and no compatibility path, probing or fallback.
+
+- **Files.** Every skill row returned, every `push.skill` and every
+  `rewrite` carries `files_encoding` next to `files`:
+  - `e1-text`: every path is a sealed `e1.` envelope, and every value is
+    the envelope's own text (encoded once, not base64 of it), or exactly
+    `""` for an empty file (never sealed). atem sends this for a sealed
+    skill.
+  - `base64`: canonical padded standard base64 of the bytes. atem sends
+    this for a plain skill, and only while the account's mode permits plain
+    text (`off`, or `disabling`'s rewrite back). The Station serves it for
+    plain, binary or partly migrated history.
+- **Refusals.** A missing, unknown or non-string encoding refuses the whole
+  batch with 400 `unsupported skill files encoding; update Atem`. Malformed
+  files, including plain entries in an `e1-text` row, get 400 `invalid skill
+  files encoding`. atem refuses the same rows: a pulled page with one isn't
+  applied, and atem never sends one.
+- **Errors.** A `/version` 404 whose body is the Station's `no such skill
+  version` is a missing version, and 410 is a purged one. Any other error,
+  including a 404 for a route the relay doesn't have, is reported as it
+  is. A POST whose outcome is unknown is sent again only in the same format.
+- **Unchanged:** the stored rows (the Station keeps base64 of the same
+  bytes), ciphertext and associated data, `content_hash`, versions, `seq`,
+  the 16 MiB batch and 16-op limits, and quotas. A 1 MiB sealed file is
+  1.33× its size on the wire instead of 1.78× (see `designs/e2e-encryption.md`
+  "Performance").
 
 Rules:
 
@@ -339,10 +423,95 @@ Rules:
   Within one batch, a later `delete`/`invalidate` that names the
   deduplicated id (as `id` or `superseded_by`) is rewritten to the
   `canonical_id`; atem rewrites its still-queued ops the same way.
-- **Skill pushes carry the client's `base_version`.** The server always
-  appends the push as the next version. If `base_version` is behind the
-  latest version, the response flags `superseded_concurrent: true` and the
-  CLI reports it; nothing is dropped.
+- **A skill push keeps its version** (the contract's compare-and-set,
+  Astation PR #76 at 89a2d50; owner decision on
+  [Atem #130](https://github.com/Agora-Build/Atem/issues/130), comment
+  6726291208).
+  - **The rule.** Each push carries `skill.version = base_version + 1`, the
+    version its files were sealed under. Both are within JavaScript's safe
+    integers; an invalid pair gets the op error `invalid skill version`.
+    The Station stores the push at exactly that version, but only if
+    `base_version` equals the skill's latest stored version, tombstones and
+    purged records included.
+  - **Otherwise** the op gets `{"ok": false, "error": "version_conflict",
+    "current_version": N}` (`N` the latest version). No row is inserted, no
+    seq allocated, no content compared.
+  - **How atem knows the base.** atem's base is its local copy's version:
+    the latest row it pulled, a tombstone included, or its own last edit.
+    `atem skill restore` bases on the newest of the relay's history (which
+    lists tombstones and purged versions) and the local copy. A base that
+    is behind comes back as a conflict and is corrected from `N` below.
+    So does a base ahead of the Station: a push it refused per op is acked,
+    which leaves the local copy at a version it never stored, and a delete
+    of a skill it doesn't have appends nothing there.
+  - **Atem's own write.** atem fetches its attempted version once
+    (`/api/skills/version`). The same content hash and metadata as the push
+    mean an earlier send was applied but never acknowledged (a lost answer,
+    a crash before the local commit). That push counts as stored and is
+    acked. The files aren't compared: every seal has fresh nonces.
+  - **A concurrent edit** is anything else: another write at that version,
+    a purged one (410), or one that never existed (404). It settles by
+    coalescing, below.
+  - **A Station behind the local copy** (`N` below the push's base) means
+    the attempted version was never stored, so there is no GET. It settles
+    by coalescing too, but with its own note: the Station's latest version
+    is vN, behind this machine's copy, and the edit goes out as v`N+1` at
+    the next sync.
+  - **Coalescing** (both cases above):
+    - **Coalesced.** The skill's queued pushes become one: the newest edit,
+      which as a full snapshot of the local skill holds every earlier local
+      edit. It goes at `N+1` on base `N`, and the local copy follows it.
+      Unpushed intermediate edits never become versions; another machine's
+      version stays in history.
+    - **Held back.** Nothing more of that skill goes out in this sync: the
+      Station judges a batch's ops in order, and only a later batch could
+      see them out of order. So the Station never has a gap that a third
+      machine's push could fill, and an older edit never becomes the latest
+      over a newer one.
+    - **Sealed again** at the next sync, under the new version. An envelope
+      is never re-used under another version.
+    - **The note** for a concurrent edit is "another machine pushed an edit
+      at the same time; both versions are kept and vN is now the latest";
+      for a Station behind the local copy it is the note above.
+  - **Superseded in the same batch.** If a later push of the same skill in
+    that batch landed, the conflicted older push is acked and never pushed
+    again. The later push is a full snapshot built on it.
+  - **Withdrawn in the same batch.** If a later delete of the skill, or a
+    purge of all its versions or of the pushed one, landed in that batch,
+    the conflicted push is acked and never pushed again. So it can't undo
+    the delete, and purged content never goes back to the relay. The local
+    tombstone stays. A later conflicting push of the skill in the same
+    batch, such as a re-add after the delete, is still settled in that
+    sync: a superseded or withdrawn push settles only itself.
+  - **Unsettled.** The conflict stays queued as it was, and that sync's push
+    stops there, with a note saying why, if:
+    - the attempted version can't be read;
+    - the answer names no `current_version`;
+    - it names one out of range: negative, or at or above the safe-integer
+      bound (a protocol error). A `current_version` below the push's base
+      is legal (see above).
+
+    A skill with any such conflict is never coalesced.
+  - **Unpushed edits win locally.** While a push of a skill is queued, a
+    pulled row of it at or above the local version never replaces the local
+    copy or its directory.
+    - The remote version stays in the relay's history, with a note:
+      "another machine pushed an edit (vN) while this machine's edit waits
+      to sync …".
+    - The queued push then settles through the conflict path: the last
+      writer wins, and both versions are kept.
+    - The push's own applied write coming back (the same content) is
+      skipped quietly.
+    - The queued push is looked up inside each pulled page's transaction,
+      reading only the queued pushes' keys. So another atem process that
+      queues an edit or acks a push during the pull is seen.
+  - **Unchanged.** Deletes carry no version (a tombstone has no envelopes),
+    and the Station appends them as `max + 1`. Purges name existing versions.
+  - **Before the compare-and-set** (the Station before Astation PR #76),
+    every push was renumbered as `max + 1` (`superseded_concurrent: true`
+    when `base_version` was behind). A sealed push renumbered there is a row
+    no device can open, which is held (see "Skill versions that don't open
+    here").
 - **Skill `purge`** erases the files of the chosen versions: `files` becomes
   `{}`, `content_hash` becomes `''`, and each row takes a new `seq` so every
   machine sees the change. Purging the latest version also deletes the skill.
@@ -543,7 +712,8 @@ atem skill purge <name> [--version <n> | --all-versions]
 atem memory status                  # account, machine, pending ops, last sync, targets,
                                     # held-back memories, credential findings,
                                     # facts with more than one valid successor,
-                                    # rows of projects not known here yet
+                                    # rows of projects not known here yet,
+                                    # held skill versions that don't open here
 ```
 
 - `<date>` is `YYYY-MM-DD` (midnight UTC) or unix seconds. `<id>` for `replace`, `invalidate`, `rm`, `purge` and `list --history` is a full id or a unique prefix, with or without `mem_` (the Codex block's short id works), or the listing form `<head>…<tail>` (`..` works in place of `…`).
@@ -575,6 +745,14 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - 503: the relay is temporarily unavailable (e.g. its database).
    - 413 on a chunk: its ops are retried one at a time. A single op that is
      still too large stays queued with a note and is never acked.
+   - A skill push answered `version_conflict` (see "Relay API"): at most one
+     GET of that version before the request's results are applied.
+     - Atem's own earlier write is acked.
+     - A concurrent edit's skill is coalesced into one queued push of its
+       newest edit, past the Station's version. Nothing more of that skill
+       goes out in this sync, and the push is sealed again at the next one:
+       that is the only extra `Crypt` work a conflict costs.
+     - A conflict that couldn't be settled stays queued and stops the push.
 
    While the account is encrypted, the ops are sealed ahead of their requests,
    in groups of whole requests (at most four cred-agent `Crypt` requests'
@@ -626,7 +804,10 @@ atem memory status                  # account, machine, pending ops, last sync, 
    `superseded_by` locally (a local invalidation not yet on the relay is
    kept); the search index follows through triggers. A row of a project this
    machine can't name is kept unresolved (see "Projects not known
-   here yet"); it never stops the pull.
+   here yet"); it never stops the pull, and neither does a skill version
+   that doesn't open here, which is held (see "Skill versions that don't
+   open here"). While a push of a skill is queued, its pulled rows never
+   replace the local copy (see "Relay API").
 4. **Resolve** unresolved rows whose project name is now known (recorded in
    `project_names.json`, or learned now: the checkout the sync runs in, and
    after a rotation the projects this machine already knows), and drop
@@ -1102,13 +1283,13 @@ Where the data comes from: the local store keeps only the latest version of
 each skill, so both commands ask the relay. They need a connection and say
 so plainly when offline.
 
-New relay endpoints, with the same auth and account isolation as the other
-skill routes:
+Relay endpoints, with the same auth and account isolation as the other
+skill routes (the skill file transport, above):
 
 | Method & path | Returns |
 |---|---|
 | `GET /api/skills/versions?scope=&project=&name=` | `{"versions":[{version, created_at, source_agent, source_machine, file_count, deleted, purged}]}`, newest first. No file contents. |
-| `GET /api/skills/version?scope=&project=&name=&version=<n>` | `{"skill": <skill row with files>}`. 404 for an unknown version; 410 for a purged one. |
+| `GET /api/skills/version?scope=&project=&name=&version=<n>` | `{"skill": <skill row with files and files_encoding>}`. 404 `no such skill version` for an unknown version; 410 `skill version purged` for a purged one. |
 
 `purged` comes from `skill_versions.purged` (migration 0005), set by
 `purge`. A purged version and a delete marker are otherwise stored the same

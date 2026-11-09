@@ -117,7 +117,7 @@ only while the signed mode is `on`; see "Injection into agents by mode" and
 | Memory encryption | Optional, off by default, switched in Astation. Mode changes are signed by Astation; atem never moves toward plain text without one. Turning off goes through `disabling`. **Planned (owner decision 2026-11-08), not implemented:** the only mode: no `off`, no `disabling`; new accounts start on, accounts still off are migrated, the relay refuses plain text, Astation's switch becomes a status display. |
 | Injection into agents | **Planned (owner decision 2026-11-08), not implemented:** a transition measure until `off` is removed: relay-synced memory facts and skills reach agents (managed blocks, skill directories) only while the signed mode is `on`. Sync, search and list work in every mode. |
 | Rollback and forgery of memory and skills | **Planned (owner decision 2026-11-08), not implemented:** signed writes (build step 3) and an anti-rollback check on pulled rows, together. |
-| Performance | Owner decision 2026-11-08: a requirement with budgets, set from measurements; a change that breaks one doesn't ship. Built: the fixes F1, F2, F3, F6 and F7; F8 waits for Astation (#130); F4 and F5 are not approved. See "Performance". |
+| Performance | Owner decision 2026-11-08: a requirement with budgets, set from measurements; a change that breaks one doesn't ship. Built: the fixes F1, F2, F3, F6, F7 and F8 (F8 released together with the Station's skill file transport, Astation PR #76); F4 and F5 are not approved. See "Performance". |
 | Credentials encryption | Always on. |
 | Offline credential reads | Grants per device. A device decrypts on its own while Astation is offline. |
 | Credential grant granularity | Per project scope. `global` is a scope. |
@@ -1061,6 +1061,66 @@ doesn't cover it; it is covered by encryption becoming the only mode.
   under `K` with a random 24-byte nonce. As built, the associated data is
   `"<record id>\n<field>"` (`account_keys::field_aad`), so the relay can't
   move a ciphertext to another record or field.
+- **Skill versions (owner decisions on
+  [Atem #130](https://github.com/Agora-Build/Atem/issues/130), comment
+  6726291208; contract: Astation PR #76 at 89a2d50).** A skill file's record
+  id is `scope:name:version` (`crypto::skill_record`), so its version is part
+  of what each path and file is bound to. A row stored under another version
+  can't be opened by any device.
+  - **The Station keeps the version.** A push carries `skill.version =
+    base_version + 1`. The Station stores it at exactly that version only if
+    the base equals the skill's maximum stored version, tombstones and purged
+    records included. Otherwise it answers the op `{"ok": false, "error":
+    "version_conflict", "current_version": N}`, inserts nothing, allocates no
+    seq, and compares no content.
+  - **Atem fetches its attempted version once.** The same content hash and
+    metadata mean its own earlier write: applied, but the answer was lost or
+    a crash came before the local commit. That push is acked.
+  - **A concurrent edit**: the skill's queued pushes are coalesced into its
+    newest edit at `N + 1`. Nothing more of that skill goes out in that
+    sync. It is sealed again under the new version at the next one. Atem
+    never re-uses an envelope under another version and never falls back to
+    plain text. A `current_version` below the push's base (the Station
+    behind the local copy) is settled the same way. A delete or purge of the
+    skill that lands after the conflicted push in the same batch withdraws
+    the push, so purged content never goes back.
+  - **Unpushed edits win locally.** While a push of a skill is queued, a
+    pulled row never replaces the local copy; the push then settles through
+    the conflict (the last writer wins, both versions kept).
+  - **A Station that renumbered** (the Station before Astation PR #76:
+    `max + 1`) produced exactly the unreadable rows this rule prevents.
+  - **Held rows.** A pulled skill row whose files fail to authenticate or
+    are malformed is held: never applied, reported, and the pull goes on
+    (designs/atem-memory.md "Skill versions that don't open here").
+    - A row under a key id this device doesn't hold stops the pull instead,
+      with the way to get the key.
+    - A fact that doesn't open still fails its page.
+    - A migration or read-back that meets such a row names it and the
+      command that removes it (`atem skill purge <name> --version <n>`).
+- **Skill files on the wire (F8; Atem #130).** The contract is Astation's
+  `designs/protocol/skill-file-wire.md` in Astation PR #76, pinned at
+  89a2d50; the vectors are in `designs/protocol/fixtures/skills-wire/`. It
+  uses the existing skill routes. Owner decision: the Station and Atem ship
+  together, with no `wire_version`, no compatibility path, probing or
+  fallback.
+  - A sealed file travels as its `e1.` text, a JSON string encoded once
+    (`files_encoding: "e1-text"`), so a large file is about 1.33× its size.
+    A sealed path is its `e1.` text too.
+  - An empty file is exactly `""`: it is never sealed, so it takes no
+    `Crypt` op and has no associated data, and its filename is still sealed.
+  - Plain files travel as base64 (`"base64"`), only while the account's mode
+    permits plain text.
+  - Every row, push and `rewrite` names its encoding. A missing, unknown or
+    non-string encoding gets 400 `unsupported skill files encoding; update
+    Atem`. A malformed envelope, or plain entries in an `e1-text` row, get 400
+    `invalid skill files encoding`. Atem refuses the same rows in a pulled
+    page and never sends one.
+  - Only the HTTP representation changed. The Station still stores base64 of
+    the same bytes, so the ciphertext, its associated data, the hashes,
+    versions, `seq` and the `Crypt` requests are unchanged.
+  - A POST whose outcome is unknown is never sent again in another format,
+    and there is never a plain-text fallback.
+  - See `designs/atem-memory.md` "Relay API".
 - **Not implemented:** binding the scope, project HMAC and version or vault
   entry number into the associated data (build step 3), so a ciphertext
   can't move to another project or entry either.
@@ -1412,8 +1472,9 @@ read and write, migration and cold command takes, and it must be fast enough
 that nobody has a reason to want plain text back. The budgets below were
 proposed from measurements of the encrypted path on `main` (b56dcd4); a budget
 moved since then only by an owner decision, cited in its row. **Built:** the
-fixes F1, F2, F3, F6 and F7 (below). **Waits for Astation:** F8 (issue #130).
-**Not approved:** F4 and F5. "Today" is the production path as built with
+fixes F1, F2, F3, F6, F7 and F8 (below; F8, issue #130, is released together
+with the Station's skill file transport, Astation PR #76, after a joint
+dev test). **Not approved:** F4 and F5. "Today" is the production path as built with
 those fixes, measured on 2026-11-08 (each number names its source: the task
 that built a fix, or the final run after the last one).
 
@@ -1445,6 +1506,10 @@ shared CI host). They measure:
    unlock, and the agent's memory with and without `mlockall`.
 6. **Ciphertext overhead:** bytes per field, per row, per request, and on the
    agent socket.
+7. **A skill file on the wire** (`perf_7`): one skill with a 1 KiB, 64 KiB
+   or 1 MiB file pushed and pulled through the client, encryption off and on:
+   the HTTP bodies, the file's value, the times, and the client's own cost of
+   each representation (`e1-text` against the legacy base64 of the `e1.` text).
 
 Loopback numbers: a real relay's round trip adds the same latency per HTTP
 request with or without encryption, so the encryption share there is smaller,
@@ -1461,7 +1526,7 @@ checks).
 | Area | Budget | Today | Status |
 |---|---|---|---|
 | Agent field ops | seal or open of a field of at most 1 KiB in at most 10 µs in the agent; at least 200 MiB/s for large fields | 2.2 to 9 µs; 250 to 300 MiB/s (keyed hash 160 MiB/s) (measured on `main`; the fixes don't change the cipher) | met |
-| Agent round trips | **Pull and read-back:** at most 1 `Crypt` request per relay page, overlapped with the next GET (owner decision 2026-11-08, "one per page", Task 4 measurements). **Push and migration:** at most 1 `Crypt` request per 1,024 ops / 2 MiB, plus one for the first chunk so its POST starts at once (owner decision 2026-11-08, "allow +1 to start", Task 4 measurements), and a small overhead above that, understood and bounded (owner decision 2026-11-08): exactly the planner's bound below the table, ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉ for a push of facts and ⌈ops / 1,024⌉ + S·G − 1 in general. **Status checks:** one per connection (the build check), and one before each POST of ops sealed by an earlier `Crypt` request, so a lock stops the push or migration within one POST (owner decision 2026-11-08, "allow lock checks", an exception to "no status probe after the first"; Task 4 measurements); they are not `Crypt` requests. One connection per process | `Crypt` requests per 1,000 / 5,000 facts: push 4 / 14, pull 5 / 25 (one per page), migration rewrite 6 / 16, read-back 9 / 29. A 1,000 / 5,000-fact push and pull is 29 / 139 socket round trips on one connection: the build check, the `Crypt` requests and about one status per POST of ops sealed ahead (Task 4) | met (the push within the planner's bound; it is "1 per 1,024 plus one" exactly up to about 4,500 facts) |
+| Agent round trips | **Pull and read-back:** at most 1 `Crypt` request per relay page, overlapped with the next GET (owner decision 2026-11-08, "one per page", Task 4 measurements). Exceptions, on the failure path only: a skill page whose request fails because of a row's content is bisected to find the rows to hold, about 2·log₂(n) requests more per such row (about 16 for a page of 200), and only after that failure (designs/atem-memory.md "Skill versions that don't open here"); a migration rewrite or read-back whose request fails that way is bisected the same way to name the first such row in its error. **Push and migration:** at most 1 `Crypt` request per 1,024 ops / 2 MiB, plus one for the first chunk so its POST starts at once (owner decision 2026-11-08, "allow +1 to start", Task 4 measurements), and a small overhead above that, understood and bounded (owner decision 2026-11-08): exactly the planner's bound below the table, ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉ for a push of facts and ⌈ops / 1,024⌉ + S·G − 1 in general. **Status checks:** one per connection (the build check), and one before each POST of ops sealed by an earlier `Crypt` request, so a lock stops the push or migration within one POST (owner decision 2026-11-08, "allow lock checks", an exception to "no status probe after the first"; Task 4 measurements); they are not `Crypt` requests. One connection per process | `Crypt` requests per 1,000 / 5,000 facts: push 4 / 14, pull 5 / 25 (one per page), migration rewrite 6 / 16, read-back 9 / 29. A 1,000 / 5,000-fact push and pull is 29 / 139 socket round trips on one connection: the build check, the `Crypt` requests and about one status per POST of ops sealed ahead (Task 4) | met (the push within the planner's bound; it is "1 per 1,024 plus one" exactly up to about 4,500 facts) |
 | One request | at most 100 µs p50 for a batch-1 request; at most 4 µs per 100 B op over the socket | 15 to 17 µs p50 (100 B seal, open or keyed hash); 2.5 to 3.3 µs per op (Task 3) | met |
 | Large fields | at most 8 ms per MiB through the socket (seal or open) | 2.3 ms per MiB (Task 3) | met |
 | Sync | encryption adds at most 30 ms per 1,000 facts pushed, pulled and applied (at most 10 ms per 1,000 pulled) on loopback, and at most 5% of the wall time against the real relay | Loopback (in-memory store): push and pull +22 ms per 1,000 facts (+86 ms at 5,000), pull +2.9 ms per 1,000 (+35.5 ms at 5,000) (final run, `perf_2b`). Against a relay that answers after 20 ms: push and pull +0.8% (1,000 facts) and +0.6% (5,000), pull +3.2% and +2.8%; after 5 ms: +2.7%, +3.8%, +2.7% and +4.1% (final runs, `perf_2c`: medians of 45 quiet-host pairs in three runs of 15; one run gave +6.2% for the 5,000-fact pull at 20 ms, the other two +1.5% and +0.3%) | met on loopback, and against the relay with latency over the 45 pairs; a 5,000-fact pull is near the line in a single run (see "Where a sync's added time goes"); the real relay is not measured |
@@ -1470,7 +1535,7 @@ checks).
 | Migration | off to on including the read-back at least 10,000 records/s; at most 1 `Crypt` request per 64-record rewrite batch (the statuses before POSTs of rows prepared by an earlier request are counted apart: owner decision 2026-11-08, "allow lock checks", Task 4 measurements) | about 21,900 records/s (6,010 records in 274 ms; 14,800 records/s for 2,010). `Crypt` requests for 1,000 / 5,000 facts and 10 skills: rewrite 6 / 16 for 17 / 80 POSTs, vault 2, read-back 9 / 29; and 15 / 78 statuses before POSTs prepared ahead. Against a 20 ms relay the migration adds 1.3% / 2.9% (no budget row) (final run, `perf_4`) | met |
 | Cold command | first agent contact at most 50 ms after spawn; agent startup at most 25 ms; unlock at most 10 ms on the agent side (Touch ID and the network excluded); `atem memory search` and the apply never touch the agent | 15.6 to 16 ms; 12.6 to 13.3 ms (about 10 ms of it `mlockall`; 2.7 ms without); about 5 ms; 0 (Task 5; final run) | met |
 | Agent memory | at most 16 MiB RSS at rest unlocked without mlock and at most 48 MiB peak; at most 48 MiB when `mlockall` applies | 13.6 MiB at rest unlocked and 37.6 MiB peak without mlock; 71.1 MiB at rest and 105.5 MiB peak with it (final run, `perf_5`) | the locked case misses; its fix (F5) is not approved |
-| Wire size | at most 52 B + 1.34x per field; skill files at most 1.4x raw on the wire | memory and vault met; skill files 1.78x | skills need F8, which waits for Astation (#130) |
+| Wire size | at most 52 B + 1.34x per field; skill files at most 1.4x raw on the wire | memory and vault met. Skill files with F8 (`perf_7`): a sealed file's value is 1.333x at 64 KiB and 1 MiB and 1.398x at 1 KiB (was 1.78x and 1.87x); a 1 MiB push or pull body is 1.334x (was 1.778x). A 1 KiB skill's push body is 1.81x (was 2.26x), mostly the fixed part (sealed path, hashes, names, JSON) | met with F8 (released together with the Station's skill file transport, #130) |
 
 **The push and migration bound, as built** (owner decision 2026-11-08: a
 small overhead above "1 per 1,024 ops plus one for the first chunk" is
@@ -1504,6 +1569,12 @@ the 1,024-op limit splits a request):
   hashed under that name when sealed, one op more than planned: a group
   holding u such facts can take up to ⌈u / 1,024⌉ requests more than the
   second bound. The first and the last bound hold as stated.
+- **Re-seals on a skill version conflict** (see "Skill versions" under "What
+  gets encrypted"). A concurrent edit's skill is coalesced into one queued
+  push and held back for the rest of the sync, so nothing is sealed again in
+  that sync. Its ops sealed ahead are dropped unsent. The coalesced push is
+  sealed at the next sync as an op queued then. With no conflict, nothing
+  changes.
 
 For uniform facts this is exactly "1 per 1,024 plus one" up to 4,562 facts of
 two ops and 5,791 of three, and then one request more now and then, as the
@@ -1551,7 +1622,7 @@ table; the tests assert nothing). A budget moves only by an owner decision
 that cites the measurement. A missed budget is fixed in the design (the fixes
 below), never by a plain-text fallback.
 
-**Fixes** (F1, F2, F3, F6 and F7 built as described; gains measured before
+**Fixes** (F1, F2, F3, F6, F7 and F8 built as described; gains measured before
 and after each, in the task that built it):
 
 | # | Fix | State | Gain |
@@ -1563,7 +1634,7 @@ and after each, in the task that built it):
 | F5 | A lighter agent: a current-thread runtime (or 1 to 2 workers), a cap on the largest request, optionally `malloc_trim` after a large one | not approved | (estimate) locked RSS 72 to about 40 MiB; peak without the lock about 20 MiB |
 | F6 | The local store: one transaction per push batch's results and per pulled page (rows and cursor together), each chunk read from the queue after the last op sent | built | 1,000-fact push and pull 5.64 to 0.25 s (0.30 s encrypted); 5,000 facts 30.5 to 1.34 s (1.54 s) (Task 1) |
 | F7 | Faster cold autostart: poll a started agent after short pauses that grow to the old 100 ms (`START_POLLS_MS`), within the same 10 s | built | first contact 101 to 16 ms (Task 5) |
-| F8 | Skill files without double base64: carry a sealed file's `e1.` text as a JSON string (a wire change with the relay) | approved; waits for Astation (#130) | (estimate) skill transfer 1.78x to 1.33x raw |
+| F8 | Skill files encoded once (the skill file transport, Astation PR #76 at 89a2d50; owner decision on #130: one set of routes, no compatibility path). A sealed file travels as its `e1.` text in a JSON string (`files_encoding: "e1-text"`; an empty file `""`); plain files travel as `base64`, only while the mode permits plain text. Same ciphertext, associated data, hashes and `Crypt` requests | built; released together with the Station's change (Astation PR #76) after a joint dev test | Sealed file on the wire 1.78x to 1.33x raw (1 MiB push body 1,864,621 to 1,398,592 B). The client's own cost per 1 MiB file: push body built in 2.0 to 1.6 ms, pulled row parsed in 1.2 to 0.9 ms (at 1 KiB, 4.3 to 6.4 µs and 2.2 to 2.4 µs). Loopback against the fake Station: a 1 MiB push takes 12.3 to 15.1 ms and a pull 11.8 to 12.6 ms (64 KiB +0.05 ms), because the fake relay now also does the Station adapter's conversion to and from its stored base64 (`perf_7`, medians of three A/B rounds) |
 
 **Fixed (#132): a pulled fact with an unknown project no longer stops Memory
 sync.** A project-scoped fact or skill whose `h1.` project hash this device has

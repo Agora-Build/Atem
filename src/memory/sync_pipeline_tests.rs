@@ -2420,3 +2420,1142 @@ async fn an_op_whose_project_hash_is_named_after_it_was_sealed_is_sealed_again()
         assert_eq!(s.pending_count().unwrap(), 0);
     }
 }
+
+// ─────────────── skill files on the wire (F8) ───────────────
+
+/// A skill with `SKILL.md` and an empty `.gitkeep`.
+fn skill_with_an_empty_file(machine: &str) -> Skill {
+    let mut skill = super::tests::skill_v1("deploy", "# deploy steps", machine);
+    skill.files.insert(".gitkeep".into(), Vec::new());
+    skill.content_hash = skill_hash(&skill.files);
+    skill
+}
+
+/// The skill requests of `log`, as (method, path without the query).
+fn skill_requests(log: &Log) -> Vec<(String, String)> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, p, _)| p.starts_with("/api/skills"))
+        .map(|(m, p, _)| (m.clone(), p.split('?').next().unwrap().to_string()))
+        .collect()
+}
+
+/// A sealed skill goes out as `e1-text`: each file's `e1.` text as it is
+/// (encoded once), an empty file as `""` (never sealed). The Station stores
+/// it as the old wire did, and another machine pulls it back whole.
+#[tokio::test]
+async fn a_skill_with_an_empty_file_travels_as_e1_text_and_comes_back_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    let skill = skill_with_an_empty_file("m1");
+    s.put_skill(&skill).unwrap();
+    s.enqueue(&PendingOp::PushSkill {
+        skill: skill.clone(),
+        base_version: 0,
+    })
+    .unwrap();
+    let client = client_with(&base, &device, device.agent.clone());
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pushed, 1);
+    let posts = posted_ops(&log);
+    let sent = &posts[0][0]["skill"];
+    assert_eq!(sent["files_encoding"], "e1-text");
+    let envelope = format!("e1.{KID}.");
+    let files = sent["files"].as_object().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(files.keys().all(|path| path.starts_with(&envelope)));
+    let mut values: Vec<&str> = files.values().map(|v| v.as_str().unwrap()).collect();
+    values.sort();
+    assert!(values[0].is_empty() && values[1].starts_with(&envelope));
+    // Stored as the old wire stored it: the same e1 text, "" for the empty
+    // file (base64 of nothing is nothing).
+    let stored = relay
+        .lock()
+        .unwrap()
+        .skills
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(stored.files.len(), 2);
+    for (path, value) in files {
+        assert_eq!(stored.files[path], value.as_str().unwrap().as_bytes());
+    }
+    assert_eq!(
+        crate::memory::fake_station_skills::row(&stored)["files_encoding"],
+        "e1-text"
+    );
+
+    // Another machine pulls it back whole: the same files and hash.
+    let other = Store::open_in_memory().unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&other, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    let pulled = other
+        .get_skill(Scope::Global, "", "deploy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pulled.files, skill.files);
+    assert_eq!(pulled.content_hash, skill_hash(&skill.files));
+    assert!(
+        skill_requests(&log)
+            .iter()
+            .all(|(_, p)| p.starts_with("/api/skills"))
+    );
+}
+
+/// A sealed skill with an empty file in a `base64` row (the stored form;
+/// the Station serves such a row as `e1-text`, but a `base64` row of any
+/// bytes is valid): the client reads it as the same bytes and opens it
+/// whole.
+#[tokio::test]
+async fn a_sealed_skill_with_an_empty_file_served_as_base64_opens_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let skill = skill_with_an_empty_file("m2");
+    let mut sealed = context(&device).encrypt_skill(skill.clone()).unwrap();
+    sealed.seq = 5;
+    assert!(sealed.files.values().any(Vec::is_empty));
+    let mut row = serde_json::to_value(&sealed).unwrap();
+    row["files_encoding"] = serde_json::json!("base64");
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay);
+    let (base, _log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "GET" && p.starts_with("/api/skills?") {
+            let rows = if since(p) < 5 {
+                vec![row.clone()]
+            } else {
+                Vec::new()
+            };
+            return (200, serde_json::json!({"skills": rows}));
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    let (_home, ctx) = test_ctx();
+    let client = client_with(&base, &device, device.agent.clone());
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(out.pulled, 1);
+    let pulled = s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!(pulled.files, skill.files);
+    assert_eq!(pulled.content_hash, skill_hash(&skill.files));
+}
+
+/// A skill push whose outcome is unknown (the connection closed with no
+/// answer) stays queued and goes again by the same route in the same
+/// format: never in another format.
+///
+/// Here the Station hadn't applied the first POST. A known pre-existing
+/// bug (not F8's; the legacy wire had it too) makes the other
+/// case unreadable: the Station stores every push as `max(version) + 1`,
+/// but a sealed skill's associated data names the version it was sealed
+/// under (`scope:name:version`). A sealed push the Station had already
+/// applied is stored again under a version its envelopes don't name, and
+/// every reader's skill pull then fails ("encrypted field authentication
+/// failed"); a concurrent push from another machine does the same. The
+/// owner decided the fix on Atem #130 (comment 6726291208): the Station
+/// stores the version the push was sealed under, or answers
+/// `version_conflict`.
+#[tokio::test]
+async fn an_uncertain_skill_push_goes_again_in_the_same_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let first = AtomicBool::new(true);
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            return (0, serde_json::Value::Null);
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    let skill = skill_with_an_empty_file("m1");
+    s.put_skill(&skill).unwrap();
+    s.enqueue(&PendingOp::PushSkill {
+        skill,
+        base_version: 0,
+    })
+    .unwrap();
+    let client = client_with(&base, &device, device.agent.clone());
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.offline, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 1);
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.offline && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert_eq!(relay.lock().unwrap().skills.len(), 1);
+    let posts = posted_ops(&log);
+    assert_eq!(posts.len(), 2);
+    for post in &posts {
+        assert_eq!(post[0]["skill"]["files_encoding"], "e1-text");
+    }
+    let requests = skill_requests(&log);
+    assert!(
+        requests.iter().all(|(_, p)| p.starts_with("/api/skills")),
+        "{requests:?}"
+    );
+    assert_eq!(
+        requests.iter().filter(|(m, _)| m == "POST").count(),
+        2,
+        "{requests:?}"
+    );
+}
+
+/// A migration rewrites a skill with an empty file as `e1-text` (the empty
+/// file `""`) while enabling, and back as `base64` while disabling: the
+/// stored row ends as it started, and both read-backs pass.
+#[tokio::test]
+async fn a_migration_rewrites_an_empty_skill_file_as_e1_text_and_back_as_base64() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = device(dir.path(), EncryptionMode::Enabling);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let skill = skill_with_an_empty_file("m2");
+    relay.lock().unwrap().put_skill(skill.clone());
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let client = client_with(&base, &device, device.agent.clone());
+    client.migrate_encryption().await.unwrap();
+    let rewrite = posted_ops(&log)[0][0].clone();
+    assert_eq!(rewrite["op"], "rewrite");
+    assert_eq!(rewrite["files_encoding"], "e1-text");
+    let envelope = format!("e1.{KID}.");
+    let mut values: Vec<&str> = rewrite["files"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    values.sort();
+    assert!(values[0].is_empty() && values[1].starts_with(&envelope));
+    client.verify_encryption_migration().await.unwrap();
+    let sealed = relay
+        .lock()
+        .unwrap()
+        .skills
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(sealed.files.values().any(Vec::is_empty));
+
+    device.state(EncryptionMode::Disabling, Some(KID));
+    client.migrate_encryption().await.unwrap();
+    let posts = posted_ops(&log);
+    let rewrite = &posts.last().unwrap()[0];
+    assert_eq!(rewrite["files_encoding"], "base64");
+    client.verify_encryption_migration().await.unwrap();
+    let plain = relay
+        .lock()
+        .unwrap()
+        .skills
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        Skill {
+            seq: skill.seq,
+            ..plain
+        },
+        Skill {
+            seq: skill.seq,
+            ..skill
+        }
+    );
+    assert!(
+        skill_requests(&log)
+            .iter()
+            .all(|(_, p)| p.starts_with("/api/skills"))
+    );
+}
+
+// ─────────────── skill versions: compare-and-set, holds ───────────────
+
+use crate::memory::fake_station_skills::Versioning;
+
+/// Queues a push of `skill` on `base_version` (as `atem skill add` does).
+fn queue_skill(s: &Store, skill: Skill, base_version: i64) {
+    s.put_skill(&skill).unwrap();
+    s.enqueue(&PendingOp::PushSkill {
+        skill,
+        base_version,
+    })
+    .unwrap();
+}
+
+fn a_relay(versioning: Versioning) -> Arc<Mutex<KeepingRelay>> {
+    Arc::new(Mutex::new(KeepingRelay::with(versioning)))
+}
+
+fn versions(relay: &Mutex<KeepingRelay>, name: &str) -> Vec<i64> {
+    let r = relay.lock().unwrap();
+    let mut versions: Vec<i64> = r
+        .skills
+        .values()
+        .filter(|k| k.name == name)
+        .map(|k| k.version)
+        .collect();
+    versions.sort();
+    versions
+}
+
+fn clean(out: &SyncOutcome) {
+    assert!(
+        out.notes.is_empty() && !out.relay_error && !out.offline,
+        "{:?}",
+        out.notes
+    );
+}
+
+const CONCURRENT: &str = "another machine pushed an edit at the same time";
+
+/// A push the Station applied but whose answer was lost goes again at the
+/// same version: the Station answers `version_conflict`, Atem reads that
+/// version, finds its own write (the same content hash and metadata; the
+/// files differ only in their nonces) and acks it. One row, readable.
+#[tokio::test]
+async fn an_applied_push_whose_answer_was_lost_is_acked_once_its_conflict_is_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Kept);
+    let keeping = keeping_relay(relay.clone());
+    let first = AtomicBool::new(true);
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        let answer = keeping(m, p, body);
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            // Applied, never answered.
+            return (0, serde_json::Value::Null);
+        }
+        answer
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    let skill = skill_with_an_empty_file("m1");
+    queue_skill(&s, skill.clone(), 0);
+    let client = client_with(&base, &device, device.agent.clone());
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.offline, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 1);
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    clean(&out);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert_eq!(versions(&relay, "deploy"), vec![1]);
+    assert_eq!(
+        skill_requests(&log),
+        [
+            ("POST", "/api/skills/batch"),
+            ("POST", "/api/skills/batch"),
+            ("GET", "/api/skills/version"),
+            ("GET", "/api/skills"),
+        ]
+        .map(|(m, p)| (m.to_string(), p.to_string()))
+    );
+    let local = s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!(
+        (local.version, local.files.clone()),
+        (1, skill.files.clone())
+    );
+
+    // Another machine reads it whole.
+    let other = Store::open_in_memory().unwrap();
+    let (_home, ctx) = test_ctx();
+    clean(
+        &run_sync(&other, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    let pulled = other
+        .get_skill(Scope::Global, "", "deploy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pulled.files, skill.files);
+}
+
+/// Two machines push the same skill at the same version: the first is
+/// stored; the second meets `version_conflict`, finds another machine's
+/// edit there, re-bases onto the next version (sealed again at the next
+/// sync) and lands. Every device reads both versions.
+#[tokio::test]
+async fn two_machines_pushing_the_same_skill_keep_both_versions_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Kept);
+    let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+    let client = client_with(&base, &device, device.agent.clone());
+    let (a, b) = (
+        Store::open_in_memory().unwrap(),
+        Store::open_in_memory().unwrap(),
+    );
+    let edit_a = super::tests::skill_v1("deploy", "# deploy, as machine a has it", "m1");
+    let edit_b = super::tests::skill_v1("deploy", "# deploy, as machine b has it", "m2");
+    queue_skill(&a, edit_a.clone(), 0);
+    queue_skill(&b, edit_b.clone(), 0);
+    let ((_ha, ctx_a), (_hb, ctx_b)) = (test_ctx(), test_ctx());
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+
+    let out = run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+        .await
+        .unwrap();
+    // What is true now: A's v1 is the latest; B's edit goes on top next.
+    assert_eq!(
+        out.notes,
+        vec![format!(
+            "skill deploy: {CONCURRENT}; its v1 is the latest for now, and this machine's edit will be pushed on top as v2 at the next sync. Both versions are kept: see them with `atem skill history deploy`."
+        )]
+    );
+    assert!(!out.relay_error && !out.offline);
+    // The conflicted push wasn't acked: not counted as pushed.
+    assert_eq!((out.pushed, out.rebased), (0, 1));
+    let queued = b.pending().unwrap();
+    assert_eq!(queued.len(), 1);
+    match &queued[0].1 {
+        PendingOp::PushSkill {
+            skill,
+            base_version,
+        } => {
+            assert_eq!((skill.version, *base_version), (2, 1));
+            assert_eq!(skill.files, edit_b.files);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The local edit moved with it: A's pulled v1 doesn't replace it.
+    let local = b.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((local.version, local.files), (2, edit_b.files.clone()));
+
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b.pending_count().unwrap(), 0);
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2]);
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    let latest = a.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((latest.version, latest.files), (2, edit_b.files.clone()));
+    for (version, edit) in [(1, &edit_a), (2, &edit_b)] {
+        let opened = client
+            .skill_version(Scope::Global, "", "deploy", version)
+            .await
+            .unwrap();
+        assert_eq!(opened.files, edit.files, "v{version}");
+    }
+}
+
+/// Two queued pushes of one skill in one batch: the first meets another
+/// machine's version, the second lands on top of it. The first is acked,
+/// never pushed again: the newer edit already went out.
+#[tokio::test]
+async fn a_conflicted_push_superseded_by_a_later_one_in_the_batch_is_acked() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Kept);
+    let theirs = super::tests::skill_v1("deploy", "# deploy from m2", "m2");
+    relay
+        .lock()
+        .unwrap()
+        .put_skill(context(&device).encrypt_skill(theirs).unwrap());
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    let first = super::tests::skill_v1("deploy", "# first edit", "m1");
+    let mut second = super::tests::skill_v1("deploy", "# second edit", "m1");
+    second.version = 2;
+    second.content_hash = skill_hash(&second.files);
+    queue_skill(&s, first, 0);
+    queue_skill(&s, second.clone(), 1);
+    let client = client_with(&base, &device, device.agent.clone());
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.relay_error && !out.offline, "{:?}", out.notes);
+    assert_eq!(out.notes.len(), 1, "{:?}", out.notes);
+    assert!(out.notes[0].contains(CONCURRENT), "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert_eq!(posted_ops(&log).len(), 1);
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2]);
+    let local = s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((local.version, local.files), (2, second.files));
+}
+
+/// A conflict in chunk 1 coalesces the skill's queued pushes into its
+/// newest edit, re-based past the Station's version, and holds the skill
+/// back for the rest of the sync: chunk 2's push of it isn't sent (nor
+/// sealed again), so the Station never has a gap a third machine could
+/// fill. A third machine pushing in between meets no gap; the newest edit
+/// is re-based again past it and lands last; the older edit never becomes
+/// a version.
+#[tokio::test]
+async fn a_conflict_holds_the_skill_back_and_coalesces_its_pushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let recorder = Recorder::new(device.agent.clone());
+    let relay = a_relay(Versioning::Kept);
+    let theirs = super::tests::skill_v1("deploy", "# deploy from m2", "m2");
+    relay
+        .lock()
+        .unwrap()
+        .put_skill(context(&device).encrypt_skill(theirs).unwrap());
+    let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+    let s = Store::open_in_memory().unwrap();
+    // Chunk 1: deploy's first edit and seven others; chunk 2: deploy's
+    // second edit and one other.
+    queue_skill(
+        &s,
+        super::tests::skill_v1("deploy", "# first edit", "m1"),
+        0,
+    );
+    for i in 0..7 {
+        queue_skill(
+            &s,
+            super::tests::skill_v1(&format!("other{i}"), "# other", "m1"),
+            0,
+        );
+    }
+    let mut second = super::tests::skill_v1("deploy", "# second edit", "m1");
+    second.version = 2;
+    second.content_hash = skill_hash(&second.files);
+    queue_skill(&s, second.clone(), 1);
+    queue_skill(&s, super::tests::skill_v1("last", "# last", "m1"), 0);
+    let client = client_with(&base, &device, recorder.clone());
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.relay_error && !out.offline, "{:?}", out.notes);
+    assert_eq!(
+        out.notes,
+        vec![format!(
+            "skill deploy: {CONCURRENT}; its v1 is the latest for now, and this machine's edit will be pushed on top as v2 at the next sync. Both versions are kept: see them with `atem skill history deploy`."
+        )]
+    );
+    // Seven of chunk 1 and `last` were acked; deploy's two pushes wait as one.
+    assert_eq!((out.pushed, out.rebased), (8, 1));
+    // Chunk 1 (8 skills: 8 paths and 8 hashes, then 8 files), chunk 2
+    // sealed ahead (2 and 2, then 2); nothing sealed again.
+    let (seals, _) = recorder.seals_and_opens();
+    assert_eq!(
+        seals.iter().map(|c| c.ops).collect::<Vec<_>>(),
+        vec![16, 8, 4, 2],
+        "{seals:?}"
+    );
+    // Chunk 2 carried only `last`; deploy has no gap.
+    let posts = posted_ops(&log);
+    assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![8, 1]);
+    assert_eq!(versions(&relay, "deploy"), vec![1]);
+    assert_eq!(versions(&relay, "last"), vec![1]);
+    let queued = s.pending().unwrap();
+    assert_eq!(queued.len(), 1);
+    assert!(
+        matches!(&queued[0].1, PendingOp::PushSkill { skill, base_version: 1 } if skill.version == 2 && skill.files == second.files),
+        "{queued:?}"
+    );
+
+    // A third machine pushes v2 meanwhile, into no gap.
+    let third = Store::open_in_memory().unwrap();
+    let (_home3, ctx3) = test_ctx();
+    clean(
+        &run_sync(&third, Some(&client), &ctx3, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    let mut theirs = super::tests::skill_v1("deploy", "# deploy from m3", "m3");
+    theirs.version = 2;
+    theirs.content_hash = skill_hash(&theirs.files);
+    queue_skill(&third, theirs, 1);
+    clean(
+        &run_sync(&third, Some(&client), &ctx3, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2]);
+
+    // Our newest edit meets it, is re-based past it, and lands last.
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(
+        out.notes.iter().any(|n| n.contains(CONCURRENT)),
+        "{:?}",
+        out.notes
+    );
+    clean(
+        &run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2, 3]);
+    let local = s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((local.version, local.files), (3, second.files.clone()));
+    // Every version opens, and the first edit is none of them.
+    for version in 1..=3 {
+        let opened = client
+            .skill_version(Scope::Global, "", "deploy", version)
+            .await
+            .unwrap();
+        assert_ne!(
+            opened.files["SKILL.md"],
+            b"# first edit".to_vec(),
+            "v{version}"
+        );
+    }
+}
+
+/// The reviewer's case: a push whose conflict couldn't be checked stays
+/// queued while the pull brings another machine's row of the same version.
+/// The local edit stays (a note says so), so the next edit, a full
+/// snapshot, carries it; the next sync acks the old push as superseded and
+/// lands the new one. No edit is lost.
+#[tokio::test]
+async fn an_unpushed_edit_is_kept_over_a_pulled_version_and_lands_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Kept);
+    let theirs = super::tests::skill_v1("deploy", "# deploy from a", "m1");
+    relay
+        .lock()
+        .unwrap()
+        .put_skill(context(&device).encrypt_skill(theirs).unwrap());
+    let keeping = keeping_relay(relay.clone());
+    let first_get = AtomicBool::new(true);
+    let (base, _log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "GET"
+            && p.starts_with("/api/skills/version?")
+            && first_get.swap(false, Ordering::SeqCst)
+        {
+            return (503, serde_json::json!({"error": "temporarily unavailable"}));
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let b = Store::open_in_memory().unwrap();
+    let mine = super::tests::skill_v1("deploy", "# deploy from b", "m2");
+    queue_skill(&b, mine.clone(), 0);
+    let client = client_with(&base, &device, device.agent.clone());
+    let (home, ctx) = test_ctx();
+    // Claude is installed here, so apply writes skill directories.
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    let out = run_sync(&b, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    // The conflict couldn't be checked; the pull still brought A's v1.
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("reading v1 to check it failed")),
+        "{:?}",
+        out.notes
+    );
+    assert!(
+        out.notes.iter().any(|n| n.contains(
+            "another machine pushed an edit (v1) while this machine's edit waits to sync"
+        )),
+        "{:?}",
+        out.notes
+    );
+    let local = b.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!(local.files, mine.files);
+    let installed = home.path().join(".claude/skills/deploy/SKILL.md");
+    assert_eq!(std::fs::read(&installed).unwrap(), b"# deploy from b");
+
+    // The user edits again: a full snapshot of the local skill.
+    let mut again = local.clone();
+    again
+        .files
+        .insert("SKILL.md".into(), b"# deploy from b, and more".to_vec());
+    again.version = 2;
+    again.content_hash = skill_hash(&again.files);
+    queue_skill(&b, again.clone(), 1);
+    let out = run_sync(&b, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.relay_error, "{:?}", out.notes);
+    assert_eq!(b.pending_count().unwrap(), 0);
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2]);
+    let latest = client
+        .skill_version(Scope::Global, "", "deploy", 2)
+        .await
+        .unwrap();
+    assert_eq!(latest.files, again.files);
+}
+
+/// A skill row under a key id this device doesn't hold (it hasn't received
+/// a rotation) stops the pull with the way to get the key: nothing is
+/// held, nothing applied, the cursor stays. So does a locked agent on a
+/// page that also has a row that would be held.
+#[tokio::test]
+async fn a_key_not_held_or_a_locked_agent_stops_the_pull_without_holding() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let other_dir = tempfile::tempdir().unwrap();
+    let mut rotated = UnlockedDevice::new(other_dir.path());
+    rotated.set_key(EncryptionMode::On, "89abcdef", [8; 32]);
+    let rotated_context =
+        EncryptionContext::for_astation_with(ASTATION_ID, &rotated.paths, rotated.agent.clone())
+            .unwrap();
+    for case in ["key not held", "locked agent"] {
+        let relay = a_relay(Versioning::Kept);
+        {
+            let mut r = relay.lock().unwrap();
+            r.put_skill(
+                context(&device)
+                    .encrypt_skill(super::tests::skill_v1("ok", "# ok", "m2"))
+                    .unwrap(),
+            );
+            // A row sealed under v1 but stored as v2: it would be held.
+            let mut bad = context(&device)
+                .encrypt_skill(super::tests::skill_v1("bad", "# bad", "m2"))
+                .unwrap();
+            bad.version = 2;
+            r.put_skill(bad);
+            if case == "key not held" {
+                r.put_skill(
+                    rotated_context
+                        .encrypt_skill(super::tests::skill_v1("rotated", "# rotated", "m3"))
+                        .unwrap(),
+                );
+            }
+        }
+        if case == "locked agent" {
+            device.agent.lock_keys().unwrap();
+        }
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let s = Store::open_in_memory().unwrap();
+        let (_home, ctx) = test_ctx();
+        let client = client_with(&base, &device, device.agent.clone());
+        let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap();
+        assert!(out.relay_error, "{case}: {:?}", out.notes);
+        if case == "key not held" {
+            assert!(
+                out.notes
+                    .iter()
+                    .any(|n| n.contains(crate::memory::crypto::KEY_NOT_HELD)),
+                "{case}: {:?}",
+                out.notes
+            );
+        }
+        assert!(s.held_skills().unwrap().is_empty(), "{case}");
+        assert!(s.all_skills().unwrap().is_empty(), "{case}");
+        assert_eq!(
+            s.get_state(&skill_cursor_key(ASTATION_ID)).unwrap(),
+            0,
+            "{case}"
+        );
+    }
+}
+
+/// A crash inside the commit of a page with a held row leaves neither the
+/// hold nor the page's rows nor the cursor; the next sync pulls the page
+/// again whole and holds the row once.
+#[tokio::test]
+async fn a_crash_while_a_page_with_a_held_row_commits_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Kept);
+    {
+        let mut r = relay.lock().unwrap();
+        r.put_skill(
+            context(&device)
+                .encrypt_skill(super::tests::skill_v1("ok", "# ok", "m2"))
+                .unwrap(),
+        );
+        let mut bad = context(&device)
+            .encrypt_skill(super::tests::skill_v1("bad", "# bad", "m2"))
+            .unwrap();
+        bad.version = 2;
+        r.put_skill(bad);
+    }
+    let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+    let td = tempfile::tempdir().unwrap();
+    let (db, image) = (
+        td.path().join("knowledge.db"),
+        td.path().join("crash/knowledge.db"),
+    );
+    let s = Store::open(&db).unwrap();
+    super::tests::arm_crash(
+        &s,
+        &db,
+        &image,
+        "CREATE TEMP TRIGGER crash_in_held_page BEFORE INSERT ON held_skills BEGIN SELECT crash(); END;",
+    );
+    let client = client_with(&base, &device, device.agent.clone());
+    let (_home, ctx) = test_ctx();
+    let err = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+    drop(s);
+    for s in [Store::open(&db).unwrap(), Store::open(&image).unwrap()] {
+        assert!(s.held_skills().unwrap().is_empty());
+        assert!(s.all_skills().unwrap().is_empty());
+        assert_eq!(s.get_state(&skill_cursor_key(ASTATION_ID)).unwrap(), 0);
+    }
+    let s = Store::open(&image).unwrap();
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.relay_error, "{:?}", out.notes);
+    assert_eq!(s.held_skills().unwrap().len(), 1);
+    assert!(s.get_skill(Scope::Global, "", "ok").unwrap().is_some());
+    let last = relay.lock().unwrap().skills.keys().max().copied().unwrap();
+    assert_eq!(s.get_state(&skill_cursor_key(ASTATION_ID)).unwrap(), last);
+}
+
+/// A Station that renumbers pushes (before Astation PR #76) stores a concurrent push under
+/// a version its envelopes don't name. Every device holds that row (never
+/// applied, reported once) and the pull goes on: later skills apply and the
+/// cursor moves. Once the Station keeps versions, the next edit is re-based
+/// past it, lands readable, and the hold clears.
+#[tokio::test]
+async fn a_skill_row_that_cannot_open_is_held_and_cleared_by_a_later_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Renumbered);
+    let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+    let client = client_with(&base, &device, device.agent.clone());
+    let (a, b, c) = (
+        Store::open_in_memory().unwrap(),
+        Store::open_in_memory().unwrap(),
+        Store::open_in_memory().unwrap(),
+    );
+    let ((_ha, ctx_a), (_hb, ctx_b), (_hc, ctx_c)) = (test_ctx(), test_ctx(), test_ctx());
+    let edit_a = super::tests::skill_v1("deploy", "# deploy from a", "m1");
+    queue_skill(&a, edit_a.clone(), 0);
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    // B's push of the same version is renumbered to v2 (sealed under v1).
+    queue_skill(
+        &b,
+        super::tests::skill_v1("deploy", "# deploy from b", "m2"),
+        0,
+    );
+    run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2]);
+    queue_skill(&a, super::tests::skill_v1("lint", "# lint", "m1"), 0);
+    let out = run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.relay_error, "{:?}", out.notes);
+
+    // C reads everything else: deploy v1, then lint after the held row.
+    let out = run_sync(&c, Some(&client), &ctx_c, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(!out.relay_error && !out.offline, "{:?}", out.notes);
+    assert_eq!(out.notes.len(), 1, "{:?}", out.notes);
+    assert!(
+        out.notes[0].contains("deploy v2") && out.notes[0].contains("can't open"),
+        "{:?}",
+        out.notes
+    );
+    let held = c.held_skills().unwrap();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(
+        (
+            held[0].scope,
+            held[0].project.as_str(),
+            held[0].name.as_str(),
+            held[0].version
+        ),
+        (Scope::Global, "", "deploy", 2)
+    );
+    assert!(held[0].reason.contains("authentication failed"), "{held:?}");
+    let deploy = c.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((deploy.version, deploy.files), (1, edit_a.files.clone()));
+    assert!(c.get_skill(Scope::Global, "", "lint").unwrap().is_some());
+    let last_seq = relay.lock().unwrap().skills.keys().max().copied().unwrap();
+    assert_eq!(
+        c.get_state(&skill_cursor_key(ASTATION_ID)).unwrap(),
+        last_seq
+    );
+    // Reported once; still held.
+    clean(
+        &run_sync(&c, Some(&client), &ctx_c, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(c.held_skills().unwrap().len(), 1);
+
+    // The Station keeps versions: A's next edit (on its v1) meets B's v2, is
+    // re-based onto v3, sealed again there, and lands readable.
+    relay.lock().unwrap().versioning = Versioning::Kept;
+    let mut again = super::tests::skill_v1("deploy", "# deploy from a, again", "m1");
+    again.version = 2;
+    again.content_hash = skill_hash(&again.files);
+    queue_skill(&a, again.clone(), 1);
+    let out = run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(
+        out.notes.iter().any(|n| n.contains(CONCURRENT)),
+        "{:?}",
+        out.notes
+    );
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2, 3]);
+    clean(
+        &run_sync(&c, Some(&client), &ctx_c, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert!(c.held_skills().unwrap().is_empty());
+    let deploy = c.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((deploy.version, deploy.files), (3, again.files));
+}
+
+/// A row that breaks skill wire v2's rules still refuses its page while
+/// encryption is on: holding is only for well-formed rows that don't open.
+#[tokio::test]
+async fn a_malformed_skill_row_still_refuses_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let sealed = context(&device)
+        .encrypt_skill(super::tests::skill_v1("deploy", "# deploy", "m2"))
+        .unwrap();
+    let mut good = crate::memory::fake_station_skills::row(&Skill {
+        seq: 1,
+        ..sealed.clone()
+    });
+    good["seq"] = serde_json::json!(1);
+    let mut bad = crate::memory::fake_station_skills::row(&Skill {
+        name: "lint".into(),
+        seq: 2,
+        ..sealed
+    });
+    let path = bad["files"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    bad["files"][path] = serde_json::json!("plaintext");
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay);
+    let (base, _log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "GET" && p.starts_with("/api/skills?") {
+            let rows = if since(p) < 2 {
+                vec![good.clone(), bad.clone()]
+            } else {
+                Vec::new()
+            };
+            return (200, serde_json::json!({"skills": rows}));
+        }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    let (_home, ctx) = test_ctx();
+    let client = client_with(&base, &device, device.agent.clone());
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("unexpected relay response")),
+        "{:?}",
+        out.notes
+    );
+    assert!(s.all_skills().unwrap().is_empty());
+    assert!(s.held_skills().unwrap().is_empty());
+    assert_eq!(s.get_state(&skill_cursor_key(ASTATION_ID)).unwrap(), 0);
+}
+
+/// The Station's compare-and-set counts tombstones: a push's base is the
+/// skill's latest version, a tombstone included. After a delete here (its
+/// tombstone at the next version, as the Station appends it) and after one
+/// pulled from another machine, the next push builds on the tombstone and
+/// lands with no conflict.
+#[tokio::test]
+async fn a_push_after_a_delete_builds_on_the_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::On);
+    let relay = a_relay(Versioning::Kept);
+    let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+    let client = client_with(&base, &device, device.agent.clone());
+    let (a, b) = (
+        Store::open_in_memory().unwrap(),
+        Store::open_in_memory().unwrap(),
+    );
+    let ((_ha, ctx_a), (_hb, ctx_b)) = (test_ctx(), test_ctx());
+    queue_skill(&a, super::tests::skill_v1("deploy", "# deploy", "m1"), 0);
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    // A removes it (as `atem skill rm`) and adds it again (as `atem skill
+    // add`, on the local tombstone's version).
+    let mut tombstone = a.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    tombstone.version += 1;
+    tombstone.deleted = true;
+    tombstone.files.clear();
+    tombstone.content_hash.clear();
+    a.put_skill(&tombstone).unwrap();
+    a.enqueue(&PendingOp::DeleteSkill {
+        scope: Scope::Global,
+        project: String::new(),
+        name: "deploy".into(),
+    })
+    .unwrap();
+    let mut again = super::tests::skill_v1("deploy", "# deploy again", "m1");
+    again.version = 3;
+    again.content_hash = skill_hash(&again.files);
+    queue_skill(&a, again.clone(), 2);
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2, 3]);
+    // B pulls the tombstone and the new version; its next edit builds on v3.
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    let local = b.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    assert_eq!((local.version, local.files), (3, again.files));
+    // A removes it again; B pulls only that tombstone and adds on it.
+    let mut tombstone = a.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
+    tombstone.version += 1;
+    tombstone.deleted = true;
+    tombstone.files.clear();
+    tombstone.content_hash.clear();
+    a.put_skill(&tombstone).unwrap();
+    a.enqueue(&PendingOp::DeleteSkill {
+        scope: Scope::Global,
+        project: String::new(),
+        name: "deploy".into(),
+    })
+    .unwrap();
+    clean(
+        &run_sync(&a, Some(&client), &ctx_a, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    let base_version = b
+        .get_skill(Scope::Global, "", "deploy")
+        .unwrap()
+        .unwrap()
+        .version;
+    assert_eq!(base_version, 4);
+    let mut from_b = super::tests::skill_v1("deploy", "# deploy from b", "m2");
+    from_b.version = base_version + 1;
+    from_b.content_hash = skill_hash(&from_b.files);
+    queue_skill(&b, from_b, base_version);
+    clean(
+        &run_sync(&b, Some(&client), &ctx_b, &NO_HARVEST)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(&relay, "deploy"), vec![1, 2, 3, 4, 5]);
+}
+
+/// A migration (and its read-back) that meets a skill row which doesn't
+/// open names it and the way to remove it; once that version is purged, it
+/// finishes. Its completion rules are unchanged.
+#[tokio::test]
+async fn a_migration_names_a_skill_row_that_cannot_open_and_how_to_remove_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device(dir.path(), EncryptionMode::Enabling);
+    let relay = a_relay(Versioning::Kept);
+    {
+        // Both already sealed under the key (so the read-back's field checks
+        // pass); one stored under a version it wasn't sealed under.
+        let mut r = relay.lock().unwrap();
+        r.put_skill(
+            context(&device)
+                .encrypt_skill(super::tests::skill_v1("ok", "# ok", "m2"))
+                .unwrap(),
+        );
+        let mut bad = context(&device)
+            .encrypt_skill(super::tests::skill_v1("bad", "# bad", "m2"))
+            .unwrap();
+        bad.version = 2;
+        r.put_skill(bad);
+    }
+    let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+    let client = client_with(&base, &device, device.agent.clone());
+    let want = "skill bad v2 (global) can't be opened on this device (encrypted field authentication failed), so this can't finish. Remove that version with `atem skill purge bad --version 2`, then try again.";
+    let error = client.migrate_encryption().await.unwrap_err().to_string();
+    assert!(error.contains(want), "{error}");
+    let error = client
+        .verify_encryption_migration()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(want), "{error}");
+
+    // The purge (as `atem skill purge bad --version 2` queues it) blanks it.
+    let s = Store::open_in_memory().unwrap();
+    s.enqueue(&PendingOp::PurgeSkill {
+        scope: Scope::Global,
+        project: String::new(),
+        name: "bad".into(),
+        versions: Some(vec![2]),
+    })
+    .unwrap();
+    let (_home, ctx) = test_ctx();
+    run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    client.migrate_encryption().await.unwrap();
+    client.verify_encryption_migration().await.unwrap();
+}

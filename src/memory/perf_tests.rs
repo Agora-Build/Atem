@@ -20,6 +20,7 @@ use crate::memory::device_keys::{DeviceKeys, UnlockAuthKey};
 use crate::memory::fake_astation::{
     ACCOUNT, ASTATION_ID, DEVICE_ID, UnlockedDevice, pin, set_state,
 };
+use crate::memory::fake_station_skills;
 use crate::memory::grant::seal_k_grant;
 use crate::memory::model::{Memory, Scope, Skill, content_hash, skill_hash};
 use crate::memory::statements::FakeAstation;
@@ -389,6 +390,8 @@ struct RelayData {
     requests: usize,
     up_bytes: usize,
     down_bytes: usize,
+    /// The length of the last pushed skill's first file value, as sent.
+    last_file_value: usize,
 }
 
 impl RelayData {
@@ -631,8 +634,28 @@ fn handle(
         ("GET", "/api/memory") => {
             json!({"memories": data.memories.range(since + 1..).take(limit).map(|(_, m)| m).collect::<Vec<_>>()})
         }
-        ("GET", "/api/skills") => {
-            json!({"skills": data.skills.range(since + 1..).take(limit).map(|(_, s)| s).collect::<Vec<_>>()})
+        // Skills as the Station's skill file transport serves
+        // them (`fake_station_skills`), the rows kept in their stored form.
+        ("GET", "/api/skills") => fake_station_skills::page(
+            data.skills
+                .range(since + 1..)
+                .take(limit)
+                .map(|(_, s)| s),
+        ),
+        ("GET", "/api/skills/version") => {
+            let name = query(target, "name").unwrap_or_default();
+            let version: i64 = query(target, "version")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let stored = data
+                .skill_seq
+                .get(&(name, version))
+                .and_then(|seq| data.skills.get(seq));
+            // This relay answers 200 only: a version it lacks panics.
+            match fake_station_skills::version_answer(stored, false) {
+                (200, row) => row,
+                (_, error) => panic!("the perf relay has no such skill version: {error}"),
+            }
         }
         ("POST", "/api/memory/batch") => {
             let mut results = Vec::new();
@@ -660,33 +683,46 @@ fn handle(
             json!({"results": results})
         }
         ("POST", "/api/skills/batch") => {
-            let mut results = Vec::new();
-            for op in body["ops"].as_array().unwrap() {
-                match op["op"].as_str().unwrap() {
-                    "push" => {
-                        let skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
-                        let version = skill.version;
-                        let seq = data.put_skill(skill);
-                        results.push(json!({"ok": true, "version": version, "seq": seq}));
-                    }
-                    "rewrite" => {
-                        let key = (
-                            op["name"].as_str().unwrap().to_string(),
-                            op["version"].as_i64().unwrap(),
-                        );
-                        let old = data.skill_seq[&key];
-                        let mut skill = data.skills.remove(&old).unwrap();
-                        skill.project = op["project"].as_str().unwrap().into();
-                        skill.files = serde_json::from_value(op["files"].clone()).unwrap();
-                        skill.content_hash = op["content_hash"].as_str().unwrap().into();
-                        let version = skill.version;
-                        let seq = data.put_skill(skill);
-                        results.push(json!({"ok": true, "version": version, "seq": seq}));
-                    }
-                    _ => results.push(json!({"ok": true})),
-                }
+            // The file's value as sent, before the Station stores it.
+            if let Some(value) = body["ops"][0]["skill"]["files"]
+                .as_object()
+                .and_then(|files| files.values().next())
+                .and_then(Value::as_str)
+            {
+                data.last_file_value = value.len();
             }
-            json!({"results": results})
+            let data = &mut *data;
+            fake_station_skills::batch_ok(body, |op| match op["op"].as_str().unwrap() {
+                "push" => {
+                    let skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
+                    // At the version it was sealed under (compare-and-set).
+                    let existing = data.skills.values().filter(|s| s.name == skill.name);
+                    let existing = existing.map(|s| (s.version, s.deleted)).collect::<Vec<_>>();
+                    match fake_station_skills::push_version(Default::default(), op, existing) {
+                        Ok(_) => {
+                            let version = skill.version;
+                            let seq = data.put_skill(skill);
+                            json!({"ok": true, "version": version, "seq": seq})
+                        }
+                        Err(conflict) => conflict,
+                    }
+                }
+                "rewrite" => {
+                    let key = (
+                        op["name"].as_str().unwrap().to_string(),
+                        op["version"].as_i64().unwrap(),
+                    );
+                    let old = data.skill_seq[&key];
+                    let mut skill = data.skills.remove(&old).unwrap();
+                    skill.project = op["project"].as_str().unwrap().into();
+                    skill.files = crate::memory::model::b64map::deserialize(&op["files"]).unwrap();
+                    skill.content_hash = op["content_hash"].as_str().unwrap().into();
+                    let version = skill.version;
+                    let seq = data.put_skill(skill);
+                    json!({"ok": true, "version": version, "seq": seq})
+                }
+                _ => json!({"ok": true}),
+            })
         }
         ("POST", "/api/vault") => {
             let id = format!("v-{}", data.vaults.len() + 1);
@@ -2404,7 +2440,7 @@ fn perf_6_ciphertext_sizes() {
     );
 
     println!(
-        "\n### 6b. One skill file (push op JSON; files are base64 on the wire, so a sealed file is base64 of the e1 text)"
+        "\n### 6b. One skill file (push op JSON: a sealed file is its e1 text, a plain one base64)"
     );
     println!(
         "| file B | path B plain→sealed | stored file B (e1 text) | ratio | push JSON off B | push JSON on B | wire ratio |"
@@ -2425,7 +2461,7 @@ fn perf_6_ciphertext_sizes() {
         .len();
         let sealed = context.encrypt_skills(vec![skill]).unwrap().remove(0);
         let (path, bytes) = sealed.files.iter().next().unwrap();
-        let on = serde_json::to_vec(&json!({"op": "push", "skill": sealed, "base_version": 0}))
+        let on = serde_json::to_vec(&json!({"op": "push", "skill": crate::memory::skill_wire::sealed_skill(&sealed).unwrap(), "base_version": 0}))
             .unwrap()
             .len();
         println!(
@@ -2484,6 +2520,134 @@ fn perf_6_ciphertext_sizes() {
             n.max(1),
             sealed.len(),
             12 + 4 * (n.max(1) + 40).div_ceil(3)
+        );
+    }
+}
+
+// ───────────────────────── 7. a skill file on the wire ─────────────────────────
+
+/// One skill with one `SKILL.md` of `size` bytes pushed to and pulled from
+/// the fake relay through `KnowledgeClient`: the HTTP bodies as sent and
+/// received, the file's value inside the push, and the median times (F8,
+/// budget "skill files at most 1.4× raw on the wire").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn perf_7_skill_file_wire() {
+    let relay = Relay::start();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut off = UnlockedDevice::new(a.path());
+    off.state(EncryptionMode::Off, None);
+    let mut on = UnlockedDevice::new(b.path());
+    on.set_key(EncryptionMode::On, KID, KEY);
+    settle();
+    println!("\n## 7. One skill file on the wire (push body up, pull body down)");
+    println!(
+        "| mode | file B | file value B | value ×raw | push body B | push ×raw | pull body B | pull ×raw | push ms | pull ms |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for (label, device) in [("off", &off), ("on", &on)] {
+        let knowledge = relay.knowledge(&device.paths, device.agent.clone());
+        for size in [1usize << 10, 64 << 10, 1 << 20] {
+            let files = BTreeMap::from([("SKILL.md".to_string(), text(size, 7).into_bytes())]);
+            let op = PendingOp::PushSkill {
+                skill: Skill {
+                    content_hash: skill_hash(&files),
+                    files,
+                    ..skill(0, 1, 1)
+                },
+                base_version: 0,
+            };
+            let reps = if size >= 1 << 20 { 9 } else { 21 };
+            let (mut pushes, mut pulls) = (Vec::new(), Vec::new());
+            let (mut value, mut up, mut down) = (0, 0, 0);
+            for _ in 0..reps + 1 {
+                relay.reset();
+                let start = Instant::now();
+                knowledge.push(&[&op], false).await.unwrap();
+                pushes.push(start.elapsed());
+                let (_, sent, _) = relay.traffic();
+                value = relay.data.lock().unwrap().last_file_value;
+                relay.reset_counters();
+                let start = Instant::now();
+                let pulled = knowledge.pull_skills(0).await.unwrap();
+                pulls.push(start.elapsed());
+                assert_eq!(pulled.len(), 1);
+                let PendingOp::PushSkill { skill, .. } = &op else { unreachable!() };
+                assert_eq!(pulled[0].files, skill.files);
+                let (_, _, received) = relay.traffic();
+                (up, down) = (sent, received);
+            }
+            // The first run warms up.
+            pushes.remove(0);
+            pulls.remove(0);
+            println!(
+                "| {label} | {size} | {value} | {:.3} | {up} | {:.3} | {down} | {:.3} | {:.2} | {:.2} |",
+                value as f64 / size as f64,
+                up as f64 / size as f64,
+                down as f64 / size as f64,
+                ms(median(pushes)),
+                ms(median(pulls)),
+            );
+        }
+    }
+
+    // The client's own cost of each representation of one sealed skill,
+    // side by side in this process: the push body built and serialized, the
+    // pulled row parsed into a `Skill`. Legacy is `Skill`'s own serde
+    // (base64 of the e1 text), what the client sent and read before F8.
+    let context =
+        EncryptionContext::for_astation_with(ASTATION_ID, &on.paths, on.agent.clone()).unwrap();
+    println!("\n### 7b. The client's cost per sealed skill, e1-text against legacy base64 (median µs)");
+    println!("| file B | build push body e1-text | legacy | parse pulled row e1-text | legacy |");
+    println!("|---|---|---|---|---|");
+    for size in [1usize << 10, 64 << 10, 1 << 20] {
+        let files = BTreeMap::from([("SKILL.md".to_string(), text(size, 7).into_bytes())]);
+        let sealed = context
+            .encrypt_skills(vec![Skill {
+                content_hash: skill_hash(&files),
+                files,
+                ..skill(0, 1, 1)
+            }])
+            .unwrap()
+            .remove(0);
+        let reps = if size >= 1 << 20 { 31 } else { 201 };
+        let push_e1 = bench(reps, || {
+            let skill = crate::memory::skill_wire::sealed_skill(&sealed).unwrap();
+            std::hint::black_box(
+                serde_json::to_vec(&json!({"ops": [{"op": "push", "skill": skill, "base_version": 0}]}))
+                    .unwrap(),
+            );
+        });
+        let push_legacy = bench(reps, || {
+            std::hint::black_box(
+                serde_json::to_vec(&json!({"ops": [{"op": "push", "skill": &sealed, "base_version": 0}]}))
+                    .unwrap(),
+            );
+        });
+        let e1_page = serde_json::to_vec(&fake_station_skills::page([&sealed])).unwrap();
+        let legacy_page = serde_json::to_vec(&json!({"skills": [&sealed]})).unwrap();
+        // Parsed straight from the body, as `KnowledgeClient` does.
+        #[derive(serde::Deserialize)]
+        struct Page<T> {
+            skills: Vec<T>,
+        }
+        let pull_e1 = bench(reps, || {
+            let page: Page<crate::memory::skill_wire::WireSkill> =
+                serde_json::from_slice(&e1_page).unwrap();
+            for row in page.skills {
+                std::hint::black_box(row.into_skill().unwrap());
+            }
+        });
+        let pull_legacy = bench(reps, || {
+            let page: Page<Skill> = serde_json::from_slice(&legacy_page).unwrap();
+            std::hint::black_box(page.skills);
+        });
+        println!(
+            "| {size} | {:.1} | {:.1} | {:.1} | {:.1} |",
+            us(push_e1),
+            us(push_legacy),
+            us(pull_e1),
+            us(pull_legacy)
         );
     }
 }

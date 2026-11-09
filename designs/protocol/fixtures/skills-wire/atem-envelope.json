@@ -1,0 +1,84 @@
+{
+  "description": "Atem's synthetic skill file transport vector: a real XChaCha20-Poly1305 e1 envelope under a synthetic key and fixed nonces, its legacy base64 form, and a skill row as it travels (wire) and as the Station stores it, also with an empty file.",
+  "empty_file_stored_skill": {
+    "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "created_at": 1700000000,
+    "deleted": false,
+    "files": {
+      "e1.0123abcd.ERERERERERERERERERERERERERERERERsYukH0SCebvIWs9GxQ9Haq4gzXNVZYmx": "ZTEuMDEyM2FiY2QuSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWl0VUxWdHgwT3BKTzc1V25nRHhHdUJxc2QvbFd3eXhjeHo2elVFVitTTkd5RzNjdEE0UzhxNUJsM1dvNGdKMUE9",
+      "e1.0123abcd.MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzJJwjCie7lCsyXPmhgd7yAl6qCRl4Pa8i": ""
+    },
+    "name": "demo",
+    "project": "",
+    "scope": "global",
+    "seq": 7,
+    "source_agent": "test",
+    "source_machine": "synthetic",
+    "version": 1
+  },
+  "empty_file_wire_skill": {
+    "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "created_at": 1700000000,
+    "deleted": false,
+    "files": {
+      "e1.0123abcd.ERERERERERERERERERERERERERERERERsYukH0SCebvIWs9GxQ9Haq4gzXNVZYmx": "e1.0123abcd.IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIitULVtx0OpJO75WngDxGuBqsd/lWwyxcxz6zUEV+SNGyG3ctA4S8q5Bl3Wo4gJ1A=",
+      "e1.0123abcd.MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzJJwjCie7lCsyXPmhgd7yAl6qCRl4Pa8i": ""
+    },
+    "files_encoding": "e1-text",
+    "name": "demo",
+    "project": "",
+    "scope": "global",
+    "seq": 7,
+    "source_agent": "test",
+    "source_machine": "synthetic",
+    "version": 1
+  },
+  "file": {
+    "envelope": "e1.0123abcd.IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIitULVtx0OpJO75WngDxGuBqsd/lWwyxcxz6zUEV+SNGyG3ctA4S8q5Bl3Wo4gJ1A=",
+    "field": "file:e1.0123abcd.ERERERERERERERERERERERERERERERERsYukH0SCebvIWs9GxQ9Haq4gzXNVZYmx",
+    "legacy_base64": "ZTEuMDEyM2FiY2QuSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWl0VUxWdHgwT3BKTzc1V25nRHhHdUJxc2QvbFd3eXhjeHo2elVFVitTTkd5RzNjdEE0UzhxNUJsM1dvNGdKMUE9",
+    "nonce_hex": "222222222222222222222222222222222222222222222222",
+    "plain": "# demo\nA synthetic skill file.\n"
+  },
+  "key_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "kid": "0123abcd",
+  "path": {
+    "envelope": "e1.0123abcd.ERERERERERERERERERERERERERERERERsYukH0SCebvIWs9GxQ9Haq4gzXNVZYmx",
+    "field": "path",
+    "legacy_base64": "ZTEuMDEyM2FiY2QuRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJzWXVrSDBTQ2VidklXczlHeFE5SGFxNGd6WE5WWllteA==",
+    "nonce_hex": "111111111111111111111111111111111111111111111111",
+    "plain": "SKILL.md"
+  },
+  "record": "global:demo:1",
+  "stored_skill": {
+    "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "created_at": 1700000000,
+    "deleted": false,
+    "files": {
+      "e1.0123abcd.ERERERERERERERERERERERERERERERERsYukH0SCebvIWs9GxQ9Haq4gzXNVZYmx": "ZTEuMDEyM2FiY2QuSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWl0VUxWdHgwT3BKTzc1V25nRHhHdUJxc2QvbFd3eXhjeHo2elVFVitTTkd5RzNjdEE0UzhxNUJsM1dvNGdKMUE9"
+    },
+    "name": "demo",
+    "project": "",
+    "scope": "global",
+    "seq": 7,
+    "source_agent": "test",
+    "source_machine": "synthetic",
+    "version": 1
+  },
+  "wire_skill": {
+    "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "created_at": 1700000000,
+    "deleted": false,
+    "files": {
+      "e1.0123abcd.ERERERERERERERERERERERERERERERERsYukH0SCebvIWs9GxQ9Haq4gzXNVZYmx": "e1.0123abcd.IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIitULVtx0OpJO75WngDxGuBqsd/lWwyxcxz6zUEV+SNGyG3ctA4S8q5Bl3Wo4gJ1A="
+    },
+    "files_encoding": "e1-text",
+    "name": "demo",
+    "project": "",
+    "scope": "global",
+    "seq": 7,
+    "source_agent": "test",
+    "source_machine": "synthetic",
+    "version": 1
+  }
+}

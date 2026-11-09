@@ -1,0 +1,73 @@
+{
+  "description": "Public structural transport vector only. The synthetic payloads are not valid AEAD ciphertext and contain no real account data.",
+  "cases": [
+    {
+      "wire_skill": {
+        "scope": "global",
+        "project": "",
+        "name": "demo",
+        "version": 1,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=="
+        },
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "created_at": 1700000000,
+        "deleted": false,
+        "seq": 7,
+        "files_encoding": "e1-text"
+      },
+      "stored_skill": {
+        "scope": "global",
+        "project": "",
+        "name": "demo",
+        "version": 1,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0="
+        },
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "created_at": 1700000000,
+        "deleted": false,
+        "seq": 7
+      }
+    },
+    {
+      "wire_skill": {
+        "scope": "global",
+        "project": "",
+        "name": "demo",
+        "version": 1,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "e1.0123abcd.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg==",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "created_at": 1700000000,
+        "deleted": false,
+        "seq": 7,
+        "files_encoding": "e1-text"
+      },
+      "stored_skill": {
+        "scope": "global",
+        "project": "",
+        "name": "demo",
+        "version": 1,
+        "files": {
+          "e1.0123abcd.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==": "ZTEuMDEyM2FiY2QuQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnPT0=",
+          "e1.0123abcd.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==": ""
+        },
+        "content_hash": "h1.0123abcd.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_agent": "test",
+        "source_machine": "synthetic",
+        "created_at": 1700000000,
+        "deleted": false,
+        "seq": 7
+      }
+    }
+  ]
+}
