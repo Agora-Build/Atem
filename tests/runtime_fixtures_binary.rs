@@ -118,7 +118,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use support::astation::{Event, FakeAstation, write_verified_pairing};
 
-const WAIT: Duration = Duration::from_secs(15);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 /// Time the runtime gets to act on what it was sent before the next event.
 const SETTLE: Duration = Duration::from_millis(400);
 /// How long a counter may take to reach its expected value. The slowest

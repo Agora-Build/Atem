@@ -6,6 +6,11 @@ use crate::runtime::worker::{self, WorkerOptions, record_path};
 use crate::runtime::worker_protocol::{ApplyOutcome, WorkerMsg, WorkerSpec, unb64};
 use std::time::Duration;
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
+
 const AGENT: &str = "echo ready; while read l; do echo got:$l; done";
 
 struct Running {
@@ -96,7 +101,7 @@ async fn until(
     mut done: impl FnMut(&WorkerMsg) -> bool,
 ) -> Vec<WorkerMsg> {
     let mut seen = Vec::new();
-    let found = tokio::time::timeout(Duration::from_secs(5), async {
+    let found = tokio::time::timeout(WAIT, async {
         while let Some(message) = handle.recv().await {
             let hit = done(&message);
             seen.push(message);
@@ -135,7 +140,7 @@ async fn stop(running: Running, mut handle: WorkerHandle) {
     handle.stop().unwrap();
     until(&mut handle, |m| matches!(m, WorkerMsg::Exited { .. })).await;
     handle.stop().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), running.served)
+    tokio::time::timeout(WAIT, running.served)
         .await
         .unwrap()
         .unwrap()
@@ -378,7 +383,7 @@ async fn the_agent_exit_reaches_the_broker_and_releases_the_worker() {
     handle.stop().unwrap();
     let state = running.state();
     let sid = running.spec.session_id.clone();
-    tokio::time::timeout(Duration::from_secs(5), running.served)
+    tokio::time::timeout(WAIT, running.served)
         .await
         .unwrap()
         .unwrap()
@@ -399,7 +404,7 @@ async fn an_exit_nobody_heard_stays_in_the_record() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     unsafe { libc::kill(agent as libc::pid_t, libc::SIGKILL) };
     // The worker lingers (2 s here) for a broker, then leaves the record.
-    tokio::time::timeout(Duration::from_secs(10), running.served)
+    tokio::time::timeout(WAIT, running.served)
         .await
         .unwrap()
         .unwrap()

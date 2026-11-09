@@ -17,11 +17,15 @@ use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const ACCOUNT: &str = "acct-r9";
 const HOST: &str = "host-r9";
 
 fn session_reply(router: &mut Router<'_>) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + WAIT;
     loop {
         let value = router
             .other_within(deadline.saturating_duration_since(Instant::now()))

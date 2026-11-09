@@ -31,7 +31,10 @@ use support::{Sandbox, within};
 
 const ACCOUNT: &str = "acct-svc";
 const HOST: &str = "host-svc";
-const WAIT: Duration = Duration::from_secs(20);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const HOUR: u64 = 3_600_000;
 
 struct Rig {

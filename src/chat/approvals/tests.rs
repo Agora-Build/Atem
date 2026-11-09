@@ -5,6 +5,11 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
+
 fn fixture(name: &str) -> String {
     fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -66,9 +71,9 @@ fn finish(child: Child) -> (bool, String, String) {
     )
 }
 
-/// The id of the one request the hook wrote (waits up to 5 s).
+/// The id of the one request the hook wrote (waits up to `WAIT`).
 fn wait_request(dir: &Path) -> String {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     loop {
         for e in fs::read_dir(approvals_dir(dir)).unwrap().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();

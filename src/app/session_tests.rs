@@ -4,6 +4,11 @@ use super::hosted::Hosted;
 use crate::websocket_client::AstationMessage;
 use std::time::Duration;
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
+
 #[test]
 fn removed_remote_ops_do_not_parse() {
     for json in [
@@ -52,7 +57,7 @@ async fn astation(app: &mut App) -> tokio::sync::mpsc::UnboundedReceiver<Astatio
 async fn mark_result(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AstationMessage>,
 ) -> (String, bool, String) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT, async {
         loop {
             if let Some(AstationMessage::MarkTaskResult {
                 task_id,
@@ -141,7 +146,7 @@ async fn raw_astation(
 /// Handles what the App received until `n` messages were handled.
 async fn handle_received(app: &mut App, n: usize) {
     let mut handled = 0;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT, async {
         while handled < n {
             match app.astation_client.recv_message() {
                 Some(message) => {
@@ -162,7 +167,7 @@ async fn replies(
 ) -> Vec<serde_json::Value> {
     let mut got = Vec::new();
     while got.len() < n {
-        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        match tokio::time::timeout(WAIT, rx.recv()).await {
             Ok(Some(value)) => got.push(value),
             _ => panic!("got {} of {n} replies: {got:?}", got.len()),
         }

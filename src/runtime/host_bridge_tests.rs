@@ -23,7 +23,10 @@ const ASTATION: &str = "astation-host-test";
 const ACCOUNT: &str = "acct-1";
 const DEVICE: &str = "device-1";
 const TRUST_GEN: u64 = 3;
-const WAIT: Duration = Duration::from_secs(20);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 
 thread_local! {
     /// This thread's sandboxes, for `HookSweep`.

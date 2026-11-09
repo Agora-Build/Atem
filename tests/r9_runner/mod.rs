@@ -68,7 +68,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const WAIT: Duration = Duration::from_secs(20);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 /// Time the runtime gets to act on what it was sent.
 const SETTLE: Duration = Duration::from_millis(400);
 /// How long a host state may take to reach its expected value.

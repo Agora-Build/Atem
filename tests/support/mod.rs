@@ -35,10 +35,12 @@ pub fn atem_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_atem")))
 }
 
-/// Waits up to ten seconds for `done`.
+/// Waits up to a minute for `done`: a passing run never gets near it, a slow
+/// runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs the
+/// slack, and a hung test still ends.
 #[track_caller]
 pub fn within(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(20));
