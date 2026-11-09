@@ -36,6 +36,15 @@ fn imitations() -> Vec<String> {
         "[\u{410}TEM] a capital Cyrillic A",
         "[atern] the m/rn false match",
         "[atem",
+        "[\u{410}\u{422}\u{415}\u{41c}] all Cyrillic capitals",
+        "[a\u{422}\u{415}\u{41c}] Latin a, Cyrillic capitals",
+        "[\u{391}\u{3a4}\u{395}\u{39c}] Greek capitals",
+        "[\u{13aa}\u{13a2}\u{13ac}\u{13b7}] Cherokee",
+        "[\u{a4ee}\u{a4d4}\u{a4f0}\u{a4df}] Lisu",
+        "\u{2800}[atem] after a Braille blank",
+        "\u{3164}[atem] after a Hangul filler",
+        "[\u{ffa0}atem] a halfwidth Hangul filler inside",
+        "[a\u{fe0f}tem] a variation selector inside",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -44,18 +53,63 @@ fn imitations() -> Vec<String> {
 
 #[test]
 fn the_folding_data_is_of_one_unicode_version() {
+    // The build already refuses tables of different versions (a const
+    // assertion in framing.rs); this names the version.
     assert_eq!(UNICODE_VERSION, (18, 0, 0));
-    assert_eq!(
-        unicode_normalization::UNICODE_VERSION,
-        (18, 0, 0),
-        "NFKC and NFD"
-    );
-    assert_eq!(
-        unicode_properties::UNICODE_VERSION,
-        (18, 0, 0),
-        "General_Category"
-    );
+    assert_eq!(unicode_data::VERSION, (18, 0, 0));
+    assert_eq!(unicode_normalization::UNICODE_VERSION, (18, 0, 0));
+    assert_eq!(unicode_properties::UNICODE_VERSION, (18, 0, 0));
 }
+
+/// The folding's lowercasing and White_Space are the pinned Unicode 18.0.0
+/// tables, not Rust's, which follow the toolchain (17.0.0 for Rust 1.94).
+/// Against Rust's own: White_Space is the same, and the lowercase mappings
+/// differ only where Rust's Unicode version doesn't know the character
+/// yet. A toolchain on another Unicode version fails here, so its
+/// differences are looked at (none may touch the folding of the vectors).
+#[test]
+fn lowercasing_and_white_space_are_pinned_not_the_toolchains() {
+    let all = || (0..=0x10ffff).filter_map(char::from_u32);
+    for c in all() {
+        assert_eq!(is_white_space(c), c.is_whitespace(), "U+{:04X}", c as u32);
+    }
+    let differ: Vec<u32> = all()
+        .filter(|&c| lowercase(&c.to_string()) != c.to_lowercase().collect::<String>())
+        .map(|c| c as u32)
+        .collect();
+    match char::UNICODE_VERSION {
+        (18, 0, 0) => assert_eq!(differ, Vec::<u32>::new()),
+        (17, 0, 0) => assert_eq!(
+            differ, STD_17_LOWERCASE_DIFFERS,
+            "the capitals Unicode 18.0.0 added (Rust 1.94's std is 17.0.0)"
+        ),
+        other => {
+            panic!("Rust's Unicode version is {other:?}: compare its lowercasing: {differ:x?}")
+        }
+    }
+    // The one rule left out, Final_Sigma, can't change a match: neither
+    // sigma folds to a character of the marker or to white space.
+    for sigma in ["\u{3c3}", "\u{3c2}"] {
+        let folded = fold(sigma);
+        for form in [&folded.lower, &folded.skeleton, &folded.capital_skeleton] {
+            let first = form.chars().next().unwrap();
+            assert!(
+                !"[atemrn".contains(first) && !is_white_space(first),
+                "{form:?}"
+            );
+        }
+    }
+    assert_eq!(lowercase("\u{3a3}A\u{130}"), "\u{3c3}a\u{69}\u{307}");
+}
+
+/// Where Rust 1.94's std (Unicode 17.0.0) and the pinned 18.0.0 tables
+/// lowercase differently: the 20 capitals Unicode 18.0.0 added (DerivedAge
+/// 18.0: U+A7DD, U+A7E2, U+AB6C, U+AB6D and Latin Extended-G's capitals
+/// from U+1DF40), which Rust's 17.0.0 data doesn't know.
+const STD_17_LOWERCASE_DIFFERS: &[u32] = &[
+    0xa7dd, 0xa7e2, 0xab6c, 0xab6d, 0x1df40, 0x1df48, 0x1df4a, 0x1df4d, 0x1df51, 0x1df68, 0x1df6a,
+    0x1df6c, 0x1df6e, 0x1df72, 0x1df74, 0x1df76, 0x1df78, 0x1df7a, 0x1df7c, 0x1df7e,
+];
 
 #[test]
 fn tags_are_60_random_bits_in_crockford_base32() {
@@ -100,16 +154,30 @@ fn every_imitation_folds_to_the_marker_and_is_escaped() {
 #[test]
 fn the_folding_steps_in_order() {
     // Cf dropped, then NFKC, then lowercase.
-    assert_eq!(fold("\u{200b}\u{ff3b}ATEM").0, "[atem");
+    assert_eq!(fold("\u{200b}\u{ff3b}ATEM").lower, "[atem");
     // NFKC turns U+00A0 and U+3000 into spaces, which step 6 skips.
-    assert_eq!(fold("\u{a0}\u{3000}[atem").0, "  [atem");
+    assert_eq!(fold("\u{a0}\u{3000}[atem").lower, "  [atem");
     // The skeleton is of the lowercased line: a capital Cyrillic A is first
     // lowered to U+0430, which the confusables map to `a`.
-    assert_eq!(fold("[\u{410}TEM").0, "[\u{430}tem");
-    assert!(fold("[\u{410}TEM").1.starts_with("[atern"));
+    assert_eq!(fold("[\u{410}TEM").lower, "[\u{430}tem");
+    assert!(fold("[\u{410}TEM").skeleton.starts_with("[atern"));
     // UTS #39 drops Default_Ignorable code points (U+034F isn't Cf).
-    assert_eq!(fold("[\u{34f}atem").0, "[\u{34f}atem");
-    assert!(fold("[\u{34f}atem").1.starts_with("[atern"));
+    assert_eq!(fold("[\u{34f}atem").lower, "[\u{34f}atem");
+    assert!(fold("[\u{34f}atem").skeleton.starts_with("[atern"));
+    // Whole-word capitals of other scripts: their lowercase forms aren't
+    // confusable with Latin, so only the skeleton taken before lowercasing
+    // (the third form) folds them to the marker.
+    for line in [
+        "[\u{410}\u{422}\u{415}\u{41c}",
+        "[\u{391}\u{3a4}\u{395}\u{39c}",
+        "[\u{13aa}\u{13a2}\u{13ac}\u{13b7}",
+        "[\u{a4ee}\u{a4d4}\u{a4f0}\u{a4df}",
+    ] {
+        let folded = fold(line);
+        assert!(!folded.lower.starts_with(MARKER), "{line}");
+        assert!(!folded.skeleton.starts_with("[atern"), "{line}");
+        assert!(folded.capital_skeleton.starts_with("[atern"), "{line}");
+    }
 }
 
 #[test]
@@ -129,6 +197,18 @@ fn lines_that_only_resemble_the_marker_are_left_alone() {
         "Reply with: atem message reply --task 3f2a6c1e <text>",
         "\u{200b}|[atem] a | after a zero-width space",
         " |[atem] a | after a space",
+        // Where the escaping stops (the tag covers these): look-alikes the
+        // confusables data doesn't list as Latin, the marker after other
+        // text or punctuation, other brackets, a mark after the bracket.
+        "[\u{430}\u{442}\u{435}\u{43c}] lowercase Cyrillic",
+        "[a\u{442}em] a Cyrillic te",
+        "[ate\u{43c}] a Cyrillic em",
+        "[\u{1d00}\u{1d1b}\u{1d07}\u{1d0d}] small capitals",
+        "> [atem] quoted",
+        "**[atem]** bold",
+        "\u{3010}atem] a lenticular bracket",
+        "\u{3014}atem] a tortoise shell bracket",
+        "[\u{301}atem] a combining acute after the bracket",
     ] {
         assert!(!needs_escape(line), "{line:?}");
         assert_eq!(escape(line), line);
@@ -409,7 +489,10 @@ fn snapshot(id: &str, text: &str) -> ContextSnapshot {
     }
 }
 
-/// The design's own example of a host sender's task, with real ids.
+/// The design's own example of a host sender's task, with real ids. One
+/// departure (review M7): a remote sender's snapshot reads `sender's
+/// snapshot, digest matches`, not `digest verified`, since Atem checked only
+/// the text against the digest that sender gave.
 #[test]
 fn a_task_reads_as_the_design_shows() {
     let tag = tag();
@@ -429,6 +512,7 @@ fn a_task_reads_as_the_design_shows() {
         text,
         mark: None,
         context: &context,
+        snapshots: Snapshots::FromSender,
         screenshots: &[],
         closing: Some(Closing::Answer { task_id: ID }),
     };
@@ -442,7 +526,7 @@ fn a_task_reads_as_the_design_shows() {
              Adapt the token scopes to the new /v2/orders contract below.\n\
              |[atem 3RRW-0B9C-KQ1T] end prompt\n\
              {p}end prompt\n\
-             {p}begin context vault:api-contract version 3 sha256 {} (12 bytes, digest verified)\n\
+             {p}begin context vault:api-contract version 3 sha256 {} (12 bytes, sender's snapshot, digest matches)\n\
              the contract\n\
              {p}end context\n\
              {p}Answer with: atem message reply --task {ID} <text>",
@@ -466,6 +550,7 @@ fn a_result_and_a_mark_read_as_the_design_shows() {
         text: "done",
         mark: None,
         context: &[],
+        snapshots: Snapshots::FromSender,
         screenshots: &[],
         closing: Some(Closing::Complete { task_id: ID }),
     };
@@ -512,6 +597,7 @@ fn a_result_and_a_mark_read_as_the_design_shows() {
         text: "",
         mark: Some(&mark),
         context: &[],
+        snapshots: Snapshots::FromSender,
         screenshots: &screenshots,
         closing: None,
     };
@@ -558,6 +644,7 @@ fn a_context_that_does_not_match_its_digest_is_never_called_verified() {
         text: "x",
         mark: None,
         context: &context,
+        snapshots: Snapshots::FromSender,
         screenshots: &[],
         closing: None,
     };
@@ -575,6 +662,7 @@ fn every_attempt_gets_a_fresh_tag() {
         text: "x",
         mark: None,
         context: &[],
+        snapshots: Snapshots::FromSender,
         screenshots: &[],
         closing: None,
     };
@@ -633,6 +721,7 @@ fn the_checked_size_is_the_worst_case_rendering() {
         text: &task.prompt,
         mark: None,
         context: &task.context,
+        snapshots: Snapshots::FromSender,
         screenshots: &[],
         closing: Some(Closing::Complete {
             task_id: &task.task_id,
@@ -654,6 +743,7 @@ fn the_checked_size_is_the_worst_case_rendering() {
         text: &task.prompt,
         mark: None,
         context: &task.context,
+        snapshots: Snapshots::FromSender,
         screenshots: &[],
         closing: Some(Closing::Answer {
             task_id: &task.task_id,
@@ -740,9 +830,15 @@ fn the_ascii_shortcut_matches_the_full_folding() {
         .collect::<Vec<_>>()
     );
     let full = |line: &str| {
-        let (lower, skeleton) = fold(line);
-        let skip = |s: &str| s.trim_start_matches(char::is_whitespace).to_string();
-        skip(&lower).starts_with(MARKER) || skip(&skeleton).starts_with(marker_skeleton())
+        let Folded {
+            lower,
+            skeleton,
+            capital_skeleton,
+        } = fold(line);
+        let skip = |s: &str| s.trim_start_matches(is_white_space).to_string();
+        skip(&lower).starts_with(MARKER)
+            || skip(&skeleton).starts_with(marker_skeleton())
+            || skip(&capital_skeleton).starts_with(marker_skeleton())
     };
     let mut lines = Vec::new();
     for space in ["", " ", "\t", " \u{b}\u{c}\r "] {

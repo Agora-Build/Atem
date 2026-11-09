@@ -207,10 +207,15 @@ written `XXXX-XXXX-XXXX`. A task from `work_enqueue` reads:
 [atem T] begin prompt (<n> bytes)
 <prompt>
 [atem T] end prompt
-[atem T] begin context <kind>:<id> version <version> sha256 <digest> (<n> bytes, digest verified)
+[atem T] begin context <kind>:<id> version <version> sha256 <digest> (<n> bytes, sender's snapshot, digest matches)
 <text>
 [atem T] end context
 ```
+
+**The tag is the guarantee.** It is drawn once the sender's text is fixed,
+so no line of the sender's carries it; the rule line tells the agent that
+only lines with it, outside blocks, are Atem's. The escaping below is the
+extra layer that marks sender lines that look like the marker.
 
 - **Atem's lines** each start with `[atem T] ` and hold only verified fields:
   ids, the sender principal (the channel's), the route id, context kinds, ids,
@@ -222,20 +227,39 @@ written `XXXX-XXXX-XXXX`. A task from `work_enqueue` reads:
   only inside `begin`/`end` lines. `n` is the length in bytes of the text as
   rendered (escaped); when it doesn't end with a newline, one is added before
   the end line and not counted.
+- **What a context's begin line says.** A remote sender's snapshot ends
+  `sender's snapshot, digest matches`: the sender gave its kind, id, version,
+  digest and text, and the host checked only that the text matches that
+  digest. A snapshot this host published and read back itself (a local
+  task's, a local reply's) ends `digest verified`. (III.2's example writes
+  `digest verified` for a host sender's task; the review of this
+  implementation narrowed it, for the design reviewers to confirm.)
 - **Escaping.** The text is cut into lines at LF, U+2028 and U+2029 (and at
   CR, VT, FF and NEL, which the text rules refuse anyway). A line gets a `|`
   in front of it (right after its line break) when, after the `|`s it already
-  starts with, it folds to `[atem`: with its General_Category Cf characters
-  dropped, NFKC-normalized and lowercased, it starts with `[atem`, or its
-  UTS #39 confusables skeleton starts with that of `[atem` (`[atern`), after
-  leading white space. The folding data is Unicode 18.0.0. Nothing else in the
-  sender's text changes.
-- **Three readings stricter than III.2's text**, each escaping more lines,
+  starts with, it folds to `[atem`. With its General_Category Cf characters
+  dropped and NFKC-normalized, after leading White_Space: its lowercased form
+  starts with `[atem`; or the UTS #39 confusables skeleton of that lowercased
+  form starts with that of `[atem` (`[atern`); or the skeleton of the line
+  before lowercasing, lowercased and skeletonized again, does. All data is
+  Unicode 18.0.0: normalization, categories and confusables from pinned
+  crates, the default lowercase mapping (without Final_Sigma, which can't
+  change a match) and White_Space from generated tables
+  (`scripts/gen-framing-unicode.py`), never the toolchain's. Nothing else in
+  the sender's text changes. Not marked (the tag covers them): look-alikes
+  `confusables.txt` doesn't list as Latin (lowercase Cyrillic `т`, `м`, small
+  capitals), the marker after other text or punctuation, other brackets, a
+  combining mark after the bracket; the vectors list each.
+- **Four readings stricter than III.2's text**, each escaping more lines,
   never fewer: the extra line breaks above; the `|`s a line already starts
   with are skipped before folding, so a sender's `|[atem` reads `||[atem`
   (without it, `[atem` and `|[atem` would both read `|[atem`, and the
-  escaping couldn't be reversed); and the skeleton is UTS #39's own, which
-  drops Default_Ignorable code points such as U+034F that aren't Cf.
+  escaping couldn't be reversed); the skeleton is UTS #39's own, which drops
+  Default_Ignorable code points such as U+034F and the Hangul fillers that
+  aren't Cf; and the third form, the skeleton taken before lowercasing,
+  which III.2's order misses for whole words in capitals of another script
+  (`[АТЕМ`, `[ΑΤΕΜ`, `[ᎪᎢᎬᎷ`, `[ꓮꓔꓰꓟ`): their lowercase forms aren't listed
+  as confusable with Latin.
 - **Vectors.** `fixtures/host-work/prompt-framing-v1.json`: tags, escaping
   cases (III.2's folding cases), rendered prompts and the size check, run by
   `atem-client`'s tests.
@@ -467,9 +491,10 @@ started, as v0.8.x does for `enabled = false`: it never starts and ends
 "Rendering"; delegated host-work design III.2), with no wire shape change. A
 v0.8.x host checked the v1 rendering against 32,768 bytes; this host checks
 the framed one with the longest first and last lines, which adds about
-0.9 KiB to a typical task's check (one context, short ids) and about 1.5 KiB
+0.9 KiB to a typical task's check (one context, short ids) and about 1.6 KiB
 in the worst case (eight contexts with 128-byte ids, the longest sender, route
-and message id), plus one byte per escaped line (the framing vectors' `size`).
+and message id, the longer snapshot note), plus one byte per escaped line (the
+framing vectors' `size`).
 A task, or a message's agent recipient, within that margin of the bound is
 refused at enqueue (`invalid_request`) where a v0.8.x host accepted it. A
 message's task stores only the message's text as its prompt.

@@ -127,6 +127,9 @@ impl Message {
     }
 
     fn valid_body(&self, local: bool) -> bool {
+        // Every agent recipient's task has the message's text, mark and
+        // context: their framed size is computed once.
+        let checked_len = std::cell::OnceCell::new();
         let mut ids = BTreeSet::new();
         let mut destinations = BTreeSet::new();
         let budget: u32 = self
@@ -188,9 +191,12 @@ impl Message {
                         }
                         Destination::Agent { target, .. } => {
                             r.host.contains(target)
-                                && self
-                                    .task(r)
-                                    .is_some_and(|t| t.valid_message(&r.host, self.mark.as_ref()))
+                                && self.task(r).is_some_and(|t| {
+                                    t.valid_message_with(&r.host, self.mark.as_ref(), || {
+                                        *checked_len
+                                            .get_or_init(|| t.checked_len(self.mark.as_ref()))
+                                    })
+                                })
                         }
                         _ => true,
                     }
@@ -398,6 +404,39 @@ mod tests {
                 destination: Destination::Host,
             }],
         }
+    }
+
+    /// Every agent recipient's task has the message's text, mark and
+    /// context, so their framed size is computed (and the text folded) once
+    /// per message, not once per recipient (review M6).
+    #[test]
+    fn a_messages_framed_size_is_checked_once_for_all_its_recipients() {
+        let mut m = message();
+        m.text = "\u{e9}\n".repeat(4000);
+        let host = m.recipients[0].host.clone();
+        m.recipients = ('a'..='z')
+            .chain('2'..='7')
+            .map(|c| Recipient {
+                recipient_id: new_id(),
+                host: host.clone(),
+                destination: Destination::Agent {
+                    route_id: "backend".into(),
+                    route_revision: 1,
+                    target: Target {
+                        account_id: host.account_id.clone(),
+                        atem_device_id: host.atem_device_id.clone(),
+                        host_trust_gen: host.host_trust_gen,
+                        session_id: format!("ses-aaaaaaaaaaa{c}"),
+                        process_gen: new_id(),
+                    },
+                },
+            })
+            .collect();
+        assert_eq!(m.recipients.len(), MAX_RECIPIENTS);
+        let checked = || crate::session::framing::CHECKED.with(|n| n.get());
+        let before = checked();
+        assert!(m.valid());
+        assert_eq!(checked() - before, 1);
     }
 
     #[test]

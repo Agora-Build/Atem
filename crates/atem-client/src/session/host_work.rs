@@ -95,7 +95,7 @@ pub struct WorkTask {
 impl WorkTask {
     /// A task its sender enqueued (`work_enqueue`): its prompt isn't blank.
     pub fn valid(&self, host: &HostTarget) -> bool {
-        !self.prompt.trim().is_empty() && self.valid_for(host, false, None)
+        !self.prompt.trim().is_empty() && self.valid_for(host, false, || self.checked_len(None))
     }
 
     /// A task of the runtime's own `local` sender: a local message's text
@@ -105,22 +105,35 @@ impl WorkTask {
     /// remote one.
     pub fn valid_local(&self, host: &HostTarget) -> bool {
         (!self.prompt.trim().is_empty() || !self.context.is_empty())
-            && self.valid_for(host, true, None)
+            && self.valid_for(host, true, || self.checked_len(None))
     }
 
     /// The task a message's agent recipient becomes (`Message::task`): its
     /// prompt is the message's text, which may be blank when the message
     /// carries context or a mark; the mark is measured with it.
     pub fn valid_message(&self, host: &HostTarget, mark: Option<&super::mark::MarkTask>) -> bool {
+        self.valid_message_with(host, mark, || self.checked_len(mark))
+    }
+
+    /// [`WorkTask::valid_message`] with the framed size from `checked_len`,
+    /// called only once every other check passed: a message's recipients
+    /// share its text, mark and context, so `Message::valid` folds them once
+    /// for all of them.
+    pub fn valid_message_with(
+        &self,
+        host: &HostTarget,
+        mark: Option<&super::mark::MarkTask>,
+        checked_len: impl FnOnce() -> usize,
+    ) -> bool {
         (!self.prompt.trim().is_empty() || !self.context.is_empty() || mark.is_some())
-            && self.valid_for(host, false, mark)
+            && self.valid_for(host, false, checked_len)
     }
 
     fn valid_for(
         &self,
         host: &HostTarget,
         local: bool,
-        mark: Option<&super::mark::MarkTask>,
+        checked_len: impl FnOnce() -> usize,
     ) -> bool {
         let clean = |text: &str| {
             !text
@@ -153,7 +166,7 @@ impl WorkTask {
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
                 == self.attachments.len()
-            && self.checked_len(mark) <= self.prompt_bound()
+            && checked_len() <= self.prompt_bound()
     }
 
     /// The size its prompt is checked at (`framing::checked_len`): the
