@@ -593,15 +593,21 @@ async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
 }
 
 /// What takes a device out of encryption mid-sync: the signed state turns
-/// off, or this device's verification is removed (an unpair).
+/// off, this device's verification is removed (an unpair), or its signed
+/// state is gone (which stopped a sync before too, as an error of its own).
 #[derive(Debug, Clone, Copy)]
 enum Downgrade {
     Off,
     Unverified,
+    NoSignedState,
 }
 
 impl Downgrade {
-    const ALL: [Downgrade; 2] = [Downgrade::Off, Downgrade::Unverified];
+    const ALL: [Downgrade; 3] = [
+        Downgrade::Off,
+        Downgrade::Unverified,
+        Downgrade::NoSignedState,
+    ];
 
     fn apply(self, device: &mut UnlockedDevice) {
         match self {
@@ -609,17 +615,31 @@ impl Downgrade {
             Downgrade::Unverified => crate::memory::trust::TrustStore::default()
                 .save_to(&device.paths.trust)
                 .unwrap(),
+            Downgrade::NoSignedState => {
+                let path = &device.paths.trust;
+                let mut trust: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                for entry in trust["astations"].as_object_mut().unwrap().values_mut() {
+                    entry["account_state"] = serde_json::Value::Null;
+                }
+                std::fs::write(path, serde_json::to_vec(&trust).unwrap()).unwrap();
+            }
+        }
+    }
+
+    /// The note the sync stops with.
+    fn note(self) -> &'static str {
+        match self {
+            Downgrade::Off | Downgrade::Unverified => "this sync started end-to-end encrypted",
+            Downgrade::NoSignedState => "waiting for Astation's signed encryption state",
         }
     }
 }
 
-/// The note a sync that started sealed stops with.
-const STOPPED: &str = "this sync started end-to-end encrypted";
-
-/// The account's state leaves encryption (off, or this device unverified)
-/// while chunk 1 is in flight, once chunk 2 was sealed ahead: chunk 2 is
-/// never sent, in plain text or at all, and stays queued with a note; no
-/// plain text reaches the relay.
+/// The account's state leaves encryption (`Downgrade`: off, this device
+/// unverified, no signed state) while chunk 1 is in flight, once chunk 2 was
+/// sealed ahead: chunk 2 is never sent, in plain text or at all, and stays
+/// queued with a note; no plain text reaches the relay.
 #[tokio::test]
 async fn a_push_that_started_sealed_never_goes_on_in_plain_text() {
     for to in Downgrade::ALL {
@@ -660,7 +680,7 @@ async fn a_push_that_started_sealed_never_goes_on_in_plain_text() {
         assert!(out.relay_error, "{to:?}: {:?}", out.notes);
         assert_eq!(out.pushed, 50, "{to:?}: {:?}", out.notes);
         assert!(
-            out.notes.iter().any(|n| n.contains(STOPPED)),
+            out.notes.iter().any(|n| n.contains(to.note())),
             "{to:?}: {:?}",
             out.notes
         );
@@ -676,10 +696,10 @@ async fn a_push_that_started_sealed_never_goes_on_in_plain_text() {
     }
 }
 
-/// The state leaves encryption between two pulled pages (page 1 opened
-/// under on, page 2 not opened yet): page 2's rows, plain text from the
-/// relay, are never accepted; page 1 stays applied and the cursor stays at
-/// its end.
+/// The state leaves encryption (`Downgrade`) between two pulled pages (page
+/// 1 opened under on, page 2 not opened yet): page 2's rows, plain text from
+/// the relay, are never accepted; page 1 stays applied and the cursor stays
+/// at its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pull_that_started_sealed_never_takes_plain_rows_after_a_state_change() {
     for to in Downgrade::ALL {
@@ -728,7 +748,7 @@ async fn a_pull_that_started_sealed_never_takes_plain_rows_after_a_state_change(
         );
         assert!(out.relay_error, "{to:?}: {:?}", out.notes);
         assert!(
-            out.notes.iter().any(|n| n.contains(STOPPED)),
+            out.notes.iter().any(|n| n.contains(to.note())),
             "{to:?}: {:?}",
             out.notes
         );

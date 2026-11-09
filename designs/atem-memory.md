@@ -1093,8 +1093,8 @@ lives.
   a queued push or an unsettled or coalesced conflict, and goes once a sync
   settled it; `--all-versions` is never held up; the question names the
   version's author machine and time.
-- **No switch to plain text:** the state goes from on to off, or to this
-  device unverified, between two chunks of one push (the second chunk is
+- **No switch to plain text:** the state goes from on to off, to this
+  device unverified, or to no signed state, between two chunks of one push (the second chunk is
   never sent, nothing plain reaches the relay) or between two pulled pages
   (the second page's plain rows are never accepted); after on, a state that
   isn't encrypting or names another data account is refused, and a sync
