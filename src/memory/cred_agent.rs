@@ -1735,9 +1735,17 @@ pub fn look(paths: &CredPaths, timeout: std::time::Duration) -> AgentLook {
     );
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let found = client
-            .is_running()
-            .then(|| client.status().map_err(|e| format!("{e:#}")));
+        // Only a proven absence is "none running"; an agent that can't be
+        // reached is reported as not answering.
+        let found = match client.probe() {
+            Ok(true) => Some(client.status().map_err(|e| format!("{e:#}"))),
+            // Nothing answers: none runs, unless one holds the key files
+            // (it may run unlocked; the status names it).
+            Ok(false) => client
+                .answers()
+                .then(|| client.status().map_err(|e| format!("{e:#}"))),
+            Err(error) => Some(Err(format!("{error:#}"))),
+        };
         let _ = tx.send(found);
     });
     let found = match rx.recv_timeout(timeout) {
@@ -1762,6 +1770,9 @@ pub fn running_agent() -> Option<Box<dyn CredAgentApi>> {
         {
             // The process-wide client that never starts an agent (it has no
             // launcher and runs no build check, like a new `existing()`).
+            // `None` only when no agent is proven to run: one that can't be
+            // reached is returned, so the caller's request says why (`atem
+            // cred lock` must never report a running agent as none).
             let client = crate::memory::agent_socket::shared(
                 crate::memory::agent_socket::CredAgentClient::existing(),
             );

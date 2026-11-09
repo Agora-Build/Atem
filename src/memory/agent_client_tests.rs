@@ -4,7 +4,7 @@
 //! the clean error an agent that closes after each reply gets, and what a
 //! kept connection retains (designs/e2e-encryption.md "Keys on disk (atem)").
 use super::tests::{
-    OTHER_DONE, cred_agent_process, eventually, make_private, own_uid, short_dir, sock,
+    OTHER_DONE, Unreadable, cred_agent_process, eventually, make_private, own_uid, short_dir, sock,
     start_agent, start_scripted_agent, start_stoppable_agent,
 };
 use super::*;
@@ -805,62 +805,79 @@ fn leave_stale_socket(socket: &Path) {
     assert!(socket.exists());
 }
 
-/// The time `attempt` takes, best of `runs` (one run stalled by a busy
-/// machine doesn't decide).
-fn best_of(runs: usize, mut attempt: impl FnMut() -> Duration) -> Duration {
-    (0..runs).map(|_| attempt()).min().unwrap()
+/// A launcher that starts an in-process agent for `dir` before it returns
+/// (it listens before the client's first look); counts its calls.
+fn spawning_now(dir: &Path, launches: &Arc<AtomicUsize>) -> Launcher {
+    let (dir, launches) = (dir.to_path_buf(), launches.clone());
+    Box::new(move || {
+        launches.fetch_add(1, Ordering::SeqCst);
+        start_agent(&dir, own_uid());
+        Ok(())
+    })
 }
 
 #[test]
 fn an_agent_that_comes_up_at_once_is_reached_without_the_old_fixed_wait() {
     // The client used to sleep 100 ms before its first look at an agent it
-    // had just started, however quickly it came up.
-    let best = best_of(5, || {
-        let dir = short_dir();
-        let launches = Arc::new(AtomicUsize::new(0));
-        let client = CredAgentClient::with_launcher(
-            sock(&dir.path().join("run")),
-            spawning_after(dir.path(), Duration::ZERO, &launches),
-        );
-        let started = std::time::Instant::now();
-        assert!(!client.status().unwrap().unlocked);
-        let took = started.elapsed();
-        assert_eq!(launches.load(Ordering::SeqCst), 1);
-        took
-    });
-    // Found by the first poll (5 ms) or, on a busy host, a few polls later;
-    // the old wait was at least 100 ms by construction (a 100 ms sleep).
-    assert!(
-        best < Duration::from_millis(80),
-        "first contact took {best:?}"
+    // had just started, however quickly it came up. Now it sleeps the
+    // schedule's first pause (5 ms) and finds an agent already listening.
+    // The pauses it actually slept are checked, not the wall clock, so a
+    // loaded host can't make this flaky and a fixed wait can't pass.
+    let dir = short_dir();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let client = CredAgentClient::with_launcher(
+        sock(&dir.path().join("run")),
+        spawning_now(dir.path(), &launches),
     );
+    assert!(!client.status().unwrap().unlocked);
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(client.traffic().polls(), 1, "found at the first look");
+    assert_eq!(client.traffic().pauses(), [Duration::from_millis(5)]);
 }
 
 #[test]
-fn an_agent_that_starts_slowly_is_waited_for_and_reached_soon_after() {
-    // Up about 105 ms after the launch, past the 5 ms polls: with the
-    // schedule's polls at 110 and 130 ms (`START_POLLS_MS`: 5 x 8, 10 x 3,
-    // 20 x 3, ...) it is found at 110 ms, or at 130 ms if the in-process
-    // start takes longer than the 5 ms before that poll; the old fixed polls
-    // (100, 200 ms) found it at 200 ms. The 150 ms bound leaves 20 ms over the
-    // 130 ms path and 50 ms under the old one; change it with the schedule.
-    let delay = Duration::from_millis(105);
-    let best = best_of(3, || {
-        let dir = short_dir();
-        let launches = Arc::new(AtomicUsize::new(0));
-        let client = CredAgentClient::with_launcher(
-            sock(&dir.path().join("run")),
-            spawning_after(dir.path(), delay, &launches),
+fn an_agent_that_starts_slowly_is_reached_at_the_next_look() {
+    // Up only once the client has looked 12 times (past the 5 ms looks into
+    // the 10 ms ones, about 70 ms in on an idle host; the old fixed wait
+    // looked every 100 ms): it is found at the next look after it listens,
+    // however slow the host, and every pause before it is the schedule's
+    // (`start_poll_pause`), never a fixed wait.
+    let dir = short_dir();
+    let launches = Arc::new(AtomicUsize::new(0));
+    // A wait long enough that no pause is cut short by its end.
+    let client = Arc::new(
+        CredAgentClient::with_launcher(sock(&dir.path().join("run")), spawning_nothing(&launches))
+            .waiting(Duration::from_secs(60)),
+    );
+    let starter = {
+        let (client, dir) = (client.clone(), dir.path().to_path_buf());
+        std::thread::spawn(move || {
+            while client.traffic().polls() < 12 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            start_agent(&dir, own_uid());
+            // The looks made by the time it listens.
+            client.traffic().polls()
+        })
+    };
+    assert!(!client.status().unwrap().unlocked);
+    let listening = starter.join().unwrap();
+    let found = client.traffic().polls();
+    assert_eq!(launches.load(Ordering::SeqCst), 1, "one start, one agent");
+    assert!(found >= 12, "found at look {found}, before it listened");
+    assert!(
+        found <= listening + 1,
+        "found at look {found}; it listened by look {listening}"
+    );
+    let pauses = client.traffic().pauses();
+    assert_eq!(pauses.len(), found);
+    for (look, pause) in pauses.iter().enumerate() {
+        assert_eq!(
+            *pause,
+            start_poll_pause(look),
+            "the pause before look {look}"
         );
-        let started = std::time::Instant::now();
-        assert!(!client.status().unwrap().unlocked);
-        let took = started.elapsed();
-        assert_eq!(launches.load(Ordering::SeqCst), 1, "one start, one agent");
-        assert!(client.is_running());
-        took
-    });
-    assert!(best >= delay, "reached before it listened? {best:?}");
-    assert!(best < Duration::from_millis(150), "found after {best:?}");
+    }
 }
 
 #[test]
@@ -970,4 +987,209 @@ fn the_polls_of_a_started_agent_begin_at_5_ms_and_back_off_to_the_old_interval()
             assert_eq!(*pause, Duration::from_millis(5), "{pauses:?}");
         }
     }
+}
+
+// ───────────── "not running" only when proven (macOS error mapping) ─────────────
+
+#[test]
+fn only_a_missing_or_refused_socket_proves_no_agent() {
+    use std::io::{Error, ErrorKind};
+    for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+        assert!(proves_absent(&Error::from(kind)), "{kind:?}");
+    }
+    // What macOS answers for a peer that closed or a listener closing, and
+    // anything else: they may hide a running, unlocked agent.
+    for kind in [
+        ErrorKind::NotConnected,
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::BrokenPipe,
+        ErrorKind::PermissionDenied,
+        ErrorKind::WouldBlock,
+        ErrorKind::InvalidInput,
+        ErrorKind::Other,
+    ] {
+        assert!(!proves_absent(&Error::from(kind)), "{kind:?}");
+    }
+    for errno in [libc::ENOTCONN, libc::ECONNRESET, libc::EPIPE, libc::EINVAL] {
+        assert!(!proves_absent(&Error::from_raw_os_error(errno)), "{errno}");
+    }
+    assert!(proves_absent(&Error::from_raw_os_error(libc::ENOENT)));
+    assert!(proves_absent(&Error::from_raw_os_error(libc::ECONNREFUSED)));
+    // A peer gone (the agent's side: a client that left before it was served).
+    assert!(peer_gone(&Error::from_raw_os_error(libc::ENOTCONN)));
+    assert!(peer_gone(&Error::from_raw_os_error(libc::ECONNRESET)));
+    assert!(!peer_gone(&Error::from_raw_os_error(libc::EACCES)));
+}
+
+#[test]
+fn an_agent_that_cannot_be_reached_is_never_taken_for_none() {
+    if running_as_root() {
+        return;
+    }
+    let dir = short_dir();
+    let socket = start_agent(dir.path(), own_uid());
+    let client = CredAgentClient::at(socket.clone());
+    assert!(client.probe().unwrap(), "running");
+    // Its socket can't be reached (here: its directory can't be searched,
+    // EACCES; on macOS also a reset or not-connected socket).
+    let blocked = Unreadable::new(socket.parent().unwrap());
+    let error = format!("{:#}", client.probe().err().unwrap());
+    assert!(error.contains("could not reach the cred agent"), "{error}");
+    assert!(client.answers(), "`running_agent` hands it out, not `None`");
+    assert!(!client.wait_gone(Duration::from_millis(200)), "not gone");
+    // `atem cred lock` reports the failure, never "no cred agent was running".
+    let message = format!(
+        "{:#}",
+        crate::memory::unlock::lock_keys_message(Some(&client))
+            .err()
+            .unwrap()
+    );
+    assert!(message.starts_with("Not locked"), "{message}");
+    drop(blocked);
+    // A missing socket, or one nobody listens on, proves no agent.
+    let gone = short_dir();
+    assert!(
+        !CredAgentClient::at(gone.path().join("none.sock"))
+            .probe()
+            .unwrap()
+    );
+    let stale = sock(&gone.path().join("run"));
+    leave_stale_socket(&stale);
+    let stale_client = CredAgentClient::at(stale);
+    assert!(!stale_client.probe().unwrap());
+    assert!(!stale_client.answers());
+    assert!(stale_client.wait_gone(Duration::ZERO));
+    // A listener of another user is an error too.
+    let other = CredAgentClient::at(socket).expecting_uid(own_uid() + 1);
+    assert!(other.probe().is_err());
+}
+
+#[test]
+fn an_unreachable_recorded_agent_is_not_hidden_by_a_missing_default_socket() {
+    // The agent records its socket (`agent.socket`); a client from another
+    // session looks there first, then at its own runtime dir's path.
+    if running_as_root() {
+        return;
+    }
+    let dir = short_dir();
+    let config = dir.path().join("config");
+    let paths = CredPaths::in_dir(&config);
+    crate::paths::create_private_dir(&paths.dir).unwrap();
+    let elsewhere = start_agent(&dir.path().join("a"), own_uid());
+    {
+        use std::os::unix::ffi::OsStrExt;
+        crate::memory::crypto::write_private(&paths.agent_socket, elsewhere.as_os_str().as_bytes())
+            .unwrap();
+    }
+    let run = dir.path().join("rb");
+    make_private(&run);
+    let client = CredAgentClient::for_paths(&paths, Some(run.into_os_string()), None);
+    assert!(client.probe().unwrap());
+    let _blocked = Unreadable::new(elsewhere.parent().unwrap());
+    // The default path is missing, but the recorded agent may be running.
+    assert!(client.probe().is_err());
+    assert!(client.answers());
+}
+
+/// Root searches a 0o000 directory anyway: the permission-denied cases
+/// can't be set up (a container run as root).
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// A client of the key files in `config` (it never starts an agent, as
+/// `running_agent`'s), from a session whose runtime dir is `run`.
+fn never_starting(config: &Path, run: &Path) -> CredAgentClient {
+    CredAgentClient::finding(config, Some(run.as_os_str().to_owned()), None)
+}
+
+#[test]
+fn a_held_key_directory_lock_is_never_reported_as_no_agent() {
+    use crate::memory::unlock::lock_keys_message;
+    let dir = short_dir();
+    let config = dir.path().join("config");
+    let paths = CredPaths::in_dir(&config);
+    let run = dir.path().join("run");
+    make_private(&run);
+    // An agent holds the key files but answers on no socket: none there,
+    // then a socket nobody listens on (refused, as macOS also answers a
+    // live agent behind a full accept queue).
+    let held = lock_key_dir(&paths, Duration::ZERO).unwrap();
+    let socket = sock(&run);
+    for refused in [false, true] {
+        if refused {
+            leave_stale_socket(&socket);
+        }
+        let client = never_starting(&config, &run);
+        assert!(!client.probe().unwrap(), "nothing answers");
+        assert!(client.answers(), "`running_agent` hands it out");
+        let message = format!("{:#}", lock_keys_message(Some(&client)).err().unwrap());
+        assert!(message.starts_with("Not locked"), "{message}");
+        assert!(message.contains("holds the key files"), "{message}");
+        let io = if refused { "refused" } else { "No such file" };
+        assert!(
+            message.contains(io),
+            "the socket's own error kept: {message}"
+        );
+    }
+    // One that is stopping: it lets go of the key files while `atem cred
+    // lock` waits, and is reported gone (never "Not locked").
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
+    let client = never_starting(&config, &run);
+    let message = lock_keys_message(Some(&client)).unwrap();
+    assert!(message.starts_with("Locked"), "{message}");
+    releaser.join().unwrap();
+    // Free and nothing answers: no agent, for `running_agent` too.
+    assert!(!never_starting(&config, &run).answers());
+}
+
+#[test]
+fn a_stale_record_names_itself_and_a_free_key_directory_lets_an_agent_start() {
+    if running_as_root() {
+        return;
+    }
+    let dir = short_dir();
+    let config = dir.path().join("config");
+    let paths = CredPaths::in_dir(&config);
+    crate::paths::create_private_dir(&paths.dir).unwrap();
+    // The record names a socket that answers with an error proving nothing
+    // (its directory can't be searched); no agent holds the key files.
+    let gone = dir.path().join("gone");
+    make_private(&gone);
+    let recorded = sock(&gone);
+    {
+        use std::os::unix::ffi::OsStrExt;
+        crate::memory::crypto::write_private(&paths.agent_socket, recorded.as_os_str().as_bytes())
+            .unwrap();
+    }
+    drop(lock_key_dir(&paths, Duration::ZERO).unwrap());
+    let _blocked = Unreadable::new(&gone);
+    let run = dir.path().join("run");
+    make_private(&run);
+    // A client that never starts one says what to remove.
+    let error = format!(
+        "{:#}",
+        never_starting(&config, &run).status().err().unwrap()
+    );
+    assert!(
+        error.contains(&paths.agent_socket.display().to_string()),
+        "{error}"
+    );
+    assert!(
+        error.contains("remove that file if no cred agent runs"),
+        "{error}"
+    );
+    // One that may start one does: nothing holds the key files.
+    let launches = Arc::new(AtomicUsize::new(0));
+    let client = CredAgentClient::finding(
+        &config,
+        Some(run.clone().into_os_string()),
+        Some(spawning_now(dir.path(), &launches)),
+    );
+    assert!(!client.status().unwrap().unlocked);
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
 }
