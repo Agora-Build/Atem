@@ -992,6 +992,14 @@ async fn a_page_that_fails_or_crashes_while_the_next_is_in_flight_keeps_the_curs
         };
         page_one_only(&s);
 
+        // The stopped sync's page-3 request is answered, and logged, only
+        // after that sync returned: wait for it, so it isn't counted as the
+        // resumed sync's.
+        assert!(
+            wait_for(Duration::from_secs(5), || memory_gets(&log).contains(&400)),
+            "the stopped sync's page-3 request was never answered"
+        );
+
         // The next sync resumes at page 2 and completes.
         log.lock().unwrap().clear();
         let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
