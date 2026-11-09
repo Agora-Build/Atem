@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const WAIT: Duration = Duration::from_secs(15);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const WALL0: u64 = 1_793_264_000_000;
 
 fn fixtures() -> PathBuf {
@@ -132,8 +135,16 @@ impl Box_ {
         self.mark("carry.json", &json!({ "entries": entries }).to_string());
     }
 
+    /// Moves the host clock the runtime reads (`ATEM_TEST_HOST_CLOCK`). The
+    /// file is replaced atomically: the runtime reads it on every pass, and
+    /// a read between `write`'s truncate and its data is no clock at all, so
+    /// the hook answers with the real one (another boot, another wall time):
+    /// the wait's accounting then loses the step just made, and the test
+    /// below timed out (about 1 run in 150 under load).
     fn set_clock(&self, wall: u64, mono: u64, boot: &str) {
-        std::fs::write(&self.clock, format!("{wall} {mono} {boot}")).unwrap();
+        let tmp = self.clock.with_extension("tmp");
+        std::fs::write(&tmp, format!("{wall} {mono} {boot}")).unwrap();
+        std::fs::rename(&tmp, &self.clock).unwrap();
     }
 
     fn log(&self) -> String {

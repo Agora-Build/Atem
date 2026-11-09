@@ -14,6 +14,10 @@ use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const HOST: &str = "host-work";
 const ACCOUNT: &str = "acct-work";
 fn uuid() -> String {
@@ -186,7 +190,7 @@ impl Dev {
         } else {
             Identity::native(id, auth(id))
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         let (handle, a) = loop {
             let handle = uuid();
             match r.connect(&handle, log, HOST, &identity) {
@@ -214,7 +218,7 @@ impl Dev {
             .send(&json!({"type":"session","data":data}), client_ms())
             .unwrap();
         r.frame(&self.handle, &frame);
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         loop {
             if let Some(at) = self.backlog.iter().position(|v| v["re"] == id) {
                 return self.backlog.remove(at);
@@ -255,7 +259,7 @@ impl Dev {
             "profile_id":"backend","profile_revision":1,"expires_at":r9log::host_now().wall_ms+60_000}))
     }
     fn launched(&mut self, r: &mut Router, rid: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         loop {
             let value = self.request(
                 r,
@@ -326,7 +330,7 @@ fn work(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
 }
 
 fn wait_state(dev: &mut Dev, r: &mut Router, tid: &Value, expected: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     loop {
         let status = work(dev, r, tid);
         if status["state"] == expected {
@@ -338,7 +342,7 @@ fn wait_state(dev: &mut Dev, r: &mut Router, tid: &Value, expected: &str) -> Val
 }
 
 fn wait_detail(dev: &mut Dev, r: &mut Router, tid: &Value, expected: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     loop {
         let status = work(dev, r, tid);
         if status["state"] == "blocked"
@@ -924,7 +928,7 @@ fn notification_waits_for_readiness_dispatches_once_and_needs_explicit_result() 
     assert!(!input.contains("Followup task must wait"));
     assert_eq!(input.matches("Implement backend contract").count(), 1);
     std::fs::write(rig.fake.join("complete"), "").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     loop {
         let status = work(&mut dev, &mut r, &first["task_id"]);
         if status["state"] == "awaiting_result" {

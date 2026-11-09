@@ -1,0 +1,1770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Delegated host work and host senders: how data, commands and authority flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..600&family=Instrument+Sans:wght@400..700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* ============ THEME: paper blueprint (light first) ============ */
+  :root {
+    --font-display: 'Fraunces', 'Iowan Old Style', Georgia, serif;
+    --font-body: 'Instrument Sans', 'Segoe UI', 'Helvetica Neue', sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+
+    --bg: #f3efe6;
+    --grid: rgba(65, 82, 196, 0.045);
+    --grid-major: rgba(65, 82, 196, 0.075);
+    --surface: #fffcf5;
+    --surface2: #f6f0e3;
+    --surface-sunk: #efe8d9;
+    --border: rgba(48, 40, 24, 0.12);
+    --border-bright: rgba(48, 40, 24, 0.24);
+    --text: #1f2430;
+    --text-dim: #5b6070;
+    --text-faint: #8a8d97;
+
+    --owner: #23845a;      --owner-dim: rgba(35, 132, 90, 0.11);
+    --agora: #b8542a;      --agora-dim: rgba(184, 84, 42, 0.10);
+    --station: #4152c4;    --station-dim: rgba(65, 82, 196, 0.09);
+    --host: #7d45b5;       --host-dim: rgba(125, 69, 181, 0.10);
+    --integ: #55688a;      --integ-dim: rgba(85, 104, 138, 0.11);
+    --proposed: #8f7a55;   --proposed-dim: rgba(143, 122, 85, 0.12);
+    --danger: #c23b36;     --danger-dim: rgba(194, 59, 54, 0.09);
+    --local: #8a8172;
+    --accent: var(--station);
+    --shadow: 0 1px 2px rgba(48, 40, 24, 0.05), 0 6px 22px rgba(48, 40, 24, 0.06);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f131b;
+      --grid: rgba(143, 160, 255, 0.035);
+      --grid-major: rgba(143, 160, 255, 0.06);
+      --surface: #161c27;
+      --surface2: #1b2230;
+      --surface-sunk: #121720;
+      --border: rgba(220, 225, 240, 0.09);
+      --border-bright: rgba(220, 225, 240, 0.18);
+      --text: #e7e3d8;
+      --text-dim: #a2a7b4;
+      --text-faint: #6f7584;
+
+      --owner: #5cd39d;      --owner-dim: rgba(92, 211, 157, 0.12);
+      --agora: #f08a5d;      --agora-dim: rgba(240, 138, 93, 0.12);
+      --station: #8fa0ff;    --station-dim: rgba(143, 160, 255, 0.12);
+      --host: #c69cf4;       --host-dim: rgba(198, 156, 244, 0.12);
+      --integ: #9cb0cc;      --integ-dim: rgba(156, 176, 204, 0.12);
+      --proposed: #c9b48a;   --proposed-dim: rgba(201, 180, 138, 0.12);
+      --danger: #ff7b72;     --danger-dim: rgba(255, 123, 114, 0.12);
+      --local: #a9a294;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 26px rgba(0, 0, 0, 0.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f131b;
+    --grid: rgba(143, 160, 255, 0.035);
+    --grid-major: rgba(143, 160, 255, 0.06);
+    --surface: #161c27;
+    --surface2: #1b2230;
+    --surface-sunk: #121720;
+    --border: rgba(220, 225, 240, 0.09);
+    --border-bright: rgba(220, 225, 240, 0.18);
+    --text: #e7e3d8;
+    --text-dim: #a2a7b4;
+    --text-faint: #6f7584;
+
+    --owner: #5cd39d;      --owner-dim: rgba(92, 211, 157, 0.12);
+    --agora: #f08a5d;      --agora-dim: rgba(240, 138, 93, 0.12);
+    --station: #8fa0ff;    --station-dim: rgba(143, 160, 255, 0.12);
+    --host: #c69cf4;       --host-dim: rgba(198, 156, 244, 0.12);
+    --integ: #9cb0cc;      --integ-dim: rgba(156, 176, 204, 0.12);
+    --proposed: #c9b48a;   --proposed-dim: rgba(201, 180, 138, 0.12);
+    --danger: #ff7b72;     --danger-dim: rgba(255, 123, 114, 0.12);
+    --local: #a9a294;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 26px rgba(0, 0, 0, 0.28);
+  }
+
+  /* ============ BASE ============ */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--grid-major) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 120px 120px, 120px 120px, 24px 24px, 24px 24px;
+    background-attachment: fixed;
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.6;
+    padding: 40px;
+    min-height: 100vh;
+    overflow-wrap: break-word;
+  }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    background: var(--station-dim);
+    color: var(--station);
+    padding: 1px 5px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  a { color: var(--station); }
+  strong { font-weight: 650; }
+
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @keyframes fadeScale { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: none; } }
+  .animate { animation: fadeUp 0.45s ease-out both; animation-delay: calc(var(--i, 0) * 0.06s); }
+  .pop { animation: fadeScale 0.4s ease-out both; animation-delay: calc(var(--i, 0) * 0.06s); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-delay: 0ms !important; transition-duration: 0.01ms !important; }
+    html { scroll-behavior: auto; }
+  }
+
+  /* ============ LAYOUT + NAV ============ */
+  .wrap {
+    max-width: 1440px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 196px 1fr;
+    gap: 0 44px;
+  }
+  .main { min-width: 0; }
+  .toc {
+    position: sticky;
+    top: 24px;
+    align-self: start;
+    padding: 14px 0;
+    grid-row: 1 / -1;
+    max-height: calc(100dvh - 48px);
+    overflow-y: auto;
+  }
+  .toc-title {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--text-faint);
+    padding: 0 0 10px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .toc a {
+    display: block;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    text-decoration: none;
+    padding: 5px 9px;
+    border-radius: 5px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    line-height: 1.35;
+    margin-bottom: 1px;
+  }
+  .toc a .n { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); margin-right: 6px; }
+  .toc a:hover { color: var(--text); background: var(--surface2); }
+  .toc a.active { color: var(--text); border-left-color: var(--accent); background: var(--surface); }
+  .toc .theme-switch { margin-top: 18px; }
+
+  /* ============ HEADER ============ */
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 1.6px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .eyebrow::before { content: ''; width: 28px; height: 2px; background: var(--agora); display: inline-block; }
+  h1 {
+    font-family: var(--font-display);
+    font-optical-sizing: auto;
+    font-weight: 600;
+    font-size: clamp(30px, 4vw, 48px);
+    line-height: 1.08;
+    letter-spacing: -0.02em;
+    max-width: 22ch;
+    text-wrap: balance;
+  }
+  h1 em { font-style: italic; font-weight: 450; color: var(--station); }
+  .subtitle {
+    margin-top: 14px;
+    max-width: 78ch;
+    color: var(--text-dim);
+    font-size: 15.5px;
+  }
+  .subtitle code { white-space: normal; }
+
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 18px;
+    margin: 30px 0 18px;
+  }
+  .hero-grid > * { min-width: 0; }
+  .ve-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 22px;
+    position: relative;
+  }
+  .ve-card--hero {
+    background: color-mix(in srgb, var(--surface) 93%, var(--station) 7%);
+    border-color: color-mix(in srgb, var(--border) 55%, var(--station) 45%);
+    box-shadow: var(--shadow);
+  }
+  .ve-card--recessed {
+    background: color-mix(in srgb, var(--bg) 60%, var(--surface) 40%);
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+  .card-label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--station);
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card-label::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .card-label.agora { color: var(--agora); }
+  .card-label.owner { color: var(--owner); }
+  .card-label.proposed { color: var(--proposed); }
+  .card-label.host { color: var(--host); }
+
+  .bullets { list-style: none; }
+  .bullets li { position: relative; padding-left: 16px; margin: 6px 0; font-size: 14px; color: var(--text); }
+  .bullets li::before { content: '›'; position: absolute; left: 0; top: 0; color: var(--text-faint); font-weight: 700; }
+  .bullets li .dim { color: var(--text-dim); }
+
+  /* ============ LEGEND ============ */
+  .legend-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px 26px;
+  }
+  .legend-grid > * { min-width: 0; }
+  .legend-group h4 {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    margin-bottom: 6px;
+  }
+  .lg { display: flex; align-items: center; gap: 9px; font-size: 13px; margin: 5px 0; color: var(--text); }
+  .lg > span:last-child { min-width: 0; }
+  .sw { width: 22px; height: 14px; border-radius: 3px; border: 1.5px solid; flex-shrink: 0; }
+  .sw.owner { border-color: var(--owner); background: var(--owner-dim); }
+  .sw.agora { border-color: var(--agora); background: var(--agora-dim); }
+  .sw.station { border-color: var(--station); background: var(--station-dim); }
+  .sw.host { border-color: var(--host); background: var(--host-dim); }
+  .sw.integ { border-color: var(--integ); background: var(--integ-dim); }
+  .sw.proposed { border-color: var(--proposed); background: var(--proposed-dim); border-style: dashed; }
+  .sw.band { border-color: transparent; background: rgba(160, 140, 106, 0.28); }
+  .ln { width: 30px; height: 0; border-top: 2.5px solid; flex-shrink: 0; }
+  .ln.agora { border-color: #d0663a; }
+  .ln.ch { border-color: #2e9e6e; }
+  .ln.signed { border-color: #5b6ee1; }
+  .ln.sealed { border-color: #9a5fd0; }
+  .ln.local { border-color: var(--local); }
+  .ln.dashed { border-top-style: dotted; border-color: var(--text-dim); }
+  .x { width: 30px; flex-shrink: 0; color: var(--danger); font-family: var(--font-mono); font-weight: 700; text-align: right; position: relative; }
+  .x::before { content: ''; position: absolute; left: 0; right: 10px; top: 50%; border-top: 2px solid var(--danger); }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1.5px solid;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  .chip.decided { color: var(--owner); border-color: var(--owner); background: var(--owner-dim); }
+  .chip.proposed { color: var(--proposed); border-color: var(--proposed); border-style: dashed; background: var(--proposed-dim); }
+  .chip.agreed { color: var(--station); border-color: var(--station); background: var(--station-dim); }
+
+  /* ============ THEME SWITCH ============ */
+  .theme-switch {
+    display: inline-flex;
+    border: 1px solid var(--border-bright);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+  .theme-switch button {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.5px;
+    padding: 5px 9px;
+    border: none;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .theme-switch button + button { border-left: 1px solid var(--border); }
+  .theme-switch button[aria-pressed="true"] { background: var(--station-dim); color: var(--text); }
+
+  /* ============ SECTIONS ============ */
+  .sec { margin-top: 64px; }
+  .sec-head {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 20px;
+    align-items: baseline;
+    margin-bottom: 18px;
+    scroll-margin-top: 20px;
+  }
+  .sec-num {
+    font-family: var(--font-display);
+    font-style: italic;
+    font-weight: 400;
+    font-size: 54px;
+    line-height: 0.9;
+    color: var(--c, var(--station));
+    opacity: 0.9;
+  }
+  .sec-head h2 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(22px, 2.6vw, 30px);
+    letter-spacing: -0.01em;
+    line-height: 1.15;
+  }
+  .sec-head .lede { grid-column: 2; color: var(--text-dim); max-width: 80ch; font-size: 15px; }
+  .sec-head .lede .chip { margin-left: 4px; }
+
+  figure.fig {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    margin: 18px 0;
+    overflow: hidden;
+  }
+  figure.fig + figure.fig { margin-top: 26px; }
+  .fig-tab {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface2);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .fig-tab b { color: var(--text); font-weight: 600; }
+  .fig-tab .hint { text-transform: none; letter-spacing: 0; color: var(--text-faint); font-size: 11px; }
+  .fig-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--surface2);
+  }
+  .fig-legend .lg { margin: 0; font-size: 12px; color: var(--text-dim); }
+
+  /* ============ MERMAID CONTAINER + ZOOM ============ */
+  /* .mermaid-wrap is the frame (holds the controls, goes full screen); .mermaid-viewport scrolls */
+  .mermaid-wrap {
+    position: relative;
+    background:
+      radial-gradient(circle, var(--grid-major) 1px, transparent 1.2px) 0 0 / 18px 18px,
+      var(--surface);
+  }
+  .mermaid-viewport {
+    overflow: auto;
+    padding: 50px 18px 22px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-bright) transparent;
+  }
+  .mermaid-viewport::-webkit-scrollbar { width: 7px; height: 7px; }
+  .mermaid-viewport::-webkit-scrollbar-track { background: transparent; }
+  .mermaid-viewport::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 4px; }
+  .mermaid-wrap.is-zoomed .mermaid-viewport { max-height: 84vh; cursor: grab; }
+  .mermaid-wrap.is-panning .mermaid-viewport { cursor: grabbing; user-select: none; }
+  .mermaid-wrap:fullscreen { background: var(--surface); }
+  .mermaid-wrap:fullscreen .mermaid-viewport { height: 100vh; max-height: none; padding: 58px 24px 24px; }
+
+  pre.mermaid {
+    margin: 0;
+    white-space: normal;
+    font: inherit;
+    line-height: 1.5;
+    background: none;
+    min-height: 120px;
+  }
+  pre.mermaid:not([data-processed]) { color: transparent; overflow: hidden; max-height: 240px; }
+  pre.mermaid.failed { color: var(--text-dim); white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px; max-height: none; }
+  pre.mermaid svg { display: block; margin: 0 auto; height: auto; }
+
+  .zoom-controls {
+    position: absolute;
+    top: 9px;
+    right: 10px;
+    display: flex;
+    gap: 2px;
+    z-index: 10;
+    background: var(--surface);
+    border: 1px solid var(--border-bright);
+    border-radius: 7px;
+    padding: 2px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  }
+  .zoom-controls button {
+    min-width: 28px;
+    height: 28px;
+    padding: 0 6px;
+    border: none;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .zoom-controls button:hover { background: var(--station-dim); color: var(--text); }
+  .zoom-controls .zl { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); padding: 0 6px; align-self: center; min-width: 42px; text-align: center; }
+
+  /* Mermaid SVG overrides: colors follow the page theme; sizes match the themeVariables so measurements hold */
+  .mermaid .nodeLabel, .mermaid .nodeLabel p, .mermaid .cluster-label .nodeLabel { color: var(--text) !important; }
+  .mermaid .edgeLabel, .mermaid .edgeLabel p, .mermaid .labelBkg { color: var(--text) !important; background-color: var(--surface) !important; }
+  .mermaid .edgeLabel rect { fill: var(--surface) !important; }
+  .mermaid .nodeLabel code { background: transparent; color: inherit; padding: 0; font-size: 0.92em; }
+  .mermaid .messageText { fill: var(--text) !important; }
+  .mermaid .noteText, .mermaid .noteText tspan { fill: var(--text) !important; }
+  .mermaid .labelText, .mermaid .labelText tspan, .mermaid .loopText, .mermaid .loopText tspan { fill: var(--text-dim) !important; }
+  .mermaid text.actor, .mermaid text.actor tspan { fill: var(--text) !important; }
+
+  /* ============ NOTES UNDER A FIGURE ============ */
+  .notes {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+    gap: 18px;
+    margin-top: 6px;
+  }
+  .notes > * { min-width: 0; }
+  .notes h3 {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    margin-bottom: 8px;
+  }
+  .notes p { font-size: 14px; margin: 6px 0; }
+  .notes code { white-space: normal; overflow-wrap: anywhere; }
+  .callout {
+    border-left: 3px solid var(--c, var(--station));
+    border-radius: 0 10px 10px 0;
+  }
+  .callout.proposed { border-left-style: dashed; --c: var(--proposed); }
+
+  /* ============ TABLE ============ */
+  .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-top: 18px; }
+  .table-scroll { overflow-x: auto; }
+  .data-table { width: 100%; border-collapse: collapse; font-size: 13.5px; line-height: 1.5; }
+  .data-table th {
+    background: var(--surface2);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 2px solid var(--border-bright);
+    white-space: nowrap;
+  }
+  .data-table td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .data-table tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface) 96%, var(--station) 4%); }
+  .data-table tbody tr:last-child td { border-bottom: none; }
+  .data-table td:first-child { white-space: nowrap; font-weight: 600; }
+  .data-table td code { white-space: normal; }
+  .prot { display: block; padding-left: 26px; position: relative; }
+  .prot .ln { position: absolute; left: 0; top: 0.72em; width: 18px; }
+
+  footer {
+    margin-top: 72px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  footer code { white-space: normal; }
+
+  /* ============ RESPONSIVE ============ */
+  @media (max-width: 1100px) {
+    .hero-grid { grid-template-columns: 1fr; }
+    .legend-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .notes { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 1000px) {
+    .wrap { grid-template-columns: 1fr; }
+    body { padding: 0 20px 28px; }
+    .toc {
+      position: sticky;
+      top: 0;
+      z-index: 200;
+      max-height: none;
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      overflow-x: auto;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      margin: 0 -20px;
+      grid-row: auto;
+    }
+    .toc::-webkit-scrollbar { display: none; }
+    .toc-title { display: none; }
+    .toc a { white-space: nowrap; flex-shrink: 0; border-left: none; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; padding: 6px 10px; font-size: 11.5px; }
+    .toc a.active { border-left: none; border-bottom-color: var(--accent); background: var(--surface); }
+    .toc .theme-switch { margin-top: 0; flex-shrink: 0; margin-left: 8px; }
+    .main { padding-top: 22px; }
+    .sec-head { scroll-margin-top: 60px; }
+  }
+  @media (max-width: 640px) {
+    .legend-grid { grid-template-columns: 1fr; }
+    .sec-num { font-size: 40px; }
+    .sec-head { grid-template-columns: 1fr; }
+    .sec-head .lede { grid-column: 1; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="toc" id="toc" aria-label="Sections">
+    <div class="toc-title">Contents</div>
+    <a href="#top"><span class="n">00</span>Read me first</a>
+    <a href="#s1"><span class="n">01</span>Who talks to whom</a>
+    <a href="#s2"><span class="n">02</span>Authority layers</a>
+    <a href="#s3"><span class="n">03</span>An integration's task</a>
+    <a href="#s4"><span class="n">04</span>Host-to-host message</a>
+    <a href="#s5"><span class="n">05</span>Host-sender states</a>
+    <a href="#s6"><span class="n">06</span>Disabled account</a>
+    <div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" data-theme-choice="auto" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+    </div>
+  </nav>
+
+  <div class="main">
+
+    <!-- ================= HEADER ================= -->
+    <header id="top" class="sec-head" style="display:block; margin-bottom:0">
+      <div class="eyebrow animate" style="--i:0">Atem · design companion · 2026-11-07</div>
+      <h1 class="animate" style="--i:1">Delegated host work and host senders: <em>how data, commands and authority flow</em></h1>
+      <p class="subtitle animate" style="--i:2">
+        Six diagrams of the paths between Auth, the Portal and its admin site, Astation (the native app and its Station
+        server) and Atem hosts. Read them next to <code>delegated-host-work-and-host-senders.md</code>
+        (revision 5), whose Appendix A holds the owner's decisions of 2026-11-07 word for word.
+      </p>
+    </header>
+
+    <div class="hero-grid">
+      <div class="ve-card ve-card--hero pop" style="--i:3">
+        <div class="card-label">What this page follows from the owner's decisions</div>
+        <ul class="bullets">
+          <li><strong>Host senders: Revoke + Readmit only.</strong> <span class="dim">No hold or release and no <code>principal_seq</code> for <code>host:</code> senders. Integration Pause / Resume stays as it is.</span></li>
+          <li><strong>Re-verification never restores sending.</strong> <span class="dim">A revoke survives every key change of the same <code>host_id</code>; only an explicit Readmit lifts it.</span></li>
+          <li><strong>Two authorities.</strong> <span class="dim">R9 authorization belongs to native managers. Agora.Build decides only whether it keeps serving its own relay and mailbox, and that is never an R9 revocation.</span></li>
+          <li><strong>Disabled account, option B.</strong> <span class="dim">The built-in Station refuses relay and mailbox service to that account's hosts. Proposed: Auth/Portal and Astation define it jointly.</span></li>
+          <li><strong>Deferred device-list entries, option A.</strong> <span class="dim">During an account recovery every unstarted delegated remote task waits; running and local work go on.</span></li>
+        </ul>
+      </div>
+      <div class="ve-card pop" style="--i:4">
+        <div class="card-label agora">Status</div>
+        <p style="font-size:14px">Nothing here is built. The core model is approved in principle, and the choices marked
+          <span class="chip decided">decided</span> are the owner's. Everything still needs review and agreement from
+          Atem, Astation and Auth/Portal before it is implemented, merged or deployed.</p>
+        <p style="font-size:14px; margin-top:8px">Marked <span class="chip proposed">proposed</span>: designs the
+          decisions asked for but nobody has agreed yet, such as the exact R9 form of Revoke and Readmit, and the
+          disabled-account binding. Every owner choice is now decided (choice 19 was withdrawn).</p>
+      </div>
+    </div>
+
+    <div class="ve-card ve-card--recessed animate" style="--i:5">
+      <div class="card-label">Legend (all diagrams)</div>
+      <div class="legend-grid">
+        <div class="legend-group">
+          <h4>Who it belongs to</h4>
+          <div class="lg"><span class="sw owner"></span><span>Owner devices, R9 native authority</span></div>
+          <div class="lg"><span class="sw agora"></span><span>Agora.Build: Auth, Portal, admin site</span></div>
+          <div class="lg"><span class="sw station"></span><span>Station: relay, control feed, mailbox</span></div>
+          <div class="lg"><span class="sw integ"></span><span>Integrations (Station holds their R9 key)</span></div>
+          <div class="lg"><span class="sw host"></span><span>Atem hosts: runtime, queue, agents</span></div>
+        </div>
+        <div class="legend-group">
+          <h4>How an edge is protected (fig. 1)</h4>
+          <div class="lg"><span class="ln agora"></span><span>Auth: OAuth sign-in, tokens, client credentials (TLS)</span></div>
+          <div class="lg"><span class="ln ch"></span><span>r9 <code>atem-ch1</code> end-to-end channel</span></div>
+          <div class="lg"><span class="ln signed"></span><span>Signed device-list entries, signed control records</span></div>
+          <div class="lg"><span class="ln sealed"></span><span>Sealed + origin-signed envelopes</span></div>
+          <div class="lg"><span class="ln local"></span><span>Same-user local socket</span></div>
+        </div>
+        <div class="legend-group">
+          <h4>Agreement</h4>
+          <div class="lg"><span class="sw owner"></span><span>Solid border: in the design, owner-decided or already agreed</span></div>
+          <div class="lg"><span class="sw proposed"></span><span>Dashed border: <strong>proposed</strong>, not yet agreed</span></div>
+          <div class="lg"><span class="ln dashed"></span><span>Dotted edge: a side relation; in fig. 6, a proposed flow</span></div>
+          <div class="lg"><span class="sw band"></span><span>Tinted band in a sequence: a <strong>proposed</strong> step</span></div>
+          <div class="lg"><span class="x">×</span><span>Never happens, or is refused</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= 1. TOPOLOGY ================= -->
+    <section class="sec" aria-labelledby="h-s1">
+      <div id="s1" class="sec-head" style="--c: var(--station)">
+        <span class="sec-num">01</span>
+        <h2 id="h-s1">Who talks to whom</h2>
+        <p class="lede">Every remote path goes through a Station, but the Station only routes, stores and relays. What
+          gives a message authority is a key the receiving host already pins, not the path it took.</p>
+      </div>
+
+      <figure class="fig">
+        <div class="fig-tab"><span><b>Fig. 1</b> · topology</span><span class="hint">+ / − zoom · ⌘/Ctrl + scroll · drag to pan · last button: full screen</span></div>
+        <div class="mermaid-wrap">
+          <div class="zoom-controls"></div>
+          <div class="mermaid-viewport">
+<pre class="mermaid">
+---
+config:
+  layout: elk
+---
+flowchart TB
+  subgraph OWN["Owner devices · R9 native members"]
+    MAC["<b>Astation app</b> · Mac<br/>native manager<br/>holds a device key"]
+    PHONE["<b>Phone app</b><br/>native member"]
+  end
+  APP["<b>Integration app</b><br/>an Agora.Build integration"]
+  subgraph AB["Agora.Build"]
+    AUTH["<b>Auth</b><br/>tokens · change feed"]
+    PORTAL["<b>Portal</b><br/>integrations: create · approve<br/>pause/resume · revoke + interruptRunning"]
+    ADMIN["<b>Admin site</b><br/>pause · revoke · interrupt<br/>account disable / enable<br/>Release R9 binding"]
+  end
+  subgraph ST["Station · built-in, dev or custom"]
+    INTEG["<b>Integrations</b><br/>hosted API · adapters<br/>R9 service keys kept here"]
+    RELAY["<b>Relay</b><br/>routes r9 channels<br/>it can't read"]
+    FEED["<b>Control feed</b><br/>records signed with a service key<br/>or by a native manager"]
+    DL["<b>Device-list copy</b>"]
+    MBOX["<b>Mailbox</b><br/>sealed envelopes · ≤ 24 h"]
+  end
+  subgraph HOSTS["Atem hosts · one outbound relay link each"]
+    subgraph HA["Host A"]
+      RTA["<b>atem runtime</b><br/>gate · queue · outbox"]
+      AGA["agent sessions"]
+    end
+    subgraph HB["Host B"]
+      RTB["<b>atem runtime</b><br/>gate · queue · outbox"]
+      AGB["agent sessions"]
+    end
+  end
+
+  MAC -->|"login · OAuth code + PKCE<br/>loopback or device grant"| AUTH
+  MAC -->|"mirror a native revoke<br/>same token and scope"| PORTAL
+  PORTAL <-->|"management API<br/>change feed · unsigned nudge"| AUTH
+  PORTAL <-->|"Station feed + reports<br/>station.report token · push is a hint"| ST
+  APP -->|"hosted API · Auth token"| INTEG
+  INTEG -->|"signs stops<br/>with the service key"| FEED
+  INTEG <-->|"tasks · atem-ch1"| RELAY
+  MAC <-->|"atem-ch1 · end to end"| RELAY
+  PHONE <-->|"atem-ch1 · end to end"| RELAY
+  MAC -->|"signed device-list entries"| DL
+  RELAY <-->|"atem-ch1 · end to end"| HOSTS
+  FEED -->|"signed control records"| HOSTS
+  DL -->|"signed device-list entries"| HOSTS
+  RTA <-->|"sealed + origin-signed<br/>envelopes"| MBOX
+  MBOX <-->|"sealed + origin-signed<br/>envelopes"| RTB
+  RTA <-->|"same-user socket"| AGA
+  RTB <-->|"same-user socket"| AGB
+  PHONE -->|"login · Auth token<br/>(OAuth PKCE, mobile client)"| AUTH
+  ADMIN -->|"admin changes<br/>admin client + passkey step-up"| AUTH
+  MAC -->|"approvals · r9_svc report<br/>integrations:read / approve"| PORTAL
+  ADMIN -->|"bindings: read, release<br/>portal.admin token · not built yet"| PORTAL
+
+  classDef owner fill:#2e9e6e22,stroke:#2e9e6e,stroke-width:1.5px
+  classDef agora fill:#d0663a22,stroke:#d0663a,stroke-width:1.5px
+  classDef station fill:#5b6ee11f,stroke:#5b6ee1,stroke-width:1.5px
+  classDef host fill:#9a5fd022,stroke:#9a5fd0,stroke-width:1.5px
+  classDef integ fill:#6f86a622,stroke:#6f86a6,stroke-width:1.5px
+  class MAC,PHONE owner
+  class AUTH,PORTAL,ADMIN agora
+  class RELAY,FEED,DL,MBOX station
+  class INTEG,APP integ
+  class RTA,RTB,AGA,AGB host
+  style OWN fill:#2e9e6e0d,stroke:#2e9e6e66
+  style AB fill:#d0663a0d,stroke:#d0663a66
+  style ST fill:#5b6ee10d,stroke:#5b6ee166
+  style HOSTS fill:#9a5fd00a,stroke:#9a5fd055
+  style HA fill:#9a5fd00d,stroke:#9a5fd066
+  style HB fill:#9a5fd00d,stroke:#9a5fd066
+  linkStyle 0,1,2,3,4,17,18,19,20 stroke:#d0663a,stroke-width:1.6px
+  linkStyle 5,9,11,12 stroke:#5b6ee1,stroke-width:1.6px
+  linkStyle 6,7,8,10 stroke:#2e9e6e,stroke-width:2px
+  linkStyle 13,14 stroke:#9a5fd0,stroke-width:2px
+  linkStyle 15,16 stroke:#8a8172,stroke-width:1.4px
+</pre>
+          </div>
+        </div>
+        <div class="fig-legend">
+          <div class="lg"><span class="ln agora"></span><span>Auth sign-in or token</span></div>
+          <div class="lg"><span class="ln ch"></span><span><code>atem-ch1</code> channel</span></div>
+          <div class="lg"><span class="ln signed"></span><span>signed entries or records</span></div>
+          <div class="lg"><span class="ln sealed"></span><span>sealed + origin-signed envelopes</span></div>
+          <div class="lg"><span class="ln local"></span><span>same-user socket</span></div>
+        </div>
+      </figure>
+
+      <div class="notes">
+        <div class="ve-card">
+          <h3>Reading it</h3>
+          <ul class="bullets">
+            <li><strong>Stations.</strong> The built-in Station is <code>station.agora.build</code>, the dev one
+              <code>station-dev.agora.build</code>. A custom Station is run by someone else and serves the same roles.</li>
+            <li><strong>One link per host.</strong> A host opens no port and never connects to another host. Channels,
+              <code>control_sync</code>, its own device-list fetch and the mailbox calls all ride its one outbound relay
+              link (or Astation's local <code>:8080</code> proxy), authenticated by the paired Astation or by its host
+              route proof.</li>
+            <li><strong>The Station holds keys only for integrations.</strong> It signs their stops with their own R9
+              service keys. For native members and host senders it holds no key a host trusts.</li>
+            <li><strong>Two sign-ins per device.</strong> The Mac and the phone each reach the Station's relay with
+              an <code>astation.remote</code> token for the selected Station, while each <code>atem-ch1</code> channel
+              to a host is authenticated by the device's own key against the device list. The phone's login is
+              <span class="chip agreed">live on dev</span> (Auth #19, merged as <code>c494bae</code>; updated after agreement).
+              Redirects: <code>build.agora.astation.ios:/oauth/callback</code> and
+              <code>build.agora.astation.android:/oauth/callback</code>.</li>
+            <li><strong>Native devices carry entries too.</strong> Inside their channels they hand hosts newer
+              device-list entries, so a Station that withholds them can't hide them from a host a native device
+              reaches.</li>
+            <li><strong>Hosts trust signatures, not carriers.</strong> Every entry, record and envelope is verified with
+              the key the host's own device list names.</li>
+          </ul>
+        </div>
+        <div class="ve-card callout" style="--c: var(--host)">
+          <h3>What each side can't do</h3>
+          <ul class="bullets">
+            <li>The relay can't read channels or tell who is inside them.</li>
+            <li>The mailbox can't read, forge or alter an envelope. It can delay, withhold or drop one, within its
+              24 h life, the senders' resends and the gate.</li>
+            <li>Auth, the Portal and the admin site hold no key that can sign a native R9 entry or a host sender's
+              revoke.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr><th>Edge</th><th>What flows</th><th>Protected by</th></tr></thead>
+            <tbody>
+              <tr><td>Astation app → Auth</td><td>The owner's sign-in; Astation's tokens</td><td><span class="prot"><span class="ln agora"></span><span>OAuth code + PKCE on a loopback redirect, or the device grant</span></span></td></tr>
+              <tr><td>Phone app → Auth</td><td>The owner's sign-in on the phone, as a public mobile client (<code>astation-ios</code>, <code>astation-android</code>), scopes <code>openid profile offline_access</code>, plus <code>astation.remote</code> on Stations; no Portal resource and no device grant. <span class="chip agreed">live on dev</span> Auth #19 (updated after agreement), redirects <code>build.agora.astation.ios:/oauth/callback</code> and <code>build.agora.astation.android:/oauth/callback</code>; contract and dev checks: Portal #30</td><td><span class="prot"><span class="ln agora"></span><span>OAuth code + PKCE on its registered scheme</span></span></td></tr>
+              <tr><td>Astation app → Portal</td><td>Approvals: the pending-approvals list and the approval report with <code>r9_svc</code> (<code>/api/v1/integrations</code>, <code>/approval</code>). This is how an integration gets its R9 binding</td><td><span class="prot"><span class="ln agora"></span><span>Astation's Auth token, scopes <code>integrations:read</code>, <code>integrations:approve</code></span></span></td></tr>
+              <tr><td>Astation app → Portal</td><td>The mirror of a native revoke of an integration, with the owner's <code>interruptRunning</code> choice</td><td><span class="prot"><span class="ln agora"></span><span>the same token and scope</span></span></td></tr>
+              <tr><td>Admin site → Auth</td><td>Admin changes: pause, revoke, interrupt running tasks, account disable and enable. For a binding release, Auth only exchanges the admin's step-up proof for a <code>portal.admin</code> token and audits it</td><td><span class="prot"><span class="ln agora"></span><span>the admin client's credentials plus the admin's passkey step-up (an MFA ID token)</span></span></td></tr>
+              <tr><td>Admin site → Portal</td><td>Reading bindings and "Release R9 binding" through the Portal's admin API (D27). <span class="chip proposed">not built yet</span></td><td><span class="prot"><span class="ln agora"></span><span>a <code>portal.admin</code> token that Auth exchanges from the admin's step-up proof</span></span></td></tr>
+              <tr><td>Portal ↔ Auth</td><td>Integration and account changes over the management API. Auth's nudge to the Portal is unsigned and carries no data; the Portal then reads the change feed over the management API</td><td><span class="prot"><span class="ln agora"></span><span>Auth management API</span></span></td></tr>
+              <tr><td>Portal ↔ Station</td><td>The Portal's Station feed (revoked, interruptRunning, pause, <code>binding_released</code> …); per-host and <code>binding_changed</code> reports back</td><td><span class="prot"><span class="ln agora"></span><span>the Station's report client token (<code>station.report</code>, audience = the Portal) for the feed and reports; the Portal's push to the Station is an unsigned hint with no authority</span></span></td></tr>
+              <tr><td>Integration app → Station</td><td>Tasks and queries through the hosted API</td><td><span class="prot"><span class="ln agora"></span><span>the integration's Auth token</span></span></td></tr>
+              <tr><td>Station ↔ host (channels)</td><td>Session-v1, chat, approvals and host-work ops from Astation, the phone, or an integration as <code>service:svc-…</code>. The Mac and the phone reach the relay with an <code>astation.remote</code> token for the selected Station</td><td><span class="prot"><span class="ln ch"></span><span><code>atem-ch1</code>, end to end; the device's key checked against the device list</span></span></td></tr>
+              <tr><td>Device list → host</td><td>Members, services, hosts and their keys, project grants, host-sender revoke and readmit</td><td><span class="prot"><span class="ln signed"></span><span>entries signed by native managers</span></span></td></tr>
+              <tr><td>Control feed → host</td><td>Integration stops (cover, revoke, hold, release, interrupt); a native interrupt for a revoked host sender</td><td><span class="prot"><span class="ln signed"></span><span>integration stops: signed with the integration's service key; a host sender's interrupt: signed by a native manager</span></span></td></tr>
+              <tr><td>Host ↔ mailbox ↔ host</td><td>Requests, cancel, complete; status and results back</td><td><span class="prot"><span class="ln sealed"></span><span>signed with <code>host_key</code>, sealed to <code>host_enc_key</code></span></span></td></tr>
+              <tr><td>Runtime ↔ agents</td><td><code>atem message send</code>, replies, framed prompts</td><td><span class="prot"><span class="ln local"></span><span>same-user socket, tied to the agent's session</span></span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 2. AUTHORITY LAYERS ================= -->
+    <section class="sec" aria-labelledby="h-s2">
+      <div id="s2" class="sec-head" style="--c: var(--owner)">
+        <span class="sec-num">02</span>
+        <h2 id="h-s2">Authority layers</h2>
+        <p class="lede">The owner's model: user authentication, command verification and a safe transport channel.
+          Prompts come from the authenticated user, with no fake one and no one in the middle. On top of that sit two
+          separate authorities.</p>
+      </div>
+
+      <figure class="fig">
+        <div class="fig-tab"><span><b>Fig. 2</b> · layers, read top to bottom</span><span class="hint">each layer builds on the one above</span></div>
+        <div class="mermaid-wrap">
+          <div class="zoom-controls"></div>
+          <div class="mermaid-viewport">
+<pre class="mermaid">
+flowchart TB
+  subgraph L1["1 · Authentication: who is speaking"]
+    DEV["<b>Astation on the Mac and the phone</b><br/>each authenticates twice"]
+    A1["<b>Agora.Build login</b><br/>Auth tokens: Mac, phone,<br/>integration clients, Stations<br/>disabled account: tokens refused"]
+    A2["<b>R9 native membership</b><br/>device keys in the device list,<br/>signed by native managers<br/>a disable changes nothing here"]
+  end
+  subgraph L2["2 · Command verification: genuine and allowed?"]
+    C1["<b>Channel principal</b><br/>key pinned in the device list"]
+    C2["<b>Admission record</b><br/>frozen at enqueue"]
+    C3["<b>Start check</b><br/>in the step to executing"]
+    C4["<b>Signed records, entries</b><br/>key from the device list,<br/>never from the object"]
+  end
+  subgraph L3["3 · Safe transport: nobody in the middle"]
+    T1["<b>End-to-end channels</b><br/>atem-ch1"]
+    T2["<b>Sealed envelopes</b><br/>origin-signed, sealed<br/>to host_enc_key"]
+    T3["<b>Relay, Station, mailbox</b><br/>can delay or withhold<br/>can't read, forge or alter"]
+    T4["<b>Local socket</b><br/>same user only"]
+  end
+  subgraph L4["4 · Who decides"]
+    IG["<b>Integration lifecycle</b><br/>Portal, admin site, Auth decide<br/>the Station signs with that<br/>integration's own key"]
+    SA["<b>Service availability</b><br/>each Station's operator:<br/>Agora.Build for the built-in one<br/>serves, refuses or closes"]
+    SAX["<b>Disabled account</b> · proposed<br/>built-in Station refuses<br/>relay + mailbox, see 06"]
+    R9["<b>R9 authorization</b><br/>native managers only<br/>device list · project grants<br/>host-sender revoke + readmit<br/>interrupt running tasks"]
+  end
+  A1 ~~~ C1
+  A1 ~~~ C2
+  A2 ~~~ C3
+  A2 ~~~ C4
+  C1 ~~~ T1
+  C2 ~~~ T2
+  C3 ~~~ T3
+  C4 ~~~ T4
+  T1 ~~~ IG
+  T2 ~~~ SA
+  T3 ~~~ SAX
+  SA --x|"never an R9 revocation<br/>holds no native key"| R9
+  IG -.->|"stops only<br/>that integration"| R9
+  SA -.-> SAX
+  DEV -->|"1 · login<br/>service access to the Station"| A1
+  DEV -->|"2 · device key<br/>authority over hosts"| A2
+
+  classDef owner fill:#2e9e6e22,stroke:#2e9e6e,stroke-width:1.5px
+  classDef agora fill:#d0663a22,stroke:#d0663a,stroke-width:1.5px
+  classDef station fill:#5b6ee11f,stroke:#5b6ee1,stroke-width:1.5px
+  classDef host fill:#9a5fd022,stroke:#9a5fd0,stroke-width:1.5px
+  classDef integ fill:#6f86a622,stroke:#6f86a6,stroke-width:1.5px
+  classDef proposed fill:#a08c6a14,stroke:#a08c6a,stroke-width:1.5px,stroke-dasharray:6 4
+  class DEV,A2,R9 owner
+  class A1,SA agora
+  class IG integ
+  class T1,T2,T3,T4 station
+  class C1,C2,C3,C4 host
+  class SAX proposed
+  style L1 fill:#a08c6a0a,stroke:#a08c6a55
+  style L2 fill:#9a5fd00a,stroke:#9a5fd055
+  style L3 fill:#5b6ee10a,stroke:#5b6ee155
+  style L4 fill:#2e9e6e0a,stroke:#2e9e6e55
+  linkStyle 11 stroke:#d9534f,stroke-width:1.8px
+  linkStyle 13 stroke:#a08c6a,stroke-width:1.5px
+</pre>
+          </div>
+        </div>
+      </figure>
+
+      <div class="notes">
+        <div class="ve-card">
+          <h3>Reading it</h3>
+          <ul class="bullets">
+            <li><strong>Authentication, twice for each native device.</strong> The Mac and the phone each have an
+              Agora.Build login (Auth tokens: service access to the Station; the phone's is live on dev since 2026-11-08, Auth #19, updated after agreement; fig. 1) and an
+              R9 native membership (their device
+              keys in the device list, a log signed by native managers: authority over hosts). A disabled Agora.Build
+              account stops the phone reaching the built-in Station, because Auth refuses its tokens, and changes
+              nothing in R9.</li>
+            <li><strong>Channel principal.</strong> The <code>atem-ch1</code> handshake binds each channel to a member
+              and the key its device-list entry pins.</li>
+            <li><strong>Admission record.</strong> At enqueue the host freezes who asked (principal and key hash), the
+              route revision, the grant, the payload digest and a deadline at most 24 h ahead. Nothing is fetched from
+              the sender later.</li>
+            <li><strong>Start check.</strong> Run in the same step that marks the attempt <code>executing</code>, so a
+              task either started and runs, or never ran.</li>
+            <li><strong>Transport.</strong> A Station can delay or withhold traffic, but each task's deadline, the
+              revocation gate and the senders' resends bound what that can do.</li>
+          </ul>
+        </div>
+        <div class="ve-card callout" style="--c: var(--owner)">
+          <h3>The two authorities <span class="chip decided">decided</span></h3>
+          <p><strong>R9 authorization</strong> decides whether a host is trusted and allowed to send work: native
+            managers only. Agora.Build gets no key that could forge a revocation or change a project grant.</p>
+          <p><strong>Service availability</strong> belongs to each Station's operator: Agora.Build for the built-in
+            Station, the owner of a custom one. Refusing service writes no record and no device-list entry, changes no
+            R9 state, and is shown as a service suspension, never as a revocation.</p>
+          <p><strong>Integrations</strong> are managed in the Portal (and the owner can revoke one natively): their
+            stops are signed with the integration's own key, which the Station holds, and reach only that
+            integration's work.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 3. INTEGRATION TASK ================= -->
+    <section class="sec" aria-labelledby="h-s3">
+      <div id="s3" class="sec-head" style="--c: var(--integ)">
+        <span class="sec-num">03</span>
+        <h2 id="h-s3">An integration's task, start to end</h2>
+        <p class="lede">Once host B durably accepts the task, Atem owns it. The integration may go offline or expire;
+          only a revocation, a narrowed grant or a route change stops unstarted work.
+          <span class="chip decided">decided</span></p>
+      </div>
+
+      <figure class="fig">
+        <div class="fig-tab"><span><b>Fig. 3a</b> · a task's life</span><span class="hint">numbers are step numbers</span></div>
+        <div class="mermaid-wrap">
+          <div class="zoom-controls"></div>
+          <div class="mermaid-viewport">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant I as Integration app
+  box rgba(91, 110, 225, 0.07) Station
+    participant S as Station adapter<br/>holds the service key
+  end
+  box rgba(154, 95, 208, 0.07) Atem host B
+    participant Q as Admission + queue
+    participant GT as Gate + start check
+    participant G as Agent session
+  end
+  I->>S: Submit a task with its Auth token
+  S->>Q: work_enqueue as service:svc-1, inside an atem-ch1 channel
+  Q->>Q: Admission checks, then freeze the admission record durably
+  Note over Q,GT: route consent · notify + prompt · scope · grant valid now · payload digest · deadline
+  Q-->>S: Accepted: task_id, deadline at most 24 h ahead
+  S-->>I: Task accepted
+  Note over I,S: From here the sender may go offline, or its grant may expire
+  Q->>GT: Task queued, FIFO per session
+  loop Until the gate opens
+    GT->>GT: Sync the control feed and the device list up to the announced heads
+  end
+  Note over GT,G: A gate-blocked task waits without holding its session
+  GT->>GT: Start check, in the same step that marks the attempt executing
+  Note over GT,G: no revoke · grant still covers · same route revision · list not frozen · deadline not passed
+  GT->>G: Framed prompt under the host-work principal, lease held for the turn
+  G-->>GT: The turn runs, the agent replies with atem message reply
+  GT->>Q: Task awaiting_result, reply kept 30 days
+  Note over I,Q: Later, with current authority, possibly after a renewal
+  I->>S: reply_query or work_query
+  S->>Q: The same query inside an atem-ch1 channel
+  Q-->>S: Status and reply
+  S-->>I: Reply
+</pre>
+          </div>
+        </div>
+      </figure>
+
+      <figure class="fig">
+        <div class="fig-tab"><span><b>Fig. 3b</b> · revoking the integration</span><span class="hint">owner, native or admin · one way to the host</span></div>
+        <div class="mermaid-wrap">
+          <div class="zoom-controls"></div>
+          <div class="mermaid-viewport">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant N as Astation app
+  box rgba(208, 102, 58, 0.07) Agora.Build
+    participant P as Portal
+    participant ADM as Admin site
+    participant A as Auth
+  end
+  box rgba(91, 110, 225, 0.07) Station
+    participant S as Station<br/>control feed
+  end
+  box rgba(154, 95, 208, 0.07) Atem host B
+    participant B as Host B runtime
+    participant G as Agent session
+  end
+  alt The owner revokes in the Portal, or natively in Astation
+    Note over N,P: The owner answers Also interrupt running tasks? yes or no
+    opt Native revoke in Astation, mirrored to Agora.Build
+      N->>S: Native-signed revoke record, appended to the feed
+      N->>P: Mirror: revoke with the same interruptRunning choice
+    end
+    P->>A: PATCH status revoked, with interruptRunning
+    A-->>P: OK
+    P->>P: Record it and append it to its Station feed
+  else An admin revokes on the admin site
+    ADM->>A: Revoke with interruptRunning, a reason and a passkey step-up
+    A--)P: Nudge, unsigned, carries no data
+    P->>A: Read Auth's change feed over the management API
+    A-->>P: revoked, interruptRunning
+    P->>P: Append it to its Station feed
+  end
+  Note over A: Auth refuses the integration's tokens at once
+  P--)S: Push hint, unsigned, no authority
+  S->>P: GET /api/v1/stations/changes with its station.report token
+  P-->>S: revoked, interruptRunning
+  S->>S: Sign a revoke with the integration's own service key, store it before announcing
+  S->>B: Head announcement
+  B->>S: control_sync after its cursor
+  S-->>B: The signed revoke record
+  B->>B: Verify with the service key in the device list, apply it with the cursor in one transaction
+  Note over B,G: Unstarted tasks cancelled as sender revoked. Attempts not yet executing are withdrawn.
+  alt interrupt_running is true
+    B->>G: Interrupt the task's turn with host authority
+  else Not chosen
+    Note over B,G: Running turns continue to their end or their deadline
+  end
+  B-->>S: Acknowledge the cursor: scan progress only, never proof of applying
+  B-->>S: Per-record result for this revoke: applied
+  Note over S,B: duplicate, pending and refused results stay between the host and the Station
+  S-->>P: revocation_applied with host and record_id, sent only for an applied result
+  S-->>P: Final revoked report: outcome all_applied or deadline_passed, with pending_hosts
+  Note over P: Revoked for all_applied. Revoked (n hosts didn't confirm…) for deadline_passed
+</pre>
+          </div>
+        </div>
+      </figure>
+
+      <div class="notes">
+        <div class="ve-card">
+          <h3>Reading 3a</h3>
+          <ul class="bullets">
+            <li><strong>Steps 1–5: admission.</strong> Checked once, against the sender's authority at that moment, and
+              frozen into the task. The reply in step 5 comes only after the record is durable.</li>
+            <li><strong>Step 7: the revocation gate.</strong> It closes on a disconnect, a feed reset, 60 s without a
+              head, and at every restart. While it is closed, unstarted remote tasks wait with
+              <code>revocations not yet checked</code>; local tasks and running turns go on.</li>
+            <li><strong>Account recovery.</strong> While a device-list entry is deferred, every unstarted delegated
+              remote task waits with <code>device list update pending</code>, then is checked again
+              <span class="chip decided">option A</span>.</li>
+            <li><strong>Step 8: the start check.</strong> Revocation, grant, route, device-list state and deadline are
+              read again in the step that marks <code>executing</code>.</li>
+            <li><strong>Steps 9–11.</strong> The prompt runs under the host-local <code>host-work</code> principal, not
+              on the sender's channel; the receipt records the task and who asked.</li>
+            <li><strong>Steps 12–15.</strong> Queries need the sender's current authority. Expiry blocks them; a
+              renewal makes the reply readable again.</li>
+          </ul>
+        </div>
+        <div class="ve-card callout" style="--c: var(--danger)">
+          <h3>Reading 3b</h3>
+          <ul class="bullets">
+            <li><strong>Three ways in.</strong> The owner's revoke in the Portal is recorded by the Portal and
+              appended to its Station feed directly; Auth's change feed doesn't drive it. A native revoke is also
+              signed with the manager's key and appended to the feed, and is mirrored to the Portal the same way. An
+              admin's revoke goes to Auth with a reason and a step-up; Auth's unsigned nudge makes the Portal read
+              Auth's change feed.</li>
+            <li><strong>The poll is the authority.</strong> The Portal's push to the Station is only a hint. The
+              Station pulls <code>GET /api/v1/stations/changes</code> with its <code>station.report</code> token, then
+              signs its own revoke with the integration's service key, which stays in force even if a native signer is
+              removed later.</li>
+            <li><strong>Unstarted tasks are cancelled</strong> as soon as host B applies the record.</li>
+            <li><strong>Running turns continue</strong> unless the owner chose to interrupt. The Portal also offers
+              "interrupt running tasks" later, within 24 h of the revocation.</li>
+            <li><strong>Only an applied result counts.</strong> The Station sends
+              <code>revocation_applied{host, record_id}</code> only for a host's per-record result
+              <code>applied</code>, never for its feed cursor: a host can scan past a record it skipped or holds
+              pending. <code>duplicate</code>, <code>pending</code> and <code>refused</code> stay between the host and
+              the Station and never reach the Portal.</li>
+            <li><strong>Revoking → Revoked.</strong> The final report is
+              <code>revoked{outcome: "all_applied" | "deadline_passed", pending_hosts}</code>; the deadline is 24 h,
+              when every task has passed its own. The Portal shows "Revoked" for <code>all_applied</code> and
+              "Revoked (n hosts didn't confirm…)" for <code>deadline_passed</code>.</li>
+            <li><strong>Pause / Resume of integrations is unchanged:</strong> hold and release records, signed the same
+              way.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 4. HOST TO HOST ================= -->
+    <section class="sec" aria-labelledby="h-s4">
+      <div id="s4" class="sec-head" style="--c: var(--host)">
+        <span class="sec-num">04</span>
+        <h2 id="h-s4">A host-to-host message</h2>
+        <p class="lede">An agent on host A asks an agent on host B to do something. A host never opens a channel to
+          another host: it sends a signed, sealed envelope through the Station's mailbox, and the result comes back the
+          same way, possibly long after A went offline.</p>
+      </div>
+
+      <figure class="fig">
+        <div class="fig-tab"><span><b>Fig. 4</b> · host A asks host B</span><span class="hint">tinted bands are proposed</span></div>
+        <div class="mermaid-wrap">
+          <div class="zoom-controls"></div>
+          <div class="mermaid-viewport">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  box rgba(154, 95, 208, 0.07) Atem host A
+    participant AA as Agent on A
+    participant A as Host A runtime<br/>outbox
+  end
+  box rgba(91, 110, 225, 0.07) Station
+    participant V as Memory and vault
+    participant M as Mailbox
+  end
+  box rgba(154, 95, 208, 0.07) Atem host B
+    participant B as Host B runtime<br/>gate · queue
+    participant AB as Agent on B
+  end
+  AA->>A: atem message send, over the same-user socket
+  A->>V: Publish the context, then read it back
+  A->>A: Freeze exact snapshots, build the envelope
+  rect rgba(160, 140, 106, 0.18)
+    Note over AA,A: Origin-signed with A's host_key, sealed to B's host_enc_key, names signed_at_head, the seq and hash of A's device-list head (proposed)
+  end
+  A->>M: Put the envelope over A's relay link
+  M-->>A: Stored, kept at most 24 h
+  Note over V,M: The Station can't read, forge or alter it. It can delay or drop it, and A resends the same bytes.
+  M->>B: Head announcement, with the mailbox head
+  B->>M: Fetch after its cursor, which only B's own link may do
+  B->>B: Reconcile: control feed and device list up to their heads too
+  B->>B: Verify the envelope, open the seal
+  Note over B,AB: B is the recipient · A is a current host · signed by A's newest host_key · times valid · a project lists A and B with the ops · route consent names A or its project
+  rect rgba(160, 140, 106, 0.18)
+    B->>B: Authorization check: A is authorized at generation g, signed_at_head seq ≥ g, its hash matches B's own entry (proposed)
+  end
+  B->>B: Commit the tasks with the mailbox cursor, then mark the object done
+  B->>M: Status accepted, signed by B, sealed to A
+  B->>B: Gate open, start check at executing
+  B->>AB: Framed prompt under the host-work principal
+  AB-->>B: Reply
+  B->>M: Result, signed by B, sealed to A
+  M->>A: A fetches its own mailbox
+  A->>A: Accept only from B's current key, for a recipient of this message, return grant live
+  alt B is authorized, not removed, and still shares a project with A
+    A->>AA: Delivered once into the asking session, framed as data, if the route allows results
+  else B is revoked, removed or no longer granted
+    A->>A: Stored as data on A only, never delivered into a session, shown by atem message status
+  end
+</pre>
+          </div>
+        </div>
+      </figure>
+
+      <div class="notes">
+        <div class="ve-card">
+          <h3>Reading it</h3>
+          <ul class="bullets">
+            <li><strong>Steps 1–3: publish before notify.</strong> A's outbox publishes the context to memory or the
+              vault, reads it back, and freezes the exact snapshots into the message. B never fetches anything from
+              A later.</li>
+            <li><strong>The envelope.</strong> Signed with A's newest <code>host_key</code> and sealed (HPKE) to B's
+              <code>host_enc_key</code>, a separate signed device-list entry. The Station sees only the account, both
+              hosts, ids, times and size.</li>
+            <li><strong>Steps 7–10: B's checks.</strong> Two locks must both be open: a signed project that lists A
+              and B with the ops, and B's own route consent (<code>project:&lt;name&gt;</code> or
+              <code>host:&lt;id&gt;</code> in <code>runtime.toml</code>). Labels address agents; they never
+              authorize.</li>
+            <li><strong>Steps 13–15.</strong> The task runs on B like any delegated task: gate, start check at
+              <code>executing</code>, framed prompt, with A offline or not.</li>
+            <li><strong>Steps 17–20: two outcomes.</strong> From an authorized B, A delivers the result into the
+              asking session once, framed as data, on a route with <code>results = true</code>. From a B that was
+              revoked, removed or is no longer in a project with A, the result is stored as data on A, shown by
+              <code>atem message status</code> and to the owner, and never delivered into a session.</li>
+          </ul>
+        </div>
+        <div class="ve-card callout proposed">
+          <h3>The authorization check <span class="chip proposed">proposed</span></h3>
+          <p>Each envelope and result names <code>signed_at_head</code>: the <code>seq</code> and <code>hash</code> of
+            the sender's device-list head when it signed. B accepts it only if A is <code>authorized(g)</code>, the
+            <code>seq</code> is at least <code>g</code>, and the hash matches B's own entry there. So nothing signed
+            before a Readmit is accepted after it, and a revoked host can't pre-sign for a head that doesn't exist yet.
+            Atem's recommendation; it needs agreement.</p>
+          <h3 style="margin-top:14px">Limits that stay</h3>
+          <ul class="bullets">
+            <li>No attachments or marks from host senders in this version.</li>
+            <li>Mailbox calls up to 512 KiB; a Message keeps its 240 KiB bound.</li>
+            <li>A host sender can't query, interrupt, resolve or answer approvals; its cancel and complete are
+              envelopes too.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 5. STATE MACHINE ================= -->
+    <section class="sec" aria-labelledby="h-s5">
+      <div id="s5" class="sec-head" style="--c: var(--owner)">
+        <span class="sec-num">05</span>
+        <h2 id="h-s5">Host-sender authorization: Revoke and Readmit</h2>
+        <p class="lede">Two states and two moves, both made only by a native manager. Keys and project membership are
+          kept apart from this state. <span class="chip decided">decided</span> <span class="chip proposed">representation proposed</span></p>
+      </div>
+
+      <figure class="fig">
+        <div class="fig-tab"><span><b>Fig. 5</b> · state of one sending host, as seen by every receiver</span><span class="hint">red: revoke · green: readmit</span></div>
+        <div class="mermaid-wrap">
+          <div class="zoom-controls"></div>
+          <div class="mermaid-viewport">
+<pre class="mermaid">
+flowchart TB
+  NEW(["first <code>add_host</code><br/>g = its seq"])
+  AUTHZ["<b>authorized(g)</b><br/>accepts envelopes<br/>signed at or after g"]
+  REV["<b>revoked(r)</b><br/>r = the revoke's seq<br/>refuses every envelope"]
+  NEW --> AUTHZ
+  AUTHZ -->|"<b>host_sender_revoke</b><br/>native manager · device-list entry<br/>interrupt_running: yes or no"| REV
+  REV -->|"<b>host_sender_readmit</b><br/>native manager confirms<br/>device-list entry · g = its seq"| AUTHZ
+
+  KEYS["<b>key changes</b><br/>atem pair verify · newer add_host<br/>host_enc_key rotation<br/>remove_host, then add_host"]
+  KEYS -.->|"never change the state"| AUTHZ
+  KEYS -.->|"never lift a revoke"| REV
+
+  ONREV["<b>on revoke</b><br/>new envelopes refused<br/>unstarted tasks cancelled<br/>running turns interrupted only if chosen,<br/>then or by a later native interrupt record"]
+  ONREAD["<b>on readmit</b><br/>only work signed after it<br/>cancelled tasks stay cancelled<br/>earlier envelopes refused<br/>both entries stay in the log"]
+  REV --- ONREV
+  AUTHZ --- ONREAD
+
+  subgraph SEND["B takes work from A only if all three hold"]
+    direction TB
+    S1["A is <b>authorized</b> here<br/>and a current host"]
+    S2["a <b>project</b> lists A and B with the ops<br/>project_set · project_remove<br/>remove_host ends memberships"]
+    S3["B's <b>route consent</b> names<br/>project:name or host:A"]
+  end
+  AUTHZ -.-> S1
+  S1 ~~~ S2
+  S2 ~~~ S3
+
+  REP["<b>Representation · proposed</b><br/>entries keyed by host_id, never a key<br/>generation = the entry's seq<br/>envelopes name signed_at_head<br/>seq + hash"]
+
+  classDef owner fill:#2e9e6e22,stroke:#2e9e6e,stroke-width:1.8px
+  classDef revoked fill:#d9534f1f,stroke:#d9534f,stroke-width:1.8px
+  classDef host fill:#9a5fd022,stroke:#9a5fd0,stroke-width:1.5px
+  classDef note fill:#a08c6a12,stroke:#a08c6a99,stroke-width:1px
+  classDef proposed fill:#a08c6a14,stroke:#a08c6a,stroke-width:1.5px,stroke-dasharray:6 4
+  classDef start fill:#6f86a622,stroke:#6f86a6,stroke-width:1.5px
+  class AUTHZ owner
+  class REV revoked
+  class KEYS host
+  class ONREV,ONREAD,S1,S2,S3 note
+  class REP proposed
+  class NEW start
+  style SEND fill:#2e9e6e08,stroke:#2e9e6e55
+  linkStyle 1 stroke:#d9534f,stroke-width:2.2px
+  linkStyle 2 stroke:#2e9e6e,stroke-width:2.2px
+</pre>
+          </div>
+        </div>
+      </figure>
+
+      <div class="notes">
+        <div class="ve-card">
+          <h3>Reading it</h3>
+          <ul class="bullets">
+            <li><strong>Revoke</strong> (<code>host_sender_revoke</code>) blocks the host's current authorization
+              for good: new envelopes are refused, unstarted tasks are cancelled once each receiver applies it, and
+              running turns are interrupted only if the owner chose <code>interrupt_running</code>, then or later with
+              a native interrupt record.</li>
+            <li><strong>Readmit</strong> (<code>host_sender_readmit</code>) is a separate, explicit act a native
+              manager confirms. Its <code>seq</code> becomes the new generation: only work signed after it is
+              accepted. It never revives cancelled tasks, never replays old envelopes, and both entries stay in the
+              log.</li>
+            <li><strong>Keys are not permission.</strong> <code>atem pair verify</code>, a new <code>add_host</code> key,
+              a <code>host_enc_key</code> rotation, even <code>remove_host</code> then <code>add_host</code> of the same
+              <code>host_id</code>: none of them changes this state, which is keyed by <code>host_id</code>.
+              A key change also no longer cancels tasks already admitted; the owner revokes to stop them.</li>
+            <li><strong>Projects are a separate lock.</strong> <code>project_set</code> and <code>project_remove</code>
+              decide which hosts may talk and with which ops. <code>remove_host</code> ends every membership; a host
+              added back starts a new membership epoch, so its old tasks can't start, and it needs a new
+              <code>project_set</code> (and a Readmit, if it was revoked).</li>
+            <li><strong>Nobody else decides.</strong> A host's own key never signs its own state, and Auth, the Portal
+              and the admin site can't revoke or readmit a host sender.</li>
+          </ul>
+        </div>
+        <div class="ve-card callout" style="--c: var(--danger)">
+          <h3>Gone since revision 1</h3>
+          <ul class="bullets">
+            <li>Native host-sender <code>hold</code> and <code>release</code>, and Pause / Resume for host senders in
+              Astation.</li>
+            <li>The <code>principal_seq</code> counter, its synchronization and <code>sender_state</code>.</li>
+            <li>"Re-verification lifts a revoke": replaced by Readmit.</li>
+          </ul>
+          <h3 style="margin-top:14px">Unchanged</h3>
+          <ul class="bullets">
+            <li>Integration Pause / Resume and Revoke (fig. 3b).</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 6. DISABLED ACCOUNT ================= -->
+    <section class="sec" aria-labelledby="h-s6">
+      <div id="s6" class="sec-head" style="--c: var(--proposed)">
+        <span class="sec-num">06</span>
+        <h2 id="h-s6">A disabled Agora.Build account</h2>
+        <p class="lede">Option B: the built-in Station stops serving relay and mailbox to that account's hosts. A
+          service restriction only: R9 trust, keys and grants don't change.
+          <span class="chip proposed">proposed</span></p>
+      </div>
+
+      <figure class="fig">
+        <div class="fig-tab"><span><b>Fig. 6</b> · disable, then enable again</span><span class="hint">dashed: proposed, needs the cross-team design</span></div>
+        <div class="mermaid-wrap">
+          <div class="zoom-controls"></div>
+          <div class="mermaid-viewport">
+<pre class="mermaid">
+---
+config:
+  layout: elk
+---
+flowchart TB
+  subgraph AB["Agora.Build"]
+    direction TB
+    ADM["<b>Admin site</b><br/>disable or enable an account<br/>read and release bindings"]
+    AUTHD["<b>Auth</b><br/>account_disabled · account_enabled<br/>for a release: token exchange<br/>+ audit only"]
+    PORT["<b>Portal</b><br/>admin API · D27, not built yet"]
+  end
+  ROOM["<b>Service-owner lookup</b><br/>proposed: being built by Astation<br/>identity rooms: issuer/subject join<br/>proved R9 routes: root/host association<br/>session rooms bound before routes<br/>unknown owner: never enabled"]
+  BIND["<b>Binding</b> · durable<br/>Agora.Build account ↔<br/>R9 account_id + genesis_hash<br/>Auth token + native manager's proof"]
+  subgraph BST["Built-in Station"]
+    direction TB
+    GATEKEEP["<b>Refuse new · close existing</b><br/>host relay links, channels to them<br/>mailbox · control_sync · list fetch<br/>close code service_suspended"]
+    HOLD["<b>Integrations of the account</b><br/>held: hold records signed<br/>with their own service keys"]
+    DROP["<b>Release the binding</b><br/>refuses a stale or repeated release<br/>changes binding + room ownership together<br/>service availability only, never R9"]
+  end
+  subgraph HOSTS["Hosts of that account"]
+    direction TB
+    RUN["running turns continue"]
+    WAIT["queued delegated remote work waits<br/>gate closed: no heads arrive"]
+    LOCAL["local tasks run"]
+    R9S["<b>R9 state unchanged</b><br/>keys · device list · projects<br/>authorization"]
+    STAT["<b>atem status</b><br/>service suspended: account<br/>disabled at Agora.Build<br/>retries, fences nothing"]
+  end
+  CUSTOM["<b>Custom Station</b><br/>its operator keeps its own policy"]
+  ENABLE["<b>Re-enabled</b><br/>hosts authenticate and reconnect<br/>full sync: feed · device list · mailbox<br/>then the gate reopens"]
+
+  ADM -->|"disable, enable: reason + step-up<br/>release: step-up → portal.admin token"| AUTHD
+  AUTHD -.->|"change feed"| PORT
+  PORT -.->|"Station feed"| GATEKEEP
+  PORT -->|"Station feed"| HOLD
+  ROOM -.->|"which hosts"| GATEKEEP
+  BIND -.->|"which hosts"| GATEKEEP
+  GATEKEEP -.->|"service_suspended<br/>no relay, no mailbox"| HOSTS
+  GATEKEEP --x|"never an R9 revocation<br/>can't decrypt or forge"| R9S
+  PORT -.->|"account_enabled"| ENABLE
+  ENABLE -.-> HOSTS
+  PORT --x|"no account-level events"| CUSTOM
+  RUN ~~~ LOCAL
+  WAIT ~~~ R9S
+  LOCAL ~~~ STAT
+  PORT <-.->|"binding_released ↓ account, binding_id, version<br/>binding_changed reports ↑ · station.report"| DROP
+  BIND -.-|"dropped by a release"| DROP
+  ROOM -.-|"changes with the binding"| DROP
+  ADM -.->|"release via admin API<br/>portal.admin token"| PORT
+
+  classDef agora fill:#d0663a22,stroke:#d0663a,stroke-width:1.5px
+  classDef station fill:#5b6ee11f,stroke:#5b6ee1,stroke-width:1.5px
+  classDef host fill:#9a5fd022,stroke:#9a5fd0,stroke-width:1.5px
+  classDef owner fill:#2e9e6e22,stroke:#2e9e6e,stroke-width:1.5px
+  classDef integ fill:#6f86a622,stroke:#6f86a6,stroke-width:1.5px
+  classDef proposed fill:#a08c6a14,stroke:#a08c6a,stroke-width:1.5px,stroke-dasharray:6 4
+  class ADM,PORT agora
+  class AUTHD,ROOM,BIND,GATEKEEP,ENABLE,DROP proposed
+  class HOLD integ
+  class RUN,WAIT,LOCAL host
+  class STAT proposed
+  class R9S owner
+  class CUSTOM station
+  style AB fill:#d0663a0d,stroke:#d0663a66
+  style BST fill:#5b6ee10d,stroke:#5b6ee166
+  style HOSTS fill:#9a5fd00a,stroke:#9a5fd055
+  linkStyle 7 stroke:#d9534f,stroke-width:1.8px
+  linkStyle 10 stroke:#d9534f,stroke-width:1.4px
+</pre>
+          </div>
+        </div>
+      </figure>
+
+      <div class="notes">
+        <div class="ve-card">
+          <h3>Reading it</h3>
+          <ul class="bullets">
+            <li><strong>Release R9 binding</strong> <span class="chip proposed">D27, not built yet</span> goes
+              through the Portal, not Auth's feed. The Station reports bindings to the Portal with its
+              <code>station.report</code> token:
+              <code>binding_changed{account, account_id, genesis_hash, binding_id, version, state}</code>. The admin
+              site reads them and releases one through the Portal's admin API, with a <code>portal.admin</code> token
+              that Auth exchanges from the admin's step-up proof; Auth's part is that authority and the audit. The
+              Portal sends <code>binding_released{account, binding_id, version}</code> in its feed to the built-in
+              Station, which refuses a stale or repeated one and changes the binding and the room ownership
+              together, as unbind and transfer do. None of it changes R9, and it gives the admin site no new trust
+              path.</li>
+            <li><strong>Disable.</strong> Auth writes <code>account_disabled</code> in its change feed, ahead of the
+              account's per-integration rows. The Portal's Station feed carries it to the built-in Station only.</li>
+            <li><strong>Which hosts.</strong> The relay, bound or not: one durable service-owner lookup for every
+              built-in transport <span class="chip proposed">being built by Astation</span>. Registered identity
+              rooms resolve through the verified issuer/subject join, proved R9 routes through the durable
+              recovery-root/host association, and session rooms are bound before they become persistent routes.
+              Unknown ownership is never treated as enabled. The new stage-3 mailbox and host-sender feeds are served
+              only to R9 accounts bound by a proof.</li>
+            <li><strong>The Station</strong> refuses and closes host relay links (routed too), channels routed to
+              them, mailbox calls, <code>control_sync</code>, the device-list fetch and push relay messages. Stored
+              mail stays, undelivered, until it expires. Integrations of the account are held, as already
+              designed.</li>
+            <li><strong>The close code</strong> <span class="chip proposed">needs agreement</span> is
+              <code>service_suspended</code>, text "service suspended: account disabled at Agora.Build": no admin, no
+              reason, never "revoked". A route proof gets <code>host_route_refused{code: "service_suspended"}</code>, an
+              open host link a <code>service_suspended</code> relay message before it closes, and channels to the host
+              <code>close{reason: "service_suspended"}</code>, so native devices see the same reason.</li>
+            <li><strong>The hosts</strong> keep running turns. Unstarted delegated remote tasks wait behind the closed
+              gate, since no feed or mailbox can be synced; local tasks run. Messages not yet accepted by a receiving
+              host may never be delivered and expire within 24 h. <code>atem status</code> shows the text on its Relay
+              line; the host keeps retrying at its normal pace and treats it as an outage, never a revocation: no R9
+              state changes and nothing is fenced.</li>
+            <li><strong>Enable.</strong> Service resumes only after the hosts authenticate, reconnect and fully sync
+              the feed, the device list and the mailbox. Expiry, ids and <code>signed_at_head</code> keep anything
+              stale from replaying, and every revocation still applies.</li>
+            <li><strong>Restarts.</strong> The Station stores the enforcement state durably and applies it before it
+              serves anything after a restart.</li>
+            <li><strong>Custom Stations</strong> get no account-level events in this version and keep their own
+              policy.</li>
+          </ul>
+        </div>
+        <div class="ve-card callout proposed">
+          <h3>The binding <span class="chip proposed">proposed</span></h3>
+          <p>Agora.Build account ↔ R9 <code>account_id</code> + <code>genesis_hash</code>, created only with an
+            <code>astation.remote</code> sign-in <em>and</em> a native manager's signature, with a fresh confirmation,
+            over a Station challenge that names the device-list head.</p>
+          <ul class="bullets">
+            <li>A second account trying to bind is refused; the bound owner is alerted.</li>
+            <li>A transfer needs a fresh proof and both accounts; the admin site can release a binding (above).
+              Unbind, release and transfer move the binding and the room ownership together.</li>
+            <li>A re-pair after a freeze is a new device list and needs a new binding.</li>
+            <li><strong>Owner choice 19 withdrawn</strong> (a forced binding after a migration window): room
+              ownership already covers the relay. It returns only if Astation finds a host link or routed channel the
+              Station can't map to a room, and then only for those links.</li>
+          </ul>
+          <p>Disabling gives Agora.Build no way to read host messages or forge native R9 records.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <p><strong>Source.</strong>
+        <code>proposals/delegated-host-work/delegated-host-work-and-host-senders.md</code>, revision 5, with the
+        owner's decisions of 2026-11-07 in its Appendix A (they win wherever the two differ). Drawn 2026-11-07. Diagrams render with Mermaid 11 in the browser; if one doesn't render, its source
+        text is shown in place.</p>
+    </footer>
+
+  </div><!-- /main -->
+</div><!-- /wrap -->
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.esm.min.mjs';
+
+  // Turn off Mermaid's own run on window load at once: this script renders the diagrams itself,
+  // after the fonts have loaded, and two runs at the same time would race on the same blocks.
+  mermaid.startOnLoad = false;
+  mermaid.initialize({ startOnLoad: false });
+
+  // ELK lays out the larger flowcharts; without it Mermaid falls back to its default layout.
+  try {
+    const elk = await import('https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.2.3/dist/mermaid-layout-elk.esm.min.mjs');
+    mermaid.registerLayoutLoaders(elk.default);
+  } catch (e) {
+    console.warn('ELK layout not available; using the default layout', e);
+  }
+
+  const BODY_FONT = "'Instrument Sans', 'Segoe UI', 'Helvetica Neue', sans-serif";
+  const blocks = Array.from(document.querySelectorAll('pre.mermaid'));
+  blocks.forEach(b => { b.dataset.src = b.innerHTML; });
+
+  function isDark() {
+    const t = document.documentElement.dataset.theme;
+    if (t === 'dark') return true;
+    if (t === 'light') return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
+  function themeVariables(dark) {
+    return dark ? {
+      background: '#161c27',
+      primaryColor: '#1b2230', primaryBorderColor: '#6b7180', primaryTextColor: '#e7e3d8',
+      secondaryColor: '#1b2230', secondaryBorderColor: '#6b7180', secondaryTextColor: '#e7e3d8',
+      tertiaryColor: '#1b2230', tertiaryBorderColor: '#6b7180', tertiaryTextColor: '#e7e3d8',
+      lineColor: '#8c93a3', textColor: '#e7e3d8',
+      clusterBkg: '#8fa0ff0a', clusterBorder: '#3a4258', titleColor: '#e7e3d8',
+      edgeLabelBackground: '#161c27',
+      noteBkgColor: '#2a2618', noteBorderColor: '#b08d3e', noteTextColor: '#e7e3d8',
+      actorBkg: '#1b2230', actorBorder: '#7a8296', actorTextColor: '#e7e3d8', actorLineColor: '#3a4258',
+      signalColor: '#c9ccd6', signalTextColor: '#e7e3d8',
+      labelBoxBkgColor: '#232b3a', labelBoxBorderColor: '#3a4258', labelTextColor: '#e7e3d8', loopTextColor: '#a2a7b4',
+      sequenceNumberColor: '#161c27', activationBkgColor: '#232b3a', activationBorderColor: '#6b7180',
+      fontFamily: BODY_FONT, fontSize: '15px'
+    } : {
+      background: '#fffcf5',
+      primaryColor: '#fffcf5', primaryBorderColor: '#8a8172', primaryTextColor: '#1f2430',
+      secondaryColor: '#f6f0e3', secondaryBorderColor: '#8a8172', secondaryTextColor: '#1f2430',
+      tertiaryColor: '#f6f0e3', tertiaryBorderColor: '#8a8172', tertiaryTextColor: '#1f2430',
+      lineColor: '#7d7566', textColor: '#1f2430',
+      clusterBkg: '#a08c6a0f', clusterBorder: '#cdbf9f', titleColor: '#1f2430',
+      edgeLabelBackground: '#fffcf5',
+      noteBkgColor: '#fbf1d6', noteBorderColor: '#c49a3c', noteTextColor: '#1f2430',
+      actorBkg: '#fffcf5', actorBorder: '#8a8172', actorTextColor: '#1f2430', actorLineColor: '#cdbf9f',
+      signalColor: '#3d4250', signalTextColor: '#1f2430',
+      labelBoxBkgColor: '#efe7d6', labelBoxBorderColor: '#cdbf9f', labelTextColor: '#1f2430', loopTextColor: '#5b6070',
+      sequenceNumberColor: '#fffcf5', activationBkgColor: '#efe7d6', activationBorderColor: '#8a8172',
+      fontFamily: BODY_FONT, fontSize: '15px'
+    };
+  }
+
+  async function renderAll() {
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      look: 'classic',
+      securityLevel: 'strict',
+      themeVariables: themeVariables(isDark()),
+      flowchart: { curve: 'basis', htmlLabels: true, padding: 14, nodeSpacing: 42, rankSpacing: 56, useMaxWidth: true },
+      sequence: {
+        mirrorActors: false, wrap: true, width: 150, actorMargin: 46, messageAlign: 'center',
+        noteMargin: 12, boxMargin: 12, useMaxWidth: true,
+        actorFontFamily: BODY_FONT, messageFontFamily: BODY_FONT, noteFontFamily: BODY_FONT
+      }
+    });
+    blocks.forEach(b => {
+      b.classList.remove('failed');
+      b.removeAttribute('data-processed');
+      b.innerHTML = b.dataset.src;
+    });
+    for (const b of blocks) {
+      try {
+        await mermaid.run({ nodes: [b] });
+      } catch (err) {
+        console.error('Mermaid could not render a diagram: ' + (err && (err.message || err.str) || err));
+        b.innerHTML = b.dataset.src;
+        b.setAttribute('data-processed', 'true');
+        b.classList.add('failed');
+      }
+      const wrap = b.closest('.mermaid-wrap');
+      if (wrap) window.veZoom.apply(wrap, true);
+    }
+  }
+
+  // Theme: Auto follows the OS; Light and Dark override it. Diagrams are drawn again in the new palette.
+  function markTheme(choice) {
+    if (choice === 'auto') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = choice;
+    document.querySelectorAll('[data-theme-choice]').forEach(btn => {
+      btn.setAttribute('aria-pressed', String(btn.dataset.themeChoice === choice));
+    });
+  }
+  let saved = null;
+  try { saved = localStorage.getItem('ve-theme'); } catch (e) { /* private mode */ }
+  if (saved === 'light' || saved === 'dark') markTheme(saved);
+
+  // Wait for the fonts so Mermaid measures labels with the real typeface.
+  await Promise.race([document.fonts ? document.fonts.ready : Promise.resolve(), new Promise(r => setTimeout(r, 3000))]);
+  try {
+    await Promise.race([
+      Promise.all([document.fonts.load("15px 'Instrument Sans'"), document.fonts.load("bold 15px 'Instrument Sans'")]),
+      new Promise(r => setTimeout(r, 2000))
+    ]);
+  } catch (e) { /* fonts are optional */ }
+
+  let rerender = renderAll();
+  document.querySelectorAll('[data-theme-choice]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const choice = btn.dataset.themeChoice;
+      markTheme(choice);
+      try { localStorage.setItem('ve-theme', choice); } catch (e) { /* private mode */ }
+      rerender = rerender.then(renderAll);
+    });
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (!document.documentElement.dataset.theme) rerender = rerender.then(renderAll);
+  });
+</script>
+
+<script>
+  /* ============ ZOOM + PAN (every diagram) ============ */
+  (function () {
+    var MIN = 0.4, MAX = 5;
+
+    function svgOf(wrap) { return wrap.querySelector('pre.mermaid svg'); }
+    function vpOf(wrap) { return wrap.querySelector('.mermaid-viewport'); }
+
+    function naturalWidth(svg) {
+      var vb = svg.viewBox && svg.viewBox.baseVal;
+      if (vb && vb.width) return vb.width;
+      var mw = parseFloat(svg.style.maxWidth);
+      return mw || svg.getBoundingClientRect().width || 800;
+    }
+
+    function fitWidth(wrap, svg) {
+      var vp = vpOf(wrap);
+      var cs = getComputedStyle(vp);
+      var avail = vp.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      return Math.max(120, Math.min(naturalWidth(svg), avail));
+    }
+
+    function label(wrap) {
+      var el = wrap.querySelector('.zoom-controls .zl');
+      if (!el) return;
+      var svg = svgOf(wrap);
+      var z = parseFloat(wrap.dataset.zoom || '1');
+      if (!svg) { el.textContent = '—'; return; }
+      var pct = Math.round(fitWidth(wrap, svg) * z / naturalWidth(svg) * 100);
+      el.textContent = pct + '%';
+    }
+
+    function apply(wrap, keepScroll, anchor) {
+      var svg = svgOf(wrap);
+      if (!svg) return;
+      var vp = vpOf(wrap);
+      var z = parseFloat(wrap.dataset.zoom || '1');
+      var ax = anchor ? anchor.x : vp.clientWidth / 2;
+      var ay = anchor ? anchor.y : vp.clientHeight / 2;
+      var rx = (vp.scrollLeft + ax) / Math.max(1, vp.scrollWidth);
+      var ry = (vp.scrollTop + ay) / Math.max(1, vp.scrollHeight);
+      svg.removeAttribute('height');
+      svg.style.maxWidth = 'none';
+      svg.style.height = 'auto';
+      svg.style.width = (fitWidth(wrap, svg) * z) + 'px';
+      wrap.classList.toggle('is-zoomed', z > 1.001);
+      if (keepScroll !== true) {
+        vp.scrollLeft = rx * vp.scrollWidth - ax;
+        vp.scrollTop = ry * vp.scrollHeight - ay;
+      }
+      label(wrap);
+    }
+
+    function setZoom(wrap, z, anchor) {
+      wrap.dataset.zoom = String(Math.min(MAX, Math.max(MIN, z)));
+      apply(wrap, false, anchor);
+    }
+
+    function toNatural(wrap) {
+      var svg = svgOf(wrap);
+      if (!svg) return;
+      setZoom(wrap, naturalWidth(svg) / fitWidth(wrap, svg));
+    }
+
+    function button(text, title, fn) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.title = title;
+      b.setAttribute('aria-label', title);
+      b.addEventListener('click', fn);
+      return b;
+    }
+
+    document.querySelectorAll('.mermaid-wrap').forEach(function (wrap) {
+      var controls = wrap.querySelector('.zoom-controls');
+      var vp = vpOf(wrap);
+      var zl = document.createElement('span');
+      zl.className = 'zl';
+      zl.textContent = '…';
+      controls.appendChild(button('+', 'Zoom in', function () { setZoom(wrap, parseFloat(wrap.dataset.zoom || '1') * 1.25); }));
+      controls.appendChild(button('−', 'Zoom out', function () { setZoom(wrap, parseFloat(wrap.dataset.zoom || '1') / 1.25); }));
+      controls.appendChild(button('↺', 'Fit to width', function () { wrap.dataset.zoom = '1'; apply(wrap, true); vp.scrollLeft = 0; vp.scrollTop = 0; }));
+      controls.appendChild(button('1:1', 'Actual size', function () { toNatural(wrap); }));
+      var fs = button('', 'Full screen', function () {
+        if (document.fullscreenElement === wrap) document.exitFullscreen();
+        else if (wrap.requestFullscreen) wrap.requestFullscreen();
+      });
+      fs.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9"/></svg>';
+      controls.appendChild(fs);
+      controls.appendChild(zl);
+
+      vp.addEventListener('wheel', function (e) {
+        if (!e.ctrlKey && !e.metaKey) return;
+        e.preventDefault();
+        var r = vp.getBoundingClientRect();
+        var factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+        setZoom(wrap, parseFloat(wrap.dataset.zoom || '1') * factor, { x: e.clientX - r.left, y: e.clientY - r.top });
+      }, { passive: false });
+
+      var startX, startY, scrollL, scrollT;
+      vp.addEventListener('mousedown', function (e) {
+        if (e.button !== 0) return;
+        var overflow = vp.scrollWidth > vp.clientWidth + 1 || vp.scrollHeight > vp.clientHeight + 1;
+        if (!overflow) return;
+        wrap.classList.add('is-panning');
+        startX = e.clientX; startY = e.clientY;
+        scrollL = vp.scrollLeft; scrollT = vp.scrollTop;
+        e.preventDefault();
+      });
+      window.addEventListener('mousemove', function (e) {
+        if (!wrap.classList.contains('is-panning')) return;
+        vp.scrollLeft = scrollL - (e.clientX - startX);
+        vp.scrollTop = scrollT - (e.clientY - startY);
+      });
+      window.addEventListener('mouseup', function () { wrap.classList.remove('is-panning'); });
+    });
+
+    document.addEventListener('fullscreenchange', function () {
+      document.querySelectorAll('.mermaid-wrap').forEach(function (w) { apply(w, true); });
+    });
+    var resizeTimer;
+    window.addEventListener('resize', function () {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function () {
+        document.querySelectorAll('.mermaid-wrap').forEach(function (w) { apply(w, true); });
+      }, 120);
+    });
+
+    window.veZoom = { apply: apply };
+  })();
+
+  /* ============ SCROLL SPY ============ */
+  (function () {
+    var toc = document.getElementById('toc');
+    var links = toc.querySelectorAll('a');
+    var sections = [];
+    links.forEach(function (link) {
+      var id = link.getAttribute('href').slice(1);
+      var el = document.getElementById(id);
+      if (el) sections.push({ el: el, link: link });
+    });
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        links.forEach(function (l) { l.classList.remove('active'); });
+        var match = sections.find(function (s) { return s.el === entry.target; });
+        if (match) {
+          match.link.classList.add('active');
+          if (window.innerWidth <= 1000) match.link.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+        }
+      });
+    }, { rootMargin: '-10% 0px -80% 0px' });
+    sections.forEach(function (s) { observer.observe(s.el); });
+    links.forEach(function (link) {
+      link.addEventListener('click', function (e) {
+        e.preventDefault();
+        var id = link.getAttribute('href').slice(1);
+        var el = document.getElementById(id);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          history.replaceState(null, '', '#' + id);
+        }
+      });
+    });
+  })();
+</script>
+</body>
+</html>

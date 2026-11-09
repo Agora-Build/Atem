@@ -545,6 +545,11 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
 mod tests {
     use super::*;
 
+    /// The longest a "wait until" helper waits. A passing run never gets near
+    /// it; a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of
+    /// tests) needs the slack, and a hung test still ends.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     #[test]
     fn respond_writes_without_counting_as_terminal_input() {
         let (input, mut queued) = PtyInput::test_channel();
@@ -704,7 +709,7 @@ mod tests {
     async fn output_of(mut session: PtySession) -> String {
         let mut output = Vec::new();
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), session.receiver.recv())
+            match tokio::time::timeout(WAIT, session.receiver.recv())
                 .await
                 .unwrap()
                 .unwrap()
@@ -788,7 +793,7 @@ mod tests {
         let mut session = spawn("printf", &["Codex CLI exited with status fake".into()]).unwrap();
         let mut output = Vec::new();
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(3), session.receiver.recv())
+            match tokio::time::timeout(WAIT, session.receiver.recv())
                 .await
                 .unwrap()
                 .unwrap()
@@ -807,7 +812,7 @@ mod tests {
         session.sender.respond(b"before stop\n".to_vec()).unwrap();
         while !matches!(session.receiver.recv().await.unwrap(), PtyEvent::Output(_)) {}
         session.resize_handle.stop().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(WAIT, async {
             while !matches!(session.receiver.recv().await.unwrap(), PtyEvent::Exit(_)) {}
         })
         .await
@@ -819,7 +824,7 @@ mod tests {
         let mut session = spawn("sh", &["-c".into(), script.into()]).unwrap();
         while !matches!(session.receiver.recv().await.unwrap(), PtyEvent::Output(_)) {}
         session.resize_handle.stop().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(WAIT, async {
             loop {
                 if let PtyEvent::Exit(status) = session.receiver.recv().await.unwrap() {
                     return status;
@@ -884,13 +889,13 @@ mod tests {
         }
         let _guard = Kill(tool);
         session.resize_handle.stop().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(WAIT, async {
             while !matches!(session.receiver.recv().await.unwrap(), PtyEvent::Exit(_)) {}
         })
         .await
         .unwrap();
         // Killed (a zombie until init reaps it) or already gone.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WAIT;
         let gone = loop {
             // A zombie answers `kill(0)` too; on Linux tell it apart, elsewhere
             // init reaps it within the deadline.

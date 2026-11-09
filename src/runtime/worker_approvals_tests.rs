@@ -6,6 +6,19 @@ use crate::runtime::worker_protocol::{ApplyOutcome, RuleGrant};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
+
+/// The longest a wait on a hook's end or on what the watcher reports about
+/// it lasts: less than the hooks' own 30 s limit (`hook(.., 30, ..)`), which
+/// ends a hook silently, with no output, exactly like "no decision". Past
+/// that limit "the worker released it" and "it gave up by itself" can no
+/// longer be told apart, so a hook the worker never woke has to fail first.
+/// Waking one takes well under a second (a few seconds on the Intel runner).
+const HOOK_END: Duration = Duration::from_secs(20);
+
 struct Session {
     dir: tempfile::TempDir,
 }
@@ -127,15 +140,14 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// What the hook printed (it must end within 5 s).
+/// What the hook printed (it must end within `HOOK_END`).
 fn printed(child: Child) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let out = child.wait_with_output().unwrap();
         let _ = tx.send(String::from_utf8(out.stdout).unwrap());
     });
-    rx.recv_timeout(Duration::from_secs(5))
-        .expect("the hook didn't end")
+    rx.recv_timeout(HOOK_END).expect("the hook didn't end")
 }
 
 fn watcher(s: &Session, agent: Agent) -> Approvals {
@@ -143,9 +155,9 @@ fn watcher(s: &Session, agent: Agent) -> Approvals {
         .with_confirm(Duration::from_millis(300))
 }
 
-/// Polls until at least one event (5 s at most).
+/// Polls until at least one event (`HOOK_END` at most).
 fn events(a: &mut Approvals, connected: bool) -> Vec<Event> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HOOK_END;
     loop {
         let out = a.poll(connected, Vec::new());
         if !out.is_empty() {
@@ -158,7 +170,7 @@ fn events(a: &mut Approvals, connected: bool) -> Vec<Event> {
 
 /// Polls until nothing waits any more, returning what that reported.
 fn drained(a: &mut Approvals) -> Vec<Event> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HOOK_END;
     let mut out = Vec::new();
     while a.waiting() > 0 {
         out.extend(a.poll(true, Vec::new()));
@@ -170,7 +182,7 @@ fn drained(a: &mut Approvals) -> Vec<Event> {
 
 /// Polls until `n` requests are known (none reported).
 fn known(a: &mut Approvals, n: usize, connected: bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HOOK_END;
     while a.waiting() < n {
         assert!(a.poll(connected, Vec::new()).is_empty());
         assert!(Instant::now() < deadline, "not seen");
@@ -747,7 +759,7 @@ fn a_claimed_decision_always_reaches_the_hook_however_fast_the_worker_polls() {
             let out = hook.wait_with_output().unwrap();
             let _ = tx.send(String::from_utf8(out.stdout).unwrap());
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HOOK_END;
         let printed = loop {
             a.poll(true, Vec::new());
             if let Ok(out) = rx.try_recv() {
@@ -837,7 +849,7 @@ fn a_prompt_on_a_whole_second_leaves_a_later_request_open() {
     let s = Session::new();
     let mut a = watcher(&s, Agent::Codex);
     let hook = s.hook("codex", 30, SECRET_BASH);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     let req = loop {
         if let Some(name) = s.files().into_iter().find(|f| f.starts_with("req-")) {
             break s.approvals().join(name);
@@ -890,7 +902,7 @@ fn turn_evidence_older_than_a_request_leaves_it_open() {
         let mut a = watcher(&s, agent);
         let before = now_ms() - 2000;
         let hook = s.hook(name, 30, SECRET_BASH);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         while !s.files().iter().any(|f| f.starts_with("req-")) {
             assert!(Instant::now() < deadline, "no request");
             std::thread::sleep(Duration::from_millis(10));

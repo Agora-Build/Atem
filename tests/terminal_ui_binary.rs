@@ -5,9 +5,11 @@ mod support;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
+/// A minute, not seconds: a slow runner needs the slack, a passing run never
+/// gets near it, and a hung test still ends.
 #[track_caller]
 fn within(mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !predicate() {
         assert!(
             Instant::now() < deadline,

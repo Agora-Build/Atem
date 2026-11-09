@@ -226,6 +226,7 @@ designs/                      # Design only: current design and planned work (RE
 ├── README.md                 # Index: current design, planned work
 ├── protocol/                 # README.md (the protocols and how atem-session evolved, where the fixtures run), atem-session-v1.md (the wire contract, r9 appendix), atem-client-bindings.md (r9 binding/effect contract), atem-host-work-v1.md (remote launch, directed work, messages, attachments/mark), station-route-v1.md (the selected Station), fixtures/ (shared with Astation)
 ├── agent-runtime.md          # `atem runtime` broker + `atem worker`s: sessions, leases, receipts, the local protocol, operations through the runtime
+├── delegated-host-work.md    # Planned (nothing built): delegated host work and stage-3 host-to-host senders; delegated-host-work-flows.html is its diagram
 ├── shared-terminal.md        # Shared terminal (terminal-v1): canonical-screen frames, credit, keys, limits
 ├── agent-chat-host.md        # Agent chat (chat-v1): adapters, Claude hooks + transcript, Codex, approvals, status
 ├── agent-chat-api.md         # Developer guide for chat clients
