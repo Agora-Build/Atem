@@ -953,7 +953,7 @@ impl EncryptionContext {
             let record = skill_record(skill);
             for (path, bytes) in &skill.files {
                 if !path.is_empty() { ops.push(CryptOp::open(&record, "path", path)); }
-                let envelope = std::str::from_utf8(bytes).context(SKILL_CIPHERTEXT_NOT_UTF8)?;
+                let envelope = std::str::from_utf8(bytes).map_err(|_| MalformedSkillField(SKILL_CIPHERTEXT_NOT_UTF8))?;
                 if !envelope.is_empty() { ops.push(CryptOp::open(&record, &format!("file:{path}"), envelope)); }
             }
         }
@@ -969,7 +969,7 @@ impl EncryptionContext {
                     let mut files = std::collections::BTreeMap::new();
                     for (path, bytes) in &skill.files {
                         let plain_path = if path.is_empty() { Vec::new() } else { next_plain(&mut results)? };
-                        let plain_path = String::from_utf8(plain_path).context(SKILL_PATH_NOT_UTF8)?;
+                        let plain_path = String::from_utf8(plain_path).map_err(|_| MalformedSkillField(SKILL_PATH_NOT_UTF8))?;
                         let plain = if bytes.is_empty() { Vec::new() } else { next_plain(&mut results)? };
                         files.insert(plain_path, plain);
                     }
@@ -1079,24 +1079,39 @@ impl OpenedSkill {
 const SKILL_CIPHERTEXT_NOT_UTF8: &str = "skill ciphertext is not UTF-8";
 const SKILL_PATH_NOT_UTF8: &str = "skill path is not UTF-8";
 
+/// A skill field this side finds malformed (its ciphertext or its opened
+/// path isn't UTF-8): a content failure by kind (`content_failure`).
+#[derive(Debug)]
+struct MalformedSkillField(&'static str);
+
+impl std::fmt::Display for MalformedSkillField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for MalformedSkillField {}
+
 /// The errors that say a field's content doesn't open here: it fails to
-/// authenticate, or is malformed inside a well-formed row (the cred agent's
-/// `account_keys::FIELD_CONTENT_FAILURES`, carried as text, and the two
-/// this side finds). The agent gives no error kind, only text, so these are
-/// matched against the shared constants, and anything else (another
-/// build's wording, a locked agent, a key this device doesn't hold) is not
-/// a content failure: the caller stops.
+/// authenticate, or is malformed inside a well-formed row. The two this
+/// side finds have a kind (`MalformedSkillField`). The cred agent gives no
+/// error kind, only text, so its failures are matched against the shared
+/// constants it uses itself (`account_keys::FIELD_CONTENT_FAILURES`), and
+/// anything else (another build's wording, a locked agent, a key this
+/// device doesn't hold) is not a content failure: the caller stops.
 fn content_failure(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(local) = error.downcast_ref::<MalformedSkillField>() {
+        return Some(local.0);
+    }
     let text = format!("{error:#}");
     crate::memory::account_keys::FIELD_CONTENT_FAILURES.iter()
-        .chain([SKILL_CIPHERTEXT_NOT_UTF8, SKILL_PATH_NOT_UTF8].iter())
         .find(|failure| text.contains(**failure))
         .copied()
 }
 
 /// A field under a key id this device doesn't hold (a device lagging a key
 /// rotation, `FIELD_UNAVAILABLE_KID`): the way to get the key.
-pub(crate) const KEY_NOT_HELD: &str = "a skill is sealed under a key this device doesn't hold yet (a key rotation it hasn't received); run `atem cred unlock` to receive the current key from Astation, then sync again";
+pub(crate) const KEY_NOT_HELD: &str = "a skill is sealed under a key id this device doesn't hold; usually a key rotation it hasn't received yet: run `atem cred unlock` to receive the current key from Astation, then sync again (if every device reports this, the row is under a key no device keeps)";
 
 fn with_key_guidance(error: anyhow::Error) -> anyhow::Error {
     if format!("{error:#}").contains(crate::memory::account_keys::FIELD_UNAVAILABLE_KID) {

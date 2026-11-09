@@ -166,15 +166,19 @@ pub enum ConflictCheck {
     /// No check ran (not a push, or not a conflict).
     #[default]
     NotChecked,
-    /// Another write holds the attempted version, or it was purged, never
-    /// stored, or is above the Station's latest: a concurrent edit.
+    /// Another write holds the attempted version, or it was purged or never
+    /// stored: a concurrent edit.
     Concurrent,
+    /// The Station's latest version is below the push's base: the local
+    /// copy is ahead of it (a push it refused was acked, or a delete of a
+    /// skill it didn't have). Settled like a concurrent edit.
+    Ahead,
     /// Reading the attempted version failed.
     ReadFailed,
     /// The answer names no `current_version`.
     NoCurrentVersion,
-    /// The answer's `current_version` is below the push's base or out of
-    /// range: a protocol error.
+    /// The answer's `current_version` is out of range (negative, or leaving
+    /// no room for the next version): a protocol error.
     BadCurrentVersion,
 }
 

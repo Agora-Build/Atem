@@ -167,7 +167,9 @@ keep pulling.
   - A row that breaks the skill file transport's rules (encoding, envelope
     shape) still refuses the page.
   - The pull still stops, as before, on a locked cred agent, a missing key,
-    or plain text while encryption is on.
+    or a plain project or plain file path while encryption is on.
+  - A plain file value under a sealed path reaches the cred agent, fails
+    there as a malformed field, and the row is held.
   - It also stops on a row under a key id this device doesn't hold: a
     device that hasn't received a key rotation. The note says to run
     `atem cred unlock` to receive the key. The row stays to be pulled again,
@@ -336,8 +338,9 @@ CREATE INDEX skill_versions_account_seq ON skill_versions (account_id, seq);
 - **Skills** are edited, unlike memories. Each push adds a version, and older
   versions are kept so nothing is lost, unless they're purged (see "Removing
   a credential that slipped through"). If two machines push the same skill
-  concurrently, the one with the higher `seq` wins. A skill is limited to
-  1 MB total.
+  concurrently, both versions are kept and the later writer's is the latest
+  ("A skill push keeps its version" under "Relay API"). A skill is limited
+  to 1 MB total.
 - **Skills are text-only.** Every file must be UTF-8 text; no binary file
   ever reaches the relay, because the secret check can't scan binary and
   refuses it (see "Security"). The server stores each file's bytes as
@@ -438,14 +441,20 @@ Rules:
     `atem skill restore` bases on the newest of the relay's history (which
     lists tombstones and purged versions) and the local copy. A base that
     is behind comes back as a conflict and is corrected from `N` below.
+    So does a base ahead of the Station: a push it refused per op is acked,
+    which leaves the local copy at a version it never stored, and a delete
+    of a skill it doesn't have appends nothing there.
   - **Atem's own write.** atem fetches its attempted version once
     (`/api/skills/version`). The same content hash and metadata as the push
     mean an earlier send was applied but never acknowledged (a lost answer,
     a crash before the local commit). That push counts as stored and is
     acked. The files aren't compared: every seal has fresh nonces.
   - **A concurrent edit** is anything else: another write at that version,
-    a purged one (410), one that never existed (404), or an attempted
-    version above `N` (never stored, so no GET).
+    a purged one (410), or one that never existed (404).
+  - **A Station behind the local copy** (`N` below the push's base: the
+    attempted version was never stored, so no GET) is settled the same way
+    as a concurrent edit. Its note says the Station is behind and the edit
+    goes out as v`N+1`.
     - **Coalesced.** The skill's queued pushes become one: the newest edit,
       which as a full snapshot of the local skill holds every earlier local
       edit. It goes at `N+1` on base `N`, and the local copy follows it.
@@ -464,12 +473,18 @@ Rules:
   - **Superseded in the same batch.** If a later push of the same skill in
     that batch landed, the conflicted older push is acked and never pushed
     again. The later push is a full snapshot built on it.
+  - **Withdrawn in the same batch.** If a later delete of the skill, or a
+    purge of all its versions or of the pushed one, landed in that batch,
+    the conflicted push is acked and never pushed again. So it can't undo
+    the delete, and purged content never goes back to the relay. The local
+    tombstone stays.
   - **Unsettled.** The conflict stays queued as it was, and that sync's push
     stops there, with a note saying why, if:
     - the attempted version can't be read;
     - the answer names no `current_version`;
-    - it names one below the push's base, or at or above the safe-integer
-      bound (a protocol error).
+    - it names one out of range: negative, or at or above the safe-integer
+      bound (a protocol error). A `current_version` below the push's base
+      is legal (see above).
 
     A skill with any such conflict is never coalesced.
   - **Unpushed edits win locally.** While a push of a skill is queued, a

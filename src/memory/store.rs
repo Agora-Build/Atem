@@ -774,7 +774,8 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// The skills (scope, project, name) with a push still queued.
+    /// The skills (scope, project, name) with a push still queued (read
+    /// once per pull).
     pub fn queued_skill_pushes(&self) -> Result<std::collections::HashSet<(Scope, String, String)>> {
         Ok(self.pending()?.into_iter()
             .filter_map(|(_, op)| match op {

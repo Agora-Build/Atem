@@ -3052,6 +3052,8 @@ async fn an_unpushed_edit_is_kept_over_a_pulled_version_and_lands_later() {
     queue_skill(&b, mine.clone(), 0);
     let client = client_with(&base, &device, device.agent.clone());
     let (home, ctx) = test_ctx();
+    // Claude is installed here, so apply writes skill directories.
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
     let out = run_sync(&b, Some(&client), &ctx, &NO_HARVEST)
         .await
         .unwrap();
@@ -3074,9 +3076,7 @@ async fn an_unpushed_edit_is_kept_over_a_pulled_version_and_lands_later() {
     let local = b.get_skill(Scope::Global, "", "deploy").unwrap().unwrap();
     assert_eq!(local.files, mine.files);
     let installed = home.path().join(".claude/skills/deploy/SKILL.md");
-    if installed.exists() {
-        assert_eq!(std::fs::read(&installed).unwrap(), b"# deploy from b");
-    }
+    assert_eq!(std::fs::read(&installed).unwrap(), b"# deploy from b");
 
     // The user edits again: a full snapshot of the local skill.
     let mut again = local.clone();
