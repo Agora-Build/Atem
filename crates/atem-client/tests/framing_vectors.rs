@@ -131,6 +131,10 @@ fn escape_inputs() -> Vec<(&'static str, String)> {
             "\u{115f}[atem] choseong filler",
         ),
         (
+            "a leading Hangul jungseong filler (U+1160)",
+            "\u{1160}[atem] jungseong filler",
+        ),
+        (
             "a halfwidth Hangul filler inside (U+FFA0)",
             "[\u{ffa0}atem] halfwidth filler",
         ),
@@ -572,7 +576,7 @@ fn generate() -> Value {
         .collect();
     json!({
         "version": 1,
-        "about": "Prompt framing vectors (delegated host-work design III.2). Tags: the low 60 bits of `bits` (hex), most significant first, in Crockford base32. Escape: `escaped` is the sender's `text` as it goes into a counted block (a `|` before each line whose folded form, after any `|`s it starts with, starts with the marker: Cf dropped, NFKC, then the lowercased line, its UTS #39 skeleton, or the skeleton of the line before lowercasing, lowercased and skeletonized again; after leading White_Space). Prompts: each `input` rendered with the tag `tag`; `snapshots` is what Atem checked of the context (`from_sender`: the text matches the sender's digest; `read_back`: published and read back by the runtime). Size: what the shared core's WorkTask::valid checks (its rendered size with the longest first and last lines). Computed with atem-client's own code; all folding data (normalization, general categories, confusables, lowercasing, White_Space) is Unicode `unicode_version`.",
+        "about": "Prompt framing vectors (delegated host-work design III.2). Tags: the low 60 bits of `bits` (hex), most significant first, in Crockford base32. Escape: `escaped` is the sender's `text` as it goes into a counted block (a `|` before each line whose folded form, after any `|`s it starts with, starts with the marker: Cf dropped, NFKC, then the lowercased line, its UTS #39 skeleton, or the skeleton of the line before lowercasing, lowercased and skeletonized again; after leading White_Space). Prompts: each `input` rendered with the tag `tag`; `snapshots` is what Atem checked of the context (`from_sender`: the text matches the sender's digest; `read_back`: read back by the runtime itself, a memory after publishing it, a vault entry twice). Size: what the shared core's WorkTask::valid checks (its rendered size with the longest first and last lines). Computed with atem-client's own code; all folding data (normalization, general categories, confusables, lowercasing, White_Space) is Unicode `unicode_version`.",
         "unicode_version": "18.0.0",
         "marker": framing::MARKER,
         "marker_skeleton": framing::marker_skeleton(),

@@ -4,11 +4,12 @@ Unicode 18.0.0 data the prompt framing's folding takes from no crate
 (the default lowercase mapping and White_Space), so no step of the folding
 depends on the Rust toolchain's own Unicode version.
 
-Usage (inputs are untrusted downloads: keep them in their own directory and
-run with -I):
+Usage, from the repository's root (inputs are untrusted downloads: keep them
+in their own directory and run with -I):
 
-    mkdir -p /tmp/ucd-18 && cd /tmp/ucd-18 && for f in UnicodeData SpecialCasing PropList; do
-      curl -fsSLO https://www.unicode.org/Public/18.0.0/ucd/$f.txt; done
+    mkdir -p /tmp/ucd-18
+    (cd /tmp/ucd-18 && for f in UnicodeData SpecialCasing PropList; do
+      curl -fsSLO "https://www.unicode.org/Public/18.0.0/ucd/$f.txt"; done)
     python3 -I scripts/gen-framing-unicode.py /tmp/ucd-18 \
       > crates/atem-client/src/session/framing/unicode_data.rs
 

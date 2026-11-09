@@ -363,9 +363,12 @@ pub(super) fn task_prompt<'a>(
         text: &task.prompt,
         mark,
         context: &task.context,
-        // A local task's context and a local reply's were published and
-        // read back by this runtime; a remote sender's are its own claim,
-        // whose text matches the digest it gave.
+        // A local task's context and a local reply's were read back by this
+        // runtime itself (a memory after publishing it, a vault entry twice);
+        // a remote sender's are its own claim, whose text matches the digest
+        // it gave. A delivery of another host's reply (the cross-instance
+        // return grant, not built) will need its own choice: its context is
+        // that host's snapshot, though the delivery record is `local`.
         snapshots: if record.principal == "local" {
             Snapshots::ReadBack
         } else {

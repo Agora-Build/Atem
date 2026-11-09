@@ -43,6 +43,7 @@ fn imitations() -> Vec<String> {
         "[\u{a4ee}\u{a4d4}\u{a4f0}\u{a4df}] Lisu",
         "\u{2800}[atem] after a Braille blank",
         "\u{3164}[atem] after a Hangul filler",
+        "\u{1160}[atem] after a Hangul jungseong filler",
         "[\u{ffa0}atem] a halfwidth Hangul filler inside",
         "[a\u{fe0f}tem] a variation selector inside",
     ]
@@ -61,12 +62,28 @@ fn the_folding_data_is_of_one_unicode_version() {
     assert_eq!(unicode_properties::UNICODE_VERSION, (18, 0, 0));
 }
 
+/// Whether a code point where the pinned tables and Rust's std disagree
+/// could change a match: under either's lowercasing, it or its skeleton
+/// holds a character of `[atem` or `[atern`, or white space.
+fn could_change_a_match(c: char) -> bool {
+    let relevant = |text: &str| {
+        text.chars()
+            .any(|ch| "[atemrn".contains(ch) || is_white_space(ch) || ch.is_whitespace())
+    };
+    let ours = lowercase(&c.to_string());
+    let rusts: String = c.to_lowercase().collect();
+    [ours, rusts]
+        .iter()
+        .any(|lower| relevant(lower) || relevant(&skeleton(lower)))
+}
+
 /// The folding's lowercasing and White_Space are the pinned Unicode 18.0.0
 /// tables, not Rust's, which follow the toolchain (17.0.0 for Rust 1.94).
 /// Against Rust's own: White_Space is the same, and the lowercase mappings
 /// differ only where Rust's Unicode version doesn't know the character
-/// yet. A toolchain on another Unicode version fails here, so its
-/// differences are looked at (none may touch the folding of the vectors).
+/// yet. On a toolchain of another Unicode version (review N1) the folding
+/// still uses the pinned tables, so only a difference that could change a
+/// match fails the test (for a person to look at); the others are printed.
 #[test]
 fn lowercasing_and_white_space_are_pinned_not_the_toolchains() {
     let all = || (0..=0x10ffff).filter_map(char::from_u32);
@@ -84,9 +101,23 @@ fn lowercasing_and_white_space_are_pinned_not_the_toolchains() {
             "the capitals Unicode 18.0.0 added (Rust 1.94's std is 17.0.0)"
         ),
         other => {
-            panic!("Rust's Unicode version is {other:?}: compare its lowercasing: {differ:x?}")
+            let (relevant, others): (Vec<u32>, Vec<u32>) = differ
+                .iter()
+                .partition(|&&code| char::from_u32(code).is_some_and(could_change_a_match));
+            eprintln!(
+                "Rust's Unicode version is {other:?}; its lowercasing differs from the pinned \
+                 tables at {others:x?}, none of which can change a match"
+            );
+            assert_eq!(
+                relevant,
+                Vec::<u32>::new(),
+                "Rust's Unicode version is {other:?}: these differences could change a match"
+            );
         }
     }
+    // The helper tells the two kinds apart.
+    assert!(could_change_a_match('A') && could_change_a_match('\u{410}'));
+    assert!(!could_change_a_match('Q') && !could_change_a_match('\u{1df48}'));
     // The one rule left out, Final_Sigma, can't change a match: neither
     // sigma folds to a character of the marker or to white space.
     for sigma in ["\u{3c3}", "\u{3c2}"] {
