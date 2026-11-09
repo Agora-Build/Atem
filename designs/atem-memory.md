@@ -755,7 +755,7 @@ atem memory status                  # account, machine, pending ops, last sync, 
    | `memory does not match the account encryption mode`, `skill does not match the account encryption mode` (the route's check against the account's mode and key as the Station read them for the batch), `content does not match the account encryption mode` (the store's repeat of it in its write transaction) | for now, unless the op's own value is the cause (below): a mode change, a key rotation or a migration racing the push, or a device behind the account's state | queued as it was, with a note; nothing more of that skill or memory goes out in that sync (`Held`: a later push, delete or purge of the skill; the memory's delete or invalidation, or a replacement's invalidation naming it as the successor), so it is sent once per sync and nothing of it lands first; other skills and memories go on; the sync is incomplete; sealed again and sent at the next sync, under the mode and key Atem has then |
    | the same texts, when the op's own value is the cause | for good | acked, with a note naming the op and why |
    | `version_conflict` | settled (see "Relay API") | |
-   | `invalid memory`, `invalid skill`, `invalid base64`, `invalid skill version`, `reserved token`, `possible credential: …`, `id conflict`, any other text or none | for good | acked (never sent again), with a note naming the op and the reason. A refused memory add stays on this machine only: never synced, still injected here like any local fact, its harvested file still linked; the note quotes its first line, and `atem memory status` counts these under "Local only". Except a refusal by the relay's secret check (`possible credential: …`, `reserved token`): that fact is removed here and its harvested file recorded `held_back` (knowledge.db holds no secret, and the token would break the managed blocks), and the note doesn't quote it. A refused skill push keeps its local copy, as before |
+   | `invalid memory`, `invalid skill`, `invalid base64`, `invalid skill version`, `reserved token`, `possible credential: …`, `id conflict`, any other text or none | for good | acked (never sent again), with a note naming the op and the reason. A refused memory add stays on this machine only: never synced, still injected here like any local fact, its harvested file still linked; the note quotes its first line (only while the fact is still live here: one deleted or purged here since is neither kept nor quoted), and `atem memory status` counts these under "Local only". Except a refusal by the relay's secret check (`possible credential: …`, `reserved token`): that fact is removed here and its harvested file recorded `held_back` (knowledge.db holds no secret, and the token would break the managed blocks), and the note doesn't quote it. A refused skill push keeps its local copy, as before |
 
    Atem judges a mode refusal against the op as it went out (the Station
    allows a field only as its mode does: while it encrypts, an envelope or
@@ -764,8 +764,9 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - **Sealed:** for good when its project is a hash under another key than
      the rest of the op: a project this machine can't name, kept as an
      earlier key's hash after a rotation, which the current key never
-     accepts (the note says `atem sync` in that project's checkout names
-     it). Otherwise for now: the Station's key or mode moved.
+     accepts; it stays on this machine only (naming the project later
+     renames the local row, never queues it again). Otherwise for now: the
+     Station's key or mode moved.
    - **Plain, from a device that isn't verified:** for now; the note says to
      run `atem pair verify` (it goes sealed once the device is verified).
    - **Plain, under a signed `off` or `disabling`:** for good when a value
@@ -777,16 +778,31 @@ atem memory status                  # account, machine, pending ops, last sync, 
    **Retry limit.** A refusal for now that repeats at
    `REFUSED_FOR_NOW_SYNCS` (5) syncs in a row, the first of them at least
    `REFUSED_FOR_NOW_SECS` (24 hours) ago, is taken as for good: acked, with a
-   note saying so ("Atem stopped retrying it"). The count and the first
-   refusal's time live with the queued op (`pending_ops.refused_for_now`,
-   `refused_since`). Both bounds count: a sync runs after every local change
-   too, so five syncs can come within a minute of an ordinary rotation.
+   note saying so ("Atem stopped retrying it"). Both bounds count: a sync
+   runs after every local change too, so five syncs can come within a
+   minute of an ordinary rotation.
+   - **In a row** means consecutive syncs (every `atem sync` and every sync
+     after a local change counts, offline ones too: `sync_state.sync_runs`)
+     that sent the op sealed under the same state (mode, key, data account,
+     verification). A sync that didn't send it (offline, a held item, a
+     stopped push) or a new state starts a new run, so a sleep followed by a
+     few refusals, or a refusal under each of several states, never gives
+     up at once.
+   - **An unverified device's refusals never count** (the relay refuses its
+     plain text while the account encrypts, and the note says it goes
+     sealed once the device is verified): it is retried at every sync,
+     however long, and a refusal of that kind ends any run.
+   - The run lives with the queued op (`pending_ops.refused_for_now`,
+     `refused_since`, `refused_run`, `refused_state`) and goes with it.
 
    An op refused for now stays queued with what the batch did after it:
    a later delete of that memory, or a later delete of that skill, a purge
    of all its versions or of its version, or a later push of it, that
    landed in the same batch withdraws it (acked, never sent: deleted or
-   purged content never goes back to the relay). A landed invalidation of
+   purged content never goes back to the relay). A memory add refused in
+   any way (for now, for good, or past the retry limit) whose delete or
+   purge landed later in the same batch is withdrawn the same way: not kept
+   here, no note, so a purged fact is never quoted. A landed invalidation of
    that memory (the Station had no such row, so it changed nothing) stays
    queued too, to go again after the add. One thing can't be held back: a
    replacement's invalidation of the old fact, in the same batch as its add
@@ -1138,10 +1154,12 @@ lives.
   the op causes (an off account and `e1.` text, a file named `e1.md`, an
   earlier key's project hash after a rotation) are refused for good, while
   a well-formed op under a key the Station moved past is kept and lands
-  later; the retry limit (five syncs and a day); a fact refused for good
+  later; the retry limit (five syncs and a day), a run restarting after a
+  sync that didn't send the op or under a new state, an unverified device
+  never giving up and sending once verified; a fact refused for good
   (other than by the secret check) stays here, still injected, counted as
   local only, and is never pushed again, while a credential refusal still
-  removes it.
+  removes it; a refused fact purged here since is neither kept nor quoted.
 - **Version purges:** `skill purge --version` is refused while the skill has
   a queued push or an unsettled or coalesced conflict, and goes once a sync
   settled it; the command checks before its question (nothing asked) and

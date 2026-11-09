@@ -3929,7 +3929,7 @@ async fn a_refusal_the_op_itself_causes_is_refused_for_good() {
     .unwrap();
     assert_eq!(
         out.notes,
-        vec!["relay refused memory mem_unknown (\"deploys go through the bastion\"): memory does not match the account encryption mode (its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept; `atem sync` in that project's checkout names it); it stays on this machine only, never synced".to_string()]
+        vec!["relay refused memory mem_unknown (\"deploys go through the bastion\"): memory does not match the account encryption mode (its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept); it stays on this machine only, never synced".to_string()]
     );
     assert!(!out.relay_error && out.pushed == 3, "{:?}", out.notes);
     assert_eq!(s.pending_count().unwrap(), 0);
@@ -4047,4 +4047,66 @@ async fn the_resolve_step_stops_after_a_downgrade_and_keeps_unknown_projects() {
         let kept = s.get_skill(Scope::Project, &hash, "bastion").unwrap();
         assert!(kept.is_some(), "{to:?}: the unresolved skill was dropped");
     }
+}
+
+/// A device that isn't verified, on an account that encrypts, sends its
+/// facts plain and the relay refuses them for now: that never counts
+/// toward the retry limit, however long it lasts (here more than a day of
+/// syncs), so once the device is verified again the fact goes, sealed.
+#[tokio::test]
+async fn an_unverified_device_never_gives_up_and_sends_once_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = device(dir.path(), EncryptionMode::On);
+    let verified = std::fs::read(&device.paths.trust).unwrap();
+    Downgrade::Unverified.apply(&mut device);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, _log) = stub_relay(mode_checking(relay.clone(), "on", Some(KID))).await;
+    let s = Store::open_in_memory().unwrap();
+    queue(&s, [fact(1, false)]);
+    let queued = s.pending().unwrap();
+    let (_home, ctx) = test_ctx();
+    let a_day_ago = now_secs() - REFUSED_FOR_NOW_SECS - 60;
+    for round in 0..2 * REFUSED_FOR_NOW_SYNCS {
+        let out = run_sync(
+            &s,
+            Some(&client_with(&base, &device, device.agent.clone())),
+            &ctx,
+            &NO_HARVEST,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.relay_error
+                && out.notes.len() == 1
+                && out.notes[0].contains("run `atem pair verify`"),
+            "{round}: {:?}",
+            out.notes
+        );
+        assert_eq!(s.pending().unwrap(), queued, "{round}");
+        // As if the syncs spanned more than a day.
+        s.test_conn()
+            .execute(
+                "UPDATE pending_ops SET refused_since = ?1",
+                rusqlite::params![a_day_ago],
+            )
+            .unwrap();
+    }
+    assert_eq!(s.local_only_count().unwrap(), 0);
+    // Verified again: the fact goes, sealed.
+    std::fs::write(&device.paths.trust, verified).unwrap();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, device.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert!(
+        relay.lock().unwrap().rows["mem_0001"]
+            .content
+            .starts_with(&format!("e1.{KID}."))
+    );
 }

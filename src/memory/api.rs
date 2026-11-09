@@ -464,6 +464,24 @@ impl SealState {
     pub fn verified(&self) -> bool {
         self.verified
     }
+
+    /// The state as one string (mode, key, data account, verification), to
+    /// tell whether two refusals for now came under the same state
+    /// (`sync::apply_batch`).
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "{:?}:{}:{}:{}",
+            self.mode,
+            self.kid.as_deref().unwrap_or_default(),
+            self.data_account,
+            if self.verified { "verified" } else { "unverified" }
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(mode: EncryptionMode, kid: Option<&str>, verified: bool) -> Self {
+        Self { mode, kid: kid.map(str::to_string), data_account: "acct-1".into(), verified }
+    }
 }
 
 /// The body of a batch POST, serialized from borrowed ops.

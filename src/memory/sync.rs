@@ -12,7 +12,7 @@ use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
 use crate::memory::model::{content_hash, new_memory_id, now_secs, skill_hash, HeldSkill, Memory, PulledSkill, Scope, Skill};
 use crate::memory::secrets::{find_secrets, skill_file_problems};
-use crate::memory::store::{memory_cursor_key, skill_cursor_key, HarvestEntry, HarvestStatus, PendingOp, Store, LAST_SYNC_AT};
+use crate::memory::store::{memory_cursor_key, skill_cursor_key, HarvestEntry, HarvestStatus, PendingOp, RefusedRun, Store, LAST_SYNC_AT, SYNC_RUNS};
 #[cfg(test)]
 use crate::memory::store::{MEMORY_CURSOR, SKILL_CURSOR};
 
@@ -197,7 +197,7 @@ pub fn too_large_note(op: &PendingOp) -> String {
 /// `apply_batch`'s notes.
 #[cfg(test)]
 pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
-    Ok(apply_batch(store, sent, results)?.notes)
+    Ok(apply_batch(store, sent, results, None)?.notes)
 }
 
 /// What applying a batch's results did (`apply_batch`).
@@ -225,8 +225,12 @@ struct Applied {
 ///   and the op's own value isn't the cause) stays queued as it was, with a
 ///   note, unless a later op of the batch that landed withdrew it, and a
 ///   landed invalidation of a memory whose add it kept stays queued behind
-///   that add (`defer_refusals`); after `REFUSED_FOR_NOW_SYNCS` syncs over at
-///   least `REFUSED_FOR_NOW_SECS` it is refused for good.
+///   that add (`defer_refusals`); after `REFUSED_FOR_NOW_SYNCS` syncs in a
+///   row over at least `REFUSED_FOR_NOW_SECS` it is refused for good. In a
+///   row: consecutive syncs (`SYNC_RUNS`) that sent it, sealed under the same
+///   state (`sealed_under`: `SealState::fingerprint`; `None` in tests that
+///   apply results directly); a refusal because this device isn't verified
+///   (`ModeRefusal::Unverified`) never counts and ends a run.
 ///
 /// A result count that doesn't match can't be paired
 /// up, so nothing is acked: the batch stays queued and a note explains why.
@@ -242,7 +246,7 @@ struct Applied {
 /// `Store::in_transaction` (not nestable).
 ///
 /// Returns the notes, and what stays queued for a refusal for now.
-fn apply_batch(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Applied> {
+fn apply_batch(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult], sealed_under: Option<&SealState>) -> Result<Applied> {
     if results.len() != sent.len() {
         return Ok(Applied {
             notes: vec![format!(
@@ -252,7 +256,7 @@ fn apply_batch(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -
             ..Default::default()
         });
     }
-    store.in_transaction(|| apply_paired_results(store, sent, results))
+    store.in_transaction(|| apply_paired_results(store, sent, results, sealed_under))
 }
 
 /// How many syncs in a row, over at least `REFUSED_FOR_NOW_SECS`, may
@@ -262,18 +266,38 @@ fn apply_batch(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -
 pub const REFUSED_FOR_NOW_SYNCS: i64 = 5;
 pub const REFUSED_FOR_NOW_SECS: i64 = 24 * 3600;
 
-fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Applied> {
+fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult], sealed_under: Option<&SealState>) -> Result<Applied> {
     let mut notes = Vec::new();
     let conflicts = settle_conflicts(sent, results);
-    // Refused for now too often for too long: refused for good from here.
+    // Each refusal for now goes on its op's run, or starts a new one when
+    // the last sync didn't send it or sealed it under another state; a
+    // refusal because this device isn't verified is never counted. Refused
+    // for now too often for too long: refused for good from here.
     let now = now_secs();
+    let this_run = store.get_state(SYNC_RUNS)?;
+    let state = sealed_under.map(SealState::fingerprint).unwrap_or_default();
     let mut given_up = BTreeMap::new();
+    let mut runs = BTreeMap::new();
     for (i, (n, _)) in sent.iter().enumerate().filter(|(i, _)| results[*i].is_temporary_refusal()) {
-        let (count, since) = store.refused_for_now(*n)?;
-        if let Some(since) = since
-            && count + 1 >= REFUSED_FOR_NOW_SYNCS
-            && now - since >= REFUSED_FOR_NOW_SECS {
-            given_up.insert(i, (count + 1, since));
+        if results[i].mode_refusal == ModeRefusal::Unverified {
+            runs.insert(i, RefusedRun::default());
+            continue;
+        }
+        let last = store.refused_for_now(*n)?;
+        let in_a_row = last.run == Some(this_run - 1) && last.state.as_deref() == Some(state.as_str());
+        let run = RefusedRun {
+            count: if in_a_row { last.count + 1 } else { 1 },
+            since: if in_a_row { last.since.or(Some(now)) } else { Some(now) },
+            run: Some(this_run),
+            state: Some(state.clone()),
+        };
+        match run.since {
+            Some(since) if run.count >= REFUSED_FOR_NOW_SYNCS && now - since >= REFUSED_FOR_NOW_SECS => {
+                given_up.insert(i, (run.count, since));
+            }
+            _ => {
+                runs.insert(i, run);
+            }
         }
     }
     let deferred = defer_refusals(sent, results, &given_up);
@@ -289,7 +313,9 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
         match deferred.get(&i) {
             // Said once for the batch, below.
             Some(Deferred::Retry) => {
-                store.count_refused_for_now(*n, now)?;
+                if let Some(run) = runs.get(&i) {
+                    store.set_refused_for_now(*n, run)?;
+                }
                 continue;
             }
             Some(Deferred::AfterAdd) => continue,
@@ -330,12 +356,17 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
             }
         } else {
             let error = r.error.clone().unwrap_or_else(|| "unknown error".into());
-            // A refused add stays here (local only, never synced), unless
-            // the relay found a possible credential or the reserved token:
-            // knowledge.db holds no secret, and the token would break the
-            // managed blocks.
+            // A refused add stays here (local only, never synced) while its
+            // row is live, unless the relay found a possible credential or
+            // the reserved token: knowledge.db holds no secret, and the token
+            // would break the managed blocks. A row deleted or purged here
+            // since is neither kept nor quoted.
+            let live = match op {
+                PendingOp::AddMemory { memory } => store.get_memory(&memory.id)?.is_some_and(|row| !row.is_deleted()),
+                _ => false,
+            };
             let kept_here = match op {
-                PendingOp::AddMemory { memory } if !refused_as_secret(&error) => Some(memory),
+                PendingOp::AddMemory { memory } if live && !refused_as_secret(&error) => Some(memory),
                 _ => None,
             };
             let what = match kept_here {
@@ -353,6 +384,7 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
                 _ => format!("relay refused {what}: {error}{then}"),
             });
             if let PendingOp::AddMemory { memory } = op
+                && live
                 && kept_here.is_none() {
                 store.mark_memory_deleted(&memory.id)?;
                 for mut e in store.harvest_entries_for_memory(&memory.id)? {
@@ -520,9 +552,11 @@ enum Deferred {
     /// sync (never again in this one: nothing more of its skill or memory
     /// goes out, `Held`).
     Retry,
-    /// Refused for now, but a later op of the batch that landed made it
-    /// moot (`moots_push`, or a delete of that memory): acked and never sent,
-    /// so deleted or purged content never goes back to the relay.
+    /// Refused (for now; for a memory add, in any way), but a later op of
+    /// the batch that landed made it moot (`moots_push`, or a delete of that
+    /// memory): acked and never sent, so deleted or purged content never
+    /// goes back to the relay, and a refused fact purged since is neither
+    /// kept here nor quoted.
     Withdrawn,
     /// Landed, but it invalidates a memory whose add was refused for now, so
     /// the Station had no such row and ignored it: queued, to go again after
@@ -531,20 +565,27 @@ enum Deferred {
 }
 
 /// The batch's refusals for now, by index, and the landed invalidations
-/// that must follow their adds (`Deferred`). Ops refused for good are not
-/// listed: they are acked as before, and so are the ones `given_up`
+/// that must follow their adds (`Deferred`). A refused add of a memory whose
+/// delete (or purge) landed later in the batch is withdrawn, whatever the
+/// refusal: never kept here, never quoted. Other ops refused for good are
+/// not listed: they are acked as before, and so are the ones `given_up`
 /// (refused for now too long).
 fn defer_refusals<T>(sent: &[(i64, PendingOp)], results: &[OpResult], given_up: &BTreeMap<usize, T>) -> BTreeMap<usize, Deferred> {
     let mut deferred = BTreeMap::new();
-    for i in (0..sent.len()).filter(|&i| results[i].is_temporary_refusal() && !given_up.contains_key(&i)) {
+    let refused = |i: usize| !results[i].ok && !results[i].is_version_conflict();
+    for i in (0..sent.len()).filter(|&i| refused(i)) {
         let later = || (i + 1..sent.len()).filter(|&j| results[j].ok);
+        let for_now = results[i].is_temporary_refusal();
         let withdrawn = match &sent[i].1 {
-            PendingOp::PushSkill { skill, .. } => later().any(|j| moots_push(&sent[j].1, skill).is_some()),
+            PendingOp::PushSkill { skill, .. } => for_now && later().any(|j| moots_push(&sent[j].1, skill).is_some()),
             PendingOp::AddMemory { memory } => later().any(|j| matches!(&sent[j].1, PendingOp::DeleteMemory { id } if *id == memory.id)),
             _ => false,
         };
         if withdrawn {
             deferred.insert(i, Deferred::Withdrawn);
+            continue;
+        }
+        if !for_now || given_up.contains_key(&i) {
             continue;
         }
         deferred.insert(i, Deferred::Retry);
@@ -634,7 +675,7 @@ fn mode_refusal(sent: &Value, state: &SealState) -> ModeRefusal {
     if content_hash.starts_with("h1.") || state.encrypts() {
         if kid(project).is_some() && kid(content_hash).is_some() && kid(project) != kid(content_hash) {
             return ModeRefusal::Own(
-                "its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept; `atem sync` in that project's checkout names it".into(),
+                "its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept".into(),
             );
         }
         return ModeRefusal::Changing;
@@ -952,10 +993,10 @@ impl SyncOutcome {
 /// acked), stop the group; `Err`: the request failed, nothing acked.
 /// Ops refused for now (`Deferred::Retry`) are `held` for the rest of the
 /// sync, and the sync is incomplete.
-fn finish_chunk(store: &Store, chunk: &[(i64, PendingOp)], posted: std::result::Result<Vec<OpResult>, ApiError>, held: &mut Held, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
+fn finish_chunk(store: &Store, chunk: &[(i64, PendingOp)], posted: std::result::Result<Vec<OpResult>, ApiError>, sealed_under: &SealState, held: &mut Held, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
     match posted {
         Ok(results) => {
-            let applied = apply_batch(store, chunk, &results)?;
+            let applied = apply_batch(store, chunk, &results, Some(sealed_under))?;
             for note in applied.notes {
                 out.note(note);
             }
@@ -1262,7 +1303,7 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
         let posted = judge_mode_refusals(&wire, &state, check_conflicts(client, &chunk, &wire, posted).await);
         let unsettled = has_unchecked_conflict(&chunk, &posted);
         held.skills.extend(rebased_skills(&chunk, &posted));
-        match finish_chunk(store, &chunk, posted, &mut held, out)? {
+        match finish_chunk(store, &chunk, posted, &state, &mut held, out)? {
             Ok(true) if unsettled => return conflict_unchecked(out),
             Ok(true) => {}
             Ok(false) => return Ok(()),
@@ -1294,7 +1335,7 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                     let posted = judge_mode_refusals(&single, &single_state, posted);
                     let unsettled = has_unchecked_conflict(&one, &posted);
                     held.skills.extend(rebased_skills(&one, &posted));
-                    match finish_chunk(store, &one, posted, &mut held, out)? {
+                    match finish_chunk(store, &one, posted, &single_state, &mut held, out)? {
                         Ok(true) if unsettled => return conflict_unchecked(out),
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
@@ -1658,6 +1699,9 @@ async fn resolve_projects(store: &Store, client: &KnowledgeClient, ctx: &Ctx) ->
 /// `client = None` means offline: harvest and apply still run locally.
 pub async fn run_sync(store: &Store, client: Option<&KnowledgeClient>, ctx: &Ctx, opts: &SyncOptions) -> Result<SyncOutcome> {
     let mut out = SyncOutcome::default();
+    // Every run counts, offline too: a refusal for now is "in a row" only
+    // across consecutive runs (`apply_batch`).
+    store.set_state(SYNC_RUNS, store.get_state(SYNC_RUNS)? + 1)?;
     if opts.harvest
         && let Some(repo) = &ctx.repo {
         let dir = claude_memory_dir(&ctx.home, &repo.root);
@@ -2327,26 +2371,89 @@ mod tests {
         }
     }
 
+    /// A fact purged here (`atem memory purge`: deleted, its delete queued)
+    /// after its add was queued: when the relay refuses the add in any way
+    /// (for good, for now past the retry limit, or for its own value) and
+    /// the purge's delete lands in the same batch, the add is withdrawn: no
+    /// note quoting it, not kept here. When the delete isn't in that batch,
+    /// the refusal's note still doesn't quote the purged fact, and it isn't
+    /// kept either.
+    #[test]
+    fn a_refused_fact_purged_since_is_neither_kept_nor_quoted() {
+        let secret = "staging token is in the deploy notes";
+        let given_up = || {
+            let s = Store::open_in_memory().unwrap();
+            queue_memories(&s, &[secret]);
+            let n = s.pending().unwrap()[0].0;
+            s.set_state(SYNC_RUNS, 10).unwrap();
+            let since = now_secs() - REFUSED_FOR_NOW_SECS - 60;
+            s.set_refused_for_now(n, &RefusedRun { count: REFUSED_FOR_NOW_SYNCS, since: Some(since), run: Some(10), state: Some(String::new()) }).unwrap();
+            s.set_state(SYNC_RUNS, 11).unwrap();
+            s
+        };
+        let fresh = || {
+            let s = Store::open_in_memory().unwrap();
+            queue_memories(&s, &[secret]);
+            s
+        };
+        let own = OpResult { mode_refusal: ModeRefusal::Own("its text starts with `e1.`".into()), ..refused(FOR_NOW[0]) };
+        let cases = [("for good", refused("invalid memory")), ("its own value", own), ("past the retry limit", refused(FOR_NOW[0]))];
+        for (label, answer) in cases {
+            let s = if label == "past the retry limit" { given_up() } else { fresh() };
+            let id = format!("mem_{secret}");
+            // `atem memory purge`, queued behind the add.
+            s.mark_memory_deleted(&id).unwrap();
+            s.enqueue(&PendingOp::DeleteMemory { id: id.clone() }).unwrap();
+            let sent = s.pending().unwrap();
+            let notes = apply_push_results(&s, &sent, &[answer.clone(), landed()]).unwrap();
+            assert!(notes.is_empty(), "{label}: {notes:?}"); // withdrawn: nothing to say
+            assert_eq!(s.pending_count().unwrap(), 0, "{label}");
+            assert!(s.live_memories().unwrap().is_empty(), "{label}");
+            assert_eq!(s.local_only_count().unwrap(), 0, "{label}");
+            // The delete in a later batch: the add's refusal comes first,
+            // with the fact already purged here.
+            let s = fresh();
+            s.mark_memory_deleted(&id).unwrap();
+            let sent = s.pending().unwrap();
+            let notes = apply_push_results(&s, &sent, &[refused("invalid memory")]).unwrap();
+            assert_eq!(notes, vec![format!("relay refused memory {id}: invalid memory")], "{label}");
+            assert!(s.live_memories().unwrap().is_empty() && s.local_only_count().unwrap() == 0, "{label}");
+        }
+    }
+
+    /// One sync's results: the sync counter moved on (`run_sync` does), then
+    /// the batch applied as sealed under `state`.
+    fn sync_round(s: &Store, sent: &[(i64, PendingOp)], results: &[OpResult], state: &SealState) -> Vec<String> {
+        s.set_state(SYNC_RUNS, s.get_state(SYNC_RUNS).unwrap() + 1).unwrap();
+        apply_batch(s, sent, results, Some(state)).unwrap().notes
+    }
+
+    fn on(kid: &str) -> SealState {
+        SealState::for_test(crate::memory::crypto::EncryptionMode::On, Some(kid), true)
+    }
+
     /// Refused for now at every sync: kept while that lasts less than
-    /// `REFUSED_FOR_NOW_SYNCS` syncs or less than `REFUSED_FOR_NOW_SECS`
-    /// (syncs after local changes can come seconds apart); past both, Atem
-    /// stops retrying and treats it as refused for good, with a note.
+    /// `REFUSED_FOR_NOW_SYNCS` syncs in a row or less than
+    /// `REFUSED_FOR_NOW_SECS` (syncs after local changes can come seconds
+    /// apart); past both, Atem stops retrying and treats it as refused for
+    /// good, with a note. The fact stays here.
     #[test]
     fn an_op_refused_for_now_too_long_is_refused_for_good() {
         let s = Store::open_in_memory().unwrap();
         harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
         let sent = s.pending().unwrap();
         let n = sent[0].0;
+        let state = on("0123abcd");
         for round in 1..=REFUSED_FOR_NOW_SYNCS + 1 {
-            let notes = apply_push_results(&s, &sent, &[refused(FOR_NOW[0])]).unwrap();
+            let notes = sync_round(&s, &sent, &[refused(FOR_NOW[0])], &state);
             assert!(notes[0].contains(" for now: "), "{round}: {notes:?}");
             assert_eq!(s.pending().unwrap(), sent, "{round}");
         }
-        assert_eq!(s.refused_for_now(n).unwrap().0, REFUSED_FOR_NOW_SYNCS + 1);
+        assert_eq!(s.refused_for_now(n).unwrap().count, REFUSED_FOR_NOW_SYNCS + 1);
         // The first refusal was over a day ago.
         let since = now_secs() - REFUSED_FOR_NOW_SECS - 60;
         s.test_conn().execute("UPDATE pending_ops SET refused_since = ?1", rusqlite::params![since]).unwrap();
-        let notes = apply_push_results(&s, &sent, &[refused(FOR_NOW[0])]).unwrap();
+        let notes = sync_round(&s, &sent, &[refused(FOR_NOW[0])], &state);
         let PendingOp::AddMemory { memory } = &sent[0].1 else { panic!("{sent:?}") };
         let id = &memory.id;
         assert_eq!(notes, vec![format!(
@@ -2357,6 +2464,51 @@ mod tests {
         // As any refusal for good of a fact: kept here, never synced.
         assert_eq!(s.live_memories().unwrap().len(), 1);
         assert_eq!((s.held_back_count().unwrap(), s.local_only_count().unwrap()), (0, 1));
+    }
+
+    /// A run of refusals for now starts again when a sync didn't send the op
+    /// (offline, held, a stopped push) or sealed it under another state (a
+    /// new key, mode or verification), so a long sleep followed by a few
+    /// refusals, or a refusal under each of several states, never gives up
+    /// at once. A refusal because this device isn't verified never counts
+    /// and ends a run.
+    #[test]
+    fn a_run_of_refusals_for_now_restarts_on_a_gap_or_a_new_state() {
+        let s = Store::open_in_memory().unwrap();
+        harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
+        let sent = s.pending().unwrap();
+        let n = sent[0].0;
+        let a_day_ago = now_secs() - REFUSED_FOR_NOW_SECS - 60;
+        let backdate = || s.test_conn().execute("UPDATE pending_ops SET refused_since = ?1", rusqlite::params![a_day_ago]).unwrap();
+        let (old_key, new_key) = (on("0123abcd"), on("89abcdef"));
+        // Four in a row, the first long ago...
+        for _ in 0..REFUSED_FOR_NOW_SYNCS - 1 {
+            sync_round(&s, &sent, &[refused(FOR_NOW[0])], &old_key);
+        }
+        backdate();
+        assert_eq!(s.refused_for_now(n).unwrap().count, REFUSED_FOR_NOW_SYNCS - 1);
+        // ...then a sync that didn't send it: the next refusal starts a new run.
+        s.set_state(SYNC_RUNS, s.get_state(SYNC_RUNS).unwrap() + 1).unwrap();
+        sync_round(&s, &sent, &[refused(FOR_NOW[0])], &old_key);
+        let run = s.refused_for_now(n).unwrap();
+        assert!(run.count == 1 && run.since.unwrap() > a_day_ago, "{run:?}");
+        // Four more in a row, backdated: then a refusal under a new key
+        // starts a new run instead of giving up.
+        for _ in 0..REFUSED_FOR_NOW_SYNCS - 2 {
+            sync_round(&s, &sent, &[refused(FOR_NOW[0])], &old_key);
+        }
+        backdate();
+        let notes = sync_round(&s, &sent, &[refused(FOR_NOW[0])], &new_key);
+        assert!(notes[0].contains(" for now: "), "{notes:?}");
+        assert_eq!(s.refused_for_now(n).unwrap().count, 1);
+        // An unverified device's refusal ends the run and never counts.
+        let unverified = SealState::for_test(crate::memory::crypto::EncryptionMode::Off, None, false);
+        let as_unverified = OpResult { mode_refusal: ModeRefusal::Unverified, ..refused(FOR_NOW[0]) };
+        for _ in 0..2 * REFUSED_FOR_NOW_SYNCS {
+            sync_round(&s, &sent, std::slice::from_ref(&as_unverified), &unverified);
+        }
+        assert_eq!(s.refused_for_now(n).unwrap(), RefusedRun::default());
+        assert_eq!(s.pending().unwrap(), sent);
     }
 
     /// A chunk refused as too large goes one op at a time; an op refused for

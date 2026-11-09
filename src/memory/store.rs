@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS skills (
   version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL,
   PRIMARY KEY (scope, project, name));
 CREATE TABLE IF NOT EXISTS pending_ops (n INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL,
-  refused_for_now INTEGER NOT NULL DEFAULT 0, refused_since INTEGER);
+  refused_for_now INTEGER NOT NULL DEFAULT 0, refused_since INTEGER, refused_run INTEGER, refused_state TEXT);
 CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS harvest_map (
   origin TEXT PRIMARY KEY, memory_id TEXT NOT NULL, content_hash TEXT NOT NULL, status TEXT NOT NULL);
@@ -186,31 +186,38 @@ fn migrate_memories(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn pending_ops_current(conn: &Connection) -> Result<bool> {
+/// The columns of a run of refusals for now (`Store::refused_for_now`).
+const REFUSED_COLUMNS: [(&str, &str); 4] = [
+    ("refused_for_now", "INTEGER NOT NULL DEFAULT 0"),
+    ("refused_since", "INTEGER"),
+    ("refused_run", "INTEGER"),
+    ("refused_state", "TEXT"),
+];
+
+fn pending_ops_columns(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("PRAGMA table_info(pending_ops)")?;
     let cols = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(cols.iter().any(|c| c == "refused_for_now") && cols.iter().any(|c| c == "refused_since"))
+    Ok(cols)
 }
 
-/// Add the counters of refusals for now (`Store::refused_for_now`) to an
-/// older `pending_ops`. Same IMMEDIATE pattern as `migrate_memories`. An
-/// older atem still reads and writes the table (it names its columns).
+fn pending_ops_current(conn: &Connection) -> Result<bool> {
+    let cols = pending_ops_columns(conn)?;
+    Ok(REFUSED_COLUMNS.iter().all(|(c, _)| cols.iter().any(|x| x == c)))
+}
+
+/// Add the columns of a run of refusals for now (`Store::refused_for_now`)
+/// to an older `pending_ops`. Same IMMEDIATE pattern as `migrate_memories`.
+/// An older atem still reads and writes the table (it names its columns).
 fn migrate_pending_ops(conn: &Connection) -> Result<()> {
     if pending_ops_current(conn)? {
         return Ok(());
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    if pending_ops_current(&tx)? {
-        return Ok(());
-    }
-    let mut stmt = tx.prepare("PRAGMA table_info(pending_ops)")?;
-    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    if !cols.iter().any(|c| c == "refused_for_now") {
-        tx.execute_batch("ALTER TABLE pending_ops ADD COLUMN refused_for_now INTEGER NOT NULL DEFAULT 0")?;
-    }
-    if !cols.iter().any(|c| c == "refused_since") {
-        tx.execute_batch("ALTER TABLE pending_ops ADD COLUMN refused_since INTEGER")?;
+    let cols = pending_ops_columns(&tx)?;
+    for (c, ty) in REFUSED_COLUMNS {
+        if !cols.iter().any(|x| x == c) {
+            tx.execute_batch(&format!("ALTER TABLE pending_ops ADD COLUMN {c} {ty}"))?;
+        }
     }
     tx.commit()?;
     Ok(())
@@ -306,6 +313,22 @@ fn row_to_harvest(r: &rusqlite::Row) -> rusqlite::Result<HarvestEntry> {
 
 pub struct Store {
     conn: Connection,
+}
+
+/// The `sync_state` key counting syncs (`sync::run_sync`, one per run): a
+/// run of refusals for now is only "in a row" across consecutive runs.
+pub const SYNC_RUNS: &str = "sync_runs";
+
+/// A queued op's run of refusals for now (`Store::refused_for_now`): how
+/// many syncs in a row refused it, since when (unix seconds), at which sync
+/// (`SYNC_RUNS`) the last one was, and the state it was sealed under then
+/// (`api::SealState::fingerprint`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefusedRun {
+    pub count: i64,
+    pub since: Option<i64>,
+    pub run: Option<i64>,
+    pub state: Option<String>,
 }
 
 impl Store {
@@ -735,22 +758,24 @@ impl Store {
         Ok(())
     }
 
-    /// How many syncs refused queued op `n` for now (`sync::defer_refusals`)
-    /// one after another, and when the first of them did (unix seconds;
-    /// `None` before any). The counts go with the op when it is acked.
-    pub fn refused_for_now(&self, n: i64) -> Result<(i64, Option<i64>)> {
+    /// Queued op `n`'s run of refusals for now (`sync::apply_batch`); the
+    /// default before any. It goes with the op when it is acked.
+    pub fn refused_for_now(&self, n: i64) -> Result<RefusedRun> {
         Ok(self.conn
-            .query_row("SELECT refused_for_now, refused_since FROM pending_ops WHERE n = ?1", params![n], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT refused_for_now, refused_since, refused_run, refused_state FROM pending_ops WHERE n = ?1",
+                params![n],
+                |r| Ok(RefusedRun { count: r.get(0)?, since: r.get(1)?, run: r.get(2)?, state: r.get(3)? }),
+            )
             .optional()?
-            .unwrap_or((0, None)))
+            .unwrap_or_default())
     }
 
-    /// Counts one more refusal for now of queued op `n`, at `now` (the
-    /// first one's time is kept).
-    pub fn count_refused_for_now(&self, n: i64, now: i64) -> Result<()> {
+    /// Records queued op `n`'s run of refusals for now.
+    pub fn set_refused_for_now(&self, n: i64, run: &RefusedRun) -> Result<()> {
         self.conn.execute(
-            "UPDATE pending_ops SET refused_for_now = refused_for_now + 1, refused_since = COALESCE(refused_since, ?2) WHERE n = ?1",
-            params![n, now],
+            "UPDATE pending_ops SET refused_for_now = ?2, refused_since = ?3, refused_run = ?4, refused_state = ?5 WHERE n = ?1",
+            params![n, run.count, run.since, run.run, run.state],
         )?;
         Ok(())
     }
@@ -1104,9 +1129,8 @@ mod tests {
         assert_eq!(fts_hits(&s, "\"tcp 876\""), vec!["mem_live"]);
     }
 
-    /// An older queue (no counters) gets them in place, its ops kept; the
-    /// counts go up per refusal, keep the first one's time, and go with the
-    /// op when it is acked.
+    /// An older queue (no run columns) gets them in place, its ops kept; a
+    /// run is kept with the op and goes when it is acked.
     #[test]
     fn refusals_for_now_are_counted_per_queued_op() {
         let td = tempfile::tempdir().unwrap();
@@ -1119,15 +1143,15 @@ mod tests {
         let s = Store::open(&p).unwrap();
         assert!(pending_ops_current(&s.conn).unwrap());
         let n = s.pending().unwrap()[0].0;
-        assert_eq!(s.refused_for_now(n).unwrap(), (0, None));
-        s.count_refused_for_now(n, 100).unwrap();
-        s.count_refused_for_now(n, 200).unwrap();
-        assert_eq!(s.refused_for_now(n).unwrap(), (2, Some(100)));
+        assert_eq!(s.refused_for_now(n).unwrap(), RefusedRun::default());
+        let run = RefusedRun { count: 2, since: Some(100), run: Some(7), state: Some("on:0123abcd".into()) };
+        s.set_refused_for_now(n, &run).unwrap();
+        assert_eq!(s.refused_for_now(n).unwrap(), run);
         drop(s);
         let s = Store::open(&p).unwrap(); // idempotent
-        assert_eq!(s.refused_for_now(n).unwrap(), (2, Some(100)));
+        assert_eq!(s.refused_for_now(n).unwrap(), run);
         s.ack(n).unwrap();
-        assert_eq!(s.refused_for_now(n).unwrap(), (0, None));
+        assert_eq!(s.refused_for_now(n).unwrap(), RefusedRun::default());
     }
 
     fn write_legacy_db(p: &Path) {
