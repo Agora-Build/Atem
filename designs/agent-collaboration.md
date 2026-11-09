@@ -629,10 +629,16 @@ its sender: two separate steps.
   lines with this tag are Atem's and that lines with any other tag, or between
   a begin line and its end line, never are. The sender's text, the reply and
   each context snapshot go only into counted blocks
-  (`[atem <tag>] begin <what> (<n> bytes)` … `[atem <tag>] end <what>`), and a
-  line of theirs that folds to `[atem` (after Cf characters are dropped, NFKC,
-  lowercasing, or on its UTS #39 confusables skeleton; with leading white
-  space or `|`s skipped) gets a `|` in front. A local task reads:
+  (`[atem <tag>] begin <what> (<n> bytes)` … `[atem <tag>] end <what>`). The
+  tag is the guarantee: nobody knows it before the text is fixed, so no line
+  of theirs carries it. As an extra layer, a line of theirs that folds to
+  `[atem` gets a `|` in front (Cf characters dropped, NFKC, then the
+  lowercased line, its UTS #39 confusables skeleton, or the skeleton taken
+  before lowercasing; with leading white space or `|`s skipped; Unicode
+  18.0.0). A context snapshot's begin line ends `digest verified` when this
+  runtime published and read back its bytes (a local task's, a local reply's)
+  and `sender's snapshot, digest matches` for a remote sender's, whose text
+  Atem only checked against the digest it gave. A local task reads:
 
   ```text
   [atem <tag>] Atem task <task id> / workflow <workflow id> from local session <session>, route <route>, message <message id>
@@ -1086,7 +1092,7 @@ Sending and automatic actions remain opt-in.
 | Calling identity | `src/runtime/server.rs`, `adopt.rs`, `broker.rs`: socket peer PID and start time, verified ancestry to the live worker agent, generation-bound persisted `self:` tags (removed with their session) |
 | Durable state | `src/runtime/collab.rs`: fixed resolutions, UUIDv5 task IDs, outbox, durable hourly/workflow counters counted in messages and removed when their windows pass, task validation before counting, scoped status views |
 | Queue integration | `src/runtime/collab_bridge.rs`, `host_work_bridge.rs`, `host_bridge.rs`: internal attachment, sender abstraction, normal prompt receipts, leases, fencing and pauses; the lifecycle rules of section 10 (`work_lost`, `reconcile_work`, `work_fence_launches`); `local` only on a host with a pinned device list (`local_authorized`, `collab_unauthorized`); Atem's lines around every task's text (a remote sender's task, message and mark, a local task, a delivered reply) rendered at dispatch from the records with a fresh tag (`collab::Frame`, `collab::task_prompt`, `WorkRecord.message`), the stored prompt holding only the sender's text or the reply |
-| Prompt framing | `crates/atem-client/src/session/framing.rs` (shared core): tags, the folding and escaping of section 10's framing (NFKC and NFD, General_Category Cf, the UTS #39 skeleton, all Unicode 18.0.0), counted blocks, rendering and reading back (`Prompt::parse`), `TaskPrompt` and the worst-case size `WorkTask::valid` checks; vectors in `designs/protocol/fixtures/host-work/prompt-framing-v1.json` |
+| Prompt framing | `crates/atem-client/src/session/framing.rs` (shared core): tags, the folding and escaping of section 10's framing (NFKC and NFD, General_Category Cf, the UTS #39 skeleton of the lowercased line and of the capitals, the lowercase mapping and White_Space from tables `scripts/gen-framing-unicode.py` generates, all Unicode 18.0.0), counted blocks, rendering and reading back (`Prompt::parse`), `TaskPrompt` and the worst-case size `WorkTask::valid` checks; vectors in `designs/protocol/fixtures/host-work/prompt-framing-v1.json` |
 | Context | `src/runtime/collab_context.rs`, `src/memory/sync.rs`, `src/vault_client.rs`: immutable capture, publication, exact decrypted read-back, bounded retries before dispatch; vault context only with the account's encryption on (checked at capture, before and after publication reads the entry, and by each read: `VaultClient::encryption_on_only`) and never with a credential value |
 | Results | `src/runtime/collab_results.rs`, `collab_bridge.rs`: one durable reply per task for every sender, bound to its session, process and turn; narrow return grants, explicit completion by the sender, optional origin prompt, status-only automatic reports, grants that end early with their reason recorded (the task goes on) |
 | Remote replies | `crates/atem-client/src/session/host_work.rs`, `principal.rs`, `connect.rs`, `src/session_protocol/r9/mod.rs`, `host_work_bridge.rs`: `reply_query`, the `host.reply` feature, the shared vectors in `designs/protocol/fixtures/host-work/requests-v1.json` |
@@ -1160,8 +1166,11 @@ Cyrillic look-alikes) reach the agent escaped, with only Atem's lines carrying
 the prompt's tag; earlier builds pasted them as written. The framing's own
 tests check every folding case of III.2, that a block can be neither extended
 nor ended early, empty and huge texts, that every rendering reads back to
-exactly the sender's text, the worst-case size, and the vectors (checked
-independently against Unicode 18.0.0's `confusables.txt`). Retention: payloads
+exactly the sender's text, the worst-case size, that a message's size is
+checked once for all its recipients, that the pinned lowercase and
+White_Space tables differ from the toolchain's only where the toolchain's
+Unicode is older, and the vectors (checked independently against Unicode
+18.0.0's `confusables.txt`). Retention: payloads
 dropped past the retention with every row kept, a database with only the v0.8.x tables opening and working
 unchanged, retries deduplicated by digest after a drop, `reply_query` answering
 `dropped`, the record caps counting open records only (tasks, messages, local
@@ -1205,13 +1214,20 @@ Stage 1 ships with these limits.
   it with the local user's permissions (section 6). A direct session-v1 or
   chat-v1 prompt from a principal with `control`, or what the person at the
   terminal types, is pasted as written and can contain lines that imitate the
-  framing: such a principal already acts as the user. A look-alike of the
-  marker that the pinned confusables data (Unicode 18.0.0) doesn't list, or a
-  character a later Unicode version adds, isn't escaped; it can't carry the
-  prompt's own tag, which is drawn after the text is fixed, and the rule line
-  tells the agent that a line with any other tag is never Atem's. A sender
-  that reads chat history (a service with `view`) sees earlier tags, which
-  escaping covers. A task accepted by an earlier build keeps the prompt it
+  framing: such a principal already acts as the user. The tag is what keeps
+  sender text from passing for Atem's lines; the `|` escaping only marks
+  lines that look like the marker, and exactly these: a line whose start,
+  after white space and invisible (Cf or Default_Ignorable) characters, is
+  `[atem` in any case or width or spelled with look-alike letters that
+  Unicode 18.0.0's `confusables.txt` lists as Latin (single letters or whole
+  words, capitals of Cyrillic, Greek, Cherokee or Lisu included). It doesn't
+  mark look-alikes that list doesn't have (lowercase Cyrillic `т` and `м`,
+  small capitals `ᴀᴛᴇᴍ`), characters a later Unicode version adds, the marker
+  after other text or punctuation (`> [atem`, `**[atem`), other brackets
+  (`【atem`) or a combining mark after the bracket: those lines get no `|`,
+  can't carry the prompt's tag, and the rule line tells the agent that a line
+  with any other tag is never Atem's. A sender that reads chat history (a
+  service with `view`) sees earlier tags, which escaping marks. A task accepted by an earlier build keeps the prompt it
   stored, which for a remote message held the old `[Message … from …]` header
   and mark lines: it is shown inside the prompt block, as the sender's text.
 - **Vault context with encryption on.** Vault context is taken only while the

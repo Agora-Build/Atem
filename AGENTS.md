@@ -314,13 +314,20 @@ neither end to end nor authenticated at Atem's end, so collaboration refuses to
 run there (`local_authorized` needs `SessionHost::refuses_r8`; "collaboration
 needs a pinned device list: run `atem pair verify`"). Every prompt Atem
 renders around sender text (remote tasks, messages and marks, local tasks,
-result deliveries) uses the agreed §III.2 framing (`atem_client::session::framing`:
-a CSPRNG tag per rendered prompt, the rule line, counted blocks, a `|` before
-any sender line that folds to `[atem` after Cf removal, NFKC, lowercasing or
-on its UTS #39 skeleton, Unicode 18.0.0; vectors
-`designs/protocol/fixtures/host-work/prompt-framing-v1.json`), so sender text
-can't imitate Atem's lines; a principal with `control` still pastes what it
-likes (design §17, "Prompt framing: what remains"). A principal
+result deliveries) uses the agreed §III.2 framing (`atem_client::session::framing`):
+a CSPRNG tag per rendered prompt, drawn after the sender's text is fixed, on
+every line of Atem's (the guarantee: no sender line can carry it), the rule
+line, and counted blocks; as an extra layer, a `|` before any sender line that
+folds to `[atem` after leading White_Space (Cf removed, NFKC, then the
+lowercased line, its UTS #39 skeleton, or the skeleton taken before
+lowercasing, lowercased and skeletonized again; all Unicode 18.0.0, the
+lowercase mapping and White_Space from generated tables,
+`framing/unicode_data.rs`, `scripts/gen-framing-unicode.py`). Look-alikes
+`confusables.txt` doesn't list, or the marker after other text, get no `|`
+and rely on the tag. Vectors:
+`designs/protocol/fixtures/host-work/prompt-framing-v1.json`. A principal with
+`control` still pastes what it likes (design §17, "Prompt framing: what
+remains"). A principal
 allowed to reach an agent acts through it with the local user's permissions
 (shell, files, Atem commands, Memory, skills, vault): Atem doesn't track who
 prompted an agent, so its `message send` is `local` and reaches every route that

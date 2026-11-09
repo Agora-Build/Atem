@@ -395,13 +395,18 @@ a pinned device list. A host verified by an earlier build that never pinned one
 still serves r8 sessions to the paired Astation over a link that is neither end
 to end nor authenticated at Atem's end; agent collaboration refuses to run
 there until `atem pair verify` pins a list. In every prompt Atem builds
-around a sender's text, Atem's own lines start with a tag drawn for that
-prompt, the sender's text sits in counted blocks, and any of its lines that
-looks like Atem's marker (in any case or width, a look-alike letter of
-another script, or behind invisible characters) gets a `|` in front, so
-text a sender writes can't pass for Atem's lines (a message header, a
-result's "as data" label). The framing tells the agent where text came from;
-it doesn't stop the agent from acting on it.
+around a sender's text, each of Atem's own lines starts with a tag drawn at
+random for that prompt once the sender's text is fixed, and the sender's text
+sits in counted blocks. The tag is the guarantee: a line without it, or
+inside a block, is never Atem's, so text a sender writes can't pass for
+Atem's lines (a message header, a result's "as data" label), earlier tags
+included. As an extra, a sender's line that starts like Atem's marker
+`[atem` gets a `|` in front: in any case or width, after white space or
+invisible characters, or spelled with look-alike letters of other scripts
+that Unicode's confusables list (Unicode 18.0.0). Look-alikes that list
+doesn't have, or `[atem` after other text on the line, get no `|` and rely
+on the tag. The framing tells the agent where text came from; it doesn't
+stop the agent from acting on it.
 Whoever may reach an agent (a route that lists it, or `control` over its
 session) acts through it with your permissions on this machine: the agent's
 shell, files and Atem commands, including `atem message send` (its tasks are
