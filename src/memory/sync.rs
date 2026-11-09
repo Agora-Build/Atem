@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
-use crate::memory::api::{seal_cost, ApiError, ConflictCheck, KnowledgeClient, OpResult, SealState, StoredVersion, MAX_SKILL_VERSION, PULL_LIMIT};
+use crate::memory::api::{seal_cost, ApiError, ConflictCheck, KnowledgeClient, ModeRefusal, OpResult, SealState, StoredVersion, MAX_SKILL_VERSION, PULL_LIMIT, TEMPORARY_REFUSALS};
 use crate::memory::crypto::{total, Planner};
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
@@ -194,6 +194,24 @@ pub fn too_large_note(op: &PendingOp) -> String {
     format!("{} is too large for the relay; it stays queued", describe(op))
 }
 
+/// `apply_batch`'s notes.
+#[cfg(test)]
+pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
+    Ok(apply_batch(store, sent, results)?.notes)
+}
+
+/// What applying a batch's results did (`apply_batch`).
+#[derive(Debug, Default)]
+struct Applied {
+    notes: Vec<String>,
+    /// The ops refused for now that stay queued (`Deferred::Retry`):
+    /// nothing more of their skill or memory goes out in this sync.
+    retried: Vec<PendingOp>,
+    /// How many ops stay queued for a refusal for now (`Retry` and
+    /// `AfterAdd`): not pushed.
+    kept: usize,
+}
+
 /// Apply one batch's results. Every op is acked: successes are done, and
 /// permanent refusals (e.g. the server's secret check) must not retry
 /// forever. The exceptions:
@@ -203,10 +221,12 @@ pub fn too_large_note(op: &PendingOp) -> String {
 ///   as it was; only one a later push of the same skill in the batch
 ///   superseded is acked;
 /// - a refusal for now (`OpResult::is_temporary_refusal`: the Station's
-///   encryption mode or key differs from the one the op was sealed under)
-///   stays queued as it was, with a note, unless a later op of the batch
-///   that landed withdrew it, and a landed invalidation of a memory whose
-///   add it kept stays queued behind that add (`defer_refusals`).
+///   encryption mode or key differs from the one the op was sealed under,
+///   and the op's own value isn't the cause) stays queued as it was, with a
+///   note, unless a later op of the batch that landed withdrew it, and a
+///   landed invalidation of a memory whose add it kept stays queued behind
+///   that add (`defer_refusals`); after `REFUSED_FOR_NOW_SYNCS` syncs over at
+///   least `REFUSED_FOR_NOW_SECS` it is refused for good.
 ///
 /// A result count that doesn't match can't be paired
 /// up, so nothing is acked: the batch stays queued and a note explains why.
@@ -220,20 +240,43 @@ pub fn too_large_note(op: &PendingOp) -> String {
 /// (a Station that renumbers, as before Astation PR #76, appends it again). It opens
 /// that transaction itself, so it must not be called inside
 /// `Store::in_transaction` (not nestable).
-pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
+///
+/// Returns the notes, and what stays queued for a refusal for now.
+fn apply_batch(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Applied> {
     if results.len() != sent.len() {
-        return Ok(vec![format!(
-            "relay returned {} results for {} changes; they stay queued for the next sync",
-            results.len(), sent.len()
-        )]);
+        return Ok(Applied {
+            notes: vec![format!(
+                "relay returned {} results for {} changes; they stay queued for the next sync",
+                results.len(), sent.len()
+            )],
+            ..Default::default()
+        });
     }
     store.in_transaction(|| apply_paired_results(store, sent, results))
 }
 
-fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
+/// How many syncs in a row, over at least `REFUSED_FOR_NOW_SECS`, may
+/// refuse an op for now before Atem stops retrying it (refused for good).
+/// A sync runs after every local change too, so the time bound keeps an
+/// ordinary rotation or migration race (minutes) from dropping an edit.
+pub const REFUSED_FOR_NOW_SYNCS: i64 = 5;
+pub const REFUSED_FOR_NOW_SECS: i64 = 24 * 3600;
+
+fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Applied> {
     let mut notes = Vec::new();
     let conflicts = settle_conflicts(sent, results);
-    let deferred = defer_refusals(sent, results);
+    // Refused for now too often for too long: refused for good from here.
+    let now = now_secs();
+    let mut given_up = BTreeMap::new();
+    for (i, (n, _)) in sent.iter().enumerate().filter(|(i, _)| results[*i].is_temporary_refusal()) {
+        let (count, since) = store.refused_for_now(*n)?;
+        if let Some(since) = since
+            && count + 1 >= REFUSED_FOR_NOW_SYNCS
+            && now - since >= REFUSED_FOR_NOW_SECS {
+            given_up.insert(i, (count + 1, since));
+        }
+    }
+    let deferred = defer_refusals(sent, results, &given_up);
     for (i, ((n, op), r)) in sent.iter().zip(results).enumerate() {
         if let Some(settled) = conflicts.get(&i) {
             // A conflicted push is acked only when this batch's later push,
@@ -245,7 +288,11 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
         }
         match deferred.get(&i) {
             // Said once for the batch, below.
-            Some(Deferred::Retry | Deferred::AfterAdd) => continue,
+            Some(Deferred::Retry) => {
+                store.count_refused_for_now(*n, now)?;
+                continue;
+            }
+            Some(Deferred::AfterAdd) => continue,
             // The delete or purge stands; nothing to add.
             Some(Deferred::Withdrawn) => {
                 store.ack(*n)?;
@@ -282,7 +329,15 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
                 _ => {}
             }
         } else {
-            notes.push(format!("relay refused {}: {}", describe(op), r.error.clone().unwrap_or_else(|| "unknown error".into())));
+            let error = r.error.clone().unwrap_or_else(|| "unknown error".into());
+            notes.push(match (&r.mode_refusal, given_up.get(&i)) {
+                (ModeRefusal::Own(why), _) => format!("relay refused {}: {error} ({why}); not sent again", describe(op)),
+                (_, Some((count, since))) => format!(
+                    "relay refused {} for now at {count} syncs in a row since {} UTC: {error}; Atem stopped retrying it (refused for good)",
+                    describe(op), crate::memory::model::format_datetime(*since)
+                ),
+                _ => format!("relay refused {}: {error}", describe(op)),
+            });
             if let PendingOp::AddMemory { memory } = op {
                 store.mark_memory_deleted(&memory.id)?;
                 for mut e in store.harvest_entries_for_memory(&memory.id)? {
@@ -296,7 +351,11 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
     }
     notes.extend(refused_for_now_notes(sent, results, &deferred));
     notes.extend(settle_skills(store, sent, results, &conflicts)?);
-    Ok(notes)
+    Ok(Applied {
+        notes,
+        retried: deferred.iter().filter(|(_, d)| **d == Deferred::Retry).map(|(&i, _)| sent[i].1.clone()).collect(),
+        kept: deferred.values().filter(|d| **d != Deferred::Withdrawn).count(),
+    })
 }
 
 /// The note for a concurrent edit where this machine's edit already
@@ -428,7 +487,8 @@ fn moots_push(later: &PendingOp, skill: &Skill) -> Option<Settled> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Deferred {
     /// Refused for now: queued as it was, sealed again and sent at the next
-    /// sync (never again in this one: its group stops).
+    /// sync (never again in this one: nothing more of its skill or memory
+    /// goes out, `Held`).
     Retry,
     /// Refused for now, but a later op of the batch that landed made it
     /// moot (`moots_push`, or a delete of that memory): acked and never sent,
@@ -442,10 +502,11 @@ enum Deferred {
 
 /// The batch's refusals for now, by index, and the landed invalidations
 /// that must follow their adds (`Deferred`). Ops refused for good are not
-/// listed: they are acked as before.
-fn defer_refusals(sent: &[(i64, PendingOp)], results: &[OpResult]) -> BTreeMap<usize, Deferred> {
+/// listed: they are acked as before, and so are the ones `given_up`
+/// (refused for now too long).
+fn defer_refusals<T>(sent: &[(i64, PendingOp)], results: &[OpResult], given_up: &BTreeMap<usize, T>) -> BTreeMap<usize, Deferred> {
     let mut deferred = BTreeMap::new();
-    for i in (0..sent.len()).filter(|&i| results[i].is_temporary_refusal()) {
+    for i in (0..sent.len()).filter(|&i| results[i].is_temporary_refusal() && !given_up.contains_key(&i)) {
         let later = || (i + 1..sent.len()).filter(|&j| results[j].ok);
         let withdrawn = match &sent[i].1 {
             PendingOp::PushSkill { skill, .. } => later().any(|j| moots_push(&sent[j].1, skill).is_some()),
@@ -467,11 +528,12 @@ fn defer_refusals(sent: &[(i64, PendingOp)], results: &[OpResult]) -> BTreeMap<u
 }
 
 /// The notes for a batch's ops refused for now (`Deferred::Retry`): one per
-/// reason, naming the first few (a key rotation can refuse a whole batch).
+/// reason and cause (`ModeRefusal`), naming the first few (a key rotation
+/// can refuse a whole batch).
 fn refused_for_now_notes(sent: &[(i64, PendingOp)], results: &[OpResult], deferred: &BTreeMap<usize, Deferred>) -> Vec<String> {
-    let mut by_reason: Vec<(&str, Vec<String>)> = Vec::new();
+    let mut by_reason: Vec<((&str, bool), Vec<String>)> = Vec::new();
     for (&i, _) in deferred.iter().filter(|(_, d)| **d == Deferred::Retry) {
-        let reason = results[i].error.as_deref().unwrap_or_default();
+        let reason = (results[i].error.as_deref().unwrap_or_default(), results[i].mode_refusal == ModeRefusal::Unverified);
         let what = describe(&sent[i].1);
         match by_reason.iter_mut().find(|(r, _)| *r == reason) {
             Some((_, ops)) => ops.push(what),
@@ -480,25 +542,101 @@ fn refused_for_now_notes(sent: &[(i64, PendingOp)], results: &[OpResult], deferr
     }
     const NAMED: usize = 3;
     by_reason.into_iter()
-        .map(|(reason, ops)| {
+        .map(|((reason, unverified), ops)| {
             let (what, stay) = match ops.len() {
                 1 => (ops[0].clone(), "it stays queued and is"),
                 n if n <= NAMED => (format!("{n} changes ({})", ops.join(", ")), "they stay queued and are"),
                 n => (format!("{n} changes ({} and {} more)", ops[..NAMED].join(", "), n - NAMED), "they stay queued and are"),
             };
-            format!(
-                "relay refused {what} for now: {reason} (the account's encryption mode or key is changing); {stay} sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected."
-            )
+            if unverified {
+                format!(
+                    "relay refused {what} for now: {reason} (this device isn't verified, so it sends without end-to-end encryption, and the account encrypts); {stay} sent sealed once this device is verified: run `atem pair verify` (see `atem status`)."
+                )
+            } else {
+                format!(
+                    "relay refused {what} for now: {reason} (the account's encryption mode or key is changing); {stay} sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected."
+                )
+            }
         })
         .collect()
 }
 
-/// Whether the batch has an op refused for now that stays queued
-/// (`Deferred::Retry`): its group stops there.
-fn has_retry(sent: &[(i64, PendingOp)], posted: &std::result::Result<Vec<OpResult>, ApiError>) -> bool {
-    posted.as_ref().is_ok_and(|results| {
-        results.len() == sent.len() && defer_refusals(sent, results).values().any(|d| *d == Deferred::Retry)
-    })
+/// Judges the batch's refusals in `TEMPORARY_REFUSALS` (`ModeRefusal`)
+/// against each op as it went out (`wire`; the chunk sealed under `state`).
+fn judge_mode_refusals(wire: &[Value], state: &SealState, posted: std::result::Result<Vec<OpResult>, ApiError>) -> std::result::Result<Vec<OpResult>, ApiError> {
+    let mut results = posted?;
+    if results.len() != wire.len() {
+        return Ok(results);
+    }
+    for (sent, result) in wire.iter().zip(results.iter_mut()) {
+        if !result.ok && result.error.as_deref().is_some_and(|error| TEMPORARY_REFUSALS.contains(&error)) {
+            result.mode_refusal = mode_refusal(sent, state);
+        }
+    }
+    Ok(results)
+}
+
+/// What a mode refusal of `sent` (an op's wire form) means. The Station
+/// accepts a field only as its mode allows: while it encrypts, an envelope
+/// or keyed hash under its current key; while off, a value that doesn't
+/// start with `e1.` (text) or `h1.` (a hash); while disabling, either
+/// (Astation `knowledge_routes.rs` `allowed_field` at 9eb5320).
+/// - Sealed (a keyed `content_hash`): refused for good when its project is
+///   a hash under another key than the rest of it (a project this machine
+///   can't name, kept as an earlier key's hash), which never passes under
+///   the current key; else the Station's key or mode isn't the one it was
+///   sealed under (for now).
+/// - Plain from a device that isn't verified: for now (it goes sealed once
+///   the device is verified).
+/// - Plain under a signed off or disabling state: refused for good when one
+///   of its values starts like a sealed one (`e1.` text, a file's name or
+///   text, an `h1.` project), which the Station refuses while off; else the
+///   Station already encrypts (for now).
+fn mode_refusal(sent: &Value, state: &SealState) -> ModeRefusal {
+    let row = match sent["op"].as_str() {
+        Some("add") => &sent["memory"],
+        Some("push") => &sent["skill"],
+        _ => return ModeRefusal::Changing,
+    };
+    let field = |name: &str| row[name].as_str().unwrap_or_default();
+    let (project, content_hash) = (field("project"), field("content_hash"));
+    let kid = atem_client::project::kid_of_project_hash;
+    if content_hash.starts_with("h1.") || state.encrypts() {
+        if kid(project).is_some() && kid(content_hash).is_some() && kid(project) != kid(content_hash) {
+            return ModeRefusal::Own(
+                "its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept; `atem sync` in that project's checkout names it".into(),
+            );
+        }
+        return ModeRefusal::Changing;
+    }
+    if !state.verified() {
+        return ModeRefusal::Unverified;
+    }
+    let sealed_like = |text: &str| text.starts_with("e1.");
+    let files = || {
+        row["files"].as_object().into_iter().flatten().map(|(path, value)| {
+            let text = value.as_str()
+                .and_then(|text| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text).ok())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_default();
+            (path.clone(), text)
+        })
+    };
+    let why = if project.starts_with("h1.") {
+        Some("its project is kept as a key's hash, a project this machine can't name")
+    } else if sealed_like(field("content")) {
+        Some("its text starts with `e1.`")
+    } else if files().any(|(path, _)| sealed_like(&path)) {
+        Some("a file's name starts with `e1.`")
+    } else if files().any(|(_, text)| sealed_like(&text)) {
+        Some("a file's text starts with `e1.`")
+    } else {
+        None
+    };
+    match why {
+        Some(why) => ModeRefusal::Own(format!("{why}, which the relay takes for an encrypted value while the account's encryption is off")),
+        None => ModeRefusal::Changing,
+    }
 }
 
 /// The skills a batch's results coalesced past a concurrent edit: no later
@@ -782,28 +920,73 @@ impl SyncOutcome {
 /// Apply a POSTed chunk's results (`posted`). `Ok(true)`: acked, carry on
 /// with the group; `Ok(false)`: results couldn't be paired up (nothing
 /// acked), stop the group; `Err`: the request failed, nothing acked.
-fn finish_chunk(store: &Store, chunk: &[(i64, PendingOp)], posted: std::result::Result<Vec<OpResult>, ApiError>, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
+/// Ops refused for now (`Deferred::Retry`) are `held` for the rest of the
+/// sync, and the sync is incomplete.
+fn finish_chunk(store: &Store, chunk: &[(i64, PendingOp)], posted: std::result::Result<Vec<OpResult>, ApiError>, held: &mut Held, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
     match posted {
         Ok(results) => {
-            for note in apply_push_results(store, chunk, &results)? {
+            let applied = apply_batch(store, chunk, &results)?;
+            for note in applied.notes {
                 out.note(note);
             }
             if results.len() != chunk.len() {
                 out.relay_error = true;
                 return Ok(Ok(false));
             }
+            for op in &applied.retried {
+                held.hold(op);
+                out.relay_error = true;
+            }
             // Only the acked ops count as pushed: a conflicted push that stays
             // queued (re-based, or unsettled) doesn't, nor does an op refused
             // for now or one queued behind it; the skills re-based are
             // counted apart.
             let conflicts = settle_conflicts(chunk, &results);
-            let waiting = conflicts.values().filter(|s| matches!(s, Settled::Rebased | Settled::Unchecked)).count()
-                + defer_refusals(chunk, &results).values().filter(|d| **d != Deferred::Withdrawn).count();
+            let waiting = conflicts.values().filter(|s| matches!(s, Settled::Rebased | Settled::Unchecked)).count() + applied.kept;
             out.pushed += chunk.len() - waiting;
             out.rebased += rebased_skills(chunk, &Ok(results)).into_iter().collect::<HashSet<_>>().len();
             Ok(Ok(true))
         }
         Err(e) => Ok(Err(e)),
+    }
+}
+
+/// What goes out no more in this sync (`push_group`): a skill coalesced
+/// past a concurrent edit (the Station judges a batch's ops in order, so
+/// only a later batch could see them out of order), and the skill or memory
+/// of an op refused for now, with every later op naming it (a memory's
+/// delete, its invalidation, or a replacement's invalidation naming it as
+/// the successor), so nothing of it lands before it and nothing is sent
+/// twice in one sync. Other skills and memories go on.
+#[derive(Default)]
+struct Held {
+    skills: HashSet<SkillKey>,
+    memories: HashSet<String>,
+}
+
+impl Held {
+    fn holds(&self, op: &PendingOp) -> bool {
+        match op {
+            PendingOp::AddMemory { memory } => self.memories.contains(&memory.id),
+            PendingOp::DeleteMemory { id } => self.memories.contains(id),
+            PendingOp::InvalidateMemory { id, superseded_by, .. } => {
+                self.memories.contains(id) || superseded_by.as_ref().is_some_and(|successor| self.memories.contains(successor))
+            }
+            _ => op_skill_key(op).is_some_and(|key| self.skills.contains(&key)),
+        }
+    }
+
+    fn hold(&mut self, op: &PendingOp) {
+        match op {
+            PendingOp::AddMemory { memory } => {
+                self.memories.insert(memory.id.clone());
+            }
+            _ => {
+                if let Some(key) = op_skill_key(op) {
+                    self.skills.insert(key);
+                }
+            }
+        }
     }
 }
 
@@ -980,24 +1163,20 @@ async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i
 /// in flight then. Before that, a skill chunk's version conflicts are
 /// checked (`check_conflicts`, one GET each); a push one re-bases is sealed
 /// again when its chunk goes (it no longer matches what was sealed ahead),
-/// and a conflict that couldn't be checked stops the push, as does an op
-/// refused for now (`defer_refusals`).
+/// and a conflict that couldn't be checked stops the push. An op refused
+/// for now (`defer_refusals`) holds back its skill or memory for the rest
+/// of the sync (`Held`); the others go on.
 async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
     let mut after = i64::MIN;
     let mut ahead = ReadAhead::new();
-    // Skills coalesced past a concurrent edit: nothing more of theirs goes
-    // out in this sync (the Station judges a batch's ops in order, so only
-    // a later batch could see them out of order).
-    let mut held_back: HashSet<SkillKey> = HashSet::new();
+    let mut held = Held::default();
     loop {
         if out.offline {
             return Ok(());
         }
         let read = store.pending_after(after, is_mem, chunk_size)?;
         let Some(&(last, _)) = read.last() else { return Ok(()) };
-        let chunk: Vec<(i64, PendingOp)> = read.into_iter()
-            .filter(|(_, op)| op_skill_key(op).is_none_or(|key| !held_back.contains(&key)))
-            .collect();
+        let chunk: Vec<(i64, PendingOp)> = read.into_iter().filter(|(_, op)| !held.holds(op)).collect();
         if chunk.is_empty() {
             after = last;
             continue;
@@ -1050,18 +1229,18 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
         } else {
             client.post_ops(&wire, is_mem).await
         };
-        let posted = check_conflicts(client, &chunk, &wire, posted).await;
-        let unsettled = has_unchecked_conflict(&chunk, &posted) || has_retry(&chunk, &posted);
-        held_back.extend(rebased_skills(&chunk, &posted));
-        match finish_chunk(store, &chunk, posted, out)? {
-            Ok(true) if unsettled => return stop_push(out),
+        let posted = judge_mode_refusals(&wire, &state, check_conflicts(client, &chunk, &wire, posted).await);
+        let unsettled = has_unchecked_conflict(&chunk, &posted);
+        held.skills.extend(rebased_skills(&chunk, &posted));
+        match finish_chunk(store, &chunk, posted, &mut held, out)? {
+            Ok(true) if unsettled => return conflict_unchecked(out),
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(ApiError::Http(413, _)) if chunk.len() > 1 => {
                 for ((n, sent), sealed) in named.iter().zip(&wire) {
                     // Re-read by `n`: an earlier single op may have rewritten it.
                     let Some(op) = store.pending_op(*n)? else { continue };
-                    if op_skill_key(&op).is_some_and(|key| held_back.contains(&key)) {
+                    if held.holds(&op) {
                         continue;
                     }
                     let one = [(*n, op)];
@@ -1071,20 +1250,22 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                         // while the chunk was in flight stops it.
                         Ok((now, renamed)) if reusable(sent, &state, &renamed[0], &now) => {
                             let checked = if sealed_by_agent(sent, &state) { client.confirm_unlocked().await } else { Ok(()) };
-                            checked.map(|()| vec![sealed.clone()])
+                            checked.map(|()| (now, vec![sealed.clone()]))
                         }
-                        Ok(_) => client.seal_ops(vec![one[0].1.clone()]).await.map(|(_, ops)| ops.into_iter().map(|(_, wire)| wire).collect()),
+                        Ok(_) => client.seal_ops(vec![one[0].1.clone()]).await
+                            .map(|(now, ops)| (now, ops.into_iter().map(|(_, wire)| wire).collect())),
                         Err(e) => Err(e),
                     };
-                    let single = match single {
+                    let (single_state, single) = match single {
                         Ok(single) => single,
                         Err(e) => return group_failed(store, e, &one, is_mem, out),
                     };
                     let posted = check_conflicts(client, &one, &single, client.post_ops(&single, is_mem).await).await;
-                    let unsettled = has_unchecked_conflict(&one, &posted) || has_retry(&one, &posted);
-                    held_back.extend(rebased_skills(&one, &posted));
-                    match finish_chunk(store, &one, posted, out)? {
-                        Ok(true) if unsettled => return stop_push(out),
+                    let posted = judge_mode_refusals(&single, &single_state, posted);
+                    let unsettled = has_unchecked_conflict(&one, &posted);
+                    held.skills.extend(rebased_skills(&one, &posted));
+                    match finish_chunk(store, &one, posted, &mut held, out)? {
+                        Ok(true) if unsettled => return conflict_unchecked(out),
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
                         Err(e) => return group_failed(store, e, &one, is_mem, out),
@@ -1191,11 +1372,10 @@ fn has_unchecked_conflict(sent: &[(i64, PendingOp)], posted: &std::result::Resul
     })
 }
 
-/// A conflict that couldn't be checked, or an op refused for now, stops the
-/// group (its note given): nothing after it goes this sync, so no later op
-/// lands before it (a later edit of that skill, an invalidation of that
-/// memory), and nothing is sent twice in one sync.
-fn stop_push(out: &mut SyncOutcome) -> Result<()> {
+/// A conflict that couldn't be checked stops the push (its note given):
+/// nothing after it goes this sync, so no later edit of that skill lands
+/// before it is settled.
+fn conflict_unchecked(out: &mut SyncOutcome) -> Result<()> {
     out.relay_error = true;
     Ok(())
 }
@@ -1981,59 +2161,177 @@ mod tests {
         assert_eq!(s.pending_count().unwrap(), 0);
     }
 
-    /// A batch refused for now (the Station's account state ahead of this
-    /// Atem's, or behind it) stops its group: nothing is sent again in that
-    /// sync, nothing after it goes, and every op stays queued. The next sync
-    /// seals them again and they land at the versions they were queued at.
+    /// An op refused for now (the Station's account state ahead of this
+    /// Atem's, or behind it) holds back its own skill or memory for the rest
+    /// of the sync: it is sent once, a later edit of that skill isn't sent at
+    /// all, and every other skill and memory goes on. The next sync seals
+    /// them again and they land, in order, at the versions they were queued
+    /// at.
     #[tokio::test]
-    async fn an_edit_refused_for_now_lands_at_the_next_sync() {
+    async fn an_edit_refused_for_now_holds_back_only_its_item_and_lands_at_the_next_sync() {
         let relay = Arc::new(Mutex::new(KeepingRelay::default()));
-        let keeping = keeping_relay(relay.clone());
         let refuse = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let refusing = refuse.clone();
+        let (refusing, keeping) = (refuse.clone(), relay.clone());
         let (base, log) = stub_relay(Box::new(move |m, p, body| {
-            if m == "POST" && refusing.load(std::sync::atomic::Ordering::SeqCst) {
-                let n = body["ops"].as_array().unwrap().len();
-                let error = if p.starts_with("/api/skills/batch?") { FOR_NOW[1] } else { FOR_NOW[0] };
-                return (200, serde_json::json!({"results": vec![serde_json::json!({"ok": false, "error": error}); n]}));
+            let refusing = refusing.load(std::sync::atomic::Ordering::SeqCst);
+            let mut r = keeping.lock().unwrap();
+            let refused = |error: &str| serde_json::json!({"ok": false, "error": error});
+            match (m, p.split('?').next().unwrap()) {
+                ("POST", "/api/memory/batch") => {
+                    let results: Vec<_> = body["ops"].as_array().unwrap().iter()
+                        .map(|op| if refusing && op["memory"]["content"] == "port 8765" { refused(FOR_NOW[0]) } else { r.op(op) })
+                        .collect();
+                    (200, serde_json::json!({"results": results}))
+                }
+                ("POST", "/api/skills/batch") => crate::memory::fake_station_skills::batch(body, |op| {
+                    if refusing && op["skill"]["name"] == "skill3" { refused(FOR_NOW[1]) } else { r.skill_op(op) }
+                }),
+                _ => {
+                    drop(r);
+                    keeping_relay(keeping.clone())(m, p, body)
+                }
             }
-            keeping(m, p, body)
         })).await;
         let s = Store::open_in_memory().unwrap();
         let (_td, ctx) = test_ctx();
-        queue_memories(&s, &["port 8765"]);
-        // Two skill chunks (8, then 2).
+        queue_memories(&s, &["port 8765", "other fact"]);
+        // Two skill chunks: skill0..skill7, then skill8, skill9 and an edit
+        // of skill3 (v2).
         for i in 0..10 {
             let skill = skill_v1(&format!("skill{i}"), &format!("# skill {i}"), "m1");
             s.put_skill(&skill).unwrap();
             s.enqueue(&PendingOp::PushSkill { skill, base_version: 0 }).unwrap();
         }
+        let edit = Skill { version: 2, ..skill_v1("skill3", "# skill 3, edited", "m1") };
+        let edit = Skill { content_hash: skill_hash(&edit.files), ..edit };
+        s.put_skill(&edit).unwrap();
+        s.enqueue(&PendingOp::PushSkill { skill: edit.clone(), base_version: 1 }).unwrap();
         let queued = s.pending().unwrap();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
-        assert!(out.relay_error && out.pushed == 0, "{:?}", out.notes);
-        let why = "(the account's encryption mode or key is changing)";
+        assert!(out.relay_error, "{:?}", out.notes);
+        assert_eq!(out.pushed, 10, "{:?}", out.notes);
+        // An unverified device (this client) sends plain: told to verify.
+        let why = "(this device isn't verified, so it sends without end-to-end encryption, and the account encrypts)";
         assert_eq!(out.notes, vec![
-            format!("relay refused memory mem_port 8765 for now: {} {why}; it stays queued and is sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected.", FOR_NOW[0]),
-            format!("relay refused 8 changes (skill skill0 v1, skill skill1 v1, skill skill2 v1 and 5 more) for now: {} {why}; they stay queued and are sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected.", FOR_NOW[1]),
+            format!("relay refused memory mem_port 8765 for now: {} {why}; it stays queued and is sent sealed once this device is verified: run `atem pair verify` (see `atem status`).", FOR_NOW[0]),
+            format!("relay refused skill skill3 v1 for now: {} {why}; it stays queued and is sent sealed once this device is verified: run `atem pair verify` (see `atem status`).", FOR_NOW[1]),
         ]);
-        assert_eq!(s.pending().unwrap(), queued);
-        assert_eq!(s.live_memories().unwrap().len(), 1);
-        // One POST of each kind: the first skill chunk alone, never again.
-        let posts = |log: &RelayLog| log.lock().unwrap().iter().filter(|(m, _, _)| m == "POST").map(|(_, p, body)| (p.split('?').next().unwrap().to_string(), body["ops"].as_array().unwrap().len())).collect::<Vec<_>>();
-        assert_eq!(posts(&log), vec![("/api/memory/batch".to_string(), 1), ("/api/skills/batch".to_string(), 8)]);
+        let left: Vec<_> = queued.iter().filter(|(_, op)| match op {
+            PendingOp::AddMemory { memory } => memory.content == "port 8765",
+            PendingOp::PushSkill { skill, .. } => skill.name == "skill3",
+            _ => false,
+        }).cloned().collect();
+        assert_eq!(s.pending().unwrap(), left);
+        assert_eq!(s.live_memories().unwrap().len(), 2);
+        // Each op sent at most once: skill3's edit not at all.
+        let posts = |log: &RelayLog| log.lock().unwrap().iter().filter(|(m, _, _)| m == "POST").map(|(_, p, body)| (
+            p.split('?').next().unwrap().to_string(),
+            body["ops"].as_array().unwrap().iter().map(|op| op["memory"]["content"].as_str().or(op["skill"]["name"].as_str()).unwrap().to_string()).collect::<Vec<_>>(),
+        )).collect::<Vec<_>>();
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(posts(&log), vec![
+            ("/api/memory/batch".to_string(), names(&["port 8765", "other fact"])),
+            ("/api/skills/batch".to_string(), (0..8).map(|i| format!("skill{i}")).collect()),
+            ("/api/skills/batch".to_string(), names(&["skill8", "skill9"])),
+        ]);
         assert!(s.get_state(LAST_SYNC_AT).unwrap() == 0);
 
         refuse.store(false, std::sync::atomic::Ordering::SeqCst);
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
         assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
-        assert_eq!(out.pushed, 11);
+        assert_eq!(out.pushed, 3);
         assert_eq!(s.pending_count().unwrap(), 0);
         let r = relay.lock().unwrap();
         assert_eq!(r.rows.values().filter(|m| m.content == "port 8765").count(), 1);
         for i in 0..10 {
             let stored = r.latest_skill(&format!("skill{i}")).unwrap();
-            assert_eq!((stored.version, stored.files["SKILL.md"].as_slice()), (1, format!("# skill {i}").as_bytes()));
+            let want = if i == 3 { (2, edit.files["SKILL.md"].clone()) } else { (1, format!("# skill {i}").into_bytes()) };
+            assert_eq!((stored.version, stored.files["SKILL.md"].clone()), want);
         }
+    }
+
+    /// Refused for now at every sync: kept while that lasts less than
+    /// `REFUSED_FOR_NOW_SYNCS` syncs or less than `REFUSED_FOR_NOW_SECS`
+    /// (syncs after local changes can come seconds apart); past both, Atem
+    /// stops retrying and treats it as refused for good, with a note.
+    #[test]
+    fn an_op_refused_for_now_too_long_is_refused_for_good() {
+        let s = Store::open_in_memory().unwrap();
+        harvest(&s, &[h("a.md", Scope::Global, "Prefers ripgrep")]);
+        let sent = s.pending().unwrap();
+        let n = sent[0].0;
+        for round in 1..=REFUSED_FOR_NOW_SYNCS + 1 {
+            let notes = apply_push_results(&s, &sent, &[refused(FOR_NOW[0])]).unwrap();
+            assert!(notes[0].contains(" for now: "), "{round}: {notes:?}");
+            assert_eq!(s.pending().unwrap(), sent, "{round}");
+        }
+        assert_eq!(s.refused_for_now(n).unwrap().0, REFUSED_FOR_NOW_SYNCS + 1);
+        // The first refusal was over a day ago.
+        let since = now_secs() - REFUSED_FOR_NOW_SECS - 60;
+        s.test_conn().execute("UPDATE pending_ops SET refused_since = ?1", rusqlite::params![since]).unwrap();
+        let notes = apply_push_results(&s, &sent, &[refused(FOR_NOW[0])]).unwrap();
+        let PendingOp::AddMemory { memory } = &sent[0].1 else { panic!("{sent:?}") };
+        let id = &memory.id;
+        assert_eq!(notes, vec![format!(
+            "relay refused memory {id} for now at {} syncs in a row since {} UTC: {}; Atem stopped retrying it (refused for good)",
+            REFUSED_FOR_NOW_SYNCS + 2, crate::memory::model::format_datetime(since), FOR_NOW[0]
+        )]);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        // As any refusal for good: removed here, its file held back.
+        assert!(s.live_memories().unwrap().is_empty());
+        assert_eq!(s.held_back_count().unwrap(), 1);
+    }
+
+    /// A chunk refused as too large goes one op at a time; an op refused for
+    /// now there holds back its memory too: its own invalidation and a
+    /// replacement naming it aren't sent in that sync, and the next sync
+    /// sends them after it. Other ops go on.
+    #[tokio::test]
+    async fn an_op_refused_for_now_on_the_one_at_a_time_path_holds_back_its_memory() {
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (refusing, keeping) = (refuse.clone(), relay.clone());
+        let (base, log) = stub_relay(Box::new(move |m, p, body| {
+            if m == "POST" && p.starts_with("/api/memory/batch?") {
+                let ops = body["ops"].as_array().unwrap();
+                if ops.len() > 1 {
+                    return (413, serde_json::json!({"error": "request body too large"}));
+                }
+                if refusing.load(std::sync::atomic::Ordering::SeqCst) && ops[0]["memory"]["content"] == "port 9000" {
+                    return (200, serde_json::json!({"results": [{"ok": false, "error": FOR_NOW[0]}]}));
+                }
+            }
+            keeping_relay(keeping.clone())(m, p, body)
+        })).await;
+        let s = Store::open_in_memory().unwrap();
+        let (_td, ctx) = test_ctx();
+        let old = valid("mem_old", "port 8765");
+        s.upsert_memory(&old).unwrap();
+        queue_memories(&s, &["alpha"]);
+        let new_id = replace_memory(&s, &old, "port 9000", None, "cli", "m1").unwrap(); // its add, then old's invalidation
+        assert!(invalidate_and_queue(&s, &new_id, T, None).unwrap()); // and the new fact's own invalidation
+        queue_memories(&s, &["omega"]);
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.relay_error, "{:?}", out.notes);
+        assert_eq!(out.pushed, 2, "{:?}", out.notes);
+        let singles: Vec<String> = log.lock().unwrap().iter()
+            .filter(|(m, p, body)| m == "POST" && p.starts_with("/api/memory/batch?") && body["ops"].as_array().unwrap().len() == 1)
+            .map(|(_, _, body)| body["ops"][0]["memory"]["content"].as_str().or(body["ops"][0]["id"].as_str()).unwrap().to_string())
+            .collect();
+        assert_eq!(singles, vec!["alpha", "port 9000", "omega"]);
+        let left: Vec<String> = s.pending().unwrap().into_iter().map(|(_, op)| match op {
+            PendingOp::AddMemory { memory } => format!("add {}", memory.content),
+            PendingOp::InvalidateMemory { id, .. } => format!("invalidate {id}"),
+            other => format!("{other:?}"),
+        }).collect();
+        assert_eq!(left, vec!["add port 9000".to_string(), "invalidate mem_old".into(), format!("invalidate {new_id}")]);
+
+        refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(!out.relay_error && out.pushed == 3, "{:?}", out.notes);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        let r = relay.lock().unwrap();
+        assert_eq!(r.rows[&new_id].invalid_at, Some(T));
     }
 
     #[test]
@@ -2699,7 +2997,7 @@ mod tests {
             self.next_seq
         }
 
-        fn op(&mut self, op: &serde_json::Value) -> serde_json::Value {
+        pub(super) fn op(&mut self, op: &serde_json::Value) -> serde_json::Value {
             self.ops_received += 1;
             match op["op"].as_str().unwrap() {
                 "add" => {

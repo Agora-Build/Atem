@@ -593,19 +593,22 @@ async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
 }
 
 /// What takes a device out of encryption mid-sync: the signed state turns
-/// off, this device's verification is removed (an unpair), or its signed
-/// state is gone (which stopped a sync before too, as an error of its own).
+/// off, this device's verification is removed (an unpair), its Astation
+/// now names another data account (still encrypting), or its signed state
+/// is gone (which stopped a sync before too, as an error of its own).
 #[derive(Debug, Clone, Copy)]
 enum Downgrade {
     Off,
     Unverified,
+    OtherAccount,
     NoSignedState,
 }
 
 impl Downgrade {
-    const ALL: [Downgrade; 3] = [
+    const ALL: [Downgrade; 4] = [
         Downgrade::Off,
         Downgrade::Unverified,
+        Downgrade::OtherAccount,
         Downgrade::NoSignedState,
     ];
 
@@ -615,6 +618,13 @@ impl Downgrade {
             Downgrade::Unverified => crate::memory::trust::TrustStore::default()
                 .save_to(&device.paths.trust)
                 .unwrap(),
+            Downgrade::OtherAccount => {
+                let path = &device.paths.trust;
+                let mut trust: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                trust["astations"][ASTATION_ID]["data_account"] = "acct-other".into();
+                std::fs::write(path, serde_json::to_vec(&trust).unwrap()).unwrap();
+            }
             Downgrade::NoSignedState => {
                 let path = &device.paths.trust;
                 let mut trust: serde_json::Value =
@@ -630,7 +640,9 @@ impl Downgrade {
     /// The note the sync stops with.
     fn note(self) -> &'static str {
         match self {
-            Downgrade::Off | Downgrade::Unverified => "this sync started end-to-end encrypted",
+            Downgrade::Off | Downgrade::Unverified | Downgrade::OtherAccount => {
+                "this sync started end-to-end encrypted"
+            }
             Downgrade::NoSignedState => "waiting for Astation's signed encryption state",
         }
     }
@@ -3700,4 +3712,306 @@ async fn a_migration_names_a_skill_row_that_cannot_open_and_how_to_remove_it() {
         .unwrap();
     client.migrate_encryption().await.unwrap();
     client.verify_encryption_migration().await.unwrap();
+}
+
+// ─────────────── refusals the op itself causes ───────────────
+
+/// The Station's encryption-mode check (`allowed_field`, Astation
+/// `knowledge_routes.rs` at 9eb5320) in front of `relay`, for an account in
+/// `mode` under `kid`: an add or push with a field the mode doesn't allow is
+/// refused per op with the Station's text; every other op goes to `relay`.
+fn mode_checking(
+    relay: Arc<Mutex<KeepingRelay>>,
+    mode: &'static str,
+    kid: Option<&'static str>,
+) -> Box<super::tests::Handler> {
+    let allowed = move |value: &str, hash: bool| {
+        let prefix = if hash { "h1." } else { "e1." };
+        let valid = kid.is_some_and(|kid| value.starts_with(&format!("{prefix}{kid}.")));
+        value.is_empty()
+            || match mode {
+                "off" => !value.starts_with(prefix),
+                "disabling" => valid || !value.starts_with(prefix),
+                _ => valid,
+            }
+    };
+    let refused = |what: &str| serde_json::json!({"ok": false, "error": format!("{what} does not match the account encryption mode")});
+    let keeping = keeping_relay(relay.clone());
+    Box::new(move |m, p, body| match (m, p.split('?').next().unwrap()) {
+        ("POST", "/api/memory/batch") => {
+            let mut r = relay.lock().unwrap();
+            let results: Vec<_> = body["ops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|op| {
+                    let field = |name: &str| op["memory"][name].as_str().unwrap_or_default();
+                    let fits = allowed(field("project"), true)
+                        && allowed(field("content"), false)
+                        && allowed(field("content_hash"), true);
+                    if op["op"] == "add" && !fits {
+                        refused("memory")
+                    } else {
+                        r.op(op)
+                    }
+                })
+                .collect();
+            (200, serde_json::json!({"results": results}))
+        }
+        ("POST", "/api/skills/batch") => {
+            let mut r = relay.lock().unwrap();
+            crate::memory::fake_station_skills::batch(body, |op| {
+                let skill = &op["skill"];
+                let field = |name: &str| skill[name].as_str().unwrap_or_default();
+                let files_fit =
+                    skill["files"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .all(|(path, value)| {
+                            let bytes = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                value.as_str().unwrap(),
+                            )
+                            .unwrap();
+                            allowed(path, false)
+                                && match std::str::from_utf8(&bytes) {
+                                    Ok(text) => allowed(text, false),
+                                    Err(_) => matches!(mode, "off" | "disabling"),
+                                }
+                        });
+                let fits = allowed(field("project"), true)
+                    && allowed(field("content_hash"), true)
+                    && files_fit;
+                if op["op"] == "push" && !fits {
+                    refused("skill")
+                } else {
+                    r.skill_op(op)
+                }
+            })
+        }
+        _ => keeping(m, p, body),
+    })
+}
+
+fn skill_with(name: &str, files: &[(&str, &str)]) -> Skill {
+    let files: BTreeMap<String, Vec<u8>> = files
+        .iter()
+        .map(|(path, text)| (path.to_string(), text.as_bytes().to_vec()))
+        .collect();
+    Skill {
+        content_hash: skill_hash(&files),
+        files,
+        ..super::tests::skill_v1(name, "", "m1")
+    }
+}
+
+/// Refusals the op's own value causes are refused for good, acked with a
+/// note saying why, never kept for the next sync: under a signed `off`, a
+/// fact whose text starts with `e1.`, a skill with a file named `e1.md` or a
+/// file whose text starts with `e1.`; after a key rotation, a fact of a
+/// project this machine can't name, kept as the earlier key's hash. Every
+/// other op lands, and the sync is complete.
+#[tokio::test]
+async fn a_refusal_the_op_itself_causes_is_refused_for_good() {
+    // An account off: plain values that start like sealed ones.
+    let dir = tempfile::tempdir().unwrap();
+    let mut signed_off = device(dir.path(), EncryptionMode::On);
+    signed_off.state(EncryptionMode::Off, None);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, _log) = stub_relay(mode_checking(relay.clone(), "off", None)).await;
+    let s = Store::open_in_memory().unwrap();
+    queue(
+        &s,
+        [
+            valid("mem_e1", "e1.example.com is the staging host"),
+            valid("mem_plain", "staging listens on 8080"),
+        ],
+    );
+    for skill in [
+        skill_with("named", &[("e1.md", "# notes"), ("SKILL.md", "# named")]),
+        skill_with("texted", &[("SKILL.md", "e1.example.com runs it")]),
+        skill_with("plain", &[("SKILL.md", "# plain")]),
+    ] {
+        queue_skill(&s, skill, 0);
+    }
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &signed_off, signed_off.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    let off = "which the relay takes for an encrypted value while the account's encryption is off); not sent again";
+    assert_eq!(
+        out.notes,
+        vec![
+            format!(
+                "relay refused memory mem_e1: memory does not match the account encryption mode (its text starts with `e1.`, {off}"
+            ),
+            format!(
+                "relay refused skill named v1: skill does not match the account encryption mode (a file's name starts with `e1.`, {off}"
+            ),
+            format!(
+                "relay refused skill texted v1: skill does not match the account encryption mode (a file's text starts with `e1.`, {off}"
+            ),
+        ]
+    );
+    assert!(!out.relay_error && out.pushed == 5, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert!(s.get_state(LAST_SYNC_AT).unwrap() > 0);
+    {
+        let r = relay.lock().unwrap();
+        assert!(r.rows.contains_key("mem_plain") && !r.rows.contains_key("mem_e1"));
+        assert_eq!(
+            r.skills
+                .values()
+                .map(|k| k.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plain"]
+        );
+    }
+
+    // After a rotation: a fact under the earlier key's hash of a project
+    // this machine can't name.
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = device(dir.path(), EncryptionMode::On);
+    let stale = unnamed(&device);
+    device.set_key(EncryptionMode::On, "89abcdef", [8; 32]);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, _log) = stub_relay(mode_checking(relay.clone(), "on", Some("89abcdef"))).await;
+    let s = Store::open_in_memory().unwrap();
+    let mut unknown = valid("mem_unknown", "deploys go through the bastion");
+    (unknown.scope, unknown.project) = (Scope::Project, stale);
+    queue(&s, [unknown, fact(1, true), fact(2, false)]);
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, device.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out.notes,
+        vec!["relay refused memory mem_unknown: memory does not match the account encryption mode (its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept; `atem sync` in that project's checkout names it); not sent again".to_string()]
+    );
+    assert!(!out.relay_error && out.pushed == 3, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    assert_eq!(relay.lock().unwrap().rows.len(), 2);
+}
+
+/// The Station rotated the account's key before this device learned it: a
+/// well-formed op sealed under the old key is refused for now and kept (not
+/// the op's fault); once the device has the new key it lands.
+#[tokio::test]
+async fn an_op_sealed_under_a_key_the_station_moved_past_is_kept_and_lands_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = device(dir.path(), EncryptionMode::On);
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let (base, _log) = stub_relay(mode_checking(relay.clone(), "on", Some("89abcdef"))).await;
+    let s = Store::open_in_memory().unwrap();
+    queue(&s, [fact(1, true)]);
+    let queued = s.pending().unwrap();
+    let (_home, ctx) = test_ctx();
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, device.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.relay_error, "{:?}", out.notes);
+    assert_eq!(
+        out.notes,
+        vec!["relay refused memory mem_0001 for now: memory does not match the account encryption mode (the account's encryption mode or key is changing); it stays queued and is sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected.".to_string()]
+    );
+    assert_eq!(s.pending().unwrap(), queued);
+    device.set_key(EncryptionMode::On, "89abcdef", [8; 32]);
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &device, device.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(s.pending_count().unwrap(), 0);
+    let r = relay.lock().unwrap();
+    assert!(r.rows["mem_0001"].content.starts_with("e1.89abcdef."));
+}
+
+/// The state leaves encryption after the last pulled page was opened, before
+/// the resolve step: the resolve step stops too, so a skill of a project this
+/// machine can't name, pulled under the current key, is kept unresolved
+/// (resolving it under `off` would have taken its hash for stale and dropped
+/// it, with the cursor already past it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_resolve_step_stops_after_a_downgrade_and_keeps_unknown_projects() {
+    for to in [Downgrade::Off, Downgrade::Unverified] {
+        let dir = tempfile::tempdir().unwrap();
+        let device = device(dir.path(), EncryptionMode::On);
+        let hash = unnamed(&device);
+        // A full first page: 199 global skills and one of a project this
+        // machine can't name (sealed as PROJECT's, then under the unknown
+        // hash: the project isn't bound in the files' associated data).
+        let mut skills: Vec<Skill> = (0..PULL_LIMIT as usize - 1)
+            .map(|i| skill_with(&format!("filler{i:03}"), &[("SKILL.md", "# filler")]))
+            .collect();
+        skills.push(Skill {
+            scope: Scope::Project,
+            project: PROJECT.into(),
+            ..skill_with("bastion", &[("SKILL.md", "# through the bastion")])
+        });
+        let mut sealed = context(&device).encrypt_skills(skills).unwrap();
+        sealed.last_mut().unwrap().project = hash.clone();
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        for skill in sealed {
+            relay.lock().unwrap().put_skill(skill);
+        }
+        let recorder = Recorder::new(device.agent.clone());
+        let device = Arc::new(Mutex::new(device));
+        let keeping = keeping_relay(relay.clone());
+        let (switch, opened) = (device.clone(), recorder.clone());
+        let (base, _log) = stub_relay(Box::new(move |m, p, body| {
+            if m == "GET" && p.starts_with("/api/skills?") && since(p) == PULL_LIMIT as i64 {
+                // Page 1 was opened under on; the empty page 2 ends the pull.
+                assert!(wait_for(Duration::from_secs(10), || opened
+                    .calls()
+                    .iter()
+                    .any(|c| c.opens && c.ok)));
+                to.apply(&mut switch.lock().unwrap());
+            }
+            keeping(m, p, body)
+        }))
+        .await;
+        let s = Store::open_in_memory().unwrap();
+        let (_home, ctx) = test_ctx();
+        let client = {
+            let device = device.lock().unwrap();
+            client_with(&base, &device, recorder.clone())
+        };
+        let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap();
+        assert!(
+            out.notes.iter().any(|n| n
+                .starts_with("rows of projects this machine doesn't know yet stay unapplied")
+                && n.contains(to.note())),
+            "{to:?}: {:?}",
+            out.notes
+        );
+        assert_eq!(
+            s.get_state(&crate::memory::store::skill_cursor_key(ASTATION_ID))
+                .unwrap(),
+            PULL_LIMIT as i64,
+            "{to:?}"
+        );
+        let kept = s.get_skill(Scope::Project, &hash, "bastion").unwrap();
+        assert!(kept.is_some(), "{to:?}: the unresolved skill was dropped");
+    }
 }

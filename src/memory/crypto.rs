@@ -582,6 +582,12 @@ impl EncryptionContext {
         matches!(self.mode, EncryptionMode::Enabling | EncryptionMode::On)
     }
 
+    /// Whether this device is verified with the Astation (its mode comes
+    /// from a signed account state); an unverified device is `off`.
+    pub(crate) fn verified(&self) -> bool {
+        self.remember_off_projects
+    }
+
     pub fn wire_project(&self, project: &str) -> Result<String> {
         if project.is_empty() { return Ok(project.to_string()); }
         Ok(self.wire_projects(&[project.to_string()])?.remove(0))

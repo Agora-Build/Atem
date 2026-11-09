@@ -739,15 +739,44 @@ atem memory status                  # account, machine, pending ops, last sync, 
    ops the server answered, in one local transaction per request, committed
    before the ops count as pushed (an interrupted one leaves the request's ops
    queued, sent again next time). A per-op refusal is either for now or for
-   good, as the Station's contract says (Astation `knowledge_routes.rs` and
-   `knowledge_store.rs` at 9eb5320; `skill-file-wire.md` at 89a2d50: policy
-   and store refusals are per op, transient failures are a 503):
+   good. The Station's contract doesn't say which: its route header (Astation
+   `knowledge_routes.rs` at 9eb5320) calls every per-op refusal permanent,
+   and `skill-file-wire.md` at 89a2d50 says only that policy and store
+   refusals are per op and transient failures are a 503. Treating the three
+   encryption-mode texts as for now is Atem's own (owner) decision; Atem
+   asked Astation for a stable per-op retry flag (Atem #130).
 
    | Refusal (the op's `error`) | Kind | What Atem does |
    |---|---|---|
-   | `memory does not match the account encryption mode`, `skill does not match the account encryption mode` (the route's check against the account's mode and key as the Station read them for the batch), `content does not match the account encryption mode` (the store's repeat of it in its write transaction) | for now: a mode change, a key rotation or a migration racing the push | queued as it was, with a note; nothing more of that kind (memories, or skills) goes out in that sync, so it is sent once per sync and nothing after it lands first; sealed again and sent at the next sync, under the mode and key Atem has then |
+   | `memory does not match the account encryption mode`, `skill does not match the account encryption mode` (the route's check against the account's mode and key as the Station read them for the batch), `content does not match the account encryption mode` (the store's repeat of it in its write transaction) | for now, unless the op's own value is the cause (below): a mode change, a key rotation or a migration racing the push, or a device behind the account's state | queued as it was, with a note; nothing more of that skill or memory goes out in that sync (`Held`: a later push, delete or purge of the skill; the memory's delete or invalidation, or a replacement's invalidation naming it as the successor), so it is sent once per sync and nothing of it lands first; other skills and memories go on; the sync is incomplete; sealed again and sent at the next sync, under the mode and key Atem has then |
+   | the same texts, when the op's own value is the cause | for good | acked, with a note naming the op and why |
    | `version_conflict` | settled (see "Relay API") | |
    | `invalid memory`, `invalid skill`, `invalid base64`, `invalid skill version`, `reserved token`, `possible credential: …`, `id conflict`, any other text or none | for good | acked, with a note naming the op and the reason; a refused add is removed here and its harvested file recorded `held_back` |
+
+   Atem judges a mode refusal against the op as it went out (the Station
+   allows a field only as its mode does: while it encrypts, an envelope or
+   keyed hash under its current key; while off, a value that doesn't start
+   with `e1.` or, for a hash, `h1.`; while disabling, either):
+   - **Sealed:** for good when its project is a hash under another key than
+     the rest of the op: a project this machine can't name, kept as an
+     earlier key's hash after a rotation, which the current key never
+     accepts (the note says `atem sync` in that project's checkout names
+     it). Otherwise for now: the Station's key or mode moved.
+   - **Plain, from a device that isn't verified:** for now; the note says to
+     run `atem pair verify` (it goes sealed once the device is verified).
+   - **Plain, under a signed `off` or `disabling`:** for good when a value
+     starts like a sealed one, which the Station refuses while off: a fact's
+     text, a skill file's name or text starting with `e1.`, or a project kept
+     as a hash (it can't be named while encryption is off). Otherwise for
+     now (the Station already encrypts).
+
+   **Retry limit.** A refusal for now that repeats at
+   `REFUSED_FOR_NOW_SYNCS` (5) syncs in a row, the first of them at least
+   `REFUSED_FOR_NOW_SECS` (24 hours) ago, is taken as for good: acked, with a
+   note saying so ("Atem stopped retrying it"). The count and the first
+   refusal's time live with the queued op (`pending_ops.refused_for_now`,
+   `refused_since`). Both bounds count: a sync runs after every local change
+   too, so five syncs can come within a minute of an ordinary rotation.
 
    An op refused for now stays queued with what the batch did after it:
    a later delete of that memory, or a later delete of that skill, a purge
@@ -755,7 +784,13 @@ atem memory status                  # account, machine, pending ops, last sync, 
    landed in the same batch withdraws it (acked, never sent: deleted or
    purged content never goes back to the relay). A landed invalidation of
    that memory (the Station had no such row, so it changed nothing) stays
-   queued too, to go again after the add. A failed request (network error, any HTTP error) leaves
+   queued too, to go again after the add. One thing can't be held back: a
+   replacement's invalidation of the old fact, in the same batch as its add
+   refused for now, has already landed, naming as its successor an id the
+   relay doesn't have yet (it gets it at the next sync; if that add then
+   folds into another `canonical_id`, the relay's old fact keeps naming the
+   first id, which Atem can't correct). In a later batch of the same sync it
+   is held back. A failed request (network error, any HTTP error) leaves
    the ops queued and stops that group, keeping queue order:
    - 401: the relay didn't recognize the Astation session (see Identity &
      auth) — reconnect atem to the Astation, then sync again.
@@ -854,7 +889,10 @@ too.
 - **Pull:** the page it would have opened is never applied (its rows are
   never accepted as plain text), and the cursor stays at the last page
   applied.
-- The resolve step ("Projects not known here yet") stops the same way.
+- The resolve step ("Projects not known here yet") stops the same way, so
+  a skill of a project not known here, pulled under the key, is kept
+  unresolved (resolving it under `off` would take its hash for stale and
+  drop it, with the cursor already past it).
 - The note says the sync started end-to-end encrypted and the state changed
   during it, and to check `atem status`, then sync again. The sync is
   incomplete ("last sync" isn't recorded). The next sync starts from the new
@@ -1085,20 +1123,29 @@ lives.
   op whose project hash is named after it was sealed is sealed again under
   its name.
 - **Refusals:** a refusal for now keeps the op queued (a memory add stays
-  live, its harvested file synced), sent once per sync, and the edit lands
-  at its version at the next; a refusal for good is acked with its note;
-  what lands after a refusal for now in the same batch (a delete or purge
-  withdraws it, an invalidation of its memory follows it).
+  live, its harvested file synced), sent once per sync, holds back only its
+  own skill or memory (other skills go on; a later edit of it, its
+  invalidation, a replacement naming it, on the one-op path after a 413
+  too), and the edit lands at its version at the next; an unverified device
+  is told to run `atem pair verify`; a refusal for good is acked with its
+  note; what lands after a refusal for now in the same batch (a delete or
+  purge withdraws it, an invalidation of its memory follows it); refusals
+  the op causes (an off account and `e1.` text, a file named `e1.md`, an
+  earlier key's project hash after a rotation) are refused for good, while
+  a well-formed op under a key the Station moved past is kept and lands
+  later; the retry limit (five syncs and a day).
 - **Version purges:** `skill purge --version` is refused while the skill has
   a queued push or an unsettled or coalesced conflict, and goes once a sync
   settled it; `--all-versions` is never held up; the question names the
   version's author machine and time.
 - **No switch to plain text:** the state goes from on to off, to this
-  device unverified, or to no signed state, between two chunks of one push (the second chunk is
-  never sent, nothing plain reaches the relay) or between two pulled pages
-  (the second page's plain rows are never accepted); after on, a state that
-  isn't encrypting or names another data account is refused, and a sync
-  that starts off is unchanged.
+  device unverified, to another data account, or to no signed state,
+  between two chunks of one push (the second chunk is never sent, nothing
+  plain reaches the relay) or between two pulled pages (the second page's
+  plain rows are never accepted), or after the last page and before the
+  resolve step (a skill of a project not known here is kept, not dropped as
+  stale); after on, a state that isn't encrypting or names another data
+  account is refused, and a sync that starts off is unchanged.
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge

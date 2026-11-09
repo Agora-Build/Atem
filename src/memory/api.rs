@@ -136,17 +136,21 @@ struct VersionPage {
 /// all (compare-and-set; Astation PR #76 at 89a2d50, Atem #130).
 pub const VERSION_CONFLICT: &str = "version_conflict";
 
-/// The per-op refusals the Station's contract makes temporary: an op whose
-/// protected fields don't match the encryption mode or key the Station has
-/// for the account (a mode change, a key rotation or a migration racing the
-/// push). The route checks each op against the state it read for the batch
-/// (`memory …` / `skill does not match the account encryption mode`), and
-/// the store repeats the check inside its write transaction (`content does
-/// not match …`): Astation `relay-server/src/knowledge_routes.rs` and
-/// `knowledge_store.rs` at 9eb5320. Every other per-op refusal is permanent
-/// (`designs/protocol/skill-file-wire.md` at 89a2d50: "Policy and store
-/// refusals remain per operation; transient failures remain HTTP 503"), and
-/// so is any text not listed here.
+/// The per-op refusals Atem treats as temporary (an owner decision, not the
+/// Station's: its route header at 9eb5320 calls every per-op refusal
+/// permanent, and `designs/protocol/skill-file-wire.md` at 89a2d50 says only
+/// "Policy and store refusals remain per operation; transient failures remain
+/// HTTP 503"). Each says an op's protected fields don't match the encryption
+/// mode or key the Station has for the account: the route checks each op
+/// against the state it read for the batch (`memory …` / `skill does not
+/// match the account encryption mode`), and the store repeats the check
+/// inside its write transaction (`content does not match …`); Astation
+/// `relay-server/src/knowledge_routes.rs` and `knowledge_store.rs` at
+/// 9eb5320. That is a race (a mode change, a key rotation, a migration, or a
+/// device behind the account's state) unless the op's own value can never
+/// pass, which `sync::judge_mode_refusals` finds (`ModeRefusal::Own`). Every
+/// other per-op refusal, and any text not listed here, is permanent. Atem
+/// asked Astation for a stable retry flag (Atem #130).
 pub const TEMPORARY_REFUSALS: [&str; 3] = [
     "memory does not match the account encryption mode",
     "skill does not match the account encryption mode",
@@ -175,6 +179,32 @@ pub struct OpResult {
     /// `version_conflict` found (`sync::check_conflicts`).
     #[serde(skip)]
     pub check: ConflictCheck,
+    /// Set by the client, never on the wire: for a refusal in
+    /// `TEMPORARY_REFUSALS`, what the op as it went out makes of it
+    /// (`sync::judge_mode_refusals`).
+    #[serde(skip)]
+    pub mode_refusal: ModeRefusal,
+}
+
+/// What a refusal in `TEMPORARY_REFUSALS` means for the op as it went out
+/// (`sync::judge_mode_refusals`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ModeRefusal {
+    /// Not judged (its batch's wire wasn't at hand): for now.
+    #[default]
+    NotJudged,
+    /// Sealed, or sent plain under a signed off or disabling state: the
+    /// account's mode or key on the Station isn't the one Atem sealed under
+    /// (a mode change, a rotation, a migration racing the push). For now.
+    Changing,
+    /// Sent plain by a device that isn't verified, to an account the Station
+    /// encrypts. For now: it goes sealed once this device is verified.
+    Unverified,
+    /// The op's own value can never pass while the state lasts (a plain
+    /// value that starts like a sealed one while the account is off, or a
+    /// project kept under an earlier key's hash): refused for good, why
+    /// given.
+    Own(String),
 }
 
 /// What checking a push's `version_conflict` found (`sync::check_conflicts`).
@@ -208,9 +238,12 @@ impl OpResult {
         !self.ok && self.error.as_deref() == Some(VERSION_CONFLICT)
     }
 
-    /// A refusal for now (`TEMPORARY_REFUSALS`): the op stays queued.
+    /// A refusal for now (`TEMPORARY_REFUSALS`, unless the op's own value
+    /// causes it: `ModeRefusal::Own`): the op stays queued.
     pub fn is_temporary_refusal(&self) -> bool {
-        !self.ok && self.error.as_deref().is_some_and(|error| TEMPORARY_REFUSALS.contains(&error))
+        !self.ok
+            && self.error.as_deref().is_some_and(|error| TEMPORARY_REFUSALS.contains(&error))
+            && !matches!(self.mode_refusal, ModeRefusal::Own(_))
     }
 }
 
@@ -407,17 +440,29 @@ pub struct SealState {
     mode: EncryptionMode,
     kid: Option<String>,
     data_account: String,
+    verified: bool,
 }
 
 impl SealState {
     fn of(encryption: &EncryptionContext) -> Self {
-        Self { mode: encryption.mode, kid: encryption.kid.clone(), data_account: encryption.data_account.clone() }
+        Self {
+            mode: encryption.mode,
+            kid: encryption.kid.clone(),
+            data_account: encryption.data_account.clone(),
+            verified: encryption.verified(),
+        }
     }
 
     /// Whether ops are sealed under this state (the account encrypts): only
     /// then does sealing an op with a protected field ask the cred agent.
     pub fn encrypts(&self) -> bool {
         matches!(self.mode, EncryptionMode::Enabling | EncryptionMode::On)
+    }
+
+    /// Whether this device is verified with the account's Astation (an
+    /// unverified one is `off` whatever the account's mode).
+    pub fn verified(&self) -> bool {
+        self.verified
     }
 }
 
