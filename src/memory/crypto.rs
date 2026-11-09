@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use crate::memory::account_keys::{CryptOp, CryptOut};
 use crate::memory::cred_agent::CredAgentApi;
-use crate::memory::model::{content_hash, is_unresolved_project, skill_hash, HeldSkill, Memory, PulledSkill, Skill};
+use crate::memory::model::{content_hash, is_unresolved_project, skill_hash, HeldSkill, Memory, PulledSkill, Scope, Skill};
+use crate::memory::project_names::ProjectNames;
 use crate::paths::CredPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -848,57 +849,104 @@ impl EncryptionContext {
 
     fn open_skills(&self, skills: Vec<Skill>, keep_unresolved: bool) -> Result<Vec<Skill>> {
         if self.mode == EncryptionMode::Off { return Ok(skills); }
-        let opened = self.open_skill_rows(&skills, keep_unresolved)?;
+        let opened = self.open_skill_rows(&skills, keep_unresolved, &std::sync::OnceLock::new())
+            .map_err(|e| self.explain_unreadable(&skills, e))?;
         Ok(skills.into_iter().zip(opened).map(|(skill, opened)| opened.apply(skill)).collect())
+    }
+
+    /// `error` from opening `skills` outside a pull (the migration, its
+    /// read-back, a restored version), made actionable. A row whose files
+    /// don't open is named, with the way to remove it (the migration can't
+    /// finish over it; its completion rules are unchanged). A key this
+    /// device doesn't hold says how to get it. Anything else is as it was.
+    fn explain_unreadable(&self, skills: &[Skill], error: anyhow::Error) -> anyhow::Error {
+        if content_failure(&error).is_none() {
+            return with_key_guidance(error);
+        }
+        let Ok(opened) = self.open_or_hold(skills, &std::sync::OnceLock::new()) else { return error };
+        let Some((skill, reason)) = skills.iter().zip(&opened).find_map(|(skill, opened)| opened.as_ref().err().map(|reason| (skill, *reason))) else {
+            return error;
+        };
+        let (flag, where_) = if skill.scope == Scope::Project { (" --scope project", " in that project's checkout") } else { ("", "") };
+        anyhow!(
+            "skill {} v{} ({}) can't be opened on this device ({reason}), so this can't finish. Remove that version with `atem skill purge {} --version {}{flag}`{where_}, then try again.",
+            skill.name, skill.version, skill.scope.as_str(), skill.name, skill.version
+        )
     }
 
     /// A pulled page's skill rows opened (`decrypt_pulled_skills`), with any
     /// row whose files don't open here held instead (`PulledSkill::Held`):
-    /// they fail to authenticate, name a key this device doesn't hold, or
-    /// are malformed inside a well-formed row (`is_content_failure`). The
-    /// page is one `Crypt` request; only when it fails that way is each row
-    /// opened on its own, to find the ones to hold. Any other failure (a
-    /// locked agent, a missing key, plain text while on) fails the page.
-    pub fn open_pulled_skills(&self, skills: Vec<Skill>) -> Result<Vec<PulledSkill>> {
+    /// they fail to authenticate or are malformed inside a well-formed row
+    /// (`content_failure`). The page is one `Crypt` request; only when it
+    /// fails that way is it bisected (`open_or_hold`) to find the rows to
+    /// hold. Any other failure fails the page: a locked agent, a missing key,
+    /// plain text while on, and a key id this device doesn't hold (a device
+    /// lagging a rotation stops, with the way to get the key, rather than
+    /// skip rows it could read later). `names` is project_names.json, read
+    /// once for the pull.
+    pub fn open_pulled_skills(&self, skills: Vec<Skill>, names: &std::sync::OnceLock<ProjectNames>) -> Result<Vec<PulledSkill>> {
         if self.mode == EncryptionMode::Off { return Ok(skills.into_iter().map(PulledSkill::Row).collect()); }
-        match self.open_skill_rows(&skills, true) {
-            Ok(opened) => Ok(skills.into_iter().zip(opened).map(|(skill, opened)| PulledSkill::Row(opened.apply(skill))).collect()),
-            Err(e) if is_content_failure(&e) => skills.into_iter()
-                .map(|skill| match self.open_skill_rows(std::slice::from_ref(&skill), true) {
-                    Ok(mut opened) => Ok(PulledSkill::Row(opened.remove(0).apply(skill))),
-                    Err(e) if is_content_failure(&e) => {
-                        let project = self.pulled_project(skill.project)?;
-                        Ok(PulledSkill::Held(HeldSkill {
-                            scope: skill.scope, project, name: skill.name, version: skill.version, seq: skill.seq,
-                            reason: content_failure(&e).unwrap_or("encrypted field doesn't open").to_string(),
-                        }))
-                    }
-                    Err(e) => Err(e),
-                })
-                .collect(),
-            Err(e) => Err(e),
+        let opened = self.open_or_hold(&skills, names).map_err(with_key_guidance)?;
+        skills.into_iter().zip(opened)
+            .map(|(skill, opened)| Ok(match opened {
+                Ok(opened) => PulledSkill::Row(opened.apply(skill)),
+                Err(reason) => {
+                    let project = self.pulled_project(skill.project, names)?;
+                    PulledSkill::Held(HeldSkill {
+                        scope: skill.scope, project, name: skill.name, version: skill.version, seq: skill.seq,
+                        reason: reason.to_string(),
+                    })
+                }
+            }))
+            .collect()
+    }
+
+    /// `skills` opened, or for each row whose files don't open here the
+    /// reason (`content_failure`). One `Crypt` request; a request that fails
+    /// because of a row's content is split in two and each half tried
+    /// again, so one bad row among n costs about 2·log₂(n) requests more,
+    /// and only after a failure. Any other failure stops it.
+    fn open_or_hold(&self, skills: &[Skill], names: &std::sync::OnceLock<ProjectNames>) -> Result<Vec<std::result::Result<OpenedSkill, &'static str>>> {
+        match self.open_skill_rows(skills, true, names) {
+            Ok(opened) => Ok(opened.into_iter().map(Ok).collect()),
+            Err(e) => match content_failure(&e) {
+                Some(reason) if skills.len() == 1 => Ok(vec![Err(reason)]),
+                Some(_) => {
+                    let (first, second) = skills.split_at(skills.len() / 2);
+                    let mut opened = self.open_or_hold(first, names)?;
+                    opened.extend(self.open_or_hold(second, names)?);
+                    Ok(opened)
+                }
+                None => Err(e),
+            },
         }
     }
 
     /// The project of a held row as its readable versions would be stored:
     /// its name if this Atem has one, else the hash (see `project_name`).
-    fn pulled_project(&self, project: String) -> Result<String> {
+    fn pulled_project(&self, project: String, names: &std::sync::OnceLock<ProjectNames>) -> Result<String> {
         if !project.starts_with("h1.") { return Ok(project); }
+        self.project_name(Some(self.cached_names(names)?), project, true)
+    }
+
+    /// project_names.json from `cache`, read into it the first time.
+    fn cached_names<'a>(&self, cache: &'a std::sync::OnceLock<ProjectNames>) -> Result<&'a ProjectNames> {
+        if let Some(names) = cache.get() { return Ok(names); }
         let names = self.names()?;
-        self.project_name(Some(&names), project, true)
+        Ok(cache.get_or_init(|| names))
     }
 
     /// What opening `skills` changes in each row (its project named, its
     /// files opened, its content hash made plain), from references, so a
     /// page that fails is still whole for `open_pulled_skills`.
-    fn open_skill_rows(&self, skills: &[Skill], keep_unresolved: bool) -> Result<Vec<OpenedSkill>> {
+    fn open_skill_rows(&self, skills: &[Skill], keep_unresolved: bool, names: &std::sync::OnceLock<ProjectNames>) -> Result<Vec<OpenedSkill>> {
         for skill in skills {
             self.require_sealed(&skill.project, "h1.", "skill project")?;
             for path in skill.files.keys() {
                 self.require_sealed(path, "e1.", "skill file path")?;
             }
         }
-        let names = if skills.iter().any(|skill| skill.project.starts_with("h1.")) { Some(self.names()?) } else { None };
+        let names = if skills.iter().any(|skill| skill.project.starts_with("h1.")) { Some(self.cached_names(names)?) } else { None };
         let sealed = |skill: &Skill| skill.files.keys().any(|path| path.starts_with("e1."));
         let mut ops = Vec::new();
         for skill in skills.iter().filter(|skill| sealed(skill)) {
@@ -913,7 +961,7 @@ impl EncryptionContext {
         skills.iter()
             .map(|skill| {
                 let project = if skill.project.starts_with("h1.") {
-                    Some(self.project_name(names.as_ref(), skill.project.clone(), keep_unresolved)?)
+                    Some(self.project_name(names, skill.project.clone(), keep_unresolved)?)
                 } else {
                     None
                 };
@@ -1031,19 +1079,31 @@ impl OpenedSkill {
 const SKILL_CIPHERTEXT_NOT_UTF8: &str = "skill ciphertext is not UTF-8";
 const SKILL_PATH_NOT_UTF8: &str = "skill path is not UTF-8";
 
-/// The errors that say a field's content doesn't open here (the cred
-/// agent's `account_keys::FIELD_FAILURES`, carried as text, and the two
-/// this side finds), as opposed to the agent's or the account's state.
+/// The errors that say a field's content doesn't open here: it fails to
+/// authenticate, or is malformed inside a well-formed row (the cred agent's
+/// `account_keys::FIELD_CONTENT_FAILURES`, carried as text, and the two
+/// this side finds). The agent gives no error kind, only text, so these are
+/// matched against the shared constants, and anything else (another
+/// build's wording, a locked agent, a key this device doesn't hold) is not
+/// a content failure: the caller stops.
 fn content_failure(error: &anyhow::Error) -> Option<&'static str> {
     let text = format!("{error:#}");
-    crate::memory::account_keys::FIELD_FAILURES.iter()
+    crate::memory::account_keys::FIELD_CONTENT_FAILURES.iter()
         .chain([SKILL_CIPHERTEXT_NOT_UTF8, SKILL_PATH_NOT_UTF8].iter())
         .find(|failure| text.contains(**failure))
         .copied()
 }
 
-fn is_content_failure(error: &anyhow::Error) -> bool {
-    content_failure(error).is_some()
+/// A field under a key id this device doesn't hold (a device lagging a key
+/// rotation, `FIELD_UNAVAILABLE_KID`): the way to get the key.
+pub(crate) const KEY_NOT_HELD: &str = "a skill is sealed under a key this device doesn't hold yet (a key rotation it hasn't received); run `atem cred unlock` to receive the current key from Astation, then sync again";
+
+fn with_key_guidance(error: anyhow::Error) -> anyhow::Error {
+    if format!("{error:#}").contains(crate::memory::account_keys::FIELD_UNAVAILABLE_KID) {
+        error.context(KEY_NOT_HELD)
+    } else {
+        error
+    }
 }
 
 fn skill_record(skill: &Skill) -> String {

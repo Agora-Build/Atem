@@ -774,6 +774,16 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// The skills (scope, project, name) with a push still queued.
+    pub fn queued_skill_pushes(&self) -> Result<std::collections::HashSet<(Scope, String, String)>> {
+        Ok(self.pending()?.into_iter()
+            .filter_map(|(_, op)| match op {
+                PendingOp::PushSkill { skill, .. } => Some((skill.scope, skill.project, skill.name)),
+                _ => None,
+            })
+            .collect())
+    }
+
     // ── held skill versions (`model::HeldSkill`) ────────────────────────
     /// Records a pulled version that doesn't open here. Pulled again (a page
     /// fetched twice), it stays reported once.

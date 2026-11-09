@@ -1076,15 +1076,24 @@ doesn't cover it; it is covered by encryption becoming the only mode.
   - **Atem fetches its attempted version once.** The same content hash and
     metadata mean its own earlier write: applied, but the answer was lost or
     a crash came before the local commit. That push is acked.
-  - **A concurrent edit** is re-based onto `N` and sealed again under the
-    next version at the next send. Atem never re-uses an envelope under
-    another version and never falls back to plain text.
+  - **A concurrent edit**: the skill's queued pushes are coalesced into its
+    newest edit at `N + 1`. Nothing more of that skill goes out in that
+    sync. It is sealed again under the new version at the next one. Atem
+    never re-uses an envelope under another version and never falls back to
+    plain text.
+  - **Unpushed edits win locally.** While a push of a skill is queued, a
+    pulled row never replaces the local copy; the push then settles through
+    the conflict (the last writer wins, both versions kept).
   - **A Station that renumbered** (the Station before Astation PR #76:
     `max + 1`) produced exactly the unreadable rows this rule prevents.
-  - **Held rows.** A pulled skill row whose files don't open is held: never
-    applied, reported, and the pull goes on (designs/atem-memory.md "Skill
-    versions that don't open here"). A fact that doesn't open still fails
-    its page.
+  - **Held rows.** A pulled skill row whose files fail to authenticate or
+    are malformed is held: never applied, reported, and the pull goes on
+    (designs/atem-memory.md "Skill versions that don't open here").
+    - A row under a key id this device doesn't hold stops the pull instead,
+      with the way to get the key.
+    - A fact that doesn't open still fails its page.
+    - A migration or read-back that meets such a row names it and the
+      command that removes it (`atem skill purge <name> --version <n>`).
 - **Skill files on the wire (F8; Atem #130).** The contract is Astation's
   `designs/protocol/skill-file-wire.md` in Astation PR #76, pinned at
   89a2d50; the vectors are in `designs/protocol/fixtures/skills-wire/`. It
@@ -1514,7 +1523,7 @@ checks).
 | Area | Budget | Today | Status |
 |---|---|---|---|
 | Agent field ops | seal or open of a field of at most 1 KiB in at most 10 µs in the agent; at least 200 MiB/s for large fields | 2.2 to 9 µs; 250 to 300 MiB/s (keyed hash 160 MiB/s) (measured on `main`; the fixes don't change the cipher) | met |
-| Agent round trips | **Pull and read-back:** at most 1 `Crypt` request per relay page, overlapped with the next GET (owner decision 2026-11-08, "one per page", Task 4 measurements). **Push and migration:** at most 1 `Crypt` request per 1,024 ops / 2 MiB, plus one for the first chunk so its POST starts at once (owner decision 2026-11-08, "allow +1 to start", Task 4 measurements), and a small overhead above that, understood and bounded (owner decision 2026-11-08): exactly the planner's bound below the table, ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉ for a push of facts and ⌈ops / 1,024⌉ + S·G − 1 in general. **Status checks:** one per connection (the build check), and one before each POST of ops sealed by an earlier `Crypt` request, so a lock stops the push or migration within one POST (owner decision 2026-11-08, "allow lock checks", an exception to "no status probe after the first"; Task 4 measurements); they are not `Crypt` requests. One connection per process | `Crypt` requests per 1,000 / 5,000 facts: push 4 / 14, pull 5 / 25 (one per page), migration rewrite 6 / 16, read-back 9 / 29. A 1,000 / 5,000-fact push and pull is 29 / 139 socket round trips on one connection: the build check, the `Crypt` requests and about one status per POST of ops sealed ahead (Task 4) | met (the push within the planner's bound; it is "1 per 1,024 plus one" exactly up to about 4,500 facts) |
+| Agent round trips | **Pull and read-back:** at most 1 `Crypt` request per relay page, overlapped with the next GET (owner decision 2026-11-08, "one per page", Task 4 measurements). Exception, on the failure path only: a skill page whose request fails because of a row's content is bisected to find the rows to hold, about 2·log₂(n) requests more per such row (about 16 for a page of 200), and only after that failure (designs/atem-memory.md "Skill versions that don't open here"). **Push and migration:** at most 1 `Crypt` request per 1,024 ops / 2 MiB, plus one for the first chunk so its POST starts at once (owner decision 2026-11-08, "allow +1 to start", Task 4 measurements), and a small overhead above that, understood and bounded (owner decision 2026-11-08): exactly the planner's bound below the table, ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉ for a push of facts and ⌈ops / 1,024⌉ + S·G − 1 in general. **Status checks:** one per connection (the build check), and one before each POST of ops sealed by an earlier `Crypt` request, so a lock stops the push or migration within one POST (owner decision 2026-11-08, "allow lock checks", an exception to "no status probe after the first"; Task 4 measurements); they are not `Crypt` requests. One connection per process | `Crypt` requests per 1,000 / 5,000 facts: push 4 / 14, pull 5 / 25 (one per page), migration rewrite 6 / 16, read-back 9 / 29. A 1,000 / 5,000-fact push and pull is 29 / 139 socket round trips on one connection: the build check, the `Crypt` requests and about one status per POST of ops sealed ahead (Task 4) | met (the push within the planner's bound; it is "1 per 1,024 plus one" exactly up to about 4,500 facts) |
 | One request | at most 100 µs p50 for a batch-1 request; at most 4 µs per 100 B op over the socket | 15 to 17 µs p50 (100 B seal, open or keyed hash); 2.5 to 3.3 µs per op (Task 3) | met |
 | Large fields | at most 8 ms per MiB through the socket (seal or open) | 2.3 ms per MiB (Task 3) | met |
 | Sync | encryption adds at most 30 ms per 1,000 facts pushed, pulled and applied (at most 10 ms per 1,000 pulled) on loopback, and at most 5% of the wall time against the real relay | Loopback (in-memory store): push and pull +22 ms per 1,000 facts (+86 ms at 5,000), pull +2.9 ms per 1,000 (+35.5 ms at 5,000) (final run, `perf_2b`). Against a relay that answers after 20 ms: push and pull +0.8% (1,000 facts) and +0.6% (5,000), pull +3.2% and +2.8%; after 5 ms: +2.7%, +3.8%, +2.7% and +4.1% (final runs, `perf_2c`: medians of 45 quiet-host pairs in three runs of 15; one run gave +6.2% for the 5,000-fact pull at 20 ms, the other two +1.5% and +0.3%) | met on loopback, and against the relay with latency over the 45 pairs; a 5,000-fact pull is near the line in a single run (see "Where a sync's added time goes"); the real relay is not measured |
@@ -1558,12 +1567,11 @@ the 1,024-op limit splits a request):
   holding u such facts can take up to ⌈u / 1,024⌉ requests more than the
   second bound. The first and the last bound hold as stated.
 - **Re-seals on a skill version conflict** (see "Skill versions" under "What
-  gets encrypted") come on top of these bounds. A push of the same skill that
-  a later request in this sync re-bases no longer matches what was sealed
-  ahead, so it is sealed again alone: two requests for its paths and hash,
-  then its files. Nothing else of its group is sealed again. A conflicted
-  push itself is sealed again at the next sync, as an op queued then. With
-  no conflict, nothing changes.
+  gets encrypted"). A concurrent edit's skill is coalesced into one queued
+  push and held back for the rest of the sync, so nothing is sealed again in
+  that sync. Its ops sealed ahead are dropped unsent. The coalesced push is
+  sealed at the next sync as an op queued then. With no conflict, nothing
+  changes.
 
 For uniform facts this is exactly "1 per 1,024 plus one" up to 4,562 facts of
 two ops and 5,791 of three, and then one request more now and then, as the

@@ -154,12 +154,33 @@ pub struct OpResult {
     /// With a `version_conflict`: the skill's latest version on the Station.
     #[serde(default)]
     pub current_version: Option<i64>,
-    /// Set by the client, never on the wire: the conflict was checked and
-    /// the version holds another write (a concurrent edit), not this
-    /// Atem's own earlier one (`sync::check_conflicts`).
+    /// Set by the client, never on the wire: what checking a
+    /// `version_conflict` found (`sync::check_conflicts`).
     #[serde(skip)]
-    pub concurrent: bool,
+    pub check: ConflictCheck,
 }
+
+/// What checking a push's `version_conflict` found (`sync::check_conflicts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConflictCheck {
+    /// No check ran (not a push, or not a conflict).
+    #[default]
+    NotChecked,
+    /// Another write holds the attempted version, or it was purged, never
+    /// stored, or is above the Station's latest: a concurrent edit.
+    Concurrent,
+    /// Reading the attempted version failed.
+    ReadFailed,
+    /// The answer names no `current_version`.
+    NoCurrentVersion,
+    /// The answer's `current_version` is below the push's base or out of
+    /// range: a protocol error.
+    BadCurrentVersion,
+}
+
+/// The largest skill version the Station accepts (JavaScript's safe
+/// integers); a `current_version` at or above it can't be built on.
+pub const MAX_SKILL_VERSION: i64 = 9_007_199_254_740_991;
 
 impl OpResult {
     pub fn is_version_conflict(&self) -> bool {
@@ -494,17 +515,17 @@ impl KnowledgeClient {
 
     /// A pulled page's skill rows opened (`open_pulled_skills`): as
     /// `open_memories`, and a row whose files don't open here is held, not
-    /// the page.
-    pub async fn open_skills(&self, rows: Vec<Skill>) -> Result<Vec<PulledSkill>, ApiError> {
+    /// the page. `names`: project_names.json, read once for the pull.
+    pub async fn open_skills(&self, rows: Vec<Skill>, names: std::sync::Arc<std::sync::OnceLock<crate::memory::project_names::ProjectNames>>) -> Result<Vec<PulledSkill>, ApiError> {
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.open_pulled_skills(rows)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.open_pulled_skills(rows, &names)).await.map_err(ApiError::from)
     }
 
     /// A page's rows opened; one that would be held is an error here.
     #[cfg(test)]
     pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let rows = self.fetch_skills(since).await?;
-        self.open_skills(rows).await?.into_iter()
+        self.open_skills(rows, Default::default()).await?.into_iter()
             .map(|row| match row {
                 PulledSkill::Row(skill) => Ok(skill),
                 PulledSkill::Held(held) => Err(ApiError::Encryption(format!("{} v{} held: {}", held.name, held.version, held.reason))),

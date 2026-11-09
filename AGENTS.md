@@ -164,7 +164,7 @@ src/
 │   ├── adapters.rs      #   Claude/Codex targets + apply report
 │   ├── api.rs           #   relay /api/memory, /api/skills client
 │   ├── skill_wire.rs    #   skill file transport (F8, #130; Astation PR #76 at 89a2d50): a sealed file as its e1 text (`e1-text`, "" an empty file), plain as `base64`; strict reader/writer
-│   ├── sync.rs          #   harvest → push → pull → apply; a skill push's `version_conflict` checked (own write acked, concurrent edit re-based), a skill row that doesn't open held
+│   ├── sync.rs          #   harvest → push → pull → apply; a skill push's `version_conflict` checked (own write acked, a concurrent edit coalesced into one push and held back for the sync), unpushed skill edits win locally, a skill row that doesn't open held (a key not held stops)
 │   ├── sync_pipeline_tests.rs # (test-only) ops sealed ahead in full Crypt groups, page prefetch: requests per phase, rewrites after sealing, failures, crashes, commit order
 │   ├── encoding.rs      #   length-prefixed fields for signed/bound inputs, base32
 │   ├── statements.rs    #   Astation-signed statements (P-256 verify)

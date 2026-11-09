@@ -156,25 +156,36 @@ device that can't name one can't migrate the account.
 A sealed skill file is bound to `scope:name:version` (designs/e2e-encryption.md
 "What gets encrypted"), so a row stored under a version its files weren't
 sealed under can't be opened by any device. Since the Station keeps each
-push's version ("Relay API" below), that happens only with a Station that
-still renumbers, a corrupted row, or one under a key this device doesn't
-hold. Owner decision on [Atem #130](https://github.com/Agora-Build/Atem/issues/130):
-hold it and keep pulling.
+push's version ("Relay API" below), that happens only with rows a Station
+renumbered before its compare-and-set, or a corrupted row. Owner decision on
+[Atem #130](https://github.com/Agora-Build/Atem/issues/130): hold it and
+keep pulling.
 
 - **Which rows.** A pulled skill row is held when its files fail to
-  authenticate, name a key id this device doesn't hold, or are malformed
-  inside a well-formed row. It is never applied, installed or injected.
-  - A row that breaks skill wire v2's rules (encoding, envelope shape) still
-    refuses the page.
-  - A locked cred agent, a missing key, or plain text while encryption is on
-    still stops the pull, as before.
+  authenticate, or are malformed inside a well-formed row. It is never
+  applied, installed or injected.
+  - A row that breaks the skill file transport's rules (encoding, envelope
+    shape) still refuses the page.
+  - The pull still stops, as before, on a locked cred agent, a missing key,
+    or plain text while encryption is on.
+  - It also stops on a row under a key id this device doesn't hold: a
+    device that hasn't received a key rotation. The note says to run
+    `atem cred unlock` to receive the key. The row stays to be pulled again,
+    rather than being skipped.
+  - The cred agent gives no error kind, only text. The content failures are
+    matched against the constants the agent itself uses
+    (`account_keys::FIELD_CONTENT_FAILURES`). Anything else stops the pull:
+    it fails closed.
   - A fact that doesn't open keeps today's behaviour: it fails its page.
 - **The pull goes on.** The held row commits with its page (`held_skills`
   in `knowledge.db`: scope, project, name, version, seq and the reason; no
   files and no plain text), and the cursor moves past it.
   - A page opens in one `Crypt` request as before. Only when that request
-    fails because of a row's content are the page's rows opened one by one,
-    to find the rows to hold.
+    fails because of a row's content is the page bisected, each half opened
+    again, to find the rows to hold. One such row among n costs about
+    2·log₂(n) requests more (about 16 for a page of 200), and only after a
+    failure.
+  - `project_names.json` is read once for the whole pull.
   - A held version that a version this machine already read replaces isn't
     recorded at all.
 - **Reported.** The sync prints one note per newly held version ("… can't
@@ -435,19 +446,42 @@ Rules:
   - **A concurrent edit** is anything else: another write at that version,
     a purged one (410), one that never existed (404), or an attempted
     version above `N` (never stored, so no GET).
-    - The push stays queued. Every queued push of that skill and the local
-      copy are re-based past `N`, in queue order (versions `N+1`, `N+2`, …,
-      each on the one before it).
+    - **Coalesced.** The skill's queued pushes become one: the newest edit,
+      which as a full snapshot of the local skill holds every earlier local
+      edit. It goes at `N+1` on base `N`, and the local copy follows it.
+      Unpushed intermediate edits never become versions; the other
+      machine's version stays in history.
+    - **Held back.** Nothing more of that skill goes out in this sync: the
+      Station judges a batch's ops in order, and only a later batch could
+      see them out of order. So the Station never has a gap that a third
+      machine's push could fill, and an older edit never becomes the latest
+      over a newer one.
+    - **Sealed again** at the next sync, under the new version. An envelope
+      is never re-used under another version.
     - The note is the one for a concurrent edit: "another machine pushed an
       edit at the same time; both versions are kept and vN is now the
       latest".
-    - It is sealed again under its new version when sent; an envelope is
-      never re-used under another version.
   - **Superseded in the same batch.** If a later push of the same skill in
     that batch landed, the conflicted older push is acked and never pushed
-    again.
-  - **Unchecked.** A conflict whose version can't be read stays queued as
-    it was, and that sync's push stops there.
+    again. The later push is a full snapshot built on it.
+  - **Unsettled.** The conflict stays queued as it was, and that sync's push
+    stops there, with a note saying why, if:
+    - the attempted version can't be read;
+    - the answer names no `current_version`;
+    - it names one below the push's base, or at or above the safe-integer
+      bound (a protocol error).
+
+    A skill with any such conflict is never coalesced.
+  - **Unpushed edits win locally.** While a push of a skill is queued, a
+    pulled row of it at or above the local version never replaces the local
+    copy or its directory.
+    - The remote version stays in the relay's history, with a note:
+      "another machine pushed an edit (vN) while this machine's edit waits
+      to sync …".
+    - The queued push then settles through the conflict path: the last
+      writer wins, and both versions are kept.
+    - The push's own applied write coming back (the same content) is
+      skipped quietly.
   - **Unchanged.** Deletes carry no version (a tombstone has no envelopes),
     and the Station appends them as `max + 1`. Purges name existing versions.
   - **Before the compare-and-set** (the Station before Astation PR #76),
@@ -688,14 +722,14 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - 503: the relay is temporarily unavailable (e.g. its database).
    - 413 on a chunk: its ops are retried one at a time. A single op that is
      still too large stays queued with a note and is never acked.
-   - A skill push answered `version_conflict` (see "Relay API"): one GET of
-     that version before the request's results are applied.
+   - A skill push answered `version_conflict` (see "Relay API"): at most one
+     GET of that version before the request's results are applied.
      - Atem's own earlier write is acked.
-     - A concurrent edit stays queued, re-based with every later queued push
-       of that skill. A push that a later request in this sync re-bases is
-       sealed again: these are the only extra `Crypt` requests a conflict
-       costs.
-     - A conflict that couldn't be checked stays queued and stops the push.
+     - A concurrent edit's skill is coalesced into one queued push of its
+       newest edit, past the Station's version. Nothing more of that skill
+       goes out in this sync, and the push is sealed again at the next one:
+       that is the only extra `Crypt` work a conflict costs.
+     - A conflict that couldn't be settled stays queued and stops the push.
 
    While the account is encrypted, the ops are sealed ahead of their requests,
    in groups of whole requests (at most four cred-agent `Crypt` requests'
@@ -749,7 +783,8 @@ atem memory status                  # account, machine, pending ops, last sync, 
    machine can't name is kept unresolved (see "Projects not known
    here yet"); it never stops the pull, and neither does a skill version
    that doesn't open here, which is held (see "Skill versions that don't
-   open here").
+   open here"). While a push of a skill is queued, its pulled rows never
+   replace the local copy (see "Relay API").
 4. **Resolve** unresolved rows whose project name is now known (recorded in
    `project_names.json`, or learned now: the checkout the sync runs in, and
    after a rotation the projects this machine already knows), and drop

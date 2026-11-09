@@ -44,8 +44,11 @@ pub(crate) enum Versioning {
     /// `version_conflict` when that version exists: nothing stored.
     #[default]
     Kept,
-    /// As the Station before Astation PR #76: `max(version) + 1`, whatever the push
-    /// carries, with `superseded_concurrent` when its base is behind.
+    /// As the Station deployed before Astation PR #76 (`knowledge_store.rs`
+    /// on Astation main at d678e9c, both stores): `max(version) + 1` over
+    /// every version, tombstones included, whatever the push carries, with
+    /// `superseded_concurrent` when its base is below the latest live
+    /// (non-deleted) version.
     Renumbered,
 }
 

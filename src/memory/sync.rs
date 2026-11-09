@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
-use crate::memory::api::{seal_cost, ApiError, KnowledgeClient, OpResult, SealState, StoredVersion, PULL_LIMIT};
+use crate::memory::api::{seal_cost, ApiError, ConflictCheck, KnowledgeClient, OpResult, SealState, StoredVersion, MAX_SKILL_VERSION, PULL_LIMIT};
 use crate::memory::crypto::{total, Planner};
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
@@ -292,51 +292,97 @@ fn concurrent_note(skill: &Skill, version: i64) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settled {
     /// A later push of the same skill in this batch landed: this one, older,
-    /// is acked and never pushed again.
+    /// is acked and never pushed again (the later one is a full snapshot
+    /// built on it).
     Superseded,
-    /// Another machine's edit holds the version: re-based (`rebase_pushes`).
+    /// Another machine's edit holds the version: the skill's queued pushes
+    /// are coalesced past it (`coalesce_pushes`).
     Rebased,
-    /// It couldn't be checked: queued as it was.
+    /// It couldn't be settled (`ConflictCheck`): queued as it was.
     Unchecked,
 }
+
+type SkillKey = (Scope, String, String);
 
 fn skill_key(skill: &Skill) -> (Scope, &str, &str) {
     (skill.scope, skill.project.as_str(), skill.name.as_str())
 }
 
-/// The batch's version conflicts on pushes, by index.
+fn owned_key(skill: &Skill) -> SkillKey {
+    (skill.scope, skill.project.clone(), skill.name.clone())
+}
+
+/// The skill an op writes (its push, delete or purge), if any.
+fn op_skill_key(op: &PendingOp) -> Option<SkillKey> {
+    match op {
+        PendingOp::PushSkill { skill, .. } => Some(owned_key(skill)),
+        PendingOp::DeleteSkill { scope, project, name } | PendingOp::PurgeSkill { scope, project, name, .. } => {
+            Some((*scope, project.clone(), name.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The batch's version conflicts on pushes, by index. Per skill: a
+/// conflicted push a later push of the skill in this batch superseded is
+/// `Superseded`; the others are `Rebased` only when every one of them was
+/// found a concurrent edit, else all `Unchecked` (never a re-base of a push
+/// whose check failed: it may be this Atem's own applied write).
 fn settle_conflicts(sent: &[(i64, PendingOp)], results: &[OpResult]) -> BTreeMap<usize, Settled> {
     let pushed = |i: usize| match &sent[i].1 {
         PendingOp::PushSkill { skill, .. } => Some(skill),
         _ => None,
     };
-    (0..sent.len())
-        .filter_map(|i| {
-            let skill = pushed(i).filter(|_| results[i].is_version_conflict())?;
-            let landed_after = (i + 1..sent.len())
-                .any(|j| results[j].ok && pushed(j).is_some_and(|later| skill_key(later) == skill_key(skill)));
-            let settled = if landed_after {
+    let conflicted: Vec<usize> = (0..sent.len())
+        .filter(|&i| pushed(i).is_some() && results[i].is_version_conflict())
+        .collect();
+    let superseded = |i: usize| {
+        let skill = pushed(i).unwrap();
+        (i + 1..sent.len()).any(|j| results[j].ok && pushed(j).is_some_and(|later| skill_key(later) == skill_key(skill)))
+    };
+    let all_concurrent = |i: usize| {
+        let skill = pushed(i).unwrap();
+        conflicted.iter()
+            .filter(|&&j| !superseded(j) && pushed(j).is_some_and(|other| skill_key(other) == skill_key(skill)))
+            .all(|&j| results[j].check == ConflictCheck::Concurrent)
+    };
+    conflicted.iter()
+        .map(|&i| {
+            let settled = if superseded(i) {
                 Settled::Superseded
-            } else if results[i].concurrent && results[i].current_version.is_some() {
+            } else if all_concurrent(i) {
                 Settled::Rebased
             } else {
                 Settled::Unchecked
             };
-            Some((i, settled))
+            (i, settled)
         })
         .collect()
 }
 
+/// The skills a batch's results coalesced past a concurrent edit: no later
+/// op of theirs goes out in this sync (`push_group`).
+fn rebased_skills(sent: &[(i64, PendingOp)], posted: &std::result::Result<Vec<OpResult>, ApiError>) -> Vec<SkillKey> {
+    let Ok(results) = posted else { return Vec::new() };
+    if results.len() != sent.len() {
+        return Vec::new();
+    }
+    settle_conflicts(sent, results).into_iter()
+        .filter(|(_, settled)| *settled == Settled::Rebased)
+        .filter_map(|(i, _)| op_skill_key(&sent[i].1))
+        .collect()
+}
+
 /// After a batch's acks, per skill with conflicts: a concurrent edit
-/// re-bases its still-queued pushes past the Station's latest version, with
-/// the note the concurrent-edit handling gives; an older push our own later
-/// push superseded gets that note too; an unchecked conflict says so.
+/// coalesces its queued pushes past the Station's latest version, with the
+/// note the concurrent-edit handling gives; an older push our own later
+/// push superseded gets that note too; an unsettled conflict says why.
 fn settle_skills(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult], conflicts: &BTreeMap<usize, Settled>) -> Result<Vec<String>> {
     let mut notes = Vec::new();
-    let mut done: Vec<(Scope, String, String)> = Vec::new();
+    let mut done: Vec<SkillKey> = Vec::new();
     for (&i, &settled) in conflicts {
-        let PendingOp::PushSkill { skill, .. } = &sent[i].1 else { continue };
-        let key = (skill.scope, skill.project.clone(), skill.name.clone());
+        let PendingOp::PushSkill { skill, base_version } = &sent[i].1 else { continue };
+        let key = owned_key(skill);
         if done.contains(&key) {
             continue;
         }
@@ -344,57 +390,75 @@ fn settle_skills(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult],
         let same = |j: &usize| matches!(&sent[*j].1, PendingOp::PushSkill { skill: other, .. } if skill_key(other) == skill_key(skill));
         match settled {
             Settled::Rebased => {
-                // From this skill's first conflict, past the latest version
-                // any of its conflicts reported.
+                // Past the latest version any of its conflicts reported
+                // (`check_conflicts` checked each is below the safe bound).
                 let current = conflicts.iter()
                     .filter(|(j, s)| **s == Settled::Rebased && same(j))
                     .filter_map(|(j, _)| results[*j].current_version)
                     .max()
                     .unwrap_or(0);
-                let latest = rebase_pushes(store, skill.scope, &skill.project, &skill.name, current)?;
+                let latest = coalesce_pushes(store, skill.scope, &skill.project, &skill.name, current)?;
                 notes.push(concurrent_note(skill, latest));
             }
             Settled::Superseded => {
                 let latest = (i + 1..sent.len()).filter(|j| same(j) && results[*j].ok)
                     .filter_map(|j| results[j].version)
                     .max();
-                if results[i].concurrent {
+                if results[i].check == ConflictCheck::Concurrent {
                     notes.push(concurrent_note(skill, latest.unwrap_or(skill.version)));
                 }
             }
-            Settled::Unchecked => notes.push(format!(
-                "skill {}: the Station reports a version conflict that couldn't be checked; it stays queued for the next sync.",
-                skill.name
-            )),
+            Settled::Unchecked => {
+                // The first of the skill's conflicts that wasn't a concurrent edit says why.
+                let why = conflicts.keys()
+                    .filter(|j| same(j) && results[**j].check != ConflictCheck::Concurrent)
+                    .map(|&j| (results[j].check, results[j].current_version))
+                    .next()
+                    .unwrap_or((ConflictCheck::NotChecked, None));
+                notes.push(unsettled_note(skill, *base_version, why));
+            }
         }
     }
     Ok(notes)
 }
 
-/// Re-bases every still-queued push of a skill, in queue order, past
-/// `current` (the Station's latest version): the k-th becomes version
-/// `current + k` on base `current + k - 1`, so each one's base is the one
-/// before it, as the Station's compare-and-set needs; each is sealed again
-/// at its next send (never an envelope re-used under another version). The
-/// local copy moves with the last one when it is that edit, as the
-/// concurrent-edit handling renumbers it, so a pulled version at the old
-/// number never replaces it. Returns the last one's version.
-fn rebase_pushes(store: &Store, scope: Scope, project: &str, name: &str, current: i64) -> Result<i64> {
-    let mut version = current;
-    let mut last = None;
-    for (n, op) in store.pending()? {
-        let PendingOp::PushSkill { mut skill, .. } = op else { continue };
-        if skill_key(&skill) != (scope, project, name) {
-            continue;
-        }
-        let original = skill.version;
-        version += 1;
-        skill.version = version;
-        store.replace_pending(n, &PendingOp::PushSkill { skill, base_version: version - 1 })?;
-        last = Some(original);
+/// Why a conflicted push stays queued as it was.
+fn unsettled_note(skill: &Skill, base: i64, (check, current): (ConflictCheck, Option<i64>)) -> String {
+    let why = match (check, current) {
+        (ConflictCheck::ReadFailed, _) => format!("reading v{} to check it failed", skill.version),
+        (ConflictCheck::NoCurrentVersion, _) => "the answer names no current version (a protocol error)".to_string(),
+        (ConflictCheck::BadCurrentVersion, Some(current)) => format!(
+            "the answer names v{current} as the latest, below this push's base v{base} or out of range (a protocol error)"
+        ),
+        _ => "it couldn't be checked".to_string(),
+    };
+    format!("skill {}: the Station reports a version conflict, but {why}; it stays queued for the next sync.", skill.name)
+}
+
+/// Coalesces a skill's still-queued pushes into one, its newest: each push
+/// is a full snapshot of the local skill when it was queued, so the newest
+/// holds every earlier local edit. The others are acked (unpushed local
+/// intermediates never become versions; the other machine's version stays
+/// in history), and the newest goes out at `current + 1` on base `current`
+/// (the Station's latest version), sealed again when it is sent: at the
+/// next sync, since `push_group` holds the skill back for the rest of this
+/// one. The local copy moves with it when it is that edit, as the
+/// concurrent-edit handling renumbers it. Returns the version it takes.
+fn coalesce_pushes(store: &Store, scope: Scope, project: &str, name: &str, current: i64) -> Result<i64> {
+    let version = current.checked_add(1).ok_or_else(|| anyhow!("skill version {current} is out of range"))?;
+    let pushes: Vec<(i64, Skill)> = store.pending()?.into_iter()
+        .filter_map(|(n, op)| match op {
+            PendingOp::PushSkill { skill, .. } if skill_key(&skill) == (scope, project, name) => Some((n, skill)),
+            _ => None,
+        })
+        .collect();
+    let Some(((newest_n, newest), older)) = pushes.split_last() else { return Ok(version) };
+    for (n, _) in older {
+        store.ack(*n)?;
     }
-    if let Some(original) = last
-        && let Some(mut local) = store.get_skill(scope, project, name)?
+    let original = newest.version;
+    store.replace_pending(*newest_n, &PendingOp::PushSkill { skill: Skill { version, ..newest.clone() }, base_version: current })?;
+    if let Some(mut local) = store.get_skill(scope, project, name)?
         && local.version == original {
         local.version = version;
         store.put_skill(&local)?;
@@ -439,20 +503,43 @@ pub fn apply_pulled_skills(store: &Store, items: &[Skill]) -> Result<i64> {
     Ok(max)
 }
 
+/// Applies a pulled page's rows in its transaction: the highest seq (the
+/// next cursor) and the notes to give once it committed.
+type ApplyPage<R> = fn(&Store, &[R]) -> Result<(i64, Vec<String>)>;
+
 /// A pulled page with held rows: each readable row applied as
 /// `apply_pulled_skills` does, clearing the holds it replaces (a later
 /// version, a tombstone, or the held version itself purged or rewritten);
 /// each held row recorded, unless a version this Atem already read
-/// replaces it. Never applied, so never installed or injected. Returns the
-/// highest seq (the next cursor), held rows included: the pull moves on.
-pub fn apply_pulled_skill_rows(store: &Store, items: &[PulledSkill]) -> Result<i64> {
+/// replaces it. Never applied, so never installed or injected.
+///
+/// Unpushed edits win locally: while a push of a skill is queued, no pulled
+/// row of it replaces the local copy (or its directory). The remote version
+/// stays in the relay's history, a note says so, and the queued push
+/// settles through the version conflict (the last writer wins, both kept).
+///
+/// Returns the highest seq (the next cursor), held rows included: the pull
+/// moves on; and the notes, given once the page committed.
+pub fn apply_pulled_skill_rows(store: &Store, items: &[PulledSkill]) -> Result<(i64, Vec<String>)> {
     let mut max = 0;
+    let mut notes = Vec::new();
+    let queued = store.queued_skill_pushes()?;
     for item in items {
         max = max.max(item.seq());
         match item {
             PulledSkill::Row(skill) => {
-                apply_pulled_skills(store, std::slice::from_ref(skill))?;
                 store.clear_held_skills(skill.scope, &skill.project, &skill.name, skill.version)?;
+                if queued.contains(&owned_key(skill))
+                    && let Some(local) = store.get_skill(skill.scope, &skill.project, &skill.name)?
+                    && skill.version >= local.version {
+                    // Its own push, applied but not acknowledged yet, comes
+                    // back with the same content: nothing to say.
+                    if skill.content_hash != local.content_hash {
+                        notes.push(shadowed_note(skill));
+                    }
+                    continue;
+                }
+                apply_pulled_skills(store, std::slice::from_ref(skill))?;
             }
             PulledSkill::Held(held) => {
                 let replaced = store.get_skill(held.scope, &held.project, &held.name)?
@@ -463,7 +550,17 @@ pub fn apply_pulled_skill_rows(store: &Store, items: &[PulledSkill]) -> Result<i
             }
         }
     }
-    Ok(max)
+    Ok((max, notes))
+}
+
+/// The note for a pulled version kept out of the local copy because an
+/// edit of that skill here still waits to sync.
+fn shadowed_note(skill: &Skill) -> String {
+    let scope_flag = if skill.scope == Scope::Project { " --scope project" } else { "" };
+    format!(
+        "skill {}: another machine pushed an edit (v{}) while this machine's edit waits to sync; this machine's edit stays here and goes out after it, and both versions are kept. See them with `atem skill history {}{}`.",
+        skill.name, skill.version, skill.name, scope_flag
+    )
 }
 
 pub fn apply_all(store: &Store, ctx: &Ctx) -> Result<Vec<ReportLine>> {
@@ -719,12 +816,23 @@ async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i
 async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
     let mut after = i64::MIN;
     let mut ahead = ReadAhead::new();
+    // Skills coalesced past a concurrent edit: nothing more of theirs goes
+    // out in this sync (the Station judges a batch's ops in order, so only
+    // a later batch could see them out of order).
+    let mut held_back: HashSet<SkillKey> = HashSet::new();
     loop {
         if out.offline {
             return Ok(());
         }
-        let chunk = store.pending_after(after, is_mem, chunk_size)?;
-        let Some(&(last, _)) = chunk.last() else { return Ok(()) };
+        let read = store.pending_after(after, is_mem, chunk_size)?;
+        let Some(&(last, _)) = read.last() else { return Ok(()) };
+        let chunk: Vec<(i64, PendingOp)> = read.into_iter()
+            .filter(|(_, op)| op_skill_key(op).is_none_or(|key| !held_back.contains(&key)))
+            .collect();
+        if chunk.is_empty() {
+            after = last;
+            continue;
+        }
         // The state ops are sealed under now, and the chunk's ops as they
         // would be sealed now (a project hash named since under its name):
         // what an op sealed ahead must still be to go out as sealed.
@@ -774,15 +882,19 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
             client.post_ops(&wire, is_mem).await
         };
         let posted = check_conflicts(client, &chunk, &wire, posted).await;
-        let unchecked = has_unchecked_conflict(&chunk, &posted);
+        let unsettled = has_unchecked_conflict(&chunk, &posted);
+        held_back.extend(rebased_skills(&chunk, &posted));
         match finish_chunk(store, &chunk, posted, out)? {
-            Ok(true) if unchecked => return conflict_unchecked(out),
+            Ok(true) if unsettled => return conflict_unchecked(out),
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(ApiError::Http(413, _)) if chunk.len() > 1 => {
                 for ((n, sent), sealed) in named.iter().zip(&wire) {
                     // Re-read by `n`: an earlier single op may have rewritten it.
                     let Some(op) = store.pending_op(*n)? else { continue };
+                    if op_skill_key(&op).is_some_and(|key| held_back.contains(&key)) {
+                        continue;
+                    }
                     let one = [(*n, op)];
                     let single = match client.seal_state(vec![one[0].1.clone()]) {
                         // Sealed before the chunk's POST: an op the agent
@@ -800,9 +912,10 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                         Err(e) => return group_failed(store, e, &one, is_mem, out),
                     };
                     let posted = check_conflicts(client, &one, &single, client.post_ops(&single, is_mem).await).await;
-                    let unchecked = has_unchecked_conflict(&one, &posted);
+                    let unsettled = has_unchecked_conflict(&one, &posted);
+                    held_back.extend(rebased_skills(&one, &posted));
                     match finish_chunk(store, &one, posted, out)? {
-                        Ok(true) if unchecked => return conflict_unchecked(out),
+                        Ok(true) if unsettled => return conflict_unchecked(out),
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
                         Err(e) => return group_failed(store, e, &one, is_mem, out),
@@ -830,9 +943,10 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
 /// but never acknowledged (a lost answer, a crash before the results
 /// committed), and counts as stored. Anything else, a purged (410) or
 /// missing (404) version, or one above `current_version` (never stored, no
-/// GET), is a concurrent edit (`OpResult::concurrent`). A version it
-/// couldn't read leaves the conflict unchecked. At most one GET per
-/// conflict, none without one.
+/// GET), is a concurrent edit (`ConflictCheck::Concurrent`). A version it
+/// couldn't read, or an answer with no usable `current_version` (missing,
+/// below the push's base, out of range), leaves the conflict unsettled. At
+/// most one GET per conflict, none without one.
 async fn check_conflicts(
     client: &KnowledgeClient,
     sent: &[(i64, PendingOp)],
@@ -849,22 +963,33 @@ async fn check_conflicts(
         }
         let skill = &sent["skill"];
         let scope = skill["scope"].as_str().and_then(|scope| Scope::parse(scope).ok());
-        let (Some(scope), Some(project), Some(name), Some(version)) =
-            (scope, skill["project"].as_str(), skill["name"].as_str(), skill["version"].as_i64()) else { continue };
-        // Above the Station's latest version: it was never stored.
-        if result.current_version.is_some_and(|current| version > current) {
-            result.concurrent = true;
+        let (Some(scope), Some(project), Some(name), Some(version), Some(base)) =
+            (scope, skill["project"].as_str(), skill["name"].as_str(), skill["version"].as_i64(), sent["base_version"].as_i64()) else { continue };
+        let Some(current) = result.current_version else {
+            result.check = ConflictCheck::NoCurrentVersion;
+            continue;
+        };
+        // The Station's latest version is never below a base it refused,
+        // and must leave room for the next version.
+        if current < base || current >= MAX_SKILL_VERSION {
+            result.check = ConflictCheck::BadCurrentVersion;
             continue;
         }
-        match client.stored_skill(scope, project, name, version).await {
+        // Above the Station's latest version: it was never stored.
+        if version > current {
+            result.check = ConflictCheck::Concurrent;
+            continue;
+        }
+        result.check = match client.stored_skill(scope, project, name, version).await {
             Ok(StoredVersion::Row(stored)) if same_write(skill, &stored) => {
                 *result = OpResult { ok: true, version: Some(stored.version), seq: Some(stored.seq), ..Default::default() };
+                continue;
             }
             // Another write, or one purged (its content gone) or never
             // stored: not this push.
-            Ok(StoredVersion::Row(_) | StoredVersion::Purged | StoredVersion::Missing) => result.concurrent = true,
-            Err(_) => {}
-        }
+            Ok(StoredVersion::Row(_) | StoredVersion::Purged | StoredVersion::Missing) => ConflictCheck::Concurrent,
+            Err(_) => ConflictCheck::ReadFailed,
+        };
     }
     Ok(results)
 }
@@ -884,7 +1009,7 @@ fn same_write(sent: &Value, stored: &Skill) -> bool {
         && sent["created_at"] == stored.created_at
 }
 
-/// Whether the batch has a conflict that stays unchecked (`Settled::Unchecked`).
+/// Whether the batch has a conflict that stays unsettled (`Settled::Unchecked`).
 fn has_unchecked_conflict(sent: &[(i64, PendingOp)], posted: &std::result::Result<Vec<OpResult>, ApiError>) -> bool {
     posted.as_ref().is_ok_and(|results| {
         results.len() == sent.len() && settle_conflicts(sent, results).values().any(|s| *s == Settled::Unchecked)
@@ -919,24 +1044,23 @@ async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
                 let client = opening.clone();
                 async move { client.open_memories(rows).await }
             },
-            apply_pulled_memories, |m: &Memory| m.seq).await?
+            |store, rows| Ok((apply_pulled_memories(store, rows)?, Vec::new())), |m: &Memory| m.seq).await?
     };
     if memories {
         let (fetching, opening) = (client.clone(), client.clone());
+        // project_names.json, read once for the whole pull (only the agent's
+        // pushes and the resolve step after the pull write it).
+        let names = std::sync::Arc::new(std::sync::OnceLock::new());
         pull_pages(store, out, &skill_cursor_key(client.account()),
             move |since| {
                 let client = fetching.clone();
-                async move { Ok(client.fetch_skills(since).await?.into_iter().map(PulledSkill::Row).collect()) }
+                async move { client.fetch_skills(since).await }
             },
-            move |rows: Vec<PulledSkill>| {
-                let client = opening.clone();
-                let rows = rows.into_iter().filter_map(|row| match row {
-                    PulledSkill::Row(skill) => Some(skill),
-                    PulledSkill::Held(_) => None,
-                }).collect();
-                async move { client.open_skills(rows).await }
+            move |rows: Vec<Skill>| {
+                let (client, names) = (opening.clone(), names.clone());
+                async move { client.open_skills(rows, names).await }
             },
-            apply_pulled_skill_rows, PulledSkill::seq).await?;
+            apply_pulled_skill_rows, |s: &Skill| s.seq).await?;
         let held = store.take_new_held_skills()?;
         if !held.is_empty() {
             out.note(held_note(&held));
@@ -997,11 +1121,14 @@ struct PagesInFlight<R> {
 }
 
 impl<R: Send + 'static> PagesInFlight<R> {
-    fn start<F, FF, O, OF>(since: i64, fetch: F, open: O, seq: fn(&R) -> i64) -> Self
+    /// `fetch` gives a page's rows as the relay sent them (`Raw`, whose
+    /// `seq` moves the cursor); `open` turns them into the rows applied.
+    fn start<Raw, F, FF, O, OF>(since: i64, fetch: F, open: O, seq: fn(&Raw) -> i64) -> Self
     where
+        Raw: Send + 'static,
         F: Fn(i64) -> FF + Send + 'static,
-        FF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
-        O: Fn(Vec<R>) -> OF + Send + 'static,
+        FF: Future<Output = std::result::Result<Vec<Raw>, ApiError>> + Send + 'static,
+        O: Fn(Vec<Raw>) -> OF + Send + 'static,
         OF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
     {
         let (tx, pages) = tokio::sync::mpsc::channel(2);
@@ -1048,20 +1175,21 @@ impl<R: Send + 'static> PagesInFlight<R> {
 /// fails to open or apply discards the page after it unapplied (the next
 /// sync starts from the committed cursor). `Ok(false)`: a request failed
 /// (noted); stop pulling.
-async fn pull_pages<R, F, FF, O, OF>(
+async fn pull_pages<Raw, R, F, FF, O, OF>(
     store: &Store,
     out: &mut SyncOutcome,
     key: &str,
     fetch: F,
     open: O,
-    apply: fn(&Store, &[R]) -> Result<i64>,
-    seq: fn(&R) -> i64,
+    apply: ApplyPage<R>,
+    seq: fn(&Raw) -> i64,
 ) -> Result<bool>
 where
+    Raw: Send + 'static,
     R: Send + 'static,
     F: Fn(i64) -> FF + Clone + Send + 'static,
-    FF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
-    O: Fn(Vec<R>) -> OF + Clone + Send + 'static,
+    FF: Future<Output = std::result::Result<Vec<Raw>, ApiError>> + Send + 'static,
+    O: Fn(Vec<Raw>) -> OF + Clone + Send + 'static,
     OF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
 {
     let mut since = store.get_state(key)?;
@@ -1095,11 +1223,15 @@ where
                 return Ok(false);
             }
         };
-        let max = store.in_transaction(|| {
-            let max = apply(store, &opened)?;
+        let (max, notes) = store.in_transaction(|| {
+            let (max, notes) = apply(store, &opened)?;
             store.set_state(key, max.max(since))?;
-            Ok(max)
+            Ok((max, notes))
         })?;
+        // Only once the page committed.
+        for note in notes {
+            out.note(note);
+        }
         in_flight.permits.add_permits(1);
         out.pulled += opened.len();
         if !cursor_advances(max, since, len) {
@@ -2261,7 +2393,7 @@ mod tests {
             self.next_seq
         }
 
-        fn skill_op(&mut self, op: &serde_json::Value) -> serde_json::Value {
+        pub(super) fn skill_op(&mut self, op: &serde_json::Value) -> serde_json::Value {
             self.ops_received += 1;
             let key = |s: &Skill| (s.scope.as_str().to_string(), s.project.clone(), s.name.clone());
             let named = (
@@ -2361,7 +2493,7 @@ mod tests {
     /// gets an error and its transaction rolls back). It copies the database
     /// and `-journal` only (the store's default rollback journal): a switch to
     /// WAL must also copy `-wal` and `-shm`.
-    fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
+    pub(super) fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
         use rusqlite::functions::FunctionFlags;
         let (db, image) = (db.to_path_buf(), image.to_path_buf());
         s.test_conn().create_scalar_function("crash", 0, FunctionFlags::SQLITE_UTF8, move |_| -> rusqlite::Result<i64> {
@@ -2695,11 +2827,118 @@ mod tests {
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
         assert!(out.relay_error, "{:?}", out.notes);
         assert_eq!(out.notes.len(), 1, "{:?}", out.notes);
-        assert!(out.notes[0].contains("couldn't be checked"), "{:?}", out.notes);
+        assert_eq!(out.notes[0], "skill deploy: the Station reports a version conflict, but reading v1 to check it failed; it stays queued for the next sync.");
         assert_eq!(s.pending().unwrap(), queued);
         assert_eq!(s.get_skill(Scope::Global, "", "deploy").unwrap().unwrap().version, 1);
         assert_eq!(skill_requests(&log), [("POST", "/api/skills/batch"), ("GET", "/api/skills/version"), ("GET", "/api/skills")]
             .map(|(m, p)| (m.to_string(), p.to_string())));
+    }
+
+    /// A conflict whose answer names no usable latest version (none, or one
+    /// below the push's base or out of range: a protocol error) is never
+    /// settled from it: the push stays queued as it was, and the note says
+    /// which.
+    #[tokio::test]
+    async fn a_version_conflict_without_a_usable_current_version_leaves_the_push_queued() {
+        let answers = [
+            (serde_json::json!({"ok": false, "error": "version_conflict"}), "the answer names no current version (a protocol error)"),
+            (serde_json::json!({"ok": false, "error": "version_conflict", "current_version": -1}), "the answer names v-1 as the latest, below this push's base v0 or out of range (a protocol error)"),
+            (serde_json::json!({"ok": false, "error": "version_conflict", "current_version": i64::MAX}), "out of range (a protocol error)"),
+        ];
+        for (answer, why) in answers {
+            let s = Store::open_in_memory().unwrap();
+            queue_skill(&s, "deploy");
+            let queued = s.pending().unwrap();
+            let (base, log) = stub_relay(Box::new(move |m, p, _| {
+                if m == "POST" && p.starts_with("/api/skills/batch?") {
+                    return (200, serde_json::json!({"results": [answer.clone()]}));
+                }
+                empty_pulls(m, p).unwrap()
+            })).await;
+            let (_td, ctx) = test_ctx();
+            let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+            assert!(out.relay_error, "{why}: {:?}", out.notes);
+            assert!(out.notes.len() == 1 && out.notes[0].contains(why), "{why}: {:?}", out.notes);
+            assert_eq!(s.pending().unwrap(), queued, "{why}");
+            // Nothing was read to check it.
+            assert!(!skill_requests(&log).iter().any(|(_, p)| p == "/api/skills/version"), "{why}");
+        }
+    }
+
+    /// The attempted version was purged (410): its content is gone, so it
+    /// isn't this push's; the push is a concurrent edit, coalesced past it,
+    /// and lands at the next sync.
+    #[tokio::test]
+    async fn a_conflict_on_a_purged_version_is_a_concurrent_edit() {
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        {
+            let mut r = relay.lock().unwrap();
+            r.put_skill(skill_v1("beta", "# beta from m2", "m2"));
+            r.skill_op(&serde_json::json!({"op": "purge", "scope": "global", "project": "", "name": "beta", "versions": [1]}));
+        }
+        let s = Store::open_in_memory().unwrap();
+        queue_skill(&s, "beta");
+        let (base, log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(!out.relay_error, "{:?}", out.notes);
+        assert!(out.notes.iter().any(|n| n.starts_with("skill beta: another machine pushed an edit at the same time")), "{:?}", out.notes);
+        assert!(log.lock().unwrap().iter().any(|(m, p, _)| m == "GET" && p.starts_with("/api/skills/version?") && p.contains("version=1")));
+        let left = s.pending().unwrap();
+        assert!(matches!(&left[..], [(_, PendingOp::PushSkill { skill, base_version: 1 })] if skill.version == 2), "{left:?}");
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+        let r = relay.lock().unwrap();
+        let mut versions: Vec<i64> = r.skills.values().filter(|k| k.name == "beta").map(|k| k.version).collect();
+        versions.sort();
+        assert_eq!(versions, vec![1, 2]);
+    }
+
+    /// A crash inside the coalescing writes of a batch's results (the
+    /// squashed push acked, the newest re-based) leaves the whole batch
+    /// queued as it was; the next sync settles it again the same way, and
+    /// the newest edit lands once.
+    #[tokio::test]
+    async fn a_crash_while_a_conflict_is_coalesced_leaves_the_batch_queued() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        {
+            let mut r = relay.lock().unwrap();
+            r.put_skill(skill_v1("beta", "# beta 1 from m2", "m2"));
+            r.put_skill(Skill { version: 2, ..skill_v1("beta", "# beta 2 from m2", "m2") });
+        }
+        let s = Store::open(&db).unwrap();
+        let first = skill_v1("beta", "# first edit", "m1");
+        let second = Skill { version: 2, ..skill_v1("beta", "# second edit", "m1") };
+        s.put_skill(&first).unwrap();
+        s.enqueue(&PendingOp::PushSkill { skill: first, base_version: 0 }).unwrap();
+        s.put_skill(&second).unwrap();
+        s.enqueue(&PendingOp::PushSkill { skill: second.clone(), base_version: 1 }).unwrap();
+        let queued = s.pending().unwrap();
+        let local = s.all_skills().unwrap();
+        arm_crash(&s, &db, &image, "CREATE TEMP TRIGGER crash_in_coalesce BEFORE UPDATE ON pending_ops BEGIN SELECT crash(); END;");
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        drop(s);
+        for s in [Store::open(&db).unwrap(), Store::open(&image).unwrap()] {
+            assert_eq!(s.pending().unwrap(), queued);
+            assert_eq!(s.all_skills().unwrap(), local);
+        }
+        let s = Store::open(&image).unwrap();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(!out.relay_error, "{:?}", out.notes);
+        let left = s.pending().unwrap();
+        assert!(matches!(&left[..], [(_, PendingOp::PushSkill { skill, base_version: 2 })] if skill.version == 3 && skill.files == second.files), "{left:?}");
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+        let r = relay.lock().unwrap();
+        let mut versions: Vec<i64> = r.skills.values().filter(|k| k.name == "beta").map(|k| k.version).collect();
+        versions.sort();
+        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(r.latest_skill("beta").unwrap().files, second.files);
     }
 
     // ─────────────── skill files on the wire (F8) ───────────────
