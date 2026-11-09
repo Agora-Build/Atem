@@ -95,7 +95,7 @@ fn fake_astation() -> (String, mpsc::Receiver<(String, Value)>) {
     (url, seen_rx)
 }
 
-/// The next message of type `kind` the fake saw (within 20 s).
+/// The next message of type `kind` the fake saw (within `WAIT`).
 fn saw(seen: &mpsc::Receiver<(String, Value)>, kind: &str) -> Value {
     let deadline = std::time::Instant::now() + WAIT;
     loop {

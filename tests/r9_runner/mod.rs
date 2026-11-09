@@ -74,8 +74,10 @@ use std::time::{Duration, Instant};
 const WAIT: Duration = Duration::from_secs(60);
 /// Time the runtime gets to act on what it was sent.
 const SETTLE: Duration = Duration::from_millis(400);
-/// How long a host state may take to reach its expected value.
-const SETTLE_STATE: Duration = Duration::from_secs(6);
+/// How long a host state may take to reach its expected value: a wait until
+/// it does (an assert that already holds returns at once), so a slow runner
+/// gets a minute and only a state that never arrives waits it out.
+const SETTLE_STATE: Duration = Duration::from_secs(60);
 /// What Atem tells the agent for a deny without a message.
 const DEFAULT_DENY: &str = "Denied from Astation";
 

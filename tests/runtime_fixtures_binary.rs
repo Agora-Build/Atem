@@ -92,7 +92,7 @@
 //! dispatches), and what the link carried: `approval_request`/`approval_closed`
 //! (pending approvals), the relay's push requests, and the receipts the
 //! client was told about (`receipts_visible`). Counters are re-read for up
-//! to 5 s until they match (`SETTLE_COUNTERS`).
+//! to 60 s until they match (`SETTLE_COUNTERS`).
 #![cfg(target_os = "linux")]
 
 mod support;
@@ -128,9 +128,10 @@ const SETTLE: Duration = Duration::from_millis(400);
 /// chain a counter waits for is a decision reaching the agent: the worker
 /// writes it at once, the hook polls every 100 ms, the worker's approval
 /// poll runs every 200 ms and the fake agent's every 20 ms — about 0.4 s in
-/// all. 5 s leaves more than 10× for a loaded machine; a counter that should
-/// stay unchanged is compared at once either way.
-const SETTLE_COUNTERS: Duration = Duration::from_secs(5);
+/// all. A minute leaves far more than the Intel macOS CI runner's 7× slowdown;
+/// a counter that should stay unchanged is compared at once either way, and
+/// only a counter that never reaches its value waits it out.
+const SETTLE_COUNTERS: Duration = Duration::from_secs(60);
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~\r";
 

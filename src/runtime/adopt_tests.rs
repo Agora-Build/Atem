@@ -95,7 +95,7 @@ async fn start_with(
     (running, handle)
 }
 
-/// Messages until `done` holds for one (5 s at most).
+/// Messages until `done` holds for one (`WAIT` at most).
 async fn until(
     handle: &mut WorkerHandle,
     mut done: impl FnMut(&WorkerMsg) -> bool,

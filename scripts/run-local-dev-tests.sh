@@ -35,6 +35,43 @@ FAIL=0
 SKIP=0
 FAILED_NAMES=()
 
+# The `atem serv` servers and temp files this run made, so an interrupted run
+# (Ctrl-C, SIGTERM, hang-up, an early exit) does not leave servers on their
+# ports for the next run to trip over. The normal paths stop each server
+# themselves (stop_serv) and remove their files; the trap covers the rest.
+SERV_PIDS=()
+SMOKE_TMP=()
+
+# stop_serv <pid>: stops a server this run started and waits for it, so its
+# tunnels are reaped too.
+stop_serv() {
+    local pid="$1" p
+    local keep=()
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    for p in ${SERV_PIDS[@]+"${SERV_PIDS[@]}"}; do
+        [[ "$p" != "$pid" ]] && keep+=("$p")
+    done
+    SERV_PIDS=(${keep[@]+"${keep[@]}"})
+}
+
+cleanup() {
+    local pid f
+    for pid in ${SERV_PIDS[@]+"${SERV_PIDS[@]}"}; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in ${SERV_PIDS[@]+"${SERV_PIDS[@]}"}; do
+        wait "$pid" 2>/dev/null || true
+    done
+    for f in ${SMOKE_TMP[@]+"${SMOKE_TMP[@]}"}; do
+        rm -f "$f"
+    done
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Allow overriding via env so token commands work even with no active project.
 if [[ -n "${APP_ID:-}" ]]; then
     export AGORA_APP_ID="$APP_ID"
@@ -139,13 +176,17 @@ run_needs_login() {
 # without the code; every later request (page or API) needs the cookie;
 # anything else is a plain 404.
 
-# printed_code <log> <port>: the code in the "Local:" URL the server printed
-# to <log> (waits up to 10 s for the line); empty when there is none.
+# printed_code <log> <port> <pid>: the code in the "Local:" URL the server
+# (process <pid>) printed to <log>; empty when there is none. `serv rtc` and
+# `serv convo` print their URLs only after their tunnels started (each may
+# take 15 s, tunnels.rs START_TIMEOUT), so this waits up to 30 s, and stops
+# at once when the server died.
 printed_code() {
-    local log="$1" port="$2" code=""
-    for _ in $(seq 1 20); do
+    local log="$1" port="$2" pid="$3" code=""
+    for _ in $(seq 1 60); do
         code="$(sed -n "s|.*:$port/?t=\([A-Za-z0-9_-]\{1,\}\).*|\1|p" "$log" 2>/dev/null | head -n 1)"
         [[ -n "$code" ]] && break
+        kill -0 "$pid" 2>/dev/null || break
         sleep 0.5
     done
     printf '%s' "$code"
@@ -387,11 +428,13 @@ echo "$(yellow "RTC test server (/api/token)")"
 RTC_PORT=18443
 RTC_PID=""
 RTC_LOG="$(mktemp -t atem-rtc.XXXXXX.log)"
+SMOKE_TMP+=("$RTC_LOG")
 
 # Only attempt if we have credentials (active project or env vars)
 if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HOME/.config/atem/project_cache.enc" ]]; then
     "$ATEM" serv rtc --channel smoketest --port "$RTC_PORT" --no-browser >"$RTC_LOG" 2>&1 &
     RTC_PID=$!
+    SERV_PIDS+=("$RTC_PID")
     # wait up to 10s for the TLS port to be accepting connections
     for _ in $(seq 1 20); do
         if curl -sk --max-time 1 "https://127.0.0.1:$RTC_PORT/" -o /dev/null 2>/dev/null; then
@@ -400,8 +443,9 @@ if [[ -n "${AGORA_APP_ID:-}" && -n "${AGORA_APP_CERTIFICATE:-}" ]] || [[ -f "$HO
         sleep 0.5
     done
 
-    RTC_CODE="$(printed_code "$RTC_LOG" "$RTC_PORT")"
+    RTC_CODE="$(printed_code "$RTC_LOG" "$RTC_PORT" "$RTC_PID")"
     RTC_JAR="$(mktemp -t atem-rtc-jar.XXXXXX)"
+    SMOKE_TMP+=("$RTC_JAR")
     serv_access "atem serv rtc" "https://127.0.0.1:$RTC_PORT" "$RTC_CODE" "$RTC_JAR"
 
     # ── Test 1: 50× POST /api/token, count non-200 responses
@@ -471,8 +515,7 @@ PY
 
     # cleanup
     if [[ -n "$RTC_PID" ]]; then
-        kill "$RTC_PID" 2>/dev/null || true
-        wait "$RTC_PID" 2>/dev/null || true
+        stop_serv "$RTC_PID"
     fi
 else
     skip "atem serv rtc — 50× /api/token"        "no AGORA_APP_ID / active project"
@@ -504,6 +547,7 @@ fi
 
 # Typo in [atem] section — deny_unknown_fields should reject it.
 TYPO_TOML="$(mktemp -t atem-typo.XXXXXX.toml)"
+SMOKE_TMP+=("$TYPO_TOML")
 cat > "$TYPO_TOML" <<'EOF'
 [atem]
 hippa = true
@@ -531,17 +575,20 @@ if [[ -f tests/fixtures/convo_full.toml ]] && {
 }; then
     CONVO_PORT=19911
     CONVO_LOG="$(mktemp -t atem-convo.XXXXXX.log)"
+    SMOKE_TMP+=("$CONVO_LOG")
     "$ATEM" serv convo --config tests/fixtures/convo_full.toml \
         --port "$CONVO_PORT" --no-browser >"$CONVO_LOG" 2>&1 &
     CONVO_PID=$!
+    SERV_PIDS+=("$CONVO_PID")
     # Wait up to 10s for TLS port
     for _ in $(seq 1 20); do
         curl -sk --max-time 1 "https://127.0.0.1:$CONVO_PORT/" -o /dev/null 2>/dev/null && break
         sleep 0.5
     done
 
-    CONVO_CODE="$(printed_code "$CONVO_LOG" "$CONVO_PORT")"
+    CONVO_CODE="$(printed_code "$CONVO_LOG" "$CONVO_PORT" "$CONVO_PID")"
     CONVO_JAR="$(mktemp -t atem-convo-jar.XXXXXX)"
+    SMOKE_TMP+=("$CONVO_JAR")
     serv_access "atem serv convo" "https://127.0.0.1:$CONVO_PORT" "$CONVO_CODE" "$CONVO_JAR"
 
     run_contains "atem serv convo — GET /" "Welcome to Agora" \
@@ -554,8 +601,7 @@ if [[ -f tests/fixtures/convo_full.toml ]] && {
         -- curl -sk -b "$CONVO_JAR" "https://127.0.0.1:$CONVO_PORT/api/convo/status"
 
     # Cleanup
-    kill "$CONVO_PID" 2>/dev/null || true
-    wait "$CONVO_PID" 2>/dev/null || true
+    stop_serv "$CONVO_PID"
     rm -f "$CONVO_LOG" "$CONVO_JAR"
 elif [[ ! -f tests/fixtures/convo_full.toml ]]; then
     skip "atem serv convo — GET /"                              "no tests/fixtures/convo_full.toml"
@@ -574,16 +620,19 @@ echo
 echo "$(yellow "Webhooks server")"
 WEBHOOK_PORT=19191
 WEBHOOK_LOG="$(mktemp -t atem-webhooks.XXXXXX.log)"
+SMOKE_TMP+=("$WEBHOOK_LOG")
 "$ATEM" serv webhooks --port "$WEBHOOK_PORT" --no-tunnel --no-browser >"$WEBHOOK_LOG" 2>&1 &
 WEBHOOK_PID=$!
+SERV_PIDS+=("$WEBHOOK_PID")
 # Wait up to 5s for HTTP listener
 for _ in $(seq 1 10); do
     curl -s --max-time 1 "http://127.0.0.1:$WEBHOOK_PORT/" -o /dev/null 2>/dev/null && break
     sleep 0.5
 done
 
-WEBHOOK_CODE="$(printed_code "$WEBHOOK_LOG" "$WEBHOOK_PORT")"
+WEBHOOK_CODE="$(printed_code "$WEBHOOK_LOG" "$WEBHOOK_PORT" "$WEBHOOK_PID")"
 WEBHOOK_JAR="$(mktemp -t atem-webhooks-jar.XXXXXX)"
+SMOKE_TMP+=("$WEBHOOK_JAR")
 serv_access "atem serv webhooks" "http://127.0.0.1:$WEBHOOK_PORT" "$WEBHOOK_CODE" "$WEBHOOK_JAR"
 
 run_contains "atem serv webhooks — GET /" "atem serv webhooks" \
@@ -623,8 +672,7 @@ else
     FAILED_NAMES+=("atem serv webhooks — log line")
 fi
 
-kill "$WEBHOOK_PID" 2>/dev/null || true
-wait "$WEBHOOK_PID" 2>/dev/null || true
+stop_serv "$WEBHOOK_PID"
 rm -f "$WEBHOOK_LOG" "$WEBHOOK_JAR"
 echo
 

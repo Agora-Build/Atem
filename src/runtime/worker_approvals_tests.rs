@@ -11,6 +11,14 @@ use std::process::{Child, Command, Stdio};
 /// the slack, and a hung test still ends.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// The longest a wait on a hook's end or on what the watcher reports about
+/// it lasts: less than the hooks' own 30 s limit (`hook(.., 30, ..)`), which
+/// ends a hook silently, with no output, exactly like "no decision". Past
+/// that limit "the worker released it" and "it gave up by itself" can no
+/// longer be told apart, so a hook the worker never woke has to fail first.
+/// Waking one takes well under a second (a few seconds on the Intel runner).
+const HOOK_END: Duration = Duration::from_secs(20);
+
 struct Session {
     dir: tempfile::TempDir,
 }
@@ -132,14 +140,14 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// What the hook printed (it must end within `WAIT`).
+/// What the hook printed (it must end within `HOOK_END`).
 fn printed(child: Child) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let out = child.wait_with_output().unwrap();
         let _ = tx.send(String::from_utf8(out.stdout).unwrap());
     });
-    rx.recv_timeout(WAIT).expect("the hook didn't end")
+    rx.recv_timeout(HOOK_END).expect("the hook didn't end")
 }
 
 fn watcher(s: &Session, agent: Agent) -> Approvals {
@@ -147,9 +155,9 @@ fn watcher(s: &Session, agent: Agent) -> Approvals {
         .with_confirm(Duration::from_millis(300))
 }
 
-/// Polls until at least one event (`WAIT` at most).
+/// Polls until at least one event (`HOOK_END` at most).
 fn events(a: &mut Approvals, connected: bool) -> Vec<Event> {
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + HOOK_END;
     loop {
         let out = a.poll(connected, Vec::new());
         if !out.is_empty() {
@@ -162,7 +170,7 @@ fn events(a: &mut Approvals, connected: bool) -> Vec<Event> {
 
 /// Polls until nothing waits any more, returning what that reported.
 fn drained(a: &mut Approvals) -> Vec<Event> {
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + HOOK_END;
     let mut out = Vec::new();
     while a.waiting() > 0 {
         out.extend(a.poll(true, Vec::new()));
@@ -174,7 +182,7 @@ fn drained(a: &mut Approvals) -> Vec<Event> {
 
 /// Polls until `n` requests are known (none reported).
 fn known(a: &mut Approvals, n: usize, connected: bool) {
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + HOOK_END;
     while a.waiting() < n {
         assert!(a.poll(connected, Vec::new()).is_empty());
         assert!(Instant::now() < deadline, "not seen");
@@ -751,7 +759,7 @@ fn a_claimed_decision_always_reaches_the_hook_however_fast_the_worker_polls() {
             let out = hook.wait_with_output().unwrap();
             let _ = tx.send(String::from_utf8(out.stdout).unwrap());
         });
-        let deadline = Instant::now() + WAIT;
+        let deadline = Instant::now() + HOOK_END;
         let printed = loop {
             a.poll(true, Vec::new());
             if let Ok(out) = rx.try_recv() {

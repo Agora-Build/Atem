@@ -597,7 +597,7 @@ impl Runtime {
 
     async fn shutdown(mut self) {
         let _ = self.stop.take().unwrap().send(());
-        tokio::time::timeout(Duration::from_secs(10), &mut self.server)
+        tokio::time::timeout(WAIT, &mut self.server)
             .await
             .expect("the server stops")
             .unwrap()

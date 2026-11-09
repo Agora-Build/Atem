@@ -440,7 +440,7 @@ impl Runtime {
 
     async fn shutdown(mut self) -> Rc<tempfile::TempDir> {
         let _ = self.stop.take().unwrap().send(());
-        tokio::time::timeout(Duration::from_secs(10), &mut self.server)
+        tokio::time::timeout(WAIT, &mut self.server)
             .await
             .expect("the server stops")
             .unwrap()
@@ -4254,7 +4254,7 @@ fn a_pin_finished_right_after_a_reopen_is_opened_on_the_next_pass() {
             journal.join("membership_applied"),
         )
         .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + WAIT;
         loop {
             let state = status(&mut client).await.device_list.map(|d| d.state);
             if fired.load(Ordering::SeqCst) && state.as_deref() == Some("open") {
