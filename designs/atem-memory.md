@@ -1055,7 +1055,8 @@ If the detector misses a credential and it syncs:
     number and always goes.
   - **The question names the version** with the machine that pushed it and
     when (UTC), from the relay's history (`atem skill history`), when it can
-    be read; a version the history doesn't list says so.
+    be read; a version the history doesn't list, one already purged, or a
+    delete marker says so instead.
 - Both commands end with a warning: **rotate the credential.** It may already
   have been copied to other machines' disks or backups, so treat it as
   exposed.
@@ -1136,8 +1137,10 @@ lives.
   later; the retry limit (five syncs and a day).
 - **Version purges:** `skill purge --version` is refused while the skill has
   a queued push or an unsettled or coalesced conflict, and goes once a sync
-  settled it; `--all-versions` is never held up; the question names the
-  version's author machine and time.
+  settled it; the command checks before its question (nothing asked) and
+  again with the queue (an edit queued while it waited); `--all-versions`
+  is never held up; the question names the version's author machine and
+  time, or that it is already purged or a delete marker.
 - **No switch to plain text:** the state goes from on to off, to this
   device unverified, to another data account, or to no signed state,
   between two chunks of one push (the second chunk is never sent, nothing
