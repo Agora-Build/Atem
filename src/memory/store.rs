@@ -774,15 +774,18 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// The skills (scope, project, name) with a push still queued (read
-    /// once per pull).
-    pub fn queued_skill_pushes(&self) -> Result<std::collections::HashSet<(Scope, String, String)>> {
-        Ok(self.pending()?.into_iter()
-            .filter_map(|(_, op)| match op {
-                PendingOp::PushSkill { skill, .. } => Some((skill.scope, skill.project, skill.name)),
-                _ => None,
-            })
-            .collect())
+    /// Whether a push of the skill (scope, project, name) is queued. Reads
+    /// only the queued pushes' keys (`json_extract`), never their files.
+    pub fn has_queued_push(&self, scope: Scope, project: &str, name: &str) -> Result<bool> {
+        let found: Option<i64> = self.conn.query_row(
+            "SELECT 1 FROM pending_ops WHERE json_extract(payload, '$.op') = 'push_skill'
+               AND json_extract(payload, '$.skill.scope') = ?1
+               AND json_extract(payload, '$.skill.project') = ?2
+               AND json_extract(payload, '$.skill.name') = ?3 LIMIT 1",
+            params![scope.as_str(), project, name],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(found.is_some())
     }
 
     // ── held skill versions (`model::HeldSkill`) ────────────────────────

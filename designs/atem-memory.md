@@ -450,16 +450,19 @@ Rules:
     a crash before the local commit). That push counts as stored and is
     acked. The files aren't compared: every seal has fresh nonces.
   - **A concurrent edit** is anything else: another write at that version,
-    a purged one (410), or one that never existed (404).
-  - **A Station behind the local copy** (`N` below the push's base: the
-    attempted version was never stored, so no GET) is settled the same way
-    as a concurrent edit. Its note says the Station is behind and the edit
-    goes out as v`N+1`.
+    a purged one (410), or one that never existed (404). It settles by
+    coalescing, below.
+  - **A Station behind the local copy** (`N` below the push's base) means
+    the attempted version was never stored, so there is no GET. It settles
+    by coalescing too, but with its own note: the Station's latest version
+    is vN, behind this machine's copy, and the edit goes out as v`N+1` at
+    the next sync.
+  - **Coalescing** (both cases above):
     - **Coalesced.** The skill's queued pushes become one: the newest edit,
       which as a full snapshot of the local skill holds every earlier local
       edit. It goes at `N+1` on base `N`, and the local copy follows it.
-      Unpushed intermediate edits never become versions; the other
-      machine's version stays in history.
+      Unpushed intermediate edits never become versions; another machine's
+      version stays in history.
     - **Held back.** Nothing more of that skill goes out in this sync: the
       Station judges a batch's ops in order, and only a later batch could
       see them out of order. So the Station never has a gap that a third
@@ -467,9 +470,9 @@ Rules:
       over a newer one.
     - **Sealed again** at the next sync, under the new version. An envelope
       is never re-used under another version.
-    - The note is the one for a concurrent edit: "another machine pushed an
-      edit at the same time; both versions are kept and vN is now the
-      latest".
+    - **The note** for a concurrent edit is "another machine pushed an edit
+      at the same time; both versions are kept and vN is now the latest";
+      for a Station behind the local copy it is the note above.
   - **Superseded in the same batch.** If a later push of the same skill in
     that batch landed, the conflicted older push is acked and never pushed
     again. The later push is a full snapshot built on it.
@@ -477,7 +480,9 @@ Rules:
     purge of all its versions or of the pushed one, landed in that batch,
     the conflicted push is acked and never pushed again. So it can't undo
     the delete, and purged content never goes back to the relay. The local
-    tombstone stays.
+    tombstone stays. A later conflicting push of the skill in the same
+    batch, such as a re-add after the delete, is still settled in that
+    sync: a superseded or withdrawn push settles only itself.
   - **Unsettled.** The conflict stays queued as it was, and that sync's push
     stops there, with a note saying why, if:
     - the attempted version can't be read;
@@ -497,6 +502,9 @@ Rules:
       writer wins, and both versions are kept.
     - The push's own applied write coming back (the same content) is
       skipped quietly.
+    - The queued push is looked up inside each pulled page's transaction,
+      reading only the queued pushes' keys. So another atem process that
+      queues an edit or acks a push during the pull is seen.
   - **Unchanged.** Deletes carry no version (a tombstone has no envelopes),
     and the Station appends them as `max + 1`. Purges name existing versions.
   - **Before the compare-and-set** (the Station before Astation PR #76),
