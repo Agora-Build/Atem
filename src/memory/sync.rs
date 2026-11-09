@@ -244,11 +244,8 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
             continue;
         }
         match deferred.get(&i) {
-            Some(Deferred::Retry) => {
-                notes.push(refused_for_now_note(op, r));
-                continue;
-            }
-            Some(Deferred::AfterAdd) => continue,
+            // Said once for the batch, below.
+            Some(Deferred::Retry | Deferred::AfterAdd) => continue,
             // The delete or purge stands; nothing to add.
             Some(Deferred::Withdrawn) => {
                 store.ack(*n)?;
@@ -297,6 +294,7 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
         }
         store.ack(*n)?;
     }
+    notes.extend(refused_for_now_notes(sent, results, &deferred));
     notes.extend(settle_skills(store, sent, results, &conflicts)?);
     Ok(notes)
 }
@@ -468,13 +466,31 @@ fn defer_refusals(sent: &[(i64, PendingOp)], results: &[OpResult]) -> BTreeMap<u
     deferred
 }
 
-/// The note for an op refused for now.
-fn refused_for_now_note(op: &PendingOp, result: &OpResult) -> String {
-    format!(
-        "relay refused {} for now: {} (the account's encryption mode or key is changing); it stays queued and is sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected.",
-        describe(op),
-        result.error.as_deref().unwrap_or_default()
-    )
+/// The notes for a batch's ops refused for now (`Deferred::Retry`): one per
+/// reason, naming the first few (a key rotation can refuse a whole batch).
+fn refused_for_now_notes(sent: &[(i64, PendingOp)], results: &[OpResult], deferred: &BTreeMap<usize, Deferred>) -> Vec<String> {
+    let mut by_reason: Vec<(&str, Vec<String>)> = Vec::new();
+    for (&i, _) in deferred.iter().filter(|(_, d)| **d == Deferred::Retry) {
+        let reason = results[i].error.as_deref().unwrap_or_default();
+        let what = describe(&sent[i].1);
+        match by_reason.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, ops)) => ops.push(what),
+            None => by_reason.push((reason, vec![what])),
+        }
+    }
+    const NAMED: usize = 3;
+    by_reason.into_iter()
+        .map(|(reason, ops)| {
+            let (what, stay) = match ops.len() {
+                1 => (ops[0].clone(), "it stays queued and is"),
+                n if n <= NAMED => (format!("{n} changes ({})", ops.join(", ")), "they stay queued and are"),
+                n => (format!("{n} changes ({} and {} more)", ops[..NAMED].join(", "), n - NAMED), "they stay queued and are"),
+            };
+            format!(
+                "relay refused {what} for now: {reason} (the account's encryption mode or key is changing); {stay} sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected."
+            )
+        })
+        .collect()
 }
 
 /// Whether the batch has an op refused for now that stays queued
@@ -1878,12 +1894,13 @@ mod tests {
             s.put_skill(&skill).unwrap();
             s.enqueue(&PendingOp::PushSkill { skill, base_version: 0 }).unwrap();
             let sent = s.pending().unwrap();
+            let id = s.live_memories().unwrap()[0].id.clone();
             let notes = apply_push_results(&s, &sent, &[refused(error), refused(error)]).unwrap();
             assert_eq!(s.pending().unwrap(), sent, "{error}");
-            assert_eq!(notes.len(), 2, "{error}: {notes:?}");
-            assert!(notes[0].starts_with(&format!("relay refused memory {} for now: {error}", s.live_memories().unwrap()[0].id)), "{notes:?}");
-            assert!(notes[1].starts_with(&format!("relay refused skill deploy v1 for now: {error}")), "{notes:?}");
-            assert!(notes.iter().all(|n| n.contains("it stays queued and is sealed again at the next sync")), "{notes:?}");
+            // One note for the batch's refusals with the same reason.
+            assert_eq!(notes, vec![format!(
+                "relay refused 2 changes (memory {id}, skill deploy v1) for now: {error} (the account's encryption mode or key is changing); they stay queued and are sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected."
+            )], "{error}");
             assert_eq!(s.live_memories().unwrap().len(), 1, "{error}");
             let e = s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap();
             assert_eq!(e.status, HarvestStatus::Synced, "{error}");
@@ -1994,8 +2011,11 @@ mod tests {
         let queued = s.pending().unwrap();
         let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
         assert!(out.relay_error && out.pushed == 0, "{:?}", out.notes);
-        assert_eq!(out.notes.len(), 9, "{:?}", out.notes);
-        assert!(out.notes.iter().all(|n| n.contains(" for now: ")), "{:?}", out.notes);
+        let why = "(the account's encryption mode or key is changing)";
+        assert_eq!(out.notes, vec![
+            format!("relay refused memory mem_port 8765 for now: {} {why}; it stays queued and is sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected.", FOR_NOW[0]),
+            format!("relay refused 8 changes (skill skill0 v1, skill skill1 v1, skill skill2 v1 and 5 more) for now: {} {why}; they stay queued and are sealed again at the next sync. If this repeats, check `atem status` and that Astation is connected.", FOR_NOW[1]),
+        ]);
         assert_eq!(s.pending().unwrap(), queued);
         assert_eq!(s.live_memories().unwrap().len(), 1);
         // One POST of each kind: the first skill chunk alone, never again.
