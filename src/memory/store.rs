@@ -826,6 +826,20 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Valid memories on this machine only: never synced (no relay seq) and
+    /// not queued to be (refused by the relay for good, or added with
+    /// `--force` over a credential finding). Reads only the queued adds' ids.
+    pub fn local_only_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories m WHERE m.seq = 0 AND m.deleted_at IS NULL AND m.invalid_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM pending_ops p WHERE json_extract(p.payload, '$.op') = 'add_memory'
+                 AND json_extract(p.payload, '$.memory.id') = m.id)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// Whether a push of the skill (scope, project, name) is queued. Reads
     /// only the queued pushes' keys (`json_extract`), never their files.
     pub fn has_queued_push(&self, scope: Scope, project: &str, name: &str) -> Result<bool> {

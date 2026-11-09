@@ -716,6 +716,10 @@ pub async fn handle_memory(command: MemoryCommands) -> Result<()> {
                 println!("{}", line);
             }
             println!("Pending:    {} change(s) waiting to sync", store.pending_count()?);
+            let local_only = store.local_only_count()?;
+            if local_only > 0 {
+                println!("Local only: {} memories never synced (refused by the relay, or added with --force); kept on this machine", local_only);
+            }
             println!("Last sync:  {}", if last == 0 { "never".to_string() } else { format!("{}s ago", now_secs() - last) });
             println!("Held back:  {} harvested memory file(s) (possible credentials)", store.held_back_count()?);
             let forks = store.multi_successors()?;

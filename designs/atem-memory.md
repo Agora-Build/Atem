@@ -260,9 +260,11 @@ MVP.
   credential is held back, and the old memory is invalidated with no
   successor.
 - **Held back and excluded:** a file that fails the secret check is
-  recorded as `held_back` and isn't synced. A memory the relay refuses for
-  good is also recorded as `held_back` (one refused for now stays queued:
-  see "Sync algorithm"). A purged memory's file is recorded as
+  recorded as `held_back` and isn't synced. A memory the relay refuses as a
+  possible credential, or for the reserved token, is also removed and its
+  file recorded as `held_back`; one it refuses for good for any other reason
+  stays on this machine, never synced (its file stays linked); one refused
+  for now stays queued (see "Sync algorithm"). A purged memory's file is recorded as
   `excluded`, so it isn't harvested again. Either status is cleared, and
   the file checked again, only when its content changes.
 - **No echo:** when atem applies memory to Claude on a machine, it skips
@@ -711,7 +713,9 @@ atem memory purge <id>              # remove a leaked credential (see Security)
 atem skill purge <name> [--version <n> | --all-versions]
 
 atem memory status                  # account, machine, pending ops, last sync, targets,
-                                    # held-back memories, credential findings,
+                                    # held-back memories, local-only memories (never
+                                    # synced: refused by the relay, or --force),
+                                    # credential findings,
                                     # facts with more than one valid successor,
                                     # rows of projects not known here yet,
                                     # held skill versions that don't open here
@@ -751,7 +755,7 @@ atem memory status                  # account, machine, pending ops, last sync, 
    | `memory does not match the account encryption mode`, `skill does not match the account encryption mode` (the route's check against the account's mode and key as the Station read them for the batch), `content does not match the account encryption mode` (the store's repeat of it in its write transaction) | for now, unless the op's own value is the cause (below): a mode change, a key rotation or a migration racing the push, or a device behind the account's state | queued as it was, with a note; nothing more of that skill or memory goes out in that sync (`Held`: a later push, delete or purge of the skill; the memory's delete or invalidation, or a replacement's invalidation naming it as the successor), so it is sent once per sync and nothing of it lands first; other skills and memories go on; the sync is incomplete; sealed again and sent at the next sync, under the mode and key Atem has then |
    | the same texts, when the op's own value is the cause | for good | acked, with a note naming the op and why |
    | `version_conflict` | settled (see "Relay API") | |
-   | `invalid memory`, `invalid skill`, `invalid base64`, `invalid skill version`, `reserved token`, `possible credential: …`, `id conflict`, any other text or none | for good | acked, with a note naming the op and the reason; a refused add is removed here and its harvested file recorded `held_back` |
+   | `invalid memory`, `invalid skill`, `invalid base64`, `invalid skill version`, `reserved token`, `possible credential: …`, `id conflict`, any other text or none | for good | acked (never sent again), with a note naming the op and the reason. A refused memory add stays on this machine only: never synced, still injected here like any local fact, its harvested file still linked; the note quotes its first line, and `atem memory status` counts these under "Local only". Except a refusal by the relay's secret check (`possible credential: …`, `reserved token`): that fact is removed here and its harvested file recorded `held_back` (knowledge.db holds no secret, and the token would break the managed blocks), and the note doesn't quote it. A refused skill push keeps its local copy, as before |
 
    Atem judges a mode refusal against the op as it went out (the Station
    allows a field only as its mode does: while it encrypts, an envelope or
@@ -1134,7 +1138,10 @@ lives.
   the op causes (an off account and `e1.` text, a file named `e1.md`, an
   earlier key's project hash after a rotation) are refused for good, while
   a well-formed op under a key the Station moved past is kept and lands
-  later; the retry limit (five syncs and a day).
+  later; the retry limit (five syncs and a day); a fact refused for good
+  (other than by the secret check) stays here, still injected, counted as
+  local only, and is never pushed again, while a credential refusal still
+  removes it.
 - **Version purges:** `skill purge --version` is refused while the skill has
   a queued push or an unsettled or coalesced conflict, and goes once a sync
   settled it; the command checks before its question (nothing asked) and

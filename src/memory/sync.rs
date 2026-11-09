@@ -330,15 +330,30 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
             }
         } else {
             let error = r.error.clone().unwrap_or_else(|| "unknown error".into());
+            // A refused add stays here (local only, never synced), unless
+            // the relay found a possible credential or the reserved token:
+            // knowledge.db holds no secret, and the token would break the
+            // managed blocks.
+            let kept_here = match op {
+                PendingOp::AddMemory { memory } if !refused_as_secret(&error) => Some(memory),
+                _ => None,
+            };
+            let what = match kept_here {
+                Some(memory) => format!("{} (\"{}\")", describe(op), excerpt(&memory.content)),
+                None => describe(op),
+            };
+            let then = if kept_here.is_some() { "; it stays on this machine only, never synced" } else { "" };
             notes.push(match (&r.mode_refusal, given_up.get(&i)) {
-                (ModeRefusal::Own(why), _) => format!("relay refused {}: {error} ({why}); not sent again", describe(op)),
+                (ModeRefusal::Own(why), _) if kept_here.is_some() => format!("relay refused {what}: {error} ({why}){then}"),
+                (ModeRefusal::Own(why), _) => format!("relay refused {what}: {error} ({why}); not sent again"),
                 (_, Some((count, since))) => format!(
-                    "relay refused {} for now at {count} syncs in a row since {} UTC: {error}; Atem stopped retrying it (refused for good)",
-                    describe(op), crate::memory::model::format_datetime(*since)
+                    "relay refused {what} for now at {count} syncs in a row since {} UTC: {error}; Atem stopped retrying it (refused for good){then}",
+                    crate::memory::model::format_datetime(*since)
                 ),
-                _ => format!("relay refused {}: {error}", describe(op)),
+                _ => format!("relay refused {what}: {error}{then}"),
             });
-            if let PendingOp::AddMemory { memory } = op {
+            if let PendingOp::AddMemory { memory } = op
+                && kept_here.is_none() {
                 store.mark_memory_deleted(&memory.id)?;
                 for mut e in store.harvest_entries_for_memory(&memory.id)? {
                     e.memory_id = String::new();
@@ -356,6 +371,21 @@ fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpR
         retried: deferred.iter().filter(|(_, d)| **d == Deferred::Retry).map(|(&i, _)| sent[i].1.clone()).collect(),
         kept: deferred.values().filter(|d| **d != Deferred::Withdrawn).count(),
     })
+}
+
+/// Whether a refusal is the relay's secret check (a possible credential, or
+/// the reserved token): what it refused must not stay in knowledge.db.
+fn refused_as_secret(error: &str) -> bool {
+    error.starts_with("possible credential") || error == "reserved token"
+}
+
+/// A fact's first line, at most 60 characters, to name it in a note.
+fn excerpt(content: &str) -> String {
+    let line = content.lines().next().unwrap_or_default();
+    match line.char_indices().nth(60) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    }
 }
 
 /// The note for a concurrent edit where this machine's edit already
@@ -2043,6 +2073,53 @@ mod tests {
         }
     }
 
+    /// A fact the relay refuses for good, for anything but its secret check,
+    /// stays here: its queued add is acked (never sent again), the row stays
+    /// live (still injected here), its harvested file stays linked, and it
+    /// counts as local only. A possible credential or the reserved token is
+    /// removed here as before (knowledge.db holds no secret).
+    #[test]
+    fn a_fact_refused_for_good_stays_here_and_is_never_synced() {
+        for (error, kept) in [
+            ("invalid memory", true),
+            ("id conflict", true),
+            ("memory does not match the account encryption mode, maybe", true),
+            ("possible credential: jwt", false),
+            ("reserved token", false),
+        ] {
+            let s = Store::open_in_memory().unwrap();
+            let items = [h("a.md", Scope::Global, "e1.example.com is the staging host")];
+            harvest(&s, &items);
+            let sent = s.pending().unwrap();
+            let PendingOp::AddMemory { memory } = &sent[0].1 else { panic!("{sent:?}") };
+            assert_eq!(s.local_only_count().unwrap(), 0, "{error}"); // queued, not local only
+            let notes = apply_push_results(&s, &sent, &[refused(error)]).unwrap();
+            assert_eq!(s.pending_count().unwrap(), 0, "{error}");
+            let entry = s.harvest_get(&format!("{}a.md", P)).unwrap().unwrap();
+            if kept {
+                assert_eq!(notes, vec![format!(
+                    "relay refused memory {} (\"e1.example.com is the staging host\"): {error}; it stays on this machine only, never synced",
+                    memory.id
+                )]);
+                assert_eq!(s.live_memories().unwrap(), vec![memory.clone()], "{error}");
+                assert_eq!((entry.status, entry.memory_id.as_str()), (HarvestStatus::Synced, memory.id.as_str()), "{error}");
+                assert_eq!((s.held_back_count().unwrap(), s.local_only_count().unwrap()), (0, 1), "{error}");
+            } else {
+                assert_eq!(notes, vec![format!("relay refused memory {}: {error}", memory.id)]);
+                assert!(s.live_memories().unwrap().is_empty(), "{error}");
+                assert_eq!(entry.status, HarvestStatus::HeldBack, "{error}");
+                assert_eq!(s.local_only_count().unwrap(), 0, "{error}");
+            }
+            // The unchanged file is never queued again.
+            harvest(&s, &items);
+            assert_eq!(s.pending_count().unwrap(), 0, "{error}");
+        }
+        // A long first line is cut in the note.
+        let long = "x".repeat(80);
+        assert_eq!(excerpt(&format!("{long}\nsecond")), format!("{}…", "x".repeat(60)));
+        assert_eq!(excerpt("short"), "short");
+    }
+
     /// The Station's refusals its contract makes temporary (Astation
     /// `relay-server/src/knowledge_routes.rs` and `knowledge_store.rs` at
     /// 9eb5320): a field that doesn't match the account's encryption mode or
@@ -2273,13 +2350,13 @@ mod tests {
         let PendingOp::AddMemory { memory } = &sent[0].1 else { panic!("{sent:?}") };
         let id = &memory.id;
         assert_eq!(notes, vec![format!(
-            "relay refused memory {id} for now at {} syncs in a row since {} UTC: {}; Atem stopped retrying it (refused for good)",
+            "relay refused memory {id} (\"Prefers ripgrep\") for now at {} syncs in a row since {} UTC: {}; Atem stopped retrying it (refused for good); it stays on this machine only, never synced",
             REFUSED_FOR_NOW_SYNCS + 2, crate::memory::model::format_datetime(since), FOR_NOW[0]
         )]);
         assert_eq!(s.pending_count().unwrap(), 0);
-        // As any refusal for good: removed here, its file held back.
-        assert!(s.live_memories().unwrap().is_empty());
-        assert_eq!(s.held_back_count().unwrap(), 1);
+        // As any refusal for good of a fact: kept here, never synced.
+        assert_eq!(s.live_memories().unwrap().len(), 1);
+        assert_eq!((s.held_back_count().unwrap(), s.local_only_count().unwrap()), (0, 1));
     }
 
     /// A chunk refused as too large goes one op at a time; an op refused for

@@ -3819,7 +3819,7 @@ async fn a_refusal_the_op_itself_causes_is_refused_for_good() {
     let mut signed_off = device(dir.path(), EncryptionMode::On);
     signed_off.state(EncryptionMode::Off, None);
     let relay = Arc::new(Mutex::new(KeepingRelay::default()));
-    let (base, _log) = stub_relay(mode_checking(relay.clone(), "off", None)).await;
+    let (base, log) = stub_relay(mode_checking(relay.clone(), "off", None)).await;
     let s = Store::open_in_memory().unwrap();
     queue(
         &s,
@@ -3836,6 +3836,7 @@ async fn a_refusal_the_op_itself_causes_is_refused_for_good() {
         queue_skill(&s, skill, 0);
     }
     let (_home, ctx) = test_ctx();
+    std::fs::create_dir_all(ctx.home.join(".claude")).unwrap();
     let out = run_sync(
         &s,
         Some(&client_with(&base, &signed_off, signed_off.agent.clone())),
@@ -3848,9 +3849,7 @@ async fn a_refusal_the_op_itself_causes_is_refused_for_good() {
     assert_eq!(
         out.notes,
         vec![
-            format!(
-                "relay refused memory mem_e1: memory does not match the account encryption mode (its text starts with `e1.`, {off}"
-            ),
+            "relay refused memory mem_e1 (\"e1.example.com is the staging host\"): memory does not match the account encryption mode (its text starts with `e1.`, which the relay takes for an encrypted value while the account's encryption is off); it stays on this machine only, never synced".to_string(),
             format!(
                 "relay refused skill named v1: skill does not match the account encryption mode (a file's name starts with `e1.`, {off}"
             ),
@@ -3873,6 +3872,40 @@ async fn a_refusal_the_op_itself_causes_is_refused_for_good() {
             vec!["plain"]
         );
     }
+    // The refused fact is still here, local only, and still injected; the
+    // refused skills keep their local copies.
+    let kept = s.get_memory("mem_e1").unwrap().unwrap();
+    assert!(kept.is_valid() && kept.seq == 0);
+    assert_eq!(s.local_only_count().unwrap(), 1);
+    let block = std::fs::read_to_string(ctx.home.join(".claude/CLAUDE.md")).unwrap();
+    assert!(
+        block.contains("e1.example.com is the staging host")
+            && block.contains("staging listens on 8080"),
+        "{block}"
+    );
+    for name in ["named", "texted"] {
+        assert!(s.get_skill(Scope::Global, "", name).unwrap().is_some());
+    }
+    // Never sent again: the next sync posts nothing.
+    let posts = |log: &Log| {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _, _)| m == "POST")
+            .count()
+    };
+    let before = posts(&log);
+    let out = run_sync(
+        &s,
+        Some(&client_with(&base, &signed_off, signed_off.agent.clone())),
+        &ctx,
+        &NO_HARVEST,
+    )
+    .await
+    .unwrap();
+    assert!(out.notes.is_empty() && !out.relay_error, "{:?}", out.notes);
+    assert_eq!(posts(&log), before);
+    assert!(s.get_memory("mem_e1").unwrap().unwrap().is_valid());
 
     // After a rotation: a fact under the earlier key's hash of a project
     // this machine can't name.
@@ -3896,7 +3929,7 @@ async fn a_refusal_the_op_itself_causes_is_refused_for_good() {
     .unwrap();
     assert_eq!(
         out.notes,
-        vec!["relay refused memory mem_unknown: memory does not match the account encryption mode (its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept; `atem sync` in that project's checkout names it); not sent again".to_string()]
+        vec!["relay refused memory mem_unknown (\"deploys go through the bastion\"): memory does not match the account encryption mode (its project is kept as an earlier key's hash, a project this machine can't name, which the account's current key doesn't accept; `atem sync` in that project's checkout names it); it stays on this machine only, never synced".to_string()]
     );
     assert!(!out.relay_error && out.pushed == 3, "{:?}", out.notes);
     assert_eq!(s.pending_count().unwrap(), 0);
