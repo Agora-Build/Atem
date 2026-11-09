@@ -225,9 +225,11 @@ owner's local consent in `runtime.toml`.
   end to end nor authenticated at Atem's end (Atem takes Astation's word for
   being authenticated), so whoever ends that socket can act as the paired
   Astation there; agent collaboration refuses to run on such a host until
-  `atem pair verify` pins a list. Sender text can imitate Atem's own lines in
-  a rendered prompt until the agreed prompt framing ships (agent
-  collaboration, section 17).
+  `atem pair verify` pins a list. Atem's own lines in a rendered prompt are
+  framed (a tag per prompt, counted blocks, look-alikes of its marker escaped;
+  the delegated host-work design, III.2, and host-work v1 §4 "Rendering"), so
+  sender text can't imitate them; a principal with `control` can still write
+  anything directly (agent collaboration, section 17).
 
 ## 5. Remote launch
 

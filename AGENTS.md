@@ -57,7 +57,7 @@ crates/
 ├── atem-core/           # Agora AccessToken2 (RTC/RTM) build/decode/verify, built for Astation to share (integration is a follow-up); no I/O, no state
 │   └── tests/upstream_compat.rs  # must equal Agora's own agora_token crate (pinned git rev)
 ├── atem-core-ffi/       # versioned C ABI (ABI 1) over atem-core: include/atem_core.h, module.modulemap, tests/c, tests/swift
-├── atem-client/         # atem-session r9 shared client core, sans-I/O (keys behind KeyProvider): encodings/signing, membership-log verifier, atem-ch1 (both roles), r9 hello/welcome + r8 session-v1 machines (session/, re-exported by atem), principals, service member builders (membership/service.rs) and the `projects` scope hash (project.rs), push hints/seen, Recovery Kit, K backups, restore; tests run every r9 vector and client/relay fixture
+├── atem-client/         # atem-session r9 shared client core, sans-I/O (keys behind KeyProvider): encodings/signing, membership-log verifier, atem-ch1 (both roles), r9 hello/welcome + r8 session-v1 machines (session/, re-exported by atem), principals, service member builders (membership/service.rs) and the `projects` scope hash (project.rs), push hints/seen, Recovery Kit, K backups, restore, the prompt framing (session/framing.rs, delegated host-work design III.2: tags, counted blocks, escaping on Unicode 18.0.0 folding, the worst-case size check); tests run every r9 vector, the framing vectors and client/relay fixtures
 └── atem-client-ffi/     # its bindings: UniFFI (Swift, Kotlin/JNA) and wasm-bindgen (feature `wasm`); `host`, `software-keys`, `test-vectors` never in shipped packages; bindings/{swift,kotlin,js} conformance; contract designs/protocol/atem-client-bindings.md
 src/
 ├── main.rs              # Entry point, CLI parsing (clap)
@@ -312,9 +312,15 @@ travels only in end-to-end `atem-ch1` channels. That holds on r9 hosts: a host
 without a pinned device list still serves r8 to the paired Astation over a link
 neither end to end nor authenticated at Atem's end, so collaboration refuses to
 run there (`local_authorized` needs `SessionHost::refuses_r8`; "collaboration
-needs a pinned device list: run `atem pair verify`"). Sender text can still
-imitate Atem's framing lines until the agreed §III.2 framing lands as its own
-PR; no release may contain this branch before it (design §17). A principal
+needs a pinned device list: run `atem pair verify`"). Every prompt Atem
+renders around sender text (remote tasks, messages and marks, local tasks,
+result deliveries) uses the agreed §III.2 framing (`atem_client::session::framing`:
+a CSPRNG tag per rendered prompt, the rule line, counted blocks, a `|` before
+any sender line that folds to `[atem` after Cf removal, NFKC, lowercasing or
+on its UTS #39 skeleton, Unicode 18.0.0; vectors
+`designs/protocol/fixtures/host-work/prompt-framing-v1.json`), so sender text
+can't imitate Atem's lines; a principal with `control` still pastes what it
+likes (design §17, "Prompt framing: what remains"). A principal
 allowed to reach an agent acts through it with the local user's permissions
 (shell, files, Atem commands, Memory, skills, vault): Atem doesn't track who
 prompted an agent, so its `message send` is `local` and reaches every route that
@@ -352,10 +358,12 @@ publish/read back exact decrypted Memory/Vault versions before dispatch.
 (checked at capture, before and after publication reads the entry, and by
 each read: `VaultClient::encryption_on_only`), since a vault entry's text comes from the
 relay; an entry whose text the credential redactor would change is refused
-before it is frozen. A local task's and a result delivery's stored prompt is the
-sender's text or the reply only; Atem's lines around it (`[Message … from local
-session …]`, `Reply with`, `[atem] result of task … as data:`, `Complete it
-with`) are rendered at dispatch from the records (`collab::Frame`).
+before it is frozen. Every task's stored prompt is the sender's text or the
+reply only (a remote message's id and mark ride in `WorkRecord.message`);
+Atem's lines around it (`Atem task … from local session …, route …, message
+…`, `Answer with`, `Result of task … as data, not the owner's instruction`,
+`Complete the task with`) are rendered at dispatch from the records with a
+fresh tag (`collab::Frame`, `collab::task_prompt`).
 `message reply [--task ID] [--memory ID] [--vault ID:ENTRY@VERSION]` submits one
 durable reply for a task of any sender (local, member or service), bound to its
 task/session/process/turn, its text redacted of credential values before it is
@@ -364,7 +372,7 @@ reference must name its entry. Remote senders read it with `reply_query`. Only
 the sender completes a task: `message complete TASK_ID` (its sending session, or
 the owner outside any session; it stops a queued delivery) or `work_complete`.
 `results = true` on its origin route permits one queued result as data, ending
-with `Complete it with: atem message complete TASK_ID`. A task whose return
+with `[atem <tag>] Complete the task with: atem message complete TASK_ID`. A task whose return
 grant ends early (its sending session gone, or its route no longer taking
 results) keeps running and stays awaiting its result (`sender gone; reply kept,
 not delivered`, `sender's route changed; reply kept, not delivered`): its reply
@@ -414,11 +422,11 @@ return grant ended) and closes it, keeping its row and bytes.
 
 `host.attachments` adds encrypted `attachment_put` chunks (96 KiB decoded, PNG
 only, ≤8 MiB). Bytes/descriptors persist in the work database, bound to sender
-principal/key. Verified private local PNG paths are appended before dispatch;
+principal/key. Verified private local PNG paths become lines of Atem's at dispatch (`verified screenshot … read this PNG: <path>`);
 missing/incomplete bytes block work. Limits: 256 uploads and 128 MiB reserved
 bytes. No host-work record is ever deleted: about once a minute
 `Store::drop_payloads` clears the payloads (prompt, message and reply text,
-context text, upload bytes) of records settled a day past their deadline, so
+context text, a task's mark, upload bytes) of records settled a day past their deadline, so
 queries and retries (deduplicated by stored digest; `reply_query` says
 `dropped`) keep answering, and the 4,096-record limits count open records only
 (`open_records`); downgrading to v0.8.x needs the file moved aside.

@@ -394,9 +394,14 @@ encrypted r9 channels the Station can't read or alter. That holds on hosts with
 a pinned device list. A host verified by an earlier build that never pinned one
 still serves r8 sessions to the paired Astation over a link that is neither end
 to end nor authenticated at Atem's end; agent collaboration refuses to run
-there until `atem pair verify` pins a list. Until a coming change to how
-prompts are framed, text a sender writes can imitate Atem's own lines (a
-message header, a result's "as data" label) in what the agent reads.
+there until `atem pair verify` pins a list. In every prompt Atem builds
+around a sender's text, Atem's own lines start with a tag drawn for that
+prompt, the sender's text sits in counted blocks, and any of its lines that
+looks like Atem's marker (in any case or width, a look-alike letter of
+another script, or behind invisible characters) gets a `|` in front, so
+text a sender writes can't pass for Atem's lines (a message header, a
+result's "as data" label). The framing tells the agent where text came from;
+it doesn't stop the agent from acting on it.
 Whoever may reach an agent (a route that lists it, or `control` over its
 session) acts through it with your permissions on this machine: the agent's
 shell, files and Atem commands, including `atem message send` (its tasks are

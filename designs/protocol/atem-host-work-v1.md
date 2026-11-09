@@ -230,11 +230,12 @@ written `XXXX-XXXX-XXXX`. A task from `work_enqueue` reads:
   UTS #39 confusables skeleton starts with that of `[atem` (`[atern`), after
   leading white space. The folding data is Unicode 18.0.0. Nothing else in the
   sender's text changes.
-- **Two readings stricter than III.2's text.** The extra line breaks above;
-  and the `|`s a line already starts with are skipped before folding, so a
-  sender's `|[atem` reads `||[atem`: without it, `[atem` and `|[atem` would
-  both read `|[atem`, and the escaping couldn't be reversed. The skeleton is
-  UTS #39's own (it drops Default_Ignorable code points such as U+034F).
+- **Three readings stricter than III.2's text**, each escaping more lines,
+  never fewer: the extra line breaks above; the `|`s a line already starts
+  with are skipped before folding, so a sender's `|[atem` reads `||[atem`
+  (without it, `[atem` and `|[atem` would both read `|[atem`, and the
+  escaping couldn't be reversed); and the skeleton is UTS #39's own, which
+  drops Default_Ignorable code points such as U+034F that aren't Cf.
 - **Vectors.** `fixtures/host-work/prompt-framing-v1.json`: tags, escaping
   cases (III.2's folding cases), rendered prompts and the size check, run by
   `atem-client`'s tests.
