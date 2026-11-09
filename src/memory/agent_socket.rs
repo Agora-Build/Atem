@@ -1070,12 +1070,35 @@ fn harden_process() {
             eprintln!(
                 "cred agent: not locking memory (RLIMIT_MEMLOCK is too low); keys could reach swap"
             );
-        } else if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
-            eprintln!(
-                "cred agent: mlockall failed ({}); keys could reach swap",
-                std::io::Error::last_os_error()
-            );
+        } else if let Err(error) = lock_all_memory() {
+            eprintln!("cred agent: mlockall failed ({error}); keys could reach swap");
         }
+    }
+}
+
+/// Locks every page of the process, mapped now or later, so none can reach
+/// swap. Each page is locked as it is first touched (`MCL_ONFAULT`, Linux
+/// 4.4): a page that holds anything was touched, so it is locked before it
+/// holds it, and the pages never touched (most of the mapped executable,
+/// the unused parts of stacks and reservations) aren't read in just to be
+/// locked. A kernel without `MCL_ONFAULT` (EINVAL) gets every page faulted
+/// in and locked at once, as before.
+#[cfg(target_os = "linux")]
+fn lock_all_memory() -> std::io::Result<()> {
+    let all = libc::MCL_CURRENT | libc::MCL_FUTURE;
+    // SAFETY: mlockall takes flags only.
+    if unsafe { libc::mlockall(all | libc::MCL_ONFAULT) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EINVAL) {
+        return Err(error);
+    }
+    // SAFETY: as above.
+    if unsafe { libc::mlockall(all) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -3164,6 +3187,77 @@ mod tests {
             eventually(|| trims.load(SeqCst) > after),
             "a connection's end makes it trim"
         );
+    }
+
+    /// Where the limit lets the agent lock its memory, every page it maps is
+    /// locked (VmLck), but only the pages it touches are read in
+    /// (`MCL_ONFAULT`): most of the mapped executable never is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_locked_agent_reads_in_only_the_pages_it_touches() {
+        use std::os::unix::process::CommandExt;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) },
+            0
+        );
+        if limit.rlim_max != libc::RLIM_INFINITY && limit.rlim_max < 512 << 20 {
+            eprintln!(
+                "skipped: RLIMIT_MEMLOCK's hard limit is under 512 MiB (the agent locks nothing)"
+            );
+            return;
+        }
+        let dir = short_dir();
+        let home = dir.path().join("home");
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&home).unwrap();
+        make_private(&run);
+        let log_path = dir.path().join("a.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut command = std::process::Command::new(atem_binary());
+        command
+            .arg("cred-agent")
+            .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", &run)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        // SAFETY: setrlimit only, between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                let raised = libc::rlimit {
+                    rlim_cur: limit.rlim_max,
+                    rlim_max: limit.rlim_max,
+                };
+                if libc::setrlimit(libc::RLIMIT_MEMLOCK, &raised) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let agent = Reaped(command.spawn().unwrap());
+        let client = CredAgentClient::at(sock(&run));
+        assert!(eventually(|| client.status().is_ok()));
+        let status = std::fs::read_to_string(format!("/proc/{}/status", agent.0.id())).unwrap();
+        let kib = |name: &str| -> u64 {
+            status
+                .lines()
+                .find(|line| line.starts_with(name))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| value.parse().ok())
+                .unwrap()
+        };
+        let (locked, resident) = (kib("VmLck:"), kib("VmRSS:"));
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(locked > 0, "the agent locked nothing: {log}");
+        assert!(
+            resident * 2 < locked,
+            "{resident} KiB resident of {locked} KiB locked: the pages were all read in"
+        );
+        drop(agent);
     }
 
     #[test]
