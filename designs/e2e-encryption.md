@@ -1061,6 +1061,28 @@ doesn't cover it; it is covered by encryption becoming the only mode.
   under `K` with a random 24-byte nonce. As built, the associated data is
   `"<record id>\n<field>"` (`account_keys::field_aad`), so the relay can't
   move a ciphertext to another record or field.
+- **Skill versions (owner decisions on
+  [Atem #130](https://github.com/Agora-Build/Atem/issues/130), comment
+  6726291208).** A skill file's record id is `scope:name:version`
+  (`crypto::skill_record`), so its version is part of what each path and
+  file is bound to. A row stored under another version can't be opened by
+  any device.
+  - **The Station keeps the version** (Astation's pin pending). It stores
+    each push at the version it was sealed under, on the `/v2` routes only,
+    and answers a per-op `version_conflict { current }` when that version
+    exists. It stores nothing then and compares no content.
+  - **Atem reads that version once.** The same content hash and metadata
+    mean its own earlier write: applied, but the answer was lost or a crash
+    came before the local commit. That push is acked.
+  - **A concurrent edit** is re-based and sealed again under the next
+    version at the next send. Atem never re-uses an envelope under another
+    version and never falls back to plain text.
+  - **A Station that renumbers** (963c74b: `max + 1`) produces exactly the
+    unreadable rows this rule prevents.
+  - **Held rows.** A pulled skill row whose files don't open is held: never
+    applied, reported, and the pull goes on (designs/atem-memory.md "Skill
+    versions that don't open here"). A fact that doesn't open still fails
+    its page.
 - **Skill files on the wire (skill wire v2, F8; Atem #130).** Atem calls only
   the Station's `/api/skills/v2` routes. The contract is Astation's
   `designs/protocol/skill-file-wire-v2.md` in draft Astation PR #76, pinned at
@@ -1533,6 +1555,13 @@ the 1,024-op limit splits a request):
   hashed under that name when sealed, one op more than planned: a group
   holding u such facts can take up to ⌈u / 1,024⌉ requests more than the
   second bound. The first and the last bound hold as stated.
+- **Re-seals on a skill version conflict** (see "Skill versions" under "What
+  gets encrypted") come on top of these bounds. A push of the same skill that
+  a later request in this sync re-bases no longer matches what was sealed
+  ahead, so it is sealed again alone: two requests for its paths and hash,
+  then its files. Nothing else of its group is sealed again. A conflicted
+  push itself is sealed again at the next sync, as an op queued then. With
+  no conflict, nothing changes.
 
 For uniform facts this is exactly "1 per 1,024 plus one" up to 4,562 facts of
 two ops and 5,791 of three, and then one request more now and then, as the

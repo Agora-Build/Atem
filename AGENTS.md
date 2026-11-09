@@ -160,11 +160,11 @@ src/
 │   ├── gitguard.rs      #   never write tracked files; .git/info/exclude
 │   ├── harvest.rs       #   read Claude Code's auto-memory
 │   ├── skills_fs.rs     #   skill dirs, .atem-skill marker, drift
-│   ├── store.rs         #   local SQLite (~/.config/atem/knowledge.db) + queue
+│   ├── store.rs         #   local SQLite (~/.config/atem/knowledge.db) + queue + held skill versions (`held_skills`)
 │   ├── adapters.rs      #   Claude/Codex targets + apply report
 │   ├── api.rs           #   relay /api/memory and /api/skills/v2 client (no other skill routes; a 404 there is "update the Station")
 │   ├── skill_wire.rs    #   skill wire v2 (F8, #130): a sealed file as its e1 text (`e1-text`, "" an empty file), plain as `base64`; strict reader/writer
-│   ├── sync.rs          #   harvest → push → pull → apply
+│   ├── sync.rs          #   harvest → push → pull → apply; a skill push's `version_conflict` checked (own write acked, concurrent edit re-based), a skill row that doesn't open held
 │   ├── sync_pipeline_tests.rs # (test-only) ops sealed ahead in full Crypt groups, page prefetch: requests per phase, rewrites after sealing, failures, crashes, commit order
 │   ├── encoding.rs      #   length-prefixed fields for signed/bound inputs, base32
 │   ├── statements.rs    #   Astation-signed statements (P-256 verify)

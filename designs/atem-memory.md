@@ -145,10 +145,46 @@ for its hash, so a pulled fact or skill of that project is **unresolved**:
   knows that project's name.
 
 Only a well-formed hash is kept this way. Anything else still fails the page
-as before: a project that isn't `h1.` while encryption is on, a malformed
-`h1.` value, or a field that doesn't open. Migration (turning encryption on
-or off, rotation) and its read-back still need every project's name: a
+as before: a project that isn't `h1.` while encryption is on, or a malformed
+`h1.` value. A skill version whose files don't open is held (next section);
+a fact that doesn't open still fails its page. Migration (turning encryption
+on or off, rotation) and its read-back still need every project's name: a
 device that can't name one can't migrate the account.
+
+### Skill versions that don't open here (held)
+
+A sealed skill file is bound to `scope:name:version` (designs/e2e-encryption.md
+"What gets encrypted"), so a row stored under a version its files weren't
+sealed under can't be opened by any device. Since the Station keeps each
+push's version ("Relay API" below), that happens only with a Station that
+still renumbers, a corrupted row, or one under a key this device doesn't
+hold. Owner decision on [Atem #130](https://github.com/Agora-Build/Atem/issues/130):
+hold it and keep pulling.
+
+- **Which rows.** A pulled skill row is held when its files fail to
+  authenticate, name a key id this device doesn't hold, or are malformed
+  inside a well-formed row. It is never applied, installed or injected.
+  - A row that breaks skill wire v2's rules (encoding, envelope shape) still
+    refuses the page.
+  - A locked cred agent, a missing key, or plain text while encryption is on
+    still stops the pull, as before.
+  - A fact that doesn't open keeps today's behaviour: it fails its page.
+- **The pull goes on.** The held row commits with its page (`held_skills`
+  in `knowledge.db`: scope, project, name, version, seq and the reason; no
+  files and no plain text), and the cursor moves past it.
+  - A page opens in one `Crypt` request as before. Only when that request
+    fails because of a row's content are the page's rows opened one by one,
+    to find the rows to hold.
+  - A held version that a version this machine already read replaces isn't
+    recorded at all.
+- **Reported.** The sync prints one note per newly held version ("… can't
+  open on this machine and are held: deploy v2 (encrypted field
+  authentication failed) …"), once. `atem memory status` has an
+  `Unreadable:` line with the count and the versions while any is held.
+- **Cleared.** The hold goes when a readable version of that skill at or
+  above it is applied: a later version, a tombstone, or that version purged.
+  A held row's project moves with its skills when its hash is named, and goes
+  with them when the hash can never be named.
 
 ## Identity & auth
 
@@ -378,10 +414,36 @@ Rules:
   Within one batch, a later `delete`/`invalidate` that names the
   deduplicated id (as `id` or `superseded_by`) is rewritten to the
   `canonical_id`; atem rewrites its still-queued ops the same way.
-- **Skill pushes carry the client's `base_version`.** The server always
-  appends the push as the next version. If `base_version` is behind the
-  latest version, the response flags `superseded_concurrent: true` and the
-  CLI reports it; nothing is dropped.
+- **A skill push keeps its version** (skill wire v2; owner decision on
+  [Atem #130](https://github.com/Agora-Build/Atem/issues/130), comment
+  6726291208; Astation's pin is pending). Each push carries the `version`
+  its files were sealed under (`base_version + 1`). The Station stores it
+  at exactly that version, never renumbered. If that version exists it
+  answers the op `{"ok": false, "error": "version_conflict", "current": N}`
+  (`N` its latest version), stores nothing and compares no content.
+  - **Atem's own write.** Atem reads that version once (`/v2/version`). The
+    same content hash and metadata as the push mean an earlier send was
+    applied but never acknowledged (a lost answer, a crash before the local
+    commit). That push counts as stored and is acked. The files aren't
+    compared: every seal has fresh nonces.
+  - **A concurrent edit** (anything else). The push stays queued. It, every
+    later queued push of that skill and the local copy are re-based past
+    `N` (versions `N+1`, `N+2`, …). The note is the one for a concurrent
+    edit: "another machine pushed an edit at the same time; both versions
+    are kept and vN is now the latest". It is sealed again under its new
+    version at the next sync; an envelope is never re-used under another
+    version.
+  - **Superseded in the same batch.** If a later push of the same skill in
+    that batch landed, the conflicted older push is acked and never pushed
+    again.
+  - **Unchecked.** A conflict whose version can't be read stays queued as
+    it was, and that sync's push stops there.
+  - **Unchanged.** Deletes carry no version (a tombstone has no envelopes),
+    and the Station appends them as `max + 1`. Purges name existing versions.
+  - The Station at 963c74b still renumbers every push as `max + 1`
+    (`superseded_concurrent: true` when `base_version` is behind). A sealed
+    push renumbered there is a row no device can open, which is held (see
+    "Skill versions that don't open here").
 - **Skill `purge`** erases the files of the chosen versions: `files` becomes
   `{}`, `content_hash` becomes `''`, and each row takes a new `seq` so every
   machine sees the change. Purging the latest version also deletes the skill.
@@ -582,7 +644,8 @@ atem skill purge <name> [--version <n> | --all-versions]
 atem memory status                  # account, machine, pending ops, last sync, targets,
                                     # held-back memories, credential findings,
                                     # facts with more than one valid successor,
-                                    # rows of projects not known here yet
+                                    # rows of projects not known here yet,
+                                    # held skill versions that don't open here
 ```
 
 - `<date>` is `YYYY-MM-DD` (midnight UTC) or unix seconds. `<id>` for `replace`, `invalidate`, `rm`, `purge` and `list --history` is a full id or a unique prefix, with or without `mem_` (the Codex block's short id works), or the listing form `<head>…<tail>` (`..` works in place of `…`).
@@ -614,6 +677,14 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - 503: the relay is temporarily unavailable (e.g. its database).
    - 413 on a chunk: its ops are retried one at a time. A single op that is
      still too large stays queued with a note and is never acked.
+   - A skill push answered `version_conflict` (see "Relay API"): one GET of
+     that version before the request's results are applied.
+     - Atem's own earlier write is acked.
+     - A concurrent edit stays queued, re-based with every later queued push
+       of that skill. A push that a later request in this sync re-bases is
+       sealed again: these are the only extra `Crypt` requests a conflict
+       costs.
+     - A conflict that couldn't be checked stays queued and stops the push.
 
    While the account is encrypted, the ops are sealed ahead of their requests,
    in groups of whole requests (at most four cred-agent `Crypt` requests'
@@ -665,7 +736,9 @@ atem memory status                  # account, machine, pending ops, last sync, 
    `superseded_by` locally (a local invalidation not yet on the relay is
    kept); the search index follows through triggers. A row of a project this
    machine can't name is kept unresolved (see "Projects not known
-   here yet"); it never stops the pull.
+   here yet"); it never stops the pull, and neither does a skill version
+   that doesn't open here, which is held (see "Skill versions that don't
+   open here").
 4. **Resolve** unresolved rows whose project name is now known (recorded in
    `project_names.json`, or learned now: the checkout the sync runs in, and
    after a rotation the projects this machine already knows), and drop
