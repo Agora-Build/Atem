@@ -136,6 +136,23 @@ struct VersionPage {
 /// all (compare-and-set; Astation PR #76 at 89a2d50, Atem #130).
 pub const VERSION_CONFLICT: &str = "version_conflict";
 
+/// The per-op refusals the Station's contract makes temporary: an op whose
+/// protected fields don't match the encryption mode or key the Station has
+/// for the account (a mode change, a key rotation or a migration racing the
+/// push). The route checks each op against the state it read for the batch
+/// (`memory …` / `skill does not match the account encryption mode`), and
+/// the store repeats the check inside its write transaction (`content does
+/// not match …`): Astation `relay-server/src/knowledge_routes.rs` and
+/// `knowledge_store.rs` at 9eb5320. Every other per-op refusal is permanent
+/// (`designs/protocol/skill-file-wire.md` at 89a2d50: "Policy and store
+/// refusals remain per operation; transient failures remain HTTP 503"), and
+/// so is any text not listed here.
+pub const TEMPORARY_REFUSALS: [&str; 3] = [
+    "memory does not match the account encryption mode",
+    "skill does not match the account encryption mode",
+    "content does not match the account encryption mode",
+];
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OpResult {
     pub ok: bool,
@@ -189,6 +206,11 @@ pub const MAX_SKILL_VERSION: i64 = 9_007_199_254_740_991;
 impl OpResult {
     pub fn is_version_conflict(&self) -> bool {
         !self.ok && self.error.as_deref() == Some(VERSION_CONFLICT)
+    }
+
+    /// A refusal for now (`TEMPORARY_REFUSALS`): the op stays queued.
+    pub fn is_temporary_refusal(&self) -> bool {
+        !self.ok && self.error.as_deref().is_some_and(|error| TEMPORARY_REFUSALS.contains(&error))
     }
 }
 

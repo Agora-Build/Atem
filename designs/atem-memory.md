@@ -260,8 +260,9 @@ MVP.
   credential is held back, and the old memory is invalidated with no
   successor.
 - **Held back and excluded:** a file that fails the secret check is
-  recorded as `held_back` and isn't synced. A memory the relay refuses is
-  also recorded as `held_back`. A purged memory's file is recorded as
+  recorded as `held_back` and isn't synced. A memory the relay refuses for
+  good is also recorded as `held_back` (one refused for now stays queued:
+  see "Sync algorithm"). A purged memory's file is recorded as
   `excluded`, so it isn't harvested again. Either status is cleared, and
   the file checked again, only when its content changes.
 - **No echo:** when atem applies memory to Claude on a machine, it skips
@@ -441,8 +442,8 @@ Rules:
     `atem skill restore` bases on the newest of the relay's history (which
     lists tombstones and purged versions) and the local copy. A base that
     is behind comes back as a conflict and is corrected from `N` below.
-    So does a base ahead of the Station: a push it refused per op is acked,
-    which leaves the local copy at a version it never stored, and a delete
+    So does a base ahead of the Station: a push it refused per op for good
+    is acked, which leaves the local copy at a version it never stored, and a delete
     of a skill it doesn't have appends nothing there.
   - **Atem's own write.** atem fetches its attempted version once
     (`/api/skills/version`). The same content hash and metadata as the push
@@ -737,8 +738,24 @@ atem memory status                  # account, machine, pending ops, last sync, 
    the last op sent. Apply `canonical_id` rewrites and remove the
    ops the server answered, in one local transaction per request, committed
    before the ops count as pushed (an interrupted one leaves the request's ops
-   queued, sent again next time). A per-op refusal is permanent and is removed
-   (with a note); a failed request (network error, any HTTP error) leaves
+   queued, sent again next time). A per-op refusal is either for now or for
+   good, as the Station's contract says (Astation `knowledge_routes.rs` and
+   `knowledge_store.rs` at 9eb5320; `skill-file-wire.md` at 89a2d50: policy
+   and store refusals are per op, transient failures are a 503):
+
+   | Refusal (the op's `error`) | Kind | What Atem does |
+   |---|---|---|
+   | `memory does not match the account encryption mode`, `skill does not match the account encryption mode` (the route's check against the account's mode and key as the Station read them for the batch), `content does not match the account encryption mode` (the store's repeat of it in its write transaction) | for now: a mode change, a key rotation or a migration racing the push | queued as it was, with a note; nothing more of that kind (memories, or skills) goes out in that sync, so it is sent once per sync and nothing after it lands first; sealed again and sent at the next sync, under the mode and key Atem has then |
+   | `version_conflict` | settled (see "Relay API") | |
+   | `invalid memory`, `invalid skill`, `invalid base64`, `invalid skill version`, `reserved token`, `possible credential: …`, `id conflict`, any other text or none | for good | acked, with a note naming the op and the reason; a refused add is removed here and its harvested file recorded `held_back` |
+
+   An op refused for now stays queued with what the batch did after it:
+   a later delete of that memory, or a later delete of that skill, a purge
+   of all its versions or of its version, or a later push of it, that
+   landed in the same batch withdraws it (acked, never sent: deleted or
+   purged content never goes back to the relay). A landed invalidation of
+   that memory (the Station had no such row, so it changed nothing) stays
+   queued too, to go again after the add. A failed request (network error, any HTTP error) leaves
    the ops queued and stops that group, keeping queue order:
    - 401: the relay didn't recognize the Astation session (see Identity &
      auth) — reconnect atem to the Astation, then sync again.
@@ -1024,6 +1041,11 @@ lives.
   their page (dropped unapplied with it when the page before fails), and an
   op whose project hash is named after it was sealed is sealed again under
   its name.
+- **Refusals:** a refusal for now keeps the op queued (a memory add stays
+  live, its harvested file synced), sent once per sync, and the edit lands
+  at its version at the next; a refusal for good is acked with its note;
+  what lands after a refusal for now in the same batch (a delete or purge
+  withdraws it, an invalidation of its memory follows it).
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge
