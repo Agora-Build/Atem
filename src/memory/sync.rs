@@ -1440,6 +1440,8 @@ pub async fn run_sync(store: &Store, client: Option<&KnowledgeClient>, ctx: &Ctx
     }
     match client {
         Some(c) => {
+            // Never from sealed to plain text within this sync.
+            let c = &c.for_sync();
             push_all(store, c, &mut out).await?;
             if !out.offline {
                 pull_all(store, c, &mut out).await?;

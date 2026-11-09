@@ -294,6 +294,42 @@ pub struct KnowledgeClient {
     astation_id: String,
     http: reqwest::Client,
     encryption_with: Option<(crate::paths::CredPaths, std::sync::Arc<dyn crate::memory::cred_agent::CredAgentApi>)>,
+    /// Set for one sync (`for_sync`), shared by its clones.
+    sync_floor: Option<std::sync::Arc<std::sync::Mutex<SyncFloor>>>,
+}
+
+/// Why a sync that started encrypted stops when the account's state would
+/// have it send or accept plain text.
+pub const NO_PLAIN_AFTER_SEALED: &str = "this sync started end-to-end encrypted, and the account's encryption state changed during it (encryption turned off, this device's verification removed, or another data account), so nothing more is sent or accepted in plain text this sync; the rest stays queued. Check `atem status`, then sync again.";
+
+/// What one sync has seen of the account's encryption (`for_sync`): the
+/// data account it encrypted for, once it read an encrypting state (at its
+/// start, or at any seal or open since).
+#[derive(Debug, Default)]
+struct SyncFloor {
+    encrypted_for: Option<String>,
+}
+
+impl SyncFloor {
+    /// Admits a state just read (whether it encrypts, and its data account),
+    /// or refuses one that would switch the sync to plain text: not
+    /// encrypting (off, disabling, an unverified device), or another data
+    /// account. A state with no signed account state never gets here (it is
+    /// an error already).
+    fn admit(&mut self, encrypts: bool, data_account: &str) -> Result<(), ApiError> {
+        match &self.encrypted_for {
+            Some(account) if !encrypts || account != data_account => {
+                Err(ApiError::Encryption(NO_PLAIN_AFTER_SEALED.into()))
+            }
+            Some(_) => Ok(()),
+            None => {
+                if encrypts {
+                    self.encrypted_for = Some(data_account.to_string());
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// `ops` with every project pulled as a hash this Atem has named since put
@@ -403,7 +439,25 @@ impl KnowledgeClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             encryption_with: None,
+            sync_floor: None,
         }
+    }
+
+    /// This client for one sync, which never switches from sealed to plain
+    /// text: once the sync has read the account's state as encrypting (`on`
+    /// or `enabling`: at its start, here, or at any seal or open since),
+    /// every later read of a state that would send or accept plain text
+    /// (off, disabling, this device unverified, another data account) fails
+    /// with `NO_PLAIN_AFTER_SEALED`, so nothing more is sealed, sent, opened
+    /// or acked. The state is read again at each chunk and page as before
+    /// (a new key is followed). A sync that starts with encryption off, and
+    /// never sees it encrypting, is unchanged.
+    pub fn for_sync(&self) -> Self {
+        let client = Self { sync_floor: Some(Default::default()), ..self.clone() };
+        // The state it starts under; one that can't be read latches nothing
+        // (every later read fails the same way).
+        let _ = client.encryption();
+        client
     }
 
     
@@ -440,13 +494,20 @@ impl KnowledgeClient {
         Ok(resp)
     }
 
+    /// The account's encryption state now (read at every seal and open);
+    /// during a sync, admitted by its `SyncFloor` first.
     fn encryption(&self) -> Result<EncryptionContext, ApiError> {
-        if let Some((paths, agent)) = &self.encryption_with {
-            return EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone())
-                .map_err(ApiError::from);
+        let encryption = if let Some((paths, agent)) = &self.encryption_with {
+            EncryptionContext::for_astation_with(&self.astation_id, paths, agent.clone())
+        } else {
+            EncryptionContext::for_astation(&self.astation_id)
         }
-        EncryptionContext::for_astation(&self.astation_id)
-            .map_err(ApiError::from)
+        .map_err(ApiError::from)?;
+        if let Some(floor) = &self.sync_floor {
+            floor.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .admit(encryption.should_encrypt(), &encryption.data_account)?;
+        }
+        Ok(encryption)
     }
 
     /// The state ops sealed now would be sealed under, and `ops` as they
@@ -896,6 +957,29 @@ mod tests {
         assert_eq!(purge_all["versions"], serde_json::Value::Null);
         let purge_one = op_to_wire(&PendingOp::PurgeSkill { scope: Scope::Global, project: String::new(), name: "demo".into(), versions: Some(vec![2]) });
         assert_eq!(purge_one["versions"], json!([2]));
+    }
+
+    /// Once a sync read an encrypting state, a state that isn't (off,
+    /// disabling, unverified) or names another data account is refused; a
+    /// new key under the same account is not a switch. Before that, a sync
+    /// that started off goes on as it did.
+    #[test]
+    fn a_sync_never_switches_from_sealed_to_plain_text() {
+        let refused = |floor: &mut SyncFloor, encrypts, account| match floor.admit(encrypts, account) {
+            Err(ApiError::Encryption(note)) => note == NO_PLAIN_AFTER_SEALED,
+            _ => false,
+        };
+        let mut floor = SyncFloor::default();
+        assert!(floor.admit(false, "acct-1").is_ok());
+        assert!(floor.admit(false, "acct-1").is_ok());
+        assert!(floor.admit(true, "acct-1").is_ok());
+        assert!(floor.admit(true, "acct-1").is_ok());
+        assert!(refused(&mut floor, false, "acct-1"));
+        assert!(refused(&mut floor, true, "acct-2"));
+        assert!(refused(&mut floor, false, "astation-id-when-unverified"));
+        // Still refused later: the floor never lowers.
+        assert!(refused(&mut floor, false, "acct-1"));
+        assert!(floor.admit(true, "acct-1").is_ok());
     }
 
     #[test]

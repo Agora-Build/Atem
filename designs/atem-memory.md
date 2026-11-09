@@ -785,7 +785,9 @@ atem memory status                  # account, machine, pending ops, last sync, 
    earlier request's `canonical_id` rewrite, or another writer, may have
    changed or removed it, and a project hash it carries may have been named
    since: see "Projects not known here yet") and the account's mode, key and
-   data account are unchanged; otherwise it is sealed again first. Before a request with ops sealed by an earlier
+   data account are unchanged; otherwise it is sealed again first, under a
+   new key or from plain text to sealed, never from sealed to plain text
+   (see "No switch to plain text within a sync" below). Before a request with ops sealed by an earlier
    `Crypt` request is sent, the cred agent must still be unlocked (a status
    on the agent connection), so `atem cred lock` stops the push within one
    request, as when each request was sealed just before it was sent; a
@@ -811,8 +813,9 @@ atem memory status                  # account, machine, pending ops, last sync, 
    open. A page opened before `atem cred lock`, a mode or key change or the
    loss of this device's verification is still applied (its plain text is
    already in the process): at most one page more than when each page was
-   opened just before it was applied; the next page's open is refused or
-   follows the new state. Cursors are
+   opened just before it was applied; the next page's open is refused, or
+   follows a new key (never a state that accepts plain text in a sync that
+   started encrypted: see below). Cursors are
    kept per account (`memory_cursor:<astation_id>`,
    `skill_cursor:<astation_id>`), so pairing with a different Astation
    pulls that account from 0; the legacy unkeyed cursor is ignored.
@@ -836,6 +839,33 @@ atem memory status                  # account, machine, pending ops, last sync, 
    (owner decision 2026-11-08), not implemented:** only while the account's
    encryption is on, a transition measure until encryption is the only mode
    (next section).
+
+**No switch to plain text within a sync.** The account's encryption state
+is read again at every chunk sealed and every page opened (so a new key is
+followed). Once a sync has read it as encrypting (`on` or `enabling`: at the
+sync's start, or at any seal or open since), a later read of a state that
+would send or accept plain text stops it: `off` or `disabling`, this device's
+verification removed (an unpair: unverified devices are `off`), or another
+data account. No signed state at all is an error as before, which stops it
+too.
+- **Push:** the chunk it would have sealed again is never sent, and nothing
+  after it; nothing more is acked. The chunk in flight, sealed before the
+  change, has its results applied first. The rest stays queued.
+- **Pull:** the page it would have opened is never applied (its rows are
+  never accepted as plain text), and the cursor stays at the last page
+  applied.
+- The resolve step ("Projects not known here yet") stops the same way.
+- The note says the sync started end-to-end encrypted and the state changed
+  during it, and to check `atem status`, then sync again. The sync is
+  incomplete ("last sync" isn't recorded). The next sync starts from the new
+  state.
+- A sync that starts with encryption off (or disabling, or an unverified
+  device) and never reads it encrypting is unchanged; the planned
+  "encryption only" work removes that case.
+- The encryption migration's steps (the memory and skill rewrite, the vault
+  rewrite, each read-back) each read the state once and use it for every
+  batch; they never re-read it per batch, so a rewrite under `enabling`
+  never writes plain text.
 
 ## Injection into agents requires encryption On (planned)
 
@@ -1063,6 +1093,12 @@ lives.
   a queued push or an unsettled or coalesced conflict, and goes once a sync
   settled it; `--all-versions` is never held up; the question names the
   version's author machine and time.
+- **No switch to plain text:** the state goes from on to off, or to this
+  device unverified, between two chunks of one push (the second chunk is
+  never sent, nothing plain reaches the relay) or between two pulled pages
+  (the second page's plain rows are never accepted); after on, a state that
+  isn't encrypting or names another data account is refused, and a sync
+  that starts off is unchanged.
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge

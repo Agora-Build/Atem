@@ -546,21 +546,85 @@ async fn an_op_changed_or_acked_after_it_was_sealed_is_sealed_again_or_dropped()
     assert_eq!(s.pending_count().unwrap(), 0);
 }
 
-/// The account's mode changes while chunk 1 is in flight, once chunk 2 (the
-/// next group) was sealed, or left plain, under the old one: chunk 2 goes out
-/// as the new mode says, sealed again, as it did when each chunk was sealed
-/// just before its POST.
+/// The account's mode turns on while chunk 1 is in flight, once chunk 2 (the
+/// next group) was left plain under off: chunk 2 goes out sealed, as it did
+/// when each chunk was sealed just before its POST. (The other way, a sync
+/// that started sealed never goes on in plain text: see
+/// `a_push_that_started_sealed_never_goes_on_in_plain_text`.)
 #[tokio::test]
 async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
-    for (from, to) in [
-        (EncryptionMode::Off, EncryptionMode::On),
-        (EncryptionMode::On, EncryptionMode::Off),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let mut device = device(dir.path(), EncryptionMode::On);
-        if from == EncryptionMode::Off {
-            device.state(EncryptionMode::Off, None);
+    let dir = tempfile::tempdir().unwrap();
+    let mut device = device(dir.path(), EncryptionMode::On);
+    device.state(EncryptionMode::Off, None);
+    let recorder = Recorder::new(device.agent.clone());
+    let device = Arc::new(Mutex::new(device));
+    let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+    let keeping = keeping_relay(relay.clone());
+    let (switch, first) = (device.clone(), AtomicBool::new(true));
+    let (base, log) = stub_relay(Box::new(move |m, p, body| {
+        if m == "POST" && first.swap(false, Ordering::SeqCst) {
+            // Chunk 2 was left plain without the agent, in the same poll
+            // that sent chunk 1, before this relay could run.
+            switch.lock().unwrap().state(EncryptionMode::On, Some(KID));
         }
+        keeping(m, p, body)
+    }))
+    .await;
+    let s = Store::open_in_memory().unwrap();
+    queue(&s, (0..60).map(|i| fact(i, true)));
+    let (_home, ctx) = test_ctx();
+    let client = {
+        let device = device.lock().unwrap();
+        client_with(&base, &device, recorder.clone())
+    };
+    let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+        .await
+        .unwrap();
+    assert_eq!(out.pushed, 60, "{:?}", out.notes);
+    let posts = posted_ops(&log);
+    assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 10]);
+    let sealed =
+        |op: &serde_json::Value| op["memory"]["content"].as_str().unwrap().starts_with("e1.");
+    assert!(posts[0].iter().all(|op| !sealed(op)));
+    assert!(posts[1].iter().all(sealed));
+    // No request until chunk 2 is sealed again under on.
+    let pushed: Vec<usize> = recorder.seals_and_opens().0.iter().map(|c| c.ops).collect();
+    assert_eq!(pushed, vec![30]);
+}
+
+/// What takes a device out of encryption mid-sync: the signed state turns
+/// off, or this device's verification is removed (an unpair).
+#[derive(Debug, Clone, Copy)]
+enum Downgrade {
+    Off,
+    Unverified,
+}
+
+impl Downgrade {
+    const ALL: [Downgrade; 2] = [Downgrade::Off, Downgrade::Unverified];
+
+    fn apply(self, device: &mut UnlockedDevice) {
+        match self {
+            Downgrade::Off => device.state(EncryptionMode::Off, None),
+            Downgrade::Unverified => crate::memory::trust::TrustStore::default()
+                .save_to(&device.paths.trust)
+                .unwrap(),
+        }
+    }
+}
+
+/// The note a sync that started sealed stops with.
+const STOPPED: &str = "this sync started end-to-end encrypted";
+
+/// The account's state leaves encryption (off, or this device unverified)
+/// while chunk 1 is in flight, once chunk 2 was sealed ahead: chunk 2 is
+/// never sent, in plain text or at all, and stays queued with a note; no
+/// plain text reaches the relay.
+#[tokio::test]
+async fn a_push_that_started_sealed_never_goes_on_in_plain_text() {
+    for to in Downgrade::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let device = device(dir.path(), EncryptionMode::On);
         let recorder = Recorder::new(device.agent.clone());
         let device = Arc::new(Mutex::new(device));
         let relay = Arc::new(Mutex::new(KeepingRelay::default()));
@@ -568,20 +632,16 @@ async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
         let (switch, sealed, first) = (device.clone(), recorder.clone(), AtomicBool::new(true));
         let (base, log) = stub_relay(Box::new(move |m, p, body| {
             if m == "POST" && first.swap(false, Ordering::SeqCst) {
-                // Chunk 2 is sealed first: under on, its request has come
-                // back; under off it was left plain without the agent, in the
-                // same poll that sent chunk 1, before this relay could run.
-                if from == EncryptionMode::On {
-                    assert!(wait_for(Duration::from_secs(2), || sealed.calls().len() == 2));
-                }
-                let kid = (to == EncryptionMode::On).then_some(KID);
-                switch.lock().unwrap().state(to, kid);
+                // Chunk 2's request (under on) has come back first.
+                assert!(wait_for(Duration::from_secs(10), || sealed.calls().len() == 2));
+                to.apply(&mut switch.lock().unwrap());
             }
             keeping(m, p, body)
         }))
         .await;
         let s = Store::open_in_memory().unwrap();
         queue(&s, (0..60).map(|i| fact(i, true)));
+        let queued = s.pending().unwrap();
         let (_home, ctx) = test_ctx();
         let client = {
             let device = device.lock().unwrap();
@@ -590,33 +650,95 @@ async fn a_mode_change_after_sealing_seals_again_under_the_new_mode() {
         let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
             .await
             .unwrap();
-        assert_eq!(out.pushed, 60, "{from:?} → {to:?}: {:?}", out.notes);
+        // Only chunk 1 went, sealed; chunk 2 stays queued as it was.
         let posts = posted_ops(&log);
-        assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 10]);
-        let sealed =
-            |op: &serde_json::Value| op["memory"]["content"].as_str().unwrap().starts_with("e1.");
-        assert!(
-            posts[0]
-                .iter()
-                .all(|op| sealed(op) == (from == EncryptionMode::On)),
-            "{from:?} → {to:?}"
+        assert_eq!(
+            posts.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![50],
+            "{to:?}"
         );
+        assert!(out.relay_error, "{to:?}: {:?}", out.notes);
+        assert_eq!(out.pushed, 50, "{to:?}: {:?}", out.notes);
         assert!(
-            posts[1]
-                .iter()
-                .all(|op| sealed(op) == (to == EncryptionMode::On)),
-            "{from:?} → {to:?}"
+            out.notes.iter().any(|n| n.contains(STOPPED)),
+            "{to:?}: {:?}",
+            out.notes
         );
-        // The push's requests: under on, both groups (chunk 2's ciphertext is
-        // dropped for its plain form); under off, none until chunk 2 is
-        // sealed again under on.
-        let pushed: Vec<usize> = recorder.seals_and_opens().0.iter().map(|c| c.ops).collect();
-        let want = if from == EncryptionMode::On {
-            vec![150, 30]
-        } else {
-            vec![30]
+        assert_eq!(s.pending().unwrap(), queued[50..].to_vec(), "{to:?}");
+        let r = relay.lock().unwrap();
+        assert_eq!(r.rows.len(), 50, "{to:?}");
+        assert!(
+            r.rows.values().all(|m| m.content.starts_with("e1.")
+                && m.content_hash.starts_with("h1.")
+                && m.project.starts_with("h1.")),
+            "{to:?}"
+        );
+    }
+}
+
+/// The state leaves encryption between two pulled pages (page 1 opened
+/// under on, page 2 not opened yet): page 2's rows, plain text from the
+/// relay, are never accepted; page 1 stays applied and the cursor stays at
+/// its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_that_started_sealed_never_takes_plain_rows_after_a_state_change() {
+    for to in Downgrade::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let device = device(dir.path(), EncryptionMode::On);
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        seed_sealed(&relay, &device, PULL_LIMIT as usize);
+        {
+            let mut r = relay.lock().unwrap();
+            for i in 0..3 {
+                r.put(valid(
+                    &format!("mem_plain{i}"),
+                    &format!("injected plain fact {i}"),
+                ));
+            }
+        }
+        let recorder = Recorder::new(device.agent.clone());
+        let device = Arc::new(Mutex::new(device));
+        let keeping = keeping_relay(relay.clone());
+        let (switch, opened) = (device.clone(), recorder.clone());
+        let (base, _log) = stub_relay(Box::new(move |m, p, body| {
+            if m == "GET" && p.starts_with("/api/memory?") && since(p) == PULL_LIMIT as i64 {
+                // Page 1 was opened under on; page 2 is opened after this answer.
+                assert!(wait_for(Duration::from_secs(10), || opened
+                    .calls()
+                    .iter()
+                    .any(|c| c.opens && c.ok)));
+                to.apply(&mut switch.lock().unwrap());
+            }
+            keeping(m, p, body)
+        }))
+        .await;
+        let s = Store::open_in_memory().unwrap();
+        let (_home, ctx) = test_ctx();
+        let client = {
+            let device = device.lock().unwrap();
+            client_with(&base, &device, recorder.clone())
         };
-        assert_eq!(pushed, want, "{from:?} → {to:?}");
+        let out = run_sync(&s, Some(&client), &ctx, &NO_HARVEST)
+            .await
+            .unwrap();
+        let stored = s.history_memories().unwrap();
+        assert!(
+            !stored.iter().any(|m| m.content.contains("injected")),
+            "{to:?}"
+        );
+        assert!(out.relay_error, "{to:?}: {:?}", out.notes);
+        assert!(
+            out.notes.iter().any(|n| n.contains(STOPPED)),
+            "{to:?}: {:?}",
+            out.notes
+        );
+        assert_eq!(stored.len(), PULL_LIMIT as usize, "{to:?}");
+        assert_eq!(
+            s.get_state(&crate::memory::store::memory_cursor_key(ASTATION_ID))
+                .unwrap(),
+            PULL_LIMIT as i64,
+            "{to:?}"
+        );
     }
 }
 
