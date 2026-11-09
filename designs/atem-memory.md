@@ -313,6 +313,10 @@ there's no window where it's readable by others:
 - `sync_state`: the last pulled `seq`, per account (paired Astation id), and
   the last clean sync time.
 - `harvest_map`: see above.
+- **Planned (owner decision 2026-11-08), not implemented:** an author column
+  (the authoring device's id) and a held state on `memories` and `skills`, for
+  the quarantine at the forced migration (see "Injection into agents requires
+  encryption On (planned)"). Rows with no author are held.
 - Drift is detected with the hash stored in each skill's `.atem-skill`
   marker.
 
@@ -577,8 +581,8 @@ atem memory status                  # account, machine, pending ops, last sync, 
    network or HTTP error. Pulled invalidations set `invalid_at` and
    `superseded_by` locally (a local invalidation not yet on the relay is
    kept); the search index follows through triggers. A row of a project this
-   machine can't name is kept unresolved (see "Projects not on this
-   machine"); it never stops the pull.
+   machine can't name is kept unresolved (see "Projects not known
+   here yet"); it never stops the pull.
 4. **Resolve** unresolved rows whose project name is now known (recorded in
    `project_names.json`, or learned now: the checkout the sync runs in, and
    after a rotation the projects this machine already knows), and drop
@@ -586,7 +590,95 @@ atem memory status                  # account, machine, pending ops, last sync, 
    lookup, the cred agent or the store) only leaves them unresolved, with a
    note.
 5. **Apply** memory blocks and skills to every discovered agent, and print
-   the report. Invalid facts and unresolved rows are skipped.
+   the report. Invalid facts and unresolved rows are skipped. **Planned
+   (owner decision 2026-11-08), not implemented:** only while the account's
+   encryption is on, a transition measure until encryption is the only mode
+   (next section).
+## Injection into agents requires encryption On (planned)
+
+**Planned (owner decision 2026-11-08), not implemented.** This is a
+**transition measure**, not the permanent design. It applies only until
+encryption becomes the only mode and `off` is removed
+([e2e-encryption.md](e2e-encryption.md#encryption-becomes-the-only-mode-planned),
+Atem issue #130); after that every account is `on`, the gate is gone, and what
+remains is the `on` mode's own protection. Until an account is migrated, it
+loses all injection: the cost described below, its own facts included, is
+accepted for that period.
+
+Today the apply step (`sync::apply_all`, run by `atem sync`, by
+`atem memory apply` and after a local change) writes every valid fact into the
+managed blocks and every live skill into the skill directories of each
+discovered agent, whatever the account's encryption mode. With encryption off
+(the default) the relay can plant a plain-text fact or a skill, and it reaches
+the instructions of every paired machine's agents. With it on, Atem already
+refuses any downloaded field that isn't encrypted
+([e2e-encryption.md](e2e-encryption.md#the-astation-setting)), but memory
+writes aren't signed yet, so the relay can still serve an older ciphertext or
+change a row's unsigned metadata.
+
+Planned:
+
+- **The gate.** Atem writes relay-synced facts into the managed blocks and
+  skills into the skill directories only while the account's signed encryption
+  mode is `on` (`verification::account_mode`, read from `cred/state.json`,
+  checked at every apply). `off`, `enabling` and `disabling` close it, because
+  those modes accept plain text; so does a device that isn't verified, has no
+  signed state yet, or can't read it. The table is in
+  [e2e-encryption.md](e2e-encryption.md#injection-into-agents-by-mode).
+- **What a closed gate does.** No fact and no skill is written. A managed block
+  keeps its place and its standing instruction lines (the credential
+  instruction, and Codex's capture and replace lines) and gets one fixed line
+  saying Atem Memory is not injected because end-to-end encryption is not on,
+  and where to turn it on (Astation, Settings > Security); the line holds
+  nothing from the store. A skill directory that Atem wrote earlier (its
+  `.atem-skill` marker is there and it was not edited) is removed as a deleted
+  skill's is; an edited one is kept and reported as drift is. Nothing outside
+  the markers changes.
+- **What stays in every mode.** Pushing, pulling, the pending queue,
+  harvesting, `memory add|replace|invalidate|rm|purge`, `memory list|search`,
+  `skill add|list|history|restore|rm`. Explicit reads are not gated: whoever
+  runs `atem memory search` or `atem skill list` sees what the store holds. Only the
+  automatic injection into agents' instruction files and skill directories is.
+- **Local facts are gated too.** The store can't tell this machine's own
+  facts from relay-sourced ones: a row has no origin column. `seq` is 0 until
+  the relay acknowledges a push, but a pulled row carries a relay-chosen `seq`
+  (zero included), a pulled row replaces a local row with the same id
+  (`Store::upsert_memory`: "the relay is authoritative"), and a fact written
+  here is the same as a pulled one once the relay has acknowledged it. So the
+  gate covers every fact and skill in the store: a fact written on this
+  machine is not injected, here or elsewhere, until encryption is on. Per-row
+  author tracking (below) later gives each new row its author; a row with none
+  stays relay-sourced.
+- **Atem says why.** `atem status` gets a `Memory:` line (`injected into agents
+  (encryption on, key <kid>)`, or `not injected: encryption is <mode>; Memory
+  and skills still sync`). `atem memory status` shows the same and how many
+  valid facts are held back. The apply report marks each skipped target
+  (`◐ ~/.claude/CLAUDE.md  not injected: encryption is off`).
+- **Signed writes and the anti-rollback check follow.** Build step 3 and the
+  check on pulled rows
+  ([e2e-encryption.md](e2e-encryption.md#anti-rollback-check-on-pulled-rows-planned))
+  are required next: `on` alone gives confidentiality and plain-text
+  rejection, not authenticity, so until each write is signed by its device and
+  a pulled row can't lower what the store holds, the relay can still replay an
+  older ciphertext, bring back a deleted fact, or retarget a row's scope,
+  project hash or validity.
+- **At the forced migration, relay-sourced content is quarantined**
+  ([e2e-encryption.md](e2e-encryption.md#quarantine-of-relay-sourced-content-at-the-migration-planned)).
+  Each device re-pushes only the rows it wrote itself. A row it only pulled
+  from the relay while the account was off is held back from agents: never
+  injected into a managed block or a skill directory, and never used as
+  context. It stays held until its author device republishes it or the owner
+  approves it in an Astation review list. Held rows stay visible to explicit
+  reads (`memory list`, `memory search`, `skill list`), marked "held: from the
+  relay before encryption; approve in Astation or republish". After the
+  migration the injection rule is "not held", and the gate above ends.
+- **Per-row author tracking is added first.** Today a row records no author
+  (`source_machine` is a string the writer or relay supplies). Planned: every
+  row carries its authoring device's id, written locally and carried encrypted
+  and signed, before the migration ships (so after signed writes). A row with
+  no recorded author is treated as relay-sourced and held; that is every row
+  written before tracking ships, so at the first migration an account's whole
+  existing store is held until approved in Astation.
 
 ## Security
 

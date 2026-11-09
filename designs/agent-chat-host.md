@@ -46,7 +46,10 @@ no `chat-v1` capability.
   view-only one); answering it — allow once, always allow with one of the
   rules Claude itself suggested, or deny with an optional message — is an
   `approval` submission bound to that one prompt and process, under the
-  current lease or taking it with `acquire: true`. The terminal can always
+  current lease or taking it with `acquire: true`. **Planned (owner decision
+  2026-11-08), not implemented:** the deny message is accepted only from a
+  principal that also holds `prompt`, since the agent shows it to the model as
+  the denial reason (contract §G). The terminal can always
   answer instead (first answer wins), and anything else — a failure, a
   timeout, nobody answering — is "no decision": Claude asks in its own
   dialog. `[claude] approvals_hook = false` in Atem's config.toml (default
@@ -509,7 +512,10 @@ on the existing authenticated Astation connection.
 - Transport: on a host with a device list (r9, Atem v0.8.0) chat-v1 runs
   inside the end-to-end `atem-ch1` channel, so the relay can't read it. On an
   r8 host it travels over the TLS connection through the relay, which can
-  read chat content.
+  read chat content. **Planned (owner decision 2026-11-08), not implemented:**
+  no r8 host: chat-v1 is served only inside `atem-ch1` channels (see
+  [protocol/atem-session-v1.md](protocol/atem-session-v1.md), "No r8
+  admission").
 
 ## Failure handling
 

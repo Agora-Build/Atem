@@ -191,7 +191,11 @@ once (built in r9; before it the runtime admitted only the paired Astation).
 
 Since r8 (atem-session appendix §G) any attachment with `control` may answer the
 agent's permission prompts from the chat view or a phone, for the exact pending
-request; the lease is neither needed nor moved. Both agents can take an external allow/deny without simulating keys:
+request; the lease is neither needed nor moved. **Planned (owner decision
+2026-11-08), not implemented:** a `deny` may carry its message only from a
+principal that also holds `prompt` (a native member with `control`; a service
+or browser grant only with `prompt` in its ops), because the model sees the
+message as the denial reason; others deny without text (§G). Both agents can take an external allow/deny without simulating keys:
 
 | | Claude Code ([hooks](https://code.claude.com/docs/en/hooks)) | Codex ([hooks](https://developers.openai.com/codex/hooks)) |
 |---|---|---|
@@ -311,7 +315,8 @@ approval requests. Notification delivery and lease ownership are independent:
    host `push_approval{approval_id, atem_device_id, session_id, tool, summary,
    expires_at}`; on a host with a device list a host-signed `push_hint` per
    member with `control`, tool and summary HPKE-sealed to its `enc_key`
-   (§R9.9). The relay delivers via **APNs (iOS) / FCM (Android)** to every
+   (§R9.9). **Planned (owner decision 2026-11-08), not implemented:** the r8
+   form goes with r8 hosts. The relay delivers via **APNs (iOS) / FCM (Android)** to every
    device on the account with `control`, online or not. Astation owns the push
    credentials, device token registration and the notification UI.
 3. The notification shows "Claude on Genie wants to run `npm test`" (tool +

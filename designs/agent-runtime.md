@@ -2,7 +2,10 @@
 
 Status: **current design, implemented and released in Atem v0.8.0
 (2026-10-31)**. The host serves atem-session r8, and r9 on a host with a
-device list. "Product decisions" are the approved rules; "Implementation
+device list. **Planned (owner decision 2026-11-08), not implemented:** r9
+only; no host welcomes an r8 `hello` (see
+[protocol/atem-session-v1.md](protocol/atem-session-v1.md), "No r8
+admission"). "Product decisions" are the approved rules; "Implementation
 status" says what was built and where it differs from the design text after
 it. The wire contract is [protocol/atem-session-v1.md](protocol/atem-session-v1.md)
 (overview: [protocol/README.md](protocol/README.md)); see also
@@ -98,7 +101,10 @@ differ:
   verified Astation gets one. Terminal-v1 and chat-v1 are bound to session-v1
   (bindings and leases); `agentInput`, `agentPrompt`, voice, `userCommand`,
   terminal-v1 `control`/`list`, provider-name terminal ids and the agent list
-  are removed with no compatibility.
+  are removed with no compatibility. **Planned (owner decision 2026-11-08),
+  not implemented:** r9 only. The link gets no r8 attachment, so a host without
+  a pinned device list serves no remote client until `atem pair verify` pins
+  one; `atem status` and runtime.log say why.
 - **Operations.** `atem pair`, `atem pair verify`, `atem cred unlock|projects`
   and the paired-token refresh run in the broker on its link, as described
   below; `atem unpair` and `atem logout` tell a running runtime, which drops the link of a changed pairing.

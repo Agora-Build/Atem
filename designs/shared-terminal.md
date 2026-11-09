@@ -10,7 +10,9 @@
 > never sees remote session messages.
 
 Updated: 2026-10-13. Status: implemented in Atem, released in Atem v0.8.0 (2026-10-31) (remote control
-since r6 through session-v1 leases; r8, and r9 on a host with a device list).
+since r6 through session-v1 leases; r8, and r9 on a host with a device list;
+**Planned (owner decision 2026-11-08), not implemented:** r9 only, see
+[protocol/atem-session-v1.md](protocol/atem-session-v1.md), "No r8 admission").
 The Astation terminal UI and its acceptance tests are the Astation owner's
 work and are not tracked here. This document is the terminal-v1 contract
 (frames, credit, keys); the parts the status note names as removed in r6
