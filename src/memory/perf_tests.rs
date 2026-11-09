@@ -510,19 +510,25 @@ async fn serve_http(
     socket.set_nodelay(true)?;
     // ACK every segment at once: the client writes a request's head and body
     // separately, and Nagle on its side plus a delayed ACK here would stall
-    // some requests 40 ms (a loopback artifact, not relay work).
+    // some requests 40 ms (a loopback artifact, not relay work). Linux only:
+    // other systems have no TCP_QUICKACK, and the measurements are Linux's.
     let quickack = |socket: &tokio::net::TcpStream| {
-        use std::os::unix::io::AsRawFd;
-        let on: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_QUICKACK,
-                &on as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let on: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_QUICKACK,
+                    &on as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = socket;
     };
     let mut buffer: Vec<u8> = Vec::with_capacity(1 << 16);
     let mut chunk = vec![0u8; 1 << 16];
