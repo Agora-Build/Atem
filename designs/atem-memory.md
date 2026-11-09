@@ -563,8 +563,11 @@ atem memory status                  # account, machine, pending ops, last sync, 
 
 1. **Harvest** Claude's memory for the current repo, unless disabled.
 2. **Push** `pending_ops` for memories, then skills (at most 50 memory ops
-   and 8 skill ops per request). Apply `canonical_id` rewrites and remove the
-   ops the server answered. A per-op refusal is permanent and is removed
+   and 8 skill ops per request), each request's ops read from the queue after
+   the last op sent. Apply `canonical_id` rewrites and remove the
+   ops the server answered, in one local transaction per request, committed
+   before the ops count as pushed (an interrupted one leaves the request's ops
+   queued, sent again next time). A per-op refusal is permanent and is removed
    (with a note); a failed request (network error, any HTTP error) leaves
    the ops queued and stops that group, keeping queue order:
    - 401: the relay didn't recognize the Astation session (see Identity &
@@ -572,8 +575,49 @@ atem memory status                  # account, machine, pending ops, last sync, 
    - 503: the relay is temporarily unavailable (e.g. its database).
    - 413 on a chunk: its ops are retried one at a time. A single op that is
      still too large stays queued with a note and is never acked.
+
+   While the account is encrypted, the ops are sealed ahead of their requests,
+   in groups of whole requests (at most four cred-agent `Crypt` requests'
+   worth per step: 1,024 ops and 2 MiB each; skills take two dependent
+   steps, paths then files), the next group while the request before it is
+   in flight. The first group is the first request alone, so it is sent as
+   soon as it is sealed (this can cost one `Crypt` request more than packing
+   it with the next ones; wall time comes first). The agent splits each step of a group into as few requests as
+   its limits allow, and a group never takes more requests than sealing its
+   requests one at a time would; a request with an op over the agent's limit
+   for one op is a group of its own. A request sends an op as sealed ahead
+   only while it is still exactly the queued op as it would be sealed now (an
+   earlier request's `canonical_id` rewrite, or another writer, may have
+   changed or removed it, and a project hash it carries may have been named
+   since: see "Projects not known here yet") and the account's mode, key and
+   data account are unchanged; otherwise it is sealed again first. Before a request with ops sealed by an earlier
+   `Crypt` request is sent, the cred agent must still be unlocked (a status
+   on the agent connection), so `atem cred lock` stops the push within one
+   request, as when each request was sealed just before it was sent; a
+   `Crypt` request made just before the send (a group, or the request's ops
+   sealed again) shows that already, and a request refused as too large and
+   resent one op at a time checks before each op the agent sealed earlier.
+   Ops whose sealing needs no agent (a memory's delete or invalidation, a
+   global skill's delete or purge) are sealed by no `Crypt` request: they
+   never wait for the check and go out while the agent is locked, as before
+   sealing ahead, and a push of only such ops never contacts (so never
+   starts) the agent. A group that fails to seal stops the push with that
+   error, after the request in flight (whose results are applied first); it
+   is not retried.
 3. **Pull** memories and skills since `cursor`, page by page. Upsert rows and
-   apply tombstones locally. Advance `cursor` after each page. Cursors are
+   apply tombstones locally. Advance `cursor` after each page, in the same
+   local transaction as the page's rows (an interrupted page is pulled again
+   whole; the cursor never passes a row that isn't stored). Page k+1 is
+   fetched and opened on tasks of their own while page k is applied (from
+   the cursor page k ends at; page k+2 is fetched only once page k is
+   committed) and applied once page k is committed; a page that fails to
+   open or apply drops the page after it unapplied, and the next sync starts
+   from the committed cursor. A transaction never waits for a request or an
+   open. A page opened before `atem cred lock`, a mode or key change or the
+   loss of this device's verification is still applied (its plain text is
+   already in the process): at most one page more than when each page was
+   opened just before it was applied; the next page's open is refused or
+   follows the new state. Cursors are
    kept per account (`memory_cursor:<astation_id>`,
    `skill_cursor:<astation_id>`), so pairing with a different Astation
    pulls that account from 0; the legacy unkeyed cursor is ignored.
@@ -594,6 +638,7 @@ atem memory status                  # account, machine, pending ops, last sync, 
    (owner decision 2026-11-08), not implemented:** only while the account's
    encryption is on, a transition measure until encryption is the only mode
    (next section).
+
 ## Injection into agents requires encryption On (planned)
 
 **Planned (owner decision 2026-11-08), not implemented.** This is a
@@ -780,7 +825,24 @@ lives.
 - **Local store:** `pending_ops`, cursor handling, `canonical_id` rewrite,
   `harvest_map` edit and delete handling, the `held_back` and `excluded`
   states (and clearing them when the file changes), `applied` drift
-  detection.
+  detection, and a crash in the middle of a push batch's results or a pulled
+  page (the disk as a killed process leaves it: nothing of the batch or page
+  applied, the next sync completes it).
+- **Sealing ahead and prefetching** (`sync_pipeline_tests.rs`): `Crypt`
+  requests per phase (a push in full groups, a pull and a read-back one per
+  page, a migration in full groups; large skills never more requests than
+  one request at a time), an op rewritten, acked, or under a new mode or key
+  after it was sealed (sealed again or dropped), a lock between two seals or
+  during one (the push stops within one request; a refusal is not retried;
+  deletes, invalidations and a global skill's purge still go, without
+  contacting the agent),
+  a page that fails to open or apply, or a crash, with the next one fetched
+  or opened, a cursor moved by another writer, and what another connection
+  sees of the queue and cursor at each relay request. Rows of a project not
+  known here on a page opened ahead are kept unresolved, committed once with
+  their page (dropped unapplied with it when the page before fails), and an
+  op whose project hash is named after it was sealed is sealed again under
+  its name.
 - **Relay (Astation):** idempotent add, dedup to `canonical_id`, a
   tombstone that clears the text, `since` paging, skill versioning and
   `superseded_concurrent`, skill purge (files erased, latest-version purge

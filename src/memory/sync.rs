@@ -1,9 +1,13 @@
 //! The learning loop: harvest what Claude learned → push local changes →
 //! pull what other agents/machines learned → apply to every agent here.
 use anyhow::{anyhow, bail, Result};
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
+use std::sync::Arc;
 use crate::memory::adapters::{apply_memory, apply_skills, Agent, Ctx, ReportLine};
-use crate::memory::api::{ApiError, KnowledgeClient, OpResult, PULL_LIMIT};
+use crate::memory::api::{seal_cost, ApiError, KnowledgeClient, OpResult, SealState, PULL_LIMIT};
+use crate::memory::crypto::{total, Planner};
 use crate::memory::block::contains_reserved;
 use crate::memory::harvest::{claude_memory_dir, harvest_dir, origin_prefix, Harvested};
 use crate::memory::model::{content_hash, new_memory_id, now_secs, skill_hash, Memory, Scope, Skill};
@@ -194,6 +198,14 @@ pub fn too_large_note(op: &PendingOp) -> String {
 /// refusals (e.g. the server's secret check) must not retry forever.
 /// A result count that doesn't match can't be paired up, so nothing is
 /// acked: the batch stays queued and a note explains why.
+///
+/// One transaction: the batch's effects and its acks commit together, before
+/// the caller reports anything. An error or a crash part way leaves the whole
+/// batch queued as it was, and the next sync sends it again, as after a sync
+/// that stopped between the POST and its results. Memory ops are idempotent
+/// on the relay (add by id, delete, invalidate); a re-sent skill push is
+/// appended again as a new version. It opens that transaction itself, so it
+/// must not be called inside `Store::in_transaction` (not nestable).
 pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
     if results.len() != sent.len() {
         return Ok(vec![format!(
@@ -201,6 +213,10 @@ pub fn apply_push_results(store: &Store, sent: &[(i64, PendingOp)], results: &[O
             results.len(), sent.len()
         )]);
     }
+    store.in_transaction(|| apply_paired_results(store, sent, results))
+}
+
+fn apply_paired_results(store: &Store, sent: &[(i64, PendingOp)], results: &[OpResult]) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     for ((n, op), r) in sent.iter().zip(results) {
         if r.ok {
@@ -344,12 +360,11 @@ impl SyncOutcome {
     }
 }
 
-/// Send one chunk and apply its results. `Ok(true)`: acked, carry on with
-/// the group; `Ok(false)`: results couldn't be paired up (nothing acked),
-/// stop the group; `Err`: the request failed, nothing acked.
-async fn send_chunk(store: &Store, client: &KnowledgeClient, chunk: &[(i64, PendingOp)], is_mem: bool, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
-    let refs: Vec<&PendingOp> = chunk.iter().map(|(_, op)| op).collect();
-    match client.push(&refs, is_mem).await {
+/// Apply a POSTed chunk's results (`posted`). `Ok(true)`: acked, carry on
+/// with the group; `Ok(false)`: results couldn't be paired up (nothing
+/// acked), stop the group; `Err`: the request failed, nothing acked.
+fn finish_chunk(store: &Store, chunk: &[(i64, PendingOp)], posted: std::result::Result<Vec<OpResult>, ApiError>, out: &mut SyncOutcome) -> Result<std::result::Result<bool, ApiError>> {
+    match posted {
         Ok(results) => {
             out.notes.extend(apply_push_results(store, chunk, &results)?);
             if results.len() != chunk.len() {
@@ -384,35 +399,237 @@ fn group_failed(store: &Store, e: ApiError, sent: &[(i64, PendingOp)], is_mem: b
     Ok(())
 }
 
+/// One push group's ops sealed ahead of their POST (F2), by queue `n`: each
+/// with the op as it was sealed (as read, with a project hash named since put
+/// under its name: `seal_ops`) and the state its group was sealed under.
+struct ReadAhead {
+    sealed: BTreeMap<i64, (PendingOp, Value, Arc<SealState>)>,
+    /// The last queue `n` a group was read through.
+    through: i64,
+}
+
+/// Whether an op sealed ahead may be sent as sealed: the queued op, as it
+/// would be sealed now (`KnowledgeClient::seal_state`), is still exactly the
+/// op that was sealed, under the same state (mode, key, data account). An
+/// earlier chunk's results or another writer may have changed the op, and a
+/// project pulled as a hash may have been named since (resolution, or this
+/// Atem hashing that project): either counts as a change, so the op is
+/// sealed again, never sent under the hash it was sealed with.
+fn reusable(sealed: &PendingOp, sealed_under: &SealState, op: &PendingOp, state: &SealState) -> bool {
+    sealed == op && sealed_under == state
+}
+
+impl ReadAhead {
+    fn new() -> Self {
+        Self { sealed: BTreeMap::new(), through: i64::MIN }
+    }
+
+    fn add(&mut self, state: SealState, ns: &[i64], ops: Vec<(PendingOp, Value)>) {
+        let state = Arc::new(state);
+        for (&n, (op, wire)) in ns.iter().zip(ops) {
+            self.sealed.insert(n, (op, wire, state.clone()));
+        }
+    }
+
+    /// The sealed wire of each op of `chunk` (each op as it would be sealed
+    /// now) that is `reusable`; `None` for the others (rewritten or named
+    /// since, sealed under another state, or never read ahead). Forgets every
+    /// entry up to the chunk's last op: sent now, or gone from the queue
+    /// (acked or removed meanwhile).
+    fn take(&mut self, chunk: &[(i64, PendingOp)], state: &SealState) -> Vec<Option<Value>> {
+        let wire = chunk.iter()
+            .map(|(n, op)| match self.sealed.remove(n) {
+                Some((sealed, wire, under)) if reusable(&sealed, &under, op, state) => Some(wire),
+                _ => None,
+            })
+            .collect();
+        if let Some(&(last, _)) = chunk.last() {
+            self.sealed = self.sealed.split_off(&last.saturating_add(1));
+        }
+        wire
+    }
+}
+
+/// The queued ops of one kind after `after` that are sealed together as one
+/// group: whole chunks, read `chunk` at a time as the push will send them,
+/// planned by `Planner` (as the migration's groups: at most
+/// `GROUP_REQUESTS` requests' worth per step, never more requests than
+/// sealing each chunk alone; the run's `first` group is one chunk).
+fn read_group(store: &Store, after: i64, is_mem: bool, chunk: usize, first: bool) -> Result<Vec<(i64, PendingOp)>> {
+    let mut group: Vec<(i64, PendingOp)> = Vec::new();
+    let mut planner = Planner::new(first);
+    let mut cursor = after;
+    loop {
+        let read = store.pending_after(cursor, is_mem, chunk)?;
+        let Some(&(last, _)) = read.last() else { return Ok(group) };
+        if !planner.take(&total(&read, |(_, op)| seal_cost(op)), read.len()) {
+            return Ok(group);
+        }
+        let whole = read.len() == chunk;
+        group.extend(read);
+        cursor = last;
+        if !whole {
+            return Ok(group);
+        }
+    }
+}
+
+/// Whether sealing `op` under `state` asked the cred agent: an op with a
+/// protected field (a memory's content or project, a skill, a project-scoped
+/// skill's delete or purge) while the account encrypts. Deletes and
+/// invalidations of memories and a global skill's delete or purge never do,
+/// so they never wait for the unlocked check and never start the agent.
+fn sealed_by_agent(op: &PendingOp, state: &SealState) -> bool {
+    state.encrypts() && seal_cost(op).iter().any(|step| step.ops > 0)
+}
+
+/// Whether some of `sealed` (as `seal_ops` returned them, under `state`)
+/// asked the cred agent: a `Crypt` request that succeeded, which shows the
+/// agent unlocked when it was answered.
+fn asked_agent(state: &SealState, sealed: &[(PendingOp, Value)]) -> bool {
+    sealed.iter().any(|(op, _)| sealed_by_agent(op, state))
+}
+
+/// Seals `group` into the read-ahead: whether that asked the cred agent
+/// (`asked_agent`), or the seal's error.
+async fn seal_ahead(client: &KnowledgeClient, ahead: &mut ReadAhead, group: Vec<(i64, PendingOp)>) -> std::result::Result<bool, ApiError> {
+    let (ns, ops): (Vec<i64>, Vec<PendingOp>) = group.into_iter().unzip();
+    let (state, sealed) = client.seal_ops(ops).await?;
+    let asked = asked_agent(&state, &sealed);
+    ahead.add(state, &ns, sealed);
+    Ok(asked)
+}
+
+/// The wire form of every op of `chunk` (each op as it would be sealed now:
+/// `KnowledgeClient::seal_state`; as sealed ahead where `reusable`, the
+/// others sealed now, together), and whether its POST must first check
+/// that the cred agent is still unlocked: some op goes out as sealed by an
+/// earlier `Crypt` request (`sealed_by_agent`), and no `Crypt` request since
+/// (`asked`: a group sealed in this pass, or this chunk's ops sealed again
+/// now) showed the agent unlocked.
+async fn chunk_wire(client: &KnowledgeClient, ahead: &mut ReadAhead, chunk: &[(i64, PendingOp)], state: &SealState, mut asked: bool) -> std::result::Result<(Vec<Value>, bool), ApiError> {
+    let mut wire = ahead.take(chunk, state);
+    let sealed_earlier = chunk.iter().zip(&wire).any(|((_, op), value)| value.is_some() && sealed_by_agent(op, state));
+    let stale: Vec<usize> = (0..chunk.len()).filter(|&i| wire[i].is_none()).collect();
+    if !stale.is_empty() {
+        let (now, sealed) = client.seal_ops(stale.iter().map(|&i| chunk[i].1.clone()).collect()).await?;
+        asked |= asked_agent(&now, &sealed);
+        for (&i, (_, value)) in stale.iter().zip(sealed) {
+            wire[i] = Some(value);
+        }
+    }
+    let wire = wire.into_iter()
+        .map(|value| value.ok_or_else(|| ApiError::Encryption("an op of the chunk was not sealed".into())))
+        .collect::<std::result::Result<_, _>>()?;
+    Ok((wire, sealed_earlier && !asked))
+}
+
 /// Push a group in chunks, in queue order. Any failure stops the group (its
 /// remaining ops stay queued, preserving order). A chunk the relay refuses
 /// as too large (413) is retried one op at a time; a single op that is still
 /// too large is never acked — it stays queued with a note.
 ///
-/// Every send re-reads its ops from the queue: an earlier chunk's results
-/// can rewrite still-queued ops (a relay canonical id), and the relay only
-/// knows the rewritten ids. `after` is the last op sent, so each send moves
-/// strictly forward in queue order.
+/// Each chunk is read from the queue just before it is sent, after `after`,
+/// the last op sent (an `n > ?` cursor): every op is read once per group,
+/// each send moves strictly forward in queue order, and a chunk carries what
+/// an earlier chunk's results rewrote in still-queued ops (a relay canonical
+/// id; the relay only knows the rewritten ids).
+///
+/// Sealing runs ahead of the chunks (F2): the ops are sealed in groups of
+/// whole chunks (`read_group`; the first is chunk 1 alone), the next group
+/// while the chunk before it is POSTed. A chunk sends an op as sealed ahead
+/// only while it is `reusable`; any other op is sealed again first. Before a
+/// chunk with ops the agent sealed in an earlier request is POSTed, the cred
+/// agent must still be unlocked (a status, unless a `Crypt` request since
+/// showed it), so a lock stops the push within one POST, as when each chunk
+/// was sealed just before it. Ops sealed without the agent (deletes,
+/// invalidations, a global skill's delete or purge) go out while it is
+/// locked, as before read-ahead. A group that fails to seal stops the push
+/// with that error (after the chunk in flight, whose results are applied
+/// first); nothing is retried. A chunk's results are applied in their own
+/// transaction after its POST, before the next chunk is read; no request is
+/// in flight then.
 async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk_size: usize, out: &mut SyncOutcome) -> Result<()> {
-    let queued_after = |after: i64| -> Result<Vec<(i64, PendingOp)>> {
-        Ok(store.pending()?.into_iter().filter(|(n, op)| *n > after && op.is_memory() == is_mem).collect())
-    };
     let mut after = i64::MIN;
+    let mut ahead = ReadAhead::new();
     loop {
         if out.offline {
             return Ok(());
         }
-        let chunk: Vec<_> = queued_after(after)?.into_iter().take(chunk_size).collect();
+        let chunk = store.pending_after(after, is_mem, chunk_size)?;
         let Some(&(last, _)) = chunk.last() else { return Ok(()) };
-        match send_chunk(store, client, &chunk, is_mem, out).await? {
+        // The state ops are sealed under now, and the chunk's ops as they
+        // would be sealed now (a project hash named since under its name):
+        // what an op sealed ahead must still be to go out as sealed.
+        let (state, named) = match client.seal_state(chunk.iter().map(|(_, op)| op.clone()).collect()) {
+            Ok((state, named)) => (state, chunk.iter().map(|&(n, _)| n).zip(named).collect::<Vec<_>>()),
+            Err(e) => return group_failed(store, e, &chunk, is_mem, out),
+        };
+        // The first group, or the read-ahead fell behind: seal from here.
+        // Only a group that asked the agent (deletes and invalidations alone
+        // don't) shows it is unlocked now.
+        let mut asked = false;
+        while last > ahead.through {
+            let first = ahead.through == i64::MIN;
+            let group = read_group(store, ahead.through.max(after), is_mem, chunk_size, first)?;
+            ahead.through = group.last().map_or(last, |&(n, _)| n);
+            match seal_ahead(client, &mut ahead, group).await {
+                Ok(group_asked) => asked |= group_asked,
+                Err(e) => return group_failed(store, e, &chunk, is_mem, out),
+            }
+        }
+        let (wire, unchecked) = match chunk_wire(client, &mut ahead, &named, &state, asked).await {
+            Ok(wire) => wire,
+            Err(e) => return group_failed(store, e, &chunk, is_mem, out),
+        };
+        // Ops the agent sealed in an earlier request: still unlocked?
+        if unchecked && let Err(e) = client.confirm_unlocked().await {
+            return group_failed(store, e, &chunk, is_mem, out);
+        }
+        // Seal the next group while this chunk is in flight, once the
+        // read-ahead no longer covers the next chunk.
+        let next = if ahead.sealed.len() < chunk_size {
+            read_group(store, ahead.through.max(last), is_mem, chunk_size, false)?
+        } else {
+            Vec::new()
+        };
+        let mut ahead_failed = None;
+        let posted = if let Some(&(through, _)) = next.last() {
+            ahead.through = through;
+            let (ns, ops): (Vec<i64>, Vec<PendingOp>) = next.into_iter().unzip();
+            let (posted, sealed) = tokio::join!(client.post_ops(&wire, is_mem), client.seal_ops(ops));
+            match sealed {
+                Ok((state, sealed)) => ahead.add(state, &ns, sealed),
+                Err(e) => ahead_failed = Some(e),
+            }
+            posted
+        } else {
+            client.post_ops(&wire, is_mem).await
+        };
+        match finish_chunk(store, &chunk, posted, out)? {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(ApiError::Http(413, _)) if chunk.len() > 1 => {
-                for n in chunk.iter().map(|(n, _)| *n) {
-                    // Re-fetched by `n`: an earlier single op may have rewritten it.
-                    let Some(one) = store.pending()?.into_iter().find(|(m, _)| *m == n) else { continue };
-                    let one = [one];
-                    match send_chunk(store, client, &one, is_mem, out).await? {
+                for ((n, sent), sealed) in named.iter().zip(&wire) {
+                    // Re-read by `n`: an earlier single op may have rewritten it.
+                    let Some(op) = store.pending_op(*n)? else { continue };
+                    let one = [(*n, op)];
+                    let single = match client.seal_state(vec![one[0].1.clone()]) {
+                        // Sealed before the chunk's POST: an op the agent
+                        // sealed waits for the unlocked check, so a lock
+                        // while the chunk was in flight stops it.
+                        Ok((now, renamed)) if reusable(sent, &state, &renamed[0], &now) => {
+                            let checked = if sealed_by_agent(sent, &state) { client.confirm_unlocked().await } else { Ok(()) };
+                            checked.map(|()| vec![sealed.clone()])
+                        }
+                        Ok(_) => client.seal_ops(vec![one[0].1.clone()]).await.map(|(_, ops)| ops.into_iter().map(|(_, wire)| wire).collect()),
+                        Err(e) => Err(e),
+                    };
+                    let posted = match single {
+                        Ok(single) => client.post_ops(&single, is_mem).await,
+                        Err(e) => return group_failed(store, e, &one, is_mem, out),
+                    };
+                    match finish_chunk(store, &one, posted, out)? {
                         Ok(true) => {}
                         Ok(false) => return Ok(()),
                         Err(e) => return group_failed(store, e, &one, is_mem, out),
@@ -420,6 +637,11 @@ async fn push_group(store: &Store, client: &KnowledgeClient, is_mem: bool, chunk
                 }
             }
             Err(e) => return group_failed(store, e, &chunk, is_mem, out),
+        }
+        // The next group failed to seal while this chunk was in flight: the
+        // push stops here, as it did when that chunk's seal failed.
+        if let Some(e) = ahead_failed {
+            return group_failed(store, e, &[], is_mem, out);
         }
         after = last;
     }
@@ -434,57 +656,192 @@ async fn push_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 /// Pull cursors are per account (the paired Astation id); see
 /// `memory_cursor_key`.
 async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome) -> Result<()> {
-    let mem_key = memory_cursor_key(client.account());
-    loop {
-        let since = store.get_state(&mem_key)?;
-        match client.pull_memories(since).await {
-            Ok(page) => {
-                if page.is_empty() {
-                    break;
-                }
-                let max = apply_pulled_memories(store, &page)?;
-                store.set_state(&mem_key, max.max(since))?;
-                out.pulled += page.len();
-                if !cursor_advances(max, since, page.len()) {
-                    out.note(STUCK_CURSOR_NOTE.into());
-                    break;
-                }
-                if page.len() < PULL_LIMIT as usize {
-                    break;
-                }
-            }
-            Err(e) => {
-                out.failed(e, None);
-                return Ok(());
-            }
-        }
-    }
-    let skill_key = skill_cursor_key(client.account());
-    loop {
-        let since = store.get_state(&skill_key)?;
-        match client.pull_skills(since).await {
-            Ok(page) => {
-                if page.is_empty() {
-                    break;
-                }
-                let max = apply_pulled_skills(store, &page)?;
-                store.set_state(&skill_key, max.max(since))?;
-                out.pulled += page.len();
-                if !cursor_advances(max, since, page.len()) {
-                    out.note(STUCK_CURSOR_NOTE.into());
-                    break;
-                }
-                if page.len() < PULL_LIMIT as usize {
-                    break;
-                }
-            }
-            Err(e) => {
-                out.failed(e, None);
-                return Ok(());
-            }
-        }
+    let memories = {
+        let (fetching, opening) = (client.clone(), client.clone());
+        pull_pages(store, out, &memory_cursor_key(client.account()),
+            move |since| {
+                let client = fetching.clone();
+                async move { client.fetch_memories(since).await }
+            },
+            move |rows| {
+                let client = opening.clone();
+                async move { client.open_memories(rows).await }
+            },
+            apply_pulled_memories, |m: &Memory| m.seq).await?
+    };
+    if memories {
+        let (fetching, opening) = (client.clone(), client.clone());
+        pull_pages(store, out, &skill_cursor_key(client.account()),
+            move |since| {
+                let client = fetching.clone();
+                async move { client.fetch_skills(since).await }
+            },
+            move |rows| {
+                let client = opening.clone();
+                async move { client.open_skills(rows).await }
+            },
+            apply_pulled_skills, |s: &Skill| s.seq).await?;
     }
     Ok(())
+}
+
+/// A task's handle that aborts it when dropped: its result is never used.
+/// Aborting stops the task at its next await; work it handed to the blocking
+/// pool (an open in flight, `cred_agent::blocking`) still runs to its end,
+/// and only its result is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A fetched page: the cursor it was fetched from, its row count, and its
+/// rows being opened on a task of their own.
+struct FetchedPage<R> {
+    since: i64,
+    len: usize,
+    opened: AbortOnDrop<std::result::Result<Vec<R>, ApiError>>,
+}
+
+impl<R> FetchedPage<R> {
+    async fn opened(mut self) -> std::result::Result<Vec<R>, ApiError> {
+        (&mut self.opened.0).await
+            .unwrap_or_else(|e| Err(ApiError::Encryption(format!("opening the page didn't finish: {e}"))))
+    }
+}
+
+/// One kind's pages from `since`, fetched in order on a task of their own,
+/// each from the cursor the page before it ends at, and each opened on a task
+/// of its own as it arrives (F2). At most one page beyond the one being
+/// applied is fetched or opened: a page is fetched only once the page two
+/// before it is committed (`permits`, one given back per committed page).
+/// Dropping it aborts the fetching (a GET in flight is cancelled) and stops
+/// waiting for the openings: an open already running on the blocking pool
+/// runs to completion, holding the cred agent connection for that one
+/// request, and its result is dropped. The pages not applied are discarded.
+struct PagesInFlight<R> {
+    pages: tokio::sync::mpsc::Receiver<std::result::Result<FetchedPage<R>, ApiError>>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    _fetching: AbortOnDrop<()>,
+}
+
+impl<R: Send + 'static> PagesInFlight<R> {
+    fn start<F, FF, O, OF>(since: i64, fetch: F, open: O, seq: fn(&R) -> i64) -> Self
+    where
+        F: Fn(i64) -> FF + Send + 'static,
+        FF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
+        O: Fn(Vec<R>) -> OF + Send + 'static,
+        OF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
+    {
+        let (tx, pages) = tokio::sync::mpsc::channel(2);
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let available = permits.clone();
+        let fetching = tokio::spawn(async move {
+            let mut since = since;
+            loop {
+                let Ok(permit) = available.acquire().await else { return };
+                permit.forget();
+                let (page, next) = match fetch(since).await {
+                    Ok(rows) => {
+                        let (len, max) = (rows.len(), rows.iter().map(seq).fold(0, i64::max));
+                        // The next page starts where this one ends; none after
+                        // a short page or one that doesn't move the cursor.
+                        let next = (len >= PULL_LIMIT as usize && max > since).then_some(max);
+                        let opened = AbortOnDrop(tokio::spawn(open(rows)));
+                        (Ok(FetchedPage { since, len, opened }), next)
+                    }
+                    Err(e) => (Err(e), None),
+                };
+                if tx.send(page).await.is_err() {
+                    return;
+                }
+                match next {
+                    Some(next) => since = next,
+                    None => return,
+                }
+            }
+        });
+        Self { pages, permits, _fetching: AbortOnDrop(fetching) }
+    }
+}
+
+/// Pulls one kind's pages from its committed cursor `key`. Each page's rows
+/// and its cursor commit in one transaction, before the page is counted: the
+/// cursor never passes a row that isn't stored, and a page cut short (an
+/// error, a crash) is pulled again whole (upserts are idempotent).
+///
+/// The next page is fetched and opened while this one is applied
+/// (`PagesInFlight`, F2), from the cursor this one ends at. A page's
+/// transaction never waits for that work; a page is applied only after the
+/// one before it committed, from the committed cursor, and a page that
+/// fails to open or apply discards the page after it unapplied (the next
+/// sync starts from the committed cursor). `Ok(false)`: a request failed
+/// (noted); stop pulling.
+async fn pull_pages<R, F, FF, O, OF>(
+    store: &Store,
+    out: &mut SyncOutcome,
+    key: &str,
+    fetch: F,
+    open: O,
+    apply: fn(&Store, &[R]) -> Result<i64>,
+    seq: fn(&R) -> i64,
+) -> Result<bool>
+where
+    R: Send + 'static,
+    F: Fn(i64) -> FF + Clone + Send + 'static,
+    FF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
+    O: Fn(Vec<R>) -> OF + Clone + Send + 'static,
+    OF: Future<Output = std::result::Result<Vec<R>, ApiError>> + Send + 'static,
+{
+    let mut since = store.get_state(key)?;
+    let mut in_flight = PagesInFlight::start(since, fetch.clone(), open.clone(), seq);
+    loop {
+        let page = match in_flight.pages.recv().await {
+            Some(Ok(page)) => page,
+            Some(Err(e)) => {
+                out.failed(e, None);
+                return Ok(false);
+            }
+            // The fetching always ends with a last page or a failure.
+            None => {
+                out.failed(ApiError::Decode("the page requests stopped".into()), None);
+                return Ok(false);
+            }
+        };
+        if page.len == 0 {
+            return Ok(true);
+        }
+        if page.since != since {
+            // Another writer moved the cursor: start again from it.
+            in_flight = PagesInFlight::start(since, fetch.clone(), open.clone(), seq);
+            continue;
+        }
+        let len = page.len;
+        let opened = match page.opened().await {
+            Ok(opened) => opened,
+            Err(e) => {
+                out.failed(e, None);
+                return Ok(false);
+            }
+        };
+        let max = store.in_transaction(|| {
+            let max = apply(store, &opened)?;
+            store.set_state(key, max.max(since))?;
+            Ok(max)
+        })?;
+        in_flight.permits.add_permits(1);
+        out.pulled += opened.len();
+        if !cursor_advances(max, since, len) {
+            out.note(STUCK_CURSOR_NOTE.into());
+            return Ok(true);
+        }
+        if len < PULL_LIMIT as usize {
+            return Ok(true);
+        }
+        since = store.get_state(key)?;
+    }
 }
 
 /// Names the projects of rows pulled as hashes this Atem had no name for
@@ -493,6 +850,11 @@ async fn pull_all(store: &Store, client: &KnowledgeClient, out: &mut SyncOutcome
 /// after a rotation the projects it already knows). Skills under a hash it
 /// can never name are dropped (see `Store::resolve_projects`). Rows it
 /// still can't name stay unresolved: kept, listed, never applied.
+///
+/// Runs once the pull is over (`pull_all` returns after its last page
+/// committed, the pages fetched or opened beyond it discarded), never inside
+/// a page's transaction: the agent's work comes first, then one transaction
+/// of its own.
 async fn resolve_projects(store: &Store, client: &KnowledgeClient, ctx: &Ctx) -> Result<()> {
     let hashes = store.unresolved_projects()?;
     if hashes.is_empty() {
@@ -595,8 +957,10 @@ mod tests {
     use super::*;
     use crate::memory::model::{content_hash, skill_hash};
     use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-    fn valid(id: &str, content: &str) -> Memory {
+    pub(super) fn valid(id: &str, content: &str) -> Memory {
         Memory {
             id: id.into(), scope: Scope::Global, content: content.into(), content_hash: content_hash(content),
             confidence: "high".into(), source_agent: "cli".into(), source_machine: "m1".into(), created_at: 1,
@@ -972,12 +1336,12 @@ mod tests {
 
     // ─────────────── relay round trips (local stub relay) ───────────────
 
-    type Handler = dyn Fn(&str, &str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync;
+    pub(super) type Handler = dyn Fn(&str, &str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync;
 
     /// A tiny HTTP/1.1 relay stub on 127.0.0.1: one request per connection,
     /// answered by `f(method, path_and_query, json_body)`. Returns the base
     /// URL and a log of (method, path_and_query, body) for every request.
-    async fn stub_relay(f: Box<Handler>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) {
+    pub(super) async fn stub_relay(f: Box<Handler>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1050,7 +1414,7 @@ mod tests {
         serde_json::json!({"results": (0..n).map(|i| serde_json::json!({"ok": true, "seq": i + 1})).collect::<Vec<_>>()})
     }
 
-    fn test_ctx() -> (tempfile::TempDir, Ctx) {
+    pub(super) fn test_ctx() -> (tempfile::TempDir, Ctx) {
         let td = tempfile::tempdir().unwrap();
         let ctx = Ctx { home: td.path().to_path_buf(), repo: None, atem_id: "m1".into(), allow_tracked: false };
         (td, ctx)
@@ -1078,7 +1442,7 @@ mod tests {
         }
     }
 
-    const NO_HARVEST: SyncOptions = SyncOptions { harvest: false };
+    pub(super) const NO_HARVEST: SyncOptions = SyncOptions { harvest: false };
 
     #[tokio::test]
     async fn pulled_replacement_leaves_the_block_but_stays_in_history() {
@@ -1223,7 +1587,7 @@ mod tests {
         })
     }
 
-    fn posted_ops(log: &std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) -> Vec<Vec<serde_json::Value>> {
+    pub(super) fn posted_ops(log: &std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>) -> Vec<Vec<serde_json::Value>> {
         log.lock().unwrap().iter().filter(|(m, _, _)| m == "POST")
             .map(|(_, _, b)| b["ops"].as_array().unwrap().clone()).collect()
     }
@@ -1481,6 +1845,430 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunks_walk_the_queue_in_order_past_the_other_kind() {
+        let s = Store::open_in_memory().unwrap();
+        // 120 memory adds with a skill delete after every tenth.
+        for i in 0..120 {
+            queue_memories(&s, &[format!("f{i:03}").as_str()]);
+            if i % 10 == 9 {
+                s.enqueue(&PendingOp::DeleteSkill { scope: Scope::Global, project: String::new(), name: format!("s{i:03}") }).unwrap();
+            }
+        }
+        let (base, log) = stub_relay(Box::new(|m, p, body| empty_pulls(m, p).unwrap_or_else(|| (200, ok_results(body))))).await;
+        let (_td, ctx) = test_ctx();
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        assert_eq!(out.pushed, 132);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        let posts = posted_ops(&log);
+        assert_eq!(posts.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 50, 20, 8, 4]);
+        let sent: Vec<&str> = posts.iter().flatten()
+            .map(|o| o["memory"]["id"].as_str().or_else(|| o["name"].as_str()).unwrap()).collect();
+        let want: Vec<String> = (0..120).map(|i| format!("mem_f{i:03}"))
+            .chain((0..12).map(|k| format!("s{:03}", k * 10 + 9))).collect();
+        assert_eq!(sent, want);
+    }
+
+    // ─────────────── a crash inside a store transaction ───────────────
+
+    const T: i64 = 1_790_000_000;
+
+    /// A relay that keeps its memory rows, so an op sent again meets what its
+    /// first send did: an add of an id it has is a no-op, an add of a fact it
+    /// has under another id (same scope, project, machine and content hash,
+    /// still valid) is deduped onto that row (`canonical_id`), and
+    /// invalidation is final (a repeat changes nothing). Skills as the real
+    /// relay keeps them: every push is appended as the next version of its
+    /// skill (`superseded_concurrent` when its `base_version` is behind), and
+    /// every version stays a row. Every write takes the next seq; pulls page
+    /// by seq.
+    #[derive(Default)]
+    pub(super) struct KeepingRelay {
+        pub(super) rows: BTreeMap<String, Memory>,
+        pub(super) skills: BTreeMap<i64, Skill>,
+        next_seq: i64,
+        pub(super) ops_received: usize,
+    }
+
+    impl KeepingRelay {
+        pub(super) fn put(&mut self, mut m: Memory) -> i64 {
+            self.next_seq += 1;
+            m.seq = self.next_seq;
+            self.rows.insert(m.id.clone(), m);
+            self.next_seq
+        }
+
+        fn op(&mut self, op: &serde_json::Value) -> serde_json::Value {
+            self.ops_received += 1;
+            match op["op"].as_str().unwrap() {
+                "add" => {
+                    let m: Memory = serde_json::from_value(op["memory"].clone()).unwrap();
+                    if let Some(r) = self.rows.get(&m.id) {
+                        return serde_json::json!({"ok": true, "seq": r.seq});
+                    }
+                    let key = |r: &Memory| (r.scope, r.project.clone(), r.machine.clone(), r.content_hash.clone());
+                    if let Some(r) = self.rows.values().find(|r| r.is_valid() && key(r) == key(&m)) {
+                        return serde_json::json!({"ok": true, "seq": r.seq, "canonical_id": r.id});
+                    }
+                    serde_json::json!({"ok": true, "seq": self.put(m)})
+                }
+                "invalidate" => {
+                    let Some(mut r) = self.rows.get(op["id"].as_str().unwrap()).cloned() else {
+                        return serde_json::json!({"ok": true});
+                    };
+                    if r.invalid_at.is_none() {
+                        r.invalid_at = op["invalid_at"].as_i64();
+                        r.superseded_by = op["superseded_by"].as_str().map(str::to_string);
+                        self.put(r);
+                    }
+                    serde_json::json!({"ok": true})
+                }
+                // An encryption migration's rewrite of a row's protected fields.
+                "rewrite" => {
+                    let mut r = self.rows[op["id"].as_str().unwrap()].clone();
+                    for field in ["project", "content", "content_hash"] {
+                        let value = op[field].as_str().unwrap().to_string();
+                        match field {
+                            "project" => r.project = value,
+                            "content" => r.content = value,
+                            _ => r.content_hash = value,
+                        }
+                    }
+                    serde_json::json!({"ok": true, "seq": self.put(r)})
+                }
+                "delete" => serde_json::json!({"ok": true}),
+                other => panic!("unexpected op {other}"),
+            }
+        }
+
+        fn page(&self, since: i64, limit: usize) -> serde_json::Value {
+            let mut rows: Vec<&Memory> = self.rows.values().filter(|r| r.seq > since).collect();
+            rows.sort_by_key(|r| r.seq);
+            rows.truncate(limit);
+            serde_json::json!({"memories": rows})
+        }
+
+        fn latest_skill(&self, name: &str) -> Option<&Skill> {
+            self.skills.values().filter(|s| s.name == name).max_by_key(|s| s.version)
+        }
+
+        pub(super) fn put_skill(&mut self, mut skill: Skill) -> i64 {
+            self.next_seq += 1;
+            skill.seq = self.next_seq;
+            self.skills.insert(skill.seq, skill);
+            self.next_seq
+        }
+
+        fn skill_op(&mut self, op: &serde_json::Value) -> serde_json::Value {
+            self.ops_received += 1;
+            match op["op"].as_str().unwrap() {
+                "push" => {}
+                "delete" | "purge" => return serde_json::json!({"ok": true}),
+                "rewrite" => {
+                    let (name, version) = (op["name"].as_str().unwrap(), op["version"].as_i64().unwrap());
+                    let seq = self.skills.values().find(|k| k.name == name && k.version == version).unwrap().seq;
+                    let mut skill = self.skills.remove(&seq).unwrap();
+                    skill.project = op["project"].as_str().unwrap().into();
+                    skill.files = serde_json::from_value(op["files"].clone()).unwrap();
+                    skill.content_hash = op["content_hash"].as_str().unwrap().into();
+                    return serde_json::json!({"ok": true, "version": version, "seq": self.put_skill(skill)});
+                }
+                other => panic!("unexpected skill op {other}"),
+            }
+            let mut skill: Skill = serde_json::from_value(op["skill"].clone()).unwrap();
+            let latest = self.latest_skill(&skill.name).map_or(0, |s| s.version);
+            skill.version = latest + 1;
+            let version = skill.version;
+            let seq = self.put_skill(skill);
+            serde_json::json!({"ok": true, "version": version, "seq": seq,
+                "superseded_concurrent": op["base_version"].as_i64().unwrap() < latest})
+        }
+
+        fn skill_page(&self, since: i64, limit: usize) -> serde_json::Value {
+            let rows: Vec<&Skill> = self.skills.range(since + 1..).map(|(_, s)| s).take(limit).collect();
+            serde_json::json!({"skills": rows})
+        }
+    }
+
+    pub(super) fn keeping_relay(relay: Arc<Mutex<KeepingRelay>>) -> Box<Handler> {
+        Box::new(move |m, p, body| {
+            let (path, query) = p.split_once('?').unwrap_or((p, ""));
+            let arg = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k)?.strip_prefix('=')?.parse::<i64>().ok());
+            let mut r = relay.lock().unwrap();
+            match (m, path) {
+                ("POST", "/api/memory/batch") => {
+                    let results: Vec<_> = body["ops"].as_array().unwrap().iter().map(|op| r.op(op)).collect();
+                    (200, serde_json::json!({"results": results}))
+                }
+                ("POST", "/api/skills/batch") => {
+                    let results: Vec<_> = body["ops"].as_array().unwrap().iter().map(|op| r.skill_op(op)).collect();
+                    (200, serde_json::json!({"results": results}))
+                }
+                ("GET", "/api/memory") => (200, r.page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
+                ("GET", "/api/skills") => (200, r.skill_page(arg("since").unwrap_or(0), arg("limit").unwrap_or(200) as usize)),
+                _ => panic!("unexpected request {m} {p}"),
+            }
+        })
+    }
+
+    /// Arm a crash inside the store's next transaction: `trigger` creates a
+    /// TEMP trigger that calls `crash()`. That copies the database file and
+    /// its rollback journal into `image`'s directory, as a process killed at
+    /// that instant leaves them on disk, then fails the statement (the sync
+    /// gets an error and its transaction rolls back). It copies the database
+    /// and `-journal` only (the store's default rollback journal): a switch to
+    /// WAL must also copy `-wal` and `-shm`.
+    fn arm_crash(s: &Store, db: &Path, image: &Path, trigger: &str) {
+        use rusqlite::functions::FunctionFlags;
+        let (db, image) = (db.to_path_buf(), image.to_path_buf());
+        s.test_conn().create_scalar_function("crash", 0, FunctionFlags::SQLITE_UTF8, move |_| -> rusqlite::Result<i64> {
+            let copy = || -> std::io::Result<()> {
+                std::fs::create_dir_all(image.parent().unwrap())?;
+                for suffix in ["", "-journal"] {
+                    let (mut from, mut to) = (db.clone().into_os_string(), image.clone().into_os_string());
+                    from.push(suffix);
+                    to.push(suffix);
+                    if Path::new(&from).exists() {
+                        std::fs::copy(&from, &to)?;
+                    }
+                }
+                Ok(())
+            };
+            copy().map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+            Err(rusqlite::Error::UserFunctionError("injected crash".into()))
+        }).unwrap();
+        s.test_conn().execute_batch(trigger).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_crash_while_push_results_are_applied_leaves_the_chunk_queued_and_the_next_sync_completes() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        let mut old = valid("mem_old", "port 8765");
+        {
+            let mut r = relay.lock().unwrap();
+            r.put(valid("mem_canon", "beta")); // another machine added "beta" first
+            old.seq = r.put(old.clone()); // synced from here earlier
+        }
+        let s = Store::open(&db).unwrap();
+        s.upsert_memory(&old).unwrap();
+        queue_memories(&s, &["alpha", "beta"]); // ops 1 and 2
+        s.harvest_put(&HarvestEntry { origin: "m1:/x/beta.md".into(), memory_id: "mem_beta".into(), content_hash: content_hash("beta"), status: HarvestStatus::Synced }).unwrap();
+        assert!(invalidate_and_queue(&s, "mem_old", T, Some("mem_alpha")).unwrap()); // op 3
+        queue_memories(&s, &["gamma"]); // op 4
+        let queued = s.pending().unwrap();
+        let rows_before = s.history_memories().unwrap();
+        // At op 3's ack: ops 1 and 2 were applied (a seq, a canonical rewrite) and acked.
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_chunk BEFORE DELETE ON pending_ops WHEN old.n = {} BEGIN SELECT crash(); END;", queued[2].0));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        assert_eq!(relay.lock().unwrap().ops_received, 4); // the relay applied the chunk
+        drop(s);
+
+        // As the crash left the disk, and after the error's rollback: the
+        // chunk still queued as it was, none of its results applied.
+        let as_before = |s: &Store| {
+            assert_eq!(s.pending().unwrap(), queued);
+            assert_eq!(s.history_memories().unwrap(), rows_before);
+            assert!(s.get_memory("mem_canon").unwrap().is_none());
+            assert_eq!(s.harvest_get("m1:/x/beta.md").unwrap().unwrap().memory_id, "mem_beta");
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        as_before(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        as_before(&s);
+
+        // The next sync sends the chunk again and completes.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pushed, 4);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        assert!(s.get_state(LAST_SYNC_AT).unwrap() > 0);
+        let r = relay.lock().unwrap();
+        // Sent twice, applied once: one row per fact, the invalidation as first sent.
+        assert_eq!(r.ops_received, 8);
+        assert_eq!(r.rows.keys().map(String::as_str).collect::<Vec<_>>(), vec!["mem_alpha", "mem_canon", "mem_gamma", "mem_old"]);
+        assert_eq!((r.rows["mem_old"].invalid_at, r.rows["mem_old"].superseded_by.as_deref()), (Some(T), Some("mem_alpha")));
+        // This store holds the relay's rows exactly, the canonical rewrite done.
+        assert_eq!(s.history_memories().unwrap().len(), r.rows.len());
+        for row in r.rows.values() {
+            assert_eq!(s.get_memory(&row.id).unwrap().as_ref(), Some(row), "{}", row.id);
+        }
+        assert_eq!(s.harvest_get("m1:/x/beta.md").unwrap().unwrap().memory_id, "mem_canon");
+        assert_eq!(s.get_state(&memory_cursor_key("ast-a")).unwrap(), r.next_seq);
+    }
+
+    #[tokio::test]
+    async fn a_crash_inside_a_pulled_page_keeps_the_cursor_at_the_last_whole_page() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let page = PULL_LIMIT as usize;
+        let total = 2 * page + 50;
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        {
+            let mut r = relay.lock().unwrap();
+            for i in 1..=total {
+                let mut m = valid(&format!("mem_r{i:03}"), &format!("remote fact {i}"));
+                m.source_machine = "m2".into();
+                r.put(m);
+            }
+        }
+        let s = Store::open(&db).unwrap();
+        // Half way through the second page.
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_page BEFORE INSERT ON memories WHEN new.id = 'mem_r{:03}' BEGIN SELECT crash(); END;", page + page / 2));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        drop(s);
+
+        // The first page whole, with its cursor; nothing of the second.
+        let first_page_only = |s: &Store| {
+            let cursor = s.get_state(&memory_cursor_key("ast-a")).unwrap();
+            assert_eq!(cursor, page as i64);
+            let rows = s.history_memories().unwrap();
+            assert_eq!(rows.len(), page);
+            assert!(rows.iter().all(|m| m.seq <= cursor));
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        first_page_only(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        first_page_only(&s);
+
+        // The next sync pulls the second page again, whole, and the rest.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pulled, total - page);
+        assert_eq!(s.get_state(&memory_cursor_key("ast-a")).unwrap(), total as i64);
+        let r = relay.lock().unwrap();
+        assert_eq!(s.history_memories().unwrap().len(), total);
+        for row in r.rows.values() {
+            assert_eq!(s.get_memory(&row.id).unwrap().as_ref(), Some(row), "{}", row.id);
+        }
+    }
+
+    pub(super) fn skill_v1(name: &str, body: &str, machine: &str) -> Skill {
+        let mut files = BTreeMap::new();
+        files.insert("SKILL.md".to_string(), body.as_bytes().to_vec());
+        Skill {
+            scope: Scope::Global, project: String::new(), name: name.into(), version: 1,
+            content_hash: skill_hash(&files), files, source_agent: "cli".into(), source_machine: machine.into(),
+            created_at: 1, deleted: false, seq: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_crash_while_skill_push_results_are_applied_leaves_every_skill_op_queued() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        relay.lock().unwrap().put_skill(skill_v1("beta", "# beta from m2", "m2")); // another machine pushed beta first
+        let s = Store::open(&db).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            let skill = skill_v1(name, &format!("# {name}"), "m1");
+            s.put_skill(&skill).unwrap();
+            s.enqueue(&PendingOp::PushSkill { skill, base_version: 0 }).unwrap();
+        }
+        let queued = s.pending().unwrap();
+        let skills_before = s.all_skills().unwrap();
+        // At op 2's ack: op 1 was acked, op 2's result applied (beta moved to the relay's v2).
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_skill_batch BEFORE DELETE ON pending_ops WHEN old.n = {} BEGIN SELECT crash(); END;", queued[1].0));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        assert_eq!(relay.lock().unwrap().ops_received, 3); // the relay applied the batch
+        drop(s);
+
+        // As the crash left the disk, and after the error's rollback: no
+        // skill op acked, none of the batch's results applied.
+        let as_before = |s: &Store| {
+            assert_eq!(s.pending().unwrap(), queued);
+            assert_eq!(s.all_skills().unwrap(), skills_before);
+            assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), 0);
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        as_before(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        as_before(&s);
+
+        // The next sync sends the batch again and completes. The relay
+        // appends every push as a new version (designs/atem-memory.md), so the
+        // re-sent pushes are new versions, each flagged concurrent.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(!out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pushed, 3);
+        assert_eq!(out.notes.len(), 3, "{:?}", out.notes);
+        assert!(out.notes.iter().all(|n| n.contains("another machine pushed an edit at the same time")), "{:?}", out.notes);
+        assert_eq!(s.pending_count().unwrap(), 0);
+        assert!(s.get_state(LAST_SYNC_AT).unwrap() > 0);
+        let r = relay.lock().unwrap();
+        assert_eq!(r.ops_received, 6);
+        let versions = |name: &str| r.skills.values().filter(|k| k.name == name).map(|k| k.version).collect::<Vec<_>>();
+        assert_eq!((versions("alpha"), versions("beta"), versions("gamma")), (vec![1, 2], vec![1, 2, 3], vec![1, 2]));
+        // This store holds each skill's latest relay version exactly.
+        assert_eq!(s.all_skills().unwrap().len(), 3);
+        for name in ["alpha", "beta", "gamma"] {
+            assert_eq!(s.get_skill(Scope::Global, "", name).unwrap().as_ref(), r.latest_skill(name), "{name}");
+        }
+        assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), r.next_seq);
+    }
+
+    #[tokio::test]
+    async fn a_crash_inside_a_pulled_skill_page_keeps_the_skill_cursor_at_the_last_whole_page() {
+        let td = tempfile::tempdir().unwrap();
+        let (db, image) = (td.path().join("knowledge.db"), td.path().join("crash/knowledge.db"));
+        let page = PULL_LIMIT as usize;
+        let total = 2 * page + 50;
+        let relay = Arc::new(Mutex::new(KeepingRelay::default()));
+        {
+            let mut r = relay.lock().unwrap();
+            for i in 1..=total {
+                r.put_skill(skill_v1(&format!("skill{i:03}"), &format!("# skill {i}"), "m2"));
+            }
+        }
+        let s = Store::open(&db).unwrap();
+        // Half way through the second skill page.
+        arm_crash(&s, &db, &image, &format!(
+            "CREATE TEMP TRIGGER crash_mid_skill_page BEFORE INSERT ON skills WHEN new.name = 'skill{:03}' BEGIN SELECT crash(); END;", page + page / 2));
+        let (base, _log) = stub_relay(keeping_relay(relay.clone())).await;
+        let (_home, ctx) = test_ctx();
+        let err = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        drop(s);
+
+        // The first skill page whole, with its cursor; nothing of the second.
+        let first_page_only = |s: &Store| {
+            let cursor = s.get_state(&skill_cursor_key("ast-a")).unwrap();
+            assert_eq!(cursor, page as i64);
+            let skills = s.all_skills().unwrap();
+            assert_eq!(skills.len(), page);
+            assert!(skills.iter().all(|k| k.seq <= cursor));
+            assert_eq!(s.get_state(LAST_SYNC_AT).unwrap(), 0);
+        };
+        first_page_only(&Store::open(&db).unwrap());
+        let s = Store::open(&image).unwrap();
+        first_page_only(&s);
+
+        // The next sync pulls the second page again, whole, and the rest.
+        let out = run_sync(&s, Some(&client(&base, "ast-a")), &ctx, &NO_HARVEST).await.unwrap();
+        assert!(out.notes.is_empty() && !out.relay_error && !out.offline, "{:?}", out.notes);
+        assert_eq!(out.pulled, total - page);
+        assert_eq!(s.get_state(&skill_cursor_key("ast-a")).unwrap(), total as i64);
+        let r = relay.lock().unwrap();
+        assert_eq!(s.all_skills().unwrap().len(), total);
+        for row in r.skills.values() {
+            assert_eq!(s.get_skill(row.scope, &row.project, &row.name).unwrap().as_ref(), Some(row), "{}", row.name);
+        }
+    }
+
+    #[tokio::test]
     async fn restore_and_history_on_an_old_relay_say_update() {
         let s = Store::open_in_memory().unwrap();
         let (base, _log) = stub_relay(Box::new(|_, _, _| (404, serde_json::json!("404 page not found")))).await;
@@ -1492,3 +2280,7 @@ mod tests {
         assert_eq!(s.pending_count().unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "sync_pipeline_tests.rs"]
+mod pipeline_tests;

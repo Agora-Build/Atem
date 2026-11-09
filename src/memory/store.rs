@@ -323,6 +323,12 @@ impl Store {
         Ok(out)
     }
 
+    /// Tests only: the connection itself, for fault-injection triggers.
+    #[cfg(test)]
+    pub(crate) fn test_conn(&self) -> &Connection {
+        &self.conn
+    }
+
     // ── memories ────────────────────────────────────────────────────────
     /// Insert or overwrite (the relay is authoritative), except that a local
     /// invalidation the incoming row doesn't have yet is kept. Invalidation
@@ -519,7 +525,7 @@ impl Store {
         self.conn.execute("DELETE FROM replacements WHERE old_id = ?1", params![old])?;
         // Queued ops that still name the old id (e.g. replace's invalidate,
         // when a chunk boundary fell after its add).
-        for (n, op) in self.pending()? {
+        for (n, op) in self.pending_naming(old)? {
             let fixed = match op {
                 PendingOp::InvalidateMemory { id, invalid_at, superseded_by }
                     if id == old || superseded_by.as_deref() == Some(old) =>
@@ -634,6 +640,50 @@ impl Store {
     pub fn pending(&self) -> Result<Vec<(i64, PendingOp)>> {
         let mut stmt = self.conn.prepare("SELECT n, payload FROM pending_ops ORDER BY n")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (n, p) = row?;
+            out.push((n, serde_json::from_str(&p)?));
+        }
+        Ok(out)
+    }
+
+    /// Up to `limit` queued ops of one kind (memory ops when `memory`, else
+    /// skill ops) after op `after`, in queue order. `n` only grows
+    /// (AUTOINCREMENT), so a caller that walks the queue from the last `n` it
+    /// sent reads each op once, and still sees what changed since its last
+    /// read: ops queued meanwhile, and queued ops an earlier batch's results
+    /// rewrote. Rows are decoded only until `limit` ops are found.
+    pub fn pending_after(&self, after: i64, memory: bool, limit: usize) -> Result<Vec<(i64, PendingOp)>> {
+        let mut stmt = self.conn.prepare("SELECT n, payload FROM pending_ops WHERE n > ?1 ORDER BY n")?;
+        let mut rows = stmt.query(params![after])?;
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            let op: PendingOp = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            if op.is_memory() == memory {
+                out.push((row.get(0)?, op));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Queued op `n`, or `None` once it was acked.
+    pub fn pending_op(&self, n: i64) -> Result<Option<PendingOp>> {
+        let payload: Option<String> = self.conn
+            .query_row("SELECT payload FROM pending_ops WHERE n = ?1", params![n], |r| r.get(0))
+            .optional()?;
+        payload.map(|p| serde_json::from_str(&p).map_err(anyhow::Error::from)).transpose()
+    }
+
+    /// Queued ops whose payload contains `id` as a JSON string, in queue
+    /// order: every op with a field equal to `id` (serde_json writes a string
+    /// the same way each time), and possibly others that mention it, so
+    /// callers still compare the fields. Skips decoding the rest of the queue.
+    fn pending_naming(&self, id: &str) -> Result<Vec<(i64, PendingOp)>> {
+        let needle = serde_json::to_string(id)?;
+        let mut stmt = self.conn.prepare("SELECT n, payload FROM pending_ops WHERE instr(payload, ?1) > 0 ORDER BY n")?;
+        let rows = stmt.query_map(params![needle], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             let (n, p) = row?;
@@ -1119,6 +1169,62 @@ mod tests {
         assert!(p[0].1.is_memory() && p[1].1.is_memory() && !p[2].1.is_memory());
         s.ack(p[0].0).unwrap();
         assert_eq!(s.pending_count().unwrap(), 2);
+    }
+
+    fn op_names(ops: &[(i64, PendingOp)]) -> Vec<String> {
+        ops.iter().map(|(_, op)| match op {
+            PendingOp::AddMemory { memory } => memory.id.clone(),
+            PendingOp::DeleteSkill { name, .. } => name.clone(),
+            other => panic!("{other:?}"),
+        }).collect()
+    }
+
+    #[test]
+    fn pending_after_reads_one_kind_after_the_cursor() {
+        let s = Store::open_in_memory().unwrap();
+        let add = |id: &str| PendingOp::AddMemory { memory: mem(id, id) };
+        let del = |name: &str| PendingOp::DeleteSkill { scope: Scope::Global, project: String::new(), name: name.into() };
+        for op in [add("mem_1"), del("s1"), add("mem_2"), add("mem_3"), del("s2"), add("mem_4")] {
+            s.enqueue(&op).unwrap();
+        }
+        let first = s.pending_after(i64::MIN, true, 2).unwrap();
+        assert_eq!(op_names(&first), ["mem_1", "mem_2"]);
+        // The next read sees what changed since: a queued op rewritten, one queued.
+        let n3 = s.pending().unwrap()[3].0;
+        s.replace_pending(n3, &add("mem_3b")).unwrap();
+        s.enqueue(&add("mem_5")).unwrap();
+        assert_eq!(op_names(&s.pending_after(first[1].0, true, 10).unwrap()), ["mem_3b", "mem_4", "mem_5"]);
+        assert_eq!(op_names(&s.pending_after(i64::MIN, false, 10).unwrap()), ["s1", "s2"]);
+        assert!(s.pending_after(s.pending().unwrap().last().unwrap().0, true, 10).unwrap().is_empty());
+        // By `n`, until it is acked.
+        let (n, op) = first[0].clone();
+        assert_eq!(s.pending_op(n).unwrap(), Some(op));
+        s.ack(n).unwrap();
+        assert_eq!(s.pending_op(n).unwrap(), None);
+    }
+
+    #[test]
+    fn a_rewrite_finds_queued_ops_whose_ids_need_escaping() {
+        let s = Store::open_in_memory().unwrap();
+        let old = "mem_\"q\\\u{1}é"; // a quote, a backslash, a control character, non-ASCII
+        s.upsert_memory(&mem(old, "A")).unwrap();
+        let other = mem("mem_z", old); // names `old` in its text only: left alone
+        for op in [
+            PendingOp::InvalidateMemory { id: old.into(), invalid_at: 5, superseded_by: Some("mem_x".into()) },
+            PendingOp::InvalidateMemory { id: "mem_y".into(), invalid_at: 6, superseded_by: Some(old.into()) },
+            PendingOp::DeleteMemory { id: old.into() },
+            PendingOp::AddMemory { memory: other.clone() },
+        ] {
+            s.enqueue(&op).unwrap();
+        }
+        s.rewrite_memory_id(old, "mem_new").unwrap();
+        let ops: Vec<PendingOp> = s.pending().unwrap().into_iter().map(|(_, op)| op).collect();
+        assert_eq!(ops, vec![
+            PendingOp::InvalidateMemory { id: "mem_new".into(), invalid_at: 5, superseded_by: Some("mem_x".into()) },
+            PendingOp::InvalidateMemory { id: "mem_y".into(), invalid_at: 6, superseded_by: Some("mem_new".into()) },
+            PendingOp::DeleteMemory { id: "mem_new".into() },
+            PendingOp::AddMemory { memory: other },
+        ]);
     }
 
     #[test]

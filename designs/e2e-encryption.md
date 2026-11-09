@@ -117,7 +117,7 @@ only while the signed mode is `on`; see "Injection into agents by mode" and
 | Memory encryption | Optional, off by default, switched in Astation. Mode changes are signed by Astation; atem never moves toward plain text without one. Turning off goes through `disabling`. **Planned (owner decision 2026-11-08), not implemented:** the only mode: no `off`, no `disabling`; new accounts start on, accounts still off are migrated, the relay refuses plain text, Astation's switch becomes a status display. |
 | Injection into agents | **Planned (owner decision 2026-11-08), not implemented:** a transition measure until `off` is removed: relay-synced memory facts and skills reach agents (managed blocks, skill directories) only while the signed mode is `on`. Sync, search and list work in every mode. |
 | Rollback and forgery of memory and skills | **Planned (owner decision 2026-11-08), not implemented:** signed writes (build step 3) and an anti-rollback check on pulled rows, together. |
-| Performance | **Planned (owner decision 2026-11-08), not implemented:** a requirement with budgets, set from measurements, that block a release when broken. See "Performance". |
+| Performance | Owner decision 2026-11-08: a requirement with budgets, set from measurements; a change that breaks one doesn't ship. Built: the fixes F1, F2, F3, F6 and F7; F8 waits for Astation (#130); F4 and F5 are not approved. See "Performance". |
 | Credentials encryption | Always on. |
 | Offline credential reads | Grants per device. A device decrypts on its own while Astation is offline. |
 | Credential grant granularity | Per project scope. `global` is a scope. |
@@ -468,6 +468,75 @@ macOS login keychain is locked in SSH sessions, and most atems run over SSH.
   CLI carries its messages to Astation, and the storage key never passes
   through the CLI in plain form. A key-file error never stops it from
   starting: it starts locked and logs the error.
+- **One client and one connection per process.** Every caller in a process
+  (each `EncryptionContext`, the knowledge and vault clients, the runtime's
+  Astation link) shares one client per agent (keyed by its socket path and
+  key directory), which sends one request at a time over one connection kept
+  between requests; `running_agent` callers share another that never starts
+  an agent. Every released agent (v0.6.11, the first, to v0.8.3) serves any
+  number of lines on a connection and drops one idle for 60 s. The client
+  checks the build (`status`) once per connection, before its first request,
+  since a new connection may reach a restarted agent. A connection idle for
+  30 s, or one the agent has closed, is replaced before anything is written
+  on it. There is no fallback for an agent that closes a connection after
+  a reply (none was released): the request after such a connection's build
+  check fails with the error of a dropped connection, below, at once, and
+  is never sent twice when it changes the agent. When a connection that had
+  already answered at least once (the build check's `status` counts) drops
+  after a request was written but before any byte of its reply, only a
+  request that leaves the agent as it was (`status`, `Crypt`, `HeldKid`,
+  `PublicKeys`, `PendingRotation`, `CheckGrant`, `MigrationComplete`) is
+  sent once more on a new connection, at most once; for every other
+  request, and for any request on a connection that never answered, the
+  dropped connection is its error. Requests carry secrets, so once a
+  connection's requests are answered the agent wipes everything they left
+  in its read buffers (the whole allocation past any unread bytes); the
+  client keeps no request or reply bytes between requests.
+- **No needless wait for an agent the client started.** A client that may
+  start the agent (`autostart`) polls the new agent instead of sleeping a
+  fixed 100 ms: short pauses at first, growing to the old 100 ms for an agent
+  slow to start (the schedule is `START_POLLS_MS` in `agent_socket.rs`), up
+  to the same 10 s overall wait. Ready is what it always was: a connection accepted
+  on the expected socket (the recorded one first), by a listener running as
+  this user. A missing socket, a stale socket file (connection refused) and
+  an agent still starting are "not yet"; a listener of another user is the
+  error it always was; no agent within the wait is the same error ("the cred
+  agent didn't start"; a held key-directory lock is named as before). The
+  spawn is unchanged (detached, no extra descriptor: a readiness pipe was
+  not used, since it would change what the agent inherits). A client that
+  finds an agent running, and every `existing()` client, spawns and waits
+  for nothing.
+- **Binary frames for `Crypt`.** An agent that reads them says
+  `"frames": 1` in its answer to a `status` (no released agent does) and
+  from then on reads them on that connection, beside JSON lines. A client
+  that checks the build sends each `Crypt` there as a frame: a 10-byte
+  header (0xFF, which never starts a JSON line, a kind, the op count and the
+  body length, little-endian), then fields with 4-byte lengths, the plain
+  text to seal or hash and the opened bytes raw (no base64, no JSON pass).
+  Every other request, and every connection without that answer (a
+  released agent, a client that checks no build), stays on JSON lines. A
+  request frame names 1 to 1,024 ops and at most 2 MiB, or 6 MiB for one op
+  alone (the batches `EncryptionContext` makes); a bigger request goes as a
+  line. Every length is checked before anything is allocated, each buffer
+  is allocated once at its declared length, and a malformed frame closes
+  the connection. A framed `Crypt` is the same request to the agent (every
+  check applies) and a refusal comes back as the same JSON response inside
+  a frame. On the agent socket path, every buffer that held plain text, on
+  either side, is wiped once over its whole allocation with `memset`
+  followed by a compiler barrier (`asm!`, zeroize 1.9's
+  `optimization_barrier`) that keeps the zeros, instead of zeroize 1.8's
+  byte-at-a-time loop. Past the socket nothing changed: what a caller makes
+  of an opened value is not wiped, as before (a fact or skill opened into a
+  `String`, a queued op held while it is sealed ahead, a JSON body sent to
+  the relay). Layout: `src/memory/agent_frame.rs`.
+- **The agent's cached trust state.** `Crypt`, `HeldKid` and the prune of
+  retired keys read `cred/state.json` (and decode its signed states) only
+  when the file changed since the last read: another device, inode, size,
+  or modification or change time (with nanoseconds). A file changed less
+  than 3 s before it was looked at is read again at every request (file
+  times have a granularity, and a freed inode number can be reused by the
+  next write), as is one whose metadata can't be read; a lock drops the
+  cache with the keys.
 - **Private writes.** Every key file and `cred/state.json` is written to a
   temp file with a name of its own (`.<name>.<pid>.<counter>.<random>.tmp`,
   0600, `O_NOFOLLOW`), fsynced and renamed. A writer that crashes leaves
@@ -1078,7 +1147,21 @@ signed final state is useful delivery assurance, not an authorization rule.
    Disabling requires no encrypted/keyed protected fields to remain. A
    failed, incomplete or interrupted pass sends no completion. Writes and
    scans can be retried; a successful rewrite acknowledgment alone is not
-   a successful verification pass.
+   a successful verification pass. The rewrite opens and seals rows in groups
+   of whole POSTs (the same 64-fact and 16-skill batches; at most four
+   cred-agent requests' worth of 1,024 ops and 2 MiB per step, and never more
+   requests than one POST at a time; the first group is the first POST
+   alone), the next group while the POST before it is in flight (vaults: the
+   next vault while the previous one is POSTed).
+   A POST of rows prepared by an earlier request first confirms that the
+   cred agent is still unlocked (a `status`, not a `Crypt` request), so a
+   lock stops the migration within one POST. While disabling, the rows
+   prepared ahead are opened plain text: up to one group (about four
+   requests' worth, some 4,096 rows or 8 MiB) of rewrite bodies is held,
+   unwiped, ahead of its POSTs, against one 64-row POST before. They are
+   written to the relay as plain text anyway, and disabling goes away once
+   encryption is the only mode. The read-back checks each page while the
+   next one is fetched, and the first failure ends the pass.
 3. **Authenticate before dispatch.** `encryptionMigrationComplete` carries
    `completion: SignedWire`, an Ed25519 `atem-migration-complete-v1` signed
    by the device's pinned device-signing key. Its fields are length-prefixed
@@ -1321,32 +1404,40 @@ Planned:
   withholding every newer write. Detecting that needs a signed head the
   devices compare, which is not planned here.
 
-## Performance (planned requirements)
+## Performance
 
-**Planned (owner decision 2026-11-08), not implemented:** the owner requires
-good performance. Once encryption is the only mode, the encrypted path is the
-path every sync, vault read and write, migration and cold command takes, and it
-must be fast enough that nobody has a reason to want plain text back. The
-budgets below are the planned requirements. They were proposed from
-measurements of the encrypted path as built on `main` (b56dcd4), and the
-numbers are those measurements. "Today" says which budgets the code meets and
-which it misses, and each miss names its fix (F1 to F8, below).
+**Owner decision 2026-11-08:** the owner requires good performance. Once
+encryption is the only mode, the encrypted path is the path every sync, vault
+read and write, migration and cold command takes, and it must be fast enough
+that nobody has a reason to want plain text back. The budgets below were
+proposed from measurements of the encrypted path on `main` (b56dcd4); a budget
+moved since then only by an owner decision, cited in its row. **Built:** the
+fixes F1, F2, F3, F6 and F7 (below). **Waits for Astation:** F8 (issue #130).
+**Not approved:** F4 and F5. "Today" is the production path as built with
+those fixes, measured on 2026-11-08 (each number names its source: the task
+that built a fix, or the final run after the last one).
 
 **What is measured, and how.** `#[ignore]` performance tests in
-`src/memory/perf_tests.rs` (not committed yet) measure each item against temp
-profiles, a fake relay (a local HTTP server with the relay's batch and
-pagination shape) and the real `atem cred-agent` binary holding a test `K`;
-they touch no real profile and no network. Run them with
+`src/memory/perf_tests.rs` measure each item against temp profiles, a fake
+relay (a local HTTP server with the relay's batch and pagination shape) and the
+real `atem cred-agent` binary holding a test `K`; they touch no real profile and
+no network. Run them with `cargo build --release`, then
 `cargo test --release --bin atem perf_ -- --ignored --nocapture --test-threads=1`.
-They measure:
+They print their numbers and assert no budget: whoever runs them compares the
+numbers with the table below (a wall-time assertion would fail at random on a
+shared CI host). They measure:
 
 1. **Agent `Crypt` cost and round trips:** seal, open and keyed-hash cost by
-   field size, inside the agent and over the socket (a reused client and the
-   production path, which makes a new client per context), and round trips per
-   sync phase and per command.
+   field size, inside the agent and over the socket (a reused client, and the
+   production path: one client and one connection per process, the build check
+   on it, binary frames), and round trips per sync phase and per command.
 2. **Sync:** the time encryption adds to a push, pull and apply of 10, 100,
    1,000 and 5,000 facts (and of skills), against the same sync with no
-   encryption, with a file store as shipped and with an in-memory store.
+   encryption, with a file store as shipped and with an in-memory store; and
+   against a relay that answers each request after a fixed 5 or 20 ms
+   (`perf_2c`: 15 pairs of the same sync off and on, back to back with the
+   order alternating, each pair started only once the host's 1-minute load is
+   under 1.5; the added time is the median of the pairs' differences).
 3. **Vault:** write and read-back latency by entry size (1 KiB, 64 KiB, 1 MiB).
 4. **Migration:** records per second of the off-to-on rewrite plus read-back,
    and of a rotation to a new key.
@@ -1365,52 +1456,114 @@ clients, and signed writes (build step 3; they need a budget of about 50 ms more
 1,000 facts once they land, with batched verification and cached certificate
 checks).
 
-**Budgets** (planned; "Today" is the production path as built):
+**Budgets** ("Today" is the production path as built):
 
 | Area | Budget | Today | Status |
 |---|---|---|---|
-| Agent field ops | seal or open of a field of at most 1 KiB in at most 10 µs in the agent; at least 200 MiB/s for large fields | 2.2 to 9 µs; 250 to 300 MiB/s (keyed hash 160 MiB/s) | met |
-| Agent round trips | at most 1 `Crypt` request per sync phase per 1,024 ops / 2 MiB; no status probe after the first per process; one connection per process | 25 requests and 50 socket round trips per 1,000 facts (each request preceded by a status probe on a new connection) | needs F2 and F3 |
-| One request | at most 100 µs p50 for a batch-1 request; at most 4 µs per 100 B op over the socket | 125 µs (70 µs on a reused client); 5 µs per op | needs F3 and F1 |
-| Large fields | at most 8 ms per MiB through the socket (seal or open) | 15.5 ms per MiB | needs F1 |
-| Sync | encryption adds at most 30 ms per 1,000 facts pushed, pulled and applied (at most 10 ms per 1,000 pulled) on loopback, and at most 5% of the wall time against the real relay | +50 ms per 1,000 facts (+25 ms per 1,000 pulled); about 1% as shipped, only because the store dominates | needs F1 to F4; the percentage needs F6 |
+| Agent field ops | seal or open of a field of at most 1 KiB in at most 10 µs in the agent; at least 200 MiB/s for large fields | 2.2 to 9 µs; 250 to 300 MiB/s (keyed hash 160 MiB/s) (measured on `main`; the fixes don't change the cipher) | met |
+| Agent round trips | **Pull and read-back:** at most 1 `Crypt` request per relay page, overlapped with the next GET (owner decision 2026-11-08, "one per page", Task 4 measurements). **Push and migration:** at most 1 `Crypt` request per 1,024 ops / 2 MiB, plus one for the first chunk so its POST starts at once (owner decision 2026-11-08, "allow +1 to start", Task 4 measurements), and a small overhead above that, understood and bounded (owner decision 2026-11-08): exactly the planner's bound below the table, ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉ for a push of facts and ⌈ops / 1,024⌉ + S·G − 1 in general. **Status checks:** one per connection (the build check), and one before each POST of ops sealed by an earlier `Crypt` request, so a lock stops the push or migration within one POST (owner decision 2026-11-08, "allow lock checks", an exception to "no status probe after the first"; Task 4 measurements); they are not `Crypt` requests. One connection per process | `Crypt` requests per 1,000 / 5,000 facts: push 4 / 14, pull 5 / 25 (one per page), migration rewrite 6 / 16, read-back 9 / 29. A 1,000 / 5,000-fact push and pull is 29 / 139 socket round trips on one connection: the build check, the `Crypt` requests and about one status per POST of ops sealed ahead (Task 4) | met (the push within the planner's bound; it is "1 per 1,024 plus one" exactly up to about 4,500 facts) |
+| One request | at most 100 µs p50 for a batch-1 request; at most 4 µs per 100 B op over the socket | 15 to 17 µs p50 (100 B seal, open or keyed hash); 2.5 to 3.3 µs per op (Task 3) | met |
+| Large fields | at most 8 ms per MiB through the socket (seal or open) | 2.3 ms per MiB (Task 3) | met |
+| Sync | encryption adds at most 30 ms per 1,000 facts pushed, pulled and applied (at most 10 ms per 1,000 pulled) on loopback, and at most 5% of the wall time against the real relay | Loopback (in-memory store): push and pull +22 ms per 1,000 facts (+86 ms at 5,000), pull +2.9 ms per 1,000 (+35.5 ms at 5,000) (final run, `perf_2b`). Against a relay that answers after 20 ms: push and pull +0.8% (1,000 facts) and +0.6% (5,000), pull +3.2% and +2.8%; after 5 ms: +2.7%, +3.8%, +2.7% and +4.1% (final runs, `perf_2c`: medians of 45 quiet-host pairs in three runs of 15; one run gave +6.2% for the 5,000-fact pull at 20 ms, the other two +1.5% and +0.3%) | met on loopback, and against the relay with latency over the 45 pairs; a 5,000-fact pull is near the line in a single run (see "Where a sync's added time goes"); the real relay is not measured |
 | Apply and injection | encryption adds 0 ms to apply; the planned injection gate at most 0.1 ms per apply | 0 ms; `account_mode` 6.4 µs | met |
-| Vault | write plus read-back adds at most 0.5 ms for entries up to 4 KiB, at most 3 ms at 64 KiB, at most 15 ms per MiB | +0.36 ms at 1 KiB; +2.2 ms at 64 KiB; +34 ms at 1 MiB | 1 MiB needs F1 |
-| Migration | off to on including the read-back at least 10,000 records/s; at most 1 agent request per 64-record rewrite batch | about 13,100 records/s; 112 requests per 6,010 records | met |
-| Cold command | first agent contact at most 50 ms after spawn; agent startup at most 25 ms; unlock at most 10 ms on the agent side (Touch ID and the network excluded); `atem memory search` and the apply never touch the agent | 100.5 ms; 14 to 17 ms; about 5 ms; 0 | contact needs F7 |
-| Agent memory | at most 16 MiB RSS at rest unlocked without mlock and at most 48 MiB peak; at most 48 MiB when `mlockall` applies | 14.6 MiB at rest and 38.6 MiB peak without mlock; 72 MiB at rest and 105 MiB peak with it | the locked case needs F5 |
-| Wire size | at most 52 B + 1.34x per field; skill files at most 1.4x raw on the wire | memory and vault met; skill files 1.78x | skills need F8 |
+| Vault | write plus read-back adds at most 0.5 ms for entries up to 4 KiB, at most 3 ms at 64 KiB, at most 15 ms per MiB | +0.10 ms at 1 KiB; +0.46 ms at 64 KiB; +6.0 ms at 1 MiB (Task 3) | met |
+| Migration | off to on including the read-back at least 10,000 records/s; at most 1 `Crypt` request per 64-record rewrite batch (the statuses before POSTs of rows prepared by an earlier request are counted apart: owner decision 2026-11-08, "allow lock checks", Task 4 measurements) | about 21,900 records/s (6,010 records in 274 ms; 14,800 records/s for 2,010). `Crypt` requests for 1,000 / 5,000 facts and 10 skills: rewrite 6 / 16 for 17 / 80 POSTs, vault 2, read-back 9 / 29; and 15 / 78 statuses before POSTs prepared ahead. Against a 20 ms relay the migration adds 1.3% / 2.9% (no budget row) (final run, `perf_4`) | met |
+| Cold command | first agent contact at most 50 ms after spawn; agent startup at most 25 ms; unlock at most 10 ms on the agent side (Touch ID and the network excluded); `atem memory search` and the apply never touch the agent | 15.6 to 16 ms; 12.6 to 13.3 ms (about 10 ms of it `mlockall`; 2.7 ms without); about 5 ms; 0 (Task 5; final run) | met |
+| Agent memory | at most 16 MiB RSS at rest unlocked without mlock and at most 48 MiB peak; at most 48 MiB when `mlockall` applies | 13.6 MiB at rest unlocked and 37.6 MiB peak without mlock; 71.1 MiB at rest and 105.5 MiB peak with it (final run, `perf_5`) | the locked case misses; its fix (F5) is not approved |
+| Wire size | at most 52 B + 1.34x per field; skill files at most 1.4x raw on the wire | memory and vault met; skill files 1.78x | skills need F8, which waits for Astation (#130) |
 
-**Fixes that bring the misses under budget** (from the measurements; a fix is
-planned work, none is built):
+**The push and migration bound, as built** (owner decision 2026-11-08: a
+small overhead above "1 per 1,024 ops plus one for the first chunk" is
+accepted when it is understood and bounded). A push of one kind, or a
+migration's rewrite of one kind, goes to the relay in chunks: 50 memory ops,
+8 skill ops, 64 memory or 16 skill rewrite rows. The planner
+(`crypto::Planner`, the same for both) seals the first chunk alone, so its POST
+starts as soon as that is answered, then groups of whole chunks, each at most
+four requests' worth per step (4,096 `Crypt` ops and 8 MiB) and 4,096 queued
+ops; `run` splits each step of a group at 1,024 ops or 2 MiB. With `ops` the
+`Crypt` ops of the push, G its groups, S its dependent steps (memory 1; skills
+2: the paths and hashes, then the files sealed under the sealed paths; a
+rewrite up to 3: open, seal, files) and k the most `Crypt` ops one chunk
+carries (50 facts: at most 150), for ops of at most 2 KiB on the wire (so only
+the 1,024-op limit splits a request):
 
-| # | Fix | Gain |
-|---|---|---|
-| F1 | Faster socket framing: length-prefixed binary frames (no base64 of the plaintext, one parse), allocate once, wipe each buffer once at its used length with a fast wipe | 1 MiB field 15.5 to about 5 to 6 ms; 100 B op 5 to about 3 µs; vault 1 MiB write plus read-back +34 to about +12 ms |
-| F2 | One request per sync phase, overlapped with the network: encrypt a phase's ops in as few requests as the 1,024-op / 2 MiB limit allows, seal chunk k+1 while POST k is in flight, open page k while GET k+1 is in flight; the same in migration | `Crypt` requests per 1,000-fact push and pull 25 to about 7; about 0 ms added wall time against a real relay |
-| F3 | One client and one connection per process: a process-wide agent handle, the build check once, a persistent connection; the agent keeps the parsed trust state and reloads it only when `cred/state.json` changes | batch-1 request 125 to about 40 µs; socket round trips per 1,000 facts 50 to 25 (about 7 with F2); vault 1 KiB +0.36 to about +0.12 ms |
-| F4 | Remove redundant ops: deduplicate keyed hashes within a batch, build the HMAC once per request, cache `project_names.json` per context | one third fewer push ops (3,500 to 2,500 per 1,000 facts); keyed hash about 40% cheaper for short inputs |
-| F5 | A lighter agent: a current-thread runtime (or 1 to 2 workers), a cap on the largest request, optionally `malloc_trim` after a large one | locked RSS 72 to about 40 MiB; peak without the lock about 20 MiB |
-| F6 | The local store: wrap each push chunk's results and each pulled page in `Store::in_transaction` and read the pending queue once per group | 1,000-fact push and pull 5.65 s to about 0.25 s; 5,000 facts 30.7 s to about 0.8 s |
-| F7 | Faster cold autostart: poll at 5 ms, then 10 ms and so on (or a readiness signal) | first contact 100 to about 15 to 20 ms |
-| F8 | Skill files without double base64: carry a sealed file's `e1.` text as a JSON string (a wire change with the relay; needs Astation) | skill transfer 1.78x to 1.33x raw |
+- requests ≤ ⌈ops / 1,024⌉ + S·G − 1. The extra requests are each group's
+  partly filled last request per step: a group holds whole chunks, and a
+  skill group's files are a request of their own after its paths.
+- A push of facts (one step, an op in every queued item): requests ≤
+  ⌈ops / 1,024⌉ + 1 + ⌈(G − 2)·(k − 1) / 1,024⌉. A group ends only when the
+  next chunk would pass 4,096 ops, so it leaves fewer than k slots unused,
+  and every group but the first and the last holds more than 4,096 − k ops
+  (G − 2 < ops / (4,097 − k)). Deletes and invalidations carry no op but
+  count toward the 4,096 queued ops, so they can end a group early; that
+  costs at most one partly filled request per such group (the first bound).
+- At any size: never more requests than sealing each chunk alone (before F2).
+- Groups are planned by the ops as queued. A fact queued under a project hash
+  this device names only later (a replacement of a fact it couldn't name, see
+  "Projects not known here yet" in [atem-memory.md](atem-memory.md)) is
+  hashed under that name when sealed, one op more than planned: a group
+  holding u such facts can take up to ⌈u / 1,024⌉ requests more than the
+  second bound. The first and the last bound hold as stated.
 
-**The local store dominates a sync today.** As shipped, a sync does one
-autocommit and fsync per acked op and per pulled row (about 1.9 ms each), and
-rereads the whole pending queue for every 50-op chunk, so 1,000 facts take
-5.65 s and encryption is only about 1% of that. That is the store, not
-encryption, and it hides the encrypted path. After F6 the same sync takes about
-0.25 s and encryption is 15 to 20% of the local work (F1 to F3 bring it under
-10%). So the percentage budget for sync is measured after the planned
-transaction fix (F6); until then the millisecond budgets are the measure.
+For uniform facts this is exactly "1 per 1,024 plus one" up to 4,562 facts of
+two ops and 5,791 of three, and then one request more now and then, as the
+unused slots add up: a group of three-op facts (27 chunks, 4,050 ops) leaves
+46, about one request more per 22 groups (about 90,000 ops); a group of
+two-op facts (40 chunks, 4,000 ops) leaves 96, about one more per 11 groups
+(about 43,000 ops). 30,000 three-op facts take 90 requests against 89 (bound
+93), 100,000 take 298 against 294 (bound 305), and 100,000 two-op facts take
+201 against 197 (bound 202). For facts in general at most about
+(k − 1) / (4,097 − k) more, plus one: 3.8% at k = 150 (149 / 3,947). Pinned by
+`planned_requests_stay_within_the_documented_bound`
+(both bounds, the group sizes, these examples) and
+`planned_groups_never_take_more_requests_than_their_chunks_alone`.
+
+**Where a sync's added time goes** (final run, 2026-11-08). Against a relay
+with latency, a pull opens each page while the page before it is applied;
+the apply (about 31 ms a page in the file store) sets the pace at 5,000
+facts, and the opens (25 `Crypt` requests, about 44 ms of client and agent
+work for 5,000 facts) stay behind it. What remains on the path is the first
+page's open, about 2 ms, which has nothing to overlap. The rest of the
+difference is the applies' own spread (fsync): one run of 15 pairs measured
++6.2% for a 5,000-fact pull at 20 ms, the next two +1.5% and +0.3% on the same
+code (+2.8% over the 45 pairs). A push seals each group while one POST is in
+flight; at 5 ms a group's seal (up to four requests) outlasts that POST, so a
+5,000-fact push and pull adds 3.5 to 5% there (+3.8% over 45 pairs), and at
+20 ms the POST covers it (+0.6%).
+
+**The local store dominated a sync before F6.** On `main`, a sync did one
+autocommit and fsync per acked op and per pulled row (about 1.9 ms each) and
+reread the whole pending queue for every 50-op chunk, so 1,000 facts took
+5.65 s and encryption was only about 1% of that. F6 commits each push batch's
+results and each pulled page in one transaction and reads each chunk from the
+queue after the last op sent: a 1,000-fact push and pull takes 0.25 s
+(0.30 s encrypted) and 5,000 facts 1.34 s (1.54 s) (Task 1), so the
+percentage budget is now the measure. Most of the rest at 5,000 facts is the
+plain SQLite apply and full-text index (the plan's estimate of 0.8 s was not a
+budget).
 
 **Rule: a change that breaks a budget doesn't ship.** The `#[ignore]`
 performance tests in `src/memory/perf_tests.rs` are the measurement. They run
 before a release and on any change to the crypto path (`crypto.rs`, the cred
 agent's `Crypt` and socket, the sync, vault and migration clients), and a result
-over budget fails it. A budget moves only by an owner decision that cites the
-measurement. A missed budget is fixed in the design (the fixes above), never by
-a plain-text fallback.
+over budget blocks the change (a person compares the printed numbers with the
+table; the tests assert nothing). A budget moves only by an owner decision
+that cites the measurement. A missed budget is fixed in the design (the fixes
+below), never by a plain-text fallback.
+
+**Fixes** (F1, F2, F3, F6 and F7 built as described; gains measured before
+and after each, in the task that built it):
+
+| # | Fix | State | Gain |
+|---|---|---|---|
+| F1 | Binary `Crypt` frames on the agent socket: a 10-byte header and length-prefixed raw fields (no base64 of the plain text, no JSON pass), agreed per connection in the build check's `status`; each buffer allocated once and wiped once over its allocation (`memset` and a compiler barrier) | built | 1 MiB seal / open 16.1 / 15.0 to 2.3 / 2.3 ms; 100 B op 5.1 to 2.5 to 3.3 µs; vault 1 MiB write plus read-back +36.3 to +6.0 ms (Task 3) |
+| F2 | Full-size, overlapped batches. Push and migration seal groups of whole relay chunks, up to four `Crypt` requests' worth per step: the first chunk alone, then each group while the POST before it is in flight; a chunk sends an op as sealed ahead only while it is unchanged under the same mode, key and data account, and a status goes before each POST of ops sealed by an earlier request (the lock bound). Pull and read-back open one `Crypt` request per page, the next page fetched and opened while the one before it is applied (one page ahead) | built | `Crypt` requests per 1,000 facts: push 20 to 4, pull 5 (one per page), migration rewrite 18 to 6; added wall time of a 1,000-fact push and pull against a 20 ms relay +5.5% and +3.3% before (two runs) to +0.8% (45 pairs); both modes about 40% faster (a 5,000-fact pull at 20 ms with no encryption: 1.48 to 0.87 s) (Task 4; final run) |
+| F3 | One client and one connection per process: a process-wide agent client, the build check once per connection, a connection kept between requests (no fallback for an agent that closes connections after a reply: every released agent serves several requests per connection); the agent keeps the parsed trust state while `cred/state.json` is unchanged | built | batch-1 request 114 to 26 µs (16 µs with F1); socket round trips per 1,000-fact push and pull 50 on 50 connections to 26 on one (Task 2) |
+| F4 | Remove redundant ops: deduplicate keyed hashes within a batch, build the HMAC once per request, cache `project_names.json` per context | not approved | (estimate) one third fewer push ops; keyed hash about 40% cheaper for short inputs |
+| F5 | A lighter agent: a current-thread runtime (or 1 to 2 workers), a cap on the largest request, optionally `malloc_trim` after a large one | not approved | (estimate) locked RSS 72 to about 40 MiB; peak without the lock about 20 MiB |
+| F6 | The local store: one transaction per push batch's results and per pulled page (rows and cursor together), each chunk read from the queue after the last op sent | built | 1,000-fact push and pull 5.64 to 0.25 s (0.30 s encrypted); 5,000 facts 30.5 to 1.34 s (1.54 s) (Task 1) |
+| F7 | Faster cold autostart: poll a started agent after short pauses that grow to the old 100 ms (`START_POLLS_MS`), within the same 10 s | built | first contact 101 to 16 ms (Task 5) |
+| F8 | Skill files without double base64: carry a sealed file's `e1.` text as a JSON string (a wire change with the relay) | approved; waits for Astation (#130) | (estimate) skill transfer 1.78x to 1.33x raw |
 
 **Fixed (#132): a pulled fact with an unknown project no longer stops Memory
 sync.** A project-scoped fact or skill whose `h1.` project hash this device has
@@ -1420,7 +1573,13 @@ unresolved: never injected or installed, shown in explicit reads as
 `project:(not known here yet)`, and the cursor moves on. It resolves when the
 device learns the project name ("Projects not known here yet" in
 [atem-memory.md](atem-memory.md)). The performance test
-`perf_x_an_unknown_project_hash_no_longer_stops_the_pull` checks it.
+`perf_x_an_unknown_project_hash_no_longer_stops_the_pull` checks it. In the
+overlapped pull (F2) the rule applies as each page is opened: an unresolved
+row is committed with its page and the page's cursor, like any other row,
+and the resolve step runs once the pull's last page has committed, outside
+any page's transaction. A push compares an op sealed ahead as it would be
+sealed now, its project hash named since or not, so an op whose hash was
+named after it was sealed is sealed again, never sent under that hash.
 
 ## Credentials (`atem cred`)
 

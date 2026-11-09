@@ -28,6 +28,11 @@ pub(crate) struct RelayState {
 }
 
 impl RelayState {
+    /// A relay that stores nothing yet.
+    pub(crate) fn empty() -> Self {
+        Self { memories: Vec::new(), skills: Vec::new(), vault_summary: String::new(), vault_entries: Vec::new(), next_seq: 1 }
+    }
+
     pub(crate) fn seeded() -> Self {
         let memory = Memory {
             id: "mem-seed".into(),

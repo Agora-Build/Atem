@@ -1,6 +1,7 @@
 //! Performance measurements of the end-to-end encrypted path
-//! (designs/e2e-encryption.md). Measurement code only: never run by default
-//! (every test is `#[ignore]`), never committed.
+//! (designs/e2e-encryption.md "Performance"). Measurement code only: never
+//! run by default (every test is `#[ignore]`), and it asserts no budget: the
+//! tests print their numbers, and a person compares them with the budgets.
 //!
 //! Temp profiles only: the in-process test agent (`UnlockedDevice`), or a
 //! real `atem cred-agent` process (the release binary beside the test
@@ -147,6 +148,8 @@ fn skill(i: usize, files: usize, file_bytes: usize) -> Skill {
 struct Counts {
     calls: AtomicUsize,
     crypts: AtomicUsize,
+    /// `Crypt` requests that open (pull, read-back); the others seal or hash.
+    open_crypts: AtomicUsize,
     ops: AtomicUsize,
     nanos: AtomicU64,
 }
@@ -155,6 +158,7 @@ impl Counts {
     fn reset(&self) {
         self.calls.store(0, Ordering::SeqCst);
         self.crypts.store(0, Ordering::SeqCst);
+        self.open_crypts.store(0, Ordering::SeqCst);
         self.ops.store(0, Ordering::SeqCst);
         self.nanos.store(0, Ordering::SeqCst);
     }
@@ -174,6 +178,9 @@ impl CredAgentApi for Meter {
         self.counts.calls.fetch_add(1, Ordering::SeqCst);
         if let Request::Crypt { ops, .. } = &request {
             self.counts.crypts.fetch_add(1, Ordering::SeqCst);
+            if ops.iter().any(|op| matches!(op, CryptOp::Open { .. })) {
+                self.counts.open_crypts.fetch_add(1, Ordering::SeqCst);
+            }
             self.counts.ops.fetch_add(ops.len(), Ordering::SeqCst);
         }
         let start = Instant::now();
@@ -185,23 +192,14 @@ impl CredAgentApi for Meter {
     }
 }
 
-/// What production does per `EncryptionContext`: `EncryptionContext::for_astation`
-/// makes a new `CredAgentClient::autostart()` each time, whose first request
-/// first asks the running agent for its status (`check_build`). Every
-/// `KnowledgeClient`/`VaultClient` call makes a new context, and each makes
-/// at most one or two `Crypt` requests, so a new client per request is the
-/// production cost (two connections, two round trips per request).
-struct FreshClientPerRequest {
-    paths: CredPaths,
-    run: PathBuf,
-    build: String,
-}
-
-impl CredAgentApi for FreshClientPerRequest {
-    fn call(&self, request: Request) -> anyhow::Result<Reply> {
-        CredAgentClient::for_paths(&self.paths, Some(self.run.clone().into_os_string()), None)
-            .checking_build(&self.build)
-            .call(request)
+/// The agent's racy window has passed for every file written so far: from
+/// now on it serves cred/state.json from its cache (`CredAgent::trust_view`).
+fn settle() {
+    std::thread::sleep(crate::memory::cred_agent::RACY_WINDOW + Duration::from_millis(100));
+    // The CPU is back at full clock speed before anything is timed.
+    let spin = Instant::now();
+    while spin.elapsed() < Duration::from_millis(300) {
+        std::hint::black_box(spin);
     }
 }
 
@@ -353,7 +351,7 @@ impl RealAgent {
         }
     }
 
-    fn reuse(&self) -> Arc<dyn CredAgentApi> {
+    fn reuse(&self) -> Arc<CredAgentClient> {
         Arc::new(CredAgentClient::for_paths(
             &self.paths,
             Some(self.run.clone().into_os_string()),
@@ -361,12 +359,16 @@ impl RealAgent {
         ))
     }
 
-    fn fresh(&self) -> Arc<dyn CredAgentApi> {
-        Arc::new(FreshClientPerRequest {
-            paths: self.paths.clone(),
-            run: self.run.clone(),
-            build: self.build.clone(),
-        })
+    /// What production does: `default_agent` hands every `EncryptionContext`
+    /// of a process the same client (`agent_socket::shared`), which keeps one
+    /// connection and checks the build once per connection. A new one is a
+    /// new process's.
+    fn production(&self) -> Arc<CredAgentClient> {
+        Arc::new(self.reuse_client().checking_build(&self.build))
+    }
+
+    fn reuse_client(&self) -> CredAgentClient {
+        CredAgentClient::for_paths(&self.paths, Some(self.run.clone().into_os_string()), None)
     }
 
     fn pid(&self) -> u32 {
@@ -423,6 +425,8 @@ impl RelayData {
 struct Relay {
     base: String,
     data: Arc<Mutex<RelayData>>,
+    /// Added to every response, in µs: a real relay's round trip.
+    latency: Arc<AtomicU64>,
 }
 
 impl Relay {
@@ -430,8 +434,10 @@ impl Relay {
     /// client's), HTTP/1.1 keep-alive like the real one behind Cloudflare.
     fn start() -> Self {
         let data = Arc::new(Mutex::new(RelayData::default()));
+        let latency = Arc::new(AtomicU64::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
         let served = data.clone();
+        let delay = latency.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -447,8 +453,9 @@ impl Relay {
                         return;
                     };
                     let data = served.clone();
+                    let delay = delay.clone();
                     tokio::spawn(async move {
-                        let _ = serve_http(socket, data).await;
+                        let _ = serve_http(socket, data, delay).await;
                     });
                 }
             });
@@ -456,7 +463,14 @@ impl Relay {
         Self {
             base: rx.recv().unwrap(),
             data,
+            latency,
         }
+    }
+
+    /// Every later response waits `latency` first.
+    fn set_latency(&self, latency: Duration) {
+        self.latency
+            .store(latency.as_micros() as u64, Ordering::SeqCst);
     }
 
     fn reset(&self) {
@@ -505,6 +519,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 async fn serve_http(
     mut socket: tokio::net::TcpStream,
     data: Arc<Mutex<RelayData>>,
+    latency: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.set_nodelay(true)?;
@@ -569,6 +584,10 @@ async fn serve_http(
         };
         buffer.drain(..header_end + length);
         let response = handle(&data, &method, &target, &body, length);
+        let delay = latency.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_micros(delay)).await;
+        }
         let bytes = serde_json::to_vec(&response).unwrap();
         data.lock().unwrap().down_bytes += bytes.len();
         // One write (and TCP_NODELAY): a separate head and body would meet
@@ -754,17 +773,19 @@ enum Mode {
     Off,
     /// `on`, the agent in this process (crypto + agent logic, no socket).
     InProcess,
-    /// `on`, a real agent process, one client reused (a connection per request).
+    /// `on`, a real agent process, one client reused (one connection, no
+    /// build check, so JSON lines).
     SocketReuse,
-    /// `on`, a real agent process, a new client per request (production).
-    SocketFresh,
+    /// `on`, a real agent process, a process's client as production makes
+    /// it (one connection, the build check on it, which agrees to frames).
+    Production,
 }
 
 const ALL_MODES: [Mode; 4] = [
     Mode::Off,
     Mode::InProcess,
     Mode::SocketReuse,
-    Mode::SocketFresh,
+    Mode::Production,
 ];
 
 struct Profiles {
@@ -782,6 +803,7 @@ impl Profiles {
         let mut on = UnlockedDevice::new(b.path());
         on.set_key(target, KID, KEY);
         let real = RealAgent::start(target, None);
+        settle();
         Self {
             _dirs: vec![a, b],
             off,
@@ -790,25 +812,42 @@ impl Profiles {
         }
     }
 
-    fn agent(&self, mode: Mode) -> (CredPaths, Arc<dyn CredAgentApi>) {
+    /// The paths and agent of `mode`, and the socket client behind it.
+    fn agent(
+        &self,
+        mode: Mode,
+    ) -> (
+        CredPaths,
+        Arc<dyn CredAgentApi>,
+        Option<Arc<CredAgentClient>>,
+    ) {
+        let socket = |client: Arc<CredAgentClient>| {
+            (
+                self.real.paths.clone(),
+                client.clone() as Arc<dyn CredAgentApi>,
+                Some(client),
+            )
+        };
         match mode {
             Mode::Off => (
                 self.off.paths.clone(),
                 self.off.agent.clone() as Arc<dyn CredAgentApi>,
+                None,
             ),
             Mode::InProcess => (
                 self.on.paths.clone(),
                 self.on.agent.clone() as Arc<dyn CredAgentApi>,
+                None,
             ),
-            Mode::SocketReuse => (self.real.paths.clone(), self.real.reuse()),
-            Mode::SocketFresh => (self.real.paths.clone(), self.real.fresh()),
+            Mode::SocketReuse => socket(self.real.reuse()),
+            Mode::Production => socket(self.real.production()),
         }
     }
 
     /// The same mode for `paths` (to seal seed rows, unmetered).
     fn context(&self, mode: Mode) -> EncryptionContext {
-        let (paths, agent) = self.agent(match mode {
-            Mode::SocketFresh => Mode::SocketReuse,
+        let (paths, agent, _) = self.agent(match mode {
+            Mode::Production => Mode::SocketReuse,
             other => other,
         });
         EncryptionContext::for_astation_with(ASTATION_ID, &paths, agent).unwrap()
@@ -833,13 +872,12 @@ fn agents_home(dir: &Path) -> PathBuf {
     home
 }
 
-/// Agent connections per request: a fresh client asks for the status first.
-fn socket_round_trips(mode: Mode, calls: usize) -> usize {
-    match mode {
-        Mode::Off | Mode::InProcess => 0,
-        Mode::SocketReuse => calls,
-        Mode::SocketFresh => calls * 2,
-    }
+/// Socket round trips (request lines, build checks included) and
+/// connections `client` made so far.
+fn traffic(client: Option<&Arc<CredAgentClient>>) -> (usize, usize) {
+    client.map_or((0, 0), |client| {
+        (client.traffic().requests(), client.traffic().connections())
+    })
 }
 
 // ───────────────────────── 1. Crypt costs ─────────────────────────
@@ -1004,6 +1042,7 @@ fn perf_1b_crypt_requests_in_process_and_over_the_socket() {
     device.set_key(EncryptionMode::On, KID, KEY);
     let real = RealAgent::start(EncryptionMode::On, None);
     let real_nolock = RealAgent::start(EncryptionMode::On, Some(8 << 20));
+    settle();
     let plain = text(100, 3).into_bytes();
     let sealed_one = device
         .agent
@@ -1020,18 +1059,21 @@ fn perf_1b_crypt_requests_in_process_and_over_the_socket() {
             "in-process agent (no socket)",
             device.agent.clone() as Arc<dyn CredAgentApi>,
         ),
-        ("socket, client reused (mlockall on)", real.reuse()),
         (
-            "socket, new client per request = production (mlockall on)",
-            real.fresh(),
+            "socket, client reused, no build check: JSON lines (mlockall on)",
+            real.reuse(),
         ),
         (
-            "socket, client reused (RLIMIT_MEMLOCK 8 MiB: no mlockall)",
+            "socket, production: one client per process, frames (mlockall on)",
+            real.production(),
+        ),
+        (
+            "socket, client reused, JSON lines (RLIMIT_MEMLOCK 8 MiB: no mlockall)",
             real_nolock.reuse(),
         ),
         (
-            "socket, new client per request (no mlockall)",
-            real_nolock.fresh(),
+            "socket, production, frames (no mlockall)",
+            real_nolock.production(),
         ),
     ];
     println!("\n## 1b. One Crypt request, by batch size (100-byte fields), median");
@@ -1117,7 +1159,7 @@ fn perf_1b_crypt_requests_in_process_and_over_the_socket() {
 
     println!("\n## 1c. Fixed costs per request / per context");
     let status_reuse = bench(300, || {
-        real.reuse().status().unwrap();
+        real.reuse_client().status().unwrap();
     });
     let client = real.reuse();
     let status_same = bench(300, || {
@@ -1197,9 +1239,11 @@ struct SyncRun {
     total: Duration,
     apply: Duration,
     agent: Duration,
-    calls: usize,
     crypts: usize,
+    open_crypts: usize,
     ops: usize,
+    round_trips: usize,
+    connections: usize,
     http: usize,
     up: usize,
     down: usize,
@@ -1217,7 +1261,7 @@ async fn sync_run(
     relay.reset();
     let _ = std::fs::remove_dir_all(work);
     std::fs::create_dir_all(work).unwrap();
-    let (paths, agent) = profiles.agent(mode);
+    let (paths, agent, client) = profiles.agent(mode);
     let (agent, counts) = metered(agent);
     let knowledge = relay.knowledge(&paths, agent);
     let store = if file_store {
@@ -1268,6 +1312,7 @@ async fn sync_run(
     }
     relay.reset_counters();
     counts.reset();
+    let traffic_before = traffic(client.as_ref());
     let start = Instant::now();
     let out = run_sync(
         &store,
@@ -1284,6 +1329,7 @@ async fn sync_run(
         out.notes
     );
     let (http, up, down) = relay.traffic();
+    let traffic_after = traffic(client.as_ref());
     let start = Instant::now();
     apply_all(&store, &ctx).unwrap();
     let apply = start.elapsed();
@@ -1291,9 +1337,11 @@ async fn sync_run(
         total,
         apply,
         agent: counts.agent_time(),
-        calls: counts.calls.load(Ordering::SeqCst),
         crypts: counts.crypts.load(Ordering::SeqCst),
+        open_crypts: counts.open_crypts.load(Ordering::SeqCst),
         ops: counts.ops.load(Ordering::SeqCst),
+        round_trips: traffic_after.0 - traffic_before.0,
+        connections: traffic_after.1 - traffic_before.1,
         http,
         up,
         down,
@@ -1341,9 +1389,9 @@ async fn sync_table(file_store: bool, sizes: &[usize], reps_for: impl Fn(usize) 
         }
     );
     println!(
-        "| scenario | N | mode | total ms | added vs off ms | added % | agent ms | apply ms | Crypt reqs | agent socket round trips | ops | HTTP reqs | up KiB | down KiB |"
+        "| scenario | N | mode | total ms | added vs off ms | added % | agent ms | apply ms | Crypt reqs (seal / open) | agent socket round trips | agent connections | ops | HTTP reqs | up KiB | down KiB |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (scenario, n) in scenarios {
         let reps = reps_for(n);
         let mut off_total = Duration::ZERO;
@@ -1366,14 +1414,17 @@ async fn sync_table(file_store: bool, sizes: &[usize], reps_for: impl Fn(usize) 
                 }
             };
             println!(
-                "| {label} | {n} | {mode:?} | {:.1} | {:.1} | {:.1}% | {:.1} | {:.1} | {} | {} | {} | {} | {:.0} | {:.0} |",
+                "| {label} | {n} | {mode:?} | {:.1} | {:.1} | {:.1}% | {:.1} | {:.1} | {} ({} / {}) | {} | {} | {} | {} | {:.0} | {:.0} |",
                 ms(run.total),
                 added * 1e3,
                 added / off_total.as_secs_f64() * 100.0,
                 ms(run.agent),
                 ms(run.apply),
                 run.crypts,
-                socket_round_trips(mode, run.calls),
+                run.crypts - run.open_crypts,
+                run.open_crypts,
+                run.round_trips,
+                run.connections,
                 run.ops,
                 run.http,
                 run.up as f64 / 1024.0,
@@ -1409,6 +1460,138 @@ async fn perf_2b_sync_cycle_in_memory_store() {
     .await;
 }
 
+/// The 1-minute load average (Linux; `None` elsewhere).
+fn load_1min() -> Option<f64> {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A quiet host: a 1-minute load average under this.
+const QUIET_LOAD: f64 = 1.5;
+/// The longest wait for a quiet host before measuring anyway.
+const QUIET_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// Waits until the host is quiet (`QUIET_LOAD`), at most `QUIET_WAIT`: the
+/// 1-minute load average then (`None` off Linux), and whether it was quiet.
+async fn quiet_host() -> (Option<f64>, bool) {
+    let start = Instant::now();
+    loop {
+        let Some(load) = load_1min() else {
+            return (None, true);
+        };
+        if load < QUIET_LOAD {
+            return (Some(load), true);
+        }
+        if start.elapsed() >= QUIET_WAIT {
+            return (Some(load), false);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The `at` quantile (0 to 1) of sorted `values`, nearest rank.
+fn quantile(values: &[f64], at: f64) -> f64 {
+    values[((values.len() - 1) as f64 * at).round() as usize]
+}
+
+/// The sync against a relay with a fixed round trip: what encryption adds
+/// to the wall time once the network, not the loopback, sets the pace.
+/// Each pair (off and on, back to back, the order alternating) starts on a
+/// quiet host (`quiet_host`); every pair is printed with its load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn perf_2c_sync_against_a_relay_with_latency() {
+    let (_profile, _scope) = crate::test_profile::temp();
+    let relay = Relay::start();
+    let profiles = Profiles::new(EncryptionMode::On);
+    let scratch = tempfile::tempdir().unwrap();
+    const REPS: usize = 15;
+    let mut summary = Vec::new();
+    println!(
+        "\n## 2c. Sync cycle against a relay that answers each request after a fixed latency, file store; {REPS} pairs, off and on back to back (order alternating), each pair started with the 1-minute load under {QUIET_LOAD}"
+    );
+    println!(
+        "| latency ms | scenario | N | pair | load 1 min | quiet | order | off ms | on ms | on − off ms |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for latency in [5u64, 20] {
+        relay.set_latency(Duration::from_millis(latency));
+        for (scenario, n) in [
+            (Scenario::PushPull, 1000usize),
+            (Scenario::PushPull, 5000),
+            (Scenario::Pull, 1000),
+            (Scenario::Pull, 5000),
+        ] {
+            let label = match scenario {
+                Scenario::PushPull => "push+pull+apply",
+                _ => "pull+apply (other device's facts)",
+            };
+            let (mut offs, mut ons, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+            for rep in 0..REPS {
+                let (load, quiet) = quiet_host().await;
+                let work = scratch.path().join(format!("{rep}"));
+                let off_first = rep % 2 == 0;
+                let mut runs = Vec::new();
+                for mode in if off_first {
+                    [Mode::Off, Mode::Production]
+                } else {
+                    [Mode::Production, Mode::Off]
+                } {
+                    runs.push(sync_run(&relay, &profiles, mode, n, scenario, &work, true).await);
+                }
+                let (off, on) = if off_first {
+                    (runs.remove(0), runs.remove(0))
+                } else {
+                    let on = runs.remove(0);
+                    (runs.remove(0), on)
+                };
+                let added = on.total.as_secs_f64() - off.total.as_secs_f64();
+                println!(
+                    "| {latency} | {label} | {n} | {rep} | {} | {} | {} | {:.1} | {:.1} | {:+.1} |",
+                    load.map_or("n/a".into(), |load| format!("{load:.2}")),
+                    if quiet { "yes" } else { "no" },
+                    if off_first { "off, on" } else { "on, off" },
+                    ms(off.total),
+                    ms(on.total),
+                    added * 1e3
+                );
+                pairs.push(added);
+                offs.push(off);
+                ons.push(on);
+            }
+            pairs.sort_by(f64::total_cmp);
+            let (off, on) = (median_run(offs), median_run(ons));
+            summary.push(format!(
+                "| {latency} | {label} | {n} | {:.1} | {:.1} | {:+.1} | {:+.1}% | {:+.1} / {:+.1} | {} of {REPS} | {:.1} | {} ({} / {}) | {} |",
+                ms(off.total),
+                ms(on.total),
+                quantile(&pairs, 0.5) * 1e3,
+                quantile(&pairs, 0.5) / off.total.as_secs_f64() * 100.0,
+                quantile(&pairs, 0.25) * 1e3,
+                quantile(&pairs, 0.75) * 1e3,
+                pairs.iter().filter(|&&added| added > 0.05 * off.total.as_secs_f64()).count(),
+                ms(on.agent),
+                on.crypts,
+                on.crypts - on.open_crypts,
+                on.open_crypts,
+                on.http
+            ));
+        }
+    }
+    relay.set_latency(Duration::ZERO);
+    println!(
+        "\n| latency ms | scenario | N | off ms (median) | on (production) ms (median) | added ms (median of pairs) | added % | pairs' quartiles ms | pairs over 5% | agent ms | Crypt reqs (seal / open) | HTTP reqs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for row in summary {
+        println!("{row}");
+    }
+}
+
 // ───────────────────────── 3. Vault ─────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1420,16 +1603,16 @@ async fn perf_3_vault_write_and_read_back() {
         "\n## 3. Vault: write one entry, then read the vault back (current view, one entry); median"
     );
     println!(
-        "| entry | mode | write ms | read ms | write+read-back ms | added vs off ms | agent calls per write+read |"
+        "| entry | mode | write ms | read ms | write+read-back ms | added vs off ms | agent calls per write+read | agent connections over the runs |"
     );
-    println!("|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|");
     for size in [1usize << 10, 64 << 10, 1 << 20] {
         let payload = text(size, 42);
         let reps = if size >= 1 << 20 { 15 } else { 40 };
         let mut off_both = Duration::ZERO;
         for mode in ALL_MODES {
             relay.reset();
-            let (paths, agent) = profiles.agent(mode);
+            let (paths, agent, client) = profiles.agent(mode);
             let (agent, counts) = metered(agent);
             let vault = relay.vault(&paths, agent);
             let id = vault.create("perf vault").await.unwrap().vault_id;
@@ -1438,6 +1621,7 @@ async fn perf_3_vault_write_and_read_back() {
             let mut reads = Vec::new();
             let mut both = Vec::new();
             counts.reset();
+            let traffic_before = traffic(client.as_ref());
             for _ in 0..reps {
                 let start = Instant::now();
                 vault.write(&id, &payload, Some(1)).await.unwrap();
@@ -1452,19 +1636,21 @@ async fn perf_3_vault_write_and_read_back() {
                 both.push(wrote + read);
             }
             let calls = counts.calls.load(Ordering::SeqCst) / reps;
+            let traffic_after = traffic(client.as_ref());
             let both = median(both);
             if mode == Mode::Off {
                 off_both = both;
             }
             println!(
-                "| {} KiB | {mode:?} | {:.2} | {:.2} | {:.2} | {:.2} | {} ({} socket round trips) |",
+                "| {} KiB | {mode:?} | {:.2} | {:.2} | {:.2} | {:.2} | {} ({} socket round trips) | {} |",
                 size >> 10,
                 ms(median(writes)),
                 ms(median(reads)),
                 ms(both),
                 ms(both) - ms(off_both),
                 calls,
-                socket_round_trips(mode, calls)
+                (traffic_after.0 - traffic_before.0) / reps,
+                traffic_after.1 - traffic_before.1
             );
         }
     }
@@ -1477,6 +1663,9 @@ struct MigrationRun {
     vault: Duration,
     verify: Duration,
     calls: usize,
+    /// `Crypt` requests of the memory+skills rewrite, the vault rewrite and
+    /// the read-back.
+    crypts: (usize, usize, usize),
     http: usize,
 }
 
@@ -1526,12 +1715,15 @@ async fn migrate_run(
     let knowledge = relay.knowledge(paths, agent.clone());
     let vault = relay.vault(paths, agent);
     relay.reset_counters();
+    let crypts = || counts.crypts.load(Ordering::SeqCst);
     let start = Instant::now();
     knowledge.migrate_encryption().await.unwrap();
     let knowledge_t = start.elapsed();
+    let rewrite_crypts = crypts();
     let start = Instant::now();
     vault.migrate_encryption().await.unwrap();
     let vault_t = start.elapsed();
+    let vault_crypts = crypts() - rewrite_crypts;
     let start = Instant::now();
     knowledge.verify_encryption_migration().await.unwrap();
     vault.verify_encryption_migration().await.unwrap();
@@ -1541,6 +1733,11 @@ async fn migrate_run(
         vault: vault_t,
         verify,
         calls: counts.calls.load(Ordering::SeqCst),
+        crypts: (
+            rewrite_crypts,
+            vault_crypts,
+            crypts() - rewrite_crypts - vault_crypts,
+        ),
         http: relay.traffic().0,
     }
 }
@@ -1562,9 +1759,9 @@ async fn perf_4_migration() {
         "\n## 4. Migration off → on (enabling): rewrite every row, then the read-back pass; median of 3"
     );
     println!(
-        "| facts | skills (10×4 KiB files) | vault entries (1 KiB) | mode | memory+skills rewrite ms | vault rewrite ms | read-back ms | total ms | added vs no-crypto ms | records/s | agent calls | HTTP reqs |"
+        "| facts | skills (10×4 KiB files) | vault entries (1 KiB) | mode | memory+skills rewrite ms | vault rewrite ms | read-back ms | total ms | added vs no-crypto ms | records/s | agent calls | Crypt reqs (rewrite / vault / read-back) | HTTP reqs |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (n, skills, entries) in [
         (10usize, 1usize, 10usize),
         (100, 10, 100),
@@ -1583,11 +1780,15 @@ async fn perf_4_migration() {
                 device.paths.clone(),
                 device.agent.clone() as Arc<dyn CredAgentApi>,
             ),
-            ("socket, client reused", real.paths.clone(), real.reuse()),
             (
-                "socket, new client per request (production)",
+                "socket, client reused",
                 real.paths.clone(),
-                real.fresh(),
+                real.reuse() as Arc<dyn CredAgentApi>,
+            ),
+            (
+                "socket, production (one client per process)",
+                real.paths.clone(),
+                real.production() as Arc<dyn CredAgentApi>,
             ),
         ];
         for (name, paths, agent) in modes {
@@ -1605,7 +1806,7 @@ async fn perf_4_migration() {
             }
             let records = n + skills + entries;
             println!(
-                "| {n} | {skills} | {entries} | {name} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {} | {} |",
+                "| {n} | {skills} | {entries} | {name} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {} | {} / {} / {} | {} |",
                 ms(run.knowledge),
                 ms(run.vault),
                 ms(run.verify),
@@ -1613,10 +1814,63 @@ async fn perf_4_migration() {
                 total - base_total,
                 records as f64 / (total / 1e3),
                 run.calls,
+                run.crypts.0,
+                run.crypts.1,
+                run.crypts.2,
                 run.http
             );
         }
     }
+    // The same against a relay with a round trip: what encryption adds once
+    // the network sets the pace.
+    println!(
+        "\n### 4''. Migration against a relay that answers each request after 20 ms, median of 3"
+    );
+    println!(
+        "| facts | skills | vault entries | mode | total ms | added vs no-crypto ms | added % | Crypt reqs (rewrite / vault / read-back) | HTTP reqs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
+    relay.set_latency(Duration::from_millis(20));
+    for (n, skills, entries) in [(1000usize, 10usize, 1000usize), (5000, 10, 1000)] {
+        let mut base_total = 0.0;
+        let modes: Vec<(&str, CredPaths, Arc<dyn CredAgentApi>)> = vec![
+            (
+                "no crypto (disabling over plain rows)",
+                baseline.paths.clone(),
+                baseline.agent.clone() as Arc<dyn CredAgentApi>,
+            ),
+            (
+                "socket, production (one client per process)",
+                real.paths.clone(),
+                real.production() as Arc<dyn CredAgentApi>,
+            ),
+        ];
+        for (name, paths, agent) in modes {
+            let mut runs = Vec::new();
+            for _ in 0..3 {
+                runs.push(
+                    migrate_run(&relay, &paths, agent.clone(), n, skills, entries, None).await,
+                );
+            }
+            runs.sort_by_key(|run| run.knowledge + run.vault + run.verify);
+            let run = runs.remove(1);
+            let total = ms(run.knowledge + run.vault + run.verify);
+            if base_total == 0.0 {
+                base_total = total;
+            }
+            println!(
+                "| {n} | {skills} | {entries} | {name} | {:.1} | {:.1} | {:.1}% | {} / {} / {} | {} |",
+                total,
+                total - base_total,
+                (total - base_total) / base_total * 100.0,
+                run.crypts.0,
+                run.crypts.1,
+                run.crypts.2,
+                run.http
+            );
+        }
+    }
+    relay.set_latency(Duration::ZERO);
     // Key rotation: every row already sealed under the old kid, re-sealed under the new one.
     println!(
         "\n### 4'. Rotation (enabling with a new kid over rows sealed under the old one), in-process agent"
@@ -1773,7 +2027,7 @@ fn perf_5_cold_start_unlock_and_memory() {
         }
     }
     println!(
-        "- client autostart (no agent running): first status after {:.1} ms (spawn + the client's 100 ms poll); then a Crypt is refused (locked) in {:.2} ms",
+        "- client autostart (no agent running): first status after {:.1} ms (spawn + the client's polls); then a Crypt is refused (locked) in {:.2} ms",
         ms(median(first)),
         ms(median(to_locked_error))
     );
@@ -1947,6 +2201,158 @@ fn perf_5_cold_start_unlock_and_memory() {
     println!(
         "\n- `atem memory search` work on 5,000 facts (open knowledge.db + FTS query; no cred agent involved): {:.2} ms",
         ms(search)
+    );
+}
+
+/// Kills the detached agents a test started, even when it panics.
+struct Detached(Vec<u32>);
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+        }
+    }
+}
+
+/// What a client's launcher does in production (`agent_socket::spawn_agent`,
+/// the detached spawn of `daemon`), with only HOME, XDG_RUNTIME_DIR and PATH
+/// set (temp dirs); the pid goes on `started`.
+fn detached_launcher(
+    home: &Path,
+    run: &Path,
+    log: &Path,
+    started: Arc<Mutex<Detached>>,
+) -> Box<dyn Fn() -> anyhow::Result<()> + Send + Sync> {
+    let (home, run, log) = (home.to_path_buf(), run.to_path_buf(), log.to_path_buf());
+    Box::new(move || {
+        let envs = [
+            ("HOME".into(), home.clone().into_os_string()),
+            ("XDG_RUNTIME_DIR".into(), run.clone().into_os_string()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ];
+        let pid = crate::daemon::spawn_detached_clean(
+            &atem_binary(),
+            "cred-agent",
+            Path::new("/"),
+            &log,
+            &envs,
+        )?;
+        started.lock().unwrap().0.push(pid);
+        Ok(())
+    })
+}
+
+/// F7: from the spawn of an agent to a client's first contact with it.
+/// Three clocks per run, each from just before the (detached) spawn:
+/// the socket accepting connections, a client that starts the agent getting
+/// its first `status` reply, and a command as production makes it (the
+/// build check on the connection, then a `Crypt` that the locked agent
+/// refuses).
+#[test]
+#[ignore]
+fn perf_5c_cold_autostart_first_contact() {
+    println!(
+        "\n## 5c. Cold autostart: first contact after the spawn (detached spawn, release agent)"
+    );
+    let build = RealAgent::start(EncryptionMode::On, None).build.clone();
+    let runs = 30;
+    let mut listening = Vec::new();
+    let mut first_status = Vec::new();
+    let mut command = Vec::new();
+    for _ in 0..runs {
+        let started = Arc::new(Mutex::new(Detached(Vec::new())));
+        // (i) the socket accepting connections (a raw 200 µs poll).
+        {
+            let dir = short_dir();
+            let (home, run) = (dir.path().join("h"), dir.path().join("r"));
+            std::fs::create_dir_all(&home).unwrap();
+            private_dir(&run);
+            let paths = CredPaths::in_dir(&home.join(".config").join("atem"));
+            let socket = paths.agent_sock(Some(run.as_path()));
+            let launch = detached_launcher(&home, &run, &dir.path().join("a.log"), started.clone());
+            let start = Instant::now();
+            launch().unwrap();
+            while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+                assert!(start.elapsed() < Duration::from_secs(10), "no agent");
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            listening.push(start.elapsed());
+        }
+        // (ii) a client that starts the agent: its first `status` reply.
+        // (iii) a command: build check, then a `Crypt` the locked agent refuses.
+        for (clock, checked) in [(&mut first_status, false), (&mut command, true)] {
+            let dir = short_dir();
+            let (home, run) = (dir.path().join("h"), dir.path().join("r"));
+            std::fs::create_dir_all(&home).unwrap();
+            private_dir(&run);
+            let paths = CredPaths::in_dir(&home.join(".config").join("atem"));
+            let launch = detached_launcher(&home, &run, &dir.path().join("a.log"), started.clone());
+            let mut client =
+                CredAgentClient::with_launcher(paths.agent_sock(Some(run.as_path())), launch);
+            if checked {
+                client = client.checking_build(&build);
+            }
+            let start = Instant::now();
+            if checked {
+                assert!(
+                    client
+                        .crypt(ASTATION_ID, vec![CryptOp::seal("m", "content", b"x")])
+                        .is_err()
+                );
+            } else {
+                client.status().unwrap();
+            }
+            clock.push(start.elapsed());
+        }
+        drop(started);
+    }
+    let spread = |samples: &[Duration]| {
+        let mut sorted = samples.to_vec();
+        sorted.sort();
+        format!(
+            "median {:.1} ms, min {:.1}, p90 {:.1}, max {:.1}",
+            ms(median(samples.to_vec())),
+            ms(sorted[0]),
+            ms(sorted[sorted.len() * 9 / 10]),
+            ms(*sorted.last().unwrap())
+        )
+    };
+    println!(
+        "- spawn to socket accepting connections ({runs} runs): {}",
+        spread(&listening)
+    );
+    println!(
+        "- spawn to a starting client's first `status` reply: {}",
+        spread(&first_status)
+    );
+    println!(
+        "- cold command (build check + refused `Crypt`, locked agent): {}",
+        spread(&command)
+    );
+    // Startup alone, with and without `mlockall` (RLIMIT_MEMLOCK 8 MiB: no
+    // lock), to see what the lock costs.
+    let mut unlocked_limit = Vec::new();
+    for _ in 0..runs {
+        let dir = short_dir();
+        let (home, run) = (dir.path().join("h"), dir.path().join("r"));
+        std::fs::create_dir_all(&home).unwrap();
+        private_dir(&run);
+        let paths = CredPaths::in_dir(&home.join(".config").join("atem"));
+        let socket = paths.agent_sock(Some(run.as_path()));
+        let start = Instant::now();
+        let mut child = spawn_agent(&home, &run, &dir.path().join("a.log"), Some(8 << 20));
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no agent");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        unlocked_limit.push(start.elapsed());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    println!(
+        "- spawn to socket accepting connections, RLIMIT_MEMLOCK 8 MiB (no mlockall; plain spawn): {}",
+        spread(&unlocked_limit)
     );
 }
 
@@ -2281,7 +2687,7 @@ fn perf_1d_large_field_breakdown() {
         ];
         let total: Duration = steps.iter().map(|(_, d)| *d).sum();
         println!(
-            "\n## 1d. A {} KiB seal through the socket path, step by step (median of {reps}; sum {:.2} ms; socket I/O and wake-ups not included)",
+            "\n## 1d. A {} KiB seal through the JSON line path, step by step (median of {reps}; sum {:.2} ms; socket I/O and wake-ups not included)",
             size >> 10,
             ms(total)
         );

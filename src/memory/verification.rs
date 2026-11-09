@@ -314,15 +314,16 @@ pub(crate) fn stored_state(entry: &AstationTrust) -> Result<Option<AccountState>
         .transpose()
 }
 
+/// Every account's newest signed state (`newest_states`).
+pub(crate) type NewestStates = std::collections::BTreeMap<String, Option<AccountState>>;
+
 /// The newest signed state of every account a verified Astation names: the
 /// highest epoch when two name one account (on equal epochs, the state of
 /// the smallest Astation id), `None` while none of them has a signed state.
 /// The one rule for which `K` an account needs, shared by the cred agent
 /// (which keys it keeps and uses) and `key_needed` (which it asks for);
 /// `effective_state` reads it for one Astation.
-pub(crate) fn newest_states(
-    trust: &TrustStore,
-) -> Result<std::collections::BTreeMap<String, Option<AccountState>>> {
+pub(crate) fn newest_states(trust: &TrustStore) -> Result<NewestStates> {
     let mut newest = std::collections::BTreeMap::new();
     for entry in trust.verified_entries() {
         let state = stored_state(entry)?;
@@ -351,12 +352,26 @@ pub(crate) fn effective_state(
     trust: &TrustStore,
     astation_id: &str,
 ) -> Result<Option<(String, Option<AccountState>)>> {
-    let Some(entry) = trust.verified(astation_id) else {
+    if trust.verified(astation_id).is_none() {
         return Ok(None);
-    };
-    let account = entry.data_account.clone();
-    let state = newest_states(trust)?.remove(&account).flatten();
-    Ok(Some((account, state)))
+    }
+    Ok(effective_state_with(
+        trust,
+        &newest_states(trust)?,
+        astation_id,
+    ))
+}
+
+/// `effective_state` over `newest`, the `newest_states` of `trust` (the
+/// cred agent keeps them while cred/state.json is unchanged).
+pub(crate) fn effective_state_with(
+    trust: &TrustStore,
+    newest: &NewestStates,
+    astation_id: &str,
+) -> Option<(String, Option<AccountState>)> {
+    let entry = trust.verified(astation_id)?;
+    let state = newest.get(&entry.data_account).cloned().flatten();
+    Some((entry.data_account.clone(), state))
 }
 
 /// What the latest signed account state says for this device and

@@ -226,12 +226,13 @@ pub(crate) fn valid_kid(kid: &str) -> bool {
 }
 
 /// Most bytes and operations one `Crypt` request carries; bigger batches are
-/// split. One skill (at most `MAX_SKILL_BYTES`, 1 MiB) always fits.
-const CRYPT_BATCH_BYTES: usize = 2 << 20;
-const CRYPT_BATCH_OPS: usize = 1024;
+/// split. One skill (at most `MAX_SKILL_BYTES`, 1 MiB) always fits. The
+/// agent's frames are bounded by the same numbers (agent_frame.rs).
+pub(crate) const CRYPT_BATCH_BYTES: usize = 2 << 20;
+pub(crate) const CRYPT_BATCH_OPS: usize = 1024;
 /// Most bytes one op may carry (`wire_len`, request and reply): well below
 /// the agent's 8 MiB line limit, so a field never makes the agent hang up.
-const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
+pub(crate) const CRYPT_OP_MAX_BYTES: usize = 6 << 20;
 
 const UNKNOWN_PROJECT: &str = "encrypted project name is unknown on this Atem; sync from a device that used it first";
 const MALFORMED_PROJECT: &str = "relay sent a malformed project hash; refusing it";
@@ -246,6 +247,221 @@ pub struct ProjectNaming {
     /// while not encrypting. A migration delivers what is still live under
     /// them again, with a fresh seq, under the current key or in plain.
     pub stale: Vec<String>,
+}
+
+/// What a batch adds to one step of its `Crypt` work: its ops, their bytes
+/// as `run` counts them (`CryptOp::wire_len`), and its largest op. For
+/// planning batches only: `run` splits at the limits itself, so a wrong
+/// estimate costs a request, never a result.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cost {
+    pub ops: usize,
+    pub bytes: usize,
+    pub largest: usize,
+}
+
+impl Cost {
+    fn one(bytes: usize) -> Self {
+        Self { ops: 1, bytes, largest: bytes }
+    }
+
+    fn seal(record: &str, field: usize, plain: usize) -> Self {
+        if plain == 0 { return Self::default(); }
+        Self::one(CryptOp::seal_wire_len(record.len(), field, plain))
+    }
+
+    fn open(record: &str, field: usize, value: usize) -> Self {
+        if value == 0 { return Self::default(); }
+        Self::one(CryptOp::open_wire_len(record.len(), field, value))
+    }
+
+    fn hash(value: usize) -> Self {
+        Self::one(CryptOp::keyed_hash_wire_len(value))
+    }
+}
+
+impl std::ops::Add for Cost {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self { ops: self.ops + other.ops, bytes: self.bytes + other.bytes, largest: self.largest.max(other.largest) }
+    }
+}
+
+impl std::ops::AddAssign for Cost {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
+    }
+}
+
+/// An item's cost in each dependent `Crypt` step of its batch, in order:
+/// opening, then sealing (paths and hashes), then a skill's files (sealed
+/// under their sealed paths, so after the paths).
+pub(crate) type Steps = [Cost; 3];
+
+/// Most `Crypt` requests' worth a planned group holds per step: what a
+/// group of relay chunks may be sealed or opened together in (and so how
+/// far sealing runs ahead of the relay).
+pub(crate) const GROUP_REQUESTS: usize = 4;
+
+/// Whether some op of `steps` is over the agent's limit for one op: `run`
+/// refuses the whole batch holding it.
+pub(crate) fn too_large(steps: &Steps) -> bool {
+    steps.iter().any(|step| step.largest > CRYPT_OP_MAX_BYTES)
+}
+
+/// Whole relay chunks gathered into one group of `Crypt` work (F2): each
+/// step stays within `GROUP_REQUESTS` requests' worth (ops, bytes, and
+/// items: an op with no sealed field costs nothing), the first chunk always
+/// fits, and a chunk with an op over the agent's limit is a group of its own
+/// (so it fails alone, as it did when each chunk was sealed alone).
+///
+/// `run` splits each step of a group at the agent's limits, op by op, in
+/// order. Sealing whole chunks together this way never takes more requests
+/// than sealing each chunk alone: packing ops in order into requests, a
+/// sequence never needs more requests than its parts packed apart.
+#[derive(Debug, Default)]
+struct Budget {
+    steps: Steps,
+    items: usize,
+}
+
+impl Budget {
+    fn fits(&self, chunk: &Steps, items: usize) -> bool {
+        self.items == 0
+            || (!too_large(chunk)
+                && self.items + items <= GROUP_REQUESTS * CRYPT_BATCH_OPS
+                && self.steps.iter().zip(chunk).all(|(used, more)| {
+                    used.ops + more.ops <= GROUP_REQUESTS * CRYPT_BATCH_OPS
+                        && used.bytes + more.bytes <= GROUP_REQUESTS * CRYPT_BATCH_BYTES
+                }))
+    }
+
+    fn add(&mut self, chunk: &Steps, items: usize) {
+        for (used, more) in self.steps.iter_mut().zip(chunk) {
+            *used += *more;
+        }
+        self.items += items;
+    }
+
+    /// No chunk may join after one with an op over the agent's limit.
+    fn closed(&self) -> bool {
+        too_large(&self.steps)
+    }
+}
+
+/// The one rule that plans a group, a relay chunk at a time (F2): the push
+/// (`sync::read_group`) and the migration (`plan_groups`) both use it. A
+/// group takes whole chunks within its `Budget`; a run's first group is its
+/// first chunk alone, so the first POST starts as soon as it is sealed (wall
+/// time first: this can cost one request more than packing it with the next
+/// chunks).
+#[derive(Debug, Default)]
+pub(crate) struct Planner {
+    budget: Budget,
+    chunks: usize,
+    one_chunk: bool,
+}
+
+impl Planner {
+    /// A group's planner; `first`: the run's first group (one chunk).
+    pub(crate) fn new(first: bool) -> Self {
+        Self { one_chunk: first, ..Self::default() }
+    }
+
+    /// Whether the next chunk (its steps and its item count) joins this
+    /// group; it is counted in when it does.
+    pub(crate) fn take(&mut self, chunk: &Steps, items: usize) -> bool {
+        let joins = self.chunks == 0
+            || (!self.one_chunk && !self.budget.closed() && self.budget.fits(chunk, items));
+        if joins {
+            self.budget.add(chunk, items);
+            self.chunks += 1;
+        }
+        joins
+    }
+}
+
+/// The steps of `items` together.
+pub(crate) fn total<T>(items: &[T], cost: impl Fn(&T) -> Steps) -> Steps {
+    items.iter().map(cost).fold(Steps::default(), |mut sum, item| {
+        for (sum, more) in sum.iter_mut().zip(item) {
+            *sum += more;
+        }
+        sum
+    })
+}
+
+/// `items`, sent to the relay `chunk` at a time, in groups of whole chunks
+/// planned by `Planner` (F2): never more `Crypt` requests than sealing each
+/// chunk alone, and the first chunk alone.
+pub(crate) fn plan_groups<T>(items: &[T], chunk: usize, cost: impl Fn(&T) -> Steps) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let (mut start, mut planner) = (0, Planner::new(true));
+    for (index, part) in items.chunks(chunk.max(1)).enumerate() {
+        let at = index * chunk.max(1);
+        let part_cost = total(part, &cost);
+        if !planner.take(&part_cost, part.len()) {
+            groups.push(start..at);
+            (start, planner) = (at, Planner::new(false));
+            planner.take(&part_cost, part.len());
+        }
+    }
+    if start < items.len() {
+        groups.push(start..items.len());
+    }
+    groups
+}
+
+/// What `encrypt_memories` asks the agent for `memory`.
+pub(crate) fn memory_seal_cost(memory: &Memory) -> Cost {
+    let mut cost = project_hash_cost(&memory.project);
+    if !memory.content.is_empty() {
+        cost += Cost::hash(memory.content.len()) + Cost::seal(&memory.id, "content".len(), memory.content.len());
+    }
+    cost
+}
+
+/// What `decrypt_memories` asks the agent for `memory`.
+pub(crate) fn memory_open_cost(memory: &Memory) -> Cost {
+    if !memory.content.starts_with("e1.") { return Cost::default(); }
+    Cost::open(&memory.id, "content".len(), memory.content.len())
+}
+
+/// A skill's content hash: hex SHA-256 (`skill_hash`).
+const SKILL_HASH_LEN: usize = 64;
+
+/// What `encrypt_skills` asks the agent for `skill`, in its two requests:
+/// paths and hashes, then the files.
+pub(crate) fn skill_seal_cost(skill: &Skill) -> [Cost; 2] {
+    let record = skill_record(skill);
+    let mut first = Cost::hash(SKILL_HASH_LEN) + project_hash_cost(&skill.project);
+    let mut files = Cost::default();
+    for (path, bytes) in &skill.files {
+        first += Cost::seal(&record, "path".len(), path.len());
+        files += Cost::seal(&record, "file:".len() + crate::memory::account_keys::sealed_len(path.len()), bytes.len());
+    }
+    [first, files]
+}
+
+/// What `decrypt_skills` asks the agent for `skill`.
+pub(crate) fn skill_open_cost(skill: &Skill) -> Cost {
+    if !skill.files.keys().any(|path| path.starts_with("e1.")) { return Cost::default(); }
+    let record = skill_record(skill);
+    skill.files.iter()
+        .map(|(path, bytes)| Cost::open(&record, "path".len(), path.len()) + Cost::open(&record, "file:".len() + path.len(), bytes.len()))
+        .fold(Cost::default(), |sum, cost| sum + cost)
+}
+
+/// What `wire_projects` asks the agent for `project`.
+pub(crate) fn project_hash_cost(project: &str) -> Cost {
+    if hashed_project(project) { Cost::hash(project.len()) } else { Cost::default() }
+}
+
+/// Whether `project` goes to the relay as its keyed hash while encrypting:
+/// not empty, and not a hash this Atem can't name (`is_unresolved_project`),
+/// which goes out as it came.
+fn hashed_project(project: &str) -> bool {
+    !project.is_empty() && !is_unresolved_project(project)
 }
 
 /// One Astation's encryption mode, and a handle on the cred agent, which
@@ -293,7 +509,7 @@ impl EncryptionContext {
         Self::for_astation_with(
             astation_id,
             &CredPaths::default_paths(),
-            Arc::from(crate::memory::cred_agent::default_agent()),
+            crate::memory::cred_agent::default_agent(),
         )
     }
 
@@ -349,6 +565,16 @@ impl EncryptionContext {
         }
         results.extend(agent.crypt(&self.astation_id, batch)?);
         Ok(results)
+    }
+
+    /// Fails as a locked agent's `Crypt` does while the cred agent is locked;
+    /// nothing to confirm without an agent (encryption off).
+    pub fn confirm_unlocked(&self) -> Result<()> {
+        let Some(agent) = &self.agent else { return Ok(()) };
+        if !agent.status()?.unlocked {
+            bail!(crate::memory::cred_agent::LOCKED);
+        }
+        Ok(())
     }
 
     pub fn should_encrypt(&self) -> bool {
@@ -534,8 +760,15 @@ impl EncryptionContext {
     /// then every file's bytes bound to its encrypted path. A project this
     /// Atem can't name goes back as the hash it came as.
     pub fn encrypt_skills(&self, skills: Vec<Skill>) -> Result<Vec<Skill>> {
-        if !self.should_encrypt() { return Ok(skills); }
-        let hashed = |skill: &Skill| !skill.project.is_empty() && !skill.has_unresolved_project();
+        Ok(self.encrypt_skills_with_projects(skills, &[])?.0)
+    }
+
+    /// `encrypt_skills`, and `projects` as `wire_projects` makes them, with
+    /// their hashes in the skills' first batch: a push of skills with their
+    /// deletes and purges is two agent requests, not three.
+    pub fn encrypt_skills_with_projects(&self, skills: Vec<Skill>, projects: &[String]) -> Result<(Vec<Skill>, Vec<String>)> {
+        if !self.should_encrypt() { return Ok((skills, self.wire_projects(projects)?)); }
+        let hashed = |skill: &Skill| hashed_project(&skill.project);
         let mut ops = Vec::new();
         for skill in &skills {
             let record = skill_record(skill);
@@ -545,6 +778,7 @@ impl EncryptionContext {
             if hashed(skill) { ops.push(CryptOp::keyed_hash(skill.project.as_bytes())); }
             ops.push(CryptOp::keyed_hash(skill_hash(&skill.files).as_bytes()));
         }
+        ops.extend(projects.iter().filter(|project| hashed_project(project)).map(|project| CryptOp::keyed_hash(project.as_bytes())));
         let mut results = self.run(ops)?.into_iter();
         let mut names = Vec::new();
         let mut staged = Vec::with_capacity(skills.len());
@@ -562,6 +796,14 @@ impl EncryptionContext {
             let hash = next_text(&mut results)?;
             staged.push((skill, paths, project, hash));
         }
+        let wire = projects.iter()
+            .map(|project| {
+                if !hashed_project(project) { return Ok(project.clone()); }
+                let hash = next_text(&mut results)?;
+                names.push((hash.clone(), project.clone()));
+                Ok(hash)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut ops = Vec::new();
         for (skill, paths, _, _) in &staged {
             let record = skill_record(skill);
@@ -583,7 +825,7 @@ impl EncryptionContext {
             encrypted.push(skill);
         }
         self.remember(names)?;
-        Ok(encrypted)
+        Ok((encrypted, wire))
     }
 
     pub fn decrypt_skill(&self, skill: Skill) -> Result<Skill> {
@@ -1110,5 +1352,218 @@ mod tests {
         assert_eq!(fs::read(&victim).unwrap(), b"untouched");
         assert!(live.exists(), "a live writer's temp is left alone");
         assert!(other.exists() && unlike.exists(), "other files' temps are left alone");
+    }
+
+    #[test]
+    fn group_plans_fill_each_request() {
+        let cost = |ops: usize, bytes: usize| [Cost { ops, bytes, largest: bytes / ops.max(1) }, Cost::default(), Cost::default()];
+        // 3-op items, 50 per chunk: the first chunk alone, then 27 chunks
+        // (4,050 ops) per group.
+        let items = vec![3usize; 3000];
+        assert_eq!(plan_groups(&items, 50, |&n| cost(n, n * 100)), vec![0..50, 50..1400, 1400..2750, 2750..3000]);
+        // Bytes bind first: chunks of 3.2 MiB, two per group; a bigger
+        // chunk alone.
+        let items = vec![400usize << 10; 48];
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..24, 24..40, 40..48]);
+        let items: Vec<usize> = [vec![1 << 10; 8], vec![2 << 20; 8], vec![1 << 10; 8]].concat();
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..16, 16..24]);
+        // A chunk with an op over the agent's limit is a group of its own.
+        let mut items = vec![1usize << 10; 32];
+        items[20] = 7 << 20;
+        assert_eq!(plan_groups(&items, 8, |&n| cost(1, n)), vec![0..8, 8..16, 16..24, 24..32]);
+        // Free items (an invalidation) still close a group.
+        let items = vec![0usize; 5000];
+        assert_eq!(plan_groups(&items, 50, |&n| cost(n, 0)), vec![0..50, 50..4100, 4100..5000]);
+    }
+
+    /// The requests `run` splits `sizes` (each op's `wire_len`, in order) into.
+    fn requests(sizes: &[usize]) -> usize {
+        let (mut count, mut ops, mut bytes) = (0, 0, 0);
+        for &size in sizes {
+            if ops > 0 && (bytes + size > CRYPT_BATCH_BYTES || ops >= CRYPT_BATCH_OPS) {
+                (count, ops, bytes) = (count + 1, 0, 0);
+            }
+            (ops, bytes) = (ops + 1, bytes + size);
+        }
+        count + usize::from(ops > 0)
+    }
+
+    #[test]
+    fn planned_groups_never_take_more_requests_than_their_chunks_alone() {
+        // Items of one to three ops, from tiny to over 1 MiB, in random orders.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for round in 0..200 {
+            let chunk = [8usize, 50, 64][round % 3];
+            let big = round % 4 == 0;
+            let items: Vec<Vec<usize>> = (0..(50 + next(500)) as usize)
+                .map(|_| (0..1 + next(3)).map(|_| if big { 1 + next(1_600_000) as usize } else { 100 + next(1900) as usize }).collect())
+                .collect();
+            let cost = |item: &Vec<usize>| {
+                let step = item.iter().fold(Cost::default(), |sum, &bytes| sum + Cost::one(bytes));
+                [step, Cost::default(), Cost::default()]
+            };
+            let sizes = |range: std::ops::Range<usize>| items[range].iter().flatten().copied().collect::<Vec<_>>();
+            let grouped: usize = plan_groups(&items, chunk, cost).into_iter().map(|g| requests(&sizes(g))).sum();
+            let alone: usize = (0..items.len()).step_by(chunk).map(|at| requests(&sizes(at..(at + chunk).min(items.len())))).sum();
+            assert!(grouped <= alone, "round {round}: {grouped} > {alone}");
+            let ops: usize = items.iter().map(Vec::len).sum();
+            if !big {
+                // Small ops (1,024 of them stay under 2 MiB): at most one
+                // request per 1,024 ops, plus one per group.
+                let groups = plan_groups(&items, chunk, cost).len();
+                assert!(grouped < ops.div_ceil(CRYPT_BATCH_OPS) + groups, "round {round}");
+            }
+        }
+    }
+
+    /// The requests `plan_groups` and `run` take for `items` sent `chunk` at a
+    /// time (each item's ops per step, by wire size), and the groups.
+    fn planned_requests(items: &[[Vec<usize>; 3]], chunk: usize) -> (usize, usize) {
+        let cost = |item: &[Vec<usize>; 3]| item.clone().map(|ops| ops.iter().fold(Cost::default(), |sum, &bytes| sum + Cost::one(bytes)));
+        let groups = plan_groups(items, chunk, cost);
+        let requests = groups.iter()
+            .map(|g| (0..3).map(|step| requests(&items[g.clone()].iter().flat_map(|item| item[step].clone()).collect::<Vec<_>>())).sum::<usize>())
+            .sum();
+        (requests, groups.len())
+    }
+
+    /// The bound designs/e2e-encryption.md "Performance" states for a push or
+    /// a rewrite of small ops (each at most 2 KiB on the wire, so only the
+    /// 1,024-op limit splits a request). With `ops` `Crypt` ops, `groups`
+    /// planned groups and `steps` dependent steps: at most
+    /// ⌈ops / 1,024⌉ + steps × groups − 1 requests (each group's last request
+    /// per step may be partly filled). With one step and an op in every item
+    /// (a push of facts): at most ⌈ops / 1,024⌉ + 1 + ⌈(groups − 2) × (k − 1)
+    /// / 1,024⌉, `k` the most ops one chunk carries (a group ends only when
+    /// the next chunk would pass 4,096 ops, so it leaves fewer than `k`
+    /// unused). And the examples the design names.
+    #[test]
+    fn planned_requests_stay_within_the_documented_bound() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for round in 0..60 {
+            let chunk = [8usize, 50, 64][round % 3];
+            let one_step = round % 2 == 0;
+            let count = 500 + next(30_000) as usize;
+            let items: Vec<[Vec<usize>; 3]> = (0..count)
+                .map(|_| {
+                    let counts = if one_step {
+                        // A fact: 1 to 3 ops in one step.
+                        [1 + next(3), 0, 0]
+                    } else if next(4) == 0 {
+                        // A delete or an invalidation: no op at all.
+                        [0, 0, 0]
+                    } else {
+                        // A skill or a rewritten row: 0 to 3 ops in each step.
+                        [next(4), next(4), next(4)]
+                    };
+                    // Each op 100 to 1,999 bytes on the wire.
+                    counts.map(|n| (0..n).map(|_| 100 + next(1_900) as usize).collect())
+                })
+                .collect();
+            let ops: usize = items.iter().flatten().map(Vec::len).sum();
+            let (planned, groups) = planned_requests(&items, chunk);
+            let steps = if one_step { 1 } else { 3 };
+            assert!(planned < ops.div_ceil(CRYPT_BATCH_OPS) + steps * groups, "round {round}: {planned} requests, {ops} ops, {groups} groups");
+            if one_step {
+                let k = items.chunks(chunk).map(|part| part.iter().map(|item| item[0].len()).sum::<usize>()).max().unwrap();
+                let extra = (groups.saturating_sub(2) * (k - 1)).div_ceil(CRYPT_BATCH_OPS);
+                assert!(planned <= ops.div_ceil(CRYPT_BATCH_OPS) + 1 + extra, "round {round}: {planned} > {} + 1 + {extra}", ops.div_ceil(CRYPT_BATCH_OPS));
+                // So the groups: the first chunk, then groups of more than
+                // 4,096 − k ops each but the last.
+                let planned_groups = plan_groups(&items, chunk, |item| [total(&item[0], |&bytes| [Cost::one(bytes), Cost::default(), Cost::default()])[0], Cost::default(), Cost::default()]);
+                assert_eq!(planned_groups[0], 0..chunk.min(items.len()));
+                for group in planned_groups.iter().skip(1).rev().skip(1) {
+                    let group_ops: usize = items[group.clone()].iter().map(|item| item[0].len()).sum();
+                    assert!(group_ops > GROUP_REQUESTS * CRYPT_BATCH_OPS - k, "round {round}: a group of {group_ops} ops");
+                }
+            }
+        }
+        // Uniform facts of two or three ops, 50 per relay chunk: "1 per 1,024
+        // ops plus one for the first chunk" holds up to 4,562 and 5,791
+        // facts, then takes a request more now and then.
+        let facts = |count: usize, ops: usize| planned_requests(&vec![[vec![200; ops], Vec::new(), Vec::new()]; count], 50).0;
+        let wording = |count: usize, ops: usize| (count * ops).div_ceil(CRYPT_BATCH_OPS) + 1;
+        for (count, ops, over) in [(4_562, 2, 0), (4_563, 2, 1), (5_791, 3, 0), (5_792, 3, 1), (30_000, 3, 1), (100_000, 3, 4), (100_000, 2, 4)] {
+            assert_eq!(facts(count, ops), wording(count, ops) + over, "{count} facts of {ops} ops");
+        }
+    }
+
+    /// Records each `Crypt` request's op count and bytes.
+    struct Sizes {
+        inner: Arc<std::sync::Mutex<crate::memory::cred_agent::CredAgent>>,
+        seen: std::sync::Mutex<Vec<Cost>>,
+    }
+
+    impl CredAgentApi for Sizes {
+        fn call(&self, request: Request) -> Result<Reply> {
+            if let Request::Crypt { ops, .. } = &request {
+                let sizes: Vec<usize> = ops.iter().map(CryptOp::wire_len).collect();
+                self.seen.lock().unwrap().push(Cost { ops: ops.len(), bytes: sizes.iter().sum(), largest: sizes.iter().copied().max().unwrap_or(0) });
+            }
+            self.inner.call(request)
+        }
+    }
+
+    #[test]
+    fn planned_costs_are_the_requests_the_agent_sees() {
+        let dir = tempfile::tempdir().unwrap();
+        let (device, _) = device(dir.path(), EncryptionMode::On);
+        let sizes = Arc::new(Sizes { inner: device.agent.clone(), seen: Default::default() });
+        let context = EncryptionContext::for_astation_with(ASTATION_ID, &device.paths, sizes.clone()).unwrap();
+        let take = || std::mem::take(&mut *sizes.seen.lock().unwrap());
+        let sum = |costs: Vec<Cost>| costs.into_iter().fold(Cost::default(), |a, b| a + b);
+
+        // A project pulled as a hash this Atem can't name goes out as it
+        // came: no keyed hash, in the cost as in the requests.
+        let unnamed = format!("h1.89abcdef.{}", "ab".repeat(32));
+        let memories: Vec<Memory> = (0..40).map(|i| {
+            let project = match i % 4 { 0 | 2 => "github.com/agora/atem", 1 => unnamed.as_str(), _ => "" };
+            memory(&format!("mem-{i}"), project, &"fact ".repeat(i + 1))
+        }).collect();
+        let sealed = context.encrypt_memories(memories.clone()).unwrap();
+        assert_eq!(take(), vec![sum(memories.iter().map(memory_seal_cost).collect())]);
+        assert!(sealed.iter().zip(&memories).all(|(sealed, plain)| plain.project != unnamed || sealed.project == unnamed));
+        context.decrypt_pulled_memories(sealed.clone()).unwrap();
+        assert_eq!(take(), vec![sum(sealed.iter().map(memory_open_cost).collect())]);
+
+        let skills: Vec<Skill> = (0..5).map(|i| {
+            let mut files = BTreeMap::new();
+            files.insert("SKILL.md".to_string(), format!("# skill {i}").into_bytes());
+            files.insert(format!("ref/part-{i}.md"), vec![b'x'; 100 * i]);
+            files.insert("empty.md".to_string(), Vec::new());
+            Skill {
+                scope: crate::memory::model::Scope::Project,
+                project: match i % 3 { 0 => "github.com/agora/atem".into(), 1 => unnamed.clone(), _ => String::new() },
+                name: format!("skill-{i}"), version: 3, content_hash: skill_hash(&files), files,
+                source_agent: "test".into(), source_machine: "mac".into(), created_at: 1, deleted: false, seq: 0,
+            }
+        }).collect();
+        let projects = vec!["github.com/agora/atem".to_string(), String::new(), unnamed.clone(), "github.com/agora/other".to_string()];
+        let (sealed, wire) = context.encrypt_skills_with_projects(skills.clone(), &projects).unwrap();
+        let [first, files] = skills.iter().map(skill_seal_cost)
+            .fold([Cost::default(); 2], |[a, b], [c, d]| [a + c, b + d]);
+        let first = first + sum(projects.iter().map(|p| project_hash_cost(p)).collect());
+        assert_eq!(take(), vec![first, files]);
+        assert_eq!(wire, context.wire_projects(&projects).unwrap());
+        assert_eq!(wire[2], unnamed);
+        take();
+        context.decrypt_pulled_skills(sealed.clone()).unwrap();
+        assert_eq!(take(), vec![sum(sealed.iter().map(skill_open_cost).collect())]);
+        // The same skills sealed with and without the projects.
+        let alone = context.decrypt_pulled_skills(context.encrypt_skills(skills.clone()).unwrap()).unwrap();
+        assert_eq!(alone, context.decrypt_pulled_skills(sealed).unwrap());
+        assert_eq!(alone, skills);
     }
 }

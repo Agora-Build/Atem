@@ -28,6 +28,8 @@ pub mod unlock;
 pub mod migration;
 #[cfg(unix)]
 pub mod agent_socket;
+#[cfg(unix)]
+pub(crate) mod agent_frame;
 
 #[cfg(test)]
 pub(crate) mod e2e_tests;

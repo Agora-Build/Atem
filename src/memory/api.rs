@@ -2,15 +2,43 @@
 //! (unit-tested); `KnowledgeClient` only sends. Auth = the Astation pairing
 //! session: the paired Astation is the account, so any machine paired with
 //! it (and approved by it) can sync.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
+use std::future::Future;
 use crate::memory::model::{Memory, Scope, Skill};
 use crate::memory::store::PendingOp;
-use crate::memory::crypto::{EncryptionContext, EncryptionMode, ProjectNaming};
+use crate::memory::crypto::{
+    memory_open_cost, memory_seal_cost, plan_groups, project_hash_cost, skill_open_cost, skill_seal_cost, Cost,
+    EncryptionContext, EncryptionMode, ProjectNaming, Steps,
+};
 
 pub const PULL_LIMIT: u32 = 200;
-const MEMORY_MIGRATION_CHUNK: usize = 64;
-const SKILL_MIGRATION_CHUNK: usize = 16;
+
+/// What an encryption migration rewrites on the relay, per batch POST.
+#[derive(Clone, Copy)]
+enum Rewrite {
+    Memory,
+    Skills,
+}
+
+impl Rewrite {
+    fn kind(self) -> &'static str {
+        match self { Self::Memory => "memory", Self::Skills => "skills" }
+    }
+
+    /// Rows per POST.
+    fn chunk(self) -> usize {
+        match self { Self::Memory => 64, Self::Skills => 16 }
+    }
+
+    fn refused(self) -> &'static str {
+        match self {
+            Self::Memory => "relay refused a memory encryption rewrite",
+            Self::Skills => "relay refused a skill encryption rewrite",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiRequest {
@@ -164,6 +192,9 @@ pub fn auth_header(session_id: &str) -> String {
     format!("session {}", session_id)
 }
 
+/// Cheap to clone (the HTTP client is shared): a pull fetches its next page
+/// on a task of its own.
+#[derive(Clone)]
 pub struct KnowledgeClient {
     base: String,
     client_id: String,
@@ -177,9 +208,9 @@ pub struct KnowledgeClient {
 /// `ops` with every project pulled as a hash this Atem has named since put
 /// back under its name (`EncryptionContext::name_hashes`): a replacement
 /// queued while its fact was unresolved goes out like any other once the
-/// name is known, never with a stale hash.
-fn named_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<PendingOp>> {
-    let mut ops = ops.to_vec();
+/// name is known, never with a stale hash. What `seal_ops` seals, and what
+/// an op sealed ahead is compared with before its POST (`seal_state`).
+fn named_ops(encryption: &EncryptionContext, mut ops: Vec<PendingOp>) -> anyhow::Result<Vec<PendingOp>> {
     encryption.name_hashes(ops.iter_mut().filter_map(|op| match op {
         PendingOp::AddMemory { memory } => Some(&mut memory.project),
         PendingOp::PushSkill { skill, .. } => Some(&mut skill.project),
@@ -189,10 +220,10 @@ fn named_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Resul
     Ok(ops)
 }
 
-/// The wire form of `ops`, encrypted when the account is: every memory,
-/// skill and project hash of the batch in a few cred-agent round trips.
+/// The wire form of `ops` (as `named_ops` made them), encrypted when the
+/// account is: every memory, skill and project hash of the batch in a few
+/// cred-agent round trips.
 fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::Result<Vec<Value>> {
-    let ops = &named_ops(encryption, ops)?;
     if !encryption.should_encrypt() {
         return Ok(ops.iter().map(op_to_wire).collect());
     }
@@ -200,11 +231,12 @@ fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::R
         PendingOp::AddMemory { memory } => Some(memory.clone()),
         _ => None,
     }).collect())?;
-    let skills = encryption.encrypt_skills(ops.iter().filter_map(|op| match op {
+    // Deleted and purged skills' project hashes ride in the pushed skills'
+    // first request.
+    let (skills, projects) = encryption.encrypt_skills_with_projects(ops.iter().filter_map(|op| match op {
         PendingOp::PushSkill { skill, .. } => Some(skill.clone()),
         _ => None,
-    }).collect())?;
-    let projects = encryption.wire_projects(&ops.iter().filter_map(|op| match op {
+    }).collect(), &ops.iter().filter_map(|op| match op {
         PendingOp::DeleteSkill { project, .. } | PendingOp::PurgeSkill { project, .. } => Some(project.clone()),
         _ => None,
     }).collect::<Vec<_>>())?;
@@ -219,6 +251,53 @@ fn encrypted_ops(encryption: &EncryptionContext, ops: &[PendingOp]) -> anyhow::R
         // encrypted above, never sent as it is by default.
         PendingOp::DeleteMemory { .. } | PendingOp::InvalidateMemory { .. } => op_to_wire(op),
     })).collect()
+}
+
+/// What `encrypted_ops` asks the cred agent for `op`, per dependent step
+/// (memory: one; skills: paths and hashes, then files), for `Planner`. A
+/// project this Atem can't name costs nothing (it goes out as it came);
+/// `Planner` prices ops as queued, so one named since (`named_ops`) costs a
+/// keyed hash more when sealed: an estimate, never a result (`Cost`).
+pub(crate) fn seal_cost(op: &PendingOp) -> Steps {
+    let none = Cost::default();
+    match op {
+        PendingOp::AddMemory { memory } => [memory_seal_cost(memory), none, none],
+        PendingOp::PushSkill { skill, .. } => {
+            let [paths, files] = skill_seal_cost(skill);
+            [paths, files, none]
+        }
+        PendingOp::DeleteSkill { project, .. } | PendingOp::PurgeSkill { project, .. } => [project_hash_cost(project), none, none],
+        PendingOp::DeleteMemory { .. } | PendingOp::InvalidateMemory { .. } => [none; 3],
+    }
+}
+
+/// The account state a batch was sealed under (mode, key, data account).
+/// An op sealed ahead of its POST is sent as sealed only while the state is
+/// still this one: after a mode or key change it is sealed again, as if it
+/// had been sealed just before its POST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealState {
+    mode: EncryptionMode,
+    kid: Option<String>,
+    data_account: String,
+}
+
+impl SealState {
+    fn of(encryption: &EncryptionContext) -> Self {
+        Self { mode: encryption.mode, kid: encryption.kid.clone(), data_account: encryption.data_account.clone() }
+    }
+
+    /// Whether ops are sealed under this state (the account encrypts): only
+    /// then does sealing an op with a protected field ask the cred agent.
+    pub fn encrypts(&self) -> bool {
+        matches!(self.mode, EncryptionMode::Enabling | EncryptionMode::On)
+    }
+}
+
+/// The body of a batch POST, serialized from borrowed ops.
+#[derive(Serialize)]
+struct Batch<'a> {
+    ops: &'a [Value],
 }
 
 impl KnowledgeClient {
@@ -253,10 +332,14 @@ impl KnowledgeClient {
             "POST" => self.http.post(&req.url),
             _ => self.http.get(&req.url),
         };
-        rb = rb.header("Authorization", auth_header(&self.session_id));
         if let Some(b) = req.body {
             rb = rb.json(&b);
         }
+        self.finish(rb).await
+    }
+
+    async fn finish(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::Response, ApiError> {
+        let rb = rb.header("Authorization", auth_header(&self.session_id));
         let resp = rb.send().await.map_err(|e| ApiError::Offline(e.to_string()))?;
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
@@ -275,32 +358,103 @@ impl KnowledgeClient {
             .map_err(ApiError::from)
     }
 
-    pub async fn push(&self, ops: &[&PendingOp], memory: bool) -> Result<Vec<OpResult>, ApiError> {
+    /// The state ops sealed now would be sealed under, and `ops` as they
+    /// would be sealed now (`named_ops`; project_names.json is read only
+    /// when some op has a project pulled as a hash). An op sealed earlier
+    /// goes out as sealed only while both are unchanged (`sync::reusable`).
+    pub fn seal_state(&self, ops: Vec<PendingOp>) -> Result<(SealState, Vec<PendingOp>), ApiError> {
         let encryption = self.encryption()?;
-        let kind = if memory { "memory" } else { "skills" };
-        let owned: Vec<PendingOp> = ops.iter().map(|op| (*op).clone()).collect();
-        let wire = encryption.blocking(move |encryption| encrypted_ops(encryption, &owned)).await?;
-        let req = ApiRequest {
-            method: "POST",
-            url: format!("{}/api/{kind}/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
-            body: Some(json!({"ops": wire})),
-        };
-        let resp: BatchResponse = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        let named = named_ops(&encryption, ops)?;
+        Ok((SealState::of(&encryption), named))
+    }
+
+    /// `ops` in their wire form, sealed while the account is encrypted, and
+    /// the state they were sealed under; each wire beside the op it was
+    /// sealed from (`named_ops`: a project hash named since under its name).
+    /// Ops planned with `seal_cost` to fit one batch are one `Crypt` request
+    /// per step.
+    pub async fn seal_ops(&self, ops: Vec<PendingOp>) -> Result<(SealState, Vec<(PendingOp, Value)>), ApiError> {
+        let encryption = self.encryption()?;
+        let state = SealState::of(&encryption);
+        let sealed = encryption.blocking(move |encryption| {
+            let ops = named_ops(encryption, ops)?;
+            let wire = encrypted_ops(encryption, &ops)?;
+            Ok(ops.into_iter().zip(wire).collect::<Vec<_>>())
+        }).await?;
+        Ok((state, sealed))
+    }
+
+    /// Before ops sealed by an earlier request are sent: the cred agent is
+    /// still unlocked (a status on the shared connection), so a lock stops a
+    /// push within one POST, as when each chunk was sealed just before its
+    /// POST. Nothing to confirm while the account isn't encrypting.
+    pub async fn confirm_unlocked(&self) -> Result<(), ApiError> {
+        let encryption = self.encryption()?;
+        if !encryption.should_encrypt() {
+            return Ok(());
+        }
+        encryption.blocking(|encryption| encryption.confirm_unlocked()).await.map_err(ApiError::from)
+    }
+
+    /// POSTs ops in their wire form (`seal_ops`) as one batch.
+    pub async fn post_ops(&self, wire: &[Value], memory: bool) -> Result<Vec<OpResult>, ApiError> {
+        self.post_batch(if memory { "memory" } else { "skills" }, wire).await
+    }
+
+    async fn post_batch(&self, kind: &str, ops: &[Value]) -> Result<Vec<OpResult>, ApiError> {
+        let url = format!("{}/api/{kind}/batch?id={}", base_trim(&self.base), enc(&self.client_id));
+        let resp: BatchResponse = self.finish(self.http.post(&url).json(&Batch { ops })).await?
+            .json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
         Ok(resp.results)
     }
 
-    pub async fn pull_memories(&self, since: i64) -> Result<Vec<Memory>, ApiError> {
-        let req = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
-        let page: MemoryPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
-        let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_pulled_memories(page.memories)).await.map_err(ApiError::from)
+    /// Seals `ops` and POSTs them as one batch.
+    #[cfg(test)]
+    pub async fn push(&self, ops: &[&PendingOp], memory: bool) -> Result<Vec<OpResult>, ApiError> {
+        let (_, sealed) = self.seal_ops(ops.iter().map(|op| (*op).clone()).collect()).await?;
+        let wire: Vec<Value> = sealed.into_iter().map(|(_, wire)| wire).collect();
+        self.post_ops(&wire, memory).await
     }
 
-    pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
+    /// The page of memory rows after `since`, as the relay sent it.
+    pub async fn fetch_memories(&self, since: i64) -> Result<Vec<Memory>, ApiError> {
+        let req = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
+        let page: MemoryPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        Ok(page.memories)
+    }
+
+    /// A pulled page's memory rows opened (`decrypt_pulled_memories`):
+    /// plain text is refused while encryption is on, and a well-formed
+    /// project hash this Atem can't name stays as it is (unresolved).
+    pub async fn open_memories(&self, rows: Vec<Memory>) -> Result<Vec<Memory>, ApiError> {
+        let encryption = self.encryption()?;
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_memories(rows)).await.map_err(ApiError::from)
+    }
+
+    #[cfg(test)]
+    pub async fn pull_memories(&self, since: i64) -> Result<Vec<Memory>, ApiError> {
+        let rows = self.fetch_memories(since).await?;
+        self.open_memories(rows).await
+    }
+
+    /// The page of skill rows after `since`, as the relay sent it.
+    pub async fn fetch_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
         let req = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
         let page: SkillPage = self.send(req).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))?;
+        Ok(page.skills)
+    }
+
+    /// A pulled page's skill rows opened (`decrypt_pulled_skills`): as
+    /// `open_memories`.
+    pub async fn open_skills(&self, rows: Vec<Skill>) -> Result<Vec<Skill>, ApiError> {
         let encryption = self.encryption()?;
-        encryption.blocking(move |encryption| encryption.decrypt_pulled_skills(page.skills)).await.map_err(ApiError::from)
+        encryption.blocking(move |encryption| encryption.decrypt_pulled_skills(rows)).await.map_err(ApiError::from)
+    }
+
+    #[cfg(test)]
+    pub async fn pull_skills(&self, since: i64) -> Result<Vec<Skill>, ApiError> {
+        let rows = self.fetch_skills(since).await?;
+        self.open_skills(rows).await
     }
 
     /// Names what it can of the pulled project hashes `hashes`, hashing and
@@ -331,61 +485,73 @@ impl KnowledgeClient {
         encryption.blocking(move |encryption| encryption.decrypt_skill(page.skill)).await.map_err(ApiError::from)
     }
 
-    /// Read every returned historical row back and authenticate its migrated fields.
+    /// Read every returned historical row back and authenticate its migrated
+    /// fields, page by page, each page checked while the next one is fetched.
     pub async fn verify_encryption_migration(&self) -> Result<(), ApiError> {
         let encryption = self.encryption()?;
         let kid = encryption.kid.clone().ok_or_else(|| ApiError::Encryption("migration key is missing".into()))?;
-        for memories in [true, false] {
-            let mut since = 0;
-            loop {
-                let request = if memories { memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT) }
-                    else { skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT) };
-                let response = self.send(request).await?;
-                let (count, next) = if memories {
-                    let page: MemoryPage = response.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
-                    let count = page.memories.len();
-                    let next = page.memories.iter().map(|row| row.seq).max().unwrap_or(since);
-                    let kid = kid.clone();
-                    encryption.blocking(move |context| {
-                        for row in &page.memories {
-                            for (value, prefix) in [(&row.content, "e1"), (&row.project, "h1"), (&row.content_hash, "h1")] {
-                                crate::memory::migration::verify_field(value, prefix, context.mode, &kid)?;
-                            }
+        let encryption = &encryption;
+        self.read_back(|since| self.fetch_memories(since), |row: &Memory| row.seq, |page: Vec<Memory>| {
+            let kid = kid.clone();
+            encryption.blocking(move |context| {
+                for row in &page {
+                    for (value, prefix) in [(&row.content, "e1"), (&row.project, "h1"), (&row.content_hash, "h1")] {
+                        crate::memory::migration::verify_field(value, prefix, context.mode, &kid)?;
+                    }
+                }
+                context.decrypt_memories(page)?;
+                Ok(())
+            })
+        }).await?;
+        self.read_back(|since| self.fetch_skills(since), |row: &Skill| row.seq, |page: Vec<Skill>| {
+            let kid = kid.clone();
+            encryption.blocking(move |context| {
+                for row in &page {
+                    for value in [&row.project, &row.content_hash] {
+                        crate::memory::migration::verify_field(value, "h1", context.mode, &kid)?;
+                    }
+                    for (path, content) in &row.files {
+                        crate::memory::migration::verify_field(path, "e1", context.mode, &kid)?;
+                        if context.mode == EncryptionMode::Enabling {
+                            crate::memory::migration::verify_field(std::str::from_utf8(content)?, "e1", context.mode, &kid)?;
+                        } else if let Ok(content) = std::str::from_utf8(content) {
+                            crate::memory::migration::verify_field(content, "e1", context.mode, &kid)?;
                         }
-                        context.decrypt_memories(page.memories)?;
-                        Ok(())
-                    }).await?;
-                    (count, next)
-                } else {
-                    let page: SkillPage = response.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
-                    let count = page.skills.len();
-                    let next = page.skills.iter().map(|row| row.seq).max().unwrap_or(since);
-                    let kid = kid.clone();
-                    encryption.blocking(move |context| {
-                        for row in &page.skills {
-                            for value in [&row.project, &row.content_hash] {
-                                crate::memory::migration::verify_field(value, "h1", context.mode, &kid)?;
-                            }
-                            for (path, content) in &row.files {
-                                crate::memory::migration::verify_field(path, "e1", context.mode, &kid)?;
-                                if context.mode == EncryptionMode::Enabling {
-                                    crate::memory::migration::verify_field(std::str::from_utf8(content)?, "e1", context.mode, &kid)?;
-                                } else if let Ok(content) = std::str::from_utf8(content) {
-                                    crate::memory::migration::verify_field(content, "e1", context.mode, &kid)?;
-                                }
-                            }
-                        }
-                        context.decrypt_skills(page.skills)?;
-                        Ok(())
-                    }).await?;
-                    (count, next)
-                };
-                if count < PULL_LIMIT as usize { break; }
-                if next <= since { return Err(ApiError::Encryption("migration verification cursor did not advance".into())); }
-                since = next;
+                    }
+                }
+                context.decrypt_skills(page)?;
+                Ok(())
+            })
+        }).await
+    }
+
+    /// Reads one kind back from the start, checking each page (`check`)
+    /// while the next one is fetched (F2); a failed check or request stops
+    /// it, and a page that doesn't move the cursor is an error.
+    async fn read_back<R, F, FF, C, CF>(&self, fetch: F, seq: fn(&R) -> i64, check: C) -> Result<(), ApiError>
+    where
+        F: Fn(i64) -> FF,
+        FF: Future<Output = Result<Vec<R>, ApiError>>,
+        C: Fn(Vec<R>) -> CF,
+        CF: Future<Output = anyhow::Result<()>>,
+    {
+        let mut since = 0;
+        let mut page = fetch(since).await?;
+        loop {
+            let count = page.len();
+            let next = page.iter().map(seq).max().unwrap_or(since);
+            if count < PULL_LIMIT as usize {
+                return Ok(check(page).await?);
             }
+            if next <= since {
+                check(page).await?;
+                return Err(ApiError::Encryption("migration verification cursor did not advance".into()));
+            }
+            let (checked, fetched) = tokio::join!(check(page), fetch(next));
+            checked?;
+            page = fetched?;
+            since = next;
         }
-        Ok(())
     }
 
     /// Snapshot every historical row before rewriting any of them. Rewrites
@@ -400,79 +566,130 @@ impl KnowledgeClient {
         let mut memories = Vec::new();
         let mut since = 0;
         loop {
-            let request = memory_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
-            let page: MemoryPage = self.send(request).await?.json().await
-                .map_err(|error| ApiError::Decode(error.to_string()))?;
-            if page.memories.is_empty() { break; }
-            since = page.memories.iter().map(|row| row.seq).max().unwrap_or(since);
-            let count = page.memories.len();
-            memories.extend(page.memories);
+            let page = self.fetch_memories(since).await?;
+            if page.is_empty() { break; }
+            since = page.iter().map(|row| row.seq).max().unwrap_or(since);
+            let count = page.len();
+            memories.extend(page);
             if count < PULL_LIMIT as usize { break; }
         }
 
         let mut skills = Vec::new();
         since = 0;
         loop {
-            let request = skills_pull_request(&self.base, &self.client_id, since, PULL_LIMIT);
-            let page: SkillPage = self.send(request).await?.json().await
-                .map_err(|error| ApiError::Decode(error.to_string()))?;
-            if page.skills.is_empty() { break; }
-            since = page.skills.iter().map(|row| row.seq).max().unwrap_or(since);
-            let count = page.skills.len();
-            skills.extend(page.skills);
+            let page = self.fetch_skills(since).await?;
+            if page.is_empty() { break; }
+            since = page.iter().map(|row| row.seq).max().unwrap_or(since);
+            let count = page.len();
+            skills.extend(page);
             if count < PULL_LIMIT as usize { break; }
         }
 
-        for chunk in memories.chunks(MEMORY_MIGRATION_CHUNK) {
-            let raw = chunk.to_vec();
-            let ops = encryption.blocking(move |encryption| {
-                let plain = encryption.decrypt_memories(raw.clone())?;
-                let desired = if encryption.mode == EncryptionMode::Enabling { encryption.encrypt_memories(plain)? } else { plain };
-                Ok(raw.iter().zip(desired).map(|(old, desired)| json!({
-                    "op": "rewrite",
-                    "id": old.id,
-                    "project": desired.project,
-                    "content": desired.content,
-                    "content_hash": desired.content_hash,
-                })).collect::<Vec<_>>())
-            }).await?;
-            let response: BatchResponse = self.send(ApiRequest {
-                method: "POST",
-                url: format!("{}/api/memory/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
-                body: Some(json!({"ops": ops})),
-            }).await?.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
-            if response.results.len() != ops.len() || response.results.iter().any(|result| !result.ok) {
-                return Err(ApiError::Encryption("relay refused a memory encryption rewrite".into()));
-            }
-        }
+        let enabling = encryption.mode == EncryptionMode::Enabling;
+        let none = Cost::default();
+        self.rewrite_all(&encryption, memories, Rewrite::Memory,
+            |row| [memory_open_cost(row), if enabling { memory_seal_cost(row) } else { none }, none],
+            rewritten_memories).await?;
+        self.rewrite_all(&encryption, skills, Rewrite::Skills,
+            |row| {
+                let [paths, files] = if enabling { skill_seal_cost(row) } else { [none; 2] };
+                [skill_open_cost(row), paths, files]
+            },
+            rewritten_skills).await
+    }
 
-        for chunk in skills.chunks(SKILL_MIGRATION_CHUNK) {
-            let raw = chunk.to_vec();
-            let ops = encryption.blocking(move |encryption| {
-                let plain = encryption.decrypt_skills(raw.clone())?;
-                let desired = if encryption.mode == EncryptionMode::Enabling { encryption.encrypt_skills(plain)? } else { plain };
-                Ok(raw.iter().zip(desired).map(|(old, desired)| json!({
-                    "op": "rewrite",
-                    "scope": desired.scope,
-                    "old_project": old.project,
-                    "name": desired.name,
-                    "version": desired.version,
-                    "project": desired.project,
-                    "files": desired.files,
-                    "content_hash": desired.content_hash,
-                })).collect::<Vec<_>>())
-            }).await?;
-            let response: BatchResponse = self.send(ApiRequest {
-                method: "POST",
-                url: format!("{}/api/skills/batch?id={}", base_trim(&self.base), enc(&self.client_id)),
-                body: Some(json!({"ops": ops})),
-            }).await?.json().await.map_err(|error| ApiError::Decode(error.to_string()))?;
-            if response.results.len() != ops.len() || response.results.iter().any(|result| !result.ok) {
-                return Err(ApiError::Encryption("relay refused a skill encryption rewrite".into()));
+    /// Rewrites `rows` on the relay, `kind.chunk()` rows per POST, in order.
+    /// The rows are opened and sealed again (`prepare`) in groups of whole
+    /// POSTs (`plan_groups`), the next group while the POST before it is in
+    /// flight (F2). A POST of rows prepared by an earlier request first
+    /// confirms the cred agent is still unlocked, so a lock stops the
+    /// migration within one POST, as when each POST was prepared just before
+    /// it. Nothing is recorded locally: a failure stops the migration, which
+    /// runs again from a new snapshot, and only the read-back says it is done.
+    async fn rewrite_all<R: Clone + Send + 'static>(
+        &self,
+        encryption: &EncryptionContext,
+        rows: Vec<R>,
+        kind: Rewrite,
+        cost: impl Fn(&R) -> Steps,
+        prepare: fn(&EncryptionContext, Vec<R>) -> anyhow::Result<Vec<Value>>,
+    ) -> Result<(), ApiError> {
+        let chunk = kind.chunk();
+        let mut groups = plan_groups(&rows, chunk, cost).into_iter();
+        let seal = |range: std::ops::Range<usize>| {
+            let rows = rows[range].to_vec();
+            encryption.blocking(move |encryption| prepare(encryption, rows))
+        };
+        let mut ready: VecDeque<Value> = VecDeque::new();
+        let mut sent = 0;
+        while sent < rows.len() {
+            let end = (sent + chunk).min(rows.len());
+            // The first chunk, or the read-ahead fell behind: this POST's rows first.
+            let mut prepared_now = false;
+            while sent + ready.len() < end {
+                let Some(range) = groups.next() else { break };
+                ready.extend(seal(range).await?);
+                prepared_now = true;
             }
+            if sent + ready.len() < end {
+                return Err(ApiError::Encryption("a migration batch lost rows".into()));
+            }
+            if !prepared_now {
+                encryption.blocking(|encryption| encryption.confirm_unlocked()).await?;
+            }
+            let ops: Vec<Value> = ready.drain(..end - sent).collect();
+            // Prepare the next group while this POST is in flight, once what is
+            // ready no longer covers the next POST.
+            let next = if ready.len() < chunk { groups.next() } else { None };
+            let (posted, prepared) = match next {
+                Some(range) => {
+                    let (posted, prepared) = tokio::join!(self.post_batch(kind.kind(), &ops), seal(range));
+                    (posted, Some(prepared))
+                }
+                None => (self.post_batch(kind.kind(), &ops).await, None),
+            };
+            let results = posted?;
+            if results.len() != ops.len() || results.iter().any(|result| !result.ok) {
+                return Err(ApiError::Encryption(kind.refused().into()));
+            }
+            if let Some(prepared) = prepared {
+                ready.extend(prepared?);
+            }
+            sent = end;
         }
         Ok(())
     }
+}
+
+/// The migration's rewrite ops for memory rows: opened, then sealed again
+/// while enabling.
+fn rewritten_memories(encryption: &EncryptionContext, raw: Vec<Memory>) -> anyhow::Result<Vec<Value>> {
+    let plain = encryption.decrypt_memories(raw.clone())?;
+    let desired = if encryption.mode == EncryptionMode::Enabling { encryption.encrypt_memories(plain)? } else { plain };
+    Ok(raw.iter().zip(desired).map(|(old, desired)| json!({
+        "op": "rewrite",
+        "id": old.id,
+        "project": desired.project,
+        "content": desired.content,
+        "content_hash": desired.content_hash,
+    })).collect())
+}
+
+/// The migration's rewrite ops for skill rows: opened, then sealed again
+/// while enabling.
+fn rewritten_skills(encryption: &EncryptionContext, raw: Vec<Skill>) -> anyhow::Result<Vec<Value>> {
+    let plain = encryption.decrypt_skills(raw.clone())?;
+    let desired = if encryption.mode == EncryptionMode::Enabling { encryption.encrypt_skills(plain)? } else { plain };
+    Ok(raw.iter().zip(desired).map(|(old, desired)| json!({
+        "op": "rewrite",
+        "scope": desired.scope,
+        "old_project": old.project,
+        "name": desired.name,
+        "version": desired.version,
+        "project": desired.project,
+        "files": desired.files,
+        "content_hash": desired.content_hash,
+    })).collect())
 }
 
 #[cfg(test)]

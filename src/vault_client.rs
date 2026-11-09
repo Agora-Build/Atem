@@ -280,13 +280,18 @@ impl VaultClient {
         Ok(())
     }
 
+    /// A vault's whole history (every version of every entry).
+    async fn history(&self, vault_id: &str) -> Result<Vec<VaultEntry>> {
+        Ok(self.send(read_vault_request(&self.base, &self.client_id, vault_id, None, true)).await?.json().await?)
+    }
+
+    /// Reads every vault's history back and checks its migrated fields,
+    /// each vault checked while the next one's history is fetched.
     pub async fn verify_encryption_migration(&self) -> Result<()> {
         let encryption = self.encryption()?;
         let kid = encryption.kid.clone().ok_or_else(|| anyhow!("migration key is missing"))?;
         let list: Vec<VaultListItem> = self.send(list_vaults_request(&self.base, &self.client_id)).await?.json().await?;
-        for item in list {
-            let entries: Vec<VaultEntry> = self.send(read_vault_request(&self.base, &self.client_id,
-                &item.vault_id, None, true)).await?.json().await?;
+        let check = |item: VaultListItem, entries: Vec<VaultEntry>| {
             let kid = kid.clone();
             encryption.blocking(move |context| {
                 crate::memory::migration::verify_field(&item.summary, "e1", context.mode, &kid)?;
@@ -296,9 +301,17 @@ impl VaultClient {
                 open_summaries(context, vec![item.clone()])?;
                 open_entries(context, &item.vault_id, entries)?;
                 Ok(())
-            }).await?;
+            })
+        };
+        let mut list = list.into_iter();
+        let Some(mut item) = list.next() else { return Ok(()) };
+        let mut entries = self.history(&item.vault_id).await?;
+        loop {
+            let Some(next) = list.next() else { return check(item, entries).await };
+            let (checked, fetched) = tokio::join!(check(item, entries), self.history(&next.vault_id));
+            checked?;
+            (item, entries) = (next, fetched?);
         }
-        Ok(())
     }
 
     pub async fn migrate_encryption(&self) -> Result<()> {
@@ -315,35 +328,46 @@ impl VaultClient {
             .await?;
         let mut snapshot = Vec::with_capacity(list.len());
         for item in list {
-            let entries: Vec<VaultEntry> = self
-                .send(read_vault_request(
-                    &self.base,
-                    &self.client_id,
-                    &item.vault_id,
-                    None,
-                    true,
-                ))
-                .await?
-                .json()
-                .await?;
+            let entries = self.history(&item.vault_id).await?;
             snapshot.push((item, entries));
         }
 
-        for (item, entries) in snapshot {
+        // Each vault is opened and sealed again while the one before it is
+        // POSTed; a vault prepared that way is POSTed only while the cred
+        // agent is still unlocked (a lock stops the migration within one
+        // POST, as when each vault was prepared just before its POST).
+        let prepare = |(item, entries): (VaultListItem, Vec<VaultEntry>)| {
             let vault_id = item.vault_id.clone();
-            let body = encryption.blocking(move |encryption| migrated_vault(encryption, &item, &entries)).await?;
-            self.send(VaultRequest {
-                method: "POST",
-                url: format!(
-                    "{}/api/vault/{}/encryption?id={}",
-                    base_trim(&self.base),
-                    enc(&vault_id),
-                    enc(&self.client_id),
-                ),
-                body: Some(body),
-            }).await?;
+            let body = encryption.blocking(move |encryption| migrated_vault(encryption, &item, &entries));
+            async move { Ok::<_, anyhow::Error>((vault_id, body.await?)) }
+        };
+        let post = |vault_id: String, body: Value| self.send(VaultRequest {
+            method: "POST",
+            url: format!(
+                "{}/api/vault/{}/encryption?id={}",
+                base_trim(&self.base),
+                enc(&vault_id),
+                enc(&self.client_id),
+            ),
+            body: Some(body),
+        });
+        let mut snapshot = snapshot.into_iter();
+        let Some(first) = snapshot.next() else { return Ok(()) };
+        let (mut vault_id, mut body) = prepare(first).await?;
+        let mut prepared_ahead = false;
+        loop {
+            if prepared_ahead {
+                encryption.blocking(|encryption| encryption.confirm_unlocked()).await?;
+            }
+            let Some(next) = snapshot.next() else {
+                post(vault_id, body).await?;
+                return Ok(());
+            };
+            let (posted, prepared) = tokio::join!(post(vault_id, body), prepare(next));
+            posted?;
+            (vault_id, body) = prepared?;
+            prepared_ahead = true;
         }
-        Ok(())
     }
 }
 
