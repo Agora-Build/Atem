@@ -338,7 +338,9 @@ pub fn framing_folds_to_marker(line: String) -> bool {
 
 /// A task's rendered size, as a JS number (`markJson` a host-work
 /// `MarkTask` or `undefined`, `contextJson` a JSON array of host-work
-/// `ContextSnapshot`s).
+/// `ContextSnapshot`s). A size-only preflight: compare it with 32,768, or
+/// with 28,672 when the task has attachments, which a message with a mark
+/// always has (its screenshot). The host stays authoritative.
 #[wasm_bindgen(js_name = framingCheckedLen)]
 pub fn framing_checked_len(
     text: String,

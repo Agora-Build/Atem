@@ -219,7 +219,7 @@ fn checked_len_refuses_inputs_that_are_not_host_work_shapes() {
     assert!(run(None, "[]").is_ok());
     assert!(run(None, &ok_context).is_ok());
     assert!(run(Some(&ok_mark.to_string()), "[]").is_ok());
-    // Not JSON, not strict JSON (a duplicate key, a float, `null`).
+    // Not JSON, or not strict JSON (a duplicate key, a float).
     assert_eq!(code_of(run(None, "[").unwrap_err()), "not_strict_json");
     let dup = ok_context.replace("\"id\":\"a\"", "\"id\":\"a\",\"id\":\"b\"");
     assert_ne!(dup, ok_context);
@@ -227,6 +227,15 @@ fn checked_len_refuses_inputs_that_are_not_host_work_shapes() {
     let float = ok_context.replace("\"version\":1", "\"version\":1.5");
     assert_ne!(float, ok_context);
     assert_eq!(code_of(run(None, &float).unwrap_err()), "not_strict_json");
+    // Over the 1 MiB the bindings parse is `not_strict_json` too (the strict
+    // parser's size bound), for the context and for the mark.
+    let big = format!("[\"{}\"]", "x".repeat(1 << 20));
+    assert_eq!(code_of(run(None, &big).unwrap_err()), "not_strict_json");
+    let big_mark = format!("\"{}\"", "x".repeat(1 << 20));
+    assert_eq!(
+        code_of(run(Some(&big_mark), "[]").unwrap_err()),
+        "not_strict_json"
+    );
     // Strict JSON of another shape: the context isn't an array, a snapshot
     // has an unknown field or lacks one or has an unknown kind, the mark
     // isn't a mark, `null` is no absent mark.

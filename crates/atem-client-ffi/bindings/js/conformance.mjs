@@ -1,5 +1,6 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) run
-// through the WASM binding under Node. Usage:
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
+// framing-size-v1.json) run through the WASM binding under Node. Usage:
 //   node conformance.mjs <wasm-bindgen nodejs pkg dir> <fixtures dir>
 // The same checks run through Kotlin (bindings/kotlin/Conformance.kt) and
 // Swift (bindings/swift/Tests/…/ConformanceTests.swift).

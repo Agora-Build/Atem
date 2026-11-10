@@ -10,7 +10,8 @@
 //!   text will be escaped (a `|` before each line that folds to Atem's
 //!   marker `[atem`), for a preview or a check;
 //! - [`framing_checked_len`]: a sender's preflight of a task's rendered
-//!   size, from the task's complete inputs, before it enqueues it;
+//!   size, from the task's complete inputs, before it enqueues it or
+//!   publishes a message (a size-only check: the host is authoritative);
 //! - [`framing_unicode_version`]: the Unicode version of all the folding
 //!   data (a build with other data would escape other lines).
 //!
@@ -67,23 +68,35 @@ pub fn framing_folds_to_marker(line: String) -> bool {
     framing::folds_to_marker(&line)
 }
 
-/// A task's rendered size, for a sender's preflight before it enqueues:
-/// the exact size of the framed `text`, `mark` and `context` blocks with
-/// the longest first and last lines any sender, route or message gets, and
-/// no screenshot lines. It calls the shared `framing::checked_len`, so it
-/// agrees with the host's own check.
+/// A task's rendered size, for a sender's preflight before it enqueues
+/// (`work_enqueue`) or publishes a message (`message_publish`): the exact
+/// size of the framed `text`, `mark` and `context` blocks with the longest
+/// first and last lines any sender, route or message gets, and no
+/// screenshot lines. It calls the shared `framing::checked_len`, the
+/// calculation the host makes.
+///
+/// **Size only.** It checks nothing but the size: not a snapshot's digest
+/// against its text, an id, a kind's use or any other limit. The host stays
+/// authoritative; this is a preflight.
 ///
 /// The inputs are the complete task, not a byte count: each snapshot adds
 /// its own block (its kind, id, version, digest and provenance lines) and
 /// its own escaping, so equal text bytes in different snapshots render to
 /// different sizes. `mark_json` is a host-work `MarkTask` (`None`: no mark),
 /// `context_json` a JSON array of host-work `ContextSnapshot`s (`[]`: none);
-/// both strict JSON of exactly those shapes (else `Invalid`).
+/// both strict JSON of exactly those shapes (else `Invalid`:
+/// `not_strict_json`, which includes input over 1 MiB, or `malformed`).
 ///
-/// A task fits when the result is at most 32,768 bytes (28,672 when it has
-/// attachments: their screenshot lines come at dispatch). Above 32,768 the
-/// value is only a lower bound: once the raw bytes alone are over it,
-/// nothing is escaped. The host stays authoritative; this is a preflight.
+/// Compare the result with the task's bound: 32,768 bytes, or 28,672 (that
+/// minus a 4,096-byte reserve for the screenshot lines added at dispatch)
+/// when the task has attachments. **A message with a mark always has one,
+/// its screenshot, so a mark's bound is 28,672, never 32,768.** The host
+/// compares the same number in `work_enqueue` (the task's own attachments)
+/// and in `message_publish`, where each agent recipient's task is the
+/// message's text and context plus the mark, with the mark's screenshot as
+/// its one attachment. `work_enqueue` measures its task with no mark. Above
+/// 32,768 the value is only a lower bound: once the raw bytes alone are over
+/// it, nothing is escaped.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn framing_checked_len(
     text: String,

@@ -1,7 +1,9 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) run
-// through the Swift binding, the same checks as the Kotlin
-// (bindings/kotlin/Conformance.kt) and WASM (bindings/js/conformance.mjs)
-// runs. ATEM_FIXTURES names the fixtures directory.
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
+// framing-size-v1.json) run through the Swift binding, the same checks as the
+// Kotlin (bindings/kotlin/Conformance.kt) and WASM
+// (bindings/js/conformance.mjs) runs. ATEM_FIXTURES names the fixtures
+// directory.
 import CryptoKit
 import Foundation
 import XCTest

@@ -1,6 +1,7 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) run
-// through the Kotlin binding (UniFFI + JNA), the same checks as the WASM
-// (bindings/js/conformance.mjs) and Swift runs. Usage:
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
+// framing-size-v1.json) run through the Kotlin binding (UniFFI + JNA), the
+// same checks as the WASM (bindings/js/conformance.mjs) and Swift runs. Usage:
 //   java -Djna.library.path=<dir of libatem_client_ffi.so> -cp … \
 //     atem.bindings.test.ConformanceKt <fixtures dir>
 package atem.bindings.test

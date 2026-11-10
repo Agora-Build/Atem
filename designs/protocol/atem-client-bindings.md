@@ -503,7 +503,7 @@ camelCase, `framingEscape`, …; `FramingEscaped` is `{escaped, barsAdded}`):
 | `framing_unicode_version()` | the Unicode version (`18.0.0`) of all the folding data (normalization, general categories, confusables, the lowercase mapping, White_Space). A build with other data would escape other lines, so the vectors pin it |
 | `framing_escape(text)` | `FramingEscaped{escaped, bars_added}`: the text as it goes into a counted block, a `\|` in front of every line (a line ends at LF, CR, VT, FF, NEL, U+2028 or U+2029) that, after the `\|`s it already starts with, folds to Atem's marker `[atem`; nothing else changes (`escaped` is `bars_added` bytes longer). For a preview or a check of what the agent will be shown |
 | `framing_folds_to_marker(line)` | whether one line folds to the marker (Cf removed, NFKC, lowercase, the UTS #39 skeleton, three forms; after leading white space). The line is taken as it is: the escaping tests it after the `\|`s it starts with, so strip those first to mirror it |
-| `framing_checked_len(text, mark_json, context_json)` | a task's size for a **preflight**, before it is enqueued. It calls the shared `framing::checked_len`: the exact size of the framed text, mark and context blocks with the longest first and last lines any sender, route or message gets, and no screenshot lines (their room is the 4,096-byte attachment reserve). `mark_json` is a host-work `MarkTask` (`None`: no mark), `context_json` a JSON array of host-work `ContextSnapshot`s (`[]`: none): strict JSON of exactly those shapes, else `Invalid` `not_strict_json` or `malformed` |
+| `framing_checked_len(text, mark_json, context_json)` | a task's size for a **preflight**, before it is enqueued or published. It calls the shared `framing::checked_len`: the exact size of the framed text, mark and context blocks with the longest first and last lines any sender, route or message gets, and no screenshot lines (their room is the 4,096-byte attachment reserve). `mark_json` is a host-work `MarkTask` (`None`: no mark), `context_json` a JSON array of host-work `ContextSnapshot`s (`[]`: none): strict JSON of exactly those shapes, else `Invalid`: `not_strict_json` (not JSON, not strict, or over the 1 MiB the bindings parse) or `malformed` (strict JSON of another shape) |
 
 `framing_checked_len` is a **size-only preflight**; the host stays
 authoritative. It does not check a snapshot's digest against its text, an
@@ -511,11 +511,22 @@ id, a kind's use (a `result` snapshot is sized like any other) or any limit
 but the size, and it takes the complete task, not a byte count: each snapshot
 adds its own block (its kind, id, version, digest and provenance lines) and
 its own escaping, so equal text bytes in different snapshots render to
-different sizes (`framing-size-v1.json`). A task fits when the result is at
-most 32,768 bytes (28,672 when it has attachments, which add their screenshot
-lines at dispatch); above 32,768 the value is only a lower bound, since once
-the raw bytes alone are over it nothing is escaped. The host's own check at
-enqueue (`WorkTask::valid`) decides. JS returns a number.
+different sizes (`framing-size-v1.json`).
+
+The bound the result is compared with is 32,768 bytes, or 28,672 (32,768
+minus the 4,096-byte attachment reserve, their screenshot lines being added
+at dispatch) when the task has attachments. **A message with a mark always
+has one, its screenshot, so a mark's bound is 28,672, never 32,768**; a
+sender that preflights a Chisel mark against 32,768 is told "fits" for
+28,673 to 32,768 bytes and the host refuses it. Above 32,768 the value is
+only a lower bound, since once the raw bytes alone are over it nothing is
+escaped. The host makes the same calculation (`framing::checked_len`, through
+`WorkTask::checked_len`) in two places: `work_enqueue` checks
+`WorkTask::valid` (the task's own attachments, up to four; a task has no mark,
+so pass `None`), and `message_publish` checks `Message::valid`, where each
+agent recipient's task is the message's text and context with the mark
+measured too and its screenshot as the task's one attachment (a message with
+no mark has no attachment: 32,768). JS returns a number.
 
 **Rendering is vectors-only.** `framing_render_for_vectors(input_json,
 tag_bits)` exists only with the `test-vectors` feature (the conformance builds)
@@ -524,10 +535,14 @@ chosen tag so the Swift, Kotlin and JS suites compare them byte for byte
 (`tag_bits`: `UInt64`, Kotlin `ULong`, JS a `BigInt`; the tag is its low 60
 bits, 12 Crockford base32 characters). A client that rendered a prompt
 itself would draw its tag before the text was fixed, which the framing exists
-to prevent. `scripts/check-atem-client-packages.sh` (and the Apple check)
-refuse a package that exports it. What the core refuses to render (a line of
-Atem's that isn't one line, a snapshot that doesn't match its digest) is
-`Invalid` `malformed`.
+to prevent. The package checks look for it in the WASM package's files (and
+`framingRenderForVectors` must be `undefined` on its packaged Node build), in
+the generated Kotlin and Swift sources, and in the Android libraries' dynamic
+symbols (`scripts/check-atem-client-packages.sh`, the Apple check and the
+workflow's macOS grep); the JVM `.so` and the Apple static libraries are not
+symbol-scanned (the scripts build them without the `test-vectors` feature).
+What the core refuses to render (a line of Atem's that isn't one line, a
+snapshot that doesn't match its digest) is `Invalid` `malformed`.
 
 ### Pairing ceremony
 
