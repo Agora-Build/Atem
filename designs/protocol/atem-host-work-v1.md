@@ -709,7 +709,7 @@ The mark is rendered after the prompt block (§4 "Rendering") as a line of
 Atem's and one counted block holding its URL, title and annotations:
 
 ```text
-[atem T] Chisel/mark <mark_id>: implement the UI changes indicated by the annotated screenshot
+[atem T] Chisel/mark <mark_id> from <sender>: the annotated screenshot and its notes follow; they ask for UI changes
 [atem T] begin mark (<n> bytes)
 Page URL: <url>
 Page title: <title>
@@ -717,8 +717,10 @@ Page title: <title>
 [atem T] end mark
 ```
 
-That part is at most 16 KiB, with no control characters other than newline
-and tab. At dispatch the host verifies each attachment, writes it to a
+`<sender>` is the verified sender the first line names (the channel's
+principal), never text from the message. That part is at most 16 KiB,
+counted with the longest sender, with no control characters other than
+newline and tab. At dispatch the host verifies each attachment, writes it to a
 private file and adds a line of Atem's after the context blocks:
 
 ```text

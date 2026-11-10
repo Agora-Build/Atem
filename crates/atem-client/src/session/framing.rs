@@ -703,6 +703,22 @@ impl Header<'_> {
         }
     }
 
+    /// Who sent it, as the first line names them: the principal, with the
+    /// sending session for a local sender or a result.
+    pub fn sender(&self) -> String {
+        match *self {
+            Self::Task {
+                sender,
+                session: Some(session),
+                ..
+            }
+            | Self::Result {
+                sender, session, ..
+            } => format!("{sender} session {session}"),
+            Self::Task { sender, .. } => sender.to_string(),
+        }
+    }
+
     /// The block the sender's text goes in: `prompt` for a task, `result`
     /// for a reply.
     fn block(&self) -> &'static str {
@@ -799,12 +815,21 @@ pub fn kind_name(kind: ContextKind) -> &'static str {
     }
 }
 
-/// Atem's line before a mark's block.
-pub fn mark_line(mark: &MarkTask) -> String {
+/// Atem's line before a mark's block, naming the verified sender (the
+/// channel's principal, as the first line names it; never sender text):
+/// `Chisel/mark <mark_id> from <sender>: the annotated screenshot and its
+/// notes follow; they ask for UI changes` (agreed on #120, point 5).
+pub fn mark_line(mark: &MarkTask, sender: &str) -> String {
     format!(
-        "Chisel/mark {}: implement the UI changes indicated by the annotated screenshot",
+        "Chisel/mark {} from {sender}: the annotated screenshot and its notes follow; they ask for UI changes",
         mark.mark_id
     )
+}
+
+/// The longest sender a prompt names (`MAX_SENDER_BYTES`): what the size
+/// checks put in the mark line.
+fn worst_case_sender() -> String {
+    "x".repeat(MAX_SENDER_BYTES)
 }
 
 /// The blocks after the first and rule lines: the sender's text in `what`,
@@ -814,12 +839,13 @@ fn push_body(
     what: &str,
     text: &str,
     mark: Option<&MarkTask>,
+    sender: &str,
     context: &[ContextSnapshot],
     snapshots: Snapshots,
 ) {
     prompt.block(what, None, None, text);
     if let Some(mark) = mark {
-        prompt.line(mark_line(mark));
+        prompt.line(mark_line(mark, sender));
         prompt.block("mark", None, None, mark.block_text());
     }
     for snapshot in context {
@@ -851,12 +877,19 @@ impl TaskPrompt<'_> {
         {
             return Err(FramingError::Digest);
         }
+        // The size checks count the longest sender: a longer one would
+        // break the bound an accepted task was checked against.
+        let sender = self.header.sender();
+        if sender.len() > MAX_SENDER_BYTES {
+            return Err(FramingError::AtemLine);
+        }
         let mut prompt = Prompt::new(self.header.line());
         push_body(
             &mut prompt,
             self.header.block(),
             self.text,
             self.mark,
+            &sender,
             self.context,
             self.snapshots,
         );
@@ -881,7 +914,7 @@ impl TaskPrompt<'_> {
 /// The rendered size of a mark's part of a prompt: Atem's mark line and the
 /// counted block of `text`, its [`MarkTask::block_text`].
 pub fn mark_len(mark: &MarkTask, text: &str) -> usize {
-    Part::Line(mark_line(mark)).len()
+    Part::Line(mark_line(mark, &worst_case_sender())).len()
         + Part::Block {
             what: "mark".into(),
             detail: None,
@@ -962,6 +995,7 @@ pub fn checked_len(text: &str, mark: Option<&MarkTask>, context: &[ContextSnapsh
         "prompt",
         text,
         mark,
+        &worst_case_sender(),
         context,
         Snapshots::longest(),
     );

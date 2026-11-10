@@ -640,7 +640,7 @@ fn a_result_and_a_mark_read_as_the_design_shows() {
             "{p}Atem task {ID} / workflow {WORKFLOW} from member:phone, route web, message {WORKFLOW}\n\
              {p}{RULE}\n\
              {p}begin prompt (0 bytes)\n\n{p}end prompt\n\
-             {p}Chisel/mark mark_1: implement the UI changes indicated by the annotated screenshot\n\
+             {p}Chisel/mark mark_1 from member:phone: the annotated screenshot and its notes follow; they ask for UI changes\n\
              {p}begin mark ({} bytes)\n{block}{p}end mark\n\
              {p}verified screenshot {ID} sha256 {}: read this PNG: /private/x.png",
             block.len(),
@@ -660,6 +660,69 @@ fn a_result_and_a_mark_read_as_the_design_shows() {
         task.prompt().unwrap().render(&tag),
         Err(FramingError::AtemLine)
     );
+}
+
+/// The mark line names the verified sender, and the size checks count
+/// the longest one: a sender longer than that is refused, never rendered.
+#[test]
+fn the_mark_line_names_the_sender_within_the_checked_bound() {
+    let shot = Attachment {
+        attachment_id: ID.into(),
+        digest: digest(b"png"),
+        size: 3,
+        media_type: "image/png".into(),
+    };
+    let mark = MarkTask {
+        mark_id: "mark_1".into(),
+        url: "u".into(),
+        title: "t".into(),
+        screenshot: shot,
+        annotations: vec![],
+    };
+    let longest = format!("service:{}", "s".repeat(128));
+    let task = |sender: &str| {
+        TaskPrompt {
+            header: Header::Task {
+                task_id: ID,
+                workflow_id: WORKFLOW,
+                sender,
+                session: None,
+                route_id: "r",
+                message_id: Some(ID),
+            },
+            text: "",
+            mark: Some(&mark),
+            context: &[],
+            snapshots: Snapshots::FromSender,
+            screenshots: &[],
+            closing: None,
+        }
+        .prompt()
+    };
+    let rendered = task(&longest).unwrap();
+    assert!(
+        rendered
+            .parts()
+            .contains(&Part::Line(mark_line(&mark, &longest)))
+    );
+    // The checked size is never below what the longest sender renders.
+    let work = WorkTask {
+        task_id: ID.into(),
+        workflow_id: WORKFLOW.into(),
+        target: Target {
+            account_id: "account".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 1,
+            session_id: "ses-aaaaaaaaaaaa".into(),
+            process_gen: crate::session::new_id(),
+        },
+        expires_at: 1,
+        prompt: String::new(),
+        context: vec![],
+        attachments: vec![],
+    };
+    assert!(work.checked_len(Some(&mark)) >= rendered.len());
+    assert_eq!(task(&format!("{longest}x")), Err(FramingError::AtemLine));
 }
 
 #[test]

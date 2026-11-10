@@ -939,7 +939,9 @@ fn view_only_attachments_never_see_a_live_tag() {
         assert!(!viewer_chat.contains(tag.as_str()), "{tag}");
         assert!(control_chat.contains(tag.as_str()), "{tag}");
     }
-    assert_eq!(tags.len(), 3);
+    // A tag is drawn for every dispatched prompt, after its input is fixed.
+    let distinct: std::collections::BTreeSet<&String> = tags.iter().collect();
+    assert_eq!(distinct.len(), 3, "{tags:?}");
 }
 
 /// A pause lasts as long as its turn, across a broker restart, and never
@@ -1052,6 +1054,46 @@ fn a_pause_outlives_a_broker_restart_but_never_its_turn() {
     assert!(frames_in(&after)[0]["reset"] == true, "{after:?}");
     let seen = [held, after].concat();
     assert!(!serde_json::to_string(&seen).unwrap().contains(&tag));
+}
+
+/// A dispatch whose terminal pause can't be written waits ("waiting to
+/// record the prompt's terminal pause"), pastes nothing and leaves no tag
+/// or pause behind; once it can, the attempt that pastes draws its own tag
+/// after the task's input is fixed, and records exactly that one.
+#[test]
+fn a_dispatch_that_cannot_record_its_pause_waits_and_leaves_nothing() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut sender = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    sender.launch(&mut r, &rid);
+    let launch = sender.launched(&mut r, &rid);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let workers = rig.sandbox.config().join("runtime/workers");
+    let (pause, tags) = (
+        workers.join(format!("{sid}.pause")),
+        workers.join(format!("{sid}.tags")),
+    );
+    // A directory where the pause file goes: its write fails.
+    std::fs::create_dir_all(&pause).unwrap();
+    let t = task(&launch, "Framed task that must wait");
+    enqueue(&mut sender, &mut r, &t);
+    wait_detail(
+        &mut sender,
+        &mut r,
+        &t["task_id"],
+        "waiting to record the prompt's terminal pause",
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!input(&rig).contains("Framed task that must wait"));
+    assert_eq!(std::fs::read_to_string(&tags).unwrap_or_default(), "");
+    std::fs::remove_dir(&pause).unwrap();
+    within("the prompt pasted", || {
+        input(&rig).contains("Framed task that must wait")
+    });
+    let tag = tag_in(&last_paste(&rig)).unwrap();
+    assert_eq!(std::fs::read_to_string(&tags).unwrap(), format!("{tag}\n"));
+    assert!(std::fs::read_to_string(&pause).unwrap().contains(&tag));
 }
 
 /// A sender's text can't pass for Atem's own lines (delegated host-work
@@ -1675,7 +1717,7 @@ fn mark_screenshots_and_messages_share_the_durable_session_queue() {
     assert!(paste.starts_with(&format!("{first}\n")), "{paste}");
     assert!(
         paste.contains(&format!(
-            "{prefix}Chisel/mark mark_123: implement the UI changes indicated by the annotated screenshot\n\
+            "{prefix}Chisel/mark mark_123 from member:{MAC}: the annotated screenshot and its notes follow; they ask for UI changes\n\
              {prefix}begin mark (96 bytes)\nPage URL: http://localhost:3000/\nPage title: Example page\n\
              1. [arrow] at (24, 10): Make this red\n{prefix}end mark\n"
         )),

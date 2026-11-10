@@ -117,6 +117,12 @@ fn escape_inputs() -> Vec<(&'static str, String)> {
         ),
         ("Cherokee", "[\u{13aa}\u{13a2}\u{13ac}\u{13b7}] Cherokee"),
         ("Lisu", "[\u{a4ee}\u{a4d4}\u{a4f0}\u{a4df}] Lisu"),
+        // CR, VT, FF and NEL end a line too (the stricter rule; valid
+        // input never has them).
+        (
+            "lines after CR, VT, FF and NEL",
+            "a\r[atem] after CR\u{b}[atem] after VT\u{c}[atem] after FF\u{85}[atem] after NEL",
+        ),
         // Invisible characters that are neither Cf nor White_Space.
         (
             "a leading Braille blank (U+2800)",
@@ -466,8 +472,41 @@ fn v1_overhead(context: &[ContextSnapshot]) -> usize {
             .sum::<usize>()
 }
 
+/// What v1 rendered for a message with a mark from `sender`: its task line,
+/// its message line, the text, the mark's lines (`[Chisel/mark …]`, the
+/// instruction, URL, title, the screenshot's line, the annotations) and the
+/// context headers.
+fn v1_mark_message(
+    text: &str,
+    sender: &str,
+    mark: &MarkTask,
+    context: &[ContextSnapshot],
+) -> usize {
+    let mut rendered = format!(
+        "[Atem task {TASK} / workflow {WORKFLOW}]\n[Message {MESSAGE} from {sender}]\n{text}\n"
+    );
+    rendered.push_str(&format!(
+        "[Chisel/mark {}]\nImplement the UI changes indicated by the annotated screenshot.\nPage URL: {}\nPage title: {}\nScreenshot attachment: {} (sha256 {})\n",
+        mark.mark_id, mark.url, mark.title, mark.screenshot.attachment_id, mark.screenshot.digest
+    ));
+    for (i, a) in mark.annotations.iter().enumerate() {
+        rendered.push_str(&format!(
+            "{}. [{}] at ({}, {}): {}\n",
+            i + 1,
+            a.tool,
+            a.x,
+            a.y,
+            a.text
+        ));
+    }
+    rendered.len() + v1_overhead(context)
+        - format!("[Atem task {TASK} / workflow {WORKFLOW}]\n").len()
+        + context.iter().map(|c| c.text.len()).sum::<usize>()
+}
+
 /// The size section: the worst-case lines, the design's typical and worst
-/// cases, and a task exactly at the bound.
+/// cases (a task, and a message with a mark), and a task exactly at the
+/// bound.
 fn size_section() -> Value {
     let typical_context = vec![snapshot(
         ContextKind::Vault,
@@ -487,6 +526,10 @@ fn size_section() -> Value {
         })
         .collect();
     let worst_text = "t".repeat(1000);
+    let worst_mark = MarkTask {
+        mark_id: "k".repeat(128),
+        ..mark()
+    };
     let added = |text: &str, context: &[ContextSnapshot]| {
         let texts = text.len() + context.iter().map(|c| c.text.len()).sum::<usize>();
         work(text, context.to_vec()).checked_len(None) - texts
@@ -538,6 +581,11 @@ fn size_section() -> Value {
             "what": "eight 1,000-byte contexts with 128-byte ids and 16-digit versions, a 1,000-byte prompt, the longest sender, route and message id, and the longer closing line",
             "v1_atem_bytes": v1_overhead(&worst_context),
             "checked_atem_bytes": added(&worst_text, &worst_context),
+        },
+        "worst_mark": {
+            "what": "the same message with a mark from the longest sender (a 128-byte mark id, two annotations): rendered bytes as v1 rendered it and as checked now (the screenshot's line now comes at dispatch, inside the attachment reserve)",
+            "v1_bytes": v1_mark_message(&worst_text, &"s".repeat(framing::MAX_SENDER_BYTES), &worst_mark, &worst_context),
+            "checked_bytes": work(&worst_text, worst_context.clone()).checked_len(Some(&worst_mark)),
         },
         "at_bound": {
             "what": "a 1-byte prompt and one context whose framed task is exactly 32,768 bytes as checked; one byte more is refused",

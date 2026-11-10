@@ -1482,34 +1482,38 @@ impl HostBridge {
             let Some((binding, _)) = self.host.binding_for_work(&attachment, &r.task.target) else {
                 continue;
             };
-            // The tag is kept, durably, before the prompt can reach the
-            // agent: chat-v1 hides it from attachments without `control`,
-            // after a restart too; and the session's terminal frames are
-            // held from them until the prompt's turn ends (`prompt_tags`).
+            // The tag and the terminal pause are kept, durably, before the
+            // prompt can reach the agent: chat-v1 hides the tag from
+            // attachments without `control`, and the session's terminal
+            // frames are held from them until the prompt's turn ends, after a
+            // restart too (`prompt_tags`). A failed write keeps the task
+            // waiting (logged once) and records nothing, so an attempt that
+            // can't be made leaves no tag or pause behind; the next one draws
+            // a fresh tag.
             let sid = r.task.target.session_id.clone();
             let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
-            if let Err(error) = self.prompt_tags.record(&state, &sid, &tag) {
-                let detail = "waiting to record the prompt's framing tag";
-                eprintln!("atem runtime: {sid}: prompt tag not recorded: {error}");
-                if r.status.state != WorkState::Blocked || r.status.detail != detail {
-                    r.status.state = WorkState::Blocked;
-                    r.status.detail = detail.into();
-                    self.work.store.as_ref().unwrap().save_work(&r)?;
-                }
-                continue;
-            }
-            // The pause, too, is on disk before the paste: a broker that
-            // restarts mid-turn goes on holding the frames.
             self.load_pauses(&state, &sid);
-            let mut pauses = self.view_pauses.get(&sid).cloned().unwrap_or_default();
+            let held = self.view_pauses.get(&sid).cloned().unwrap_or_default();
+            let mut pauses = held.clone();
             pauses.push(crate::runtime::prompt_tags::Pause {
                 receipt_id: r.status.receipt_id.clone(),
                 tag: tag.as_str().to_string(),
                 until_wall_ms: r.task.expires_at,
             });
-            if !self.write_pauses(&sid, &pauses) {
-                let detail = "waiting to record the prompt's terminal pause";
+            let recorded = crate::runtime::prompt_tags::write_pauses(&state, &sid, &pauses)
+                .map_err(|e| ("waiting to record the prompt's terminal pause", e))
+                .and_then(|()| {
+                    self.prompt_tags.record(&state, &sid, &tag).map_err(|e| {
+                        let _ = crate::runtime::prompt_tags::write_pauses(&state, &sid, &held);
+                        (
+                            "waiting to record the prompt's framing tag",
+                            std::io::Error::other(e.to_string()),
+                        )
+                    })
+                });
+            if let Err((detail, error)) = recorded {
                 if r.status.state != WorkState::Blocked || r.status.detail != detail {
+                    eprintln!("atem runtime: {sid}: {detail}: {error}");
                     r.status.state = WorkState::Blocked;
                     r.status.detail = detail.into();
                     self.work.store.as_ref().unwrap().save_work(&r)?;
