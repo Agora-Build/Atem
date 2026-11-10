@@ -3383,7 +3383,8 @@ impl HostBridge {
     /// has (`prompt_tags`), once each: a restarted broker learns those of
     /// adopted sessions before it serves their chat or frames.
     /// Sessions that are gone are forgotten (their tags are dead: their
-    /// turns ended), so what is kept follows the broker's sessions.
+    /// turns ended; a pause file left to rewrite goes with its worker's
+    /// files), so what is kept follows the broker's sessions.
     fn load_prompt_tags(&mut self, cx: &Cx) {
         let Some(state) = self.dir.parent().map(Path::to_path_buf) else {
             return;
@@ -3392,6 +3393,7 @@ impl HostBridge {
             |sid: &str| SessionId::parse(sid).is_some_and(|id| cx.sessions.contains_key(&id));
         self.prompt_tags.retain(known);
         self.pauses_loaded.retain(|sid| known(sid));
+        self.pauses_dirty.retain(|sid| known(sid));
         for sid in cx.sessions.keys() {
             self.prompt_tags.load(&state, sid.as_str());
             self.load_pauses(&state, sid.as_str());
@@ -3414,11 +3416,12 @@ impl HostBridge {
 
     /// Holds terminal frames from attachments without `control` while a
     /// framed prompt's turn runs on the session, until `Pause::holds` says
-    /// it ended: the session no longer live, the deadline, the receipt
-    /// completed or rejected, or (its outcome unknown: a restart, a prompt
-    /// the agent didn't take in time) the chat showing the agent took the
-    /// prompt and its turn ended. Each change is written to the session's
-    /// pause file.
+    /// it ended: the session no longer live, the receipt completed or
+    /// rejected, or (its outcome unknown: a restart, a prompt the agent
+    /// didn't take in time) the chat showing the agent took the prompt and
+    /// its turn ended; at the latest the host's bound (a day on the wall
+    /// and monotonic clocks; never the task's deadline). Each change is
+    /// written to the session's pause file.
     fn view_pause_pass(&mut self, cx: &Cx) {
         use super::prompt_tags::{ChatSigns, TurnSigns};
         self.rewrite_pauses();

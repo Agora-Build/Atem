@@ -1248,43 +1248,53 @@ Stage 1 ships with these limits.
     text of a request becomes a path), and a session's tags are forgotten
     once it is gone. A file that can't be read hides every tag-shaped
     string of that session's chat outside its ids (`id`, `…Id`, `…_id`,
+    `…Ids`, `…_ids`, `generation`, `oldest_retained`, `controller_session`,
     `next`, `before`), and nothing in any other session's.
-  - **Paused on terminal-v1.** Frames are the agent's own rendering (it
-    wraps, splits or truncates the prompt), so no frame goes to an
-    attachment without `control` from a framed prompt's paste until its
-    turn ends. The pause is written to `runtime/workers/<session>.pause`
-    (with the prompt's tag and its bound) before the paste, so a restarted
-    broker that adopts the worker goes on holding it. It ends at the first
-    of: the session is no longer live (the agent exited, its worker went
-    away, the session stopped); the host's bound passed (a day from the
-    dispatch on the wall clock and on the monotonic clock both, so a wall
-    clock set forward doesn't end it: a pause is never stuck; the task's
-    deadline is no bound, since the sender chooses it and a turn isn't
-    interrupted at it); the prompt's receipt completed (the
-    turn ended, done or interrupted) or was rejected (refused before the
-    prompt reached the agent); or, when the receipt can't tell (its outcome
-    is unknown, as after a restart or for a prompt the agent didn't take in
-    time, or it is gone), the session's chat shows the agent took the
-    prompt (a user message carries its tag) and that turn ended (the chat is
-    `ready`). Without turn state (no chat, a withdrawn chat, or an adopting
-    broker that hasn't got the worker's chat yet) the pause holds until the
-    session ends or the bound. A `subscribe` or `ack` meanwhile is
-    accepted; terminal-v1 has no message that says why the frames wait (the
-    registry's `activity` reads `working`), and none was added. Then the
-    stream resumes with a full frame (`reset`), as a new subscription's
-    first. A pause file that can't be read holds the frames until the
-    session ends or a day after the file's last write: the hold is written
-    back, so a broker start doesn't restart it (if it can't be written, the
-    file's time bounds it on both clocks). A pause write that fails leaves
-    nothing behind: the file is rewritten from what the broker holds.
+  - **Paused on terminal-v1.** Frames are the agent's own rendering (it wraps,
+    splits or truncates the prompt), so no frame goes to an attachment without
+    `control` from a framed prompt's paste until its turn ends. The pause is
+    written to `runtime/workers/<session>.pause` (with the prompt's tag and
+    its bound) before the paste, so a restarted broker that adopts the worker
+    goes on holding it. It ends at the first of: the session is no longer live
+    (the agent exited, its worker went away, the session stopped); the host's
+    bound passed (a day from the dispatch on the wall clock and on the
+    monotonic clock both, so a wall clock set forward doesn't end it: a pause
+    is never stuck; the task's deadline is no bound, since the sender chooses
+    it and a turn isn't interrupted at it. A broker that starts in what reads
+    as another boot counts the monotonic day again from its start: after a
+    reboot, which no session survives; on macOS, where the boot id is
+    `kern.boottime`, after a clock step shifted it; or when no boot id can be
+    read. That only lengthens a pause whose turn's end isn't seen); the
+    prompt's receipt completed (the turn ended, done or interrupted) or was
+    rejected (refused before the prompt reached the agent); or, when the
+    receipt can't tell (its outcome is unknown, as after a restart or for a
+    prompt the agent didn't take in time, or it is gone), the session's chat
+    shows the agent took the prompt (a user message carries its tag) and that
+    turn ended (the chat is `ready`). Without turn state (no chat, a withdrawn
+    chat, or an adopting broker that hasn't got the worker's chat yet) the
+    pause holds until the session ends or the bound. A `subscribe` or `ack`
+    meanwhile is accepted; terminal-v1 has no message that says why the frames
+    wait (the registry's `activity` reads `working`), and none was added. Then
+    the stream resumes with a full frame (`reset`), as a new subscription's
+    first. A pause file that can't be read holds the frames until the session
+    ends, or until both a day after the file's last write (wall clock) and a
+    day after the broker read it (monotonic clock) have passed: the hold is
+    written back, so a later broker start doesn't restart it. If it can't be
+    written either, the monotonic side is what is left of the file's day on
+    the wall clock, so no broker start lengthens it, and a wall clock set
+    forward before that start shortens it (it needs a damaged file, an
+    unwritable path and a clock step). A pause write that fails leaves nothing
+    behind: the file is rewritten from what the broker holds.
   - **What stays.** A tag the agent paraphrases (rather than repeats) isn't
     hidden, nor an echo split across parts or cut short (a tool summary or
-    result the chat truncates). Once the turn ended, its dead tag can show on the terminal (the
-    rule line makes it worthless then). An agent that copies its own live
-    tag into something another session shows (a reply delivered as data, a
-    file or command output another agent reads) can put it on that
-    session's terminal after that session's own pause ended (chat-v1 hides
-    it, for every session); only pausing every session's view-only frames
+    result the chat truncates). Once the turn ended, its dead tag can show on
+    the terminal (the rule line makes it worthless then). An agent that copies
+    its own live tag into something another session shows (a reply delivered
+    as data, a file or command output another agent reads) can put it on that
+    session's terminal after that session's own pause ended (chat-v1 hides it
+    in every session, unless the copying session's tags file couldn't be read
+    at a broker start: its tags are then unknown, and only its own chat hides
+    every tag-shaped string); only pausing every session's view-only frames
     while any framed turn on the host runs would cover that. Principals with
     `control`, the local frontends, the session logs and the journal keep
     the real text. A task accepted by an earlier build keeps the prompt it

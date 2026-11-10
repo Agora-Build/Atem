@@ -409,10 +409,12 @@ with look-alike letters of other scripts that Unicode's confusables list
 doesn't have, or `[atem` after other text on the line, get no `|` and rely
 on the tag. Atem keeps the live tag for whoever holds `control` and hides it
 from view-only devices and services where it can: chat replaces it with
-`****-****-****`, and their terminal view pauses while a framed prompt's turn
-runs (at most a day), then shows the screen again. Not hidden: a tag the
-agent paraphrases or echoes split or cut short, a finished turn's tag still
-on the screen, and a tag an agent copies into another session's output.
+`****-****-****`, and their terminal view pauses while a framed prompt's
+turn runs (a day at most, unless a restart can't tell the boot is the same,
+as on macOS after a clock change), then shows the screen again. Not hidden:
+a tag the agent paraphrases or echoes split or cut short, a finished turn's
+tag still on the screen, and a tag an agent copies into another session's
+output.
 The framing tells the agent where text came from; it doesn't stop the agent
 from acting on it.
 Whoever may reach an agent (a route that lists it, or `control` over its

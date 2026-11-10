@@ -226,9 +226,10 @@ offsets, sequences and `next` tokens hold), and terminal-v1 sends no frame
 from the paste until the prompt's turn ends, across a host restart (the
 receipt completed or rejected; or, when its outcome is unknown, the chat
 showing the agent took the prompt and the turn ended; or the session no
-longer live; at most a day from the dispatch on the host's wall and
-monotonic clocks both: the task's deadline, which the sender chooses, never
-ends it), then a full frame (`reset: true`). A `subscribe` or `ack`
+longer live; else a day from the dispatch on the host's wall and monotonic
+clocks both, longer only when a broker restart reads as another boot, as on
+macOS after a clock step: the task's deadline, which the sender chooses,
+never ends it), then a full frame (`reset: true`). A `subscribe` or `ack`
 meanwhile is accepted and answered as usual, without frames; no terminal-v1
 message says why (the registry's `activity` is `working`). Chat-v1 hides a
 whole tag in one string, in any letter case. A paraphrased tag, an echo

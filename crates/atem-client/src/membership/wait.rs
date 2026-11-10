@@ -23,7 +23,9 @@ pub struct HostNow {
     /// `CLOCK_MONOTONIC`, ms.
     pub mono_ms: u64,
     /// The boot the monotonic reading belongs to (Linux
-    /// `/proc/sys/kernel/random/boot_id`, macOS `kern.bootsessionuuid`).
+    /// `/proc/sys/kernel/random/boot_id`; macOS `kern.boottime`, which a
+    /// wall clock step can shift: that reads as another boot, which only
+    /// lengthens a wait or a hold).
     pub boot_id: String,
 }
 

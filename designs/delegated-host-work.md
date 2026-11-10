@@ -2063,10 +2063,12 @@ A delivered result:
   (the pause is written before the paste): the receipt completed or was rejected; or, its outcome unknown, the chat
   shows the agent took the prompt and the turn ended; or the session is no longer live. Without turn state the pause
   holds until the session ends. Its only other bound is the host's own: a day from the dispatch, on the host's wall
-  and monotonic clocks both. The task's deadline, which the sender chooses, never ends it (a v1 turn isn't
+  and monotonic clocks both (a host restart that reads as another boot, as on macOS after a clock step, counts the
+  monotonic day again: only longer). The task's deadline, which the sender chooses, never ends it (a v1 turn isn't
   interrupted at the deadline; final security review, 2026-11-10). Then a full frame. A tags file the host can't read
   hides every tag-shaped string outside ids in that session's chat (only that session's); a pause file it can't read
-  holds that session's frames until the session ends or a day after the file's last write. What stays: a tag an
+  holds that session's frames until the session ends, or until a day after the file's last write (wall clock) and a
+  day after the host read it (monotonic clock) have both passed. What stays: a tag an
   agent paraphrases, an echo split across parts or cut short (a truncated tool summary or result), a finished turn's
   tag on the screen, and a tag an agent copies into something another session shows (only a host-wide pause would
   cover that). Control holders, the local terminal, logs and the journal keep the real text.

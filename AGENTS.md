@@ -327,8 +327,10 @@ paste) with `****-****-****` for attachments without `control`, and their
 terminal-v1 frames pause from a framed prompt's paste until its turn ends
 (`Pause::holds`: receipt completed or rejected; with its outcome unknown, as
 after a restart, the chat showing the agent took the prompt and the turn
-ended; the session not live; at most a day from the dispatch on the host's
-wall and monotonic clocks, never the sender's task deadline), kept in
+ended; the session not live; else a day from the dispatch on the host's
+wall and monotonic clocks, longer only when a broker restart reads as
+another boot, as on macOS after a clock step; never the sender's task
+deadline), kept in
 `runtime/workers/<sid>.pause` so a restarted broker goes on holding it, then
 resume with a full frame; only sessions the runtime has, by a parsed id, are
 read, and an unreadable tags file hides tag-shaped strings in its own

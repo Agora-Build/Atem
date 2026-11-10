@@ -1201,7 +1201,10 @@ fn a_turn_that_outlasts_its_tasks_deadline_stays_paused() {
     viewer.subscribe(&mut r, &sid, &pg);
     let mut seen = first_frames(&mut viewer, &mut r, &sid, &pg, "first frames");
 
-    let short = task_until(&launch, "Framed task that outlasts its deadline", 4_000);
+    // Long enough to be dispatched on a loaded runner (a task past its
+    // deadline before submission expires unpasted); the fake turn holds
+    // until `complete`, so the deadline still passes mid-turn.
+    let short = task_until(&launch, "Framed task that outlasts its deadline", 15_000);
     let deadline = short["expires_at"].as_u64().unwrap();
     enqueue(&mut sender, &mut r, &short);
     within("the prompt pasted", || {
@@ -1365,6 +1368,7 @@ struct MovingClock {
     path: PathBuf,
     offsets: std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    writer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MovingClock {
@@ -1397,7 +1401,7 @@ impl MovingClock {
         };
         write();
         let s = stop.clone();
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             while !s.load(Ordering::SeqCst) {
                 write();
                 std::thread::sleep(Duration::from_millis(20));
@@ -1407,6 +1411,7 @@ impl MovingClock {
             path,
             offsets,
             stop,
+            writer: Some(writer),
         }
     }
 
@@ -1421,8 +1426,13 @@ impl MovingClock {
 }
 
 impl Drop for MovingClock {
+    /// Stops the writer and waits for it, before the sandbox it writes in
+    /// goes (the clock is declared after the rig, so it drops first).
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 
