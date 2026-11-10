@@ -7,13 +7,15 @@ records the agreement as D29. Nothing activates (features unadvertised, the sign
 cross-team schemas are published, every strict verifier is compatible and the joint checks pass (V.2).
 
 **Amended after agreement, 2026-11-09/10 (#120 comment 6751584108).** The prompt framing (III.2), the one part built
-before the rest (on PR #124, owner choice 9), is amended with the wording Astation agreed on all seven points and
-Auth/Portal agreed with the owner (its post pending): the four stricter folding rules and Unicode 18.0.0 for all
-folding data, the snapshot wording, the old v1 headers in test 38, the mark line, the narrowed rule line, the final
-size figures (V.1), the binding exports before Phase 1 consumers (VII.C 40), and the live tag shown to `control`
-holders only (chat redaction and the terminal pause, the owner's decision of 2026-11-10). Each changed passage is
-marked "Amended after agreement, 2026-11-09/10, #120 comment 6751584108" (in I.6.4, III.2, IV row 13, V.1, VI, VII.C
-38 to 40 and VIII.2 item 9). The implementation, its vectors
+before the rest (on PR #124, owner choice 9), is amended with the wording Astation agreed on all seven points (#120
+comment 6751584108; Auth/Portal's confirmation is pending its post on #120): the four stricter folding rules and
+Unicode 18.0.0 for all folding data, the snapshot wording, the old v1 headers in test 38, the mark line, the narrowed
+rule line, the final size figures (V.1), the binding exports before Phase 1 consumers (VII.C 40), and the live tag
+shown to `control` holders only (chat redaction and the terminal pause, the owner's decision of 2026-11-10). Each
+changed passage is marked "Amended after agreement, 2026-11-09/10, #120 comment 6751584108" (in I.6.4, III.2, IV row
+13, V.1, VI, VII.C 38 to 40 and VIII.2 item 9). The final security review (2026-11-10) then made the terminal
+pause's bound the host's own (a day on both clocks, never the sender's deadline) and scoped an unreadable tags file
+to its session (III.2, "Who sees the live tag"; VI). The implementation, its vectors
 (`designs/protocol/fixtures/host-work/prompt-framing-v1.json`) and this text land together; nothing else changed.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
@@ -2055,14 +2057,19 @@ A delivered result:
   decision of 2026-11-10; more than Astation's agreement requires).
   Principals with `control` only. For an attachment without `control`, chat-v1 replaces every tag the host drew with
   `****-****-****`, of the same length (counts, offsets, sequences and `next` tokens hold), in all it serves:
-  live messages, history pages, lookups, snapshot replays, and verbatim echoes in the agent's replies and tool parts.
-  Terminal frames, the agent's own rendering, can't be redacted soundly, so none goes to such an attachment from a
-  framed prompt's paste until its turn ends, across a host restart (the pause is written before the paste): the
-  receipt completed or was rejected; or, its outcome unknown, the chat shows the agent took the prompt and the turn
-  ended; or the session is no longer live; or the task's deadline passed. Without turn state the pause holds until
-  the session ends or the deadline. Then a full frame. What stays: a tag an agent paraphrases, a finished turn's tag
-  on the screen, and a tag an agent copies into something another session shows (only a host-wide pause would cover
-  that). Control holders, the local terminal, logs and the journal keep the real text.
+  live messages, history pages, lookups, snapshot replays, and the agent's echoes in its replies and tool parts, in
+  any letter case, when the whole tag is in one string. Terminal frames, the agent's own rendering, can't be redacted
+  soundly, so none goes to such an attachment from a framed prompt's paste until its turn ends, across a host restart
+  (the pause is written before the paste): the receipt completed or was rejected; or, its outcome unknown, the chat
+  shows the agent took the prompt and the turn ended; or the session is no longer live. Without turn state the pause
+  holds until the session ends. Its only other bound is the host's own: a day from the dispatch, on the host's wall
+  and monotonic clocks both. The task's deadline, which the sender chooses, never ends it (a v1 turn isn't
+  interrupted at the deadline; final security review, 2026-11-10). Then a full frame. A tags file the host can't read
+  hides every tag-shaped string outside ids in that session's chat (only that session's); a pause file it can't read
+  holds that session's frames until the session ends or a day after the file's last write. What stays: a tag an
+  agent paraphrases, an echo split across parts or cut short (a truncated tool summary or result), a finished turn's
+  tag on the screen, and a tag an agent copies into something another session shows (only a host-wide pause would
+  cover that). Control holders, the local terminal, logs and the journal keep the real text.
 - **Amended after agreement, 2026-11-09/10, #120 comment 6751584108.** **What it is not.** Provenance assistance for
   the model, not an authorization boundary, a sandbox or a
   cryptographic guarantee against prompt injection: R9 membership, permissions, leases, approvals and execution checks
@@ -2375,7 +2382,8 @@ I.9) and Astation.
     check waits there or ends `failed`, never `outcome_unknown` (I.4.3, "Launches"); the fences of hosting §5 are
     unchanged.
 - **Observable behaviour on every host with the new framing** (III.2): the rendered prompt text changes for every
-  sender, and a released sender's task within about 1.5 KiB of the prompt bound (worst case) is refused at enqueue.
+  sender, and a released sender's task within about 1.5 KiB of the prompt bound (worst case; an interim figure,
+  superseded by the final margin that follows) is refused at enqueue.
   **Amended after agreement, 2026-11-09/10, #120 comment 6751584108.** The final margin is 1,800 bytes (about 1.8
   KiB) in the worst case, plus one byte per escaped line; a
   typical task's rendering grows by 653 bytes. Attachments without `control` see the live tag as `****-****-****` in
@@ -2541,9 +2549,9 @@ Nothing is merged or deployed before step 1.
   **Amended after agreement, 2026-11-09/10, #120 comment 6751584108.** It is provenance assistance for the model, not
   an authorization boundary, a sandbox or a cryptographic
   guarantee against prompt injection; R9 membership, permissions, leases, approvals and execution checks are the
-  enforcement. Its residual: an agent can paraphrase a live tag, a finished turn's tag can stay on the screen, and an
-  agent can copy its tag into something another session shows; the narrowed rule line makes any tag read later
-  worthless.
+  enforcement. Its residual: an agent can paraphrase a live tag or echo it split across parts or cut short (chat-v1
+  hides only a whole tag in one string), a finished turn's tag can stay on the screen, and an agent can copy its tag
+  into something another session shows; the narrowed rule line makes any tag read later worthless.
 - **Plain host keys.** `host_channel_key` and `host_enc_key` are plain files, as `host_channel_key` is today (R9.3).
   A copied disk can sign as the host until it is re-verified (a new `host_key`) or removed, and read its mail until its
   `host_enc_key` is rotated (with `retire_previous`) or it is removed. A revoke as a sender stops only its envelopes
@@ -2844,8 +2852,8 @@ Items 6 to 18 were introduced by this combined design:
 9. **Unforgeable framing for every rendered prompt, released v1 prompts included** (III.2). Confirmed. It is the one
    shared-core change outside `host.delegated` (V.3).
    **Amended after agreement, 2026-11-09/10, #120 comment 6751584108.** Its wording, folding rules,
-   Unicode pin, sizes and the live tag's visibility were agreed by Astation (all seven points) and by Auth/Portal
-   (with the owner, pending its post); built on PR #124.
+   Unicode pin, sizes and the live tag's visibility were agreed by Astation (all seven points, #120 comment
+   6751584108); Auth/Portal's confirmation is pending its post on #120. Built on PR #124.
 10. **Host senders stay outside Agora.Build's kill switch** (I.9). Confirmed, with two separate authorities (III.4):
     native managers alone hold R9 authorization, and Agora.Build may refuse only its own relay and mailbox service,
     never as an R9 revocation. Not chosen: a Station-held key hosts trust.

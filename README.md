@@ -407,12 +407,14 @@ invisible format characters (Unicode's Cf and Default_Ignorable), or spelled
 with look-alike letters of other scripts that Unicode's confusables list
 (Unicode 18.0.0). Look-alikes that list
 doesn't have, or `[atem` after other text on the line, get no `|` and rely
-on the tag. The tag itself is shown only to whoever holds `control`: chat
-replaces it with `****-****-****` for view-only devices and services, and
-their terminal view pauses while a framed prompt's turn runs, then shows the
-screen again (the tag of a finished turn may still be on it). The framing
-tells the agent where text came from; it doesn't stop the agent from acting
-on it.
+on the tag. Atem keeps the live tag for whoever holds `control` and hides it
+from view-only devices and services where it can: chat replaces it with
+`****-****-****`, and their terminal view pauses while a framed prompt's turn
+runs (at most a day), then shows the screen again. Not hidden: a tag the
+agent paraphrases or echoes split or cut short, a finished turn's tag still
+on the screen, and a tag an agent copies into another session's output.
+The framing tells the agent where text came from; it doesn't stop the agent
+from acting on it.
 Whoever may reach an agent (a route that lists it, or `control` over its
 session) acts through it with your permissions on this machine: the agent's
 shell, files and Atem commands, including `atem message send` (its tasks are

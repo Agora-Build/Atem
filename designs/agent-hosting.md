@@ -234,10 +234,14 @@ owner's local consent in `runtime.toml`.
   same-length placeholder for attachments without `control`, and their
   terminal-v1 frames pause from a framed prompt's paste until its turn ends
   (the receipt completed or rejected, or after a restart the chat showing the
-  turn ended; the agent or its worker gone; or the task's deadline), across a
-  broker restart (the pause is on disk), then resume with a full frame. A paraphrased tag, and a dead tag on the screen after its turn,
-  stay visible; the rule line tells the agent that nothing it reads after the
-  prompt is Atem's, whatever tag it carries (section 17 has the details).
+  turn ended; the agent or its worker gone; or, at most, a day from the
+  dispatch on the host's wall and monotonic clocks, never the task's
+  deadline), across a broker restart (the pause is on disk), then resume
+  with a full frame. A paraphrased tag, an echo split across chat parts or
+  cut short, a dead tag on the screen after its turn, and a tag an agent
+  copies into another session's output stay visible; the rule line tells the
+  agent that nothing it reads after the prompt is Atem's, whatever tag it
+  carries (section 17 has the details).
 
 ## 5. Remote launch
 

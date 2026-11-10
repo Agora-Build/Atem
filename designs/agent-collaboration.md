@@ -1237,22 +1237,30 @@ Stage 1 ships with these limits.
   - **Redacted in chat-v1.** Every tag this runtime drew for a prompt it
     pasted is replaced by `****-****-****`, of the same length, in all that
     chat-v1 serves to an attachment without `control`: live messages,
-    history pages, lookups and snapshot replays, the user messages and
-    verbatim echoes in assistant and tool parts. Counts, offsets, sequences
-    and `next` tokens hold (the tokens bind positions, not text; nothing a
-    client checks hashes the text). The tags are kept per session in
+    history pages, lookups and snapshot replays, the user messages and the
+    agent's echoes in assistant and tool parts, in any letter case, when the
+    whole tag is in one string. Counts, offsets, sequences and `next` tokens
+    hold (the tokens bind positions, not text; nothing a client checks
+    hashes the text). The tags are kept per session in
     `runtime/workers/<session>.tags`, written and synced before the prompt
-    is pasted, so a restarted broker hides them too; a file it can't read
-    hides every tag-shaped string of that session.
+    is pasted, so a restarted broker hides them too. Only the files of
+    sessions the broker has, named by a parsed session id, are read (no
+    text of a request becomes a path), and a session's tags are forgotten
+    once it is gone. A file that can't be read hides every tag-shaped
+    string of that session's chat outside its ids (`id`, `…Id`, `…_id`,
+    `next`, `before`), and nothing in any other session's.
   - **Paused on terminal-v1.** Frames are the agent's own rendering (it
     wraps, splits or truncates the prompt), so no frame goes to an
     attachment without `control` from a framed prompt's paste until its
     turn ends. The pause is written to `runtime/workers/<session>.pause`
-    (with the prompt's tag and the task's deadline) before the paste, so a
-    restarted broker that adopts the worker goes on holding it. It ends at
-    the first of: the session is no longer live (the agent exited, its
-    worker went away, the session stopped); the task's deadline passed (the
-    bound: a pause is never stuck); the prompt's receipt completed (the
+    (with the prompt's tag and its bound) before the paste, so a restarted
+    broker that adopts the worker goes on holding it. It ends at the first
+    of: the session is no longer live (the agent exited, its worker went
+    away, the session stopped); the host's bound passed (a day from the
+    dispatch on the wall clock and on the monotonic clock both, so a wall
+    clock set forward doesn't end it: a pause is never stuck; the task's
+    deadline is no bound, since the sender chooses it and a turn isn't
+    interrupted at it); the prompt's receipt completed (the
     turn ended, done or interrupted) or was rejected (refused before the
     prompt reached the agent); or, when the receipt can't tell (its outcome
     is unknown, as after a restart or for a prompt the agent didn't take in
@@ -1260,14 +1268,18 @@ Stage 1 ships with these limits.
     prompt (a user message carries its tag) and that turn ended (the chat is
     `ready`). Without turn state (no chat, a withdrawn chat, or an adopting
     broker that hasn't got the worker's chat yet) the pause holds until the
-    session ends or the deadline. A `subscribe` or `ack` meanwhile is
+    session ends or the bound. A `subscribe` or `ack` meanwhile is
     accepted; terminal-v1 has no message that says why the frames wait (the
     registry's `activity` reads `working`), and none was added. Then the
     stream resumes with a full frame (`reset`), as a new subscription's
     first. A pause file that can't be read holds the frames until the
-    session ends or a day passed.
+    session ends or a day after the file's last write: the hold is written
+    back, so a broker start doesn't restart it (if it can't be written, the
+    file's time bounds it on both clocks). A pause write that fails leaves
+    nothing behind: the file is rewritten from what the broker holds.
   - **What stays.** A tag the agent paraphrases (rather than repeats) isn't
-    hidden. Once the turn ended, its dead tag can show on the terminal (the
+    hidden, nor an echo split across parts or cut short (a tool summary or
+    result the chat truncates). Once the turn ended, its dead tag can show on the terminal (the
     rule line makes it worthless then). An agent that copies its own live
     tag into something another session shows (a reply delivered as data, a
     file or command output another agent reads) can put it on that

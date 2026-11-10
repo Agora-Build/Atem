@@ -225,12 +225,16 @@ tag the host drew with `****-****-****` (the same length: page bounds,
 offsets, sequences and `next` tokens hold), and terminal-v1 sends no frame
 from the paste until the prompt's turn ends, across a host restart (the
 receipt completed or rejected; or, when its outcome is unknown, the chat
-showing the agent took the prompt and the turn ended; the session no longer
-live; or the task's deadline), then a full frame (`reset: true`). A
-`subscribe` or `ack` meanwhile is accepted and answered as usual, without
-frames; no terminal-v1 message says why (the registry's `activity` is
-`working`). A paraphrased tag, and a finished turn's tag still on the
-screen, aren't hidden. Details: agent collaboration, section 17.
+showing the agent took the prompt and the turn ended; or the session no
+longer live; at most a day from the dispatch on the host's wall and
+monotonic clocks both: the task's deadline, which the sender chooses, never
+ends it), then a full frame (`reset: true`). A `subscribe` or `ack`
+meanwhile is accepted and answered as usual, without frames; no terminal-v1
+message says why (the registry's `activity` is `working`). Chat-v1 hides a
+whole tag in one string, in any letter case. A paraphrased tag, an echo
+split across parts or cut short, a finished turn's tag still on the screen,
+and a tag an agent copies into another session's output aren't hidden.
+Details: agent collaboration, section 17.
 
 - **Atem's lines** each start with `[atem T] ` and hold only verified fields:
   ids, the sender principal (the channel's), the route id, context kinds, ids,
