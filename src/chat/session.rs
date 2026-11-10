@@ -441,6 +441,11 @@ impl ChatSession {
         self.current_turn.as_ref().map(|(id, _)| id.as_str())
     }
 
+    /// The turn that ended last (done or interrupted).
+    pub fn last_completed_turn(&self) -> Option<&str> {
+        self.last_completed.as_deref()
+    }
+
     /// The request id of the remote prompt that began the current turn
     /// (none for one typed in the terminal).
     pub fn current_request_id(&self) -> Option<&str> {

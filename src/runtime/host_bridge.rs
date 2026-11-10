@@ -517,8 +517,12 @@ pub struct HostBridge {
     /// chat-v1 shows them to attachments with `control` only.
     prompt_tags: super::prompt_tags::PromptTags,
     /// Sessions whose terminal frames are held from attachments without
-    /// `control` while a framed prompt's turn runs (`view_pause_pass`).
+    /// `control` while a framed prompt's turn runs (`view_pause_pass`), as
+    /// kept in each session's pause file.
     view_pauses: super::prompt_tags::Pauses,
+    /// Sessions whose pause file was read (a restarted broker's adopted
+    /// sessions, once each).
+    pauses_loaded: HashSet<String>,
     /// Interrupts waiting for a turn to end, per session.
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
@@ -782,6 +786,7 @@ impl HostBridge {
             prompts: HashMap::new(),
             prompt_tags: Default::default(),
             view_pauses: Default::default(),
+            pauses_loaded: HashSet::new(),
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
@@ -3364,40 +3369,57 @@ impl HostBridge {
 
     // ── Frames ──
 
-    /// Reads the prompt tags of every session the broker has (`prompt_tags`),
-    /// once each: a restarted broker learns those of adopted sessions before
-    /// it serves their chat.
+    /// Reads the prompt tags and terminal pauses of every session the broker
+    /// has (`prompt_tags`), once each: a restarted broker learns those of
+    /// adopted sessions before it serves their chat or frames.
     fn load_prompt_tags(&mut self, cx: &Cx) {
-        let Some(state) = self.dir.parent() else {
+        let Some(state) = self.dir.parent().map(Path::to_path_buf) else {
             return;
         };
         for sid in cx.sessions.keys() {
-            self.prompt_tags.load(state, sid.as_str());
+            self.prompt_tags.load(&state, sid.as_str());
+            self.load_pauses(&state, sid.as_str());
+        }
+    }
+
+    /// Session `sid`'s pause file, once (a pause written before a restart
+    /// goes on holding the frames).
+    pub(super) fn load_pauses(&mut self, state: &Path, sid: &str) {
+        if self.pauses_loaded.insert(sid.to_string()) {
+            let pauses = super::prompt_tags::read_pauses(state, sid, host_now().wall_ms);
+            if !pauses.is_empty() {
+                self.view_pauses
+                    .entry(sid.to_string())
+                    .or_default()
+                    .extend(pauses);
+            }
         }
     }
 
     /// Holds terminal frames from attachments without `control` while a
-    /// framed prompt's turn runs on the session: from its paste until its
-    /// receipt is final, its session isn't live or has no turn state, or
-    /// its task's deadline passed (`prompt_tags::Pause::holds`). The pause
-    /// lives in memory: a broker restart ends it (the prompt's outcome is
-    /// then unknown).
+    /// framed prompt's turn runs on the session, until `Pause::holds` says
+    /// it ended: the session no longer live, the deadline, the receipt
+    /// completed or rejected, or (its outcome unknown: a restart, a prompt
+    /// the agent didn't take in time) the chat showing the agent took the
+    /// prompt and its turn ended. Each change is written to the session's
+    /// pause file.
     fn view_pause_pass(&mut self, cx: &Cx) {
+        use super::prompt_tags::{ChatSigns, TurnSigns};
         if self.view_pauses.is_empty() {
             return;
         }
         let now_wall_ms = host_now().wall_ms;
         let sessions: Vec<String> = self.view_pauses.keys().cloned().collect();
         for sid in sessions {
-            let (live, chat) = SessionId::parse(&sid)
-                .and_then(|id| cx.sessions.get(&id))
-                .map(|s| (s.is_live(), s.chat_v1))
-                .unwrap_or((false, false));
+            let session = SessionId::parse(&sid).and_then(|id| cx.sessions.get(&id));
+            let live = session.is_some_and(|s| s.is_live());
             let pauses = self.view_pauses.remove(&sid).unwrap_or_default();
+            let before = pauses.len();
             let holding: Vec<_> = pauses
                 .into_iter()
                 .filter(|p| {
-                    p.holds(super::prompt_tags::TurnSigns {
+                    let chat = session.map_or(ChatSigns::Unknown, |s| chat_signs(s, &p.tag));
+                    p.holds(TurnSigns {
                         receipt: self.host.receipt(&p.receipt_id).map(|r| r.state),
                         live,
                         chat,
@@ -3405,8 +3427,29 @@ impl HostBridge {
                     })
                 })
                 .collect();
+            if holding.len() != before {
+                self.write_pauses(&sid, &holding);
+            }
             if !holding.is_empty() {
                 self.view_pauses.insert(sid, holding);
+            }
+        }
+    }
+
+    /// Writes session `sid`'s pauses (none: removes the file).
+    pub(super) fn write_pauses(
+        &self,
+        sid: &str,
+        pauses: &[super::prompt_tags::Pause],
+    ) -> bool {
+        let Some(state) = self.dir.parent() else {
+            return false;
+        };
+        match super::prompt_tags::write_pauses(state, sid, pauses) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("atem runtime: {sid}: terminal pause not written: {error}");
+                false
             }
         }
     }
@@ -4207,6 +4250,41 @@ pub(super) fn complete_envelope(
     };
     body.insert("outcome".into(), Value::String(outcome.into()));
     chat_envelope(conversation, sid, "complete", head, body)
+}
+
+/// What session `s`'s chat shows of the turn of the prompt that carries
+/// `tag`: no turn state; the prompt not taken (no user message carries the
+/// tag); its turn running; or ended (the chat `ready`, and that turn the
+/// last one completed, or no longer the current one).
+fn chat_signs(s: &BrokerSession, tag: &str) -> super::prompt_tags::ChatSigns {
+    use super::prompt_tags::ChatSigns;
+    use crate::chat::adapter::Part;
+    use crate::chat::session::Role;
+    if tag.is_empty() || !s.chat_v1 {
+        return ChatSigns::Unknown;
+    }
+    let taken = s
+        .chat
+        .retained()
+        .filter(|m| m.role == Role::User)
+        .filter(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text { markdown, .. } if markdown.contains(tag)))
+        })
+        .last()
+        .map(|m| m.turn_id.clone());
+    match taken {
+        None => ChatSigns::NotTaken,
+        Some(turn)
+            if s.chat.status().state == ChatState::Ready
+                && (s.chat.last_completed_turn() == Some(turn.as_str())
+                    || s.chat.current_turn_id() != Some(turn.as_str())) =>
+        {
+            ChatSigns::Ended
+        }
+        Some(_) => ChatSigns::Running,
+    }
 }
 
 fn session_of<'a>(cx: &'a mut Cx, sid: &str) -> Option<&'a mut BrokerSession> {

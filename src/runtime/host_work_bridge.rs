@@ -1498,13 +1498,25 @@ impl HostBridge {
                 }
                 continue;
             }
-            self.view_pauses
-                .entry(sid)
-                .or_default()
-                .push(crate::runtime::prompt_tags::Pause {
-                    receipt_id: r.status.receipt_id.clone(),
-                    until_wall_ms: r.task.expires_at,
-                });
+            // The pause, too, is on disk before the paste: a broker that
+            // restarts mid-turn goes on holding the frames.
+            self.load_pauses(&state, &sid);
+            let mut pauses = self.view_pauses.get(&sid).cloned().unwrap_or_default();
+            pauses.push(crate::runtime::prompt_tags::Pause {
+                receipt_id: r.status.receipt_id.clone(),
+                tag: tag.as_str().to_string(),
+                until_wall_ms: r.task.expires_at,
+            });
+            if !self.write_pauses(&sid, &pauses) {
+                let detail = "waiting to record the prompt's terminal pause";
+                if r.status.state != WorkState::Blocked || r.status.detail != detail {
+                    r.status.state = WorkState::Blocked;
+                    r.status.detail = detail.into();
+                    self.work.store.as_ref().unwrap().save_work(&r)?;
+                }
+                continue;
+            }
+            self.view_pauses.insert(sid.clone(), pauses);
             let message = json!({"type":"session", "data": {"v":1,"op":"submit", "id":uuid::Uuid::new_v4().to_string(),
                 "binding":binding, "request_id":r.status.receipt_id, "kind":"prompt", "payload":{"text":prompt}, "acquire":true}});
             r.status.state = WorkState::Submitting;
@@ -1520,6 +1532,15 @@ impl HostBridge {
             r.status.state = if self.host.receipt(&r.status.receipt_id).is_some() {
                 WorkState::Submitted
             } else {
+                // Not admitted, so never pasted: nothing to hold.
+                if let Some(pauses) = self.view_pauses.get_mut(&sid) {
+                    pauses.retain(|p| p.receipt_id != r.status.receipt_id);
+                    let left = pauses.clone();
+                    if left.is_empty() {
+                        self.view_pauses.remove(&sid);
+                    }
+                    self.write_pauses(&sid, &left);
+                }
                 WorkState::OutcomeUnknown
             };
             self.work.store.as_ref().unwrap().save_work(&r)?;

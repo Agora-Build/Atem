@@ -150,11 +150,16 @@ fn read_private(path: &Path) -> std::io::Result<Option<String>> {
 }
 
 /// One framed prompt whose turn holds the session's terminal frames from
-/// attachments without `control`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// attachments without `control`. Kept in `<state>/workers/<sid>.pause`
+/// (written before the paste, rewritten as pauses end), so a restarted
+/// broker that adopts the worker goes on holding them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Pause {
     /// The prompt's session-v1 request id.
     pub receipt_id: String,
+    /// The prompt's tag: the user message that carries it shows the agent
+    /// took the prompt (after a restart, when the receipt can't tell).
+    pub tag: String,
     /// The task's deadline (wall ms): the bounded fallback.
     pub until_wall_ms: u64,
 }
@@ -166,32 +171,123 @@ pub struct TurnSigns {
     pub receipt: Option<ReceiptState>,
     /// The session runs with a worker.
     pub live: bool,
-    /// The session's chat has turn state (chat-v1 available).
-    pub chat: bool,
+    /// What the session's chat shows of the prompt's turn.
+    pub chat: ChatSigns,
     pub now_wall_ms: u64,
 }
 
+/// The prompt's turn as the session's chat shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatSigns {
+    /// No turn state: no chat (Codex without hooks, a withdrawn chat), or
+    /// an adopting broker that hasn't got the worker's chat yet.
+    Unknown,
+    /// The agent hasn't taken the prompt: no user message carries its tag.
+    NotTaken,
+    /// The agent took the prompt and its turn runs.
+    Running,
+    /// The agent took the prompt and its turn ended: the chat is `ready`
+    /// with no current turn of it.
+    Ended,
+}
+
 impl Pause {
-    /// Whether the prompt's turn may still run: its receipt is accepted or
-    /// executing, its session is live with turn state, and its deadline
-    /// hasn't passed. Every other case ends the pause: the turn completed
-    /// (done or interrupted), the prompt was rejected (refused, timed out
-    /// before the agent took it) or its outcome is unknown (a worker or
-    /// broker restart), the receipt is gone, the agent exited or its worker
-    /// went away, the session stopped, the chat was withdrawn (no turn end
-    /// will come), or the deadline passed.
+    /// Whether the prompt's turn may still run. The pause ends at the first
+    /// of these:
+    /// - the session is no longer live (the agent exited, its worker went
+    ///   away, the session stopped);
+    /// - the deadline passed (the bounded fallback: a pause is never
+    ///   stuck);
+    /// - the receipt completed (the turn ended, done or interrupted), or
+    ///   was rejected (refused before the prompt reached the agent);
+    /// - the chat shows the agent took the prompt and its turn ended.
+    ///
+    /// While the receipt is accepted or executing, the turn may run. When
+    /// it can't tell (its outcome is unknown: a broker restart, a prompt the
+    /// agent didn't take in time; or it is gone), the chat decides, and with
+    /// no turn state the pause holds until the session ends or the
+    /// deadline.
     pub fn holds(&self, signs: TurnSigns) -> bool {
-        matches!(
-            signs.receipt,
-            Some(ReceiptState::Accepted | ReceiptState::Executing)
-        ) && signs.live
-            && signs.chat
-            && signs.now_wall_ms < self.until_wall_ms
+        if !signs.live || signs.now_wall_ms >= self.until_wall_ms {
+            return false;
+        }
+        match signs.receipt {
+            Some(ReceiptState::Completed | ReceiptState::Rejected) => false,
+            Some(ReceiptState::Accepted | ReceiptState::Executing) => true,
+            Some(ReceiptState::OutcomeUnknown) | None => signs.chat != ChatSigns::Ended,
+        }
     }
 }
 
 /// Sessions whose frames are held, and the prompts holding them.
 pub type Pauses = HashMap<String, Vec<Pause>>;
+
+/// The longest a pause read back without its deadline holds (a task's
+/// longest lifetime).
+const UNREADABLE_PAUSE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Replaces session `sid`'s pause file with `pauses` (removes it when there
+/// are none): before a paste, and when pauses end.
+pub fn write_pauses(state: &Path, sid: &str, pauses: &[Pause]) -> std::io::Result<()> {
+    let path = super::worker::pause_path(state, sid);
+    if pauses.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    let mut bytes = serde_json::to_vec(pauses).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    let tmp = path.with_file_name(format!("{sid}.pause.tmp{}", std::process::id()));
+    let result = (|| {
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        if let Some(dir) = path.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            dir.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Session `sid`'s pauses as a restarted broker reads them back. A file
+/// that can't be read holds the frames anyway (fail closed), for at most a
+/// task's lifetime from `now_wall_ms`.
+pub fn read_pauses(state: &Path, sid: &str, now_wall_ms: u64) -> Vec<Pause> {
+    let path = super::worker::pause_path(state, sid);
+    match read_private(&path) {
+        Ok(None) => Vec::new(),
+        Ok(Some(text)) => match serde_json::from_str::<Vec<Pause>>(&text) {
+            Ok(pauses) => pauses,
+            Err(error) => unreadable(sid, &error.to_string(), now_wall_ms),
+        },
+        Err(error) => unreadable(sid, &error.to_string(), now_wall_ms),
+    }
+}
+
+fn unreadable(sid: &str, why: &str, now_wall_ms: u64) -> Vec<Pause> {
+    eprintln!(
+        "atem runtime: {sid}: terminal pause unreadable ({why}); frames stay held from attachments without control until the session ends or a day passed"
+    );
+    vec![Pause {
+        receipt_id: String::new(),
+        tag: String::new(),
+        until_wall_ms: now_wall_ms.saturating_add(UNREADABLE_PAUSE_MS),
+    }]
+}
 
 #[cfg(test)]
 mod tests {
@@ -258,43 +354,77 @@ mod tests {
     }
 
     /// The pause ends on every way a framed prompt's turn can end, and on
-    /// its bounded fallback (the task's deadline).
+    /// its bounded fallback (the task's deadline); after a restart (the
+    /// receipt's outcome unknown) the chat decides, and without turn state
+    /// the pause holds until the session ends or the deadline.
     #[test]
     fn a_pause_ends_with_every_turn_outcome() {
         let pause = Pause {
             receipt_id: "r".into(),
+            tag: "7QK2-M9XD-4TPA".into(),
             until_wall_ms: 1_000,
         };
         let running = TurnSigns {
             receipt: Some(ReceiptState::Executing),
             live: true,
-            chat: true,
+            chat: ChatSigns::Running,
             now_wall_ms: 10,
         };
-        assert!(pause.holds(running));
-        assert!(pause.holds(TurnSigns {
-            receipt: Some(ReceiptState::Accepted),
+        let restarted = TurnSigns {
+            receipt: Some(ReceiptState::OutcomeUnknown),
             ..running
-        }));
+        };
+        for holding in [
+            running,
+            TurnSigns {
+                receipt: Some(ReceiptState::Accepted),
+                chat: ChatSigns::NotTaken,
+                ..running
+            },
+            // A running receipt holds whatever the chat says.
+            TurnSigns {
+                chat: ChatSigns::Ended,
+                ..running
+            },
+            // After a restart: the turn runs, the prompt isn't taken yet, or
+            // no turn state (the worker's chat not here yet, no chat).
+            restarted,
+            TurnSigns {
+                chat: ChatSigns::NotTaken,
+                ..restarted
+            },
+            TurnSigns {
+                chat: ChatSigns::Unknown,
+                ..restarted
+            },
+            TurnSigns {
+                receipt: None,
+                chat: ChatSigns::Unknown,
+                ..running
+            },
+        ] {
+            assert!(pause.holds(holding), "{holding:?}");
+        }
         for ended in [
             // completed (done or interrupted)
             TurnSigns {
                 receipt: Some(ReceiptState::Completed),
                 ..running
             },
-            // rejected: refused, or not taken by the agent in time
+            // rejected: refused before the prompt reached the agent
             TurnSigns {
                 receipt: Some(ReceiptState::Rejected),
                 ..running
             },
-            // outcome unknown: a worker or broker restart mid-turn
+            // after a restart, or a prompt not taken in time: the chat shows
+            // the turn ended
             TurnSigns {
-                receipt: Some(ReceiptState::OutcomeUnknown),
-                ..running
+                chat: ChatSigns::Ended,
+                ..restarted
             },
-            // the receipt is gone
             TurnSigns {
                 receipt: None,
+                chat: ChatSigns::Ended,
                 ..running
             },
             // the agent exited, its worker went away, the session stopped
@@ -302,18 +432,54 @@ mod tests {
                 live: false,
                 ..running
             },
-            // the chat was withdrawn: no turn end will come
             TurnSigns {
-                chat: false,
-                ..running
+                live: false,
+                chat: ChatSigns::Unknown,
+                ..restarted
             },
-            // the task's deadline passed
+            // the task's deadline passed (also without turn state)
             TurnSigns {
                 now_wall_ms: 1_000,
                 ..running
             },
+            TurnSigns {
+                now_wall_ms: 1_000,
+                chat: ChatSigns::Unknown,
+                ..restarted
+            },
         ] {
             assert!(!pause.holds(ended), "{ended:?}");
         }
+    }
+
+    #[test]
+    fn pauses_are_written_before_the_paste_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("workers")).unwrap();
+        let sid = "ses-aaaaaaaaaaaa";
+        let pauses = vec![
+            Pause {
+                receipt_id: "r1".into(),
+                tag: "7QK2-M9XD-4TPA".into(),
+                until_wall_ms: 5_000,
+            },
+            Pause {
+                receipt_id: "r2".into(),
+                tag: "3RRW-0B9C-KQ1T".into(),
+                until_wall_ms: 6_000,
+            },
+        ];
+        write_pauses(dir.path(), sid, &pauses).unwrap();
+        assert_eq!(read_pauses(dir.path(), sid, 0), pauses);
+        write_pauses(dir.path(), sid, &pauses[1..]).unwrap();
+        assert_eq!(read_pauses(dir.path(), sid, 0), pauses[1..].to_vec());
+        write_pauses(dir.path(), sid, &[]).unwrap();
+        assert!(!super::super::worker::pause_path(dir.path(), sid).exists());
+        assert_eq!(read_pauses(dir.path(), sid, 0), Vec::new());
+        // A damaged file holds the frames anyway, for at most a day.
+        std::fs::write(super::super::worker::pause_path(dir.path(), sid), "{").unwrap();
+        let held = read_pauses(dir.path(), sid, 100);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].until_wall_ms, 100 + 24 * 60 * 60 * 1000);
     }
 }

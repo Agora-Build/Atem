@@ -938,12 +938,13 @@ fn view_only_attachments_never_see_a_live_tag() {
     assert_eq!(tags.len(), 3);
 }
 
-/// A pause never outlives its turn: a worker killed mid-turn ends it (the
-/// session is no longer live); a broker restart mid-turn ends it too (the
-/// prompt's outcome is then unknown), while chat-v1 still hides the tag,
-/// read back from the session's tags file.
+/// A pause lasts as long as its turn, across a broker restart, and never
+/// longer: a worker killed mid-turn ends it (the session is no longer live);
+/// after a broker restart mid-turn it goes on (read back from the session's
+/// pause file) until the adopted worker's chat shows the turn ended, and
+/// chat-v1 still hides the tag (read back from the tags file).
 #[test]
-fn a_lost_worker_or_a_restart_ends_the_pause_and_the_tag_stays_hidden() {
+fn a_pause_outlives_a_broker_restart_but_never_its_turn() {
     let mut rig = Rig::new("claude");
     private(&rig.fake.join("echo"), "");
     let mut r = Router::new(&rig.astation);
@@ -1003,7 +1004,9 @@ fn a_lost_worker_or_a_restart_ends_the_pause_and_the_tag_stays_hidden() {
         .collect();
     assert!(!serde_json::to_string(&chat).unwrap().contains(&tag));
 
-    // A broker restart mid-turn: the worker and its turn go on.
+    // A broker restart mid-turn: the adopted worker's turn goes on, and so
+    // does the pause (it was written before the paste), until the chat shows
+    // the turn ended; then a full frame.
     let (launch, sid, pg) = start(&mut sender, &mut r);
     let t = task(&launch, "Framed task across a restart");
     enqueue(&mut sender, &mut r, &t);
@@ -1011,25 +1014,39 @@ fn a_lost_worker_or_a_restart_ends_the_pause_and_the_tag_stays_hidden() {
         input(&rig).contains("Framed task across a restart")
     });
     let tag = tag_in(&last_paste(&rig)).unwrap();
+    // The runtime saw the agent take it: the turn runs.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while work(&mut sender, &mut r, &t["task_id"])["detail"] != "in the agent's turn" {
+        assert!(Instant::now() < deadline, "the turn never began");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     drop((r, sender, viewer));
     rig.restart();
     let mut r = Router::new(&rig.astation);
     let mut viewer = Dev::new(&mut r, &rig.log, "svc-view", true);
     viewer.list(&mut r, &sid);
     viewer.open_chat(&mut r, &sid, false);
-    let opened = viewer.gather(&mut r, Duration::from_millis(500));
     viewer.subscribe(&mut r, &sid, &pg);
-    let seen = [
-        opened,
-        frames_until(&mut viewer, &mut r, &sid, &pg, "no frame after the restart"),
-    ]
-    .concat();
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let got = viewer.gather(&mut r, Duration::from_millis(300));
+        viewer.ack_frames(&mut r, &sid, &pg, &got);
+        held.extend(got);
+    }
+    assert!(
+        frames_in(&held).is_empty(),
+        "frames while the adopted worker's turn runs: {held:?}"
+    );
     // The history replayed to the view-only attachment hides the tag.
     assert!(
-        user_texts(&seen).iter().any(|x| x.contains("Framed task across a restart")
+        user_texts(&held).iter().any(|x| x.contains("Framed task across a restart")
             && x.contains("[atem ****-****-****] ")),
-        "{seen:?}"
+        "{held:?}"
     );
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    let after = frames_until(&mut viewer, &mut r, &sid, &pg, "no frame after the turn ended");
+    assert!(frames_in(&after)[0]["reset"] == true, "{after:?}");
+    let seen = [held, after].concat();
     assert!(!serde_json::to_string(&seen).unwrap().contains(&tag));
 }
 
