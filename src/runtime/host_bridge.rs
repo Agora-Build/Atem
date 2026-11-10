@@ -513,6 +513,12 @@ pub struct HostBridge {
     submitters: HashMap<String, (String, String)>,
     /// Prompts pasted and not reported yet: request id → session.
     prompts: HashMap<String, String>,
+    /// The framing tags of the prompts this runtime pasted (`prompt_tags`):
+    /// chat-v1 shows them to attachments with `control` only.
+    prompt_tags: super::prompt_tags::PromptTags,
+    /// Sessions whose terminal frames are held from attachments without
+    /// `control` while a framed prompt's turn runs (`view_pause_pass`).
+    view_pauses: super::prompt_tags::Pauses,
     /// Interrupts waiting for a turn to end, per session.
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
@@ -774,6 +780,8 @@ impl HostBridge {
             history_key: HistoryKey::random(),
             submitters: HashMap::new(),
             prompts: HashMap::new(),
+            prompt_tags: Default::default(),
+            view_pauses: Default::default(),
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
@@ -1495,6 +1503,7 @@ impl HostBridge {
         let mut cx = Cx { client, sessions };
         self.sync_link(app_link(app), &mut cx);
         self.sync_sessions(&mut cx);
+        self.load_prompt_tags(&cx);
         self.sync_local(&mut cx);
         if !adopting && !self.recovered {
             self.recovered = true;
@@ -1577,6 +1586,7 @@ impl HostBridge {
             self.work_pass(&mut cx);
         }
         self.drain_remote(&mut cx);
+        self.view_pause_pass(&cx);
         self.frames(&mut cx);
         self.heartbeats(&mut cx);
         self.flush_pushes(&mut cx);
@@ -2157,8 +2167,18 @@ impl HostBridge {
             self.refused(code);
         }
         let sid = env.agent_id.clone();
-        let text = serde_json::to_string(&AstationMessage::AgentChat(env))
+        let mut text = serde_json::to_string(&AstationMessage::AgentChat(env))
             .expect("chat envelopes serialize");
+        // The live framing tags are for `control` only (`prompt_tags`): the
+        // same-length placeholder keeps every count and position.
+        if !self.host.attachment_can(attachment, Permission::Control) {
+            if let Some(state) = self.dir.parent() {
+                self.prompt_tags.load(state, &sid);
+            }
+            if let Some(redacted) = self.prompt_tags.redact(&text) {
+                text = redacted;
+            }
+        }
         if self.r9.owns(attachment) {
             let host_id = self.host.context().atem_device_id.clone();
             self.r9.deliver_family(
@@ -3344,6 +3364,68 @@ impl HostBridge {
 
     // ── Frames ──
 
+    /// Reads the prompt tags of every session the broker has (`prompt_tags`),
+    /// once each: a restarted broker learns those of adopted sessions before
+    /// it serves their chat.
+    fn load_prompt_tags(&mut self, cx: &Cx) {
+        let Some(state) = self.dir.parent() else {
+            return;
+        };
+        for sid in cx.sessions.keys() {
+            self.prompt_tags.load(state, sid.as_str());
+        }
+    }
+
+    /// Holds terminal frames from attachments without `control` while a
+    /// framed prompt's turn runs on the session: from its paste until its
+    /// receipt is final, its session isn't live or has no turn state, or
+    /// its task's deadline passed (`prompt_tags::Pause::holds`). The pause
+    /// lives in memory: a broker restart ends it (the prompt's outcome is
+    /// then unknown).
+    fn view_pause_pass(&mut self, cx: &Cx) {
+        if self.view_pauses.is_empty() {
+            return;
+        }
+        let now_wall_ms = host_now().wall_ms;
+        let sessions: Vec<String> = self.view_pauses.keys().cloned().collect();
+        for sid in sessions {
+            let (live, chat) = SessionId::parse(&sid)
+                .and_then(|id| cx.sessions.get(&id))
+                .map(|s| (s.is_live(), s.chat_v1))
+                .unwrap_or((false, false));
+            let pauses = self.view_pauses.remove(&sid).unwrap_or_default();
+            let holding: Vec<_> = pauses
+                .into_iter()
+                .filter(|p| {
+                    p.holds(super::prompt_tags::TurnSigns {
+                        receipt: self.host.receipt(&p.receipt_id).map(|r| r.state),
+                        live,
+                        chat,
+                        now_wall_ms,
+                    })
+                })
+                .collect();
+            if !holding.is_empty() {
+                self.view_pauses.insert(sid, holding);
+            }
+        }
+    }
+
+    /// Whether the stream `key` gets no frames now: its session's framed
+    /// prompt is in its turn and the attachment has no `control`. A held
+    /// stream drops what it had pending and resumes with a full frame.
+    fn frames_held(&mut self, key: &(String, String)) -> bool {
+        if !self.view_pauses.contains_key(&key.1)
+            || self.host.attachment_can(&key.0, Permission::Control)
+        {
+            return false;
+        }
+        if let Some(stream) = self.streams.get_mut(key) {
+            stream.hold();
+        }
+        true
+    }
+
     fn frames(&mut self, cx: &mut Cx) {
         self.flush_terminal(cx);
         if !self.terminal_out.is_empty() {
@@ -3360,6 +3442,9 @@ impl HostBridge {
                 continue;
             }
             if !self.current(&key.0) {
+                continue;
+            }
+            if self.frames_held(&key) {
                 continue;
             }
             let Some(session) = session_of(cx, &key.1) else {
@@ -3401,7 +3486,7 @@ impl HostBridge {
     /// An r9 channel's stream: frames go into its channel (sealed, bounded
     /// by the channel's queue), held back while the channel has a backlog.
     fn r9_frames(&mut self, key: &(String, String), cx: &mut Cx) {
-        if self.r9.backlog(&key.0) > R9_FRAME_BACKLOG {
+        if self.r9.backlog(&key.0) > R9_FRAME_BACKLOG || self.frames_held(key) {
             return;
         }
         let Some(session) = session_of(cx, &key.1) else {

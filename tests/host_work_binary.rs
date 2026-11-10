@@ -275,7 +275,10 @@ impl Dev {
                 Out::Frame(frame) => {
                     for e in self.a.on_frame(&frame, client_ms()).unwrap() {
                         let value = match e {
-                            Event::Family(f) => f.data,
+                            Event::Family(f) => f.data.map(|mut d| {
+                                d["__type"] = json!(f.family);
+                                d
+                            }),
                             Event::Session(m) => Some(
                                 atem_client::session::wire::to_value(
                                     &atem_client::session::wire::Envelope::Session(m),
@@ -294,6 +297,111 @@ impl Dev {
                     }
                 }
             }
+        }
+    }
+    /// A message of any family (`terminal`, `agentChat`, `session`).
+    fn send_raw(&mut self, r: &mut Router, msg: Value) {
+        let frame = self.a.send(&msg, client_ms()).unwrap();
+        r.frame(&self.handle, &frame);
+    }
+    /// Everything that arrives within `wait` (the backlog included).
+    fn gather(&mut self, r: &mut Router, wait: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if r.quiet(&self.handle, Duration::from_millis(100)) {
+                continue;
+            }
+            match r.next(&self.handle) {
+                Out::Frame(frame) => {
+                    for e in self.a.on_frame(&frame, client_ms()).unwrap() {
+                        if let Event::Family(f) = e
+                            && let Some(mut d) = f.data
+                        {
+                            d["__type"] = json!(f.family);
+                            self.backlog.push(d);
+                        }
+                    }
+                }
+                Out::Close(reason) => panic!("channel closed: {reason:?}"),
+            }
+        }
+        std::mem::take(&mut self.backlog)
+    }
+    /// The read binding of `sid` (after `list`).
+    fn read(&self, sid: &str) -> Value {
+        json!({"target": self.a.target(sid).expect("listed"),
+               "attachment_gen": self.a.welcome().attachment_gen})
+    }
+    /// Lists the sessions until `sid` is among them.
+    fn list(&mut self, r: &mut Router, sid: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let id = uuid();
+            self.send_raw(r, json!({"type":"session","data":{"v":1,"op":"list","id":id}}));
+            let sessions = self.wait(r, |v| v["op"] == "sessions");
+            if sessions["sessions"]
+                .as_array()
+                .is_some_and(|all| all.iter().any(|d| d["session_id"] == sid))
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{sid} never listed: {sessions}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    /// Subscribes to `sid`'s terminal.
+    fn subscribe(&mut self, r: &mut Router, sid: &str, pg: &str) {
+        let binding = self.read(sid);
+        self.send_raw(
+            r,
+            json!({"type":"terminal","data":{"v":1,"op":"subscribe","terminal_id":sid,
+                "generation":pg,"binding":binding}}),
+        );
+        self.wait(r, |v| v["__type"] == "terminal" && v["op"] == "attached");
+    }
+    /// Opens a chat-v1 conversation on `sid` (once its agent is ready, with
+    /// `ready`).
+    fn open_chat(&mut self, r: &mut Router, sid: &str, ready: bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let conversation = uuid();
+            let binding = self.read(sid);
+            self.send_raw(
+                r,
+                json!({"type":"agentChat","data":{"v":1,"op":"open",
+                    "conversationId":conversation,"agentId":sid,"binding":binding}}),
+            );
+            let c = conversation.clone();
+            let reply = self.wait(r, move |v| {
+                v["__type"] == "agentChat"
+                    && v["conversationId"] == c.as_str()
+                    && (v["op"] == "opened" || v["op"] == "error")
+            });
+            if reply["op"] == "opened" && (!ready || reply["status"]["state"] == "ready") {
+                return conversation;
+            }
+            assert!(Instant::now() < deadline, "chat never ready: {reply}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    /// Acknowledges every terminal frame in `seen`.
+    fn ack_frames(&mut self, r: &mut Router, sid: &str, pg: &str, seen: &[Value]) {
+        use base64::Engine as _;
+        let binding = self.read(sid);
+        for f in seen
+            .iter()
+            .filter(|v| v["__type"] == "terminal" && v["op"] == "frame")
+        {
+            let len = base64::engine::general_purpose::STANDARD
+                .decode(f["bytes"].as_str().unwrap())
+                .unwrap()
+                .len() as u64;
+            self.send_raw(
+                r,
+                json!({"type":"terminal","data":{"v":1,"op":"ack","terminal_id":sid,
+                    "generation":pg,"stream_id":f["stream_id"],
+                    "offset":f["offset"].as_u64().unwrap() + len,"binding":binding.clone()}}),
+            );
         }
     }
     fn launch(&mut self, r: &mut Router, rid: &str) -> Value {
@@ -589,6 +697,340 @@ fn last_paste(rig: &Rig) -> String {
         .split_once("\u{1b}[201~")
         .map(|(text, _)| text.to_string())
         .unwrap_or_default()
+}
+
+/// The live framing tag of `text` (Atem's first line), if any.
+fn tag_in(text: &str) -> Option<String> {
+    let rest = text.split("[atem ").nth(1)?;
+    let tag = rest.get(..14)?;
+    atem_client::session::framing::Tag::parse(tag).map(|t| t.as_str().to_string())
+}
+
+/// The chat-v1 user messages' text in `seen` (live and history).
+fn user_texts(seen: &[Value]) -> Vec<String> {
+    seen.iter()
+        .filter(|v| v["__type"] == "agentChat" && v["op"] == "message" && v["role"] == "user")
+        .flat_map(|v| v["parts"].as_array().cloned().unwrap_or_default())
+        .filter_map(|p| p["markdown"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The decoded bytes of the terminal frames in `seen`.
+fn frame_text(seen: &[Value]) -> String {
+    use base64::Engine as _;
+    seen.iter()
+        .filter(|v| v["__type"] == "terminal" && v["op"] == "frame")
+        .map(|f| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(f["bytes"].as_str().unwrap())
+                .unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .collect()
+}
+
+fn frames_in(seen: &[Value]) -> Vec<&Value> {
+    seen.iter()
+        .filter(|v| v["__type"] == "terminal" && v["op"] == "frame")
+        .collect()
+}
+
+/// A control holder and a view-only service watch one session while
+/// services' tasks are framed and pasted into it (owner decision
+/// 2026-11-10). Gathers both until `done`, acknowledging frames.
+struct Watch {
+    control: Dev,
+    viewer: Dev,
+    sid: String,
+    pg: String,
+    control_seen: Vec<Value>,
+    viewer_seen: Vec<Value>,
+    /// The control holder's screen, rebuilt from its frames (a diff writes
+    /// only the cells that changed).
+    screen: Option<vt100::Parser>,
+}
+
+impl Watch {
+    fn step(&mut self, r: &mut Router) {
+        use base64::Engine as _;
+        let c = self.control.gather(r, Duration::from_millis(300));
+        self.control.ack_frames(r, &self.sid, &self.pg, &c);
+        for f in frames_in(&c) {
+            if f["reset"] == true || self.screen.is_none() {
+                self.screen = Some(vt100::Parser::new(
+                    f["rows"].as_u64().unwrap() as u16,
+                    f["cols"].as_u64().unwrap() as u16,
+                    0,
+                ));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(f["bytes"].as_str().unwrap())
+                .unwrap();
+            self.screen.as_mut().unwrap().process(&bytes);
+        }
+        self.control_seen.extend(c);
+        let v = self.viewer.gather(r, Duration::from_millis(300));
+        self.viewer.ack_frames(r, &self.sid, &self.pg, &v);
+        self.viewer_seen.extend(v);
+    }
+
+    /// Watches until `done`; what each side got meanwhile.
+    /// What the control holder's terminal shows.
+    fn control_screen(&self) -> String {
+        self.screen
+            .as_ref()
+            .map(|p| p.screen().contents())
+            .unwrap_or_default()
+    }
+
+    fn until(&mut self, r: &mut Router, what: &str, done: impl Fn(&Watch) -> bool) -> (Vec<Value>, Vec<Value>) {
+        let (c0, v0) = (self.control_seen.len(), self.viewer_seen.len());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done(self) {
+            assert!(Instant::now() < deadline, "{what}: {:?}", self.control_seen[c0..].iter().filter(|v| v["__type"] != "terminal").collect::<Vec<_>>());
+            self.step(r);
+        }
+        (self.control_seen[c0..].to_vec(), self.viewer_seen[v0..].to_vec())
+    }
+}
+
+/// The live tag is for the agent and for control holders (owner decision
+/// 2026-11-10). A view-only attachment gets chat-v1 with every tag this
+/// host drew replaced by a same-length placeholder, and no terminal-v1
+/// frames from a framed prompt's paste until its turn ends, then a full
+/// one; a control attachment sees everything throughout. Two prompts back
+/// to back each pause.
+#[test]
+fn view_only_attachments_never_see_a_live_tag() {
+    let rig = Rig::new("claude");
+    private(&rig.fake.join("echo"), "");
+    let mut r = Router::new(&rig.astation);
+    let mut sender = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    sender.launch(&mut r, &rid);
+    let launch = sender.launched(&mut r, &rid);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let pg = launch["process_gen"].as_str().unwrap().to_string();
+    let mut control = Dev::new(&mut r, &rig.log, MAC, false);
+    let mut viewer = Dev::new(&mut r, &rig.log, "svc-view", true);
+    for dev in [&mut control, &mut viewer] {
+        dev.list(&mut r, &sid);
+        dev.open_chat(&mut r, &sid, true);
+        dev.subscribe(&mut r, &sid, &pg);
+    }
+    let mut w = Watch {
+        control,
+        viewer,
+        sid: sid.clone(),
+        pg: pg.clone(),
+        control_seen: Vec::new(),
+        viewer_seen: Vec::new(),
+        screen: None,
+    };
+    w.until(&mut r, "first frames", |w| {
+        !frames_in(&w.control_seen).is_empty() && !frames_in(&w.viewer_seen).is_empty()
+    });
+
+    // A framed prompt: the control holder reads its tag in chat and on the
+    // terminal; the viewer gets the placeholder and no frame in the turn.
+    let first = task(&launch, "First framed task");
+    enqueue(&mut sender, &mut r, &first);
+    let (c, v) = w.until(&mut r, "the first prompt on the control holder's terminal", |w| {
+        let text = user_texts(&w.control_seen).concat();
+        tag_in(&text).is_some_and(|tag| w.control_screen().contains(&tag))
+    });
+    let tag1 = tag_in(&user_texts(&w.control_seen).concat()).unwrap();
+    let (c2, v2) = w.until(&mut r, "the viewer's user message", |w| {
+        user_texts(&w.viewer_seen)
+            .iter()
+            .any(|t| t.contains("First framed task"))
+    });
+    let during: Vec<Value> = [v, v2].concat();
+    assert!(frames_in(&during).is_empty(), "frames during the turn: {during:?}");
+    let control_text = user_texts(&[c, c2].concat())
+        .into_iter()
+        .find(|t| t.contains("First framed task"))
+        .unwrap();
+    let viewer_text = user_texts(&during)
+        .into_iter()
+        .find(|t| t.contains("First framed task"))
+        .unwrap();
+    assert!(!viewer_text.contains(&tag1), "{viewer_text}");
+    assert_eq!(
+        viewer_text,
+        control_text.replace(&tag1, "****-****-****"),
+        "only the tag is replaced"
+    );
+    // Still nothing a while later, mid-turn.
+    let mid = w.viewer_seen.len();
+    for _ in 0..4 {
+        w.step(&mut r);
+    }
+    assert!(frames_in(&w.viewer_seen[mid..]).is_empty());
+
+    // The turn ends: the viewer gets a full frame, as a new subscription.
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    let (_, v) = w.until(&mut r, "the viewer's frame after the turn", |w| {
+        !frames_in(&w.viewer_seen[mid..]).is_empty()
+    });
+    assert!(
+        frames_in(&v).first().is_some_and(|f| f["reset"] == true),
+        "{v:?}"
+    );
+
+    // Two framed prompts back to back: each pauses the viewer's frames, and
+    // neither tag reaches its chat.
+    wait_state(&mut sender, &mut r, &first["task_id"], "awaiting_result");
+    let (second, third) = (task(&launch, "Second framed task"), task(&launch, "Third framed task"));
+    enqueue(&mut sender, &mut r, &second);
+    enqueue(&mut sender, &mut r, &third);
+    let mut tags = vec![tag1.clone()];
+    for (n, (t, name)) in [(&second, "Second framed task"), (&third, "Third framed task")]
+        .into_iter()
+        .enumerate()
+    {
+        w.until(&mut r, name, |w| {
+            user_texts(&w.control_seen).iter().any(|x| x.contains(name))
+                && user_texts(&w.viewer_seen).iter().any(|x| x.contains(name))
+        });
+        let tag = user_texts(&w.control_seen)
+            .into_iter()
+            .find(|x| x.contains(name))
+            .and_then(|x| tag_in(&x))
+            .unwrap();
+        // Mid-turn: no frame carries this prompt's tag, or arrives at all.
+        let (_, v) = w.until(&mut r, "mid-turn", |w| w.control_screen().contains(&tag));
+        assert!(!frame_text(&v).contains(&tag), "turn {n}: {v:?}");
+        let mid = w.viewer_seen.len();
+        w.step(&mut r);
+        w.step(&mut r);
+        assert!(frames_in(&w.viewer_seen[mid..]).is_empty(), "turn {n}");
+        tags.push(tag);
+        std::fs::write(rig.fake.join("complete"), "").unwrap();
+        wait_state(&mut sender, &mut r, &t["task_id"], "awaiting_result");
+    }
+    let last = w.viewer_seen.len();
+    w.until(&mut r, "the viewer's frame after the last turn", |w| {
+        frames_in(&w.viewer_seen[last..])
+            .first()
+            .is_some_and(|f| f["reset"] == true)
+    });
+    // No tag ever reached the viewer through chat-v1; the control holder
+    // read each one.
+    let viewer_chat = serde_json::to_string(
+        &w.viewer_seen
+            .iter()
+            .filter(|v| v["__type"] == "agentChat")
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let control_chat = serde_json::to_string(
+        &w.control_seen
+            .iter()
+            .filter(|v| v["__type"] == "agentChat")
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    for tag in &tags {
+        assert!(!viewer_chat.contains(tag.as_str()), "{tag}");
+        assert!(control_chat.contains(tag.as_str()), "{tag}");
+    }
+    assert_eq!(tags.len(), 3);
+}
+
+/// A pause never outlives its turn: a worker killed mid-turn ends it (the
+/// session is no longer live); a broker restart mid-turn ends it too (the
+/// prompt's outcome is then unknown), while chat-v1 still hides the tag,
+/// read back from the session's tags file.
+#[test]
+fn a_lost_worker_or_a_restart_ends_the_pause_and_the_tag_stays_hidden() {
+    let mut rig = Rig::new("claude");
+    private(&rig.fake.join("echo"), "");
+    let mut r = Router::new(&rig.astation);
+    let mut sender = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let mut viewer = Dev::new(&mut r, &rig.log, "svc-view", true);
+    let start = |sender: &mut Dev, r: &mut Router| {
+        let rid = uuid();
+        sender.launch(r, &rid);
+        let launch = sender.launched(r, &rid);
+        let sid = launch["session_id"].as_str().unwrap().to_string();
+        let pg = launch["process_gen"].as_str().unwrap().to_string();
+        (launch, sid, pg)
+    };
+    let frames_until = |viewer: &mut Dev, r: &mut Router, sid: &str, pg: &str, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        while frames_in(&seen).is_empty() {
+            assert!(Instant::now() < deadline, "{what}: {seen:?}");
+            let got = viewer.gather(r, Duration::from_millis(300));
+            viewer.ack_frames(r, sid, pg, &got);
+            seen.extend(got);
+        }
+        seen
+    };
+
+    // A worker killed mid-turn.
+    let (launch, sid, pg) = start(&mut sender, &mut r);
+    viewer.list(&mut r, &sid);
+    viewer.open_chat(&mut r, &sid, true);
+    viewer.subscribe(&mut r, &sid, &pg);
+    frames_until(&mut viewer, &mut r, &sid, &pg, "first frames");
+    let t = task(&launch, "Framed task whose worker dies");
+    enqueue(&mut sender, &mut r, &t);
+    within("the prompt pasted", || {
+        input(&rig).contains("Framed task whose worker dies")
+    });
+    let tag = tag_in(&last_paste(&rig)).unwrap();
+    let quiet = viewer.gather(&mut r, Duration::from_millis(1500));
+    assert!(frames_in(&quiet).is_empty(), "frames mid-turn: {quiet:?}");
+    rig.sandbox.track();
+    let worker = rig
+        .sandbox
+        .records()
+        .into_iter()
+        .find(|rec| rec["session_id"] == sid.as_str())
+        .and_then(|rec| rec["worker_pid"].as_u64())
+        .unwrap();
+    unsafe {
+        libc::kill(worker as i32, libc::SIGKILL);
+    }
+    let after = frames_until(&mut viewer, &mut r, &sid, &pg, "the pause outlived the worker");
+    assert!(frames_in(&after)[0]["reset"] == true, "{after:?}");
+    let both = [quiet, after].concat();
+    let chat: Vec<&Value> = both
+        .iter()
+        .filter(|v| v["__type"] == "agentChat")
+        .collect();
+    assert!(!serde_json::to_string(&chat).unwrap().contains(&tag));
+
+    // A broker restart mid-turn: the worker and its turn go on.
+    let (launch, sid, pg) = start(&mut sender, &mut r);
+    let t = task(&launch, "Framed task across a restart");
+    enqueue(&mut sender, &mut r, &t);
+    within("the second prompt pasted", || {
+        input(&rig).contains("Framed task across a restart")
+    });
+    let tag = tag_in(&last_paste(&rig)).unwrap();
+    drop((r, sender, viewer));
+    rig.restart();
+    let mut r = Router::new(&rig.astation);
+    let mut viewer = Dev::new(&mut r, &rig.log, "svc-view", true);
+    viewer.list(&mut r, &sid);
+    viewer.open_chat(&mut r, &sid, false);
+    let opened = viewer.gather(&mut r, Duration::from_millis(500));
+    viewer.subscribe(&mut r, &sid, &pg);
+    let seen = [
+        opened,
+        frames_until(&mut viewer, &mut r, &sid, &pg, "no frame after the restart"),
+    ]
+    .concat();
+    // The history replayed to the view-only attachment hides the tag.
+    assert!(
+        user_texts(&seen).iter().any(|x| x.contains("Framed task across a restart")
+            && x.contains("[atem ****-****-****] ")),
+        "{seen:?}"
+    );
+    assert!(!serde_json::to_string(&seen).unwrap().contains(&tag));
 }
 
 /// A sender's text can't pass for Atem's own lines (delegated host-work

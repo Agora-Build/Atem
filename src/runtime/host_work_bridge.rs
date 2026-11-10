@@ -1431,6 +1431,7 @@ impl HostBridge {
             // reply's come from the outbox and the reply); the stored prompt
             // is only the sender's text or reply.
             let frame = self.collab_frame(&r)?;
+            let tag = framing::Tag::random();
             let paths: Option<Vec<String>> = paths
                 .iter()
                 .map(|p| p.to_str().map(str::to_string))
@@ -1446,7 +1447,8 @@ impl HostBridge {
                         .map(|(attachment, path)| framing::Screenshot { attachment, path })
                         .collect();
                     crate::runtime::collab::task_prompt(&r, frame.as_ref(), &screenshots)
-                        .render()
+                        .prompt()
+                        .and_then(|p| p.render(&tag))
                         .map_err(|e| format!("the prompt could not be rendered: {e}"))
                 }
             };
@@ -1480,6 +1482,29 @@ impl HostBridge {
             let Some((binding, _)) = self.host.binding_for_work(&attachment, &r.task.target) else {
                 continue;
             };
+            // The tag is kept, durably, before the prompt can reach the
+            // agent: chat-v1 hides it from attachments without `control`,
+            // after a restart too; and the session's terminal frames are
+            // held from them until the prompt's turn ends (`prompt_tags`).
+            let sid = r.task.target.session_id.clone();
+            let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
+            if let Err(error) = self.prompt_tags.record(&state, &sid, &tag) {
+                let detail = "waiting to record the prompt's framing tag";
+                eprintln!("atem runtime: {sid}: prompt tag not recorded: {error}");
+                if r.status.state != WorkState::Blocked || r.status.detail != detail {
+                    r.status.state = WorkState::Blocked;
+                    r.status.detail = detail.into();
+                    self.work.store.as_ref().unwrap().save_work(&r)?;
+                }
+                continue;
+            }
+            self.view_pauses
+                .entry(sid)
+                .or_default()
+                .push(crate::runtime::prompt_tags::Pause {
+                    receipt_id: r.status.receipt_id.clone(),
+                    until_wall_ms: r.task.expires_at,
+                });
             let message = json!({"type":"session", "data": {"v":1,"op":"submit", "id":uuid::Uuid::new_v4().to_string(),
                 "binding":binding, "request_id":r.status.receipt_id, "kind":"prompt", "payload":{"text":prompt}, "acquire":true}});
             r.status.state = WorkState::Submitting;

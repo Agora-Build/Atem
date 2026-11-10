@@ -19,7 +19,8 @@
 //!
 //! Files (the broker's state dir): `<state>/workers/<sid>.spec.json` (the
 //! broker's request, removed once read), `<sid>.json` (the worker record),
-//! `<sid>.lock` (one worker per session) and `<sid>.log` (its output).
+//! `<sid>.lock` (one worker per session), `<sid>.log` (its output) and
+//! `<sid>.tags` (the broker's: the framing tags of the prompts it pasted).
 
 use super::adopt::process_start_time;
 use super::worker_approvals::{Approvals, Event as ApprovalEvent};
@@ -82,10 +83,18 @@ pub fn log_path(state: &Path, session_id: &str) -> PathBuf {
     workers_dir(state).join(format!("{session_id}.log"))
 }
 
-/// Removes a released worker's lock and log (its record is gone).
+/// The framing tags of the prompts pasted into the session
+/// (`prompt_tags`).
+pub fn tags_path(state: &Path, session_id: &str) -> PathBuf {
+    workers_dir(state).join(format!("{session_id}.tags"))
+}
+
+/// Removes a released worker's lock, log and prompt tags (its record is
+/// gone).
 pub fn remove_leftovers(state: &Path, session_id: &str) {
     let _ = std::fs::remove_file(lock_path(state, session_id));
     let _ = std::fs::remove_file(log_path(state, session_id));
+    let _ = std::fs::remove_file(tags_path(state, session_id));
 }
 
 /// Where worker sockets live: `$XDG_RUNTIME_DIR/atem/workers` when the

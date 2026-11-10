@@ -160,6 +160,10 @@ while True:
                 break
             text = buf[s + len(START):e].decode("utf-8", "replace")
             buf = buf[e + len(END):]
+            # Like a real agent's interface, show the prompt on the screen
+            # (only when the test asks: `echo` in the control directory).
+            if os.path.exists(os.path.join(ctl, "echo")):
+                os.write(1, text.replace("\n", "\r\n").encode("utf-8") + b"\r\n")
             n_turns += 1
             turn = "turn-%d" % n_turns
             fire("UserPromptSubmit", {"prompt": text, "prompt_id": turn})
