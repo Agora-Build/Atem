@@ -723,6 +723,57 @@ fn the_mark_line_names_the_sender_within_the_checked_bound() {
     };
     assert!(work.checked_len(Some(&mark)) >= rendered.len());
     assert_eq!(task(&format!("{longest}x")), Err(FramingError::AtemLine));
+    // A result's sender is its principal: the session its first line adds
+    // is counted apart (`worst_case_lines`), so the longest principal
+    // renders, within the checked size; a longer one doesn't.
+    let result = |sender: &str, mark: Option<&MarkTask>| {
+        TaskPrompt {
+            header: Header::Result {
+                task_id: ID,
+                sender,
+                session: "ses-abcdefghijkl",
+            },
+            text: "",
+            mark,
+            context: &[],
+            snapshots: Snapshots::FromSender,
+            screenshots: &[],
+            closing: None,
+        }
+        .prompt()
+    };
+    let rendered = result(&longest, None).unwrap();
+    assert!(work.checked_len(None) >= rendered.len());
+    assert_eq!(
+        result(&format!("{longest}x"), None),
+        Err(FramingError::AtemLine)
+    );
+    // With a mark, its line names the principal and session: that whole
+    // sender is bounded.
+    assert_eq!(result(&longest, Some(&mark)), Err(FramingError::AtemLine));
+    assert!(result("local", Some(&mark)).is_ok());
+    // A local task names its session too: bounded whole.
+    let local = |sender: &str| {
+        TaskPrompt {
+            header: Header::Task {
+                task_id: ID,
+                workflow_id: WORKFLOW,
+                sender,
+                session: Some("ses-abcdefghijkl"),
+                route_id: "r",
+                message_id: None,
+            },
+            text: "",
+            mark: None,
+            context: &[],
+            snapshots: Snapshots::FromSender,
+            screenshots: &[],
+            closing: None,
+        }
+        .prompt()
+    };
+    assert!(local("local").is_ok());
+    assert_eq!(local(&longest), Err(FramingError::AtemLine));
 }
 
 #[test]

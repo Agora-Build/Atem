@@ -8,94 +8,169 @@
 //!   `control` (live messages, history pages, lookups, snapshot replays),
 //!   by [`PLACEHOLDER`], of the same length, so byte counts, offsets,
 //!   sequences and `next` tokens (which bind positions, not text) hold.
-//!   Verbatim echoes by an agent are replaced too; a paraphrase isn't.
+//!   An agent's echo is replaced too, in any letter case, when the whole
+//!   tag is in one string; an echo split across parts or cut short (a
+//!   truncated tool summary or result) and a paraphrase aren't.
 //! - **terminal-v1:** frames aren't text Atem controls (the agent's
 //!   interface wraps, splits or truncates the prompt), so they are held
 //!   from attachments without `control` while a framed prompt's turn runs
-//!   ([`Pause`]), and resume with a full frame once it ended.
+//!   ([`Pause`]; at most a day, the host's bound, never the sender's task
+//!   deadline), and resume with a full frame once it ended.
 //!
 //! The tags are kept per session in `<state>/workers/<sid>.tags` (one per
 //! line, 0600), written and synced before the prompt is pasted, so a
 //! restarted broker still knows them; they go with the session's worker
-//! files. Control holders, the local frontends, the session logs and the
-//! journal keep the real text.
+//! files. Only a session the broker has, by a parsed id, is read: no text
+//! of a request becomes a path. A tags file that can't be read hides every
+//! tag-shaped string in that session's chat only. Control holders, the
+//! local frontends, the session logs and the journal keep the real text.
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use anyhow::Result;
+use atem_client::membership::HostNow;
 use atem_client::session::framing::{TAG_LEN, Tag};
 use atem_client::session::wire::ReceiptState;
 
 /// What an attachment without `control` sees in place of a tag.
 pub const PLACEHOLDER: &str = "****-****-****";
 
+/// The tags of the sessions this runtime has, each loaded once from its
+/// tags file. Only sessions the broker knows by a parsed id are kept (a
+/// request's text never becomes a path), and a session that is gone is
+/// dropped (`retain`), so memory follows the live sessions.
 #[derive(Default)]
 pub struct PromptTags {
-    known: HashSet<String>,
-    loaded: HashSet<String>,
-    /// Sessions whose tags file couldn't be read: every tag-shaped string
-    /// is replaced for them (fail closed).
-    unreadable: HashSet<String>,
+    sessions: HashMap<String, SessionTags>,
+}
+
+#[derive(Default)]
+struct SessionTags {
+    tags: HashSet<String>,
+    /// Its tags file couldn't be read: every tag-shaped string in this
+    /// session's chat is hidden (fail closed, for this session only).
+    unreadable: bool,
 }
 
 impl PromptTags {
     /// Records `tag` for session `sid`, durably, before its prompt is
-    /// pasted.
+    /// pasted (the session's file read first, so its earlier tags stay).
     pub fn record(&mut self, state: &Path, sid: &str, tag: &Tag) -> Result<()> {
+        if crate::session::SessionId::parse(sid).is_none() {
+            anyhow::bail!("not a session id");
+        }
+        self.load(state, sid);
         let path = super::worker::tags_path(state, sid);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
+        if !file.metadata()?.is_file() {
+            anyhow::bail!("the tags file is not a regular file");
+        }
         file.write_all(format!("{}\n", tag.as_str()).as_bytes())?;
         file.sync_data()?;
-        self.loaded.insert(sid.to_string());
-        self.known.insert(tag.as_str().to_string());
+        self.sessions
+            .entry(sid.to_string())
+            .or_default()
+            .tags
+            .insert(tag.as_str().to_string());
         Ok(())
     }
 
-    /// Reads session `sid`'s tags once (a session the broker adopted, or
-    /// registered after a restart). A file that can't be read makes every
-    /// tag-shaped string redacted.
+    /// Reads session `sid`'s tags once: a session the broker has (adopted,
+    /// or registered after a restart). Nothing happens for a string that
+    /// isn't a session id. A file that can't be read hides every
+    /// tag-shaped string of that session.
     pub fn load(&mut self, state: &Path, sid: &str) {
-        if !self.loaded.insert(sid.to_string()) {
+        if crate::session::SessionId::parse(sid).is_none() || self.sessions.contains_key(sid) {
             return;
         }
+        let entry = self.sessions.entry(sid.to_string()).or_default();
         let path = super::worker::tags_path(state, sid);
         let text = match read_private(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return,
             Err(error) => {
                 eprintln!(
-                    "atem runtime: {sid}: prompt tags unreadable ({error}); every tag-shaped string is hidden from attachments without control"
+                    "atem runtime: {sid}: prompt tags unreadable ({error}); every tag-shaped string of this session is hidden from attachments without control"
                 );
-                self.unreadable.insert(sid.to_string());
+                entry.unreadable = true;
                 return;
             }
         };
         for line in text.lines() {
             match Tag::parse(line) {
                 Some(tag) => {
-                    self.known.insert(tag.as_str().to_string());
+                    entry.tags.insert(tag.as_str().to_string());
                 }
-                None => {
-                    self.unreadable.insert(sid.to_string());
-                }
+                None => entry.unreadable = true,
             }
         }
     }
 
-    /// `text` with every known tag (every tag-shaped string while a tags
-    /// file is unreadable) replaced by [`PLACEHOLDER`]; `None` when there
-    /// is none.
-    pub fn redact(&self, text: &str) -> Option<String> {
-        if self.known.is_empty() && self.unreadable.is_empty() {
+    /// Keeps only the sessions `live` names (the broker's).
+    pub fn retain(&mut self, live: impl Fn(&str) -> bool) {
+        self.sessions.retain(|sid, _| live(sid));
+    }
+
+    /// `text` (a chat-v1 envelope, serialized), served in session `sid`'s
+    /// chat, with every tag any session of this runtime drew (an agent can
+    /// echo another session's) replaced by [`PLACEHOLDER`], in any letter
+    /// case; and, while `sid`'s tags file is unreadable, every tag-shaped
+    /// string outside its ids (`id`, `…Id`, `…_id`, `…Ids`, `…_ids`,
+    /// `next`, `before`: a UUID can hold one; an id never holds prompt
+    /// text). `None` when there is none. An echo split across parts, cut
+    /// short or paraphrased isn't found.
+    pub fn redact(&self, sid: &str, text: &str) -> Option<String> {
+        let fail_closed = self.sessions.get(sid).is_some_and(|s| s.unreadable);
+        if !fail_closed && self.sessions.values().all(|s| s.tags.is_empty()) {
             return None;
         }
+        if fail_closed && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) {
+            return self
+                .redact_value(&mut value, false)
+                .then(|| value.to_string());
+        }
+        self.scan(text, fail_closed)
+    }
+
+    /// Redacts the strings of `value` in place; `id`: they are ids (only
+    /// known tags go). Whether anything changed.
+    fn redact_value(&self, value: &mut serde_json::Value, id: bool) -> bool {
+        use serde_json::Value;
+        match value {
+            Value::String(s) => match self.scan(s, !id) {
+                Some(redacted) => {
+                    *s = redacted;
+                    true
+                }
+                None => false,
+            },
+            Value::Array(items) => items
+                .iter_mut()
+                .fold(false, |changed, v| self.redact_value(v, id) | changed),
+            Value::Object(map) => map.iter_mut().fold(false, |changed, (key, v)| {
+                let id = key == "id"
+                    || key == "next"
+                    || key == "before"
+                    || key.ends_with("Id")
+                    || key.ends_with("_id")
+                    || key.ends_with("Ids")
+                    || key.ends_with("_ids");
+                self.redact_value(v, id) | changed
+            }),
+            _ => false,
+        }
+    }
+
+    /// `text` with every known tag replaced, and with `any` every
+    /// tag-shaped string; `None` when nothing was.
+    fn scan(&self, text: &str, any: bool) -> Option<String> {
         let bytes = text.as_bytes();
         let mut out: Option<String> = None;
         let mut copied = 0;
@@ -106,9 +181,12 @@ impl PromptTags {
                 && candidate[9] == b'-'
                 && std::str::from_utf8(candidate)
                     .ok()
-                    .and_then(Tag::parse)
+                    .and_then(|c| Tag::parse(&c.to_ascii_uppercase()))
                     .is_some_and(|tag| {
-                        !self.unreadable.is_empty() || self.known.contains(tag.as_str())
+                        any || self
+                            .sessions
+                            .values()
+                            .any(|s| s.tags.contains(tag.as_str()))
                     });
             if hit {
                 // A tag is ASCII: `at` and `at + TAG_LEN` are char boundaries.
@@ -129,25 +207,42 @@ impl PromptTags {
 
     #[cfg(test)]
     pub fn knows(&self, tag: &str) -> bool {
-        self.known.contains(tag)
+        self.sessions.values().any(|s| s.tags.contains(tag))
+    }
+
+    #[cfg(test)]
+    fn sessions(&self) -> usize {
+        self.sessions.len()
     }
 }
 
+/// A private file's text, `None` when it doesn't exist. Never follows a
+/// symlink, never blocks on a FIFO, reads regular files only.
 fn read_private(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path);
-    let mut file = match file {
+    let file = match file {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
     let mut text = String::new();
-    file.read_to_string(&mut text)?;
+    file.take(1024 * 1024).read_to_string(&mut text)?;
     Ok(Some(text))
 }
+
+/// The longest a framed prompt's turn holds the session's terminal frames:
+/// a day from the dispatch, on the host's wall clock and on its monotonic
+/// clock both (the pause holds until both have passed, so a wall clock set
+/// forward doesn't end it). The host's own bound: the sender's task
+/// deadline never ends a pause, since a v1 turn isn't interrupted at it.
+pub const PAUSE_BOUND_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// One framed prompt whose turn holds the session's terminal frames from
 /// attachments without `control`. Kept in `<state>/workers/<sid>.pause`
@@ -160,8 +255,11 @@ pub struct Pause {
     /// The prompt's tag: the user message that carries it shows the agent
     /// took the prompt (after a restart, when the receipt can't tell).
     pub tag: String,
-    /// The task's deadline (wall ms): the bounded fallback.
+    /// The bound ([`PAUSE_BOUND_MS`]) on the wall clock, ms since the epoch.
     pub until_wall_ms: u64,
+    /// The bound on `CLOCK_MONOTONIC` (ms) of boot `boot_id`.
+    pub until_mono_ms: u64,
+    pub boot_id: String,
 }
 
 /// What a pause's end is decided from, each pass.
@@ -173,7 +271,6 @@ pub struct TurnSigns {
     pub live: bool,
     /// What the session's chat shows of the prompt's turn.
     pub chat: ChatSigns,
-    pub now_wall_ms: u64,
 }
 
 /// The prompt's turn as the session's chat shows it.
@@ -192,23 +289,43 @@ pub enum ChatSigns {
 }
 
 impl Pause {
+    /// The pause of a prompt dispatched `now`: bounded a day from now.
+    pub fn new(receipt_id: &str, tag: &Tag, now: &HostNow) -> Pause {
+        Pause {
+            receipt_id: receipt_id.to_string(),
+            tag: tag.as_str().to_string(),
+            until_wall_ms: now.wall_ms.saturating_add(PAUSE_BOUND_MS),
+            until_mono_ms: now.mono_ms.saturating_add(PAUSE_BOUND_MS),
+            boot_id: now.boot_id.clone(),
+        }
+    }
+
+    /// Both clocks passed the bound. A reading of another boot can't tell
+    /// the monotonic side: not passed (a broker started after a reboot
+    /// counts it again, [`load_pauses`]).
+    pub fn bound_passed(&self, now: &HostNow) -> bool {
+        now.wall_ms >= self.until_wall_ms
+            && now.boot_id == self.boot_id
+            && now.mono_ms >= self.until_mono_ms
+    }
+
     /// Whether the prompt's turn may still run. The pause ends at the first
     /// of these:
     /// - the session is no longer live (the agent exited, its worker went
     ///   away, the session stopped);
-    /// - the deadline passed (the bounded fallback: a pause is never
-    ///   stuck);
     /// - the receipt completed (the turn ended, done or interrupted), or
     ///   was rejected (refused before the prompt reached the agent);
-    /// - the chat shows the agent took the prompt and its turn ended.
+    /// - the chat shows the agent took the prompt and its turn ended;
+    /// - the host's bound passed (a day on both clocks: a pause is never
+    ///   stuck). The task's deadline isn't one of them: the turn goes on
+    ///   past it.
     ///
     /// While the receipt is accepted or executing, the turn may run. When
     /// it can't tell (its outcome is unknown: a broker restart, a prompt the
     /// agent didn't take in time; or it is gone), the chat decides, and with
-    /// no turn state the pause holds until the session ends or the
-    /// deadline.
-    pub fn holds(&self, signs: TurnSigns) -> bool {
-        if !signs.live || signs.now_wall_ms >= self.until_wall_ms {
+    /// no turn state the pause holds until the session ends or the bound.
+    pub fn holds(&self, signs: TurnSigns, now: &HostNow) -> bool {
+        if !signs.live || self.bound_passed(now) {
             return false;
         }
         match signs.receipt {
@@ -222,13 +339,12 @@ impl Pause {
 /// Sessions whose frames are held, and the prompts holding them.
 pub type Pauses = HashMap<String, Vec<Pause>>;
 
-/// The longest a pause read back without its deadline holds (a task's
-/// longest lifetime).
-const UNREADABLE_PAUSE_MS: u64 = 24 * 60 * 60 * 1000;
-
 /// Replaces session `sid`'s pause file with `pauses` (removes it when there
 /// are none): before a paste, and when pauses end.
 pub fn write_pauses(state: &Path, sid: &str, pauses: &[Pause]) -> std::io::Result<()> {
+    if crate::session::SessionId::parse(sid).is_none() {
+        return Err(std::io::Error::other("not a session id"));
+    }
     let path = super::worker::pause_path(state, sid);
     if pauses.is_empty() {
         return match std::fs::remove_file(&path) {
@@ -263,35 +379,78 @@ pub fn write_pauses(state: &Path, sid: &str, pauses: &[Pause]) -> std::io::Resul
     result
 }
 
-/// Session `sid`'s pauses as a restarted broker reads them back. A file
-/// that can't be read holds the frames anyway (fail closed), for at most a
-/// task's lifetime from `now_wall_ms`.
-pub fn read_pauses(state: &Path, sid: &str, now_wall_ms: u64) -> Vec<Pause> {
-    let path = super::worker::pause_path(state, sid);
-    match read_private(&path) {
-        Ok(None) => Vec::new(),
-        Ok(Some(text)) => match serde_json::from_str::<Vec<Pause>>(&text) {
-            Ok(pauses) => pauses,
-            Err(error) => unreadable(sid, &error.to_string(), now_wall_ms),
-        },
-        Err(error) => unreadable(sid, &error.to_string(), now_wall_ms),
+/// Session `sid`'s pauses as a broker reads them back (at its start, for a
+/// session it adopted). A pause written in another boot counts its
+/// monotonic side again from `now` (only longer). A file that can't be
+/// read holds the frames anyway (fail closed), bounded a day from the
+/// file's last write (its mtime, at most `now`) on the wall clock and a day
+/// from `now` on the monotonic one; either change is written back, so the
+/// next broker start keeps that start. If it can't be written, the
+/// monotonic side keeps the file's start too (what is left of its day on
+/// the wall clock), so no broker start lengthens the hold.
+pub fn load_pauses(state: &Path, sid: &str, now: &HostNow) -> Vec<Pause> {
+    if crate::session::SessionId::parse(sid).is_none() {
+        return Vec::new();
     }
-}
-
-fn unreadable(sid: &str, why: &str, now_wall_ms: u64) -> Vec<Pause> {
-    eprintln!(
-        "atem runtime: {sid}: terminal pause unreadable ({why}); frames stay held from attachments without control until the session ends or a day passed"
-    );
-    vec![Pause {
-        receipt_id: String::new(),
-        tag: String::new(),
-        until_wall_ms: now_wall_ms.saturating_add(UNREADABLE_PAUSE_MS),
-    }]
+    let path = super::worker::pause_path(state, sid);
+    let read = read_private(&path).and_then(|text| match text {
+        None => Ok(None),
+        Some(text) => serde_json::from_str::<Vec<Pause>>(&text)
+            .map(Some)
+            .map_err(std::io::Error::other),
+    });
+    let (mut pauses, why) = match read {
+        Ok(None) => return Vec::new(),
+        Ok(Some(pauses)) => (pauses, None),
+        Err(error) => {
+            let written = std::fs::symlink_metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(now.wall_ms, |d| d.as_millis() as u64)
+                .min(now.wall_ms);
+            let pause = Pause {
+                receipt_id: String::new(),
+                tag: String::new(),
+                until_wall_ms: written.saturating_add(PAUSE_BOUND_MS),
+                until_mono_ms: now.mono_ms.saturating_add(PAUSE_BOUND_MS),
+                boot_id: now.boot_id.clone(),
+            };
+            (vec![pause], Some(error.to_string()))
+        }
+    };
+    let mut rewrite = why.is_some();
+    for pause in &mut pauses {
+        if pause.boot_id != now.boot_id {
+            pause.boot_id = now.boot_id.clone();
+            pause.until_mono_ms = now.mono_ms.saturating_add(PAUSE_BOUND_MS);
+            rewrite = true;
+        }
+    }
+    if let Some(why) = &why {
+        eprintln!(
+            "atem runtime: {sid}: terminal pause unreadable ({why}); frames stay held from attachments without control until the session ends or a day after the file's last write"
+        );
+    }
+    if rewrite && let Err(error) = write_pauses(state, sid, &pauses) {
+        eprintln!("atem runtime: {sid}: terminal pause not rewritten: {error}");
+        if why.is_some() {
+            for pause in &mut pauses {
+                pause.until_mono_ms = now
+                    .mono_ms
+                    .saturating_add(pause.until_wall_ms.saturating_sub(now.wall_ms));
+            }
+        }
+    }
+    pauses
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A: &str = "ses-aaaaaaaaaaaa";
+    const B: &str = "ses-bbbbbbbbbbbb";
 
     fn tags(dir: &Path, sid: &str, list: &[&str]) -> PromptTags {
         let mut t = PromptTags::default();
@@ -302,73 +461,159 @@ mod tests {
         t
     }
 
+    fn at(wall_ms: u64, mono_ms: u64) -> HostNow {
+        HostNow {
+            wall_ms,
+            mono_ms,
+            boot_id: "boot-1".into(),
+        }
+    }
+
     #[test]
     fn known_tags_are_replaced_by_a_placeholder_of_the_same_length() {
         let dir = tempfile::tempdir().unwrap();
-        let t = tags(
-            dir.path(),
-            "ses-aaaaaaaaaaaa",
-            &["7QK2-M9XD-4TPA", "3RRW-0B9C-KQ1T"],
-        );
+        let t = tags(dir.path(), A, &["7QK2-M9XD-4TPA", "3RRW-0B9C-KQ1T"]);
         assert_eq!(PLACEHOLDER.len(), TAG_LEN);
         let text = "[atem 7QK2-M9XD-4TPA] Atem task\n|[atem 3RRW-0B9C-KQ1T] end prompt \
-                    echo 7QK2-M9XD-4TPA, other ZZZZ-ZZZZ-ZZZZ, é7QK2-M9XD-4TPA";
-        let redacted = t.redact(text).unwrap();
+                    echo 7QK2-M9XD-4TPA, other ZZZZ-ZZZZ-ZZZZ, é7QK2-M9XD-4TPA, \
+                    lower 7qk2-m9xd-4tpa, mixed 3rRw-0b9C-kQ1t";
+        let redacted = t.redact(A, text).unwrap();
         assert_eq!(redacted.len(), text.len());
         assert_eq!(
             redacted,
             "[atem ****-****-****] Atem task\n|[atem ****-****-****] end prompt \
-             echo ****-****-****, other ZZZZ-ZZZZ-ZZZZ, é****-****-****"
+             echo ****-****-****, other ZZZZ-ZZZZ-ZZZZ, é****-****-****, \
+             lower ****-****-****, mixed ****-****-****"
         );
+        // Another session's chat: an agent can echo any session's tag.
+        assert_eq!(t.redact(B, text).unwrap(), redacted);
         // Nothing else changes; text without a known tag is left alone.
-        assert_eq!(t.redact("no tags here, ZZZZ-ZZZZ-ZZZZ"), None);
-        assert_eq!(t.redact(""), None);
+        assert_eq!(t.redact(A, "no tags here, ZZZZ-ZZZZ-ZZZZ"), None);
+        assert_eq!(t.redact(A, ""), None);
+        // Split or cut short, an echo isn't found (documented).
+        assert_eq!(t.redact(A, "7QK2-M9XD-4TP… 7QK2-M9XD 4TPA"), None);
         // A file read back gives the same set (a restarted broker).
         let mut again = PromptTags::default();
-        again.load(dir.path(), "ses-aaaaaaaaaaaa");
+        again.load(dir.path(), A);
         assert!(again.knows("7QK2-M9XD-4TPA") && again.knows("3RRW-0B9C-KQ1T"));
-        assert_eq!(again.redact(text).unwrap(), redacted);
+        assert_eq!(again.redact(A, text).unwrap(), redacted);
+        // Recording reads the session's file first: a restarted broker
+        // that records before it loaded keeps the earlier tags.
+        let mut fresh = PromptTags::default();
+        fresh
+            .record(dir.path(), A, &Tag::parse("ZZZZ-ZZZZ-ZZZZ").unwrap())
+            .unwrap();
+        assert!(fresh.knows("7QK2-M9XD-4TPA") && fresh.knows("ZZZZ-ZZZZ-ZZZZ"));
     }
 
+    /// A tags file that can't be read hides every tag-shaped string of that
+    /// session's chat, outside its ids, and nothing in any other session's.
     #[test]
-    fn an_unreadable_tags_file_hides_every_tag_shaped_string() {
+    fn an_unreadable_tags_file_hides_tag_shaped_strings_of_its_session_only() {
         let dir = tempfile::tempdir().unwrap();
         let workers = dir.path().join("workers");
         std::fs::create_dir_all(&workers).unwrap();
-        std::fs::write(workers.join("ses-aaaaaaaaaaaa.tags"), "not a tag\n").unwrap();
+        std::fs::write(workers.join(format!("{A}.tags")), "not a tag\n").unwrap();
         let mut t = PromptTags::default();
-        t.load(dir.path(), "ses-aaaaaaaaaaaa");
+        t.load(dir.path(), A);
+        t.load(dir.path(), B);
+        let envelope = serde_json::json!({
+            "type": "agentChat",
+            "data": {"v": 1, "op": "message", "agentId": A,
+                "conversationId": "c-7qk2-m9xd-4tpa-x",
+                "messageId": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
+                "message": {"id": "ZZZZ-ZZZZ-ZZZZ", "turn_id": "ZZZZ-ZZZZ-ZZZZ",
+                    "reply_message_ids": ["ZZZZ-ZZZZ-ZZZZ"],
+                    "parts": [{"type": "text", "markdown": "x ZZZZ-ZZZZ-ZZZZ y zzzz-zzzz-zzzz"}]},
+                "next": "abcd-ABCD-abcd"}
+        })
+        .to_string();
+        let redacted = t.redact(A, &envelope).unwrap();
+        assert_eq!(redacted.len(), envelope.len());
+        let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        let data = &value["data"];
         assert_eq!(
-            t.redact("x ZZZZ-ZZZZ-ZZZZ y").as_deref(),
+            data["message"]["parts"][0]["markdown"],
+            "x ****-****-**** y ****-****-****"
+        );
+        // Ids keep what they hold (a UUID's middle groups are tag-shaped).
+        assert_eq!(data["messageId"], "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed");
+        assert_eq!(data["conversationId"], "c-7qk2-m9xd-4tpa-x");
+        assert_eq!(data["message"]["id"], "ZZZZ-ZZZZ-ZZZZ");
+        assert_eq!(data["message"]["turn_id"], "ZZZZ-ZZZZ-ZZZZ");
+        assert_eq!(data["message"]["reply_message_ids"][0], "ZZZZ-ZZZZ-ZZZZ");
+        assert_eq!(data["next"], "abcd-ABCD-abcd");
+        // Another session is unaffected.
+        assert_eq!(t.redact(B, &envelope), None);
+        assert_eq!(t.redact(B, "x ZZZZ-ZZZZ-ZZZZ y"), None);
+        // Text that isn't JSON: every tag-shaped string.
+        assert_eq!(
+            t.redact(A, "x ZZZZ-ZZZZ-ZZZZ y").as_deref(),
             Some("x ****-****-**** y")
         );
         // A symlink isn't followed.
         std::os::unix::fs::symlink(
-            workers.join("ses-aaaaaaaaaaaa.tags"),
-            workers.join("ses-bbbbbbbbbbbb.tags"),
+            workers.join(format!("{A}.tags")),
+            workers.join(format!("{B}.tags")),
         )
         .unwrap();
         let mut t = PromptTags::default();
-        t.load(dir.path(), "ses-bbbbbbbbbbbb");
-        assert!(t.redact("ZZZZ-ZZZZ-ZZZZ").is_some());
+        t.load(dir.path(), B);
+        assert!(t.redact(B, "ZZZZ-ZZZZ-ZZZZ").is_some());
+        assert!(t.redact(A, "ZZZZ-ZZZZ-ZZZZ").is_none());
     }
 
-    /// The pause ends on every way a framed prompt's turn can end, and on
-    /// its bounded fallback (the task's deadline); after a restart (the
-    /// receipt's outcome unknown) the chat decides, and without turn state
-    /// the pause holds until the session ends or the deadline.
+    /// No text that isn't a session id becomes a path: nothing is opened,
+    /// recorded or remembered, and redaction is unchanged.
+    #[test]
+    fn a_request_id_is_never_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("workers")).unwrap();
+        // Files a traversal would reach: each one, read, would switch its
+        // "session" to fail closed (not a tag).
+        std::fs::write(state.join("x.tags"), "not a tag\n").unwrap();
+        std::fs::write(dir.path().join("x.tags"), "not a tag\n").unwrap();
+        let mut t = PromptTags::default();
+        for id in [
+            "../x",
+            "../../x",
+            "/etc/hostname/x",
+            &format!("{}/x", dir.path().display()),
+            "ses-aaaaaaaaaaaa/../../x",
+            "ses-AAAAAAAAAAAA",
+            "",
+        ] {
+            t.load(&state, id);
+            assert!(t.record(&state, id, &Tag::random()).is_err(), "{id}");
+            assert_eq!(t.redact(id, "x ZZZZ-ZZZZ-ZZZZ y"), None, "{id}");
+            assert!(write_pauses(&state, id, &[]).is_err(), "{id}");
+            assert_eq!(load_pauses(&state, id, &at(0, 0)), Vec::new(), "{id}");
+        }
+        assert_eq!(t.sessions(), 0);
+        let mut left: Vec<_> = std::fs::read_dir(state.join("workers")).unwrap().collect();
+        assert!(left.pop().is_none());
+        // A session that is gone is forgotten.
+        let mut t = tags(&state, A, &["7QK2-M9XD-4TPA"]);
+        t.load(&state, B);
+        assert_eq!(t.sessions(), 2);
+        t.retain(|sid| sid == B);
+        assert_eq!(t.sessions(), 1);
+        assert!(!t.knows("7QK2-M9XD-4TPA"));
+    }
+
+    /// The pause ends on every way a framed prompt's turn can end; after a
+    /// restart (the receipt's outcome unknown) the chat decides, and
+    /// without turn state the pause holds until the session ends or the
+    /// host's bound. The task's deadline isn't one of them.
     #[test]
     fn a_pause_ends_with_every_turn_outcome() {
-        let pause = Pause {
-            receipt_id: "r".into(),
-            tag: "7QK2-M9XD-4TPA".into(),
-            until_wall_ms: 1_000,
-        };
+        let now = at(1_000, 1_000);
+        let pause = Pause::new("r", &Tag::parse("7QK2-M9XD-4TPA").unwrap(), &now);
         let running = TurnSigns {
             receipt: Some(ReceiptState::Executing),
             live: true,
             chat: ChatSigns::Running,
-            now_wall_ms: 10,
         };
         let restarted = TurnSigns {
             receipt: Some(ReceiptState::OutcomeUnknown),
@@ -403,7 +648,13 @@ mod tests {
                 ..running
             },
         ] {
-            assert!(pause.holds(holding), "{holding:?}");
+            assert!(pause.holds(holding, &now), "{holding:?}");
+            // A minute or an hour later (any task deadline long past).
+            assert!(pause.holds(holding, &at(61_000, 61_000)), "{holding:?}");
+            assert!(
+                pause.holds(holding, &at(3_601_000, 3_601_000)),
+                "{holding:?}"
+            );
         }
         for ended in [
             // completed (done or interrupted)
@@ -437,49 +688,122 @@ mod tests {
                 chat: ChatSigns::Unknown,
                 ..restarted
             },
-            // the task's deadline passed (also without turn state)
-            TurnSigns {
-                now_wall_ms: 1_000,
-                ..running
-            },
-            TurnSigns {
-                now_wall_ms: 1_000,
-                chat: ChatSigns::Unknown,
-                ..restarted
-            },
         ] {
-            assert!(!pause.holds(ended), "{ended:?}");
+            assert!(!pause.holds(ended, &now), "{ended:?}");
         }
+    }
+
+    /// The host's bound: a day from the dispatch on the wall clock and on
+    /// the monotonic clock both; a reading of another boot can't end it.
+    #[test]
+    fn the_pause_bound_is_a_day_on_both_clocks() {
+        let day = PAUSE_BOUND_MS;
+        let pause = Pause::new("r", &Tag::random(), &at(1_000, 5_000));
+        assert_eq!(
+            (pause.until_wall_ms, pause.until_mono_ms),
+            (1_000 + day, 5_000 + day)
+        );
+        let running = TurnSigns {
+            receipt: Some(ReceiptState::Executing),
+            live: true,
+            chat: ChatSigns::Running,
+        };
+        // Within the day, on either clock: holds.
+        assert!(pause.holds(running, &at(day, day)));
+        // The wall clock set a day forward: the monotonic side holds.
+        assert!(pause.holds(running, &at(1_000 + day, 5_000 + 60_000)));
+        // The monotonic day passed, the wall clock set back: holds.
+        assert!(pause.holds(running, &at(1_000, 5_000 + day)));
+        // Both passed: the bound ends it, whatever the turn says.
+        assert!(!pause.holds(running, &at(1_000 + day, 5_000 + day)));
+        // Another boot: not passed.
+        let other = HostNow {
+            boot_id: "boot-2".into(),
+            ..at(1_000 + 2 * day, 5_000 + 2 * day)
+        };
+        assert!(pause.holds(running, &other));
     }
 
     #[test]
     fn pauses_are_written_before_the_paste_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("workers")).unwrap();
-        let sid = "ses-aaaaaaaaaaaa";
+        let path = super::super::worker::pause_path(dir.path(), A);
+        let now = at(10_000, 20_000);
         let pauses = vec![
-            Pause {
-                receipt_id: "r1".into(),
-                tag: "7QK2-M9XD-4TPA".into(),
-                until_wall_ms: 5_000,
-            },
-            Pause {
-                receipt_id: "r2".into(),
-                tag: "3RRW-0B9C-KQ1T".into(),
-                until_wall_ms: 6_000,
-            },
+            Pause::new("r1", &Tag::parse("7QK2-M9XD-4TPA").unwrap(), &now),
+            Pause::new("r2", &Tag::parse("3RRW-0B9C-KQ1T").unwrap(), &now),
         ];
-        write_pauses(dir.path(), sid, &pauses).unwrap();
-        assert_eq!(read_pauses(dir.path(), sid, 0), pauses);
-        write_pauses(dir.path(), sid, &pauses[1..]).unwrap();
-        assert_eq!(read_pauses(dir.path(), sid, 0), pauses[1..].to_vec());
-        write_pauses(dir.path(), sid, &[]).unwrap();
-        assert!(!super::super::worker::pause_path(dir.path(), sid).exists());
-        assert_eq!(read_pauses(dir.path(), sid, 0), Vec::new());
-        // A damaged file holds the frames anyway, for at most a day.
-        std::fs::write(super::super::worker::pause_path(dir.path(), sid), "{").unwrap();
-        let held = read_pauses(dir.path(), sid, 100);
+        write_pauses(dir.path(), A, &pauses).unwrap();
+        assert_eq!(load_pauses(dir.path(), A, &now), pauses);
+        write_pauses(dir.path(), A, &pauses[1..]).unwrap();
+        assert_eq!(load_pauses(dir.path(), A, &now), pauses[1..].to_vec());
+        write_pauses(dir.path(), A, &[]).unwrap();
+        assert!(!path.exists());
+        assert_eq!(load_pauses(dir.path(), A, &now), Vec::new());
+        // Read in another boot: the monotonic side counts again from now,
+        // and that is written back.
+        write_pauses(dir.path(), A, &pauses).unwrap();
+        let rebooted = HostNow {
+            boot_id: "boot-2".into(),
+            ..at(11_000, 300)
+        };
+        let back = load_pauses(dir.path(), A, &rebooted);
+        assert_eq!(back.len(), 2);
+        for p in &back {
+            assert_eq!(p.until_wall_ms, 10_000 + PAUSE_BOUND_MS);
+            assert_eq!(
+                (p.boot_id.as_str(), p.until_mono_ms),
+                ("boot-2", 300 + PAUSE_BOUND_MS)
+            );
+        }
+        assert_eq!(load_pauses(dir.path(), A, &rebooted), back);
+    }
+
+    /// A pause file that can't be read holds the frames anyway, a day from
+    /// the file's last write, and keeps that start at every later broker
+    /// start: written back when it can be, else from the file's time.
+    #[test]
+    fn an_unreadable_pause_keeps_its_start_across_broker_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("workers")).unwrap();
+        let path = super::super::worker::pause_path(dir.path(), A);
+        std::fs::write(&path, "{").unwrap();
+        let written = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let first = at(written + 5_000, 1_000);
+        let held = load_pauses(dir.path(), A, &first);
         assert_eq!(held.len(), 1);
-        assert_eq!(held[0].until_wall_ms, 100 + 24 * 60 * 60 * 1000);
+        assert_eq!(held[0].until_wall_ms, written + PAUSE_BOUND_MS);
+        assert_eq!(held[0].until_mono_ms, 1_000 + PAUSE_BOUND_MS);
+        assert!(held[0].tag.is_empty() && held[0].receipt_id.is_empty());
+        // Written back: the next broker start, hours later, keeps it.
+        let later = at(written + 3_600_000, 1_000 + 3_595_000);
+        assert_eq!(load_pauses(dir.path(), A, &later), held);
+        // A path that can't be written either (a directory): the
+        // monotonic side is what is left of the file's day.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let written = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let now = at(written + 3_600_000, 7_000);
+        let held = load_pauses(dir.path(), A, &now);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].until_wall_ms, written + PAUSE_BOUND_MS);
+        assert_eq!(held[0].until_mono_ms, 7_000 + PAUSE_BOUND_MS - 3_600_000);
+        // A file's time ahead of the wall clock counts as now.
+        let early = at(written.saturating_sub(60_000), 7_000);
+        let held = load_pauses(dir.path(), A, &early);
+        assert_eq!(held[0].until_wall_ms, early.wall_ms + PAUSE_BOUND_MS);
     }
 }

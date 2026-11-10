@@ -523,6 +523,10 @@ pub struct HostBridge {
     /// Sessions whose pause file was read (a restarted broker's adopted
     /// sessions, once each).
     pauses_loaded: HashSet<String>,
+    /// Sessions whose pause file a failed write left behind `view_pauses`
+    /// (`rewrite_pauses`), and when to try again.
+    pauses_dirty: HashSet<String>,
+    pauses_retry_at: Option<std::time::Instant>,
     /// Interrupts waiting for a turn to end, per session.
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
@@ -787,6 +791,8 @@ impl HostBridge {
             prompt_tags: Default::default(),
             view_pauses: Default::default(),
             pauses_loaded: HashSet::new(),
+            pauses_dirty: HashSet::new(),
+            pauses_retry_at: None,
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
@@ -2176,11 +2182,15 @@ impl HostBridge {
             .expect("chat envelopes serialize");
         // The live framing tags are for `control` only (`prompt_tags`): the
         // same-length placeholder keeps every count and position.
+        // Only a session the broker has is read (an envelope's `agentId` can
+        // be a refused request's raw text, never a path).
         if !self.host.attachment_can(attachment, Permission::Control) {
-            if let Some(state) = self.dir.parent() {
+            if let Some(state) = self.dir.parent()
+                && SessionId::parse(&sid).is_some_and(|id| cx.sessions.contains_key(&id))
+            {
                 self.prompt_tags.load(state, &sid);
             }
-            if let Some(redacted) = self.prompt_tags.redact(&text) {
+            if let Some(redacted) = self.prompt_tags.redact(&sid, &text) {
                 text = redacted;
             }
         }
@@ -3372,10 +3382,16 @@ impl HostBridge {
     /// Reads the prompt tags and terminal pauses of every session the broker
     /// has (`prompt_tags`), once each: a restarted broker learns those of
     /// adopted sessions before it serves their chat or frames.
+    /// Sessions that are gone are forgotten (their tags are dead: their
+    /// turns ended), so what is kept follows the broker's sessions.
     fn load_prompt_tags(&mut self, cx: &Cx) {
         let Some(state) = self.dir.parent().map(Path::to_path_buf) else {
             return;
         };
+        let known =
+            |sid: &str| SessionId::parse(sid).is_some_and(|id| cx.sessions.contains_key(&id));
+        self.prompt_tags.retain(known);
+        self.pauses_loaded.retain(|sid| known(sid));
         for sid in cx.sessions.keys() {
             self.prompt_tags.load(&state, sid.as_str());
             self.load_pauses(&state, sid.as_str());
@@ -3386,7 +3402,7 @@ impl HostBridge {
     /// goes on holding the frames).
     pub(super) fn load_pauses(&mut self, state: &Path, sid: &str) {
         if self.pauses_loaded.insert(sid.to_string()) {
-            let pauses = super::prompt_tags::read_pauses(state, sid, host_now().wall_ms);
+            let pauses = super::prompt_tags::load_pauses(state, sid, &host_now());
             if !pauses.is_empty() {
                 self.view_pauses
                     .entry(sid.to_string())
@@ -3405,10 +3421,11 @@ impl HostBridge {
     /// pause file.
     fn view_pause_pass(&mut self, cx: &Cx) {
         use super::prompt_tags::{ChatSigns, TurnSigns};
+        self.rewrite_pauses();
         if self.view_pauses.is_empty() {
             return;
         }
-        let now_wall_ms = host_now().wall_ms;
+        let now = host_now();
         let sessions: Vec<String> = self.view_pauses.keys().cloned().collect();
         for sid in sessions {
             let session = SessionId::parse(&sid).and_then(|id| cx.sessions.get(&id));
@@ -3419,12 +3436,14 @@ impl HostBridge {
                 .into_iter()
                 .filter(|p| {
                     let chat = session.map_or(ChatSigns::Unknown, |s| chat_signs(s, &p.tag));
-                    p.holds(TurnSigns {
-                        receipt: self.host.receipt(&p.receipt_id).map(|r| r.state),
-                        live,
-                        chat,
-                        now_wall_ms,
-                    })
+                    p.holds(
+                        TurnSigns {
+                            receipt: self.host.receipt(&p.receipt_id).map(|r| r.state),
+                            live,
+                            chat,
+                        },
+                        &now,
+                    )
                 })
                 .collect();
             if holding.len() != before {
@@ -3436,21 +3455,45 @@ impl HostBridge {
         }
     }
 
-    /// Writes session `sid`'s pauses (none: removes the file).
-    pub(super) fn write_pauses(
-        &self,
-        sid: &str,
-        pauses: &[super::prompt_tags::Pause],
-    ) -> bool {
-        let Some(state) = self.dir.parent() else {
-            return false;
-        };
-        match super::prompt_tags::write_pauses(state, sid, pauses) {
-            Ok(()) => true,
+    /// Writes session `sid`'s pauses (none: removes the file). One that
+    /// fails leaves the file behind what is held here (an attempt's pause
+    /// that was never pasted, a pause that ended): the session is rewritten
+    /// from memory at the next pass that can (`rewrite_pauses`).
+    pub(super) fn write_pauses(&mut self, sid: &str, pauses: &[super::prompt_tags::Pause]) -> bool {
+        let written = self
+            .dir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no state directory"))
+            .and_then(|state| super::prompt_tags::write_pauses(state, sid, pauses));
+        match written {
+            Ok(()) => {
+                self.pauses_dirty.remove(sid);
+                true
+            }
             Err(error) => {
-                eprintln!("atem runtime: {sid}: terminal pause not written: {error}");
+                if self.pauses_dirty.insert(sid.to_string()) {
+                    eprintln!("atem runtime: {sid}: terminal pause not written: {error}");
+                }
                 false
             }
+        }
+    }
+
+    /// Rewrites the pause files a write left behind, from memory, at most
+    /// once a second.
+    fn rewrite_pauses(&mut self) {
+        if self.pauses_dirty.is_empty()
+            || self
+                .pauses_retry_at
+                .is_some_and(|at| at > std::time::Instant::now())
+        {
+            return;
+        }
+        self.pauses_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        let dirty: Vec<String> = self.pauses_dirty.iter().cloned().collect();
+        for sid in dirty {
+            let pauses = self.view_pauses.get(&sid).cloned().unwrap_or_default();
+            self.write_pauses(&sid, &pauses);
         }
     }
 

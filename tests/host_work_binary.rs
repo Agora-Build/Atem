@@ -837,7 +837,7 @@ fn view_only_attachments_never_see_a_live_tag() {
 
     // A framed prompt: the control holder reads its tag in chat and on the
     // terminal; the viewer gets the placeholder and no frame in the turn.
-    let first = task(&launch, "First framed task");
+    let first = long_task(&launch, "First framed task");
     enqueue(&mut sender, &mut r, &first);
     let (c, v) = w.until(&mut r, "the first prompt on the control holder's terminal", |w| {
         let text = user_texts(&w.control_seen).concat();
@@ -885,7 +885,7 @@ fn view_only_attachments_never_see_a_live_tag() {
     // Two framed prompts back to back: each pauses the viewer's frames, and
     // neither tag reaches its chat.
     wait_state(&mut sender, &mut r, &first["task_id"], "awaiting_result");
-    let (second, third) = (task(&launch, "Second framed task"), task(&launch, "Third framed task"));
+    let (second, third) = (long_task(&launch, "Second framed task"), long_task(&launch, "Third framed task"));
     enqueue(&mut sender, &mut r, &second);
     enqueue(&mut sender, &mut r, &third);
     let mut tags = vec![tag1.clone()];
@@ -982,7 +982,7 @@ fn a_pause_outlives_a_broker_restart_but_never_its_turn() {
     viewer.open_chat(&mut r, &sid, true);
     viewer.subscribe(&mut r, &sid, &pg);
     frames_until(&mut viewer, &mut r, &sid, &pg, "first frames");
-    let t = task(&launch, "Framed task whose worker dies");
+    let t = long_task(&launch, "Framed task whose worker dies");
     enqueue(&mut sender, &mut r, &t);
     within("the prompt pasted", || {
         input(&rig).contains("Framed task whose worker dies")
@@ -1014,7 +1014,7 @@ fn a_pause_outlives_a_broker_restart_but_never_its_turn() {
     // does the pause (it was written before the paste), until the chat shows
     // the turn ended; then a full frame.
     let (launch, sid, pg) = start(&mut sender, &mut r);
-    let t = task(&launch, "Framed task across a restart");
+    let t = long_task(&launch, "Framed task across a restart");
     enqueue(&mut sender, &mut r, &t);
     within("the second prompt pasted", || {
         input(&rig).contains("Framed task across a restart")
@@ -1076,7 +1076,7 @@ fn a_dispatch_that_cannot_record_its_pause_waits_and_leaves_nothing() {
     );
     // A directory where the pause file goes: its write fails.
     std::fs::create_dir_all(&pause).unwrap();
-    let t = task(&launch, "Framed task that must wait");
+    let t = long_task(&launch, "Framed task that must wait");
     enqueue(&mut sender, &mut r, &t);
     wait_detail(
         &mut sender,
@@ -1094,6 +1094,404 @@ fn a_dispatch_that_cannot_record_its_pause_waits_and_leaves_nothing() {
     let tag = tag_in(&last_paste(&rig)).unwrap();
     assert_eq!(std::fs::read_to_string(&tags).unwrap(), format!("{tag}\n"));
     assert!(std::fs::read_to_string(&pause).unwrap().contains(&tag));
+}
+
+/// A dispatch whose framing tag can't be recorded (after its pause was)
+/// waits ("waiting to record the prompt's framing tag"), pastes nothing and
+/// leaves no pause behind: the pause file goes back to what was held.
+#[test]
+fn a_dispatch_that_cannot_record_its_tag_waits_and_leaves_nothing() {
+    let rig = Rig::new("claude");
+    let mut r = Router::new(&rig.astation);
+    let mut sender = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    sender.launch(&mut r, &rid);
+    let launch = sender.launched(&mut r, &rid);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let workers = rig.sandbox.config().join("runtime/workers");
+    let (pause, tags) = (
+        workers.join(format!("{sid}.pause")),
+        workers.join(format!("{sid}.tags")),
+    );
+    // A directory where the tags file goes: its write fails.
+    std::fs::create_dir_all(&tags).unwrap();
+    let t = long_task(&launch, "Framed task whose tag must wait");
+    enqueue(&mut sender, &mut r, &t);
+    wait_detail(
+        &mut sender,
+        &mut r,
+        &t["task_id"],
+        "waiting to record the prompt's framing tag",
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!input(&rig).contains("Framed task whose tag must wait"));
+    assert!(!pause.exists(), "the attempt's pause was left behind");
+    std::fs::remove_dir(&tags).unwrap();
+    within("the prompt pasted", || {
+        input(&rig).contains("Framed task whose tag must wait")
+    });
+    let tag = tag_in(&last_paste(&rig)).unwrap();
+    assert_eq!(std::fs::read_to_string(&tags).unwrap(), format!("{tag}\n"));
+    let held: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(&pause).unwrap()).unwrap();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["tag"], tag.as_str());
+}
+
+/// A task whose deadline is `ms` from now on the host's clock; the pause
+/// tests use a long one, so their turns never meet it unless they mean to.
+fn task_until(launch: &Value, text: &str, ms: u64) -> Value {
+    let mut t = task(launch, text);
+    t["expires_at"] = json!(r9log::host_now().wall_ms + ms);
+    t
+}
+
+fn long_task(launch: &Value, text: &str) -> Value {
+    task_until(launch, text, 30 * 60_000)
+}
+
+/// The viewer's frames over `wait`, acknowledged.
+fn viewer_frames(
+    viewer: &mut Dev,
+    r: &mut Router,
+    sid: &str,
+    pg: &str,
+    wait: Duration,
+) -> Vec<Value> {
+    let got = viewer.gather(r, wait);
+    viewer.ack_frames(r, sid, pg, &got);
+    got
+}
+
+/// Waits for `viewer`'s first terminal frame; everything it got meanwhile.
+fn first_frames(viewer: &mut Dev, r: &mut Router, sid: &str, pg: &str, what: &str) -> Vec<Value> {
+    let deadline = Instant::now() + WAIT;
+    let mut seen = Vec::new();
+    while frames_in(&seen).is_empty() {
+        assert!(Instant::now() < deadline, "{what}: {seen:?}");
+        seen.extend(viewer_frames(
+            viewer,
+            r,
+            sid,
+            pg,
+            Duration::from_millis(300),
+        ));
+    }
+    seen
+}
+
+/// The sender chooses its task's deadline, and a v1 turn isn't interrupted
+/// at it: a turn that outlasts it keeps the view-only terminal paused until
+/// the turn ends (final security review C1; 7e7aab8 ended the pause at the
+/// deadline, mid-turn). Then the view-only attachment's history pages and
+/// lookups (`before`, `turn_id`, `request_id`) hide the tag too.
+#[test]
+fn a_turn_that_outlasts_its_tasks_deadline_stays_paused() {
+    let rig = Rig::new("claude");
+    private(&rig.fake.join("echo"), "");
+    let mut r = Router::new(&rig.astation);
+    let mut sender = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    sender.launch(&mut r, &rid);
+    let launch = sender.launched(&mut r, &rid);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let pg = launch["process_gen"].as_str().unwrap().to_string();
+    let mut viewer = Dev::new(&mut r, &rig.log, "svc-view", true);
+    viewer.list(&mut r, &sid);
+    let conversation = viewer.open_chat(&mut r, &sid, true);
+    viewer.subscribe(&mut r, &sid, &pg);
+    let mut seen = first_frames(&mut viewer, &mut r, &sid, &pg, "first frames");
+
+    let short = task_until(&launch, "Framed task that outlasts its deadline", 4_000);
+    let deadline = short["expires_at"].as_u64().unwrap();
+    enqueue(&mut sender, &mut r, &short);
+    within("the prompt pasted", || {
+        input(&rig).contains("Framed task that outlasts its deadline")
+    });
+    let tag = tag_in(&last_paste(&rig)).unwrap();
+    // The deadline passes mid-turn (nothing interrupts the turn at it).
+    let mut during = Vec::new();
+    while r9log::host_now().wall_ms < deadline + 3_000 {
+        during.extend(viewer_frames(
+            &mut viewer,
+            &mut r,
+            &sid,
+            &pg,
+            Duration::from_millis(300),
+        ));
+    }
+    assert_eq!(
+        work(&mut sender, &mut r, &short["task_id"])["detail"],
+        "in the agent's turn"
+    );
+    assert!(
+        frames_in(&during).is_empty(),
+        "frames after the deadline, mid-turn: {during:?}"
+    );
+    // The turn ends: the viewer gets a full frame.
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    let after = first_frames(
+        &mut viewer,
+        &mut r,
+        &sid,
+        &pg,
+        "no frame after the turn ended",
+    );
+    assert!(frames_in(&after)[0]["reset"] == true, "{after:?}");
+
+    // A second prompt, so there is a message to page before.
+    release_lease(&mut sender, &mut r, &launch);
+    let next = long_task(&launch, "Second framed task");
+    enqueue(&mut sender, &mut r, &next);
+    within("the second prompt pasted", || {
+        input(&rig).contains("Second framed task")
+    });
+    let tag2 = tag_in(&last_paste(&rig)).unwrap();
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    wait_state(&mut sender, &mut r, &next["task_id"], "awaiting_result");
+    seen.extend(during);
+    seen.extend(after);
+    seen.extend(viewer.gather(&mut r, Duration::from_millis(500)));
+    let user = |seen: &[Value], text: &str| {
+        seen.iter()
+            .find(|v| {
+                v["__type"] == "agentChat"
+                    && v["op"] == "message"
+                    && v["role"] == "user"
+                    && v.to_string().contains(text)
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no user message {text}: {seen:?}"))
+    };
+    let first = user(&seen, "Framed task that outlasts its deadline");
+    let second = user(&seen, "Second framed task");
+    let binding = viewer.read(&sid);
+    let receipt = stored(&rig, &short["task_id"])["receipt_id"].clone();
+    for (page, selector, value) in [
+        ("p-before", "before", second["messageId"].clone()),
+        ("p-turn", "turn_id", first["turnId"].clone()),
+        ("p-request", "request_id", receipt),
+    ] {
+        viewer.backlog.clear();
+        viewer.send_raw(
+            &mut r,
+            json!({"type":"agentChat","data":{"v":1,"op":"history",
+                "conversationId":conversation,"agentId":sid,"generation":pg,
+                "page_id":page,selector:value,"binding":binding.clone()}}),
+        );
+        let end = viewer.wait(&mut r, |v| {
+            v["__type"] == "agentChat" && v["op"] == "history_end" && v["page_id"] == page
+        });
+        let got = std::mem::take(&mut viewer.backlog);
+        let text = serde_json::to_string(&got).unwrap();
+        assert!(
+            text.contains("Framed task that outlasts its deadline")
+                && text.contains("[atem ****-****-****] "),
+            "{selector}: {end} {got:?}"
+        );
+        assert!(
+            !text.contains(&tag) && !text.contains(&tag2),
+            "{selector}: {text}"
+        );
+    }
+}
+
+/// A refused chat-v1 request's `agentId` is never a path (final security
+/// review I2): a view-only attachment that names `../x` or
+/// `/etc/hostname/x` changes nothing; a session's chat still shows a
+/// tag-shaped string that isn't a tag and hides the tag. (Over r9 the
+/// channel's own authority check refuses these ops before the session host
+/// sees them; the session host no longer depends on that: it reads only
+/// the tags of sessions it has, by a parsed id, `prompt_tags`.)
+#[test]
+fn a_refused_chat_request_never_names_a_file() {
+    let rig = Rig::new("claude");
+    private(&rig.fake.join("echo"), "");
+    // What `../x` names from the workers' directory: read, not a tag.
+    std::fs::create_dir_all(rig.sandbox.config().join("runtime")).unwrap();
+    private(&rig.sandbox.config().join("runtime/x.tags"), "not a tag\n");
+    let mut r = Router::new(&rig.astation);
+    let mut sender = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    sender.launch(&mut r, &rid);
+    let launch = sender.launched(&mut r, &rid);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let mut viewer = Dev::new(&mut r, &rig.log, "svc-view", true);
+    viewer.list(&mut r, &sid);
+    viewer.open_chat(&mut r, &sid, true);
+    for id in ["../x", "/etc/hostname/x", "ses-aaaaaaaaaaaa/../../x"] {
+        let conversation = uuid();
+        viewer.send_raw(
+            &mut r,
+            json!({"type":"agentChat","data":{"v":1,"op":"opened",
+                "conversationId":conversation,"agentId":id}}),
+        );
+        let refused = viewer.wait(&mut r, |v| {
+            v["__type"] == "agentChat"
+                && v["op"] == "error"
+                && v["conversationId"] == conversation.as_str()
+        });
+        assert_eq!(refused["agentId"], id, "{refused}");
+    }
+    let t = long_task(&launch, "Keep Q7Q7-Q7Q7-Q7Q7 as it is");
+    enqueue(&mut sender, &mut r, &t);
+    within("the prompt pasted", || input(&rig).contains("Keep Q7Q7"));
+    let tag = tag_in(&last_paste(&rig)).unwrap();
+    let deadline = Instant::now() + WAIT;
+    let mut seen = Vec::new();
+    while !user_texts(&seen).iter().any(|t| t.contains("Keep Q7Q7")) {
+        assert!(Instant::now() < deadline, "no user message: {seen:?}");
+        seen.extend(viewer.gather(&mut r, Duration::from_millis(300)));
+    }
+    let text = user_texts(&seen)
+        .into_iter()
+        .find(|t| t.contains("Keep Q7Q7"))
+        .unwrap();
+    assert!(text.contains("Keep Q7Q7-Q7Q7-Q7Q7 as it is"), "{text}");
+    assert!(
+        text.contains("[atem ****-****-****] ") && !text.contains(&tag),
+        "{text}"
+    );
+    assert!(
+        !runtime_log(&rig).contains("prompt tags unreadable"),
+        "{}",
+        runtime_log(&rig)
+    );
+}
+
+/// The host clock (`ATEM_TEST_HOST_CLOCK`, debug builds): the real wall and
+/// monotonic clocks plus offsets the test moves, this boot, rewritten every
+/// 20 ms (atomically).
+struct MovingClock {
+    path: PathBuf,
+    offsets: std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MovingClock {
+    fn start(dir: &Path) -> MovingClock {
+        use std::sync::atomic::Ordering;
+        let path = dir.join("moving-clock");
+        let offsets = std::sync::Arc::new((
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let boot = boot.trim().to_string();
+        let write = {
+            let (path, offsets) = (path.clone(), offsets.clone());
+            move || {
+                let mut ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // SAFETY: `ts` is a valid timespec for the call to fill.
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                let mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+                let wall = r9log::host_now().wall_ms + offsets.0.load(Ordering::SeqCst);
+                let mono = mono + offsets.1.load(Ordering::SeqCst);
+                let tmp = path.with_extension("tmp");
+                std::fs::write(&tmp, format!("{wall} {mono} {boot}")).unwrap();
+                std::fs::rename(&tmp, &path).unwrap();
+            }
+        };
+        write();
+        let s = stop.clone();
+        std::thread::spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                write();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        MovingClock {
+            path,
+            offsets,
+            stop,
+        }
+    }
+
+    /// Moves the host's wall and monotonic clocks `wall_ms` and `mono_ms`
+    /// ahead of the real ones.
+    fn jump(&self, wall_ms: u64, mono_ms: u64) {
+        use std::sync::atomic::Ordering;
+        self.offsets.0.store(wall_ms, Ordering::SeqCst);
+        self.offsets.1.store(mono_ms, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+impl Drop for MovingClock {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The pause's bound is the host's own: a day from the dispatch on the
+/// wall clock and on the monotonic clock both (final security review C1).
+/// A wall clock set a day forward doesn't end it (the monotonic day hasn't
+/// passed); once both have, a view-only attachment gets frames again,
+/// though the turn still runs (a pause is never stuck).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_CLOCK hook"
+)]
+fn a_pause_ends_a_day_after_its_dispatch_on_both_clocks() {
+    const DAY: u64 = 86_400_000;
+    let mut rig = Rig::prepared("claude", |_| {});
+    let clock = MovingClock::start(rig.sandbox.dir.path());
+    rig.clock = Some(clock.path.clone());
+    rig.start();
+    private(&rig.fake.join("echo"), "");
+    let mut r = Router::new(&rig.astation);
+    let mut sender = Dev::new(&mut r, &rig.log, "svc-work", true);
+    let rid = uuid();
+    sender.launch(&mut r, &rid);
+    let launch = sender.launched(&mut r, &rid);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let pg = launch["process_gen"].as_str().unwrap().to_string();
+    // A native view-only member: its channel outlives a wall clock jump.
+    let watch = |r: &mut Router| {
+        let mut viewer = Dev::new(r, &rig.log, "messenger", false);
+        viewer.list(r, &sid);
+        viewer.subscribe(r, &sid, &pg);
+        viewer
+    };
+    let mut viewer = watch(&mut r);
+    first_frames(&mut viewer, &mut r, &sid, &pg, "first frames");
+    let t = long_task(&launch, "Framed task held for a day");
+    enqueue(&mut sender, &mut r, &t);
+    within("the prompt pasted", || {
+        input(&rig).contains("Framed task held for a day")
+    });
+    let deadline = Instant::now() + WAIT;
+    while work(&mut sender, &mut r, &t["task_id"])["detail"] != "in the agent's turn" {
+        assert!(Instant::now() < deadline, "the turn never began");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let quiet = viewer_frames(&mut viewer, &mut r, &sid, &pg, Duration::from_millis(1_500));
+    assert!(frames_in(&quiet).is_empty(), "frames mid-turn: {quiet:?}");
+    r.close(&viewer.handle);
+    drop((sender, viewer));
+
+    // The wall clock a day ahead (and the task's deadline long past): a new
+    // view-only subscription still gets nothing.
+    clock.jump(DAY + 120_000, 60_000);
+    let mut viewer = watch(&mut r);
+    let held = viewer_frames(&mut viewer, &mut r, &sid, &pg, Duration::from_millis(2_000));
+    assert!(
+        frames_in(&held).is_empty(),
+        "frames once only the wall clock passed the day: {held:?}"
+    );
+    r.close(&viewer.handle);
+    drop(viewer);
+
+    // The monotonic day too: frames again, the turn still running.
+    clock.jump(DAY + 180_000, DAY + 120_000);
+    let mut viewer = watch(&mut r);
+    let after = first_frames(&mut viewer, &mut r, &sid, &pg, "no frame after the day");
+    assert!(frames_in(&after)[0]["reset"] == true, "{after:?}");
+    assert!(!rig.fake.join("complete").exists());
 }
 
 /// A sender's text can't pass for Atem's own lines (delegated host-work

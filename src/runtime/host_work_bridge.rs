@@ -1493,18 +1493,20 @@ impl HostBridge {
             let sid = r.task.target.session_id.clone();
             let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
             self.load_pauses(&state, &sid);
+            // The pause is bounded by the host (a day from now on both
+            // clocks), never by the task's deadline: a v1 turn isn't
+            // interrupted at it, and the sender chooses it.
             let held = self.view_pauses.get(&sid).cloned().unwrap_or_default();
             let mut pauses = held.clone();
-            pauses.push(crate::runtime::prompt_tags::Pause {
-                receipt_id: r.status.receipt_id.clone(),
-                tag: tag.as_str().to_string(),
-                until_wall_ms: r.task.expires_at,
-            });
+            pauses.push(crate::runtime::prompt_tags::Pause::new(
+                &r.status.receipt_id,
+                &tag,
+                &host_now(),
+            ));
             let recorded = crate::runtime::prompt_tags::write_pauses(&state, &sid, &pauses)
                 .map_err(|e| ("waiting to record the prompt's terminal pause", e))
                 .and_then(|()| {
                     self.prompt_tags.record(&state, &sid, &tag).map_err(|e| {
-                        let _ = crate::runtime::prompt_tags::write_pauses(&state, &sid, &held);
                         (
                             "waiting to record the prompt's framing tag",
                             std::io::Error::other(e.to_string()),
@@ -1512,6 +1514,11 @@ impl HostBridge {
                     })
                 });
             if let Err((detail, error)) = recorded {
+                // Even a pause write that failed may have replaced the file
+                // (its directory's sync failing after the rename): the file
+                // goes back to what is held, or is rewritten from memory
+                // at a later pass (`write_pauses`).
+                self.write_pauses(&sid, &held);
                 if r.status.state != WorkState::Blocked || r.status.detail != detail {
                     eprintln!("atem runtime: {sid}: {detail}: {error}");
                     r.status.state = WorkState::Blocked;

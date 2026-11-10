@@ -877,10 +877,23 @@ impl TaskPrompt<'_> {
         {
             return Err(FramingError::Digest);
         }
-        // The size checks count the longest sender: a longer one would
-        // break the bound an accepted task was checked against.
+        // The size checks count the longest sender ([`worst_case_lines`],
+        // [`mark_len`]): a longer one would break the bound an accepted task
+        // was checked against. A task's first line and mark line name
+        // `sender` (with the sending session for a local sender); a
+        // result's first line names its principal and session (counted
+        // whole), and only a mark line would name both as the sender.
         let sender = self.header.sender();
-        if sender.len() > MAX_SENDER_BYTES {
+        let fits = match self.header {
+            Header::Task { .. } => sender.len() <= MAX_SENDER_BYTES,
+            Header::Result {
+                sender: principal, ..
+            } => {
+                principal.len() <= MAX_SENDER_BYTES
+                    && (self.mark.is_none() || sender.len() <= MAX_SENDER_BYTES)
+            }
+        };
+        if !fits {
             return Err(FramingError::AtemLine);
         }
         let mut prompt = Prompt::new(self.header.line());
