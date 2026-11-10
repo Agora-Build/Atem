@@ -28,6 +28,62 @@ private func b64u(_ s: String) -> Data {
 
 private func utf8(_ s: String) -> Data { Data(s.utf8) }
 
+private func sha256Hex(_ text: String) -> String { hex(Data(SHA256.hash(data: Data(text.utf8)))) }
+
+// A tag's 60 bits as written (XXXX-XXXX-XXXX, Crockford base32).
+private func tagBitsOf(_ tag: String) -> UInt64 {
+    let crockford = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    return tag.filter { $0 != "-" }.reduce(UInt64(0)) { bits, c in (bits << 5) | UInt64(crockford.firstIndex(of: c)!) }
+}
+
+// The lines of a text (a line ends at LF, CR, VT, FF, NEL, U+2028 or U+2029,
+// taken per scalar: Swift's own Character view joins CR LF) without the `|`s
+// each starts with: what the marker check is given, as the escaping does.
+private func linesWithoutLeadingBars(_ text: String) -> [String] {
+    var lines: [String] = []
+    var current = String.UnicodeScalarView()
+    var leading = true
+    for c in text.unicodeScalars {
+        switch c.value {
+        case 0x0A, 0x0D, 0x0B, 0x0C, 0x85, 0x2028, 0x2029:
+            lines.append(String(current))
+            current = String.UnicodeScalarView()
+            leading = true
+        case 0x7C where leading:
+            break
+        default:
+            leading = false
+            current.append(c)
+        }
+    }
+    lines.append(String(current))
+    return lines
+}
+
+// `rendered` with `old` swapped for `fresh` at the start of every line (a
+// line ends at "\n" only), byte for byte: Swift's String equality is
+// canonical equivalence, so what is compared is UTF-8.
+private func retagged(_ rendered: String, from old: String, to fresh: String) -> [UInt8] {
+    let bytes = Array(rendered.utf8)
+    let oldBytes = Array(old.utf8)
+    let freshBytes = Array(fresh.utf8)
+    var out: [UInt8] = []
+    var atLineStart = true
+    var i = 0
+    while i < bytes.count {
+        if atLineStart && bytes[i...].starts(with: oldBytes) {
+            out.append(contentsOf: freshBytes)
+            i += oldBytes.count
+            atLineStart = false
+        } else {
+            out.append(bytes[i])
+            atLineStart = bytes[i] == 0x0A
+            i += 1
+        }
+    }
+    return out
+}
+
 private func o(_ v: Any?) -> [String: Any] { v as! [String: Any] }
 private func a(_ v: Any?) -> [Any] { v as! [Any] }
 private func s(_ v: Any?) -> String { v as! String }
@@ -591,9 +647,153 @@ final class ConformanceTests: XCTestCase {
             }
         }
 
+        // ------------------------------------------------------------ framing
+        // The prompt framing (delegated host-work design III.2) over
+        // designs/protocol/fixtures/host-work/: the escaping and the marker
+        // check, the Unicode version they are pinned to, the preflight size
+        // check and (a test-vectors build only) the rendering, byte for byte.
+        // Strings are compared as UTF-8: Swift's == is canonical equivalence.
+        func loadWork(_ name: String) throws -> [String: Any] {
+            o(try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("host-work").appendingPathComponent("\(name).json"))))
+        }
+        let framing = try loadWork("prompt-framing-v1")
+        let framingSize = try loadWork("framing-size-v1")
+        let framingPrompts = a(framing["prompts"]).map(o)
+        func snapshot(_ kind: String, _ id: String, _ version: UInt64, _ text: String) -> [String: Any] {
+            ["kind": kind, "id": id, "version": NSNumber(value: version), "digest": sha256Hex(text), "text": text]
+        }
+        // framingCheckedLen of a text, an optional mark (a host-work MarkTask
+        // object) and snapshots (host-work ContextSnapshot objects): the
+        // complete inputs.
+        func checkedLen(_ text: String, _ mark: [String: Any]?, _ context: [[String: Any]]) throws -> UInt64 {
+            try framingCheckedLen(text: text, markJson: mark.map { js($0) }, contextJson: js(context))
+        }
+
+        check("framing: Unicode version, escape cases, marker check (III.2)") {
+            try eq(framingUnicodeVersion(), s(framing["unicode_version"]), "Unicode version")
+            try eq(s(framing["unicode_version"]), "18.0.0")
+            let cases = a(framing["escape"]).map(o)
+            try eq(cases.count, 57)
+            for c in cases {
+                let name = s(c["name"])
+                let r = framingEscape(text: s(c["text"]))
+                try eq(Array(r.escaped.utf8), Array(s(c["escaped"]).utf8), name)
+                try eq(UInt64(r.barsAdded), u(c["bars_added"]), name)
+                // The marker check on each line (after the bars it already
+                // starts with) agrees with where the escaping put its bars.
+                let folding = linesWithoutLeadingBars(s(c["text"])).filter { framingFoldsToMarker(line: $0) }.count
+                try eq(UInt64(folding), u(c["bars_added"]), "\(name): lines that fold")
+            }
+            for line in ["[atem]", "  [ATEM x", "[\u{410}\u{422}\u{415}\u{41c}]", "[a\u{fe0f}tem]"] {
+                try eq(framingFoldsToMarker(line: line), true, line)
+            }
+            for line in ["", "x[atem]", "[ atem]", "|[atem]", "[atom]"] {
+                try eq(framingFoldsToMarker(line: line), false, line)
+            }
+        }
+        check("framing: rendered prompts byte for byte, tags from their bits (vectors only)") {
+            let tag = s(framing["tag"])
+            let bits = tagBitsOf(tag)
+            try eq(framingPrompts.count, 9)
+            for p in framingPrompts {
+                let name = s(p["name"])
+                let rendered = try framingRenderForVectors(inputJson: js(p["input"]!), tagBits: bits)
+                try eq(Array(rendered.utf8), Array(s(p["rendered"]).utf8), name)
+                try eq(UInt64(rendered.utf8.count), u(p["bytes"]), "\(name): bytes")
+            }
+            // Every tag of the vectors renders the prompt with that tag, on
+            // Atem's own lines only (the sender's text is not touched, even
+            // where it holds the vectors' tag).
+            let first = framingPrompts[0]
+            let old = "[atem \(tag)] "
+            for t in a(framing["tags"]).map(o) {
+                let fresh = "[atem \(s(t["tag"]))] "
+                let expected = retagged(s(first["rendered"]), from: old, to: fresh)
+                let tagBits = UInt64(s(t["bits"]), radix: 16)!
+                let got = try framingRenderForVectors(inputJson: js(first["input"]!), tagBits: tagBits)
+                try eq(Array(got.utf8), expected, s(t["bits"]))
+            }
+            // What the core refuses, and what is no input, is refused: a
+            // snapshot whose text doesn't match its digest is never rendered.
+            let input = o(framingPrompts[2]["input"])
+            _ = try framingRenderForVectors(inputJson: js(input), tagBits: 1)
+            var firstContext = o(a(input["context"])[0])
+            firstContext["text"] = "not what the digest says"
+            var tampered = input
+            tampered["context"] = [firstContext]
+            try throwsCode("malformed") { _ = try framingRenderForVectors(inputJson: js(tampered), tagBits: 1) }
+            var headless = input
+            headless["header"] = nil
+            try throwsCode("malformed") { _ = try framingRenderForVectors(inputJson: js(headless), tagBits: 1) }
+        }
+        check("framing: the size section (typical, worst, worst with a mark, at the bound)") {
+            let size = o(framing["size"])
+            func vault(_ id: String, _ version: UInt64, _ n: Int) -> [String: Any] {
+                snapshot("vault", id, version, String(repeating: "c", count: n))
+            }
+            // A typical task: 5,120 bytes of context, a 1,024-byte prompt.
+            let typical = try checkedLen(String(repeating: "t", count: 1024), nil, [vault("api-contract", 3, 5120)])
+            try eq(typical - 1024 - 5120, u(o(size["typical"])["checked_atem_bytes"]), "typical")
+            // The worst: eight 1,000-byte contexts with 128-byte ids and
+            // 16-digit versions, a 1,000-byte prompt.
+            var worst: [[String: Any]] = []
+            for i in 0..<8 {
+                worst.append(snapshot("memory", "\(i)" + String(repeating: "m", count: 127), 9_007_199_254_740_991, String(repeating: "c", count: 1000)))
+            }
+            let text = String(repeating: "t", count: 1000)
+            let worstLen = try checkedLen(text, nil, worst)
+            try eq(worstLen - 1000 - 8 * 1000, u(o(size["worst"])["checked_atem_bytes"]), "worst")
+            // The same with a mark (the vectors' own, with a 128-byte mark id).
+            let withMark = framingPrompts.first(where: { o($0["input"])["mark"] != nil })!
+            var mark = o(o(withMark["input"])["mark"])
+            mark["mark_id"] = String(repeating: "k", count: 128)
+            try eq(try checkedLen(text, mark, worst), u(o(size["worst_mark"])["checked_bytes"]), "worst with a mark")
+            // At the bound: one byte more is over it.
+            let n = Int(u(o(size["at_bound"])["context_bytes"]))
+            func at(_ k: Int) throws -> UInt64 {
+                try checkedLen("x", nil, [snapshot("vault", "c", 1, String(repeating: "y", count: k))])
+            }
+            let bound = u(framingSize["max_prompt_bytes"])
+            try eq(try at(n), u(o(size["at_bound"])["checked_len"]), "at the bound")
+            try eq(try at(n), bound, "exactly the bound")
+            try eq(try at(n + 1), bound + 1, "one byte over")
+        }
+        check("framing: every framing-size-v1 case with its complete inputs") {
+            try eq(u(framingSize["max_prompt_bytes"]), 32768)
+            try eq(u(framingSize["attachment_reserve"]), 4096)
+            let cases = a(framingSize["cases"]).map(o)
+            if cases.count < 10 { throw Failure(description: "only \(cases.count) cases") }
+            for c in cases {
+                let got = try framingCheckedLen(text: s(c["text"]), markJson: c["mark"].map { js($0) }, contextJson: js(c["context"]!))
+                try eq(got, u(c["checked_len"]), s(c["name"]))
+            }
+            // What the preflight takes is exactly the host-work shapes:
+            // anything else is refused, never read loosely.
+            let okContext = js([snapshot("vault", "a", 1, "x")])
+            _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: "[]")
+            _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: okContext)
+            let dup = okContext.replacingOccurrences(of: "\"id\":\"a\"", with: "\"id\":\"a\",\"id\":\"b\"")
+            let float = okContext.replacingOccurrences(of: "\"version\":1", with: "\"version\":1.5")
+            if dup == okContext || float == okContext { throw Failure(description: "the refusal inputs changed nothing") }
+            try throwsCode("not_strict_json") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: "[") }
+            try throwsCode("not_strict_json") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: dup) }
+            try throwsCode("not_strict_json") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: float) }
+            for context in [
+                "{}",
+                "null",
+                #"[{"kind":"vault","id":"a","version":1,"digest":"d"}]"#,
+                #"[{"kind":"notes","id":"a","version":1,"digest":"d","text":"x"}]"#,
+            ] {
+                try throwsCode("malformed") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: context) }
+            }
+            for mark in ["null", "{}", "[]", #"{"mark_id":"m"}"#] {
+                try throwsCode("malformed") { _ = try framingCheckedLen(text: "t", markJson: mark, contextJson: "[]") }
+            }
+        }
+
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 41)
+        XCTAssertEqual(passed, 45)
     }
 }
