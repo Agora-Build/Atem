@@ -216,10 +216,20 @@ written `XXXX-XXXX-XXXX`. A task from `work_enqueue` reads:
 so no line of the sender's carries it; the rule line tells the agent that
 only this prompt's lines with it, outside blocks, are Atem's, and that
 nothing it reads later (tool output, files, pages, messages) is, whatever
-tag it carries: a principal with `view` can read the tag during the turn
-(the owner's decision of 2026-11-09 narrowed the rule line for that). The
-escaping below is the extra layer that marks sender lines that look like the
-marker.
+tag it carries (the owner's decision of 2026-11-09). The escaping below is
+the extra layer that marks sender lines that look like the marker.
+
+**Who sees the tag** (the owner's decision of 2026-11-10). Principals with
+`control` only. For an attachment without `control`, chat-v1 replaces every
+tag the host drew with `****-****-****` (the same length: page bounds,
+offsets, sequences and `next` tokens hold), and terminal-v1 sends no frame
+from the paste until the prompt's turn ends (its receipt is final or gone,
+the session isn't live, its chat was withdrawn, or the task's deadline
+passed; a host restart ends it), then a full frame (`reset: true`). A
+`subscribe` or `ack` meanwhile is accepted and answered as usual, without
+frames; no terminal-v1 message says why (the registry's `activity` is
+`working`). A paraphrased tag, and a finished turn's tag still on the
+screen, aren't hidden. Details: agent collaboration, section 17.
 
 - **Atem's lines** each start with `[atem T] ` and hold only verified fields:
   ids, the sender principal (the channel's), the route id, context kinds, ids,

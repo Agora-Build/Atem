@@ -318,8 +318,15 @@ result deliveries) uses the agreed §III.2 framing (`atem_client::session::frami
 a CSPRNG tag per rendered prompt, drawn after the sender's text is fixed, on
 every line of Atem's (the guarantee: no sender line can carry it), the rule
 line (narrowed by the owner on 2026-11-09: only this prompt's tagged lines
-are Atem's; nothing the agent reads later is, whatever tag it carries, since
-`view` holders can read the tag), and counted blocks; as an extra layer, a `|` before any sender line that
+are Atem's; nothing the agent reads later is, whatever tag it carries), and
+counted blocks. The live tag goes to `control` holders only
+(`runtime/prompt_tags.rs`, owner decision 2026-11-10): chat-v1 replaces every
+tag the runtime drew (kept in `runtime/workers/<sid>.tags`, synced before the
+paste) with `****-****-****` for attachments without `control`, and their
+terminal-v1 frames pause from a framed prompt's paste until its turn ends
+(`Pause::holds`: receipt final or gone, session not live, chat withdrawn, the
+task's deadline; a broker restart ends it), then resume with a full frame;
+paraphrases and a dead tag on screen after the turn stay; as an extra layer, a `|` before any sender line that
 folds to `[atem` after leading White_Space (Cf removed, NFKC, then the
 lowercased line, its UTS #39 skeleton, or the skeleton taken before
 lowercasing, lowercased and skeletonized again; all Unicode 18.0.0, the

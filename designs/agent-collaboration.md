@@ -1231,12 +1231,40 @@ Stage 1 ships with these limits.
   after other text or punctuation (`> [atem`, `**[atem`), other brackets
   (`【atem`) or a combining mark after the bracket: those lines get no `|`,
   can't carry the prompt's tag, and the rule line tells the agent that a line
-  with any other tag is never Atem's. A principal with `view` reads the tag
-  in chat history and on the terminal, during the turn too; escaping marks it
-  in later sender text, and the rule line says nothing the agent reads after
-  the prompt (tool output, files, pages, messages) is Atem's, whatever tag
-  it carries. The tag isn't yet withheld from principals without `control`
-  (an open item: the terminal's frames can't be redacted soundly). A task accepted by an earlier build keeps the prompt it
+  with any other tag is never Atem's. The live tag is for the agent and for
+  principals with `control` (the owner's decision of 2026-11-10;
+  `runtime/prompt_tags.rs`):
+  - **Redacted in chat-v1.** Every tag this runtime drew for a prompt it
+    pasted is replaced by `****-****-****`, of the same length, in all that
+    chat-v1 serves to an attachment without `control`: live messages,
+    history pages, lookups and snapshot replays, the user messages and
+    verbatim echoes in assistant and tool parts. Counts, offsets, sequences
+    and `next` tokens hold (the tokens bind positions, not text; nothing a
+    client checks hashes the text). The tags are kept per session in
+    `runtime/workers/<session>.tags`, written and synced before the prompt
+    is pasted, so a restarted broker hides them too; a file it can't read
+    hides every tag-shaped string of that session.
+  - **Paused on terminal-v1.** Frames are the agent's own rendering (it
+    wraps, splits or truncates the prompt), so no frame goes to an
+    attachment without `control` from a framed prompt's paste until its
+    turn ends: its receipt completed (done or interrupted), was rejected
+    (refused, or not taken by the agent in time), or its outcome is unknown,
+    or the receipt is gone; the session is no longer live (the agent exited,
+    its worker went away, the session stopped); its chat was withdrawn (no
+    turn end will come); or, the bounded fallback, the task's deadline
+    passed. A `subscribe` or `ack` meanwhile is accepted; terminal-v1 has no
+    message that says why the frames wait (the registry's `activity` reads
+    `working`), and none was added. Then the stream resumes with a full
+    frame (`reset`), as a new subscription's first.
+  - **What stays.** A tag the agent paraphrases (rather than repeats) isn't
+    hidden. Once the turn ended, its dead tag can show on the terminal (the
+    rule line makes it worthless then). The pause lives in memory: a broker
+    restart mid-turn ends it (the prompt's outcome becomes unknown) though
+    the adopted worker's turn may still run. An agent that copies its own
+    live tag into a reply shows it on the sending session's terminal once
+    that session's own pause ended (chat-v1 hides it, for every session).
+    Principals with `control`, the local frontends, the session logs and the
+    journal keep the real text. A task accepted by an earlier build keeps the prompt it
   stored, which for a remote message held the old `[Message … from …]` header
   and mark lines: it is shown inside the prompt block, as the sender's text.
 - **Vault context with encryption on.** Vault context is taken only while the

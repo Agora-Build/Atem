@@ -229,11 +229,15 @@ owner's local consent in `runtime.toml`.
   framed (a tag per prompt, counted blocks, look-alikes of its marker escaped;
   the delegated host-work design, III.2, and host-work v1 §4 "Rendering"), so
   sender text can't imitate them; a principal with `control` can still write
-  anything directly (agent collaboration, section 17). A principal with
-  `view` can read a prompt's tag in chat history and on the terminal during
-  the turn; the rule line tells the agent that nothing it reads after the
-  prompt is Atem's, whatever tag it carries. The tag isn't yet withheld from
-  principals without `control` (an open item).
+  anything directly (agent collaboration, section 17). The live tag goes to
+  principals with `control` only: chat-v1 replaces every tag Atem drew with a
+  same-length placeholder for attachments without `control`, and their
+  terminal-v1 frames pause from a framed prompt's paste until its turn ends
+  (completed, interrupted, rejected, outcome unknown, the agent or its worker
+  gone, the chat withdrawn, or the task's deadline), then resume with a full
+  frame. A paraphrased tag, and a dead tag on the screen after its turn,
+  stay visible; the rule line tells the agent that nothing it reads after the
+  prompt is Atem's, whatever tag it carries (section 17 has the details).
 
 ## 5. Remote launch
 
