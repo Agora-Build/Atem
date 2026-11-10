@@ -1,11 +1,13 @@
 //! Shared byte-oriented PTY transport. Terminal data and lifecycle events never mix.
 use anyhow::{Result, anyhow, bail};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const MAX_INPUT: usize = 16 * 1024;
@@ -329,8 +331,25 @@ fn stop_child(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>) {
     });
 }
 
+impl Process {
+    /// Output stopped with ^S (`IXON`) started again, as ^Q would. The
+    /// session holds the slave until the child's output was read
+    /// ([`SlaveHold`]), so on macOS an agent that exits with its output
+    /// stopped waits in the kernel until it is read: a stop never leaves it
+    /// there.
+    fn restart_output(&self) {
+        if let Ok(master) = self.master.lock()
+            && let Some(fd) = master.as_raw_fd()
+        {
+            // SAFETY: `fd` is the master, open while `master` is borrowed.
+            unsafe { libc::tcflow(fd, libc::TCOON) };
+        }
+    }
+}
+
 impl Drop for Process {
     fn drop(&mut self) {
+        self.restart_output();
         stop_child(self.child.clone());
     }
 }
@@ -358,6 +377,7 @@ impl PtyHandle {
     }
 
     pub fn stop(&self) -> Result<()> {
+        self.0.restart_output();
         stop_child(self.0.child.clone());
         Ok(())
     }
@@ -430,7 +450,104 @@ impl std::fmt::Debug for SpawnSpec {
     }
 }
 
+/// The child's output, every byte it wrote before its exit, comes before
+/// its `Exit`, on Linux and macOS alike ([`SlaveHold`]).
 pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
+    spawn_reading_after(spec, Duration::ZERO)
+}
+
+/// Keeps a child's last output readable. On macOS, when the slave's last
+/// descriptor closes, the kernel waits 0.6 s for the master to read what is
+/// left (`ptsclose` drains with `t_timeout = 60` ticks), then discards it,
+/// and the master reads EOF: a reader late by that much (a busy host) lost
+/// everything a child wrote just before it exited. The session holds a
+/// slave descriptor until the child exited and the master has nothing left
+/// to read, so the child's exit is never that last close: a session leader's
+/// exit (the agent's) drains its terminal with no time limit, then revokes
+/// it, and the master reads EOF once it read everything. Linux keeps the
+/// output readable after the last close (EIO only once it was read), so
+/// there the hold only delays EIO until the exit was seen.
+struct SlaveHold {
+    /// The parent's slave descriptor (close-on-exec).
+    _slave: Box<dyn SlavePty + Send>,
+    /// Readable once the child exited ([`watch_exit`]).
+    exited: std::io::PipeReader,
+}
+
+/// Writes a byte to `exited` once the child `pid` exited. `WNOWAIT` leaves
+/// it a zombie, so `Child::try_wait` still reaps it and reads its status;
+/// any error (ECHILD: reaped already, by `stop_child` or the reader) counts
+/// as exited. Only a reap before this thread's `waitid` and the pid reused
+/// for another child of this process in between (pids are recycled after
+/// the whole range) could make it wait for the wrong process.
+fn watch_exit(pid: u32, mut exited: std::io::PipeWriter) -> std::io::Result<()> {
+    std::thread::Builder::new().spawn(move || {
+        loop {
+            // SAFETY: a zeroed `siginfo_t` is valid for `waitid` to fill.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: plain syscall on our own child's pid with a valid out
+            // pointer.
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if waited == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+        // A byte, not only the closed end: a copy of this end another child
+        // inherited (a fork before close-on-exec was set) can't keep the
+        // reader waiting. The reader may have ended already (macOS: EOF at
+        // the exit): EPIPE, as Rust ignores SIGPIPE.
+        let _ = exited.write_all(&[1]);
+    })?;
+    Ok(())
+}
+
+/// While the slave is held: waits until the master has something to read
+/// (`true`: output, or the EOF/EIO a macOS session leader's exit leads to)
+/// or the child exited with nothing left to read (`false`: let the slave
+/// go). Output first, so after the exit the master is read dry before the
+/// slave goes. `false` too if it can't wait (plain reads, as without a hold).
+fn output_before_exit(master: RawFd, exited: RawFd) -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: exited,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: `fds` is a valid array of two pollfds for the call.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if fds[0].revents != 0 {
+            return true;
+        }
+        if fds[1].revents != 0 {
+            return false;
+        }
+    }
+}
+
+/// [`spawn_spec`], its reader starting `read_delay` late (tests: a reader
+/// slower than macOS's 0.6 s at the slave's last close).
+fn spawn_reading_after(spec: SpawnSpec, read_delay: Duration) -> Result<PtySession> {
     let SpawnSpec {
         binary,
         args,
@@ -465,10 +582,28 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
     command.env("TERM_PROGRAM", "Atem");
     command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     command.env("FORCE_COLOR", "1");
-    let child = Arc::new(Mutex::new(pair.slave.spawn_command(command)?));
-    drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader()?;
+    // The reader's own master descriptor (read and polled), the exit pipe
+    // and the writer: made before the child, so no failure leaves it behind.
+    let master_fd = pair
+        .master
+        .as_raw_fd()
+        .ok_or_else(|| anyhow!("the PTY master has no descriptor"))?;
+    // SAFETY: `master_fd` is the master's, open while `pair.master` lives.
+    let mut reader =
+        std::fs::File::from(unsafe { BorrowedFd::borrow_raw(master_fd) }.try_clone_to_owned()?);
+    let (exited, exit_signal) = std::io::pipe()?;
     let mut writer = pair.master.take_writer()?;
+    let child = Arc::new(Mutex::new(pair.slave.spawn_command(command)?));
+    let pid = child.lock().unwrap().process_id();
+    let hold = if pid.is_some_and(|pid| watch_exit(pid, exit_signal).is_ok()) {
+        Some(SlaveHold {
+            _slave: pair.slave,
+            exited,
+        })
+    } else {
+        drop(pair.slave);
+        None
+    };
     let handle = PtyHandle(Arc::new(Process {
         master: Mutex::new(pair.master),
         child: child.clone(),
@@ -499,8 +634,20 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
         }
     });
     std::thread::spawn(move || {
+        if !read_delay.is_zero() {
+            std::thread::sleep(read_delay);
+        }
+        let mut hold = hold;
         let mut buf = [0; 4096];
         loop {
+            if let Some(held) = &hold
+                && !output_before_exit(reader.as_raw_fd(), held.exited.as_raw_fd())
+            {
+                // The child exited and everything it wrote was read: the
+                // master ends (EOF/EIO) once no other process holds the
+                // slave (its tools).
+                hold = None;
+            }
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -513,7 +660,7 @@ pub fn spawn_spec(spec: SpawnSpec) -> Result<PtySession> {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 // Linux reports PTY EOF as EIO.
-                Err(e) if e.raw_os_error() == Some(5) => break,
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
                 Err(e) => {
                     let _ = output.blocking_send(PtyEvent::Error(e.to_string()));
                     break;
@@ -804,6 +951,59 @@ mod tests {
             }
         }
         assert_eq!(output, b"Codex CLI exited with status fake");
+    }
+
+    /// The output up to `Exit`; any other event fails.
+    async fn all_output_then_exit(mut session: PtySession) -> String {
+        let mut output = Vec::new();
+        loop {
+            match tokio::time::timeout(WAIT, session.receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                PtyEvent::Output(bytes) => output.extend(bytes),
+                PtyEvent::Exit(_) => return String::from_utf8(output).unwrap(),
+                event => panic!("unexpected {event:?}"),
+            }
+        }
+    }
+
+    /// macOS discards what the master hasn't read 0.6 s after the slave's
+    /// last close: the session holds the slave until the child exited and
+    /// its output was read, so a reader that starts well after a child
+    /// wrote and exited still gets every byte, then `Exit`. (On Linux the
+    /// output stays readable anyway; this runs the release of the hold.)
+    #[tokio::test]
+    async fn a_late_reader_still_gets_everything_a_child_wrote_before_it_exited() {
+        let spec = SpawnSpec {
+            binary: "printf".into(),
+            args: vec!["written just before the exit".into()],
+            cwd: std::env::temp_dir(),
+            env: None,
+            rows: 24,
+            cols: 80,
+        };
+        let session = spawn_reading_after(spec, Duration::from_millis(1500)).unwrap();
+        assert_eq!(
+            all_output_then_exit(session).await,
+            "written just before the exit"
+        );
+    }
+
+    /// Many children that write and exit at once, read concurrently: each
+    /// one's whole output comes before its `Exit`.
+    #[tokio::test]
+    async fn every_short_lived_child_has_its_whole_output_before_its_exit() {
+        let sessions: Vec<_> = (0..16)
+            .map(|i| spawn("printf", &[format!("child {i} wrote this")]).unwrap())
+            .collect();
+        for (i, session) in sessions.into_iter().enumerate() {
+            assert_eq!(
+                all_output_then_exit(session).await,
+                format!("child {i} wrote this")
+            );
+        }
     }
 
     #[tokio::test]
