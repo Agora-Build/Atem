@@ -104,6 +104,8 @@ impl Action {
                 json!({"target": target.to_hex()})
             }
             Action::KBackup(record) => json!({"k_backup": record.to_json()}),
+            Action::ProjectSet { project } => json!({"project": project.to_json()}),
+            Action::ProjectRemove { name } => json!({"name": name}),
         };
         match value {
             Value::Object(map) => map,
@@ -173,6 +175,23 @@ pub fn sign_entry_cosigned(
     let mut object = SignedObject::sign(provider, key, body)?;
     object.cosign(kit, kit_key)?;
     Entry::parse(object)
+}
+
+/// The action as the verifier parses it, for the typed builders (services,
+/// projects): drafted on a placeholder chain position (account, `seq`,
+/// hashes and signer don't affect the action's own rules) at `signed_at`
+/// (a service's expiry bound counts from it), then [`check_body`].
+pub(super) fn verified(action: Action, signed_at: u64) -> Result<Action, Invalid> {
+    let body = draft_on(
+        "draft-check",
+        &Hash32([0; 32]),
+        2,
+        &Hash32([0; 32]),
+        "draft-check",
+        signed_at,
+        &action,
+    );
+    Ok(check_body(&body)?.action)
 }
 
 /// The verifier's structural check of an unsigned body (`draft`'s output):

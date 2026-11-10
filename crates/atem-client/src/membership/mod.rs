@@ -52,6 +52,7 @@ use crate::signed::SignedObject;
 pub mod capacity;
 pub mod draft;
 pub mod entry;
+pub mod projects;
 pub mod publish;
 pub mod service;
 pub mod stored;
@@ -65,6 +66,10 @@ pub use draft::{check_body, draft_on, sign_entry, sign_entry_cosigned};
 pub use entry::{
     Action, Entry, HostRecord, KBackupRecord, KitMode, Member, MemberKind, RECOVERY_SIGNER, Role,
     RolesChange, Scope,
+};
+pub use projects::{
+    MAX_PROJECT_HOSTS, MAX_PROJECT_NAME, MIN_PROJECT_HOSTS, Project, ProjectOp, project_name_ok,
+    project_remove, project_set,
 };
 pub use service::{
     ServiceChangeError, ServiceScope, service_add, service_grant, service_key_fingerprint,
@@ -130,7 +135,8 @@ pub enum Invalid {
     /// A service `expires_at` more than 90 days after `signed_at`.
     ServiceExpiry,
     BadScope,
-    /// `remove_host` of a host that isn't current.
+    /// A host that isn't current where the action needs one: a
+    /// `remove_host` of it, or a `project_set` listing it.
     NotAHost,
     /// `add_host` whose `host_trust_gen` isn't above every earlier one.
     HostTrustGenNotIncreasing,
@@ -143,6 +149,12 @@ pub enum Invalid {
     BlobVersionNotIncreasing,
     /// A `k_backup` naming a kit that is neither current nor pending.
     KBackupKitNotCurrent,
+    /// A `project_set` or `project_remove` outside a project's rules (the
+    /// name grammar, 2 to 64 host ids, a non-empty set of the four ops,
+    /// `notify` only with `message` and `prompt`; II.2.2).
+    BadProject,
+    /// A `project_remove` of a name no project in effect has.
+    NotAProject,
     /// The log (or its member or host list) is full.
     LogFull,
     /// More than 64 entries or 256 KiB in one carriage.
@@ -183,6 +195,8 @@ impl Invalid {
             Invalid::SelfApproval => "self_approval",
             Invalid::BlobVersionNotIncreasing => "blob_version_not_increasing",
             Invalid::KBackupKitNotCurrent => "k_backup_kit_not_current",
+            Invalid::BadProject => "bad_project",
+            Invalid::NotAProject => "not_a_project",
             Invalid::LogFull => "log_full",
             Invalid::CarriageTooLarge => "carriage_too_large",
         }
@@ -450,6 +464,15 @@ pub enum Effect {
     KBackupRecorded {
         blob_version: u64,
     },
+    /// A project's new state took effect (II.2.2): host-work re-evaluates
+    /// the unstarted tasks of the senders it affects (step 4).
+    ProjectSet {
+        name: String,
+    },
+    /// A project ended (II.2.2).
+    ProjectRemoved {
+        name: String,
+    },
     /// Atem's veto at the head was replaced by an equivalent one (§R9.4 row 1).
     VetoReplaced(Head),
     Evidence(EvidenceReason),
@@ -473,7 +496,8 @@ struct HostState {
 }
 
 /// What follows from a chain prefix: members, hosts, keys, the newest K
-/// backup. Pure function of the entries and the recorded decisions.
+/// backup, projects. Pure function of the entries and the recorded
+/// decisions.
 #[derive(Debug, Clone, PartialEq)]
 struct Derived {
     members: BTreeMap<String, MemberState>,
@@ -484,6 +508,7 @@ struct Derived {
     /// `kit: "lost"` replacements still pending: (entry hash, new key).
     pending_keys: Vec<(Hash32, PublicKey)>,
     k_backup: Option<KBackupRecord>,
+    projects: projects::Projects,
 }
 
 impl Derived {
@@ -511,6 +536,7 @@ impl Derived {
             used_keys: vec![recovery_key.clone()],
             pending_keys: Vec::new(),
             k_backup: None,
+            projects: projects::Projects::default(),
         }
     }
 
@@ -576,6 +602,7 @@ impl Derived {
                 if let Some(host) = self.hosts.get_mut(host_id) {
                     host.removed = true;
                 }
+                self.projects.host_removed(host_id);
             }
             Action::SetRecoveryKey { recovery_key, kit } => {
                 self.used_keys.push(recovery_key.clone());
@@ -586,6 +613,8 @@ impl Derived {
             }
             Action::RecoveryApprove { .. } | Action::RecoveryVeto { .. } => {}
             Action::KBackup(record) => self.k_backup = Some(record.clone()),
+            Action::ProjectSet { project } => self.projects.set(project),
+            Action::ProjectRemove { name } => self.projects.remove(name),
         }
     }
 
@@ -1061,6 +1090,23 @@ impl Membership {
                     return Err(Invalid::KBackupKitNotCurrent);
                 }
             }
+            // II.2.2: every listed host current at `seq-1` (an `add_host`
+            // and no later `remove_host`); a removal needs a project in
+            // effect.
+            Action::ProjectSet { project } => {
+                if project
+                    .hosts
+                    .iter()
+                    .any(|h| d.hosts.get(h).is_none_or(|s| s.removed))
+                {
+                    return Err(Invalid::NotAHost);
+                }
+            }
+            Action::ProjectRemove { name } => {
+                if !d.projects.contains(name) {
+                    return Err(Invalid::NotAProject);
+                }
+            }
         }
         Ok(deferred)
     }
@@ -1123,6 +1169,12 @@ impl Membership {
             Action::KBackup(record) => effects.push(Effect::KBackupRecorded {
                 blob_version: record.blob_version,
             }),
+            Action::ProjectSet { project } => effects.push(Effect::ProjectSet {
+                name: project.name.clone(),
+            }),
+            Action::ProjectRemove { name } => {
+                effects.push(Effect::ProjectRemoved { name: name.clone() })
+            }
             _ => {}
         }
         let pending = entry.action.is_pending_type();

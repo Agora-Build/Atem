@@ -5,7 +5,8 @@
 //! exactly the fields of its action (no unknown field anywhere in the body,
 //! §R9.1), the fixed algorithm of every key inside it (`auth_key` P-256 or
 //! Ed25519, `enc_key` X25519, `host_key` and `recovery_key` Ed25519), id
-//! syntax, roles, scope and service expiry, and who may sign which action.
+//! syntax, roles, scope and service expiry, a project's shape
+//! ([`super::projects`]), and who may sign which action.
 //! Rules that need the chain (signer authority, ids never reused, version
 //! floors) are [`super::Membership`]'s.
 use std::collections::BTreeSet;
@@ -20,6 +21,7 @@ use crate::keys::{Alg, PublicKey};
 use crate::signed::SignedObject;
 
 use super::Invalid;
+use super::projects::{Project, project_name};
 
 /// The reserved signer of `recovery_add` (no device id may equal it).
 pub const RECOVERY_SIGNER: &str = "recovery";
@@ -195,6 +197,14 @@ pub enum Action {
         target: Hash32,
     },
     KBackup(KBackupRecord),
+    /// A project's whole new state (delegated host-work design II.2.2).
+    ProjectSet {
+        project: Project,
+    },
+    /// Ends the project `name` (one in effect).
+    ProjectRemove {
+        name: String,
+    },
 }
 
 impl Action {
@@ -211,6 +221,8 @@ impl Action {
             Action::RecoveryApprove { .. } => "recovery_approve",
             Action::RecoveryVeto { .. } => "recovery_veto",
             Action::KBackup(_) => "k_backup",
+            Action::ProjectSet { .. } => "project_set",
+            Action::ProjectRemove { .. } => "project_remove",
         }
     }
 
@@ -276,6 +288,8 @@ impl Entry {
             "set_recovery_key" => &["recovery_key", "kit"],
             "recovery_approve" | "recovery_veto" => &["target"],
             "k_backup" => &["k_backup"],
+            "project_set" => &["project"],
+            "project_remove" => &["name"],
             _ => return Err(Invalid::Malformed("unknown action")),
         };
         const COMMON: [&str; 9] = [
@@ -433,6 +447,12 @@ impl Entry {
                     backup_hash: hash_value(field(record, "backup_hash")?, "backup_hash")?,
                 })
             }
+            "project_set" => Action::ProjectSet {
+                project: Project::parse(field(body, "project")?)?,
+            },
+            "project_remove" => Action::ProjectRemove {
+                name: project_name(str_field(body, "name")?)?,
+            },
             _ => unreachable!("matched above"),
         };
 
@@ -487,11 +507,17 @@ impl Entry {
     }
 }
 
-fn field<'a>(object: &'a Map<String, Value>, name: &'static str) -> Result<&'a Value, Invalid> {
+pub(super) fn field<'a>(
+    object: &'a Map<String, Value>,
+    name: &'static str,
+) -> Result<&'a Value, Invalid> {
     object.get(name).ok_or(Invalid::Malformed(name))
 }
 
-fn str_field<'a>(object: &'a Map<String, Value>, name: &'static str) -> Result<&'a str, Invalid> {
+pub(super) fn str_field<'a>(
+    object: &'a Map<String, Value>,
+    name: &'static str,
+) -> Result<&'a str, Invalid> {
     field(object, name)?
         .as_str()
         .ok_or(Invalid::Malformed(name))
@@ -512,7 +538,7 @@ fn hash_value(value: &Value, name: &'static str) -> Result<Hash32, Invalid> {
 
 /// Every key of `object` is in `allowed` (§R9.1: no unknown fields in a
 /// signed body). Required fields are checked where they are read.
-fn only_fields(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), Invalid> {
+pub(super) fn only_fields(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), Invalid> {
     if object.keys().all(|key| allowed.contains(&key.as_str())) {
         Ok(())
     } else {
@@ -539,7 +565,7 @@ fn device_id(value: &Value) -> Result<String, Invalid> {
 
 /// A set of strings (the signed-object parse already checked order and
 /// uniqueness).
-fn string_set(value: &Value, name: &'static str) -> Result<Vec<String>, Invalid> {
+pub(super) fn string_set(value: &Value, name: &'static str) -> Result<Vec<String>, Invalid> {
     value
         .as_array()
         .ok_or(Invalid::Malformed(name))?

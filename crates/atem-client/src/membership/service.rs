@@ -6,10 +6,10 @@
 //! as a set (sorted by bytes, no duplicates, §R9.2's canonical order) and
 //! always holds `view`; each builder makes the crate's own [`Action`],
 //! drafts it with the crate's drafter and runs the verifier's structural
-//! parse over the body ([`check_body`]), so a builder returns only an
-//! action whose entry the verifier accepts for its shape (bounds, id and
-//! hash syntax, ops, the 90-day expiry), or the verifier's own
-//! [`Invalid`].
+//! parse over the body ([`check_body`](super::check_body)), so a builder
+//! returns only an action whose entry the verifier accepts for its shape
+//! (bounds, id and hash syntax, ops, the 90-day expiry), or the verifier's
+//! own [`Invalid`].
 //!
 //! The renewal and narrowing helpers start from the service's current
 //! grant in a verified log. Pair them with [`super::check_change`] before
@@ -17,12 +17,11 @@
 //! a narrowing never is.
 use std::collections::BTreeSet;
 
-use crate::encoding::Hash32;
 use crate::error::Error;
 use crate::keys::{Alg, PublicKey};
 
 use super::capacity::narrows;
-use super::draft::{check_body, draft_on};
+use super::draft::verified;
 use super::entry::{Action, Member, MemberKind, RolesChange, Scope};
 use super::{Invalid, MemberStatus, Membership};
 
@@ -166,23 +165,6 @@ impl From<Invalid> for ServiceChangeError {
     fn from(i: Invalid) -> Self {
         ServiceChangeError::Invalid(i)
     }
-}
-
-/// The action as the verifier parses it: drafted on a placeholder chain
-/// position (account, `seq`, hashes and signer don't affect the action's
-/// own rules) at `signed_at` (the expiry bound counts from it), then
-/// [`check_body`].
-fn verified(action: Action, signed_at: u64) -> Result<Action, Invalid> {
-    let body = draft_on(
-        "service-check",
-        &Hash32([0; 32]),
-        2,
-        &Hash32([0; 32]),
-        "service-check",
-        signed_at,
-        &action,
-    );
-    Ok(check_body(&body)?.action)
 }
 
 /// The `add` of a service member: `auth_key` (P-256 or Ed25519, the bot's
@@ -345,7 +327,9 @@ pub fn service_key_fingerprint_of_add(action: &Action) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::Hash32;
     use crate::keys::Alg;
+    use crate::membership::draft::draft_on;
     use crate::membership::entry::SERVICE_MAX_LIFETIME_MS;
     use crate::membership::{ChangeRefusal, check_change};
 

@@ -183,6 +183,8 @@ pub(crate) fn effect_info(effect: &Effect) -> MembershipEffect {
         Effect::KBackupRecorded { blob_version } => MembershipEffect::KBackupRecorded {
             blob_version: *blob_version,
         },
+        Effect::ProjectSet { name } => MembershipEffect::ProjectSet { name: name.clone() },
+        Effect::ProjectRemoved { name } => MembershipEffect::ProjectRemoved { name: name.clone() },
         Effect::VetoReplaced(h) => MembershipEffect::VetoReplaced { head: (*h).into() },
         Effect::Evidence(reason) => MembershipEffect::Evidence {
             reason: reason.as_str().into(),

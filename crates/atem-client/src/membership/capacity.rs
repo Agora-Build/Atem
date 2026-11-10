@@ -182,7 +182,10 @@ impl std::error::Error for ChangeRefusal {}
 ///   [`SERVICE_CHANGE_MIN_INTERVAL_MS`] of that service's last grant (its
 ///   `add` or a `set_roles` that granted something new) is refused; one
 ///   that only narrows is never rate-limited, nor is `remove`. A last grant
-///   signed after `now_ms` counts as within the interval.
+///   signed after `now_ms` counts as within the interval;
+/// - project entries (`project_set`, `project_remove`, delegated host-work
+///   II.2.2) take one entry each and are never paced: a project adds no
+///   member or host.
 ///
 /// Scope lists are compared as the verifier holds them: canonical (sorted,
 /// unique), as every parsed entry and the bindings' `action_json` are. A
@@ -236,6 +239,7 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
                 _ => Ok(()),
             }
         }
+        Action::ProjectSet { .. } | Action::ProjectRemove { .. } => Ok(()),
         _ => Ok(()),
     }
 }

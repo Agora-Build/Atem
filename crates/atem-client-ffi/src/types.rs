@@ -293,6 +293,8 @@ data_enum! {
         RecoveryCancelled { entry_hash: String, reason: String },
         RecoveryKeyReplaced,
         KBackupRecorded { blob_version: u64 },
+        ProjectSet { name: String },
+        ProjectRemoved { name: String },
         VetoReplaced { head: LogHead },
         Evidence { reason: String },
         Frozen,
