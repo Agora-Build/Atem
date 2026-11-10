@@ -588,6 +588,10 @@ fn a_framed_crypt_dropped_unanswered_goes_once_more_as_a_frame() {
     assert_eq!(Proxy::count(&proxy.passed(), "crypt"), 2);
     assert_eq!(client.traffic().frames(), 3);
     assert_eq!(proxy.frames(), 3);
+    // The dropped connection was closed, not only shut down (on macOS a
+    // shutdown alone can leave the client's read asleep until its reply
+    // wait ends: EAGAIN, a timeout, never resent); the kept one is open.
+    assert!(eventually(|| proxy.open() == 1), "{}", proxy.open());
 }
 
 #[test]
