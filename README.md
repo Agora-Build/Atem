@@ -440,7 +440,7 @@ agent runs. Sending, result prompts and automatic launch are off by default.
 
 See the [collaboration design](designs/agent-collaboration.md) and
 [runtime sample](configs/runtime.example.toml). This stage is local and
-unreleased; cross-instance delivery is planned separately.
+released in v0.8.5; cross-instance delivery is planned separately.
 
 ### Vault (shared cross-agent context)
 

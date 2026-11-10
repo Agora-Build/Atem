@@ -23,7 +23,7 @@ implemented)", and a design with nothing built says so in its status line.
 | [agent-chat-host.md](agent-chat-host.md) | Agent chat (chat-v1) on the host: Claude and Codex adapters, status, approvals |
 | [agent-chat-api.md](agent-chat-api.md) | Developer guide for chat clients |
 | [agent-hosting.md](agent-hosting.md) | Remote launch from `runtime.toml` profiles, messages, notices, directed work and Chisel/mark on the host |
-| [agent-collaboration.md](agent-collaboration.md) | Stage 1: local selectors and tags, durable messages, verified context, correlated results and optional launch on message (unreleased) |
+| [agent-collaboration.md](agent-collaboration.md) | Stage 1: local selectors and tags, durable messages, verified context, correlated results and optional launch on message (released in v0.8.5) |
 | [astation-connection.md](astation-connection.md) | How Atem reaches Astation: local then relay, authentication, pairing, relay only, Stations |
 | [account-trust.md](account-trust.md) | Account trust for r9: the signed device list, recovery, the Recovery Kit |
 | [e2e-encryption.md](e2e-encryption.md) | End-to-end encryption of memory, skills and vault; credentials (`atem cred get`, planned) |
