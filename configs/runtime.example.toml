@@ -5,9 +5,39 @@
 #
 # Fill in approved profiles/routes below, then explicitly set enabled = true.
 # Healthy enabled hosting keeps the runtime online with zero agent sessions.
-# This does not install a boot service or start coding agents automatically.
+# Boot startup needs a separately installed service. Local collaboration may
+# launch an agent only when its route explicitly sets launch = "on_message"
+# (a Claude Code profile) and the sender asks with `atem message send --launch`.
 version = 1
 enabled = false
+
+# -- Local agent collaboration (optional, off by default) ----------------------
+# Owner labels address agents, never authorize work. Names use 1-32 lowercase
+# ASCII letters, digits or hyphens. At most 64 labels per instance or route.
+# Agents may add only their own self: labels with `atem agent tag`.
+# [instance]
+# labels = ["project:backend", "tag:workstation"]
+#
+# [collab]
+# send = false            # true: agents may send local work to routes that
+#                         # list "local". Security is at user authentication:
+#                         # only your device list's members (by route or
+#                         # control) and your own user's processes reach an
+#                         # agent, each request bound to its sender and checked
+#                         # again before it runs, remote ones over end-to-end
+#                         # channels. Whoever may reach an agent acts through
+#                         # it as you: its sends are "local" and reach every
+#                         # route that lists "local". The agent's own tool
+#                         # approvals still apply. That holds with a pinned
+#                         # device list: a host without one still serves r8
+#                         # over its Astation link, which is neither end to
+#                         # end nor authenticated at Atem's end, so
+#                         # collaboration doesn't run there (run
+#                         # `atem pair verify`). Vault context needs your
+#                         # account's end-to-end encryption on.
+# per_hour = 30
+# per_workflow = 8        # messages per workflow, however many agents each reaches
+# result_timeout = "30m"  # 1s-24h; automatic status never completes a task
 
 # -- Who may launch and send work ---------------------------------------------
 # A profile or route that lists no `principals` is open to the Astation this
@@ -72,8 +102,9 @@ enabled = false
 # A route selects an approved profile and the principals allowed to send work.
 # Work targets an existing session matching that profile's project/provider/cwd.
 # A coordinator may explicitly launch a session first, then enqueue work.
-# Automatic launch-on-notification is not implemented. Busy agents, drafts,
-# approvals and active control leases hold work until safe delivery is possible.
+# Remote launch-on-notification is not implemented. Local collaboration can
+# opt in per route (below). Busy agents, drafts, approvals and active control
+# leases hold work until safe delivery is possible.
 # Increase revision when changing a route's approvals or selected profile.
 #
 # [[routes]]
@@ -87,3 +118,21 @@ enabled = false
 # revision = 1
 # profile_id = "mobile-claude"
 # principals = ["member:YOUR_ASTATION_ID", "service:YOUR_SERVICE_ID"]  # optional; replaces the paired Astation
+#
+# Local collaboration requires explicit route consent: add "local" to that
+# route's principals. "local" is never valid in a profile's launch principals.
+# A route's own principals replaces the paired-Astation default: list
+# "member:YOUR_ASTATION_ID" beside "local" if the route should keep serving it.
+# These optional keys belong to a [[routes]] table:
+# labels = ["tag:mobile"]
+# launch = "off"          # "on_message": `atem message send --launch` may start
+#                         # this route's profile when no agent runs; Claude Code
+#                         # profiles only for now (a Codex route is refused)
+# results = false         # opt in to receive correlated results as agent input
+# auto_report = "status"  # "final_message" opts in to assistant-text reports
+#
+# Inside an Atem-launched agent, after enabling [collab] and route consent:
+#   atem message send --to tag:mobile "Review the mobile API contract"
+#   atem message reply --task TASK_ID "Contract verified"
+# Read progress with `atem message status MESSAGE_ID`.
+# See ../designs/agent-collaboration.md in the source tree for a full example.

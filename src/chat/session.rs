@@ -436,6 +436,24 @@ impl ChatSession {
         &self.generation
     }
 
+    /// The provider turn the session is in, if any.
+    pub fn current_turn_id(&self) -> Option<&str> {
+        self.current_turn.as_ref().map(|(id, _)| id.as_str())
+    }
+
+    /// The turn that ended last (done or interrupted).
+    pub fn last_completed_turn(&self) -> Option<&str> {
+        self.last_completed.as_deref()
+    }
+
+    /// The request id of the remote prompt that began the current turn
+    /// (none for one typed in the terminal).
+    pub fn current_request_id(&self) -> Option<&str> {
+        self.current_turn
+            .as_ref()
+            .and_then(|(_, request)| request.as_deref())
+    }
+
     /// This session's state with at most `max_messages` / `max_bytes` of
     /// its newest history.
     pub fn snapshot(&self, max_messages: usize, max_bytes: usize) -> ChatSnapshot {
@@ -2128,6 +2146,7 @@ mod tests {
                 State::Working,
                 "whole seconds {whole_seconds}"
             );
+            assert_eq!(s.current_request_id(), Some("r2"));
             // Turn 2's own end completes it, once.
             let o = pass(
                 &mut s,

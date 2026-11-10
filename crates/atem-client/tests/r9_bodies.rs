@@ -410,6 +410,15 @@ fn one_authority_check_per_request() {
         need("session", json!({"op": "message_query"})),
         Need::Op(Op::Message)
     );
+    // A reply is read with the authority that queried its task.
+    assert_eq!(
+        need("session", json!({"op": "reply_query"})),
+        need("session", json!({"op": "work_query"}))
+    );
+    assert_eq!(
+        need("session", json!({"op": "reply_query"})),
+        Need::Op(Op::Notify)
+    );
     assert!(!Op::Message.is_control());
     assert_eq!(
         need("terminal", json!({"op": "input"})),

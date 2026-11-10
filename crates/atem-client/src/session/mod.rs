@@ -15,14 +15,18 @@
 //!   §R9.8 (`membership`, `membership_head`, `revoke_grant`,
 //!   `grant_revoked`, `approval_seen`, `seen`);
 //! - [`host_policy`]: §R9.8a's relay-only policy (`host_policy_set`,
-//!   `host_policy_get`, `host_policy_result`) and the client's tracker.
+//!   `host_policy_get`, `host_policy_result`) and the client's tracker;
+//! - [`framing`]: the prompt framing sender text can't imitate (delegated
+//!   host-work design III.2): per-prompt tags, counted blocks, escaping.
 use rand_core::{OsRng, RngCore};
 
 pub mod chat;
 pub mod client;
+pub mod framing;
 pub mod host_policy;
 pub mod host_work;
 pub mod messages;
+pub mod select;
 pub mod attachments;
 pub mod mark;
 pub mod r9;

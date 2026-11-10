@@ -19,6 +19,30 @@ use crate::memory::store::{MEMORY_CURSOR, SKILL_CURSOR};
 const MEMORY_PUSH_CHUNK: usize = 50;
 const SKILL_PUSH_CHUNK: usize = 8;
 
+/// Publish the captured version, then verify exact decrypted bytes at the
+/// returned canonical id and sequence. Normalized memory hashes aren't proofs
+/// that the requested text was published unchanged.
+pub async fn push_memory_and_read_back(client: &KnowledgeClient, memory: &Memory) -> Result<atem_client::session::host_work::ContextSnapshot> {
+    use atem_client::session::host_work::{ContextKind, ContextSnapshot, digest};
+    let op = PendingOp::AddMemory { memory: memory.clone() };
+    // Sealed and posted at once as one batch: nothing sealed earlier waits.
+    let (_, sealed) = client.seal_ops(vec![op]).await?;
+    let wire: Vec<Value> = sealed.into_iter().map(|(_, wire)| wire).collect();
+    let results = client.post_ops(&wire, true).await?;
+    let result = results.first().filter(|r| results.len() == 1 && r.ok)
+        .ok_or_else(|| anyhow!("context publication refused"))?;
+    let id = result.canonical_id.as_deref().unwrap_or(&memory.id);
+    let seq = result.seq.filter(|n| *n > 0).ok_or_else(|| anyhow!("context publication missing sequence"))?;
+    let page = client.open_memories(client.fetch_memories(seq - 1).await?).await?;
+    let found = page.iter().find(|m| m.id == id && m.seq == seq)
+        .ok_or_else(|| anyhow!("published context not readable"))?;
+    if !found.is_valid() || found.content != memory.content { bail!("context changed"); }
+    let snapshot = ContextSnapshot { kind: ContextKind::Memory, id: id.into(), version: seq as u64,
+        digest: digest(found.content.as_bytes()), text: found.content.clone() };
+    if !snapshot.valid() { bail!("invalid context snapshot"); }
+    Ok(snapshot)
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct HarvestSummary {
     pub added: usize,

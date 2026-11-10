@@ -347,6 +347,101 @@ your own (a backup is kept as `hooks.json.atem-bak`); to turn them off later,
 set `hooks = false` under `[codex]` in `~/.config/atem/config.toml` — the next
 `atem agent launch codex` removes them. See the [session protocol](designs/protocol/atem-session-v1.md) for the details.
 
+### Agents asking agents
+
+Local collaboration lets an Atem-launched agent ask other agents in the same
+runtime to work, then receive a correlated reply. In private `runtime.toml`,
+enable hosting and `[collab] send = true`, configure approved profiles, and
+give receiving routes `principals = ["local"]` and labels such as
+`labels = ["tag:backend"]`. A route's own `principals` replaces the default
+(the paired Astation), so list your Astation's `member:<id>` beside `"local"`
+if that route should keep serving it (`atem runtime check` shows the ID).
+From inside an agent:
+
+```bash
+atem message directory tag:backend
+atem message send --to tag:backend "Review the API contract"
+atem message status MESSAGE_ID
+# From the receiving agent, using the task ID in its prompt:
+atem message reply --task TASK_ID "Contract verified"
+# From the sending agent, to finish the task:
+atem message complete TASK_ID
+```
+
+Tasks use the normal per-session queue and wait for readiness, drafts,
+approvals and control leases. `atem message reply` answers a task from any
+sender (a local agent, Astation's apps, an integration) and never completes
+it: the sender does, with `atem message complete TASK_ID` (or, for a remote
+sender, `work_complete`), and a task nobody completes expires at its deadline.
+Remote senders read the reply with `reply_query`. A workflow (the chain of
+messages one request starts) is limited to 8 messages (`per_workflow`); a
+message counts once however many agents it reaches, and replies count against
+nothing. `results = true` on the originating route also queues the reply into
+its agent; otherwise it remains visible through status. `--memory ID` and
+`--vault ID[:ENTRY]@VERSION` attach exact context to a message (a reply names
+its vault entry: `ID:ENTRY@VERSION`). A vault entry's text comes from the
+relay, so `--vault` works only while your account's end-to-end encryption is
+on, and an entry holding a credential value is refused. The `atem message` and
+`atem agent tag` commands only connect to the running runtime: they never start
+or replace one.
+
+Security is at user authentication. Remotely, only the members of your signed
+device list (devices, services, and browser grants your devices issue) reach
+your agents, and locally only your own user's processes; each request is bound
+to its sender and checked against the sender's current permission when it is
+accepted and again before it runs; host work travels only in end-to-end
+encrypted r9 channels the Station can't read or alter. That holds on hosts with
+a pinned device list. A host verified by an earlier build that never pinned one
+still serves r8 sessions to the paired Astation over a link that is neither end
+to end nor authenticated at Atem's end; agent collaboration refuses to run
+there until `atem pair verify` pins a list. In every prompt Atem builds
+around a sender's text, each of Atem's own lines starts with a tag drawn at
+random for that prompt once the sender's text is fixed, and the sender's text
+sits in counted blocks. The tag is the guarantee: a line without it, or
+inside a block, is never Atem's, and nothing the agent reads later (tool
+output, files, pages, messages) is, whatever tag it carries. So text a sender
+writes can't pass for Atem's lines (a message header, a result's "as data"
+label), earlier tags included. As an extra, a sender's line that starts like Atem's marker
+`[atem` gets a `|` in front: in any case or width, after white space or
+invisible format characters (Unicode's Cf and Default_Ignorable), or spelled
+with look-alike letters of other scripts that Unicode's confusables list
+(Unicode 18.0.0). Look-alikes that list
+doesn't have, or `[atem` after other text on the line, get no `|` and rely
+on the tag. Atem keeps the live tag for whoever holds `control` and hides it
+from view-only devices and services where it can: chat replaces it with
+`****-****-****`, and their terminal view pauses while a framed prompt's
+turn runs (a day at most, unless a restart can't tell the boot is the same,
+as on macOS after a clock change), then shows the screen again. Not hidden:
+a tag the agent paraphrases or echoes split or cut short, a finished turn's
+tag still on the screen, and a tag an agent copies into another session's
+output.
+The framing tells the agent where text came from; it doesn't stop the agent
+from acting on it.
+Whoever may reach an agent (a route that lists it, or `control` over its
+session) acts through it with your permissions on this machine: the agent's
+shell, files and Atem commands, including `atem message send` (its tasks are
+`local` and reach every route that lists `local`), Memory, skills and the
+vault. Atem doesn't track who prompted an agent, so list a principal on a
+route, or give it `control`, only if you'd let it act as you;
+`[collab] send = true` and `local` on a route decide what your agents may
+reach. Each agent's own tool approvals still apply.
+
+A `runtime.toml` that doesn't load or hosting turned off pauses local work (new
+sends are refused, queued tasks wait) and never fences it, except that turning
+hosting off cancels launches not yet started; `send = false` only refuses new
+sends. A sender that goes away cancels nothing: its tasks still run and the
+reply is kept for you (`atem message complete TASK_ID`). A task whose sender's
+authority or route approval changed fails at once (`sender's authority
+changed`, `route changed`). Records are kept; a day after a task settles past
+its deadline only its text is dropped. A route can opt in to `launch =
+"on_message"`, but only for a Claude Code profile, and only `atem message send
+--launch --to atem:ATEM_ID/ROUTE_ID …` then starts its approved profile when no
+agent runs. Sending, result prompts and automatic launch are off by default.
+
+See the [collaboration design](designs/agent-collaboration.md) and
+[runtime sample](configs/runtime.example.toml). This stage is local and
+unreleased; cross-instance delivery is planned separately.
+
 ### Vault (shared cross-agent context)
 
 ```bash

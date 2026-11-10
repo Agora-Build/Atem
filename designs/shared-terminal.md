@@ -249,6 +249,15 @@ A frame has these fields in `data`, in addition to `v: 1` and `op: "frame"`:
    rendered progressively. Disable controls during the initial restore until
    this marker has been consumed. Acknowledge intermediate chunks promptly.
 
+A viewer whose principal has no `control` gets no frames while a framed
+prompt's turn runs on the session (the prompt's tag is for `control` holders
+only; agent collaboration, section 17): its `subscribe` and `ack` are
+answered as usual, and when the turn ends (or a day after the prompt was
+dispatched, on the host's wall and monotonic clocks; longer only when a
+broker restart reads as another boot, as on macOS after a clock step) the
+stream goes on at the next offset with a reset transaction. No terminal-v1
+message announces the pause.
+
 The host sends at most 16 KiB decoded data per frame and 128 KiB of
 unacknowledged bytes per viewer. A pending snapshot/diff is bounded at 1 MiB.
 It generates the next diff only after the current transaction is acknowledged,

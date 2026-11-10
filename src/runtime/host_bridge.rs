@@ -483,6 +483,7 @@ struct Link {
 }
 
 pub struct HostBridge {
+    local: Option<(String, Identity)>,
     work: host_work_bridge::State,
     host: SessionHost<FileJournal>,
     dir: std::path::PathBuf,
@@ -512,6 +513,20 @@ pub struct HostBridge {
     submitters: HashMap<String, (String, String)>,
     /// Prompts pasted and not reported yet: request id → session.
     prompts: HashMap<String, String>,
+    /// The framing tags of the prompts this runtime pasted (`prompt_tags`):
+    /// chat-v1 shows them to attachments with `control` only.
+    prompt_tags: super::prompt_tags::PromptTags,
+    /// Sessions whose terminal frames are held from attachments without
+    /// `control` while a framed prompt's turn runs (`view_pause_pass`), as
+    /// kept in each session's pause file.
+    view_pauses: super::prompt_tags::Pauses,
+    /// Sessions whose pause file was read (a restarted broker's adopted
+    /// sessions, once each).
+    pauses_loaded: HashSet<String>,
+    /// Sessions whose pause file a failed write left behind `view_pauses`
+    /// (`rewrite_pauses`), and when to try again.
+    pauses_dirty: HashSet<String>,
+    pauses_retry_at: Option<std::time::Instant>,
     /// Interrupts waiting for a turn to end, per session.
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
@@ -632,6 +647,18 @@ impl HostBridge {
             };
         }
         let mut host = Self::build(journal, &identity, epoch, previous, &clock)?;
+        // The principals host-work tasks name keep their control states from
+        // the first control write on (the device list's start fences below
+        // may be one): a task compares its sender's control generation with
+        // the one it was accepted under. Each scheduling pass renews the set.
+        match crate::runtime::host_work::Store::named_principals_at(dir.parent().unwrap_or(dir)) {
+            Ok(named) => host.keep_principals(named),
+            // The store won't open for hosting either: nothing of it
+            // dispatches until it does.
+            Err(error) => eprintln!(
+                "atem runtime: agent hosting records can't be read ({error:#}); the principals their tasks name are kept once hosting runs"
+            ),
+        }
         // r9 §R9.3: the device list is opened before any remote admission
         // and before recovered work is resolved; its start fences go
         // through the host's §H fence now (only durable generations: no
@@ -722,6 +749,7 @@ impl HostBridge {
             None => Arc::new(NoHasher),
         };
         Ok(Self {
+            local: None,
             work: host_work_bridge::State::open(dir, profile.is_some()),
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
@@ -760,6 +788,11 @@ impl HostBridge {
             history_key: HistoryKey::random(),
             submitters: HashMap::new(),
             prompts: HashMap::new(),
+            prompt_tags: Default::default(),
+            view_pauses: Default::default(),
+            pauses_loaded: HashSet::new(),
+            pauses_dirty: HashSet::new(),
+            pauses_retry_at: None,
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             terminal_out: VecDeque::new(),
@@ -1481,6 +1514,8 @@ impl HostBridge {
         let mut cx = Cx { client, sessions };
         self.sync_link(app_link(app), &mut cx);
         self.sync_sessions(&mut cx);
+        self.load_prompt_tags(&cx);
+        self.sync_local(&mut cx);
         if !adopting && !self.recovered {
             self.recovered = true;
             let effects = self.host.recover();
@@ -1554,6 +1589,7 @@ impl HostBridge {
             self.r9_exec(effects, &mut cx);
         }
         self.test_carriage(&mut cx);
+        self.sync_local(&mut cx);
         self.work_config();
         self.project_pass(&mut cx);
         self.sync_all(&mut cx);
@@ -1561,6 +1597,7 @@ impl HostBridge {
             self.work_pass(&mut cx);
         }
         self.drain_remote(&mut cx);
+        self.view_pause_pass(&cx);
         self.frames(&mut cx);
         self.heartbeats(&mut cx);
         self.flush_pushes(&mut cx);
@@ -1873,7 +1910,91 @@ impl HostBridge {
     /// The attachment is the link's own or an r9 channel's: its messages
     /// have somewhere to go.
     fn reachable(&self, attachment: &str) -> bool {
-        self.current(attachment) || self.r9.owns(attachment)
+        self.current(attachment)
+            || self.r9.owns(attachment)
+            || (!attachment.is_empty() && attachment == self.local_attachment())
+    }
+
+    pub(super) fn local_attachment(&self) -> &str {
+        self.local.as_ref().map_or("", |(attachment, _)| attachment)
+    }
+
+    /// `local` still has the authority of a verified host: paired, a pinned
+    /// device list (so r8 is refused) that is neither frozen nor faulted, a
+    /// usable session journal.
+    /// Without it `sync_local` fences `local`. A new host identity, an
+    /// unpairing or a device list that went unusable is a real change of
+    /// authority; a plain session-journal halt fences `local` in memory
+    /// only, a pause for its tasks (`local_halted`: they wait, and the
+    /// restart that ends the halt brings back its durable control state).
+    /// The switches in `runtime.toml` are not part of it (`collab_paused`).
+    pub(super) fn local_authorized(&self) -> bool {
+        self.host.context().account_id != UNPAIRED
+            && self.host.refuses_r8()
+            && !self.host.journal_halted()
+            && self.membership_error.is_none()
+            && self
+                .membership
+                .as_ref()
+                .is_none_or(|m| !m.is_frozen() && m.faulted().is_none() && m.held().is_none())
+    }
+
+    /// Local work may dispatch now: authorized, and not paused by
+    /// `runtime.toml` (not loading, hosting off) or a failed receipt
+    /// database. `[collab] send` only governs new sends (`collab_ready`).
+    pub(super) fn local_healthy(&self) -> bool {
+        self.hosting_enabled() && self.local_authorized()
+    }
+
+    /// Keeps the internal local attachment. A pause leaves it (and `local`'s
+    /// control generation) alone, so queued local work and return grants
+    /// resume as they were; a lost authority or a new host identity fences
+    /// `local` and ends the attachment. A plain session-journal halt does
+    /// too, in memory only: `local`'s tasks take it as a pause
+    /// (`local_halted`) and wait for the restart.
+    fn sync_local(&mut self, cx: &mut Cx) {
+        let context = self.host.context();
+        let identity = Identity {
+            account_id: context.account_id.clone(),
+            atem_device_id: context.atem_device_id.clone(),
+            host_trust_gen: context.host_trust_gen,
+        };
+        let current = self.local.as_ref().is_some_and(|(att, bound)| {
+            *bound == identity && self.host.attachment_principal(att) == Some("local")
+        });
+        if current && self.local_authorized() {
+            return;
+        }
+        if let Some((old, _)) = self.local.take() {
+            let effects = self.host.fence_principal("local", 0);
+            self.exec(effects, cx);
+            let effects = self.host.disconnect(&old);
+            self.exec(effects, cx);
+        }
+        if !self.local_healthy() {
+            return;
+        }
+        let attachment = uuid::Uuid::new_v4().to_string();
+        let attach = Attach {
+            client: "atem-internal-local".into(),
+            principal: "local".into(),
+            attachment_gen: attachment.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: atem_client::canonical::MAX_SAFE_INTEGER
+                .saturating_sub(self.clock.now()),
+        };
+        if let Ok(effects) = self.host.connect(attach) {
+            self.local = Some((attachment.clone(), identity));
+            self.exec(effects, cx);
+            if self.host.welcome_r9(&attachment, self.clock.now()).is_err() {
+                self.local = None;
+                let effects = self.host.disconnect(&attachment);
+                self.exec(effects, cx);
+            }
+            let effects = self.host.take_effects();
+            self.exec(effects, cx);
+        }
     }
 
     // ── Messages ──
@@ -2005,6 +2126,9 @@ impl HostBridge {
     }
 
     fn send(&mut self, attachment: &str, message: &Envelope, cx: &mut Cx) {
+        if !attachment.is_empty() && attachment == self.local_attachment() {
+            return;
+        }
         if self.r9.owns(attachment) {
             let host_id = self.host.context().atem_device_id.clone();
             self.r9.deliver(
@@ -2045,14 +2169,31 @@ impl HostBridge {
     }
 
     fn send_chat(&mut self, attachment: &str, env: ChatEnvelope, cx: &mut Cx) {
+        if !attachment.is_empty() && attachment == self.local_attachment() {
+            return;
+        }
         if env.op == "error"
             && let Some(code) = env.body.get("code").and_then(Value::as_str)
         {
             self.refused(code);
         }
         let sid = env.agent_id.clone();
-        let text = serde_json::to_string(&AstationMessage::AgentChat(env))
+        let mut text = serde_json::to_string(&AstationMessage::AgentChat(env))
             .expect("chat envelopes serialize");
+        // The live framing tags are for `control` only (`prompt_tags`): the
+        // same-length placeholder keeps every count and position.
+        // Only a session the broker has is read (an envelope's `agentId` can
+        // be a refused request's raw text, never a path).
+        if !self.host.attachment_can(attachment, Permission::Control) {
+            if let Some(state) = self.dir.parent()
+                && SessionId::parse(&sid).is_some_and(|id| cx.sessions.contains_key(&id))
+            {
+                self.prompt_tags.load(state, &sid);
+            }
+            if let Some(redacted) = self.prompt_tags.redact(&sid, &text) {
+                text = redacted;
+            }
+        }
         if self.r9.owns(attachment) {
             let host_id = self.host.context().atem_device_id.clone();
             self.r9.deliver_family(
@@ -2100,6 +2241,10 @@ impl HostBridge {
                 // delivery as uncertain. Other attachments it closes are
                 // already gone from the link.
                 Effect::Close { attachment } => {
+                    if !attachment.is_empty() && attachment == self.local_attachment() {
+                        self.local = None;
+                        continue;
+                    }
                     if self.r9.owns(&attachment) {
                         self.r9.close_attachment(&attachment, host_now().mono_ms);
                         self.forget_r9(&attachment);
@@ -3234,6 +3379,142 @@ impl HostBridge {
 
     // ── Frames ──
 
+    /// Reads the prompt tags and terminal pauses of every session the broker
+    /// has (`prompt_tags`), once each: a restarted broker learns those of
+    /// adopted sessions before it serves their chat or frames.
+    /// Sessions that are gone are forgotten (their tags are dead: their
+    /// turns ended; a pause file left to rewrite goes with its worker's
+    /// files), so what is kept follows the broker's sessions.
+    fn load_prompt_tags(&mut self, cx: &Cx) {
+        let Some(state) = self.dir.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let known =
+            |sid: &str| SessionId::parse(sid).is_some_and(|id| cx.sessions.contains_key(&id));
+        self.prompt_tags.retain(known);
+        self.pauses_loaded.retain(|sid| known(sid));
+        self.pauses_dirty.retain(|sid| known(sid));
+        for sid in cx.sessions.keys() {
+            self.prompt_tags.load(&state, sid.as_str());
+            self.load_pauses(&state, sid.as_str());
+        }
+    }
+
+    /// Session `sid`'s pause file, once (a pause written before a restart
+    /// goes on holding the frames).
+    pub(super) fn load_pauses(&mut self, state: &Path, sid: &str) {
+        if self.pauses_loaded.insert(sid.to_string()) {
+            let pauses = super::prompt_tags::load_pauses(state, sid, &host_now());
+            if !pauses.is_empty() {
+                self.view_pauses
+                    .entry(sid.to_string())
+                    .or_default()
+                    .extend(pauses);
+            }
+        }
+    }
+
+    /// Holds terminal frames from attachments without `control` while a
+    /// framed prompt's turn runs on the session, until `Pause::holds` says
+    /// it ended: the session no longer live, the receipt completed or
+    /// rejected, or (its outcome unknown: a restart, a prompt the agent
+    /// didn't take in time) the chat showing the agent took the prompt and
+    /// its turn ended; at the latest the host's bound (a day on the wall
+    /// and monotonic clocks; never the task's deadline). Each change is
+    /// written to the session's pause file.
+    fn view_pause_pass(&mut self, cx: &Cx) {
+        use super::prompt_tags::{ChatSigns, TurnSigns};
+        self.rewrite_pauses();
+        if self.view_pauses.is_empty() {
+            return;
+        }
+        let now = host_now();
+        let sessions: Vec<String> = self.view_pauses.keys().cloned().collect();
+        for sid in sessions {
+            let session = SessionId::parse(&sid).and_then(|id| cx.sessions.get(&id));
+            let live = session.is_some_and(|s| s.is_live());
+            let pauses = self.view_pauses.remove(&sid).unwrap_or_default();
+            let before = pauses.len();
+            let holding: Vec<_> = pauses
+                .into_iter()
+                .filter(|p| {
+                    let chat = session.map_or(ChatSigns::Unknown, |s| chat_signs(s, &p.tag));
+                    p.holds(
+                        TurnSigns {
+                            receipt: self.host.receipt(&p.receipt_id).map(|r| r.state),
+                            live,
+                            chat,
+                        },
+                        &now,
+                    )
+                })
+                .collect();
+            if holding.len() != before {
+                self.write_pauses(&sid, &holding);
+            }
+            if !holding.is_empty() {
+                self.view_pauses.insert(sid, holding);
+            }
+        }
+    }
+
+    /// Writes session `sid`'s pauses (none: removes the file). One that
+    /// fails leaves the file behind what is held here (an attempt's pause
+    /// that was never pasted, a pause that ended): the session is rewritten
+    /// from memory at the next pass that can (`rewrite_pauses`).
+    pub(super) fn write_pauses(&mut self, sid: &str, pauses: &[super::prompt_tags::Pause]) -> bool {
+        let written = self
+            .dir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no state directory"))
+            .and_then(|state| super::prompt_tags::write_pauses(state, sid, pauses));
+        match written {
+            Ok(()) => {
+                self.pauses_dirty.remove(sid);
+                true
+            }
+            Err(error) => {
+                if self.pauses_dirty.insert(sid.to_string()) {
+                    eprintln!("atem runtime: {sid}: terminal pause not written: {error}");
+                }
+                false
+            }
+        }
+    }
+
+    /// Rewrites the pause files a write left behind, from memory, at most
+    /// once a second.
+    fn rewrite_pauses(&mut self) {
+        if self.pauses_dirty.is_empty()
+            || self
+                .pauses_retry_at
+                .is_some_and(|at| at > std::time::Instant::now())
+        {
+            return;
+        }
+        self.pauses_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        let dirty: Vec<String> = self.pauses_dirty.iter().cloned().collect();
+        for sid in dirty {
+            let pauses = self.view_pauses.get(&sid).cloned().unwrap_or_default();
+            self.write_pauses(&sid, &pauses);
+        }
+    }
+
+    /// Whether the stream `key` gets no frames now: its session's framed
+    /// prompt is in its turn and the attachment has no `control`. A held
+    /// stream drops what it had pending and resumes with a full frame.
+    fn frames_held(&mut self, key: &(String, String)) -> bool {
+        if !self.view_pauses.contains_key(&key.1)
+            || self.host.attachment_can(&key.0, Permission::Control)
+        {
+            return false;
+        }
+        if let Some(stream) = self.streams.get_mut(key) {
+            stream.hold();
+        }
+        true
+    }
+
     fn frames(&mut self, cx: &mut Cx) {
         self.flush_terminal(cx);
         if !self.terminal_out.is_empty() {
@@ -3250,6 +3531,9 @@ impl HostBridge {
                 continue;
             }
             if !self.current(&key.0) {
+                continue;
+            }
+            if self.frames_held(&key) {
                 continue;
             }
             let Some(session) = session_of(cx, &key.1) else {
@@ -3291,7 +3575,7 @@ impl HostBridge {
     /// An r9 channel's stream: frames go into its channel (sealed, bounded
     /// by the channel's queue), held back while the channel has a backlog.
     fn r9_frames(&mut self, key: &(String, String), cx: &mut Cx) {
-        if self.r9.backlog(&key.0) > R9_FRAME_BACKLOG {
+        if self.r9.backlog(&key.0) > R9_FRAME_BACKLOG || self.frames_held(key) {
             return;
         }
         let Some(session) = session_of(cx, &key.1) else {
@@ -3957,15 +4241,18 @@ impl ProjectHasher for NoHasher {
 /// is authenticating an authenticated link again (a routed one keeps it).
 fn r9_app_link(app: &App) -> Option<u64> {
     // A routed link keeps its r9 carrier while Astation authenticates it.
-    (app.r9_link_up() && !app.station_direct_blocked()
+    (app.r9_link_up()
+        && !app.station_direct_blocked()
         && (app.astation_reauth.is_none() || app.astation_routed))
         .then_some(app.astation_link_gen)
 }
 
 fn app_link(app: &App) -> Option<u64> {
-    (app.astation_connected && !app.station_direct_blocked()
-        && app.astation_reauth.is_none() && !app.astation_client.is_ws_closed())
-        .then_some(app.astation_link_gen)
+    (app.astation_connected
+        && !app.station_direct_blocked()
+        && app.astation_reauth.is_none()
+        && !app.astation_client.is_ws_closed())
+    .then_some(app.astation_link_gen)
 }
 
 /// §6: what a failed host write proves (`None`: it was written).
@@ -4009,6 +4296,41 @@ pub(super) fn complete_envelope(
     };
     body.insert("outcome".into(), Value::String(outcome.into()));
     chat_envelope(conversation, sid, "complete", head, body)
+}
+
+/// What session `s`'s chat shows of the turn of the prompt that carries
+/// `tag`: no turn state; the prompt not taken (no user message carries the
+/// tag); its turn running; or ended (the chat `ready`, and that turn the
+/// last one completed, or no longer the current one).
+fn chat_signs(s: &BrokerSession, tag: &str) -> super::prompt_tags::ChatSigns {
+    use super::prompt_tags::ChatSigns;
+    use crate::chat::adapter::Part;
+    use crate::chat::session::Role;
+    if tag.is_empty() || !s.chat_v1 {
+        return ChatSigns::Unknown;
+    }
+    let taken = s
+        .chat
+        .retained()
+        .filter(|m| m.role == Role::User)
+        .filter(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text { markdown, .. } if markdown.contains(tag)))
+        })
+        .last()
+        .map(|m| m.turn_id.clone());
+    match taken {
+        None => ChatSigns::NotTaken,
+        Some(turn)
+            if s.chat.status().state == ChatState::Ready
+                && (s.chat.last_completed_turn() == Some(turn.as_str())
+                    || s.chat.current_turn_id() != Some(turn.as_str())) =>
+        {
+            ChatSigns::Ended
+        }
+        Some(_) => ChatSigns::Running,
+    }
 }
 
 fn session_of<'a>(cx: &'a mut Cx, sid: &str) -> Option<&'a mut BrokerSession> {

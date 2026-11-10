@@ -6,7 +6,7 @@ Copy the one you need, edit, drop it into the config dir.
 | File | Where it goes | What it's for |
 |------|---------------|---------------|
 | [config.example.toml](config.example.toml) | `~/.config/atem/config.toml` | Astation WebSocket / relay URL, BFF / SSO overrides, extra hostnames for the self-signed cert |
-| [runtime.example.toml](runtime.example.toml) | `~/.config/atem/runtime.toml` | `atem runtime` remote-launch profiles, notification routes and optional zero-session hosting (disabled by default) |
+| [runtime.example.toml](runtime.example.toml) | `~/.config/atem/runtime.toml` | Approved profiles, notification routes, local agent collaboration and optional zero-session hosting (disabled by default) |
 | [convo.example.toml](convo.example.toml) | `~/.config/atem/convo.toml` | `atem serv convo` — agent provider blocks (LLM/ASR/TTS/avatar), preset list, HIPAA / geofence / encryption / `enable_avatar` defaults |
 | [webhooks.example.toml](webhooks.example.toml) | `~/.config/atem/webhooks.toml` | `atem serv webhooks` — local port, HMAC secret, ngrok / cloudflared tunnel provider |
 
@@ -30,3 +30,36 @@ with `atem runtime check`, and explicitly enable hosting when ready. Both
 commands require pairing. Provider environment files are optional private
 JSON files referenced by the profile; the samples contain variable names
 and placeholders, never credentials.
+
+Local collaboration also requires `[collab] send = true` and `"local"` in
+each receiving route's `principals`. A route's own `principals` replaces the
+default, which is the Astation this Atem is paired with: a route with only
+`["local"]` no longer serves that Astation, so list its `member:<id>` too
+(`atem runtime check` shows the ID) if it should keep access. Give those routes
+owner labels such as `labels = ["tag:backend"]`. Inside an Atem-launched agent:
+
+```bash
+atem message directory tag:backend
+atem message send --to tag:backend "Review the API contract"
+atem message status MESSAGE_ID
+atem message reply --task TASK_ID "Contract verified"
+atem message complete TASK_ID
+atem agent tag add self:reviewer
+```
+
+The defaults are 30 sends per session per hour, 8 messages per workflow (a
+message counts once however many agents it reaches; results count against
+nothing), a 30-minute status-report timeout, `launch = "off"`,
+`results = false`, and `auto_report = "status"`. Set `results = true` on the
+originating route to queue replies back into its agent. Set
+`launch = "on_message"` on a receiving route (a Claude Code profile only) so
+that `atem message send --launch --to atem:<atem_id>/<route_id>` starts its
+approved profile when no matching session exists. `local` belongs only in route
+principals; profile principals continue to control remote launch.
+
+`--memory ID` and `--vault ID[:ENTRY]@VERSION` publish or verify the exact
+context before delivery. A bare vault ID/version is accepted only when it
+identifies one entry; include `:ENTRY` when ambiguous (`atem message reply`
+always needs it). These commands currently
+reach agents in the same runtime. Cross-instance delivery is planned in the
+[collaboration design](../designs/agent-collaboration.md).

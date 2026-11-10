@@ -993,6 +993,8 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
         let log = super::worker::log_path(&runtime.state(), &sid);
         std::fs::write(&lock, "").unwrap();
         std::fs::write(&log, "worker output").unwrap();
+        let tags = runtime.state().join(format!("collab-tags-{sid}.json"));
+        std::fs::write(&tags, "[]").unwrap();
         // This broker already scanned at start: another one adopts it.
         let dir = runtime.dir.clone();
         runtime.shutdown().await;
@@ -1036,8 +1038,9 @@ fn a_record_without_its_worker_is_listed_interrupted_and_stop_removes_it() {
         })
         .await;
         assert!(!record_file(&runtime, &sid).exists());
-        // Its lock and log go with it.
+        // Its lock, log and collaboration tags go with it.
         assert!(!lock.exists() && !log.exists());
+        assert!(!tags.exists());
         assert!(list(&mut client).await.is_empty());
         runtime.shutdown().await;
     });
@@ -1126,6 +1129,7 @@ impl FakeWorker {
             pid,
             start_time,
             agent_pid: None,
+            agent_start_time: None,
             offset,
             input_epoch: 0,
             dropped: 0,
@@ -1810,6 +1814,7 @@ fn a_runtime_of_another_worker_protocol_is_kept() {
                             rows: 24,
                             cols: 80,
                             generation: "g".into(),
+                            self_tags: vec![],
                             worker_build: Some("9.9.9+1".into()),
                         }],
                     },
@@ -1837,6 +1842,102 @@ fn a_runtime_of_another_worker_protocol_is_kept() {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("ses-bbbbbbbbbbbb"), "{notes:?}");
         assert!(notes[0].contains("worker protocol 9"), "{notes:?}");
+    });
+}
+
+/// A fake runtime on `locator`'s socket: it welcomes with `protocol`, `build`
+/// and `pid`, answers nothing else and records every op it received.
+fn fake_runtime(
+    locator: &super::client::Locator,
+    protocol: u32,
+    build: &str,
+) -> std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let listener = tokio::net::UnixListener::bind(&locator.socket).unwrap();
+    let (log, build) = (seen.clone(), build.to_string());
+    tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (log, build) = (log.clone(), build.clone());
+            tokio::task::spawn_local(async move {
+                let (read, mut write) = stream.into_split();
+                let mut reader = BufReader::new(read);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let message = super::protocol::decode_client(&line).unwrap();
+                    log.borrow_mut().push(message.op());
+                    if matches!(message, ClientMsg::Hello { .. }) {
+                        let welcome = RuntimeMsg::Welcome {
+                            protocol,
+                            build: build.clone(),
+                            pid: 1,
+                            astation: false,
+                            host_error: None,
+                            worker_protocol: Some(9),
+                            device_list: None,
+                        };
+                        let text = super::protocol::encode_runtime(&welcome);
+                        write.write_all(text.as_bytes()).await.unwrap();
+                    }
+                    line.clear();
+                }
+            });
+        }
+    });
+    seen
+}
+
+/// `atem message …` and `atem agent tag` run inside the runtime: they connect
+/// to the one that is running and never start or replace one.
+#[test]
+fn agent_commands_connect_only_to_the_running_runtime() {
+    use super::client::Locator;
+    local(async {
+        let dir = short_dir();
+        let locator = Locator::in_dir(dir.path());
+        let error = RuntimeClient::connect_existing_at(&locator)
+            .await
+            .err()
+            .expect("nothing runs");
+        assert_eq!(
+            error.to_string(),
+            "no Atem runtime is running; agents run inside one"
+        );
+        assert!(!locator.socket.exists(), "nothing was started");
+
+        // Another build of the same protocol (and another worker protocol, so
+        // that a replacement would have been refused too): used as it is,
+        // and nothing but the greeting is sent.
+        let seen = fake_runtime(&locator, PROTOCOL, "9.9.9+other-build");
+        let client = RuntimeClient::connect_existing_at(&locator).await.unwrap();
+        assert_eq!(client.welcome.build, "9.9.9+other-build");
+        assert_ne!(
+            client.welcome.build,
+            crate::memory::cred_agent::build_id(),
+            "another build"
+        );
+        assert_eq!(*seen.borrow(), vec!["hello"], "never asked to restart");
+    });
+}
+
+#[test]
+fn agent_commands_name_both_protocols_when_the_runtime_speaks_another() {
+    use super::client::Locator;
+    local(async {
+        let dir = short_dir();
+        let locator = Locator::in_dir(dir.path());
+        let seen = fake_runtime(&locator, PROTOCOL + 6, "9.9.9+future");
+        let error = RuntimeClient::connect_existing_at(&locator)
+            .await
+            .err()
+            .expect("another protocol");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("speaks protocol {}", PROTOCOL + 6))
+                && text.contains(&format!("this atem speaks protocol {PROTOCOL}")),
+            "{text}"
+        );
+        assert_eq!(*seen.borrow(), vec!["hello"]);
     });
 }
 
@@ -1955,4 +2056,98 @@ fn a_restarting_runtime_starts_nothing_new_and_tells_the_frontends() {
             .unwrap()
             .unwrap();
     });
+}
+#[test]
+fn a_tag_from_outside_a_session_is_refused() {
+    local(async {
+        let runtime = Runtime::start(Duration::from_secs(60), own_uid());
+        let mut client = runtime.client().await;
+        client
+            .send(&ClientMsg::Tag {
+                action: super::protocol::TagOp::List,
+                name: None,
+            })
+            .await
+            .unwrap();
+        expect(&mut client, |m| match m {
+            RuntimeMsg::Error { text, op } if op.as_deref() == Some("tag") => {
+                assert_eq!(text, "not inside an Atem session");
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        runtime.shutdown().await;
+    });
+}
+
+/// Spec section 10, "Who sees what": an agent's command acts for the
+/// nearest agent in its verified process ancestry; a verified process with
+/// no agent there is the owner. A peer that can't be verified (no
+/// credentials, or it ended or was replaced since it connected) is refused,
+/// never taken for the owner.
+#[test]
+fn an_unverified_peer_is_refused_and_one_without_an_agent_is_the_owner() {
+    use super::server::{Caller, caller_of};
+    use crate::session::SessionId;
+    let sid = SessionId::new();
+    let agents = [(sid.clone(), (200, 7))];
+    let start = |pid: u32| match pid {
+        100 => Some(5),
+        200 => Some(7),
+        300 => Some(9),
+        _ => None,
+    };
+    let tree = |pid: u32| match pid {
+        100 => vec![100, 150, 200, 1],
+        _ => vec![pid, 1],
+    };
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &agents, &[]),
+        Caller::Session(sid.clone())
+    );
+    assert_eq!(
+        caller_of(Some((300, 9)), start, tree, &agents, &[]),
+        Caller::Owner
+    );
+    // An agent's pid now used by another process is no agent.
+    let reused = [(sid, (200, 8))];
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &reused, &[]),
+        Caller::Owner
+    );
+    // The peer was replaced, or ended, since it connected; no credentials.
+    assert_eq!(
+        caller_of(Some((100, 4)), start, tree, &agents, &[]),
+        Caller::Unverified
+    );
+    assert_eq!(
+        caller_of(Some((400, 1)), start, tree, &agents, &[]),
+        Caller::Unverified
+    );
+    assert_eq!(
+        caller_of(None, start, tree, &agents, &[]),
+        Caller::Unverified
+    );
+    // A live agent whose start time isn't known (a worker of an older build
+    // said none): a process under it is unverified, never the owner; a
+    // verified agent nearer the peer still names its session.
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &[], &[200]),
+        Caller::Unverified
+    );
+    assert_eq!(
+        caller_of(Some((100, 5)), start, tree, &[], &[150]),
+        Caller::Unverified
+    );
+    let nearer = [(SessionId::new(), (150, 6))];
+    let start_150 = |pid: u32| if pid == 150 { Some(6) } else { start(pid) };
+    assert!(matches!(
+        caller_of(Some((100, 5)), start_150, tree, &nearer, &[200]),
+        Caller::Session(_)
+    ));
+    assert_eq!(
+        caller_of(Some((300, 9)), start, tree, &[], &[200]),
+        Caller::Owner
+    );
 }

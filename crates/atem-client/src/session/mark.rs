@@ -23,7 +23,11 @@ pub struct MarkTask {
 }
 
 impl MarkTask {
+    /// The rendered mark (Atem's mark line and its counted block, delegated
+    /// host-work design III.2) is at most 16 KiB, and its text has no
+    /// control characters other than newline and tab.
     pub fn valid(&self) -> bool {
+        let text = self.block_text();
         is_opaque_id(&self.mark_id)
             && self.url.len() <= 2048
             && self.title.len() <= 512
@@ -33,24 +37,21 @@ impl MarkTask {
                 .annotations
                 .iter()
                 .all(|a| a.tool.len() <= 32 && a.text.len() <= 1024 && a.x <= 16384 && a.y <= 16384)
-            && self.render().len() <= 16 * 1024
-            && !self
-                .render()
+            && !text
                 .chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
+            && text.len() <= MAX_RENDERED_BYTES
+            && super::framing::mark_len(self, &text) <= MAX_RENDERED_BYTES
     }
 
-    pub fn render(&self) -> String {
-        let mut prompt = format!(
-            "[Chisel/mark {}]\nImplement the UI changes indicated by the annotated screenshot.\nPage URL: {}\nPage title: {}\nScreenshot attachment: {} (sha256 {})\n",
-            self.mark_id,
-            self.url,
-            self.title,
-            self.screenshot.attachment_id,
-            self.screenshot.digest
-        );
+    /// The sender's part of a mark, the text of its counted block: its URL,
+    /// title and annotations, one per line. Atem's line before the block
+    /// names the mark (`framing::mark_line`); the screenshot is a line of
+    /// Atem's once verified at dispatch.
+    pub fn block_text(&self) -> String {
+        let mut text = format!("Page URL: {}\nPage title: {}\n", self.url, self.title);
         for (i, a) in self.annotations.iter().enumerate() {
-            prompt.push_str(&format!(
+            text.push_str(&format!(
                 "{}. [{}] at ({}, {}): {}\n",
                 i + 1,
                 a.tool,
@@ -59,6 +60,9 @@ impl MarkTask {
                 a.text
             ));
         }
-        prompt
+        text
     }
 }
+
+/// The bound on a rendered mark.
+pub const MAX_RENDERED_BYTES: usize = 16 * 1024;

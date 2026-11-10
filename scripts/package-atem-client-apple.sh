@@ -79,9 +79,11 @@ VECTOR="atem-client-${VERSION}-station-route-v1.json"
 cp designs/protocol/fixtures/station-route/v1.json "$OUT/$VECTOR"
 WORK_VECTOR="atem-client-${VERSION}-host-work-requests-v1.json"
 cp designs/protocol/fixtures/host-work/requests-v1.json "$OUT/$WORK_VECTOR"
+FRAMING_VECTOR="atem-client-${VERSION}-host-work-prompt-framing-v1.json"
+cp designs/protocol/fixtures/host-work/prompt-framing-v1.json "$OUT/$FRAMING_VECTOR"
 ./scripts/atem-client-source-pin.sh "$OUT/$PIN" apple-swiftpm "default (uniffi)" \
   "xcodebuild=$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')" \
   "swift=$(swift --version 2>&1 | sed -n 1p)"
-(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" > "atem-client-${VERSION}-SHA256SUMS.txt")
+(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" "$FRAMING_VECTOR" > "atem-client-${VERSION}-SHA256SUMS.txt")
 echo "Packaged into $OUT:"
 ls -l "$OUT"

@@ -264,6 +264,13 @@ other, or while `runtime.toml` fails what `atem runtime check` checks, as the
 new build reads it (it would start without hosting). `atem runtime restart`
 does the same on request, without the 60 s guard.
 
+`atem agent tag` and `atem message …` are not such clients: agents run them
+inside the runtime, so they only connect to the one that is running
+(`RuntimeClient::connect_existing`). They never start a runtime, never replace
+one of another build and fail with a message when none runs or its protocol
+differs, so an agent can't restart the runtime in the middle of its own task
+([agent-collaboration.md](agent-collaboration.md), section 9).
+
 ### Local protocol (v1)
 
 JSON lines, `{"v":1,"op":…,"request_id"?:…}`. Terminal bytes are base64.

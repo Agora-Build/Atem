@@ -27,6 +27,7 @@ before emitting that event; apps still inspect errors and each result state.
 |---|---|---|
 | `host.launch` | `host_profiles`, `host_launch`, `host_launch_query` | [Host work](atem-host-work-v1.md) |
 | `host.work` | `work_enqueue`, `work_query`, `work_cancel`, `work_complete` | [Host work](atem-host-work-v1.md) |
+| `host.reply` | `reply_query` | [Host work](atem-host-work-v1.md#reply) |
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
 
@@ -47,10 +48,15 @@ launch token scopes and HTTP adapters remain Station/Auth/Portal integration
 work; `agent.prompt` alone does not authorize creating a process.
 
 Every production SDK artifact includes
-`atem-client-<version>-host-work-requests-v1.json` in its SHA-256 manifest. These
-are the shared positive/negative request vectors from
-`fixtures/host-work/requests-v1.json`, run by the Rust core's tests. They are
-fixture data, not an additional binding export or a live integration test.
+`atem-client-<version>-host-work-requests-v1.json` and
+`atem-client-<version>-host-work-prompt-framing-v1.json` in its SHA-256
+manifest. These are the shared positive/negative request vectors from
+`fixtures/host-work/requests-v1.json` and the prompt framing's vectors from
+`fixtures/host-work/prompt-framing-v1.json` (tags, escaping, rendered prompts
+and the size check; delegated host-work design III.2), both run by the Rust
+core's tests. They are fixture data, not an additional binding export or a
+live integration test: the framing runs on the host (`session::framing`), and
+no binding exports it yet.
 
 Status: built and released in Atem v0.8.0 (2026-10-31);
 Astation integrates the bindings, and the joint live tests passed. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of

@@ -164,9 +164,10 @@ impl Need {
             ("session", "host_profiles" | "host_launch" | "host_launch_query") => {
                 Need::Op(Op::Launch)
             }
-            ("session", "work_enqueue" | "work_query" | "work_cancel" | "work_complete") => {
-                Need::Op(Op::Notify)
-            }
+            (
+                "session",
+                "work_enqueue" | "work_query" | "reply_query" | "work_cancel" | "work_complete",
+            ) => Need::Op(Op::Notify),
             ("session", "message_publish" | "message_query" | "attachment_put") => Need::Op(Op::Message),
             ("session", "membership") => Need::Op(Op::View),
             ("terminal", "input" | "resize") => Need::Op(Op::Terminal),

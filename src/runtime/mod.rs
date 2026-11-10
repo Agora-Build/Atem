@@ -6,6 +6,8 @@
 pub mod adopt;
 pub mod broker;
 pub mod client;
+pub mod collab;
+pub mod collab_context;
 pub mod commands;
 pub mod host_bridge;
 pub mod host_work;
@@ -13,6 +15,7 @@ mod host_attachments;
 pub mod op_client;
 pub mod ops;
 pub mod project_scope;
+pub mod prompt_tags;
 pub mod protocol;
 pub mod push_queue;
 pub mod refusal_log;

@@ -56,6 +56,14 @@ impl FrameStream {
         }
     }
 
+    /// Sends nothing for now (a framed prompt's turn holds the frames of
+    /// attachments without `control`): what was pending goes, and the next
+    /// frame is a full one (`reset`), as a new subscription's first.
+    pub fn hold(&mut self) {
+        self.pending.clear();
+        self.baseline = None;
+    }
+
     /// The viewer acknowledged everything up to `offset` (a frame boundary).
     pub fn ack(&mut self, offset: u64) -> Result<(), String> {
         if offset == self.acked {

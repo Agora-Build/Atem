@@ -1438,6 +1438,7 @@ impl R9Host {
             features.extend([
                 atem_client::session::host_work::LAUNCH_FEATURE.to_owned(),
                 atem_client::session::host_work::WORK_FEATURE.to_owned(),
+                atem_client::session::host_work::REPLY_FEATURE.to_owned(),
                 atem_client::session::messages::FEATURE.to_owned(),
                 atem_client::session::attachments::FEATURE.to_owned(),
             ]);
@@ -1654,6 +1655,7 @@ impl R9Host {
                         | "host_launch_query"
                         | "work_enqueue"
                         | "work_query"
+                        | "reply_query"
                         | "work_cancel"
                         | "work_complete"
                         | "message_publish"
