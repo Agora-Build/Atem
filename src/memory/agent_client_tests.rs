@@ -8,6 +8,7 @@ use super::tests::{
     start_agent, start_scripted_agent, start_stoppable_agent,
 };
 use super::*;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 
 /// Serves `agent` at `socket` on its own thread.
@@ -78,6 +79,13 @@ pub(super) fn read_message(reader: &mut impl BufRead) -> Option<(Vec<u8>, bool)>
 /// agent does with idle ones) or swallows requests (the next one, or the
 /// next ones of an op): reads one, never passes it on, and closes that
 /// connection unanswered.
+///
+/// A connection it ends is closed, not only shut down, as an agent that
+/// stops or restarts closes it: on macOS a peer's `shutdown` can fail to
+/// wake a reader already blocked in `recv` on a Unix stream socket (an XNU
+/// race; Linux never misses it), and a client then sleeps through its
+/// whole reply wait and reads EAGAIN, a timeout, never resent. A close
+/// always wakes it.
 pub(super) struct Proxy {
     pub(super) socket: PathBuf,
     connections: Arc<std::sync::atomic::AtomicUsize>,
@@ -87,7 +95,24 @@ pub(super) struct Proxy {
     frames: Arc<std::sync::atomic::AtomicUsize>,
     /// The op to swallow (any when `None`) and how many more.
     swallow: Arc<Mutex<(Option<String>, usize)>>,
-    live: Arc<Mutex<Vec<UnixStream>>>,
+    /// A copy of each open client connection, by its number: it goes when
+    /// the connection's thread ends, so that end closes the connection.
+    live: Arc<Mutex<HashMap<usize, UnixStream>>>,
+}
+
+/// Closes a proxied client connection's copy in `live` when its thread ends
+/// (any way it ends): with the thread's own, its last descriptor.
+struct Closing {
+    id: usize,
+    live: Arc<Mutex<HashMap<usize, UnixStream>>>,
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.live.lock() {
+            live.remove(&self.id);
+        }
+    }
 }
 
 impl Proxy {
@@ -115,8 +140,12 @@ impl Proxy {
         std::thread::spawn(move || {
             for client in listener.incoming() {
                 let Ok(client) = client else { return };
-                connections.fetch_add(1, SeqCst);
-                live.lock().unwrap().push(client.try_clone().unwrap());
+                let id = connections.fetch_add(1, SeqCst);
+                live.lock().unwrap().insert(id, client.try_clone().unwrap());
+                let closing = Closing {
+                    id,
+                    live: live.clone(),
+                };
                 let (seen, passed, frames, swallow, upstream) = (
                     seen.clone(),
                     passed.clone(),
@@ -125,6 +154,7 @@ impl Proxy {
                     upstream.clone(),
                 );
                 std::thread::spawn(move || {
+                    let _closing = closing;
                     let Ok(agent) = UnixStream::connect(&upstream) else {
                         return;
                     };
@@ -190,13 +220,18 @@ impl Proxy {
         self.frames.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The client connections it holds open now.
+    pub(super) fn open(&self) -> usize {
+        self.live.lock().unwrap().len()
+    }
+
     pub(super) fn count(ops: &[String], op: &str) -> usize {
         ops.iter().filter(|seen| *seen == op).count()
     }
 
     /// Closes every client connection open now.
     fn drop_connections(&self) {
-        for stream in self.live.lock().unwrap().drain(..) {
+        for (_, stream) in self.live.lock().unwrap().drain() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }
