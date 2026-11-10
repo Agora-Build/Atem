@@ -3,21 +3,21 @@
 Status (2026-11-07): **stage 1 implemented, unreleased**, on
 `feat/agent-collaboration`; sections 10 and 17 give its lifecycle, retention and
 known limits. Agents in one Atem runtime can send work and reply through the
-existing host queue. **Not implemented:** stages 2 and 3, cross-instance
-delivery, directory publication, the Station mailbox and signed projects.
+existing host queue. **Not implemented (planned):** stages 2 and 3, see
+[delegated-host-work.md](delegated-host-work.md), Part II.
 Security is at user authentication and authorization (section 6): a principal
 allowed to reach an agent acts through it with the local user's permissions,
 `atem message send` included, so a route that lists `local` takes work from
-whoever may prompt the agents that send. Every part of stages 2 and 3 that
-would change the remote permission contract is marked **Needs agreement** and
-waits until all three projects agree.
+whoever may prompt the agents that send.
 
 Reviews (2026-11-04): Auth/Portal's answers and changes are folded in; so are
 Astation's ([#120](https://github.com/Agora-Build/Atem/issues/120)): a narrow
 return grant for results, typed snapshots instead of references in text,
 automatic reports that never complete a task, durable selector resolution with
 one 32-agent budget across hosts, and separate Station connection capacity.
-Astation supports the direction; nothing cross-instance is signed off.
+The cross-instance parts moved to
+[delegated-host-work.md](delegated-host-work.md), which Atem, Astation and
+Auth/Portal agreed on 2026-11-08.
 
 ## 1. Goal
 
@@ -56,8 +56,8 @@ It comes in three stages:
 | Stage | Covers | Depends on |
 |---|---|---|
 | 1. Local (implemented, unreleased) | Agents on the same Atem instance | Atem only; owner opts in through runtime.toml |
-| 2. Online | Agents on different instances, while both sides are online | The existing permission contract, plus three agreements with Astation (the return grant, the typed selector and snapshot boundary, Station connection capacity); the Station turns on and extends its host-work adapters |
-| 3. Autonomous | Store-and-forward, offline recovery, project-level permissions | **Needs agreement**: origin-signed envelopes, a Station mailbox, signed projects |
+| 2. Online (planned) | Agents on different instances, while both sides are online | See [delegated-host-work.md](delegated-host-work.md) (II.1) |
+| 3. Autonomous (planned) | Store-and-forward, offline recovery, project-level permissions | See [delegated-host-work.md](delegated-host-work.md) (II.2-II.5) |
 
 ## 3. Terms
 
@@ -114,9 +114,10 @@ The agent working on token scopes in the Auth repo adds `self:tokens` itself.
   service scopes use).
 - Labels only address. Adding `self:tokens` makes an agent reachable by
   messages addressed to `self:tokens`; whether a sender may give it work is
-  still decided by permissions (section 6). Until projects are signed (stage
-  3), a project grants nothing either. Labels do decide where content goes,
-  which is why only the owner sets `project:` and `tag:`.
+  still decided by permissions (section 6). A project grants nothing either
+  (signed project grants are planned:
+  [delegated-host-work.md](delegated-host-work.md), II.2.2). Labels do decide
+  where content goes, which is why only the owner sets `project:` and `tag:`.
 
 ## 5. Addressing
 
@@ -156,13 +157,14 @@ agent at most once; the sending agent never receives its own message.
    final for that message.
 
 Stage 1 is the same on one host, with the whole budget. Its directory is read
-from the local runtime only; no vault directory record is published yet.
+from the local runtime only; no vault directory record is published yet
+(planned: [delegated-host-work.md](delegated-host-work.md), II.6).
 
 The shared types include a new host-work destination,
 `select{selectors, budget}`, beside `host`, `project` and `agent` (feature
 `host.select`). Stage 1 uses it internally: `host.select` is not advertised and
-remote host admission refuses `select`. Before stage 2, the Station's adapters
-must accept it too and the boundary must be agreed.
+remote host admission refuses `select`. **Stages 2 and 3 (planned):** see
+[delegated-host-work.md](delegated-host-work.md), Part II.
 
 **When no agent runs.** Only a sender that asks for it (`atem message send
 --launch`, with an `atem:<atem_id>/<route_id>` selector) gets a session
@@ -196,8 +198,7 @@ is `local`, whoever prompted the agent that sent it (below).
 | Stage | Sender identity | Account permission | Route consent |
 |---|---|---|---|
 | 1. Local | `local`: an internal attachment of the session host, never welcomed over a link | none: the message never leaves the machine (the same-user boundary every local command has); the sending agent's session is verified from its process (below) | the route lists `local` in `principals` |
-| 2. Online | an existing principal: the instance enrolled as a Station integration, `service:svc-<id>` | its signed service grant: `message`, `notify`, `prompt`, and `launch` for launches; its hosts and projects bound the targets | the route lists that service |
-| 3. Autonomous | the instance itself, `host:<host_id>`, signing with its pinned `host_key` (**needs agreement**) | a signed project grant, below (**needs agreement**) | the route lists `project:<name>` or the host (**needs agreement**) |
+| 2-3. Cross-instance (planned) | an instance enrolled as a Station integration, or the instance itself as `host:<host_id>` | see [delegated-host-work.md](delegated-host-work.md), II.1 and II.2 | see [delegated-host-work.md](delegated-host-work.md), II.2.3 |
 
 **Trust model: security is at user authentication.** Prompts must come from
 an authenticated, authorized user, neither forged nor altered on the way.
@@ -263,34 +264,8 @@ each command it runs; native members with `control`, and services and browser
 grants with the `approval` op, can answer them remotely. What is planned
 against the rest is in section 17 ("Known limits").
 
-**Stage 2 in practice.** The instance sends nothing until the owner has
-approved its integration in Astation; Auth issues no token before that. One
-integration per instance (Auth/Portal's answer), so each can be paused or
-revoked on its own, with its own quota, audit trail and R9 service identity.
-Costs: each counts toward the built-in Station's plan limit of active
-integrations (Basic 4, Premium 10; custom Stations have none); each expires
-after at most 90 days and is renewed and approved again; a key rotation keeps
-the old key valid for 10 minutes after the new one is registered, so Atem makes
-the new key, the owner registers it, and Atem switches once Auth accepts it.
-Configuration grows with every pair: each sending instance's service must be
-listed in every receiving route's `principals`, which is the practical case for
-signed projects.
-
-**Project-level permissions (stage 3, needs agreement).** A project becomes a
-signed object: a native device with `manage` signs
-`project{name, members: [host ids], ops: [message, notify, prompt, launch]}`
-into the device list or a sibling signed log. A route that lists
-`project:astation` in `principals` then accepts work from any instance the
-signed project names, within the project's ops. Removing an instance from the
-project, or removing its host, fences its queued work like any revoked
-principal. Until all three projects agree, routes keep naming explicit
-principals.
-
-A stage-3 `host:` sender is outside Agora.Build's kill switch: an integration
-can be stopped at once by Auth, paused from the Portal or the admin site and is
-audited by Auth; a host that signs its own envelopes can be stopped only by
-removing it from the device list (consistent with native members using
-membership, not scopes).
+**Stages 2 and 3 (planned):** see
+[delegated-host-work.md](delegated-host-work.md), Part II.
 
 **Limits against runaway chains.** A misleading message must not fan out:
 
@@ -345,9 +320,7 @@ digest), plus:
   either, or a `kind` other than `request`, is invalid (the shared SDK's
   `Message::valid`), so an SDK sender never sends one and the host refuses it
   at decode (`invalid_request`). Stage 1 sends only requests; a task's result
-  is its reply (section 10), not an envelope;
-- stage 3: `origin`, the sender's signature over the canonical envelope
-  (**needs agreement**).
+  is its reply (section 10), not an envelope.
 
 **Outbox.** `atem message send` hands the envelope to the sender's runtime,
 which commits it to `host-work.sqlite` before replying; the CLI sends nothing
@@ -424,10 +397,8 @@ before its snapshot is frozen ("vault context contains a credential value;
 remove it"), on a send and on a reply: its text would reach other agents, and
 remote senders through `reply_query`, as it is.
 
-**Stage 2: typed snapshots only.** The message adapter proposed in Astation's
-host-work branch accepts inline text only. Stage 2 does not put references in
-the text as a fallback: it waits for typed snapshots in the shared SDK and the
-Station adapter, with the boundary above agreed and tested.
+**Stages 2 and 3 (planned):** see
+[delegated-host-work.md](delegated-host-work.md), Part II.
 
 **Later: atomic (Station).** The Station stores the encrypted context version
 and the pending envelope in one transaction, so neither exists without the
@@ -445,8 +416,9 @@ Host-work v1, unchanged except for the selector destination:
   readiness, drafts, approvals, leases and expiry apply as today;
 - a task is submitted as a session-v1 prompt with `acquire` on its sender's
   attachment, and the prompt's receipt drives the task's states. A remote
-  sender's attachment is its live channel (stage 2) or its verified origin
-  (stage 3). A local task's sender is `local`, whoever prompted the agent that
+  sender's attachment is its live channel (delegated senders: see
+  [delegated-host-work.md](delegated-host-work.md), I.4.2). A local task's
+  sender is `local`, whoever prompted the agent that
   sent it (section 6). Local senders share one internal attachment, created
   through the session host's existing `connect` and welcome path (again after a
   host restart or identity change, which clear attachments), with the `local`
@@ -514,11 +486,10 @@ held, sender offline, screenshot missing, launching. A local task that waits
 out a pause keeps its state and shows `paused: <reason>` (section 9).
 
 **Automatic status.** The receiving runtime reports each task transition to
-the sender: in-process in stage 1; in stage 2 the sender's outbox polls
-`message_query` and `tasks/:id` instead; in stage 3 as `status` envelopes
-through the mailbox. The sending agent reads them with `atem message status`;
-nothing is typed or prompted into its session for a status (only a result,
-under its return grant, below).
+the sender: in-process in stage 1; across instances:
+[delegated-host-work.md](delegated-host-work.md), II.4.4. The sending agent
+reads them with `atem message status`; nothing is typed or prompted into its
+session for a status (only a result, under its return grant, below).
 
 Without an id, status shows the latest 32 messages, bounded to 1 MiB; query
 an explicit message id for older receipts. Views are cut at a whole message:
@@ -725,8 +696,8 @@ its sender: two separate steps.
   after the task settled past its deadline only the text goes ("Records and
   retention" below, [agent-hosting.md](agent-hosting.md) section 9).
 
-Stage 1 implements all of this within one runtime. Cross-instance, the return
-grant is a contract to agree with Astation before stage 2.
+Stage 1 implements all of this within one runtime. **Stages 2 and 3
+(planned):** see [delegated-host-work.md](delegated-host-work.md), Part II.
 
 ### Lifecycle
 
@@ -886,41 +857,17 @@ one.
 Stage 1 persists local sends, resolutions, tasks, counters, replies and return
 grants across broker restarts. It needs no network transport for text-only work;
 Memory/Vault publication waits for a reachable relay. A lost or uncertain
-launch is not respawned automatically. The cross-instance behavior below is
-planned, not implemented.
-
-| Situation | Stage 2 (planned) | Stage 3 (planned) |
-|---|---|---|
-| Sender restarts | the outbox resumes from its rows | same |
-| Receiver offline | the outbox retries until expiry (24 h at most) | the Station mailbox holds the envelope until the receiver reconnects |
-| Sender offline after acceptance | its remote tasks stay `blocked(sender offline)`: dispatch needs its live channel | dispatch goes on, on the verified origin; the receiver checks the sender's authority against its own device list |
-| Receiver restarts mid-task | host-work recovery: `submitting` becomes `outcome_unknown`, reconciled from its receipt, never sent again | same |
-| Results while the sender is offline | queued in the receiver's outbox | held in the mailbox |
-
-On the built-in Station the mailbox means Agora.Build's server stores the
-(sealed) envelopes: deleting the account deletes the mailbox's contents, and
-the trust notice mentions the mailbox as it does hosted execution.
+launch is not respawned automatically. **Stages 2 and 3 (planned):** see
+[delegated-host-work.md](delegated-host-work.md), Part II.
 
 ## 12. Transports
 
 | Transport | Stage | Sender identity | Carried by | Offline |
 |---|---|---|---|---|
 | In-process | 1 | `local` (the internal attachment; the sending session is recorded with the envelope) | the runtime | not needed |
-| Station hosted agent API | 2 | a Station integration, `service:svc-<id>`: the Station holds its R9 key, the instance holds its Auth client key (`private_key_jwt`) in the cred agent | Station adapters: `messages`, `launches`, `tasks`; new: `routes`, a `work_complete` route, the `select` destination, snapshots | no |
-| Station mailbox with sealed envelopes | 3 | `host:<host_id>`, origin-signed | the Station stores envelopes per instance and delivers them with acknowledgments | yes |
 
-Stage 2 capacity (Astation): the Station keeps an integration's channel to a
-host while its `events` WebSocket is open, which keeps dispatch working, but each
-such WebSocket holds one of the Station's eight shared request permits for its
-lifetime. Separate, bounded connection and request budgets (per integration and
-account) come first, before online collaboration scales. When a token expires,
-the instance reconnects with a fresh one; a kept channel never extends a
-token's authority.
-
-Why stage 2 doesn't use a key the instance holds: Station provisioning takes no
-client-supplied service key, the direct channel endpoint needs a user
-`astation.remote` token that Atem must not hold, and the device list gives hosts
-no roles. Stage 3 makes the instance's own pinned key the origin, once agreed.
+**Stages 2 and 3 (planned):** see
+[delegated-host-work.md](delegated-host-work.md), Part II.
 
 ## 13. Commands and configuration
 
@@ -936,9 +883,6 @@ send = true                 # off by default
 per_hour = 30
 per_workflow = 8
 result_timeout = "30m"
-# Proposed stage-2 keys, NOT accepted by the current runtime.toml parser:
-# integration = "i-..."
-# station = "https://station-dev.agora.build"
 
 [[profiles]]
 id = "auth"
@@ -956,7 +900,7 @@ id = "auth"
 revision = 1
 profile_id = "auth"
 labels = ["tag:auth"]
-principals = ["local"]      # stage 2 adds services; stage 3 may add project:<name>
+principals = ["local"]      # local agents; project:<name> and host:<host_id> are planned (delegated-host-work.md II.2.3)
 launch = "on_message"       # optional; the profile must be Claude Code in stage 1
 results = true              # off by default: results of tasks this route's agents sent reach them
 auto_report = "status"      # or "final_message" (opt-in)
@@ -981,33 +925,25 @@ validate it with `atem runtime check`. Repeat `--to` for a union of selectors.
 
 ## 14. Ownership and dependencies
 
-The local items below are implemented; directory publication and every
-cross-instance item are planned.
+The local items below are implemented; Codex launch on message, atomic
+write-and-notify and every cross-instance item are planned.
 
 | Item | Owner | Depends on |
 |---|---|---|
 | Labels and `atem agent tag` | Atem | nothing |
-| Directory records in the vault (needed from stage 2: local delivery resolves selectors itself) | Atem | nothing |
 | Outbox, retries, deduplication, delivery status | Atem | nothing |
 | Publish before notify: publish, read back, freeze | Atem | nothing |
 | Local delivery between agents of one instance: the internal `local` attachment and route principal | Atem | nothing |
 | The `select` destination with budgets and persisted resolution, launch on message, automatic reports, return grants and results (local) | Atem | nothing |
-| Cross-instance delivery while online, as a Station integration | Atem | Agreements with Astation: the return grant, the typed `select` and snapshot boundary. Station: turning on the host-work gate (off on every Station; it grants `agent.launch`/`message`/`notify` only when built with `host-work-api`); `routes` and `work_complete` adapters; `select` and typed snapshots in the message adapter; separate connection and request budgets. Auth/Portal: nothing new: the owner registers the instance's public key as a "Custom App / API" integration, and the scope names are final |
 | Result submission for every sender: `atem message reply`, the `host.reply` feature and `reply_query` for remote senders | Atem | nothing for Astation's apps over their channel (they adopt the SDK op); integrations need a Station task route for replies |
 | Launch on message for Codex | Atem | Codex's first-prompt readiness fixed and tested first |
 | Atomic write-and-notify | Station | a transaction over encrypted context versions and pending envelopes, with its boundary specified |
-| Mailbox, offline delivery, origin-signed envelopes, `host:` principal, signed projects | all three | **needs agreement** on the permission contract |
 
-Order (Astation's proposal, agreed): (1) Atem builds stage 1 with the
-tightened result, correlation, resolution and budget rules, and supplies the
-shared contract and fixtures; (2) Atem and Astation agree the return grant and
-the typed selector and snapshot boundary; the Station adds its adapters and
-connection capacity; (3) a joint online test: lost acknowledgment,
-reconnect and restart, duplicate delivery and result, changed selectors, exact
-context verification, revocation and refused route or scope, a held lease or
-open approval, fan-out and capacity limits. It can be folded into the D28
-joint dev check on an upgraded test host. (4) Host-origin signatures, signed
-projects and offline dispatch are stage 3, not prerequisites.
+**Stages 2 and 3 (planned):** the directory in the vault, cross-instance
+delivery as a Station integration, the mailbox, origin-signed envelopes, the
+`host:` principal and signed projects: see
+[delegated-host-work.md](delegated-host-work.md), Part II (contract changes in
+IV, order of work in V.2, open questions per team in IX).
 
 ## 15. Questions
 
@@ -1017,13 +953,14 @@ Astation (answered 2026-11-04, [#120](https://github.com/Agora-Build/Atem/issues
    with immutable resolution and publication and access checks; no references
    in free text.
 2. The `events` WebSocket keeps the host channel; its request permit is the
-   capacity problem (section 12). Message and task queries stay the
-   authoritative progress and recovery.
+   capacity problem (delegated-host-work.md, II.1). Message and task queries
+   stay the authoritative progress and recovery.
 3. Mailbox (stage 3): supported on the selected Station: sealed envelopes per
    instance, at most 24 h retention, quotas, acknowledgments and deduplication,
    the sender's current authority checked before execution; stored channel
    ciphertext is never replayed as an authenticated message on a new channel.
-   Atomic write-and-notify lives in the Station (section 8).
+   Atomic write-and-notify lives in the Station (section 8). The mailbox is
+   designed in [delegated-host-work.md](delegated-host-work.md), II.4.3.
 
 Auth/Portal (answered 2026-11-04):
 
@@ -1040,20 +977,22 @@ Auth/Portal (answered 2026-11-04):
    has `agent.message` and `agent.prompt`; `agent.view` is always included.
    Design of record: Portal `docs/integrations.md` §3.1.3.
 
-Still open (all three, before stage 2 and stage 3):
+Cross-instance (stages 2 and 3):
 
-6. The return grant (section 10) as the cross-instance contract for results.
-7. A `host:<host_id>` principal signing with its pinned `host_key`, or must
-   every sender be a service? (Stage 3; Astation's review approves no new
-   principal yet.)
-8. Signed projects: in the device list or a separate signed log? Signed by a
-   native `manage` device only? Which ops may a project grant? (Stage 3.)
+**6-8.** Answered in [delegated-host-work.md](delegated-host-work.md) (II.1,
+II.2.1, II.2.2); planned, nothing built.
+
+Still open:
+
 9. Should a renewal that only extends a service's expiry keep the service's
    control generation? In r9 today any service `set_roles`, including a routine
    renewal with unchanged scopes, raises it, so the service's unstarted and
    awaiting tasks fail `sender's authority changed` and it must send them again
    (section 10). A permission-contract question for Astation, Auth and Portal;
-   stage 1 doesn't change it.
+   stage 1 doesn't change it. Narrowed by
+   [delegated-host-work.md](delegated-host-work.md), V.3 (#127): neither expiry
+   nor renewal touches the accepted tasks of delegated senders, so the question
+   is left with channels, leases and v1 senders.
 
 Decided (owner, 2026-11-07):
 
@@ -1195,7 +1134,7 @@ These are runtime and protocol tests with fake providers. They do not claim a
 live Claude/Codex conversation, native app acceptance or deployed cross-host
 delivery. Stages 2 and 3, the directory in the vault, cross-instance return
 grants, Station typed adapters/capacity, mailbox and signed projects remain
-outside this implementation.
+outside this implementation ([delegated-host-work.md](delegated-host-work.md)).
 
 ### Known limits
 

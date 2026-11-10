@@ -232,8 +232,8 @@ designs/                      # Design only: current design and planned work (RE
 ├── README.md                 # Index: current design, planned work
 ├── protocol/                 # README.md (the protocols and how atem-session evolved, where the fixtures run), atem-session-v1.md (the wire contract, r9 appendix), atem-client-bindings.md (r9 binding/effect contract), atem-host-work-v1.md (remote launch, directed work, messages, attachments/mark), station-route-v1.md (the selected Station), fixtures/ (shared with Astation)
 ├── agent-runtime.md          # `atem runtime` broker + `atem worker`s: sessions, leases, receipts, the local protocol, operations through the runtime
-├── agent-collaboration.md    # local collaboration (stage 1); planned cross-instance transport, return grants and mailbox (stages 2-3)
-├── delegated-host-work.md    # Planned (nothing built): delegated host work and stage-3 host-to-host senders; delegated-host-work-flows.html is its diagram
+├── agent-collaboration.md    # local collaboration (stage 1); stages 2-3 point to delegated-host-work.md
+├── delegated-host-work.md    # Planned (only its prompt framing, III.2, is built, with stage 1): delegated host work and host-to-host senders (stages 2-3 of collaboration); delegated-host-work-flows.html is its diagram
 ├── shared-terminal.md        # Shared terminal (terminal-v1): canonical-screen frames, credit, keys, limits
 ├── agent-chat-host.md        # Agent chat (chat-v1): adapters, Claude hooks + transcript, Codex, approvals, status
 ├── agent-chat-api.md         # Developer guide for chat clients
@@ -419,7 +419,7 @@ and the local tasks sent to it), `cancel TASK_ID` (inside a session: its own
 messages) and `directory [SELECTOR]` inspect the local runtime. `host.select`,
 local `result` snapshots, the `local` sender and the local-only
 `from_session`/`reply_to` are never admitted from remote channels.
-Cross-instance delivery is not built.
+Cross-instance delivery is not built (planned: `designs/delegated-host-work.md`).
 
 **TUI State Machine** (`app.rs`): bare `atem` is a menu and a client of `atem runtime`; it opens no Astation connection (the runtime owns the machine's one link). Enum-based mode switching via `AppMode`:
 - `MainMenu` - Navigation between features

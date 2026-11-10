@@ -62,4 +62,4 @@ context before delivery. A bare vault ID/version is accepted only when it
 identifies one entry; include `:ENTRY` when ambiguous (`atem message reply`
 always needs it). These commands currently
 reach agents in the same runtime. Cross-instance delivery is planned in the
-[collaboration design](../designs/agent-collaboration.md).
+[delegated host-work design](../designs/delegated-host-work.md).
