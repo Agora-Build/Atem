@@ -1958,7 +1958,7 @@ fn a_task_whose_outcome_is_unknown_expires_and_frees_its_session() {
         rig.status(&next)["tasks"][0]["detail"] == "waiting for an earlier task on this session"
     });
     // Its deadline is up to 12 s after the send.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while rig.status(&id)["tasks"][0]["state"] != "expired" {
         assert!(
             std::time::Instant::now() < deadline,

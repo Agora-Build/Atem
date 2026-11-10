@@ -1163,10 +1163,12 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Memory { command } => crate::memory::cmd::handle_memory(command).await,
         Commands::Skill { command } => crate::memory::cmd::handle_skill(command).await,
         Commands::Cred { command } => crate::memory::unlock::handle_cred(command).await,
+        // `main` runs the cred agent itself, on its own one-thread runtime
+        // (agent_socket::cred_agent_main), so it never gets here on Unix.
         Commands::CredAgent => {
             #[cfg(unix)]
             {
-                crate::memory::agent_socket::run_cred_agent().await
+                anyhow::bail!("the cred agent runs only from `main` (atem cred-agent)")
             }
             #[cfg(not(unix))]
             {

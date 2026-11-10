@@ -33,6 +33,10 @@ use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const ACCOUNT: &str = "acct-two-hosts";
 const HOST_A: &str = "host-a";
 const HOST_B: &str = "host-b";
@@ -136,7 +140,7 @@ impl Host {
     /// Waits until the state dump satisfies `ok`.
     fn until_state(&self, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
         let mut last = Value::Null;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + WAIT;
         while std::time::Instant::now() < deadline {
             last = self.state();
             if ok(&last) {

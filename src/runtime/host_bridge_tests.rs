@@ -23,7 +23,10 @@ const ASTATION: &str = "astation-host-test";
 const ACCOUNT: &str = "acct-1";
 const DEVICE: &str = "device-1";
 const TRUST_GEN: u64 = 3;
-const WAIT: Duration = Duration::from_secs(20);
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 
 thread_local! {
     /// This thread's sandboxes, for `HookSweep`.
@@ -437,7 +440,7 @@ impl Runtime {
 
     async fn shutdown(mut self) -> Rc<tempfile::TempDir> {
         let _ = self.stop.take().unwrap().send(());
-        tokio::time::timeout(Duration::from_secs(10), &mut self.server)
+        tokio::time::timeout(WAIT, &mut self.server)
             .await
             .expect("the server stops")
             .unwrap()
@@ -3056,6 +3059,13 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         let from = peer.seen.len();
         send(peer, &r4, "remote four");
         peer.wait_from(from, accepted(r4.clone())).await;
+        // `accepted` is the receipt's durable acceptance: the paste may not
+        // have reached the agent yet. The tool call asks for permission
+        // inside this turn, so wait until the agent has started it. (Asked
+        // earlier, a slow runner let the request open before the prompt
+        // reached the agent; the prompt, newer than the request, then closed
+        // it with no decision, and the answer below was `stale_target`.)
+        agent_event(&fake, "prompt turn-4 remote four").await;
         ask(
             &fake,
             1,
@@ -4262,7 +4272,7 @@ fn a_pin_finished_right_after_a_reopen_is_opened_on_the_next_pass() {
             journal.join("membership_applied"),
         )
         .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + WAIT;
         loop {
             let state = status(&mut client).await.device_list.map(|d| d.state);
             if fired.load(Ordering::SeqCst) && state.as_deref() == Some("open") {

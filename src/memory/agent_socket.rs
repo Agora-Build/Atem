@@ -665,11 +665,30 @@ async fn serve_with(
             .map_or(Duration::from_secs(3600), |w| w.every),
     );
     checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // When the freed memory is given back: `TrimDue`, pushed back by the
+    // connections; the sleep is armed while a trim is due.
+    let trim_due = Arc::new(TrimDue::default());
+    let mut trim = std::pin::pin!(tokio::time::sleep(TRIM_IDLE));
+    let mut trim_armed = false;
     loop {
         while connections.try_join_next().is_some() {}
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = stop_requested.wait_for(|stop| *stop) => break,
+            _ = trim_due.pushed.notified() => {
+                if let Some(at) = trim_due.at() {
+                    trim.as_mut().reset(at);
+                    trim_armed = true;
+                }
+                continue;
+            }
+            _ = trim.as_mut(), if trim_armed => {
+                match trim_due.trim_if_due() {
+                    Some(later) => trim.as_mut().reset(later),
+                    None => trim_armed = false,
+                }
+                continue;
+            }
             _ = checks.tick(), if watch.is_some() => {
                 if let Some(watch) = &watch
                     && let Some(why) = watch.orphaned()
@@ -700,13 +719,14 @@ async fn serve_with(
                 continue;
             }
         };
-        let (agent, stopping) = (agent.clone(), stopping.clone());
+        let (agent, stopping, trim_due) = (agent.clone(), stopping.clone(), trim_due.clone());
         connections.spawn(async move {
             if let Err(error) =
-                serve_connection(stream, &agent, allowed_uid, &stopping, frames).await
+                serve_connection(stream, &agent, allowed_uid, &stopping, &trim_due, frames).await
             {
                 eprintln!("cred agent: {error:#}");
             }
+            trim_due.push_back();
         });
     }
     eprintln!("cred agent: locked by `atem cred lock`; exiting");
@@ -743,12 +763,15 @@ async fn serve_with(
 
 /// One connection: JSON lines, and frames once a `status` answered here
 /// offered them (only when this agent reads them: `frames`). A malformed
-/// frame closes it with an error.
+/// frame closes it with an error. A request or reply of `TRIM_BYTES` or
+/// more pushes `trim_due` back before its reply is written, and again once
+/// its buffers are freed.
 async fn serve_connection(
     stream: tokio::net::UnixStream,
     agent: &Mutex<CredAgent>,
     allowed_uid: u32,
     stopping: &tokio::sync::watch::Sender<bool>,
+    trim_due: &TrimDue,
     frames: bool,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -769,22 +792,28 @@ async fn serve_connection(
     let mut lines = Lines::new();
     loop {
         let mut answered = false;
+        let mut large = false;
         while let Some(message) = lines.next_message()? {
-            let (reply, stop) = match message {
+            let (reply, stop, size) = match message {
                 Message::Line(line) => {
                     let end = line.len() - 1;
                     let (reply, stop, agreed) = match std::str::from_utf8(&line[..end]) {
                         Ok(text) => respond(agent, text, frames),
                         Err(_) => respond(agent, "", frames),
                     };
+                    let size = line.len();
                     drop(line);
                     if agreed {
                         lines.frames = true;
                     }
-                    (reply, stop)
+                    (reply, stop, size)
                 }
-                Message::Frame(head, body) => (respond_frame(agent, head, body)?, false),
+                Message::Frame(head, body) => (respond_frame(agent, head, body)?, false, head.len),
             };
+            if size.max(reply.len()) >= TRIM_BYTES {
+                large = true;
+                trim_due.push_back();
+            }
             write.write_all(&reply).await?;
             drop(reply);
             answered = true;
@@ -801,6 +830,9 @@ async fn serve_connection(
                     log.lock().unwrap().push(lines.held());
                 }
             });
+        }
+        if large {
+            trim_due.push_back();
         }
         if lines.too_long() {
             bail!("a request is too long");
@@ -829,6 +861,10 @@ thread_local! {
     /// Tests: what the connections served on this thread hold once they
     /// have answered (`Lines::held`), when a test asks for it.
     static SETTLED: std::cell::RefCell<Option<HeldLog>> = const { std::cell::RefCell::new(None) };
+    /// Tests: when the agent served on this thread gives its freed memory
+    /// back (`TrimLog`), when a test asks for it.
+    static TRIMS: std::cell::RefCell<Option<Arc<TrimLog>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A message read on an agent connection.
@@ -1021,7 +1057,7 @@ impl Lines {
 }
 
 /// No core dumps, no ptrace by the same user, and (when the limit allows)
-/// no swapping. Linux only; elsewhere a no-op.
+/// no swapping (`lock_memory`). Linux only; elsewhere a no-op.
 fn harden_process() {
     #[cfg(target_os = "linux")]
     {
@@ -1036,24 +1072,237 @@ fn harden_process() {
             rlim_max: 0,
         };
         let known = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0;
-        // With MCL_FUTURE, every allocation past the limit fails, so lock only
-        // when the limit leaves room for the whole process.
-        if !known || (limit.rlim_cur != libc::RLIM_INFINITY && limit.rlim_cur < 512 << 20) {
-            eprintln!(
-                "cred agent: not locking memory (RLIMIT_MEMLOCK is too low); keys could reach swap"
-            );
-        } else if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
-            eprintln!(
-                "cred agent: mlockall failed ({}); keys could reach swap",
-                std::io::Error::last_os_error()
-            );
+        let locked = lock_memory(known.then_some(limit), |flags| {
+            // SAFETY: mlockall takes flags only.
+            if unsafe { libc::mlockall(flags) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+        if let Some(line) = locked.log_line() {
+            eprintln!("{line}");
         }
     }
 }
 
-/// `atem cred-agent`: serve this user's agent until the process exits.
-pub async fn run_cred_agent() -> Result<()> {
+/// What `lock_memory` did.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum MemoryLock {
+    /// Every page, mapped now or later, locked as it is first touched.
+    OnFault,
+    /// Every page locked and faulted in at once (a kernel without
+    /// `MCL_ONFAULT`).
+    AllAtOnce,
+    /// Not attempted: `RLIMIT_MEMLOCK` unknown or too low.
+    TooLow,
+    /// `mlockall` failed: nothing is locked.
+    Failed(std::io::Error),
+}
+
+#[cfg(target_os = "linux")]
+impl MemoryLock {
+    /// The agent's log line for it (`None` once memory is locked).
+    fn log_line(&self) -> Option<String> {
+        match self {
+            Self::OnFault | Self::AllAtOnce => None,
+            Self::TooLow => Some(
+                "cred agent: not locking memory (RLIMIT_MEMLOCK is too low); keys could reach swap"
+                    .to_string(),
+            ),
+            Self::Failed(error) => Some(format!(
+                "cred agent: mlockall failed ({error}); keys could reach swap"
+            )),
+        }
+    }
+}
+
+/// Locks every page of the process, mapped now or later, so none can reach
+/// swap, through `mlockall` (the system call, or a test's stand-in), when
+/// `limit` (`RLIMIT_MEMLOCK`, `None` when unknown) is unlimited or at least
+/// 512 MiB: with `MCL_FUTURE` every allocation past the limit would fail.
+/// Each page is locked as it is first touched (`MCL_ONFAULT`, Linux 4.4): a
+/// page that holds anything was touched, so it is locked before it holds
+/// it, and the pages never touched (most of the mapped executable, the
+/// unused parts of stacks and reservations) aren't read in just to be
+/// locked. A kernel without `MCL_ONFAULT` (EINVAL) gets every page faulted
+/// in and locked at once, as before. Locked only when a call returned
+/// success; a failed call locks nothing.
+#[cfg(target_os = "linux")]
+fn lock_memory(
+    limit: Option<libc::rlimit>,
+    mut mlockall: impl FnMut(libc::c_int) -> std::io::Result<()>,
+) -> MemoryLock {
+    let Some(limit) = limit else {
+        return MemoryLock::TooLow;
+    };
+    if limit.rlim_cur != libc::RLIM_INFINITY && limit.rlim_cur < 512 << 20 {
+        return MemoryLock::TooLow;
+    }
+    let all = libc::MCL_CURRENT | libc::MCL_FUTURE;
+    match mlockall(all | libc::MCL_ONFAULT) {
+        Ok(()) => MemoryLock::OnFault,
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => match mlockall(all) {
+            Ok(()) => MemoryLock::AllAtOnce,
+            Err(error) => MemoryLock::Failed(error),
+        },
+        Err(error) => MemoryLock::Failed(error),
+    }
+}
+
+/// The agent's heap: every block up to `HEAP_BLOCKS` comes from it, and
+/// it gives nothing back by itself until `HEAP_KEPT` is free at its top
+/// (glibc's `M_MMAP_THRESHOLD`, at its largest value, and
+/// `M_TRIM_THRESHOLD`). So the next large request reuses the pages the last
+/// one freed instead of faulting them in (and locking them) again: left to
+/// itself glibc gives big blocks back as they are freed, and a 2 MiB seal
+/// then took about 1.6 times as long. `give_back_freed_memory` returns
+/// what is free once the agent is idle.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HEAP_BLOCKS: libc::c_int = 32 << 20;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HEAP_KEPT: libc::c_int = 64 << 20;
+
+/// Sets the agent's heap (`HEAP_BLOCKS`). glibc only; elsewhere a no-op.
+fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only sets the allocator's parameters; called before
+    // the agent starts its runtime.
+    unsafe {
+        if libc::mallopt(libc::M_MMAP_THRESHOLD, HEAP_BLOCKS) != 1
+            || libc::mallopt(libc::M_TRIM_THRESHOLD, HEAP_KEPT) != 1
+        {
+            eprintln!("cred agent: could not set the allocator's thresholds");
+        }
+    }
+}
+
+/// A request or reply at least this big, or a connection's end, leaves
+/// freed memory in the heap (`HEAP_BLOCKS`); the agent gives it back once
+/// neither happened for `TRIM_IDLE`, so a burst of large requests reuses it.
+const TRIM_BYTES: usize = 128 << 10;
+#[cfg(not(test))]
+const TRIM_IDLE: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const TRIM_IDLE: Duration = Duration::from_millis(100);
+
+/// When the agent gives its freed memory back (`give_back_freed_memory`):
+/// `TRIM_IDLE` after the last request or reply of `TRIM_BYTES` or more, or
+/// the last connection's end. The connections push it back as they go; the
+/// serve loop sleeps until it and trims only once it has really passed.
+#[derive(Default)]
+struct TrimDue {
+    at: Mutex<Option<tokio::time::Instant>>,
+    /// Wakes the serve loop when `at` was pushed back.
+    pushed: tokio::sync::Notify,
+}
+
+impl TrimDue {
+    /// Puts the trim `TRIM_IDLE` from now.
+    fn push_back(&self) {
+        if let Ok(mut at) = self.at.lock() {
+            *at = Some(tokio::time::Instant::now() + TRIM_IDLE);
+        }
+        #[cfg(test)]
+        trim_log(|log| log.due.store(true, std::sync::atomic::Ordering::SeqCst));
+        self.pushed.notify_one();
+    }
+
+    /// When the trim is due, if one is.
+    fn at(&self) -> Option<tokio::time::Instant> {
+        self.at.lock().ok().and_then(|at| *at)
+    }
+
+    /// Gives the freed memory back if the trim's time has come (then none
+    /// is due any more); else when it is due, if it still is.
+    fn trim_if_due(&self) -> Option<tokio::time::Instant> {
+        let mut at = self.at.lock().ok()?;
+        match *at {
+            Some(when) if when > tokio::time::Instant::now() => Some(when),
+            Some(_) => {
+                *at = None;
+                give_back_freed_memory();
+                #[cfg(test)]
+                trim_log(|log| log.due.store(false, std::sync::atomic::Ordering::SeqCst));
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+/// Tests: how many times the agent gave its freed memory back, and whether
+/// a trim is due (set before a large request's reply is written, cleared
+/// only after the trim that covers it).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TrimLog {
+    trims: std::sync::atomic::AtomicUsize,
+    due: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl TrimLog {
+    fn trims(&self) -> usize {
+        self.trims.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn due(&self) -> bool {
+        self.due.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Tests: `record` on the `TrimLog` of the agent served on this thread.
+#[cfg(test)]
+fn trim_log(record: impl FnOnce(&TrimLog)) {
+    TRIMS.with(|log| {
+        if let Some(log) = &*log.borrow() {
+            record(log);
+        }
+    });
+}
+
+/// Gives the heap's free memory back to the system (glibc's `malloc_trim`):
+/// what requests' buffers left there once they were wiped and freed. Under
+/// `mlockall` only the free top of the heap can go (the kernel keeps locked
+/// pages, free or not, in the middle of it): a block still in use above
+/// freed ones, such as a connection opened while a large request was being
+/// read, keeps them until it is freed and the next trim. glibc only;
+/// elsewhere a no-op.
+fn give_back_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no pointer; the allocator locks itself.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(test)]
+    trim_log(|log| {
+        log.trims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// `atem cred-agent`, called by `main` before any runtime exists: hardens
+/// the process (`mlockall` among it) and sets its heap, then serves on a
+/// current-thread runtime. The agent has no use for worker threads: every
+/// request already runs under the agent's one lock, and each thread would
+/// bring a 2 MiB stack and a malloc arena of its own
+/// (designs/e2e-encryption.md, "Performance", F5). Every connection's I/O
+/// waits without blocking the thread, so a client that stalls holds up
+/// nobody; a request's own work (within the request limits) runs to its
+/// end before another's starts.
+pub fn cred_agent_main() -> Result<()> {
     harden_process();
+    tune_allocator();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("could not start the cred agent's runtime")?
+        .block_on(run_cred_agent())
+}
+
+/// Serves this user's agent until the process exits (`cred_agent_main`).
+async fn run_cred_agent() -> Result<()> {
     // Taken now, before a rebuild can replace the executable on disk.
     let _ = build_id();
     let paths = CredPaths::default_paths();
@@ -2196,11 +2445,22 @@ mod tests {
 
     /// Serves an agent for the key files in `dir` on its own thread.
     pub(super) fn start_agent(dir: &Path, allowed_uid: u32) -> PathBuf {
+        start_agent_counting_trims(dir, allowed_uid, None)
+    }
+
+    /// `start_agent`, recording in `trims` when it gives its freed memory
+    /// back.
+    fn start_agent_counting_trims(
+        dir: &Path,
+        allowed_uid: u32,
+        trims: Option<Arc<TrimLog>>,
+    ) -> PathBuf {
         let socket = sock(&dir.join("run"));
         let paths = CredPaths::in_dir(dir);
         let (ready, started) = std::sync::mpsc::channel();
         let path = socket.clone();
         std::thread::spawn(move || {
+            TRIMS.with(|counter| *counter.borrow_mut() = trims);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2948,6 +3208,332 @@ mod tests {
         );
         let log = std::fs::read_to_string(dir.path().join("a.log")).unwrap();
         assert!(log.contains("exiting"), "{log}");
+    }
+
+    /// The agent process serves every connection on its one thread (F5,
+    /// designs/e2e-encryption.md "Performance"), and a client that stalls
+    /// mid-request (a frame or a line half sent) or never reads its replies
+    /// holds up no other client's request: all of its I/O waits without
+    /// blocking the thread.
+    #[test]
+    fn the_agent_runs_on_one_thread_and_a_stalled_client_holds_up_no_one() {
+        let dir = short_dir();
+        let home = dir.path().join("home");
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&home).unwrap();
+        make_private(&run);
+        let agent = cred_agent_process(&home, &run, &dir.path().join("a.log"));
+        let socket = sock(&run);
+        let client = CredAgentClient::at(socket.clone());
+        assert!(eventually(|| client.status().is_ok()));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            std::fs::read_dir(format!("/proc/{}/task", agent.0.id()))
+                .unwrap()
+                .count(),
+            1,
+            "the agent runs on one thread"
+        );
+        // A frame half sent, on a connection whose status agreed to frames.
+        let mut framed = UnixStream::connect(&socket).unwrap();
+        framed
+            .write_all(encode_request(&Request::Status).unwrap().as_bytes())
+            .unwrap();
+        let mut agreed = String::new();
+        BufReader::new(&framed).read_line(&mut agreed).unwrap();
+        assert!(agreed.contains("\"frames\":1"), "{agreed}");
+        let frame =
+            agent_frame::crypt_request("astation", &[CryptOp::seal("r", "f", &vec![1; 1 << 20])])
+                .unwrap();
+        framed.write_all(&frame[..frame.len() / 2]).unwrap();
+        // A line half sent.
+        let mut line = UnixStream::connect(&socket).unwrap();
+        line.write_all(&vec![b'x'; 1 << 20]).unwrap();
+        // Requests whose replies are never read, written until the agent
+        // stops reading them (its replies have filled the socket).
+        let mut deaf = UnixStream::connect(&socket).unwrap();
+        deaf.set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let requests = encode_request(&Request::Status).unwrap().repeat(1_000);
+        while deaf.write_all(requests.as_bytes()).is_ok() {}
+        let start = std::time::Instant::now();
+        let status = CredAgentClient::at(socket.clone()).status().unwrap();
+        assert!(!status.unlocked);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "another client waited {:?}",
+            start.elapsed()
+        );
+        drop((framed, line, deaf, agent));
+    }
+
+    /// After a request or reply of `TRIM_BYTES` or more, or a connection's
+    /// end, the agent gives its freed memory back once neither happened for
+    /// `TRIM_IDLE`; small requests never make it trim. Each assertion of
+    /// "no trim" holds whatever the timing: a trim can come only while one
+    /// is due, which a large request sets before its reply is written.
+    #[test]
+    fn the_agent_gives_freed_memory_back_once_idle_after_a_large_request() {
+        let dir = short_dir();
+        let log = Arc::new(TrimLog::default());
+        let socket = start_agent_counting_trims(dir.path(), own_uid(), Some(log.clone()));
+        let client = CredAgentClient::at(socket.clone());
+        for _ in 0..20 {
+            client.status().unwrap();
+        }
+        assert!(!log.due(), "small requests never make a trim due");
+        std::thread::sleep(TRIM_IDLE * 3);
+        assert_eq!(log.trims(), 0, "small requests never trim");
+        // Large lines (refused or not, each gets its reply), back to back.
+        let large = format!(
+            "{{\"v\":2,\"op\":\"status\",\"pad\":\"{}\"}}\n",
+            "x".repeat(TRIM_BYTES)
+        );
+        let stream = UnixStream::connect(&socket).unwrap();
+        for _ in 0..3 {
+            (&stream).write_all(large.as_bytes()).unwrap();
+            let mut reply = String::new();
+            BufReader::new(&stream).read_line(&mut reply).unwrap();
+            assert!(reply.ends_with('\n'), "{reply}");
+        }
+        assert!(
+            eventually(|| !log.due() && log.trims() > 0),
+            "it trims once idle"
+        );
+        let after = log.trims();
+        std::thread::sleep(TRIM_IDLE * 3);
+        assert_eq!(
+            log.trims(),
+            after,
+            "and not again until another large request"
+        );
+        client.status().unwrap();
+        std::thread::sleep(TRIM_IDLE * 3);
+        assert!(!log.due());
+        assert_eq!(log.trims(), after);
+        drop(stream);
+        assert!(
+            eventually(|| !log.due() && log.trims() > after),
+            "a connection's end makes it trim"
+        );
+    }
+
+    /// Where the limit lets the agent lock its memory, every page it maps is
+    /// locked (VmLck), but only the pages it touches are read in
+    /// (`MCL_ONFAULT`): most of the mapped executable never is. It says
+    /// whether it ran; with `ATEM_TEST_REQUIRE_MLOCK` set (the Linux CI job,
+    /// which raises the limit) a limit too low to run it is a failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_locked_agent_reads_in_only_the_pages_it_touches() {
+        use std::os::unix::process::CommandExt;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) },
+            0
+        );
+        let hard = if limit.rlim_max == libc::RLIM_INFINITY {
+            "unlimited".to_string()
+        } else {
+            format!("{} KiB", limit.rlim_max >> 10)
+        };
+        if limit.rlim_max != libc::RLIM_INFINITY && limit.rlim_max < 512 << 20 {
+            assert!(
+                std::env::var_os("ATEM_TEST_REQUIRE_MLOCK").is_none(),
+                "RLIMIT_MEMLOCK's hard limit is {hard}, under 512 MiB: raise it for this job"
+            );
+            println!(
+                "a_locked_agent_reads_in_only_the_pages_it_touches: skipped: RLIMIT_MEMLOCK's hard limit is {hard}, under 512 MiB (the agent locks nothing)"
+            );
+            return;
+        }
+        let dir = short_dir();
+        let home = dir.path().join("home");
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&home).unwrap();
+        make_private(&run);
+        let log_path = dir.path().join("a.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut command = std::process::Command::new(atem_binary());
+        command
+            .arg("cred-agent")
+            .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", &run)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        // SAFETY: setrlimit only, between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                let raised = libc::rlimit {
+                    rlim_cur: limit.rlim_max,
+                    rlim_max: limit.rlim_max,
+                };
+                if libc::setrlimit(libc::RLIMIT_MEMLOCK, &raised) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let agent = Reaped(command.spawn().unwrap());
+        let client = CredAgentClient::at(sock(&run));
+        assert!(eventually(|| client.status().is_ok()));
+        let status = std::fs::read_to_string(format!("/proc/{}/status", agent.0.id())).unwrap();
+        let kib = |name: &str| -> u64 {
+            status
+                .lines()
+                .find(|line| line.starts_with(name))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| value.parse().ok())
+                .unwrap()
+        };
+        let (locked, resident) = (kib("VmLck:"), kib("VmRSS:"));
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(locked > 0, "the agent locked nothing: {log}");
+        assert!(!log.contains("keys could reach swap"), "{log}");
+        // Read in at once, the pages would all be resident (VmRSS about
+        // VmLck); how much of the rest is depends on the page cache.
+        assert!(
+            resident * 4 < locked * 3,
+            "{resident} KiB resident of {locked} KiB locked: the pages were all read in"
+        );
+        println!(
+            "a_locked_agent_reads_in_only_the_pages_it_touches: ran (RLIMIT_MEMLOCK hard limit {hard}): {resident} KiB resident of {locked} KiB locked"
+        );
+        drop(agent);
+    }
+
+    /// `lock_memory`'s `mlockall` calls (their flags, in order), what it
+    /// did and the line the agent logs, with `RLIMIT_MEMLOCK` at `limit`
+    /// (`None`: unknown) and each call answering from `answers` (0 for
+    /// success, else that errno).
+    #[cfg(target_os = "linux")]
+    fn locking(
+        limit: Option<libc::rlim_t>,
+        answers: &[i32],
+    ) -> (Vec<libc::c_int>, MemoryLock, Option<String>) {
+        let mut calls = Vec::new();
+        let mut answers = answers.iter();
+        let limit = limit.map(|limit| libc::rlimit {
+            rlim_cur: limit,
+            rlim_max: limit,
+        });
+        let locked = lock_memory(limit, |flags| {
+            calls.push(flags);
+            match answers
+                .next()
+                .expect("an mlockall call no answer was given for")
+            {
+                0 => Ok(()),
+                errno => Err(std::io::Error::from_raw_os_error(*errno)),
+            }
+        });
+        let line = locked.log_line();
+        (calls, locked, line)
+    }
+
+    #[cfg(target_os = "linux")]
+    const ON_FAULT: libc::c_int = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
+    #[cfg(target_os = "linux")]
+    const ALL_AT_ONCE: libc::c_int = libc::MCL_CURRENT | libc::MCL_FUTURE;
+    #[cfg(target_os = "linux")]
+    const ENOUGH: libc::rlim_t = 512 << 20;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memory_is_locked_as_it_is_touched_where_the_kernel_can() {
+        for limit in [ENOUGH, 4 << 30, libc::RLIM_INFINITY] {
+            let (calls, locked, line) = locking(Some(limit), &[0]);
+            assert_eq!(calls, [ON_FAULT], "one call, every page as it is touched");
+            assert!(matches!(locked, MemoryLock::OnFault), "{locked:?}");
+            assert_eq!(line, None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kernel_without_on_fault_gets_every_page_locked_at_once() {
+        let (calls, locked, line) = locking(Some(ENOUGH), &[libc::EINVAL, 0]);
+        assert_eq!(calls, [ON_FAULT, ALL_AT_ONCE]);
+        assert!(matches!(locked, MemoryLock::AllAtOnce), "{locked:?}");
+        assert_eq!(line, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_fallback_locks_nothing_and_says_so_with_its_own_error() {
+        let (calls, locked, line) = locking(Some(ENOUGH), &[libc::EINVAL, libc::ENOMEM]);
+        assert_eq!(calls, [ON_FAULT, ALL_AT_ONCE]);
+        assert!(
+            matches!(&locked, MemoryLock::Failed(error) if error.raw_os_error() == Some(libc::ENOMEM)),
+            "{locked:?}"
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "cred agent: mlockall failed (Cannot allocate memory (os error 12)); keys could reach swap"
+            )
+        );
+        let (calls, locked, line) = locking(Some(ENOUGH), &[libc::EINVAL, libc::EINVAL]);
+        assert_eq!(calls, [ON_FAULT, ALL_AT_ONCE]);
+        assert!(matches!(locked, MemoryLock::Failed(_)), "{locked:?}");
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "cred agent: mlockall failed (Invalid argument (os error 22)); keys could reach swap"
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_error_locks_nothing_and_tries_no_fallback() {
+        for (errno, text) in [
+            (libc::ENOMEM, "Cannot allocate memory (os error 12)"),
+            (libc::EPERM, "Operation not permitted (os error 1)"),
+            (
+                libc::EAGAIN,
+                "Resource temporarily unavailable (os error 11)",
+            ),
+        ] {
+            let (calls, locked, line) = locking(Some(ENOUGH), &[errno]);
+            assert_eq!(calls, [ON_FAULT], "errno {errno}: no fallback");
+            assert!(
+                matches!(&locked, MemoryLock::Failed(error) if error.raw_os_error() == Some(errno)),
+                "{locked:?}"
+            );
+            assert_eq!(
+                line,
+                Some(format!(
+                    "cred agent: mlockall failed ({text}); keys could reach swap"
+                ))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memory_is_not_locked_under_a_low_or_unknown_limit() {
+        for limit in [
+            None,
+            Some(0),
+            Some(64 << 10),
+            Some(8 << 20),
+            Some(ENOUGH - 1),
+        ] {
+            let (calls, locked, line) = locking(limit, &[]);
+            assert!(calls.is_empty(), "{limit:?}: no mlockall at all");
+            assert!(matches!(locked, MemoryLock::TooLow), "{locked:?}");
+            assert_eq!(
+                line.as_deref(),
+                Some(
+                    "cred agent: not locking memory (RLIMIT_MEMLOCK is too low); keys could reach swap"
+                )
+            );
+        }
     }
 
     #[test]

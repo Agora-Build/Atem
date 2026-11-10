@@ -12,6 +12,10 @@ use std::time::Duration;
 use support::Sandbox;
 use tokio_tungstenite::tungstenite::Message;
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const ASTATION: &str = "astation-bin";
 /// The P-256 generator, uncompressed: a valid Astation signing key.
 const SIGN_PUB: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
@@ -91,9 +95,9 @@ fn fake_astation() -> (String, mpsc::Receiver<(String, Value)>) {
     (url, seen_rx)
 }
 
-/// The next message of type `kind` the fake saw (within 20 s).
+/// The next message of type `kind` the fake saw (within `WAIT`).
 fn saw(seen: &mpsc::Receiver<(String, Value)>, kind: &str) -> Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + WAIT;
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         let (seen_kind, data) = seen

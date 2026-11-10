@@ -14,6 +14,10 @@ use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
 
+/// The longest a "wait until" helper waits. A passing run never gets near it;
+/// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
+/// the slack, and a hung test still ends.
+const WAIT: Duration = Duration::from_secs(60);
 const HOST: &str = "host-work";
 const ACCOUNT: &str = "acct-work";
 fn uuid() -> String {
@@ -223,7 +227,7 @@ impl Dev {
         } else {
             Identity::native(id, auth(id))
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         let (handle, a) = loop {
             let handle = uuid();
             match r.connect(&handle, log, HOST, &identity) {
@@ -260,7 +264,7 @@ impl Dev {
     }
     /// The first message (in the backlog, or arriving) `matches` takes.
     fn wait(&mut self, r: &mut Router, matches: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         loop {
             if let Some(at) = self.backlog.iter().position(&matches) {
                 return self.backlog.remove(at);
@@ -334,7 +338,7 @@ impl Dev {
     }
     /// Lists the sessions until `sid` is among them.
     fn list(&mut self, r: &mut Router, sid: &str) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         loop {
             let id = uuid();
             self.send_raw(r, json!({"type":"session","data":{"v":1,"op":"list","id":id}}));
@@ -362,7 +366,7 @@ impl Dev {
     /// Opens a chat-v1 conversation on `sid` (once its agent is ready, with
     /// `ready`).
     fn open_chat(&mut self, r: &mut Router, sid: &str, ready: bool) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         loop {
             let conversation = uuid();
             let binding = self.read(sid);
@@ -409,7 +413,7 @@ impl Dev {
             "profile_id":"backend","profile_revision":1,"expires_at":r9log::host_now().wall_ms+60_000}))
     }
     fn launched(&mut self, r: &mut Router, rid: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         loop {
             let value = self.request(
                 r,
@@ -480,7 +484,7 @@ fn work(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
 }
 
 fn wait_state(dev: &mut Dev, r: &mut Router, tid: &Value, expected: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     loop {
         let status = work(dev, r, tid);
         if status["state"] == expected {
@@ -492,7 +496,7 @@ fn wait_state(dev: &mut Dev, r: &mut Router, tid: &Value, expected: &str) -> Val
 }
 
 fn wait_detail(dev: &mut Dev, r: &mut Router, tid: &Value, expected: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     loop {
         let status = work(dev, r, tid);
         if status["state"] == "blocked"
@@ -657,7 +661,7 @@ fn a_service_task_takes_a_reply_from_its_target_session_only() {
         intruder["stderr"].as_str().unwrap().contains("mismatch"),
         "{intruder}"
     );
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     while work(&mut dev, &mut r, &first["task_id"])["detail"] != "in the agent's turn" {
         assert!(
             Instant::now() < deadline,
@@ -785,7 +789,7 @@ impl Watch {
 
     fn until(&mut self, r: &mut Router, what: &str, done: impl Fn(&Watch) -> bool) -> (Vec<Value>, Vec<Value>) {
         let (c0, v0) = (self.control_seen.len(), self.viewer_seen.len());
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         while !done(self) {
             assert!(Instant::now() < deadline, "{what}: {:?}", self.control_seen[c0..].iter().filter(|v| v["__type"] != "terminal").collect::<Vec<_>>());
             self.step(r);
@@ -959,7 +963,7 @@ fn a_pause_outlives_a_broker_restart_but_never_its_turn() {
         (launch, sid, pg)
     };
     let frames_until = |viewer: &mut Dev, r: &mut Router, sid: &str, pg: &str, what: &str| {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + WAIT;
         let mut seen = Vec::new();
         while frames_in(&seen).is_empty() {
             assert!(Instant::now() < deadline, "{what}: {seen:?}");
@@ -1015,7 +1019,7 @@ fn a_pause_outlives_a_broker_restart_but_never_its_turn() {
     });
     let tag = tag_in(&last_paste(&rig)).unwrap();
     // The runtime saw the agent take it: the turn runs.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + WAIT;
     while work(&mut sender, &mut r, &t["task_id"])["detail"] != "in the agent's turn" {
         assert!(Instant::now() < deadline, "the turn never began");
         std::thread::sleep(Duration::from_millis(50));
@@ -1165,7 +1169,7 @@ fn task_in_its_turn(rig: &Rig, r: &mut Router, dev: &mut Dev, text: &str) -> Val
             .unwrap_or_default()
             .contains(text)
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     while work(dev, r, &t["task_id"])["detail"] != "in the agent's turn" {
         assert!(
             Instant::now() < deadline,
@@ -1311,7 +1315,7 @@ fn a_settled_task_keeps_its_records_when_its_payloads_go() {
     );
     publish(&mut dev, &mut r, &message);
     let tid = message["recipients"][0]["recipient_id"].clone();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     while work(&mut dev, &mut r, &tid)["detail"] != "in the agent's turn" {
         assert!(
             Instant::now() < deadline,
@@ -1433,7 +1437,7 @@ fn a_reply_with_context_reads_publishing_then_submitted_and_survives_a_restart()
         "reply received; publishing its context"
     );
     std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     let submitted = loop {
         let reply = reply_query(&mut dev, &mut r, tid)["result"]["reply"].clone();
         if reply["state"] == "submitted" {
@@ -1506,7 +1510,7 @@ fn a_refused_reply_reads_refused_until_a_corrected_one_replaces_it() {
     );
     assert_eq!(run["code"], 0, "{run}");
     let result_id = result_id_of(&run);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     let refused = loop {
         let reply = reply_query(&mut dev, &mut r, &json!(tid))["result"]["reply"].clone();
         if reply["state"] == "refused" {
@@ -1561,7 +1565,7 @@ fn a_message_sender_reads_the_reply_to_its_message_by_recipient_id() {
             .unwrap_or_default()
             .contains("Review the backend contract")
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     while work(&mut dev, &mut r, &recipient)["detail"] != "in the agent's turn" {
         assert!(Instant::now() < deadline, "the turn was never stored");
         std::thread::sleep(Duration::from_millis(40));
@@ -2201,7 +2205,7 @@ fn notification_waits_for_readiness_dispatches_once_and_needs_explicit_result() 
     assert!(!input.contains("Followup task must wait"));
     assert_eq!(input.matches("Implement backend contract").count(), 1);
     std::fs::write(rig.fake.join("complete"), "").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + WAIT;
     loop {
         let status = work(&mut dev, &mut r, &first["task_id"]);
         if status["state"] == "awaiting_result" {
