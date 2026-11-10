@@ -294,7 +294,7 @@ together. Progress stays on the original message/task receipt; there is no
 `runtime inbox` command. Not implemented: a Station durable outbox, offline
 origin proofs and direct Atem host senders.
 
-**Local agent collaboration** (stage 1, unreleased; `designs/agent-collaboration.md`):
+**Local agent collaboration** (stage 1, released in v0.8.5; `designs/agent-collaboration.md`):
 `atem agent tag add|remove|list` and `atem message send|reply` identify the
 calling agent from the local socket peer's verified process ancestry (`message
 status|cancel|complete|directory` also run from the owner's terminal, outside
