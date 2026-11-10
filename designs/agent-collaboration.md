@@ -1,7 +1,7 @@
 # Agent collaboration: Atem-to-Atem messaging
 
-Status (2026-11-07): **stage 1 implemented, unreleased**, on
-`feat/agent-collaboration`; sections 10 and 17 give its lifecycle, retention and
+Status (2026-11-10): **stage 1 implemented** (merged in #124, with the agreed
+prompt framing); sections 10 and 17 give its lifecycle, retention and
 known limits. Agents in one Atem runtime can send work and reply through the
 existing host queue. **Not implemented (planned):** stages 2 and 3, see
 [delegated-host-work.md](delegated-host-work.md), Part II.
@@ -55,7 +55,7 @@ It comes in three stages:
 
 | Stage | Covers | Depends on |
 |---|---|---|
-| 1. Local (implemented, unreleased) | Agents on the same Atem instance | Atem only; owner opts in through runtime.toml |
+| 1. Local (implemented) | Agents on the same Atem instance | Atem only; owner opts in through runtime.toml |
 | 2. Online (planned) | Agents on different instances, while both sides are online | See [delegated-host-work.md](delegated-host-work.md) (II.1) |
 | 3. Autonomous (planned) | Store-and-forward, offline recovery, project-level permissions | See [delegated-host-work.md](delegated-host-work.md) (II.2-II.5) |
 
@@ -1008,8 +1008,7 @@ permissions; agents editing projects; message content leaving the account.
 
 ## 17. Stage 1 implementation
 
-Stage 1 is implemented in local commits on `feat/agent-collaboration`
-(unreleased) and has: agents that send with the local user's permissions,
+Stage 1 is implemented (merged in #124) and has: agents that send with the local user's permissions,
 whoever prompted them (section 6), limits counted in messages and checked at
 send, pauses instead of fences, agent commands that only connect, one reply for
 every sender with `reply_query` for remote ones, tasks that expire at their
