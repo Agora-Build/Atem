@@ -707,7 +707,8 @@ mod tests {
     }
 
     /// Pending while locked (no answer, never a guess), retried every
-    /// `RETRY`, known after the unlock; only the named kid counts.
+    /// `RETRY`, known after the unlock; only the named kid counts. Then
+    /// asked again only for its retention check, once due.
     #[test]
     fn hashes_are_pending_while_locked_and_known_after_an_unlock() {
         let table = Arc::new(Table {
@@ -742,10 +743,21 @@ mod tests {
         );
         assert_eq!(p.matches("ses-b", "h1.k1.21"), None, "no launch project");
         assert_eq!(p.matches("ses-a", "not-h1"), None);
-        // Nothing missing: no more calls.
+        // Nothing missing: no job, so no call, until the retention check is
+        // due (`REVALIDATE` after the hash was learned at `t0 + RETRY`).
+        // Checked before then: at the due time a job starts at once, on
+        // its own thread, and a count read right after it races that call.
         let calls = *table.calls.lock().unwrap();
-        p.pass(&kids, t0 + RETRY * 3);
+        let due = t0 + RETRY + REVALIDATE;
+        p.pass(&kids, due - Duration::from_millis(1));
+        assert!(p.pending.is_none(), "no job before the check is due");
         assert_eq!(*table.calls.lock().unwrap(), calls);
+        // Then one retention check: the same answer, still known.
+        p.pass(&kids, due);
+        assert!(p.pending.is_some(), "the retention check is due");
+        assert!(settle(&mut p, &kids, due).is_empty());
+        assert_eq!(*table.calls.lock().unwrap(), calls + 1);
+        assert_eq!(p.matches("ses-a", "h1.k1.21"), Some(true));
         p.forget("ses-a");
         assert_eq!(p.matches("ses-a", "h1.k1.21"), None);
     }
