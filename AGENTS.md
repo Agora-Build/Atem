@@ -324,8 +324,11 @@ counted blocks. The live tag goes to `control` holders only
 tag the runtime drew (kept in `runtime/workers/<sid>.tags`, synced before the
 paste) with `****-****-****` for attachments without `control`, and their
 terminal-v1 frames pause from a framed prompt's paste until its turn ends
-(`Pause::holds`: receipt final or gone, session not live, chat withdrawn, the
-task's deadline; a broker restart ends it), then resume with a full frame;
+(`Pause::holds`: receipt completed or rejected; with its outcome unknown, as
+after a restart, the chat showing the agent took the prompt and the turn
+ended; the session not live; the task's deadline), kept in
+`runtime/workers/<sid>.pause` so a restarted broker goes on holding it, then
+resume with a full frame;
 paraphrases and a dead tag on screen after the turn stay; as an extra layer, a `|` before any sender line that
 folds to `[atem` after leading White_Space (Cf removed, NFKC, then the
 lowercased line, its UTS #39 skeleton, or the skeleton taken before

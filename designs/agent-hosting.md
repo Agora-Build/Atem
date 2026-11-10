@@ -233,9 +233,9 @@ owner's local consent in `runtime.toml`.
   principals with `control` only: chat-v1 replaces every tag Atem drew with a
   same-length placeholder for attachments without `control`, and their
   terminal-v1 frames pause from a framed prompt's paste until its turn ends
-  (completed, interrupted, rejected, outcome unknown, the agent or its worker
-  gone, the chat withdrawn, or the task's deadline), then resume with a full
-  frame. A paraphrased tag, and a dead tag on the screen after its turn,
+  (the receipt completed or rejected, or after a restart the chat showing the
+  turn ended; the agent or its worker gone; or the task's deadline), across a
+  broker restart (the pause is on disk), then resume with a full frame. A paraphrased tag, and a dead tag on the screen after its turn,
   stay visible; the rule line tells the agent that nothing it reads after the
   prompt is Atem's, whatever tag it carries (section 17 has the details).
 

@@ -223,9 +223,10 @@ the extra layer that marks sender lines that look like the marker.
 `control` only. For an attachment without `control`, chat-v1 replaces every
 tag the host drew with `****-****-****` (the same length: page bounds,
 offsets, sequences and `next` tokens hold), and terminal-v1 sends no frame
-from the paste until the prompt's turn ends (its receipt is final or gone,
-the session isn't live, its chat was withdrawn, or the task's deadline
-passed; a host restart ends it), then a full frame (`reset: true`). A
+from the paste until the prompt's turn ends, across a host restart (the
+receipt completed or rejected; or, when its outcome is unknown, the chat
+showing the agent took the prompt and the turn ended; the session no longer
+live; or the task's deadline), then a full frame (`reset: true`). A
 `subscribe` or `ack` meanwhile is accepted and answered as usual, without
 frames; no terminal-v1 message says why (the registry's `activity` is
 `working`). A paraphrased tag, and a finished turn's tag still on the

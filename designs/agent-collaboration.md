@@ -1247,24 +1247,35 @@ Stage 1 ships with these limits.
   - **Paused on terminal-v1.** Frames are the agent's own rendering (it
     wraps, splits or truncates the prompt), so no frame goes to an
     attachment without `control` from a framed prompt's paste until its
-    turn ends: its receipt completed (done or interrupted), was rejected
-    (refused, or not taken by the agent in time), or its outcome is unknown,
-    or the receipt is gone; the session is no longer live (the agent exited,
-    its worker went away, the session stopped); its chat was withdrawn (no
-    turn end will come); or, the bounded fallback, the task's deadline
-    passed. A `subscribe` or `ack` meanwhile is accepted; terminal-v1 has no
-    message that says why the frames wait (the registry's `activity` reads
-    `working`), and none was added. Then the stream resumes with a full
-    frame (`reset`), as a new subscription's first.
+    turn ends. The pause is written to `runtime/workers/<session>.pause`
+    (with the prompt's tag and the task's deadline) before the paste, so a
+    restarted broker that adopts the worker goes on holding it. It ends at
+    the first of: the session is no longer live (the agent exited, its
+    worker went away, the session stopped); the task's deadline passed (the
+    bound: a pause is never stuck); the prompt's receipt completed (the
+    turn ended, done or interrupted) or was rejected (refused before the
+    prompt reached the agent); or, when the receipt can't tell (its outcome
+    is unknown, as after a restart or for a prompt the agent didn't take in
+    time, or it is gone), the session's chat shows the agent took the
+    prompt (a user message carries its tag) and that turn ended (the chat is
+    `ready`). Without turn state (no chat, a withdrawn chat, or an adopting
+    broker that hasn't got the worker's chat yet) the pause holds until the
+    session ends or the deadline. A `subscribe` or `ack` meanwhile is
+    accepted; terminal-v1 has no message that says why the frames wait (the
+    registry's `activity` reads `working`), and none was added. Then the
+    stream resumes with a full frame (`reset`), as a new subscription's
+    first. A pause file that can't be read holds the frames until the
+    session ends or a day passed.
   - **What stays.** A tag the agent paraphrases (rather than repeats) isn't
     hidden. Once the turn ended, its dead tag can show on the terminal (the
-    rule line makes it worthless then). The pause lives in memory: a broker
-    restart mid-turn ends it (the prompt's outcome becomes unknown) though
-    the adopted worker's turn may still run. An agent that copies its own
-    live tag into a reply shows it on the sending session's terminal once
-    that session's own pause ended (chat-v1 hides it, for every session).
-    Principals with `control`, the local frontends, the session logs and the
-    journal keep the real text. A task accepted by an earlier build keeps the prompt it
+    rule line makes it worthless then). An agent that copies its own live
+    tag into something another session shows (a reply delivered as data, a
+    file or command output another agent reads) can put it on that
+    session's terminal after that session's own pause ended (chat-v1 hides
+    it, for every session); only pausing every session's view-only frames
+    while any framed turn on the host runs would cover that. Principals with
+    `control`, the local frontends, the session logs and the journal keep
+    the real text. A task accepted by an earlier build keeps the prompt it
   stored, which for a remote message held the old `[Message … from …]` header
   and mark lines: it is shown inside the prompt block, as the sender's text.
 - **Vault context with encryption on.** Vault context is taken only while the
