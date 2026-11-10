@@ -8,7 +8,7 @@ cross-team schemas are published, every strict verifier is compatible and the jo
 
 **Amended after agreement, 2026-11-09/10 (#120 comment 6751584108).** The prompt framing (III.2), the one part built
 before the rest (on PR #124, owner choice 9), is amended with the wording Astation agreed on all seven points (#120
-comment 6751584108; Auth/Portal's confirmation is pending its post on #120): the four stricter folding rules and
+comment 6751584108; Auth/Portal agreed on 2026-11-10, #120 comments 6763735840 and 6763757850, at `c69c9db`): the four stricter folding rules and
 Unicode 18.0.0 for all folding data, the snapshot wording, the old v1 headers in test 38, the mark line, the narrowed
 rule line, the final size figures (V.1), the binding exports before Phase 1 consumers (VII.C 40), and the live tag
 shown to `control` holders only (chat redaction and the terminal pause, the owner's decision of 2026-11-10). Each
@@ -2856,7 +2856,8 @@ Items 6 to 18 were introduced by this combined design:
    shared-core change outside `host.delegated` (V.3).
    **Amended after agreement, 2026-11-09/10, #120 comment 6751584108.** Its wording, folding rules,
    Unicode pin, sizes and the live tag's visibility were agreed by Astation (all seven points, #120 comment
-   6751584108); Auth/Portal's confirmation is pending its post on #120. Built on PR #124.
+   6751584108) and by Auth/Portal on 2026-11-10 (#120 comments 6763735840 and 6763757850, at `c69c9db`). Built on
+   PR #124.
 10. **Host senders stay outside Agora.Build's kill switch** (I.9). Confirmed, with two separate authorities (III.4):
     native managers alone hold R9 authorization, and Agora.Build may refuse only its own relay and mailbox service,
     never as an R9 revocation. Not chosen: a Station-held key hosts trust.
