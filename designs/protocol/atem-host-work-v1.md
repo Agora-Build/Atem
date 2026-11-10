@@ -15,7 +15,7 @@ Types: `atem_client::session::{host_work, messages, attachments, mark}`. Host:
 Shared request vectors: `fixtures/host-work/requests-v1.json`, run by the
 client core's tests and listed in every SDK's checksum manifest.
 
-Local collaboration (stage 1, unreleased) reuses these receipts inside one
+Local collaboration (stage 1, released in v0.8.5) reuses these receipts inside one
 runtime; see [../agent-collaboration.md](../agent-collaboration.md). Its shared
 types include `select`, optional message correlation fields, and locally
 stored `result` context snapshots. The host advertises `host.reply` (§4,

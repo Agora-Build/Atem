@@ -15,7 +15,7 @@ and the r9 appendix of [protocol/atem-session-v1.md](protocol/atem-session-v1.md
 
 [Agent collaboration](agent-collaboration.md) adds opt-in messaging between
 agents in this runtime, including selectors, context publication, correlated
-replies and local launch on message (stage 1, unreleased). It adds one
+replies and local launch on message (stage 1, released in v0.8.5). It adds one
 read-only remote op, `reply_query` (section 7); the remote contract described
 here otherwise retains its existing admission rules.
 
@@ -517,8 +517,8 @@ rest; keep secrets out of screenshots and context.
 
 ### Sending work from Atem agents
 
-[Agent collaboration](agent-collaboration.md) stage 1 is implemented and
-unreleased: agents in this runtime can address work by project, tag or
+[Agent collaboration](agent-collaboration.md) stage 1 is released in
+v0.8.5: agents in this runtime can address work by project, tag or
 `atem_id`, with a durable outbox, publish-before-notify, status reports and
 explicit correlated results. It uses this receiver and its approved routes.
 The agent answers any task, whoever sent it, with `atem message reply`; the
