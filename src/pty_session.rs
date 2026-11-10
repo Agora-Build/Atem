@@ -388,7 +388,7 @@ impl PtyHandle {
     }
 
     /// The slave's path (tests).
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     fn tty_name(&self) -> Option<PathBuf> {
         self.0.master.lock().ok()?.tty_name()
     }
@@ -495,10 +495,24 @@ struct SlaveHold {
 /// the whole range) could make it wait for the wrong process. It keeps
 /// `reading`, a copy of the pipe's read end, until it has written: the
 /// write never meets a closed pipe (EPIPE, or SIGPIPE were it not ignored).
+///
+/// It also keeps `master`, a copy of the master, until it saw the exit, so
+/// while this process lives the PTY's index can't be reused before then,
+/// whichever path let the slave and the other master copies go first (the
+/// reader takes the copy away after a read error, [`MasterHold`]). On macOS
+/// a session leader's exit (with the slave held, every agent's) revokes
+/// every vnode of its terminal's device number, after its descriptors are
+/// closed: had the pair been freed meanwhile, the revoke would hit a newer
+/// terminal that took the same `/dev/ttysN` (another session's, or any
+/// program's on the Mac). A watcher waiting on a recycled pid (above) would
+/// also keep the index until that process exits. `exit_hold` is a test
+/// fault: how much longer the copy stays (a child still on its way out).
 fn watch_exit(
     pid: u32,
     mut exited: std::io::PipeWriter,
     reading: std::io::PipeReader,
+    master: MasterHold,
+    exit_hold: Duration,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("atem-pty-exit".into())
@@ -529,8 +543,35 @@ fn watch_exit(
             // reader waiting.
             let _ = exited.write_all(&[1]);
             drop(reading);
+            if !exit_hold.is_zero() {
+                std::thread::sleep(exit_hold);
+            }
+            master.release();
         })?;
     Ok(())
+}
+
+/// The exit watcher's copy of the master ([`watch_exit`]), shared with the
+/// reader, which takes it away after a read error: nothing reads the master
+/// then, and a macOS agent already draining its output at its exit waits
+/// until every master copy is closed, so a copy kept until that exit would
+/// keep both waiting. So after a read error the index can again be freed
+/// before such an agent's revoke, if the session is also dropped first; the
+/// worker keeps the session until `Exit`, so it never is. Like this process
+/// exiting, which closes every copy, that case is not covered.
+#[derive(Clone)]
+struct MasterHold(Arc<Mutex<Option<std::fs::File>>>);
+
+impl MasterHold {
+    fn new(master: std::fs::File) -> Self {
+        MasterHold(Arc::new(Mutex::new(Some(master))))
+    }
+
+    /// Closes the copy (idempotent).
+    fn release(&self) {
+        let copy = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(copy);
+    }
 }
 
 /// While the slave is held: waits until the master has something to read
@@ -569,11 +610,14 @@ fn output_before_exit(master: RawFd, exited: RawFd) -> bool {
 }
 
 /// Tests only: a reader that starts `delay` late (slower than macOS's 0.6 s
-/// at the slave's last close), or whose first read fails.
+/// at the slave's last close), or whose first read fails; an exit watcher
+/// that keeps its master copy `exit_hold` longer after it saw the exit (a
+/// child still on its way out).
 #[derive(Clone, Copy, Default)]
 struct ReaderFaults {
     delay: Duration,
     fail_first_read: bool,
+    exit_hold: Duration,
 }
 
 /// [`spawn_spec`], with the reader's `faults` (none outside tests).
@@ -623,15 +667,30 @@ fn spawn_with_faults(spec: SpawnSpec, faults: ReaderFaults) -> Result<PtySession
         std::fs::File::from(unsafe { BorrowedFd::borrow_raw(master_fd) }.try_clone_to_owned()?);
     let (exited, exit_signal) = std::io::pipe()?;
     let reading = exited.try_clone()?;
+    let master_hold = MasterHold::new(reader.try_clone()?);
     let mut writer = pair.master.take_writer()?;
     let child = Arc::new(Mutex::new(pair.slave.spawn_command(command)?));
     let pid = child.lock().unwrap().process_id();
-    let hold = if pid.is_some_and(|pid| watch_exit(pid, exit_signal, reading).is_ok()) {
+    let watching = pid.is_some_and(|pid| {
+        watch_exit(
+            pid,
+            exit_signal,
+            reading,
+            master_hold.clone(),
+            faults.exit_hold,
+        )
+        .is_ok()
+    });
+    let hold = if watching {
         Some(SlaveHold {
             _slave: pair.slave,
             exited,
         })
     } else {
+        // Atem doesn't hold the slave: the child's exit is normally its last
+        // close and revokes nothing, and without a watcher nothing could
+        // tell when to let the copy go.
+        master_hold.release();
         drop(pair.slave);
         None
     };
@@ -711,6 +770,7 @@ fn spawn_with_faults(spec: SpawnSpec, faults: ReaderFaults) -> Result<PtySession
                     if listened {
                         let _ = output.blocking_send(PtyEvent::Error(e.to_string()));
                     }
+                    master_hold.release();
                     break;
                 }
             }
@@ -1060,6 +1120,98 @@ mod tests {
         );
     }
 
+    /// The number at the end of a slave's path (`/dev/pts/7`, `/dev/ttys007`).
+    fn tty_index(tty: &std::path::Path) -> Option<u32> {
+        let name = tty.file_name()?.to_str()?;
+        let digits = name.trim_start_matches(|c: char| !c.is_ascii_digit());
+        digits.parse().ok()
+    }
+
+    /// Opens PTYs for a second and fails if one gets `tty`'s index back. New
+    /// PTYs take the lowest free index, so the ones below `tty`'s are kept
+    /// open (a few, within descriptor limits) to reach it even when other
+    /// tests freed lower ones.
+    async fn assert_index_not_reused(tty: &std::path::Path) {
+        let ours = tty_index(tty).unwrap();
+        let mut below = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            let Ok(pair) = native_pty_system().openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) else {
+                break;
+            };
+            let name = pair.master.tty_name().unwrap();
+            assert_ne!(
+                name, tty,
+                "the PTY index was reused before the child's exit was seen"
+            );
+            if tty_index(&name).is_some_and(|index| index < ours) && below.len() < 32 {
+                below.push(pair);
+            } else {
+                drop(pair);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// A spawn whose exit watcher keeps its master copy `WAIT` longer after
+    /// it saw the exit: a child still on its way out.
+    fn spawn_with_late_exit(binary: &str, args: Vec<String>) -> PtySession {
+        let spec = SpawnSpec {
+            binary: binary.into(),
+            args,
+            cwd: std::env::temp_dir(),
+            env: None,
+            rows: 24,
+            cols: 80,
+        };
+        spawn_with_faults(
+            spec,
+            ReaderFaults {
+                exit_hold: WAIT,
+                ..ReaderFaults::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// A PTY's index (`/dev/pts/N`, `/dev/ttysN`) stays allocated until the
+    /// child's exit was seen, except after a read error: on macOS a session
+    /// leader's exit revokes every vnode of its terminal's device number, so
+    /// an index reused before that revoke loses the new terminal (CI: the
+    /// next spawn failed with EBADF at `TIOCSCTTY`).
+    #[tokio::test]
+    async fn a_pty_index_is_not_reused_before_the_exit_is_seen() {
+        let session = spawn_with_late_exit("true", Vec::new());
+        let tty = session.resize_handle.tty_name().unwrap();
+        // Read to `Exit`, then drop the session: every other master copy
+        // and the slave hold are gone.
+        all_output_then_exit(session).await;
+        assert_index_not_reused(&tty).await;
+    }
+
+    /// The same once nobody takes the events (the path the CI failure took):
+    /// the reader lets the slave go at its first output, before the exit.
+    #[tokio::test]
+    async fn a_pty_index_is_not_reused_when_nobody_listens() {
+        let PtySession {
+            sender,
+            receiver,
+            resize_handle,
+        } = spawn_with_late_exit("printf", vec!["x".into()]);
+        let tty = resize_handle.tty_name().unwrap();
+        drop(receiver);
+        // The child writes and exits; its output finds no receiver.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(sender);
+        drop(resize_handle);
+        assert_index_not_reused(&tty).await;
+    }
+
     /// How many descriptors of this process are open on `tty`.
     #[cfg(target_os = "linux")]
     fn open_on(tty: &std::path::Path) -> usize {
@@ -1067,6 +1219,33 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == tty))
+            .count()
+    }
+
+    /// How many master descriptors of this process are open on the PTY
+    /// whose slave is `tty` (Linux: `/proc/self/fdinfo`'s `tty-index`).
+    #[cfg(target_os = "linux")]
+    fn masters_on(tty: &std::path::Path) -> usize {
+        let index = tty.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|fd| {
+                std::fs::read_link(fd.path())
+                    .is_ok_and(|target| target == std::path::Path::new("/dev/ptmx"))
+            })
+            .filter(|fd| {
+                std::fs::read_to_string(format!(
+                    "/proc/self/fdinfo/{}",
+                    fd.file_name().to_string_lossy()
+                ))
+                .is_ok_and(|info| {
+                    info.lines().any(|line| {
+                        line.split_once(':')
+                            .is_some_and(|(key, value)| key == "tty-index" && value.trim() == index)
+                    })
+                })
+            })
             .count()
     }
 
@@ -1104,12 +1283,14 @@ mod tests {
             event => panic!("unexpected {event:?}"),
         }
         // The agent is still running, and this process no longer holds its
-        // terminal.
+        // terminal, nor more than the session's two master copies (the
+        // handle's and the writer's): the reader's and the exit watcher's
+        // are gone, so nothing keeps a draining agent waiting at its exit.
         let deadline = std::time::Instant::now() + WAIT;
-        while open_on(&tty) > 0 {
+        while open_on(&tty) > 0 || masters_on(&tty) > 2 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the slave is still held"
+                "the slave or the watcher's master copy is still held"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
