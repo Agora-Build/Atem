@@ -26,10 +26,11 @@ one update marked "updated after agreement" in III.4 (the phone's login is live 
 amendment above. The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
-and 2, marked the same way. Citations of agent-collaboration.md (PR #124) and its section numbers
+and 2, marked the same way. Citations of [agent-collaboration.md](agent-collaboration.md) and its section numbers
 (`collaboration §n`) refer to that file at `3e60fcc`, PR #124's head when the text was agreed. That file, the stage-1
-collaboration design, is in PR #124 and not yet merged, so it is not in this repository; Appendix B quotes the cited
-passages as they were.
+collaboration design, is in this repository (merged in #124): it has been edited since `3e60fcc` but its section
+numbers are the same, and its stage 2 and 3 passages are now pointers to this file. Appendix B quotes the cited
+passages as they were at `3e60fcc`.
 
 Written by the Atem agent for the Atem, Astation and Auth/Portal agents and the owner.
 Revision 4 applies the owner's binding decisions of 2026-11-07, which Appendix A
@@ -39,7 +40,7 @@ design; next to it stays only the diagram of the flows. It merges two designs:
 
 - Auth/Portal's *Delegated host work: Atem owns accepted tasks* of 2026-11-07, merged here as Part I ("the source"
   below);
-- Atem's host-to-host senders: stages 2 and 3 of agent collaboration (agent-collaboration.md (PR #124) on Atem's
+- Atem's host-to-host senders: stages 2 and 3 of agent collaboration ([agent-collaboration.md](agent-collaboration.md) on Atem's
   branch `feat/agent-collaboration`, `3e60fcc`).
 
 Nothing here is built. The owner has decided every choice: those of Appendix A on 2026-11-07, and owner choice 20,
@@ -92,7 +93,7 @@ planned only (agent-collaboration.md §17, "Known limits"). Atem doesn't track w
 
 Atem facts are cited by file and section. Atem files are on `feat/agent-collaboration` (`3e60fcc`). Short names:
 **session-v1** is `designs/protocol/atem-session-v1.md` (R9.x is its r9 appendix), **host-work-v1** is
-`designs/protocol/atem-host-work-v1.md`, **collaboration** is agent-collaboration.md (PR #124), **hosting** is
+`designs/protocol/atem-host-work-v1.md`, **collaboration** is [agent-collaboration.md](agent-collaboration.md), **hosting** is
 `designs/agent-hosting.md`, **account-trust** is `designs/account-trust.md`.
 
 ### Revision 4: owner decisions applied (2026-11-07)
@@ -2440,7 +2441,7 @@ Nothing is merged or deployed before step 1.
   prompt (`local_task`) and result delivery (`delivery_task`). If #124 is merged first, the new pull request changes
   those renderers and its released prompt text; if this work lands first, #124 adapts its renderers before it merges.
   Nothing else in #124 changes.
-- **agent-collaboration.md (PR #124)** changes where it says a remote task dispatches "on its sender's attachment"
+- **[agent-collaboration.md](agent-collaboration.md)** changes where it says a remote task dispatches "on its sender's attachment"
   (§9), where a `submitting` task becomes `outcome_unknown` after a restart (§11; attempts, I.6.3), in §10 (stage-3
   status and results, the cross-instance return grant, II.4.4) and §14 (ownership), and in stage 3's sections:
   projects (§6, II.2), envelopes (§7, II.4), transports (§12, II.4.3) and questions 7 and 8 (§15, answered here once
@@ -3065,7 +3066,7 @@ Checked on 2026-11-07:
 - **Merged in:** Auth/Portal's Delegated Host-work design of 2026-11-07 (Part I), and the owner's decisions of
   2026-11-07 (Appendix A).
 - **Atem**, branch `feat/agent-collaboration` at `3e60fcc`, which was PR #124's head when this design was reviewed
-  (later commits to #124 aren't reflected): agent-collaboration.md (PR #124) (§2, §4 to §7,
+  (later commits to #124 aren't reflected): [agent-collaboration.md](agent-collaboration.md) (§2, §4 to §7,
   §9 to §12, §14, §15, §17), `designs/protocol/atem-host-work-v1.md`, `designs/agent-hosting.md`,
   `designs/protocol/atem-session-v1.md` (§0, §5, §6, appendix §H and §I, the r9 appendix R9.1 to R9.9 and R9.12),
   `designs/account-trust.md`, `designs/e2e-encryption.md` (keys), and `crates/atem-client/src/` (`domain.rs`,
@@ -3355,10 +3356,13 @@ Do not merge or deploy the new protocol until the cross-team contract is agreed 
 
 ## Appendix B. The cited passages of agent-collaboration.md (at `3e60fcc`)
 
-The text above cites agent-collaboration.md (PR #124) by section (`collaboration §n`) as it stood at `3e60fcc`, PR
-#124's head when the text was agreed. That file is in PR #124 and not yet merged, so it is not in this repository.
-The cited passages are quoted below verbatim: each whole paragraph, list or table that held removed text, under its section
-(`[…]` marks text left out). They record what was cited, not current design; where they differ from Parts I to III,
+The text above cites [agent-collaboration.md](agent-collaboration.md) by section (`collaboration §n`) as it stood at
+`3e60fcc`, PR #124's head when the text was agreed. That file is in this repository (merged in #124); it keeps stage 1
+(edited since `3e60fcc`, with the same section numbers) and replaces its stage 2 and 3 passages with pointers here. Those
+passages are quoted below verbatim, as they stood at `3e60fcc`: each whole paragraph, list or table that held removed text, under its section
+(`[…]` marks text left out). Three small edits are not quoted: the status and review lines at the top of the file,
+the commented stage 2 keys and the `principals` comment in section 13's sample, and the last sentence of section 17.
+The quoted passages record what was cited, not current design; where they differ from Parts I to III,
 Parts I to III apply.
 
 ### 2. The design in brief

@@ -23,7 +23,7 @@ stored `result` context snapshots. The host advertises `host.reply` (§4,
 remote host admission refuses selector destinations, the `local` sender,
 local UUIDv5 task references and `result` context snapshots. Remote admission
 still requires the contract below. Cross-instance selector/result support waits for
-the stage-2 agreement.
+the stage-2 agreement ([../delegated-host-work.md](../delegated-host-work.md), II.1).
 
 ## 1. Features and transport
 

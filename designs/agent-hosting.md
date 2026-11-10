@@ -489,7 +489,7 @@ rest; keep secrets out of screenshots and context.
 - **Not implemented:** work from an offline sender. Dispatch uses the sender's
   live channel, so its tasks wait until it reconnects. There is no origin proof
   that would let the Station replay an envelope. Cross-instance sending is
-  planned in [agent-collaboration.md](agent-collaboration.md).
+  planned in [delegated-host-work.md](delegated-host-work.md).
 - **Not implemented:** remote selector routing and context subscriptions.
   Remote senders resolve recipients (host, route, session, process) themselves.
   Local collaboration expands selectors once and persists that resolution.
@@ -536,7 +536,8 @@ the same way until that restart; `[collab] send = false` only refuses new
 sends. A session is launched only for `atem message send --launch` on a route
 with `launch = "on_message"`, and only for a Claude Code profile.
 **Not implemented:** cross-instance transport, the shared Station directory
-and mailbox, and the stages 2-3 permission agreements.
+and mailbox, and the stages 2-3 permission agreements
+([delegated-host-work.md](delegated-host-work.md)).
 
 ### OS service and boot startup (not implemented)
 
