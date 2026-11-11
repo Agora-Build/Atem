@@ -1377,11 +1377,18 @@ Station's own revoke is recorded, naming the native record.
   after its own deadline is final at once (**Atem's choice, for Auth/Portal
   to confirm**): `all_applied` when every covered host already has the
   revocation in force (through a native revoke), else `deadline_passed`.
-- **Order.** A `revoked` report is delivered only after the per-host
-  reports made before it, so the Portal never sees `all_applied` ahead of
-  a covered host's `revocation_applied`, nor `deadline_passed` ahead of
-  those made before the deadline (the second is **Atem's choice, for
-  Auth/Portal to confirm**).
+- **Order.** Reports of one principal go to the Portal in the order they
+  were made, one at a time: a report is sent only once every report of
+  the same principal made before it is settled (done, final or dropped),
+  so a per-host report made after its revocation's `revoked` is delivered
+  after it (**Atem's rule, for Auth/Portal to confirm**). As a consequence
+  a `revoked` report is delivered only after the per-host reports made
+  before it, so the Portal never sees `all_applied` ahead of a covered
+  host's `revocation_applied`, nor `deadline_passed` ahead of those made
+  before the deadline (the second is **Atem's choice, for Auth/Portal to
+  confirm**). The one exception is a per-host report dropped by a resume
+  under another report client ID (below): it is settled unsent, so the
+  final goes without it.
 
 **`reportId`.** `<kind>:` followed by the lowercase hex SHA-256 of
 `enc(["atem-station-report-id-v1", kind, account_id, genesis_hash, principal,

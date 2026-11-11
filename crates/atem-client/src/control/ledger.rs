@@ -47,10 +47,17 @@
 //! ID than the stop's, another Station at Auth as Atem reads "start fresh",
 //! drops the reports pending then, and every revocation reports on as
 //! usual). Each of those is a transition the Station commits like any
-//! other. An intent waits for those its `not_before` names
-//! until they are settled (confirmed or refused): a `revoked` report for the
-//! per-host reports made before it, so the Portal never sees `all_applied`
-//! ahead of the `revocation_applied` of a covered host.
+//! other.
+//!
+//! **Order.** Reports of one principal go to the Portal in the order they
+//! were made: [`AckLedger::pending_reports`] offers a report only once every
+//! report of the same principal made before it is settled (confirmed,
+//! refused or dropped), so one at a time per principal. As a consequence a
+//! `revoked` report goes after the per-host reports made before it (those
+//! its `not_before` names), so the Portal never sees `all_applied` ahead of
+//! a covered host's `revocation_applied` (but one dropped by a resume under
+//! another report client ID, which is settled unsent), and a host's report
+//! made after the final never goes before it.
 //!
 //! **What counts** (I.5.8; plan decision 8).
 //! - Only an effect result of `applied` or `duplicate` counts: both say the
@@ -942,9 +949,11 @@ impl AckLedger {
         self.stopped.as_deref()
     }
 
-    /// Every intent not yet settled whose `not_before` are all settled
-    /// (confirmed or refused), in delivery order: what to send now, after a
-    /// commit, a restart or a failed POST. Nothing while reporting is
+    /// What to send now, after a commit, a restart or a failed POST: for
+    /// each principal, its earliest report not yet settled (confirmed,
+    /// refused or dropped), when every report its `not_before` names is
+    /// settled too, in delivery order. Reports of one principal thus go in
+    /// the order they were made, one at a time. Nothing while reporting is
     /// stopped.
     pub fn pending_reports(&self) -> Vec<ReportIntent> {
         if self.stopped.is_some() {
@@ -955,16 +964,26 @@ impl AckLedger {
             .iter()
             .map(|p| p.intent.report_id.as_str())
             .collect();
-        self.pending
-            .iter()
-            .filter(|p| {
-                p.intent
-                    .not_before
-                    .iter()
-                    .all(|id| !waiting.contains(id.as_str()))
-            })
-            .map(|p| p.intent.clone())
-            .collect()
+        // Reports of one principal go in the order they were made: only
+        // the earliest unsettled one of each principal is offered. That
+        // `not_before` is settled follows (those reports were made before),
+        // and is checked as well.
+        let mut ahead: BTreeSet<&str> = BTreeSet::new();
+        let mut offered = Vec::new();
+        for p in &self.pending {
+            if !ahead.insert(p.principal.as_str()) {
+                continue;
+            }
+            let ready = p
+                .intent
+                .not_before
+                .iter()
+                .all(|id| !waiting.contains(id.as_str()));
+            if ready {
+                offered.push(p.intent.clone());
+            }
+        }
+        offered
     }
 
     /// The native-signed records not yet in force, for every effect they
@@ -1755,6 +1774,18 @@ mod ack_ledger_tests {
     }
 
     fn rec_of(account: &str, origin: &str, by: By, action: ControlAction, n: u32) -> ControlRecord {
+        rec_for(account, origin, "svc-1", by, action, n)
+    }
+
+    /// [`rec_of`] for the service `service` (an integration of its own).
+    fn rec_for(
+        account: &str,
+        origin: &str,
+        service: &str,
+        by: By,
+        action: ControlAction,
+        n: u32,
+    ) -> ControlRecord {
         let host_principal = matches!(
             action,
             ControlAction::InterruptRunning {
@@ -1764,7 +1795,7 @@ mod ack_ledger_tests {
         let principal = if host_principal {
             ControlPrincipal::Host("host-z".into())
         } else {
-            ControlPrincipal::Service("svc-1".into())
+            ControlPrincipal::Service(service.into())
         };
         let body = ControlBody {
             account_id: account.into(),
@@ -1783,7 +1814,13 @@ mod ack_ledger_tests {
             record_id: rid(n),
             issued_at: T0 + u64::from(n),
             about: ControlAbout {
-                integration_id: (!host_principal).then(|| INTEGRATION.into()),
+                integration_id: (!host_principal).then(|| {
+                    if service == "svc-1" {
+                        INTEGRATION.into()
+                    } else {
+                        format!("i-{service}")
+                    }
+                }),
                 by: "owner".into(),
             },
         };
@@ -2222,7 +2259,9 @@ mod ack_ledger_tests {
         for host in ["a", "b"] {
             l.ack_by(host, vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         }
-        assert_eq!(l.pending_reports().len(), 2);
+        // Three made (two per-host reports and the final), one offered at a
+        // time.
+        assert_eq!((l.pending.len(), l.pending_reports().len()), (3, 1));
         let n = revoke(By::Native, true, 2);
         assert_eq!(l.rec(&n, T0 + HOUR, &["a", "b"]), vec![]);
         assert_eq!(l.resign_alerts(), vec![rid(2)]);
@@ -2369,11 +2408,12 @@ mod ack_ledger_tests {
         let b = l.ack_by("b", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         let (ra, rb, fin) = (a[0].clone(), b[0].clone(), b[1].clone());
         // The final's intent exists (persisted with the state), but is not
-        // delivered before the per-host reports it requires.
-        assert_eq!(l.pending_reports(), vec![ra.clone(), rb.clone()]);
-        l.confirm_id(&rb.report_id);
+        // delivered before the per-host reports it requires: reports of one
+        // principal go in the order they were made, one at a time.
         assert_eq!(l.pending_reports(), vec![ra.clone()]);
         l.confirm_id(&ra.report_id);
+        assert_eq!(l.pending_reports(), vec![rb.clone()]);
+        l.confirm_id(&rb.report_id);
         assert_eq!(l.pending_reports(), vec![fin.clone()]);
         l.confirm_id(&fin.report_id);
         assert_eq!(l.pending_reports(), vec![]);
@@ -2390,6 +2430,86 @@ mod ack_ledger_tests {
         assert_eq!(l.pending_reports(), a);
         l.confirm_id(&a[0].report_id);
         assert_eq!(l.pending_reports(), d);
+    }
+
+    /// Reports of one principal go to the Portal in the order they were
+    /// made: a late host's report waits for the revocation's final made
+    /// before it (a Portal outage across the deadline, or a 403 stop across
+    /// it, must never let it overtake).
+    #[test]
+    fn reports_of_one_principal_go_in_the_order_they_were_made() {
+        // A Portal outage across the deadline.
+        let mut l = ledger();
+        let s = revoke(By::Own, false, 1);
+        l.rec(&s, T0, &["a", "b", "c"]);
+        let a1 = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
+        // a1 is not confirmed: the Portal is down.
+        let f = l.tick_at(T0 + DAY);
+        assert_eq!(
+            reports(&f),
+            vec![revoked(RevokedOutcome::DeadlinePassed, &["b", "c"])]
+        );
+        let b1 = l.ack_by(
+            "b",
+            vec![res(&s, &[(E::Revocation, R::Applied)])],
+            T0 + DAY + 1,
+        );
+        assert_eq!(reports(&b1), vec![applied("b", &s)]);
+        assert_eq!(b1[0].not_before, Vec::<String>::new());
+        // Only the earliest: b's report never goes before the final.
+        assert_eq!(l.pending_reports(), a1);
+        l.confirm_id(&a1[0].report_id);
+        assert_eq!(l.pending_reports(), f);
+        l.confirm_id(&f[0].report_id);
+        assert_eq!(l.pending_reports(), b1);
+        // A refused report settles its place in the order too.
+        let mut r = l.clone();
+        r = r.refuse(&b1[0].report_id).next;
+        assert_eq!(r.pending_reports(), vec![]);
+
+        // A 403 stop across the deadline, then a resume under the same ID.
+        let mut l = ledger();
+        l.rec(&s, T0, &["a", "b", "c"]);
+        let a1 = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
+        l = l.stop_reporting(CLIENT).unwrap().next;
+        let f = l.tick_at(T0 + DAY);
+        let b1 = l.ack_by(
+            "b",
+            vec![res(&s, &[(E::Revocation, R::Applied)])],
+            T0 + DAY + 1,
+        );
+        l = l.resume_reporting(CLIENT).unwrap().next;
+        assert_eq!(l.pending_reports(), a1);
+        l.confirm_id(&a1[0].report_id);
+        assert_eq!(l.pending_reports(), f);
+        l.confirm_id(&f[0].report_id);
+        assert_eq!(l.pending_reports(), b1);
+
+        // Another principal's reports don't wait: the order is per
+        // principal.
+        let mut l = ledger();
+        l.rec(&s, T0, &["a", "b"]);
+        let s2 = rec_for(
+            ACCOUNT,
+            ORIGIN,
+            "svc-2",
+            By::Own,
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+            2,
+        );
+        l.rec(&s2, T0, &["a"]);
+        let a1 = l.ack_by(
+            "a",
+            vec![
+                res(&s, &[(E::Revocation, R::Applied)]),
+                res(&s2, &[(E::Revocation, R::Applied)]),
+            ],
+            T0,
+        );
+        assert_eq!(a1.len(), 3, "svc-1's report, svc-2's report and its final");
+        assert_eq!(l.pending_reports(), a1[..2].to_vec());
     }
 
     /// A Station in the tests: its committed state (the JSON it persisted)
@@ -3138,10 +3258,7 @@ mod ack_ledger_tests {
         // With every report confirmed, the revocation's outcome alone says a
         // final was made: one missing would make it again.
         let mut l = full();
-        for intent in l.pending_reports() {
-            l.confirm_id(&intent.report_id);
-        }
-        for intent in l.pending_reports() {
+        while let Some(intent) = l.pending_reports().into_iter().next() {
             l.confirm_id(&intent.report_id);
         }
         assert!(l.pending.is_empty());
@@ -3329,10 +3446,11 @@ mod ack_ledger_tests {
         l = t.next;
         assert!(!l.reporting_stopped());
         assert_eq!(l.stopped_client_id(), None);
-        // Everything held goes, in order, the final after the per-host
-        // reports.
-        assert_eq!(l.pending_reports(), vec![a[0].clone(), b[0].clone()]);
+        // Everything held goes, in the order it was made, the final after
+        // the per-host reports.
+        assert_eq!(l.pending_reports(), vec![a[0].clone()]);
         l.confirm_id(&a[0].report_id);
+        assert_eq!(l.pending_reports(), vec![b[0].clone()]);
         l.confirm_id(&b[0].report_id);
         assert_eq!(l.pending_reports(), vec![b[1].clone()]);
         assert_eq!(l.to_json().get("stopped"), None);

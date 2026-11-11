@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "relay",
   "log": "r9-vectors-membership-log",
-  "note": "Test 48, the deadline (I.5.8). The Portal revokes svc-discord's integration, covering host-b and host-c, at revoked_at_ms. host-b applies the Station's revoke: revocation_applied for host-b (Revoking shows one host of two). host-c's cursor moves past the record while it keeps it pending (it needs a newer device list): nothing is sent for it. 24 hours after the revocation (its own time, persisted: a restart doesn't move it), revoked{deadline_passed, pending_hosts: [host-c]}, after host-b's report. host-c applies it later: its revocation_applied is still sent (Auth/Portal: the Portal records it and lowers the count of hosts that didn't confirm); revoked is never sent again.",
+  "note": "Test 48, the deadline (I.5.8). The Portal revokes svc-discord's integration, covering host-b and host-c, at revoked_at_ms. host-b applies the Station's revoke: revocation_applied for host-b (Revoking shows one host of two), but the Portal is down (503) and the report stays pending across the deadline. host-c's cursor moves past the record while it keeps it pending (it needs a newer device list): nothing is sent for it. 24 hours after the revocation (its own time, persisted: a restart doesn't move it), revoked{deadline_passed, pending_hosts: [host-c]}, after host-b's report. host-c applies it later: its revocation_applied is still sent (Auth/Portal: the Portal records it and lowers the count of hosts that didn't confirm), and never before the final made before it: reports of one principal go in the order they were made, one at a time, so with the Portal back host-b's report goes first, then the final, then host-c's. revoked is never sent again.",
   "setup": {
     "station": {
       "origin": "https://station-dev.agora.build",
@@ -72,7 +72,11 @@
       ]
     },
     {
-      "confirm": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+      "report_failure": {
+        "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+        "status": 503,
+        "answer": "retry"
+      }
     },
     {
       "control_ack": {
@@ -101,7 +105,18 @@
       "made": []
     },
     {
-      "expect_report": []
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-b",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        }
+      ]
     },
     {
       "advance_ms": 86362999
@@ -125,23 +140,16 @@
     {
       "expect_report": [
         {
-          "not_before": [
-            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
-          ],
+          "not_before": [],
           "report": {
+            "host": "host-b",
             "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
-            "kind": "revoked",
-            "outcome": "deadline_passed",
-            "pending_hosts": [
-              "host-c"
-            ]
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
           },
-          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+          "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
         }
       ]
-    },
-    {
-      "confirm": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
     },
     {
       "advance_ms": 3600000
@@ -177,6 +185,44 @@
       "made": [
         "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
       ]
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-b",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        }
+      ]
+    },
+    {
+      "confirm": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "deadline_passed",
+            "pending_hosts": [
+              "host-c"
+            ]
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        }
+      ]
+    },
+    {
+      "confirm": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
     },
     {
       "expect_report": [

@@ -1204,8 +1204,11 @@ A network error or a timeout has no status: it is `Retry`, so never pass a
 "no response" sentinel such as `0` to `report_answer`, which takes it for
 a status the Portal never answers with (`Refuse`).
 
-A report that waits for another (`not_before`) goes once that one is
-settled, confirmed or refused. Keep sending `revocation_applied` after a
+Reports of one principal go in the order they were made, one at a time:
+`pending_reports()` offers a report only once every report of the same
+principal made before it is settled (confirmed, refused or dropped), so a
+per-host report made after its revocation's `revoked` is delivered after
+it, and a final after the per-host reports made before it (`not_before`). Keep sending `revocation_applied` after a
 revocation's `revoked{deadline_passed}`: a host that applies it late is
 still reported, and the Portal records it (it lowers "n hosts didn't
 confirm"); `revoked` is never sent again.

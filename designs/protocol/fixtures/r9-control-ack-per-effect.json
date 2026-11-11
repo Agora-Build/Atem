@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "relay",
   "log": "r9-vectors-membership-log",
-  "note": "Test 48, an integration revoke and per-effect counting (I.5.8; decision 8's amendment: revocation_applied at a host's first applied or duplicate for the revocation, naming that record). Astation's native revoke M1_revoke reaches the feed first and host-d applies it; nothing is reported until the Station records its own revoke S4_revoke (the Portal revoked the integration, covering host-b, host-c and host-d), which reports host-d at once, naming M1. host-b applies S4: one revocation_applied. The Station re-signs it as S5_revoke_interrupt, which adds interrupt_running: true; host-b reports it duplicate for the revocation and applied for the interrupt, and nothing more is reported for host-b. An ack claiming host-c on host-b's link is refused whole (the ack's claim must be the link's association). host-c applied the revocation through another record first (a native revoke in another Station's feed it syncs) and reports S4 duplicate: that counts, and its revocation_applied names S4. revoked{all_applied} follows, delivered only after every covered host's revocation_applied is confirmed. Record times are the vectors'; the order is the feed's.",
+  "note": "Test 48, an integration revoke and per-effect counting (I.5.8; decision 8's amendment: revocation_applied at a host's first applied or duplicate for the revocation, naming that record). Astation's native revoke M1_revoke reaches the feed first and host-d applies it; nothing is reported until the Station records its own revoke S4_revoke (the Portal revoked the integration, covering host-b, host-c and host-d), which reports host-d at once, naming M1. host-b applies S4: one revocation_applied. The Station re-signs it as S5_revoke_interrupt, which adds interrupt_running: true; host-b reports it duplicate for the revocation and applied for the interrupt, and nothing more is reported for host-b. An ack claiming host-c on host-b's link is refused whole (the ack's claim must be the link's association). host-c applied the revocation through another record first (a native revoke in another Station's feed it syncs) and reports S4 duplicate: that counts, and its revocation_applied names S4. revoked{all_applied} follows, delivered only after every covered host's revocation_applied is confirmed: reports of one principal go in the order they were made, one at a time. Record times are the vectors'; the order is the feed's.",
   "setup": {
     "station": {
       "origin": "https://station-dev.agora.build",
@@ -289,16 +289,6 @@
             "record_id": "00000000-0000-4000-8000-000000000004"
           },
           "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
-        },
-        {
-          "not_before": [],
-          "report": {
-            "host": "host-c",
-            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
-            "kind": "revocation_applied",
-            "record_id": "00000000-0000-4000-8000-000000000004"
-          },
-          "report_id": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
         }
       ]
     },
