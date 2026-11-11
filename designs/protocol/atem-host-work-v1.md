@@ -1531,48 +1531,87 @@ stays as the design gives it.
   - In the same boot, `H = max(wall clock, the prediction)`.
   - After a reboot, `H = max(wall clock, wall_hw)` until a new record.
   - `H` never includes `station_time`.
-
-  **The record's update** (**Atem's fill-in** of the design's "the
+- **One boot** (**Atem's fill-in**). Every boot-time difference is taken
+  within one `boot_id` only: a prediction, an update's `Δ`, the floor's
+  elapsed time, and an anchor's predictions.
+  - A record, floor or anchor copy from an earlier boot predicts its own
+    value, never more, and `Δ` across a reboot is 0.
+  - No anchor carries over a reboot.
+  - The **first reading of a boot** is no jump and makes no anchor: it
+    follows the rule after a reboot (below).
+  - A runtime restarted within the same boot is the same boot: its
+    first reading is compared as any other.
+- **The record's update** (**Atem's fill-in** of the design's "the
   highest wall-clock reading"). The host updates the record at least once
-  a minute and at shutdown. With the reading `w`, the prediction `p` and
-  `Δ` the boot time since the previous update, the new value is:
+  a minute and at shutdown. Take the reading `w`, the prediction `p`, and
+  `Δ`, the boot time since the previous update in this boot. The new
+  value is:
   - `w` when `w ≥ p`;
   - when `w < p`, `max(w, p − ρ·Δ)` if the **follow-down** applies, else
     `p`.
 
   The new value is stamped with the current `boot_id` and boot time. A
-  wall clock set back, all at once or in small steps, therefore pulls
-  the prediction down by no more than the follow-down. Recording the
-  highest raw reading instead would let a set-back reading that is
-  still above the stored value replace a higher prediction.
+  clock set back (all at once or in small steps) pulls the prediction
+  down by no more than the follow-down. Recording the highest raw
+  reading instead would let a set-back reading still above the stored
+  value replace a higher prediction.
   - **The follow-down rate `ρ` is 500 ppm** (0.5 ms a second, 30 ms a
-    minute, 43.2 s a day). That is the frequency tolerance of NTP
-    (RFC 5905, `MAXFREQ`), and the bound the Linux kernel puts on the
-    frequency correction its NTP discipline applies (`MAXFREQ` in the
-    kernel's `include/linux/timex.h`, "max frequency error", 500 000 ns a
-    second).
-  - **When it applies.** On Linux, at an update whose reading comes with
-    the OS's report that its clock is synchronized (`adjtimex` without
-    `STA_UNSYNC`; below). On macOS, at every update until its report is
-    confirmed (below). Without it, `p` is kept.
+    minute, 43.2 s a day). That is NTP's frequency tolerance (RFC 5905,
+    `MAXFREQ`), and the bound the Linux kernel puts on the frequency
+    correction its NTP discipline applies (`MAXFREQ` in the kernel's
+    `include/linux/timex.h`, "max frequency error", 500 000 ns a second).
+  - **When it applies.**
+    - On Linux, at an update whose reading comes with the OS's report
+      that its clock is synchronized (`adjtimex` without `STA_UNSYNC`;
+      below).
+    - On macOS, at every update, until its report is confirmed (below).
+    - Without it, `p` is kept.
   - **Why it is needed.**
-    - On Linux, the OS's slewing moves `CLOCK_BOOTTIME` and the wall
+    - **On Linux,** the OS's slewing moves `CLOCK_BOOTTIME` and the wall
       clock together, so only the OS's steps separate them: a leap
       second, or a step back by the time-sync daemon.
-    - On macOS, `mach_continuous_time` is a raw counter. The wall clock
-      that `timed` corrects drifts from it by the oscillator's error, a
-      quartz crystal's typically well under 100 ppm.
-    - Without the follow-down, a record that never comes down keeps
-      every such lead. The lead builds over the whole uptime, carries
-      into the next boot whenever the reboot is shorter than the lead,
-      and past 10 minutes raises a false "host clock went back" alert
-      every hour on a healthy host. At 23 ppm that is a minute a month;
-      at 20 ppm, 10 minutes takes about a year.
-  - **Its price.** Someone who can set the clock back, while the OS
-    reports it synchronized (on macOS, at any time until confirmation),
-    can walk the record down by at most 500 ppm of the boot time: 43.2 s
-    a day. A set-back faster than that leaves the wall clock below `H`,
-    and past 10 minutes the owner is alerted.
+    - **On macOS,** `mach_continuous_time` is a raw counter. The wall
+      clock that `timed` corrects drifts from it by the oscillator's
+      error, a quartz crystal's typically well under 100 ppm.
+    - **Without the follow-down,** a record that never comes down keeps
+      every such lead:
+      - the lead builds over the whole uptime;
+      - it carries into the next boot whenever the reboot is shorter
+        than the lead;
+      - past 10 minutes it raises a false "host clock went back" alert
+        every hour on a healthy host.
+
+      At 23 ppm that is a minute a month; at 20 ppm, 10 minutes takes
+      about a year.
+  - **What it bounds, and its price there.** The follow-down bounds what
+    the record gives up to a wall clock that falls behind the boot-time
+    counter:
+    - on Linux, the OS's own steps back while it reports synchronized;
+    - on macOS, any fall of the wall clock against the raw counter,
+      stepped or slewed.
+
+    There someone who can move the clock back walks the record down by
+    at most 500 ppm of the boot time: 43.2 s a day. A fall faster than
+    that leaves the wall clock below `H`, and past 10 minutes the owner
+    is alerted. A step back made while the OS reports its clock
+    unsynchronized (any manual `settimeofday` on Linux) isn't followed
+    at all.
+  - **The price of trusting the OS's slewing (Linux).**
+    - On Linux the OS's slewing moves `CLOCK_BOOTTIME` too. So a time
+      source the OS follows can slew the wall clock and the boot-time
+      counter down together.
+    - The wall clock never falls behind the prediction, so nothing is
+      followed down and **no alert fires**: `H` moves with the source at
+      the OS's slew rate. chrony's default maximum (`maxslewrate`) is
+      83,333 ppm, about 2 hours a day. The kernel accepts tick changes of
+      up to ±10% (`adjtimex`'s `ADJ_TICK`).
+    - The owner's decision takes boot time and the OS's sync report as
+      the inputs, and Linux has no raw boot-time clock that counts
+      suspend. So no rule within the decision removes this: it is the
+      price of trusting the OS's own synchronization, stated here for
+      the owner.
+    - On macOS the counter is raw, so such a slew is followed down at
+      500 ppm and alerted as above.
   - **A healthy host, worked through.**
     - **A Mac** whose counter runs 20 ppm fast against `timed`'s wall
       clock (about 52 s a month): each minute the prediction gains
@@ -1584,25 +1623,29 @@ stays as the design gives it.
       leap second's 1 s step back is followed down in about 33 minutes.
     - In both cases deadlines fall at most that lead early, never late.
   - **What the follow-down doesn't clear quickly.** Say a clock booted
-    an hour ahead and the OS's first sync stepped it back. The record is
-    followed down at 500 ppm, an hour in about 83 days, with the alert
-    raised meanwhile. At the next reboot, the rule after a reboot (below)
-    lowers it at once.
-    A step back reported as the OS's sync isn't taken within the boot:
-    the owner's decision lowers the record to a synchronized wall clock
-    only across a reboot.
+    an hour ahead and the OS's first sync stepped it back.
+    - The record is followed down at 500 ppm, an hour in about 83 days,
+      with the alert raised meanwhile.
+    - At the next reboot, the rule after a reboot (below) lowers it at
+      once.
+    - A step back reported as the OS's sync isn't taken within the boot:
+      the owner's decision lowers the record to a synchronized wall clock
+      only across a reboot.
 - **The clock floor** is the latest `station_time` the host has seen,
-  with the boot time it was seen at. It takes a `station_time` only up to
-  `H` plus 10 minutes. One further ahead closes the gate for that origin
-  and raises an owner alert ("Station clock ahead of this host", at most
-  one an hour), and the gate reopens when a head within the cap arrives.
+  with the boot time it was seen at.
+  - It takes a `station_time` only up to `H` plus 10 minutes. One further
+    ahead closes the gate for that origin and raises an owner alert
+    ("Station clock ahead of this host", at most one an hour). The gate
+    reopens when a head within the cap arrives.
   - A `station_time` below the floor's prediction lowers the floor by at
     most 500 ppm of the boot time since the floor last changed, as the
-    record's follow-down does. So the counter's rate error doesn't build
-    a lead on the floor either.
-  - The floor is only a lower bound beside `H`, so this lowers no
-    deadline comparison below `H`.
-  - Only this and the repair below lower the floor.
+    record's follow-down does. So the counter's rate error builds no lead
+    on the floor either.
+    - This uses the Station's time, which is not one of the repair's
+      inputs, so it is no part of the repair.
+    - It can only bring the floor toward the Station's time, and the
+      floor lowers no deadline comparison below `H`.
+  - Only this follow-down and the repair below lower the floor.
 - **Deadline comparisons** use `max(H, floor + boot time elapsed since
   the floor was set)`, the floor's boot time counting within one boot
   only. After a restart or a reboot, the floor alone is the lower bound
@@ -1623,8 +1666,9 @@ stays as the design gives it.
   of the owner's "comes back to the trajectory the boot time predicts
   from before the jump (within 60 s)".
   - **A jump undone within one boot.**
-    1. **A forward jump** is a reading more than 60 s above the record's
-       prediction.
+    1. **A forward jump** is a reading more than 60 s above the
+       prediction of a record of the same boot. The first reading of a
+       boot never is one (one boot, above).
        - If the OS reports its clock synchronized with that reading,
          the jump is the OS's own step. No anchor is made, and a pending
          one is dropped (rule 4).
@@ -1633,45 +1677,60 @@ stays as the design gives it.
          record and a copy of the floor, as they stood (each a value, a
          `boot_id` and a boot time).
        - The copies never change, so the anchor's two predictions (each
-         value plus the boot time since its own boot time) never
-         decrease.
-    2. **While an anchor is pending,** the record goes on as above: it
-       takes the jumped readings, and comes down only by the follow-down.
-       A further jump keeps the first anchor.
+         value plus the boot time since its own boot time, in this boot)
+         never decrease.
+    2. **While an anchor is pending:**
+       - the record goes on as above: it takes the jumped readings, and
+         comes down only by the follow-down;
+       - a `station_time` that raises the floor is kept with the anchor
+         as well, the highest one with its boot time;
+       - a further jump keeps the first anchor.
     3. **The jump is undone** when a later reading `w`, in the anchor's
        boot, is within 60 s of the anchor's record prediction (above or
        below it). Then both values are lowered, never raised, and
        stamped now:
        - `wall_hw` to `max(w, the anchor's record prediction)`;
-       - the floor to `max(w, the anchor's floor prediction)`.
+       - the floor to `max(w, the anchor's floor prediction, the
+         prediction of the highest Station raise kept with it)`.
 
-       The anchor is dropped.
+       The anchor is dropped. Keeping the Station raise means a repair
+       never undoes the Station's own lead. A raise that only the
+       jumped `H`'s wider cap let in stays too: it can only make
+       deadlines early.
     4. **The OS's sync ends an anchor.** At a reading outside the
        anchor's band, a report from the OS that its clock is
        synchronized drops the anchor: the OS has made the jumped
-       trajectory its synchronized time, and the jump stands. A
-       step clears the Linux kernel's synchronized state until the
-       time-sync daemon next reports, so a synchronized report after a
-       jump is the OS's report on the new time (to be checked in step
-       4).
-       - Dropping an anchor only gives up a repair: `H` stays as high
-         as the record is. So no lateness can come of this rule, even
-         if the check above failed.
-       - Nothing else ends an anchor in its boot. A reading more than
+       trajectory its synchronized time, and the jump stands.
+       - **Why the report can be trusted here:** a step clears the Linux
+         kernel's synchronized state until the time-sync daemon next
+         reports, so a synchronized report after a jump is the OS's
+         report on the new time (to be checked in step 4).
+       - **Dropping an anchor only gives up a repair:** `H` stays as
+         high as the record is. So no lateness can come of this rule,
+         even if that check fails.
+       - **Nothing else ends an anchor** in its boot. A reading more than
          60 s below its record prediction is a clock set back: the
-         alert, and no repair. A reboot drops the anchor (the rule after
-         a reboot, below).
-  - **The invariants.**
-    - Within a boot, the record's prediction decreases only at a
-      repair, or at an update under the follow-down, by at most 500 ppm
-      of the boot time since the previous update.
-    - The anchor's record and floor predictions never decrease.
-    - A repair never sets `wall_hw` below the anchor's record
-      prediction, the floor below the anchor's floor prediction, or
-      either below the reading.
-    - So, apart from the follow-down's 500 ppm while it applies, a
-      forward move and back ends neither `wall_hw` nor the floor below
-      where each stood before the move. Nothing settled is revived.
+         alert, and no repair. A reboot drops the anchor (one boot,
+         above).
+  - **The invariants**, measured on the boot-time counter, within one
+    boot:
+    - the record's prediction decreases only at a repair, by the rule
+      after a reboot (once, at the boot's first synchronized reading),
+      or at an update under the follow-down by at most 500 ppm of the
+      boot time since the previous update;
+    - the anchor's two predictions never decrease, nor does the Station
+      raise kept with it;
+    - a repair never sets `wall_hw` below the anchor's record prediction,
+      the floor below the higher of the anchor's floor prediction and
+      the Station raise kept with it, or either below the reading;
+    - no comparison crosses a reboot.
+
+    So, against the boot-time counter, a forward move and back ends
+    neither `wall_hw` nor the floor below where each stood before the
+    move, apart from the follow-down while it applies. Against true
+    time, add what the counter itself loses: on macOS only its rate
+    error; on Linux whatever the OS's slewing takes away (the price
+    above). Nothing settled is revived.
   - **The small-steps-back attack, worked through.** Suppose the true
     time is `T`, the record's prediction is on it, and the OS doesn't
     report its clock synchronized, so no follow-down applies.
@@ -1702,66 +1761,112 @@ stays as the design gives it.
     2. The daemon's next report clears the mark. At Atem's next reading
        (still on the true time `T`, outside the anchor's band, and
        synchronized) the anchor is dropped, and the record stays on `T`.
-    3. Later someone sets the clock back toward `S`, or a bad NTP source
-       slews it down through `S`'s band. No anchor exists, so nothing is
-       repaired. The record comes down by at most 500 ppm (while the
-       report says synchronized), and the alert fires once the wall
-       clock is 10 minutes below `H`. `H` falls behind `T` by at most
-       43.2 s a day of that.
+    3. Later someone sets the clock back toward `S`. No anchor exists,
+       so nothing is repaired.
+       - While the OS reports the clock unsynchronized, as a manual step
+         makes it, the record keeps `p`.
+       - Once the OS reports synchronized again, the record comes down by
+         at most 500 ppm.
+       - The alert fires once the wall clock is 10 minutes below `H`.
+    4. If instead a bad time source makes the daemon slew the clock down,
+       the slew moves the boot-time counter too. `H` comes down with it
+       at the daemon's slew rate, with no alert: the price of trusting
+       the OS's slewing (above). On a Mac the same slew is followed down
+       at 500 ppm and alerted.
 
     Under the previous text the stale anchor stayed armed for the boot.
     The set-back would have lowered `wall_hw` and the floor to `S`,
     three hours below `T`, and later jumps in that boot could no longer
     be repaired.
+  - **A reboot, worked through.** A Mac (sync report not yet confirmed)
+    shuts down at `X` with `wall_hw` = `X`, stays off three days, and
+    boots.
+    1. Its first reading, `X` + 3 days, is the boot's first reading: no
+       jump and no anchor. The record becomes `X` + 3 days in the new
+       boot.
+    2. Later someone steps the clock back to `X` + 30 s. No anchor
+       exists, so nothing is repaired. The follow-down lowers the record
+       by at most 500 ppm, and the alert fires past 10 minutes. `H`
+       stays within 43.2 s a day of the true time, plus the counter's own
+       rate error.
+
+    Compared across the reboot, the first reading would have been a
+    jump. It would have armed an anchor at `X` for the whole boot, and
+    the step back would have "repaired" `wall_hw` and the floor to
+    `X` + 30 s: three days, plus the uptime, below the true time.
+
+    A clock set forward while the machine was off shows up only as the
+    boot's first reading, so it is never repaired in that boot.
+    Deadlines are early. It is cleared by the follow-down (on macOS, or
+    on Linux when the OS steps it back while synchronized), or at the
+    next reboot by the rule after a reboot once the OS reports
+    synchronized.
   - **The bounds that remain,** for the owner:
-    - **On Linux,** the anchor is still armed between an OS step and
-      Atem's first reading that comes with the OS's next synchronized
-      report. That window is at most a reading interval plus the
-      daemon's poll interval, and usually far shorter (to be measured in
-      step 4). A set-back into its band in that window lowers `wall_hw`
-      to the old trajectory, below the true time by up to the step's
-      size.
-    - **On macOS, until its sync report is confirmed,** rule 4 never
-      applies. A forward step `timed` makes on a clock that was slow by
-      more than 60 s arms an anchor that lasts the boot. A later
-      set-back, or a down-slew into its band, lowers `wall_hw` to the
-      old trajectory, up to the step's size below the true time. Later
-      jumps in that boot aren't repaired, and `H` stays at the jumped
-      value until the reboot. A Mac's clock keeps time while it's off,
-      so such steps are rare, and exploiting one needs someone able to
-      set the clock or to steer its time source. The floor is lowered
-      no further than its own pre-step value, so with a Station it
-      stays a lower bound.
-    - **A jump the OS reports as synchronized is never repaired** in
-      its boot. `H` stays ahead (deadlines early), comes down at
-      500 ppm, and is cleared after a reboot.
-  - **After a reboot.** Boot time doesn't cross a reboot. The record
-    carries a mark from the reboot until the first reading at which the
-    OS reports its clock synchronized in the new boot. At that reading,
-    if `wall_hw` or the floor is more than 10 minutes ahead of the wall
-    clock, Atem lowers both to the current wall clock. Then the mark
-    goes, and for the rest of the boot only the rules above apply (the
-    mark is **Atem's fill-in**: it fixes when the rule applies).
-    - Linux: `adjtimex`'s status without `STA_UNSYNC`, which chrony and
-      systemd-timesyncd clear once synchronized. In a container it
+    - **On Linux, the slewing price** above: `H` moves with a time source
+      the OS follows, at the OS's slew rate, with no alert.
+    - **On Linux, the step window.** An anchor armed by the OS's own
+      forward step is still armed until the time-sync daemon next
+      reports synchronized (to be measured in step 4), and for the rest
+      of the boot if it never does. A set-back into its band before then
+      lowers `wall_hw` to the old trajectory, below the true time by up
+      to the step's size.
+    - **On macOS, until its sync report is confirmed:**
+      - Rule 4 never applies, so an anchor armed by `timed`'s own forward
+        step on a clock slow by more than 60 s lasts the boot.
+      - A later set-back, or a down-slew into its band, lowers `wall_hw`
+        to the old trajectory, up to the step's size below the true time.
+      - Later jumps in that boot aren't repaired: `H` stays ahead of the
+        wall clock, coming down at 500 ppm. A reboot doesn't clear it
+        either, since macOS has no lowering after a reboot before
+        confirmation.
+      - A Mac's clock keeps time while it's off, so such steps are rare,
+        and exploiting one needs someone able to set the clock or to
+        steer its time source.
+      - The floor is lowered no further than its own pre-step value and
+        the Station's raises, so with a Station it stays a lower bound.
+    - **A jump the OS reports as synchronized** is never repaired in its
+      boot. `H` stays ahead (deadlines early) and comes down:
+      - by the follow-down when the OS steps the wall clock back while
+        synchronized;
+      - with the counter on Linux, when the OS slews it back;
+      - at the next reboot, by the rule after a reboot (on macOS, once
+        the report is confirmed).
+  - **After a reboot.** Boot time doesn't cross a reboot (one boot,
+    above).
+    - The boot's first reading records `max(w, wall_hw)` with the new
+      `boot_id`.
+    - The record carries a **mark** from the reboot until the first
+      reading at which the OS reports its clock synchronized in the new
+      boot. At that reading, if `wall_hw` or the floor is more than 10
+      minutes ahead of the wall clock, Atem lowers both to the current
+      wall clock.
+    - Then the mark goes, and for the rest of the boot only the rules
+      above apply. The mark is **Atem's fill-in**: it fixes when the rule
+      applies.
+    - **Linux:** `adjtimex`'s status without `STA_UNSYNC`, which chrony
+      and systemd-timesyncd clear once synchronized. In a container it
       reports the host kernel's state, which is the right answer.
-    - macOS: the candidate is `ntp_gettime()` returning `TIME_OK` rather
-      than `TIME_ERROR`, to be confirmed against `timed`'s behaviour in
-      step 4. Until it is, macOS doesn't lower them after a reboot.
+    - **macOS:** the candidate is `ntp_gettime()` returning `TIME_OK`
+      rather than `TIME_ERROR`, to be confirmed against `timed`'s
+      behaviour in step 4. Until it is, macOS doesn't lower them after a
+      reboot.
   - **Otherwise** Atem stays on the safe side: tasks may expire early, and
     `atem status` says why and names the fix. Where the flag never clears
     because no time-sync daemon runs, it says `host clock ahead of its
     record; enable time synchronization (chrony or systemd-timesyncd)`.
     On macOS before confirmation, it says `host clock ahead of its
     record; waiting for a synchronized clock`.
-  - **What doesn't change.** Neither value is ever set below the current
-    wall clock. Nothing already settled is revived: tasks already
-    `expired`, envelopes already refused as expired, `outcome_unknown`
-    tasks already past their deadline. The device list's recovery waits
-    (session-v1 R9.5) keep their own clocks. Every repair, and every
-    lowering after a reboot, writes one `runtime.log` line with the old
-    and new values, and `atem status` shows it. The follow-down is no
-    repair: it writes no line.
+  - **What doesn't change.**
+    - No repair, and no lowering after a reboot, sets either value below
+      the current wall clock.
+    - Nothing already settled is revived: tasks already `expired`,
+      envelopes already refused as expired, `outcome_unknown` tasks
+      already past their deadline.
+    - The device list's recovery waits (session-v1 R9.5) keep their own
+      clocks.
+    - Every repair, and every lowering after a reboot, writes one
+      `runtime.log` line with the old and new values, and `atem status`
+      shows it. The follow-down is no repair: it writes no line.
 
 #### On the host
 

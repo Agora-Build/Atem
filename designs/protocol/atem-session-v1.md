@@ -4347,16 +4347,30 @@ agreement.
      completes with the turn's outcome (`interrupted`, §6).
    - **Pending until done.** An intent stays pending until the turn was
      interrupted or ended, or the attempt was withdrawn.
-     - The interrupt is **delivered once per turn** in a runtime's run:
-       written, and reported written by the worker.
-     - **A consumed write is written again.** If the worker reports the
-       write consumed rather than written, the runtime writes it again on
-       the next pass. On Codex this happens when an approval hook is
-       waiting: the Esc only hands the approval to Codex's own dialog
-       (what a remote interrupt reports as "the approval was handed to
-       the terminal; interrupt again to stop the turn"). Each consumed
-       write releases a waiting hook, so the repeats end, and a turn is
-       never left in the dialog past its task's deadline.
+     - The interrupt is **delivered once per turn** in a runtime's run.
+       Delivered means the worker reported it written (`ok`).
+     - **When nothing was written, it is written again on the next
+       pass,** while the intent is pending. The worker's report says
+       so in three ways:
+       - **`consumed`.** On Codex an approval hook was waiting, and the
+         Esc only handed the approval to Codex's own dialog. A remote
+         interrupt reports this as "the approval was handed to the
+         terminal; interrupt again to stop the turn".
+       - **Consumed again, in the worker's consume window.** After such
+         a release the worker also consumes input until the released
+         hooks have exited. That window lasts at most 500 ms
+         (`CONSUME_INPUT`), so a few passes' writes are consumed without
+         releasing anything.
+       - **`dropped` or `no_effect`:** a stale input epoch, or a write
+         refused before it was queued.
+     - **The repeats end.** A consumed write either releases one of the
+       finitely many waiting hooks or falls in that window, which is
+       bounded. A turn is never left in Codex's dialog past its task's
+       deadline.
+     - **An error after queueing** may have reached the terminal. It
+       counts as delivered, so no blind second Esc follows. If the
+       turn is still the session's current turn 10 s later (§6's bound
+       for an interrupt), the interrupt is written again.
      - On later passes while the intent is pending, only the lease
        revocation repeats: a lease a native takes over during the turn
        is revoked again on the next pass, so a takeover can't defeat the
