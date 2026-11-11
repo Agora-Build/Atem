@@ -1836,6 +1836,7 @@ Planned:
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
 | (`enc_sig` inside a `host_enc_key` entry; planned, R9.2 "Host senders and projects") | `atem-host-enc-key-v1` over fields, never a body: `enc([label, account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])` | the host's `host_channel_key` (its newest `add_host`'s `host_key`) |
+| `atem-host-work-control` (control records; planned, host-work-v1 §11.1) | `atem-host-work-control-v1` | the principal's own key (a service: an `auth_key` it had in the list, the one the body's `principal_key` names; the Station that hosts the integration holds it), any action; or a native member holding `manage` at the verifier's head (`member:<device_id>`), `revoke` and `interrupt_running` only. A host's key signs none |
 
 Other domain strings (never signing inputs of another kind):
 `atem-membership-hash-v1`, `atem-browser-grant-hash-v1`,
@@ -1845,7 +1846,8 @@ Other domain strings (never signing inputs of another kind):
 `atem-push-seal-v1`, `atem-enc-kid-v1`, `atem-k-backup-v2`,
 `atem-recovery-kit-v2`, `atem-recovery-kit-tag-v1`,
 `atem-k-backup-hash-v1`, `atem-recovery-sign-v1`, `atem-safety-code-v2`.
-Vectors: `r9-vectors-encoding`, `r9-vectors-keys`.
+Vectors: `r9-vectors-encoding`, `r9-vectors-keys`; control records:
+`r9-vectors-host-work-control`.
 
 ### R9.2 The membership log
 
@@ -2422,6 +2424,40 @@ pending_recovery}` (no `re`) when its head moves or a pending entry
 starts, takes effect or is cancelled, so clients fetch. Atem may also fetch the suffix
 from the relay over its own link; it gets no more trust than any
 carrier.
+
+**Control records on an open channel** (planned: feature `host.senders`,
+which no host advertises yet; the records are host-work-v1 §11.1). A native
+member sends `control_records{id, records}` beside `membership{id,
+entries}`: one to 64 signed control records, at most 256 KiB in all,
+strict like `membership` (exactly `v`, `op`, `id` (a UUID v4), `records`).
+They are native managers' `interrupt_running` records about host
+principals only (delegated host-work II.3.1; ruling T12c): a service's
+records travel only in its Station's feed. The host answers
+`control_records_result{re, results}`, one result per record, in the order
+sent (R9.8).
+
+- **Carriage order** (ruling T10b). A carrier sends `membership` up to its
+  own head first, then `control_records`: each record is verified against
+  the device list the host holds when it applies the record. A record
+  whose principal or native signer isn't in that list yet waits
+  (`pending`: `principal_unknown`, `signer_unknown`), as does a host
+  principal's interrupt whose `revoke_seq` is beyond the head
+  (`revoke_not_in_list`); a native the list holds without `manage` (a
+  promotion the carrier didn't send first included) is refused
+  (`signer_not_allowed`), and Astation signs it again once that native
+  holds `manage`. A Station feed's records are verified only after the
+  host fetched the device list up to the head the Station announced
+  (delegated host-work I.5.8).
+- **A record the parser refuses** fails the whole message
+  `invalid_request` (ruling T12b): nothing of it is applied, and
+  runtime.log gets one refusal line. In a Station feed, by contrast, a
+  record that doesn't parse is refused on its own and kept as evidence.
+- **A carrier gets no authority from carrying** (account-trust §3.5): the
+  host verifies and applies each record whoever carried it. Only a native
+  member may send the op (a service or a browser gets `forbidden`), and a
+  host that doesn't advertise `host.senders` refuses it
+  `unsupported_version` (detail `host.senders is not advertised`; ruling
+  T12a), with no effect.
 
 **Bounds against rejected traffic:** ≤ 65 signature checks per carriage;
 r7.1's one `hello` per second per transport; `evidence` keeps a count
@@ -3485,6 +3521,8 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | `host_policy_get` | C→H | → `host_policy_result{re}` (R9.8a; native `manage`) |
 | `host_policy_result` | H→C | `re`, `request_id?`, `outcome`, `policy{relay_only, revision, state}`, `account_id`, `atem_device_id`, `host_trust_gen`, `head`, `channel_id`, `attachment_gen` (R9.8a) |
 | `host_policy_changed` | H→C | event: `policy`, `account_id`, `atem_device_id`, `host_trust_gen`, `head`, `channel_id`, `attachment_gen` (R9.8a; other manager attachments, after a commit) |
+| `control_records` | C→H | `id`, `records` (one to 64 signed control records of host principals, ≤ 256 KiB) → `control_records_result{re}` (planned, feature `host.senders`; native members only; R9.3) |
+| `control_records_result` | H→C | `re`, `results`: one `{record_id, result, effects}` per record in the order sent, `result` and each effect's `result` `applied`, `duplicate`, `pending` or `refused`, `effects` `[{effect, result}]` with `effect` `revocation`, `interrupt`, `hold`, `release` or `cover` (host-work-v1 §11.1) |
 
 - A `hello` without `revision: 9` gets `error{code:"unsupported_version",
   revision: 9}` and nothing else (as §A). Any session message outside a
@@ -3492,6 +3530,12 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 - `features`: the nine r8 features plus `membership.carry`,
   `push.sealed`, `approval.seen`, `grant.revoke`, `recovery.wait`,
   `host.policy`.
+- An r9 session op of a feature the host doesn't advertise is refused
+  `unsupported_version` with no effect (as §A refuses an op of a feature
+  it doesn't list; ruling T12a): today `control_records`, whose feature
+  `host.senders` no host advertises (detail `host.senders is not
+  advertised`). The host-work ops of a feature it doesn't list are
+  host-work-v1's (`busy` while hosting is off, §1).
 - One principal may have several attachments (a phone and its widget);
   each is fenced separately by `attachment_gen`, together by the
   principal's `control_gen`.
@@ -3898,7 +3942,12 @@ the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
 `r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
-`r9-vectors-host-route`. The membership log also carries the planned
+`r9-vectors-host-route`, and, planned, `r9-vectors-host-work-control`
+(control records, host-work-v1 §11.1: service records for each action,
+native managers' and a host principal's records, a record signed by a
+manager removed before the host received it, every verification reason
+and parse code, and `ControlState` sequences with their per-effect
+results). The membership log also carries the planned
 actions of R9.2 "Host senders and projects" (signed only behind the
 signing gate): projects (`P7_add_host_b`, `P8_set`, the replacing
 `P9_narrow`, `P10_remove`; a host removed and added again,
@@ -3952,7 +4001,11 @@ today it recomputes and verifies every cryptographic value of
 `enc`, entry hashes, key derivations and `enc_kid`s, every Ed25519 and
 low-S P-256 signature by the key its chain names, `kit_sig` and each
 `enc_sig` whose binding fields parse) and the arrays' canonical forms,
-and exits non-zero on a mismatch; it grows a checker per file. It
+and of `r9-vectors-host-work-control` (each body's `jcs` and signing
+input, every signature by the key its chain names for the signer, the
+`r9Svc` beside each service record's `principal_key`, and the record
+digests a sequence's state keeps), and exits non-zero on a mismatch; it
+grows a checker per file. It
 derives no verdict: `expect` and each refusal's `reason` are checked by
 the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
 conformance suites. Scenarios

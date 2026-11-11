@@ -1,6 +1,7 @@
 # Host work v1: launch, directed work, messages and attachments
 
-Status: implemented and released (Atem v0.8.2).
+Status: implemented and released (Atem v0.8.2). §11 (delegated work) is
+planned: its features are defined and advertised by no host.
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
@@ -37,6 +38,8 @@ the stage-2 agreement ([../delegated-host-work.md](../delegated-host-work.md), I
 
 A host lists all five in r9 `welcome.features` when hosting is enabled and
 healthy and its work database is open, else none; an r8 host never does.
+Three more, `host.delegated`, `host.alerts` and `host.senders`, belong to
+delegated work (§11, planned): no host lists them in this version.
 Clients check the feature before sending. When hosting turns off under an open
 channel, or 64 host-work requests already wait for the host's next pass, a
 request is `busy` ("agent hosting is disabled or busy").
@@ -815,3 +818,263 @@ dropped.
   its agent submits moves it to `awaiting_result`; otherwise it expires at
   `expires_at`), and deleting or archiving the host's records (every record is
   kept; only payloads go, §9).
+
+## 11. Delegated work (planned; `host.delegated`, `host.alerts`, `host.senders`; not advertised)
+
+The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
+agreed revision 6b) gives tasks a lifecycle Atem owns, stops that reach
+hosts while the sender is offline, and host-to-host senders. Its wire adds
+three features, defined in `atem_client::session::host_work`
+(`DELEGATED_FEATURE`, `ALERTS_FEATURE`, `SENDERS_FEATURE`):
+
+| Feature | Ops |
+|---|---|
+| `host.delegated` | `work_interrupt`, `work_resolve` (Part I; written in a later section) |
+| `host.alerts` | `alert_list` (Part I; written in a later section) |
+| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (written later) |
+
+**No host advertises them in this version**, and a host refuses each of
+their ops as it refuses any op of a feature it doesn't list: a session op
+(`control_records`) is `unsupported_version` with no effect (session-v1
+R9.8; ruling T12a). Clients check `welcome.features` first; the client core
+refuses to send `control_records` to a host that doesn't list
+`host.senders` (`host feature not available`).
+
+### 11.1 Control records
+
+A control record is a signed stop of a **service** principal
+(`service:<device_id>`), which the Station that hosts the integration signs
+with the integration's own service key and serves in its control feed, or
+of a **host sender** (`host:<host_id>`), whose only record is a native
+manager's later `interrupt_running` after a device-list
+`host_sender_revoke` (design I.5, II.3.1). Hosts verify each record against
+their device list and apply it to the delegated work they hold for that
+principal. Types: `atem_client::control::{record, verify, state}`; the
+channel op: `atem_client::session::r9::{control_records_op,
+ControlRecordsRequest, ControlRecordsResult}`; for Station builders, the
+bindings' §9 ([atem-client-bindings.md](atem-client-bindings.md)).
+
+#### Format
+
+A signed object in R9.1's one form: wire `{"body":{…},"sig":"<b64u>"}`,
+signing input `enc(["atem-host-work-control-v1", jcs(body)])`, body `jcs` at
+most 4,096 bytes, strict I-JSON, absent fields omitted (never `null`). No
+`kit_sig`, `enc` or `ct`; no array anywhere.
+
+```json
+{"body":{"type":"atem-host-work-control","v":1,
+  "account_id":"acct-test-1","genesis_hash":"<hex>",
+  "origin":"https://station-dev.agora.build","feed_id":"<UUID v4>",
+  "principal":"service:svc-1","principal_key":"<hex SHA-256 of the principal's auth_key>",
+  "signer":"service:svc-1",
+  "action":"revoke","interrupt_running":false,
+  "record_id":"<UUID v4>","issued_at":1793620800000,
+  "about":{"integration_id":"i-…","by":"owner"}},
+ "sig":"<b64u>"}
+```
+
+| Field | Rule |
+|---|---|
+| `type`, `v` | `atem-host-work-control`, `1` |
+| `account_id`, `genesis_hash` | the device list's (1–128 bytes; lowercase hex) |
+| `origin` | a service's record: the Station's exact origin, as `station_route::normalize_relay` writes it (`https://` and a lowercase host, a port only when not the default, no path, trailing slash or user info; `http://` on a loopback address for development) |
+| `feed_id` | a service's record: the feed's UUID v4, minted with the feed and never reused |
+| `principal` | `service:<device_id>` (an opaque id, never `recovery`) or `host:<host_id>` |
+| `principal_key` | a service's record: lowercase hex SHA-256 of the principal's `auth_key` raw bytes, exactly the integration's `r9Svc` (`service_key_fingerprint`; decision 8), so a Station cross-checks records against the Portal feed |
+| `signer` | the principal itself, or `member:<device_id>` (a native manager) |
+| `action` | `cover`, `revoke`, `hold`, `release` or `interrupt_running` |
+| `interrupt_running` | a boolean, present exactly on `revoke` |
+| `revoke_seq` | a host principal's record only: the `seq` of the `host_sender_revoke` it follows, 1 to 2^53 − 1 |
+| `record_id` | a UUID v4 (lowercase), the record's identity |
+| `issued_at` | ms since the epoch, at most 2^53 − 1; display, and the order of covers (below) |
+| `about` | `{integration_id?, by}`: display and audit only, nothing is decided by it. `integration_id` (Auth's client id, an opaque id) is required on a service's record and absent on a host principal's. `by` is a label of 1 to 32 characters of `[a-z_]`: the Portal feed's least-disclosure reasons `owner`, `station`, `agora_build`, `member_removed`, `station_removed`, `reconciled`, and later `account_deleted` (decision 8); an unknown value is accepted for display, so a host never refuses a valid stop because the Portal added a reason |
+
+**Two forms.** A service's record carries `origin`, `feed_id`,
+`principal_key` and `about.integration_id`, never `revoke_seq`. A host
+principal's record is `interrupt_running` only, with `revoke_seq` and none
+of `origin`, `feed_id`, `principal_key`, `interrupt_running` or
+`about.integration_id`: it is bound to no feed (II.3.1).
+
+**Refused at parse** (`ControlError::code`; the record isn't one at all):
+
+| Code | When |
+|---|---|
+| the signed-object layer's (`not_strict_json`, `too_large`, `null_value`, `unknown_type`, `array_not_canonical`, `malformed`) | not a signed object of R9.1's form |
+| `wrong_type` | a signed object of another type |
+| `unknown_field` | a field outside the body's, or outside `about`'s |
+| `malformed` | a field missing, mistyped or out of its grammar (the error names it) |
+| `field_not_allowed` | a field this form doesn't take: `origin`, `feed_id`, `principal_key`, `about.integration_id` on a host principal's record, `interrupt_running` beside another action than `revoke`, `revoke_seq` on a service's |
+| `not_for_host_principal` | a host principal's `cover`, `revoke`, `hold` or `release` (ruling T9a: refused at parse; in a feed it is kept as evidence like a verification refusal) |
+
+#### Signers and verification
+
+A host verifies a record against its device list at the head of the
+transaction that applies it, never with a verdict from before (design
+I.5.4). The key and its algorithm come from the device-list entry of the
+signer the body names, never from the record.
+
+| Signer | May sign |
+|---|---|
+| the principal's own key (`signer` = `principal`, a service) | every action: any `auth_key` the service had in the list (also after its grant expired or it was removed), the one whose SHA-256 `principal_key` names |
+| a current native manager (`member:<device_id>`: a `native` member holding `manage` at the head) | `revoke` and `interrupt_running` only, of any principal; never `cover`, `hold` or `release`. A service record it signs still names the principal's key |
+| a host's own key | nothing (`host_key_signed`) |
+
+A host principal's `interrupt_running` must name, in `revoke_seq`, that
+host's own `host_sender_revoke` in the list (ruling T10a): beyond the head
+it waits, any other entry there is refused. A readmit since then changes
+nothing: the interrupt is for the tasks admitted before that revoke.
+
+The verdict (`verify_control`): **valid**, **pending** (stored and verified
+again after every device-list advance) or **refused** (kept as evidence and
+alerted, the scan cursor moves past it):
+
+| Pending | When |
+|---|---|
+| `principal_unknown` | the list holds no member the `service:` names, or no `add_host` of the `host:` |
+| `signer_unknown` | the list holds no native member the `member:` names yet, or one whose `recovery_add` still waits |
+| `revoke_not_in_list` | a host principal's `revoke_seq` is beyond the head |
+
+| Refused | When |
+|---|---|
+| `wrong_account` | `account_id` or `genesis_hash` isn't the list's |
+| `bad_signature` | the signature doesn't verify under the named signer's key |
+| `key_mismatch` | `principal_key` names no key the service ever had |
+| `signer_not_allowed` | a manager's `cover`, `hold` or `release`; a `member:` signer that isn't a native manager (a native without `manage`, a service, a cancelled `recovery_add`) |
+| `removed_manager` | its native signer was a manager and was removed or lost `manage` before the host applied it (its signature verifies under that signer's old key): the strict rule of I.5.4; Astation signs it again with a current manager (the same stop, a new `record_id`) |
+| `host_key_signed` | a host principal's record naming the host as its signer |
+| `not_a_service` | `service:<id>` names a native member |
+| `not_a_revoke` | a host principal's `revoke_seq` names an entry that isn't that host's `host_sender_revoke` |
+
+**Order.** What no later entry can make valid is refused first (the
+account; a host's own key; a manager's `cover`, `hold` or `release`; a
+`member:` signer that is removed, cancelled or a service); then the
+principal (unknown waits; a native principal, a key mismatch or a
+`revoke_seq` naming another entry is refused; one beyond the head waits);
+then the signer (unknown waits; a native without `manage` is refused); then
+the signature. A record is never applied while the host's device list is
+frozen (R9.4) or the host is held after a write fault (R9.3).
+
+#### Carriage
+
+- **Feeds.** A Station's control feed carries every record of the
+  principals it covers, native managers' records included (Astation submits
+  them, the Station appends them), and host principals' interrupts (they
+  count from any feed). The host reads it in feed order (`feed_seq`, not a
+  field of the record) and verifies its records only after fetching the
+  device list up to the head the Station announced (I.5.8). A record that
+  doesn't parse is refused on its own and kept as evidence; the cursor
+  moves past it. The feed calls and acknowledgments are written in a later
+  section.
+- **Channels.** `control_records{id, records}` (session-v1 R9.3, R9.8):
+  host principals' records only (ruling T12c), from native members only,
+  after `membership` up to the carrier's head (ruling T10b). A record the
+  parser refuses fails the whole message `invalid_request`: nothing
+  applied, one refusal line in runtime.log (ruling T12b). A carrier gets
+  no authority from carrying.
+
+#### Application and per-effect results
+
+Each record is applied in one `host-work.sqlite` transaction with what it
+does and the scan cursor (design I.5.5; the reference implementation is
+`atem_client::control::ControlState`, exported to the bindings as
+`ControlStateHandle`). A record's **effects** are, by action:
+
+| `action` | Effects |
+|---|---|
+| `cover` | `cover` |
+| `revoke` | `revocation`, and `interrupt` with `interrupt_running: true` |
+| `hold`, `release` | `hold`, `release` |
+| `interrupt_running` | `interrupt` (for a host principal, the interrupt of the revocation at its `revoke_seq`) |
+
+Each effect gets one result: `applied` (this record put it in force on
+this host), `duplicate` (the host already had it in force: the same
+record, a re-signed copy, a revoke of a revoked principal, an interrupt for
+a revocation already interrupted), `pending` (not in force yet, and it can
+be later), `refused` (not in force, and never from this record). The
+record's `result` is `applied` when any effect is, `duplicate` when every
+effect is, else `pending` when any effect is, else `refused`. **Consumers
+read `effects`, not only `result`**: a revoke that adds `interrupt_running:
+true` to one already applied is `applied` for its interrupt and `duplicate`
+for its revocation. For the revocation, `duplicate` means "already in force
+on this host" (decision 8): a Station counts it as applied there (decision
+8's amendment to I.5.8: its `revocation_applied` report names the record of
+a host's first `applied` or `duplicate` for the revocation).
+
+The rules:
+
+1. **Idempotent by `record_id`.** A record that counted (`applied` or
+   `duplicate`) is kept with the SHA-256 of its body's `jcs`; the same body
+   again is `duplicate` for every effect, whatever its signature bytes, its
+   position or what the list says now (a revoke whose signer was removed
+   since stays applied). Another body under that `record_id` is `refused`
+   and kept as evidence; the first counts. A record kept pending or refused
+   takes no `record_id`.
+2. **Verification** (above): `pending` waits for every effect; `refused` is
+   evidence. A list of another account or genesis applies nothing.
+3. **A revoke is final**, from any feed or from none.
+4. **One interrupt per revocation.** A service's interrupt waits
+   (`pending`) while the service isn't revoked on this host. A host
+   principal's interrupt waits until host-work's applied device-list `seq`
+   reaches `revoke_seq` (its cancellations and the revoke's own interrupt
+   intents are durable then; ruling T10a), and is a `duplicate` when the
+   revoke entry itself carried `interrupt_running: true`.
+5. **Coverage** is per Station (origin), ordered by `(issued_at,
+   record_id)` (ruling T11a, **for Astation's and Auth/Portal's
+   agreement**). A `cover` read at its own feed's position starts it.
+   Another Station's cover takes it over only when strictly newer than the
+   newest cover taken from the covering Station; an older or equal one is
+   `refused` and changes nothing. The same Station's cover is a
+   `duplicate`; a newer one from another `feed_id` of that origin (the
+   feed after a reset) moves the coverage's ordering to that feed. **A
+   cover never releases**: a hold survives every coverage change.
+6. **Hold and release** follow feed order within the coverage's current
+   feed: taken only from it, at their own feed's position, after that
+   feed's cover and after the last hold or release taken there. One that
+   asks for the recorded hold state is a `duplicate`; one that would change
+   it is `applied` when in order, else `refused`. So only a release from
+   the current covering feed, after its cover, lifts a hold.
+7. **After a revoke**, `cover`, `hold` and `release` change nothing: a
+   `duplicate` when they ask for what is recorded, else `refused`.
+
+**Resets.** A reset's snapshot (design I.5.2) re-issues, for each principal
+the Station currently covers, its `cover` first, signed anew (so newer),
+then its current hold or release, signed anew, and its revoke and
+interrupt records as they are or signed anew. On a host that applied the
+old feed each re-issued record is a `duplicate` (the cover moves the
+ordering to the new feed); on one that never saw it they apply, so a reset
+loses no stop.
+
+**Stations: the trust model** (ruling T11b, **for Astation's and
+Auth/Portal's agreement**). The principal's own key may sign every action,
+so whoever holds it controls coverage and can always sign a newer cover;
+ordering can't stop a key holder. So a Station re-issues covers only for
+principals it currently covers; a Station that hands an integration over
+stops signing for it, and the key leaves with it (or the integration is
+created again as a new principal); a Station whose clock went back signs
+covers that take nothing and fails closed (its holds and releases are
+refused until it signs a newer cover); and a revoke is final whoever holds
+the key. A misbehaving former key holder can lift a pause, never a revoke,
+until the owner revokes the integration. A Station learns of its own
+removal only through the Portal's two-phase removal (its integrations go
+`revoking` with reason `station_removed`, it issues and serves their
+records, then the removal completes; decision 8).
+
+#### Vectors
+
+`fixtures/r9-vectors-host-work-control.json` (schema in
+`fixtures/schema.md`): service records for each action, native managers'
+`revoke` and `interrupt_running`, a host principal's `interrupt_running`
+and a repeat for the same revoke, a record signed by a manager removed
+before the host received it (refused) and its re-signed copy, an
+`about.by` no host knows that still applies, each service record's
+`principal_key` beside the `r9Svc` of the service's key, every verification
+reason and the parse codes, and `ControlState` sequences with each step's
+per-effect results (a stale cover from another Station, a newer one taking
+coverage with the hold persisting until the new feed releases, a reset,
+a host interrupt waiting for the list and for host-work's applied `seq`).
+They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
+`tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
+`scripts/check-r9-vectors.py` recomputes their cryptographic values
+(`jcs`, signing inputs, every signature by the key its chain names, the
+`r9Svc` values, the record digests a state keeps) and derives no verdict.
+Every SDK package's checksum manifest lists the file.

@@ -588,10 +588,13 @@ pub const MAX_CONTROL_RECORDS_BYTES: usize = 256 * 1024;
 /// they are. It is for native members, as `membership` is for entries, and
 /// the host answers one [`ControlRecordsResult`].
 ///
-/// **Carriage order.** A carrier sends `membership` up to its head before
-/// `control_records` on a channel: a record is verified against the device
-/// list the host has applied, so one signed by a native whose `manage` the
-/// host hasn't applied yet is refused, not held for the entry to come.
+/// **Carriage order** (ruling T10b). A carrier sends `membership` up to its
+/// head before `control_records` on a channel: a record is verified against
+/// the device list the host has applied. One whose principal or native
+/// signer isn't in that list yet waits (`pending`, `principal_unknown` or
+/// `signer_unknown`), but one signed by a native the list holds without
+/// `manage`, a promotion the host hasn't applied yet included, is refused
+/// (`signer_not_allowed`), not held for the entry to come.
 ///
 /// **A carrier gets no authority from carrying** ("trust the signature, not
 /// the sender", account-trust §3.5): the host verifies each record against
