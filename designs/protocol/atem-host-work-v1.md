@@ -819,8 +819,9 @@ dropped.
   host-to-host sender.
 - **Not implemented:** resolving an `outcome_unknown` task by hand (a reply
   its agent submits moves it to `awaiting_result`; otherwise it expires at
-  `expires_at`), and deleting or archiving the host's records (every record is
-  kept; only payloads go, §9).
+  `expires_at`; planned behind `host.delegated`: §11.2, §11.6), and deleting
+  or archiving the host's records (every record is kept; only payloads go,
+  §9).
 
 ## 11. Delegated work (planned; `host.delegated`, `host.alerts`, `host.senders`; not advertised)
 
@@ -834,17 +835,19 @@ three features, defined in `atem_client::session::host_work`
 |---|---|
 | `host.delegated` | `work_interrupt`, `work_resolve` (§11.2) |
 | `host.alerts` | `alert_list` (§11.3), and the push hint of kind `outcome_unknown` (session-v1 R9.9) |
-| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (written later) |
+| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (session-v1 R9.8, R9.14) |
 
 **No host advertises them in this version**, and a host refuses each of
 their ops as it refuses any op of a feature it doesn't list: a session op
-(`control_records`) is `unsupported_version` with no effect (session-v1
-R9.8; **Atem's choice of code, for Astation to confirm**), and a host-work
-request (`work_interrupt`, `work_resolve`, `alert_list`) is `busy` (§7, §11.2,
-§11.3). Clients check
+(`control_records`, `host_enc_key_get`) is `unsupported_version` with no
+effect (session-v1 R9.8; **Atem's choice of code, for Astation to
+confirm**), and a host-work request (`work_interrupt`, `work_resolve`,
+`alert_list`) is `busy` (§7, §11.2, §11.3). Clients check
 `welcome.features` first; the client core
-refuses to send `control_records` to a host that doesn't list
-`host.senders` (`host feature not available`).
+refuses to send `control_records` or `host_enc_key_get` to a host that
+doesn't list `host.senders` (`host feature not available`). The lifecycle
+these ops serve (§11.6) and session-v1's side of it (R9.14) are planned
+with them.
 
 ### 11.1 Control records
 
@@ -1347,3 +1350,254 @@ Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
 invalid, and the `alerts` results: an empty page, a page, every sender and
 the bounds, and each refusal), `fixtures/r9-vectors-push-hint.json` (the
 hints).
+
+### 11.6 Delegated lifecycle (planned)
+
+Behind `host.delegated`, a task from a **delegated sender** has a lifecycle
+the host owns (design I.1 to I.6): it runs while the sender is offline,
+under the host-local `host-work` principal (session-v1 R9.14), and only
+signed data stops it. The delegated senders are a service its Station's
+control feed covers, a native member, and a host sender (`host:<host_id>`,
+on hosts that list `host.senders`). Browser grants, services no feed
+covers and `local` keep this document's v1 lifecycle (design I.1.3).
+Nothing here runs in this version. The host builds it in step 4 of the
+design's order of work, with the session-v1 revision of R9.14. What a
+client reads changes only where marked: the per-attempt `receipt_id` and
+`resolved` (§11.2), the alerts (§11.3), the receipts' `task_id` and
+`sender` (session-v1 R9.14) and the `detail` texts below. The rest is
+behaviour behind the feature, and `atem status` and `runtime.log` text.
+
+#### The start check
+
+A delegated task gets an **attempt** (below) when all of these hold, in one
+host-work transaction (design I.4.3):
+
+1. It is `queued`, no earlier task of its session holds it, and its
+   deadline hasn't passed (on the clock below).
+2. Its sender has no `revoke` record, isn't removed from the device list,
+   isn't held, and no device-list update is deferred on this host. A host
+   sender's `host_id` is `authorized` at the generation recorded at
+   admission, isn't removed, and its membership epoch is the one recorded
+   at admission; otherwise the task is `cancelled`, `sender revoked`.
+   - 2a. The device list isn't frozen, held or faulted, and the session
+     journal isn't halted. A frozen, faulted or held list fails the task
+     `sender's authority changed`. A halted journal alone leaves it
+     `blocked` until the restart.
+3. The current grant still covers the target, `notify` and `prompt` (a
+   lapsed grant is judged as it stood when it lapsed). For a host sender,
+   its project still lists it and this host, with `notify` and `prompt`.
+4. The route still exists at the recorded revision, with the sender among
+   its principals.
+5. The revocation gate for the sender's feed is open (for a host sender,
+   the mailbox gate too).
+6. The session is live, with chat, `ready`, no draft, no lease held, no
+   approval open, and its attachments verified.
+
+The sender's channel and online status are not conditions.
+
+- **At the start.** The same check runs again when the attempt's
+  request becomes `executing`, in the same serialized step (conditions 2,
+  2a, 3, 4 and 5, against the committed device list, `runtime.toml` and
+  the control state; session-v1 R9.14, item 3). A refusal there is the
+  receipt's `rejected` (`withdrawn by the host`), and the task takes the
+  event's state: `cancelled`, `failed`, or `blocked` for a hold.
+- **Waiting doesn't hold the session.** A task `blocked` for `paused`,
+  `revocations not yet checked` or `device list update pending` doesn't
+  hold its session's queue, so later tasks of other senders, local ones
+  included, may pass it. One sender's tasks keep their order.
+- **Deferred entries.** While the host's last carriage or relay fetch
+  stopped at a deferred device-list entry, every unstarted delegated
+  remote task waits (`blocked`, `device list update pending`), for at
+  most the 24 h recovery wait (session-v1 R9.5). Running turns go on, and
+  local tasks run.
+- **Locked credentials.** A locked cred agent leaves a project scope
+  pending (session-v1 R9.6): the task is `blocked`, `waiting for unlock`,
+  never failed as narrowed.
+- **Launches.** A delegated sender's launch is checked at the spawn
+  boundary against conditions 2, 2a, 3 (with `launch`), 4 and 5, before
+  the worker is spawned (design I.4.3, "Launches"). A reason that can
+  clear (a hold, the gate closed, a deferred entry) makes it wait while
+  its expiry holds, then `failed`, `expired before the spawn`. A reason
+  that can't clear ends it `failed` at once with the event's detail, and
+  never `outcome_unknown`. A receipt-database fault, a halted journal and
+  hosting switched off still fence it as §4 says.
+
+#### Attempts and `receipt_id`
+
+- **An attempt** is one dispatch of a task: a fresh UUID v4, committed in
+  the attempt's row before the submit, and the session-v1 `request_id` of
+  its prompt. The `host-work` principal submits it. Each attempt renders
+  the prompt anew with a fresh framing tag, drawn after the attempt's
+  input is fixed. A resent submit returns the recorded receipt, so an
+  attempt never runs twice.
+- **One live attempt.** At most one attempt of a task is live at a time.
+  A new one is made only once the previous one is proven side-effect-free:
+  never admitted (no receipt in the recovered journal), withdrawn, or
+  `rejected`. An attempt that reached `executing`, `completed` or
+  `outcome_unknown` ends the task's attempts for good.
+- **The limit.** At most **8** attempts per task, then `failed`, `too
+  many attempts`. Attempts a hold withdrew don't count. Nor does an
+  attempt the session host answered `request_id_reused` (an id recorded
+  under another submitter, session-v1 R9.14 item 7): it was never
+  admitted, and the host takes a fresh id. The deadline bounds them
+  anyway.
+- **`receipt_id`** in a `work` result is the current attempt's id (§11.2),
+  so it changes when a new attempt starts. A client compares it with
+  nothing; a task's identity is its `task_id`.
+- **Restart.** Recovered `accepted` attempts are `rejected`, `withdrawn
+  at recovery`, before anything is dispatched (session-v1 R9.14 item 6).
+  Their tasks go back to `queued` for a new attempt once the revocation
+  gate opens, after pending interrupt intents are carried out, every
+  task is reconciled with its latest attempt's receipt and route changes
+  are applied (design I.6.2, I.6.3).
+
+#### Unknown outcomes
+
+- `outcome_unknown` is final for execution: such a task is never
+  submitted again. Nothing ever treats it as success. To try again, the
+  sender enqueues a new task.
+- It no longer becomes `expired` at the deadline. There it stops holding
+  its session, and its `detail` becomes `deadline passed; outcome
+  unknown`. It stays `outcome_unknown` until `work_resolve` (§11.2) or the
+  host's own command (below) resolves it, which records the resolver and
+  the time (`resolved`).
+- A reply its agent submits proves the turn ran: the task moves to
+  `awaiting_result` and still needs `work_complete`. A reply that arrives
+  after a `failed` resolution is stored, and the task stays `failed`.
+- Each one raises an alert (§11.3); the alert ends when the task is
+  resolved, or a reply moves it to `awaiting_result`.
+
+#### Capacity
+
+- An unresolved task drops its prompt and context a day after its
+  deadline, with the uploads it named, and stops being an open record
+  (§9). It stays `outcome_unknown`, with its alert.
+- At **32** unresolved on a host, a new alert's `reason` says so (§11.3).
+- At **64** unresolved from one sender, the host refuses that sender's
+  requests that would make a new task (`work_enqueue`, and
+  `message_publish` with an agent recipient): `busy`, detail `too many
+  unresolved outcomes`.
+- At **256** unresolved on the host, it refuses such requests from every
+  remote sender, with the same code and detail, until the owner resolves
+  some. Local tasks are never refused for unresolved outcomes. Which
+  requests count, and the one detail for both limits, are **Atem's
+  choice, for Astation to confirm**: the design says "new tasks" and
+  "new remote tasks", and names the 64's detail only.
+
+#### Details
+
+`detail` stays display text that clients don't parse; these texts are
+exact.
+
+| State | `detail` | When |
+|---|---|---|
+| `blocked` | `paused` | the sender is held (a `hold` record) |
+| `blocked` | `revocations not yet checked` | the revocation gate (or, for a host sender, the mailbox gate) is closed |
+| `blocked` | `device list update pending` | the last carriage or fetch stopped at a deferred entry |
+| `blocked` | `waiting for unlock` | a locked cred agent leaves the project scope pending |
+| `cancelled` | `sender revoked` | a `revoke` record, an R9 removal, or a host sender's `host_sender_revoke`, `remove_host` or new membership epoch |
+| `failed` | `sender's authorization narrowed` | the current grant (or a host sender's projects) no longer covers the task |
+| `failed` | `route changed` | the route's revision, principals or profile changed |
+| `failed` | `sender's authority changed` | a frozen, faulted or held device list |
+| `failed` | `too many attempts` | 8 attempts |
+| `failed` | `expired before the spawn` | a launch still waiting at the spawn boundary at its expiry |
+| `awaiting_result` | `interrupted at deadline` | a running turn interrupted at the task's deadline (then `expired` as today) |
+| `outcome_unknown` | `deadline passed; outcome unknown` | its deadline passed unresolved |
+| (a `work_interrupt` result) | `not running` | the task's turn isn't the session's current turn (§11.2) |
+| (an error) | `too many unresolved outcomes` | `busy`, the 64 or 256 limit |
+| (a receipt) | `withdrawn by the host`, `withdrawn at recovery` | session-v1 R9.14 items 3, 4 and 6; the task's state follows the event |
+
+#### Clocks
+
+Every deadline check of the delegated lifecycle uses one clock (design
+I.6.5, as amended by the **owner's decision of 2026-11-10**). It is
+Atem-internal: no field or message changes, and Astation's `station_time`
+stays as the design gives it.
+
+- **Boot time.** Atem measures elapsed time on a clock that keeps
+  counting while the machine sleeps: `CLOCK_BOOTTIME` on Linux,
+  `mach_continuous_time` on macOS. (`CLOCK_MONOTONIC` and
+  `mach_absolute_time` stop during suspend, so a laptop's sleep would look
+  like a forward jump that never comes back.) Boot time counts only
+  within the boot it was read in (its `boot_id`). Session-v1 §3's lease
+  deadlines keep `CLOCK_MONOTONIC`.
+- **The host's own time `H`.** The host keeps `wall_hw`, the highest
+  wall-clock reading it has seen, with its `boot_id` and boot time. It
+  updates it at least once a minute and at shutdown. In the same boot,
+  `H = max(wall clock, wall_hw + boot time since wall_hw was recorded)`.
+  After a reboot, `H = max(wall clock, wall_hw)` until a new reading. `H`
+  never includes `station_time`.
+- **The clock floor** is the latest `station_time` the host has seen,
+  with the boot time it was seen at. It takes a `station_time` only up to
+  `H` plus 10 minutes. One further ahead closes the gate for that origin
+  and raises an owner alert ("Station clock ahead of this host", at most
+  one an hour), and the gate reopens when a head within the cap arrives.
+  Only the repair below lowers the floor.
+- **Deadline comparisons** use `max(H, floor + boot time elapsed since
+  the floor was set)`, the floor's boot time counting within one boot
+  only. After a restart or a reboot, the floor alone is the lower bound
+  until the next sync. The envelope times of host senders use the same
+  clock.
+- **A clock that goes back.** A wall clock more than 10 minutes below `H`
+  raises an owner alert ("host clock went back", at most one an hour).
+  Nothing is revived: every comparison keeps using `H`.
+- **Automatic repair** (owner decision 2026-11-10). It replaces the
+  design's "owner's reset", a local command left unnamed. There is no
+  command and no network time. Keeping the clock right is the OS's job,
+  and HTTP `Date` headers are no time service. A clock that jumped
+  forward and was corrected would otherwise expire tasks early for good,
+  so Atem repairs `wall_hw` and the floor itself:
+  - **A jump undone within one boot.** Boot time since a reading
+    predicts where the wall clock should be. Atem keeps, beside
+    `wall_hw`, the **anchor**: the last reading (wall clock, `boot_id`,
+    boot time) at which the wall clock was within 60 s of that
+    prediction. It follows every such reading, so ordinary drift and slew
+    never accumulate. A reading more than 60 s ahead of the prediction is
+    a forward jump: the anchor stays where it was, and `wall_hw` rises
+    as usual. When a later reading in the same boot is back within 60 s
+    of the trajectory the anchor predicts, the jump was undone. `wall_hw`
+    and the floor are then lowered, never raised, to the later of the
+    current wall clock and that trajectory, and the anchor moves to the
+    reading. This is safe: neither falls below the pre-jump trajectory,
+    so nothing settled is revived, and jumping a clock forward and back
+    gains an attacker nothing. (The anchor, and "the later of", are
+    Atem's fill-in of the owner's "come back to the trajectory the boot
+    time predicts from before the jump (within 60 s)".)
+  - **After a reboot.** Boot time doesn't cross a reboot. If `wall_hw` or
+    the floor is more than 10 minutes ahead of the wall clock, and the
+    OS reports its clock synchronized, Atem lowers both to the current
+    wall clock.
+    - Linux: `adjtimex`'s status without `STA_UNSYNC`, which chrony and
+      systemd-timesyncd clear once synchronized. In a container it
+      reports the host kernel's state, which is the right answer.
+    - macOS: the candidate is `ntp_gettime()` returning `TIME_OK` rather
+      than `TIME_ERROR`, to be confirmed against `timed`'s behaviour in
+      step 4. Until it is, macOS doesn't lower them after a reboot.
+  - **Otherwise** Atem stays on the safe side: tasks may expire early, and
+    `atem status` says why and names the fix. Where the flag never clears
+    because no time-sync daemon runs, it says `host clock ahead of its
+    record; enable time synchronization (chrony or systemd-timesyncd)`.
+    On macOS before confirmation, it says `host clock ahead of its
+    record; waiting for a synchronized clock`.
+  - **What doesn't change.** Neither value is ever set below the current
+    wall clock. Nothing already settled is revived: tasks already
+    `expired`, envelopes already refused as expired, `outcome_unknown`
+    tasks already past their deadline. The device list's recovery waits
+    (session-v1 R9.5) keep their own clocks. Every repair writes one
+    `runtime.log` line with the old and new values, and `atem status`
+    shows it.
+
+#### On the host
+
+- `atem status` shows the number of unresolved outcomes, and the clock
+  state above when it holds deadlines back.
+- `atem task list --unknown` lists the unresolved outcomes: the task,
+  session, sender, reason and when.
+- `atem task resolve <task_id> failed|done` resolves one as the owner, on
+  the host. Its `resolved.by` is `local` (§11.2), and it works for a
+  revoked sender's task and for a local task's UUID v5 id, which
+  `work_resolve` doesn't take.
+
+Both commands are built in step 4, with the lifecycle. Their output, and
+how `done` takes its result snapshot and `failed` its detail, are
+step 4's.

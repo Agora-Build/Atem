@@ -31,6 +31,15 @@ before emitting that event; apps still inspect errors and each result state.
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
 
+Planned, advertised by no host yet: `host.senders`'s two session ops,
+`control_records` and `host_enc_key_get`, go through `send_json` the same way
+(session-v1 R9.8, R9.14). The core refuses them without the feature, reads them
+as the host does and tracks each request, and their answers arrive as
+`ClientEvent::Family` with `op` `control_records_result` or `host_enc_key`. A
+`host_enc_key` answer is taken only from the channel's host at its trust
+generation; its `host_id`, `host_trust_gen`, `enc_key.pub` and `enc_sig` are the
+arguments of `host_enc_key_action` (below), which a manager signs.
+
 Persist launch request IDs and immutable message/task identities before sending.
 Recover uncertain results with their query operations; a retry uses a fresh
 exchange `id` and preserves the original request or envelope. A `started` launch
