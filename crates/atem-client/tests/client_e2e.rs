@@ -1567,6 +1567,29 @@ mod control_records {
         .unwrap()
     }
 
+    /// A service's record: well formed, but it travels only in its
+    /// Station's feed, never on a channel.
+    fn service_record() -> ControlRecord {
+        let body = json!({
+            "type": "atem-host-work-control", "v": 1,
+            "account_id": "acct-test-1", "genesis_hash": "11".repeat(32),
+            "origin": "https://station-dev.agora.build",
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "principal": "service:svc-discord", "principal_key": "22".repeat(32),
+            "signer": "member:dev-mac",
+            "action": "revoke", "interrupt_running": false,
+            "record_id": "0b9a8c7d-6e5f-4a3b-9c2d-0000000000ff",
+            "issued_at": 1_793_620_800_000u64,
+            "about": {"integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0", "by": "owner"},
+        });
+        ControlRecord::parse(
+            json!({"body": body, "sig": b64u(&[7u8; 64])})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap()
+    }
+
     fn advertise_senders(world: &World) {
         world.core.lock().unwrap().welcome_override =
             Some(|w| w.features.push(SENDERS_FEATURE.into()));
@@ -1619,6 +1642,13 @@ mod control_records {
             attached.send_control_records(&many, now()).err(),
             Some(ConnectError::Request("too many records"))
         );
+        // A service's record isn't carried on a channel, alone or mixed.
+        for records in [vec![service_record()], vec![record(1), service_record()]] {
+            assert_eq!(
+                attached.send_control_records(&records, now()).err(),
+                Some(ConnectError::Request("not a host principal's record"))
+            );
+        }
         assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
     }
 

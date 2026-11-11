@@ -582,19 +582,26 @@ pub fn seen(id: &str, re: &str) -> Value {
 pub const MAX_CONTROL_RECORDS: usize = 64;
 /// The most bytes one `control_records` message is: its plaintext, as sealed.
 pub const MAX_CONTROL_RECORDS_BYTES: usize = 256 * 1024;
+/// Why a `control_records` message holding a service's record is refused.
+const NOT_A_HOST_RECORD: &str = "not a host principal's record";
 
 /// `control_records{records}` (C→H, feature [`SENDERS_FEATURE`]): control
 /// records carried to the host on an open channel, the signed objects as
 /// they are. It is for native members, as `membership` is for entries, and
-/// the host answers one [`ControlRecordsResult`].
+/// the host answers one [`ControlRecordsResult`]. It carries **host
+/// principals' records only** (`host:<host_id>`, a native manager's
+/// `interrupt_running`): a service's record travels only in its Station's
+/// feed, and a message holding one is refused whole.
 ///
-/// **Carriage order** (ruling T10b). A carrier sends `membership` up to its
-/// head before `control_records` on a channel: a record is verified against
-/// the device list the host has applied. One whose principal or native
-/// signer isn't in that list yet waits (`pending`, `principal_unknown` or
+/// **Carriage order.** A carrier sends `membership` up to its head before
+/// `control_records` on a channel: a record is verified against the device
+/// list the host has applied. One whose principal or native signer isn't
+/// in that list yet waits (`pending`, `principal_unknown` or
 /// `signer_unknown`), but one signed by a native the list holds without
 /// `manage`, a promotion the host hasn't applied yet included, is refused
-/// (`signer_not_allowed`), not held for the entry to come.
+/// (`signer_not_allowed`), not held for the entry to come; delivering the
+/// same record again after `membership` brought the host to the promotion
+/// is enough (a refused record takes no `record_id`).
 ///
 /// **A carrier gets no authority from carrying** ("trust the signature, not
 /// the sender", account-trust §3.5): the host verifies each record against
@@ -604,7 +611,8 @@ pub const MAX_CONTROL_RECORDS_BYTES: usize = 256 * 1024;
 /// client never sends it to a host that didn't list the feature, and a host
 /// that didn't refuses it.
 ///
-/// `Err` for what the host would refuse: none, too many, over the size.
+/// `Err` for what the host would refuse: none, too many, a service's
+/// record, over the size.
 ///
 /// [`SENDERS_FEATURE`]: crate::session::host_work::SENDERS_FEATURE
 pub fn control_records_op(id: &str, records: &[ControlRecord]) -> Result<Value, &'static str> {
@@ -613,6 +621,9 @@ pub fn control_records_op(id: &str, records: &[ControlRecord]) -> Result<Value, 
     }
     if records.len() > MAX_CONTROL_RECORDS {
         return Err("too many records");
+    }
+    if !records.iter().all(|r| r.principal().is_host()) {
+        return Err(NOT_A_HOST_RECORD);
     }
     let message = session(json!({"v": 1, "op": "control_records", "id": id,
         "records": records.iter().map(|r| r.object().to_json()).collect::<Vec<_>>()}));
@@ -636,8 +647,9 @@ impl ControlRecordsRequest {
     /// integers only): exactly `{"type":"session","data":{"v":1,"op":
     /// "control_records","id":<UUID v4>,"records":[…]}}`, one to 64 records
     /// of at most 256 KiB in all. Each record must parse as a control
-    /// record; one that doesn't spoils the message, and nothing is read
-    /// partly. `Err` is a short reason, fit for the error's `detail`.
+    /// record of a host principal (`host:<host_id>`); one that doesn't, or a
+    /// service's record, spoils the message, and nothing is read partly.
+    /// `Err` is a short reason, fit for the error's `detail`.
     pub fn decode(plain: &[u8]) -> Result<Self, &'static str> {
         let root = StrictValue::parse(plain, MAX_CONTROL_RECORDS_BYTES).map_err(|e| match e {
             crate::canonical::StrictError::TooLarge => "message too large",
@@ -673,10 +685,15 @@ impl ControlRecordsRequest {
         let records = items
             .iter()
             .map(|item| {
-                SignedObject::from_strict(item)
+                let record = SignedObject::from_strict(item)
                     .ok()
                     .and_then(|object| ControlRecord::from_signed(object).ok())
-                    .ok_or("not a control record")
+                    .ok_or("not a control record")?;
+                if record.principal().is_host() {
+                    Ok(record)
+                } else {
+                    Err(NOT_A_HOST_RECORD)
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ControlRecordsRequest { id, records })
@@ -939,6 +956,29 @@ mod tests {
             (1..=count).map(record).collect()
         }
 
+        /// A service's record (a native manager's revoke of `service:svc-1`),
+        /// number `n`: well formed, but its place is its Station's feed.
+        fn service_record(n: u64) -> ControlRecord {
+            let body = json!({
+                "type": "atem-host-work-control", "v": 1,
+                "account_id": "acct-test-1", "genesis_hash": "11".repeat(32),
+                "origin": "https://station-dev.agora.build",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "principal": "service:svc-1", "principal_key": "22".repeat(32),
+                "signer": "member:dev-mac",
+                "action": "revoke", "interrupt_running": true,
+                "record_id": format!("0b9a8c7d-6e5f-4a3b-9c2d-{n:012x}"),
+                "issued_at": 1_793_620_800_000u64,
+                "about": {"integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0", "by": "owner"},
+            });
+            ControlRecord::parse(
+                json!({"body": body, "sig": b64u(&[7u8; 64])})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap()
+        }
+
         fn ids(records: &[ControlRecord]) -> Vec<String> {
             records.iter().map(|r| r.record_id().to_owned()).collect()
         }
@@ -1159,6 +1199,33 @@ mod tests {
             assert_eq!(
                 ControlRecordsRequest::decode(b"{").unwrap_err(),
                 "not strict JSON"
+            );
+        }
+
+        /// Host principals' records only: a service's record travels in its
+        /// Station's feed, never on a channel. The builder refuses one, and
+        /// the host's reading refuses the whole message (nothing of it is
+        /// applied), alone or beside host principals' records.
+        #[test]
+        fn a_service_record_is_refused_whole() {
+            let why = "not a host principal's record";
+            assert_eq!(
+                control_records_op(ID, &[service_record(1)]).unwrap_err(),
+                why
+            );
+            let mixed = [record(1), service_record(2), record(3)];
+            assert_eq!(control_records_op(ID, &mixed).unwrap_err(), why);
+            // Built by hand: refused whole when read.
+            let mut message = control_records_op(ID, &records(3)).unwrap();
+            message["data"]["records"][1] = service_record(2).object().to_json();
+            assert_eq!(
+                ControlRecordsRequest::decode(&bytes(&message)).unwrap_err(),
+                why
+            );
+            message["data"]["records"] = json!([service_record(1).object().to_json()]);
+            assert_eq!(
+                ControlRecordsRequest::decode(&bytes(&message)).unwrap_err(),
+                why
             );
         }
 
