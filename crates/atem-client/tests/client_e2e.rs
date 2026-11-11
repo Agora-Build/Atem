@@ -1535,3 +1535,274 @@ fn the_host_policy_is_set_and_confirmed_in_the_channel() {
     let ev = exchange(&mut b, &mut bw, &frame, now(), |e| error_code(e).is_some());
     assert_eq!(error_code(&ev).as_deref(), Some("forbidden"));
 }
+
+// ------------------------------------------------------- control_records
+
+/// `control_records` (delegated host-work design II.3.1) on the client: sent
+/// only to a host that advertised `host.senders`, answered once per record.
+mod control_records {
+    use super::*;
+    use atem_client::control::ControlRecord;
+    use atem_client::encoding::b64u;
+    use atem_client::session::host_work::SENDERS_FEATURE;
+    use atem_client::session::r9::{ControlRecordsResult, MAX_CONTROL_RECORDS};
+
+    /// A host principal's `interrupt_running`, number `n`: the right shape
+    /// with a signature that is never verified here.
+    fn record(n: u64) -> ControlRecord {
+        let body = json!({
+            "type": "atem-host-work-control", "v": 1,
+            "account_id": "acct-test-1", "genesis_hash": "11".repeat(32),
+            "principal": "host:host-a", "signer": "member:dev-mac",
+            "action": "interrupt_running", "revoke_seq": 7,
+            "record_id": format!("0b9a8c7d-6e5f-4a3b-9c2d-{n:012x}"),
+            "issued_at": 1_793_620_800_000u64,
+            "about": {"by": "owner"},
+        });
+        ControlRecord::parse(
+            json!({"body": body, "sig": b64u(&[7u8; 64])})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn advertise_senders(world: &World) {
+        world.core.lock().unwrap().welcome_override =
+            Some(|w| w.features.push(SENDERS_FEATURE.into()));
+    }
+
+    /// The `control_records_result` a family event carries, if it is one.
+    fn result_of(events: &[Event]) -> Option<Value> {
+        events.iter().find_map(|e| match e {
+            Event::Family(f) => f
+                .data
+                .clone()
+                .filter(|d| d["op"] == "control_records_result"),
+            _ => None,
+        })
+    }
+
+    /// A host that doesn't advertise `host.senders` is never sent the op: the
+    /// request fails before anything is sealed, so the channel carries on
+    /// (its next record is the next in sequence).
+    #[test]
+    fn client_refuses_without_feature() {
+        let world = World::new(&L);
+        let log = world.log(&L);
+        let now = || world.mono();
+        let phone = Device::native(&world, "dev-phone", log);
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        assert!(
+            !attached
+                .welcome()
+                .features
+                .iter()
+                .any(|f| f == SENDERS_FEATURE)
+        );
+        assert_eq!(
+            attached.send_control_records(&[record(1)], now()).err(),
+            Some(ConnectError::Request("host feature not available"))
+        );
+        assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
+        // Refused for what the op is, too: none, or too many.
+        advertise_senders(&world);
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        assert_eq!(
+            attached.send_control_records(&[], now()).err(),
+            Some(ConnectError::Request("no records"))
+        );
+        let many: Vec<_> = (1..=MAX_CONTROL_RECORDS as u64 + 1).map(record).collect();
+        assert_eq!(
+            attached.send_control_records(&many, now()).err(),
+            Some(ConnectError::Request("too many records"))
+        );
+        assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
+    }
+
+    /// With the feature, the op is answered once per record, in order, and
+    /// the result reaches the app as a session family message.
+    #[test]
+    fn control_records_are_answered_per_record() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        advertise_senders(&world);
+        let phone = Device::native(&world, "dev-phone", world.log(&L));
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        assert!(
+            attached
+                .welcome()
+                .features
+                .iter()
+                .any(|f| f == SENDERS_FEATURE)
+        );
+        let records = [record(1), record(2), record(3)];
+        let (id, frame) = attached.send_control_records(&records, now()).unwrap();
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            result_of(e).is_some()
+        });
+        let data = result_of(&events).unwrap();
+        assert_eq!(data["re"], id);
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        for (r, record) in results.iter().zip(&records) {
+            assert_eq!(r["record_id"], record.record_id());
+            assert_eq!(r["result"], "pending");
+            assert_eq!(
+                r["effects"],
+                json!([{"effect": "interrupt", "result": "pending"}])
+            );
+        }
+        // The same records again are a new request, answered again.
+        let (id2, frame) = attached.send_control_records(&records, now()).unwrap();
+        assert_ne!(id, id2);
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            result_of(e).is_some()
+        });
+        assert_eq!(result_of(&events).unwrap()["re"], id2);
+    }
+
+    /// A result that answers nothing the client asked is a malformed host
+    /// message: another request, another record order, other records,
+    /// fewer results.
+    #[test]
+    fn a_result_that_answers_nothing_asked_is_refused() {
+        type Rewrite = fn(&mut ControlRecordsResult);
+        let cases: [(Rewrite, &str); 4] = [
+            (|r| r.results.reverse(), "reversed"),
+            (
+                |r| r.results[0].record_id = record(9).record_id().to_owned(),
+                "another record",
+            ),
+            (|r| r.results.truncate(1), "fewer results"),
+            (
+                |r| r.re = "aaaaaaaa-0000-4000-8000-0000000000f1".into(),
+                "another request",
+            ),
+        ];
+        for (rewrite, why) in cases {
+            let world = World::new(&L);
+            let now = || world.mono();
+            advertise_senders(&world);
+            world.core.lock().unwrap().control_records_override = Some(rewrite);
+            let phone = Device::native(&world, "dev-phone", world.log(&L));
+            let mut wire = world.tcp();
+            let mut attached = phone.connect(&mut wire).unwrap();
+            let (_, frame) = attached
+                .send_control_records(&[record(1), record(2)], now())
+                .unwrap();
+            wire.send(&frame);
+            let reply = wire.recv().expect("a reply");
+            assert_eq!(
+                attached.on_frame(&reply, now()).err(),
+                Some(ConnectError::Malformed("unbound control records result")),
+                "{why}"
+            );
+        }
+    }
+
+    /// The generic `send` (what the bindings' `send_json` calls) holds a
+    /// `control_records` message to the same rules as the method: the
+    /// advertised feature, the host's own reading of the message, a fresh
+    /// id, and its request tracked, so its result is taken.
+    #[test]
+    fn the_generic_send_is_checked_like_the_method() {
+        use atem_client::session::r9::control_records_op;
+        const MINE: &str = "aaaaaaaa-0000-4000-8000-0000000000f2";
+        let world = World::new(&L);
+        let now = || world.mono();
+        let phone = Device::native(&world, "dev-phone", world.log(&L));
+        // No feature: nothing is sealed.
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        let message = control_records_op(MINE, &[record(1)]).unwrap();
+        assert_eq!(
+            attached.send(&message, now()).err(),
+            Some(ConnectError::Request("host feature not available"))
+        );
+        assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
+        // With it: a hand-built message is read as the host reads it.
+        advertise_senders(&world);
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        let mut bad = message.clone();
+        bad["data"]["records"][0]["body"]["action"] = json!("pause");
+        assert_eq!(
+            attached.send(&bad, now()).err(),
+            Some(ConnectError::Request("not a control record"))
+        );
+        let mut bad = message.clone();
+        bad["data"]["id"] = json!("not-a-uuid");
+        assert_eq!(
+            attached.send(&bad, now()).err(),
+            Some(ConnectError::Request("not a control_records message"))
+        );
+        // A good one goes, and its result is taken (it was tracked); the id
+        // can't be used again while it waits.
+        let frame = attached.send(&message, now()).unwrap();
+        assert_eq!(
+            attached.send(&message, now()).err(),
+            Some(ConnectError::Request("duplicate control records id"))
+        );
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            result_of(e).is_some()
+        });
+        assert_eq!(result_of(&events).unwrap()["re"], MINE);
+        // Answered: the id is free again.
+        let frame = attached.send(&message, now()).unwrap();
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            result_of(e).is_some()
+        });
+        assert_eq!(result_of(&events).unwrap()["re"], MINE);
+    }
+
+    /// At most 64 requests wait for their answers; an answer, or an error
+    /// for the request, frees its place.
+    #[test]
+    fn outstanding_requests_are_bounded_and_answers_clear_them() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        advertise_senders(&world);
+        let log = world.log(&L);
+        let drain = |attached: &mut Attached, wire: &mut Wire, n: usize| {
+            for _ in 0..n {
+                let reply = wire.recv().expect("a reply");
+                attached.on_frame(&reply, now()).unwrap();
+            }
+        };
+        // Answered.
+        let phone = Device::native(&world, "dev-phone", log.clone());
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        for n in 1..=64 {
+            let (_, frame) = attached.send_control_records(&[record(n)], now()).unwrap();
+            wire.send(&frame);
+        }
+        assert_eq!(
+            attached.send_control_records(&[record(65)], now()).err(),
+            Some(ConnectError::Request("too many control records requests"))
+        );
+        drain(&mut attached, &mut wire, 64);
+        let (_, frame) = attached.send_control_records(&[record(65)], now()).unwrap();
+        wire.send(&frame);
+        drain(&mut attached, &mut wire, 1);
+        // Refused by the host (a service is no native): an error with `re`
+        // frees the place too.
+        let bot = Device::service(&world, "svc-discord", log);
+        let mut wire = world.tcp();
+        let mut attached = bot.connect(&mut wire).unwrap();
+        for n in 1..=64 {
+            let (_, frame) = attached.send_control_records(&[record(n)], now()).unwrap();
+            wire.send(&frame);
+        }
+        drain(&mut attached, &mut wire, 64);
+        let (_, frame) = attached.send_control_records(&[record(65)], now()).unwrap();
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            error_code(e).is_some()
+        });
+        assert_eq!(error_code(&events).as_deref(), Some("forbidden"));
+    }
+}

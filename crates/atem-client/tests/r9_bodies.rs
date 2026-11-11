@@ -76,6 +76,10 @@ fn a_grant_has_exactly_its_fields_and_a_p256_browser_key() {
             && !a.allows(Need::Op(Op::Terminal))
     );
     assert!(!a.allows(Need::RevokeGrant), "a browser never revokes");
+    assert!(
+        !a.allows(Need::ControlRecords),
+        "a browser carries no control records"
+    );
     let g = BrowserGrant::parse(resign(&book, "dev-mac/auth", control.clone())).unwrap();
     assert_eq!(
         Authority::of_grant(&g, &log, "host-a", 1, 1_793_264_001_000, &|_| false),
@@ -403,6 +407,10 @@ fn one_authority_check_per_request() {
     );
     assert_eq!(need("session", json!({"op": "approval_seen"})), Need::Seen);
     assert_eq!(
+        need("session", json!({"op": "control_records"})),
+        Need::ControlRecords
+    );
+    assert_eq!(
         need("session", json!({"op": "message_publish"})),
         Need::Op(Op::Message)
     );
@@ -493,5 +501,25 @@ fn one_authority_check_per_request() {
         Ok(()),
         "a member with control"
     );
+    // Control records are for native members only (the records' own
+    // signatures carry the authority; the carrier's is only to carry).
+    assert_eq!(
+        bot.authorize(Need::ControlRecords, None),
+        Err(Denied::Forbidden),
+        "a service is no native"
+    );
+    let phone = Authority::resolve(
+        &log,
+        &atem_client::channel::Principal::Native {
+            device_id: "dev-phone".into(),
+        },
+        None,
+        "host-a",
+        1,
+        &now,
+        &|_| false,
+    )
+    .unwrap();
+    assert_eq!(phone.authorize(Need::ControlRecords, None), Ok(()));
     let _ = book;
 }

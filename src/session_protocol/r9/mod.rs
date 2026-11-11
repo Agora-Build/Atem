@@ -5,7 +5,8 @@
 //! r9 `welcome`, `membership`/`membership_head`, `revoke_grant`,
 //! `approval_seen`, and the fences: each attachment is fenced on its own
 //! (its `attachment_gen`), a principal's attachments together (its §H
-//! `control_gen`).
+//! `control_gen`). An op of a feature the welcome doesn't list (today
+//! `control_records`, of `host.senders`) is `unsupported_version`.
 //!
 //! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
 //! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
@@ -450,6 +451,17 @@ fn error(code: &str, re: Option<&str>, detail: Option<&str>) -> SessionError {
     }
 }
 
+/// The feature of an op that exists only for delegated host work (plan
+/// decision 4): `control_records` is `host.senders`'s. `work_interrupt` and
+/// `work_resolve` (`host.delegated`), `alert_list` (`host.alerts`) and
+/// `host_enc_key_get` (`host.senders`) join it when they are specified.
+fn delegated_feature_of(op: &str) -> Option<&'static str> {
+    match op {
+        "control_records" => Some(atem_client::session::host_work::SENDERS_FEATURE),
+        _ => None,
+    }
+}
+
 /// The session `error` a fence reason gives the fenced principal's
 /// attachments (sent without `re`: the client closes, §R9.8).
 fn fence_error(reason: FenceReason) -> SessionError {
@@ -485,6 +497,28 @@ impl Default for R9Host {
 impl R9Host {
     pub fn enable_host_work(&mut self, enabled: bool) {
         self.host_work_enabled = enabled;
+    }
+
+    /// The features a welcome lists: the one source of what this host takes
+    /// (an op of a feature not listed here is `unsupported_version`,
+    /// session-v1 §A). Step 3 of delegated host work advertises none of
+    /// `host.delegated`, `host.alerts` and `host.senders`.
+    fn advertised_features(&self) -> Vec<String> {
+        let mut features: Vec<String> = crate::session_protocol::revision::FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        features.extend(R9_FEATURES.iter().map(|f| f.to_string()));
+        if self.host_work_enabled {
+            features.extend([
+                atem_client::session::host_work::LAUNCH_FEATURE.to_owned(),
+                atem_client::session::host_work::WORK_FEATURE.to_owned(),
+                atem_client::session::host_work::REPLY_FEATURE.to_owned(),
+                atem_client::session::messages::FEATURE.to_owned(),
+                atem_client::session::attachments::FEATURE.to_owned(),
+            ]);
+        }
+        features
     }
 
     pub fn take_host_work(&mut self) -> Vec<HostWorkRequest> {
@@ -1429,20 +1463,7 @@ impl R9Host {
         };
         effects.extend(parts.host.take_effects());
         let ctx = parts.host.context().clone();
-        let mut features: Vec<String> = crate::session_protocol::revision::FEATURES
-            .iter()
-            .map(|f| f.to_string())
-            .collect();
-        features.extend(R9_FEATURES.iter().map(|f| f.to_string()));
-        if self.host_work_enabled {
-            features.extend([
-                atem_client::session::host_work::LAUNCH_FEATURE.to_owned(),
-                atem_client::session::host_work::WORK_FEATURE.to_owned(),
-                atem_client::session::host_work::REPLY_FEATURE.to_owned(),
-                atem_client::session::messages::FEATURE.to_owned(),
-                atem_client::session::attachments::FEATURE.to_owned(),
-            ]);
-        }
+        let features = self.advertised_features();
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1674,6 +1695,22 @@ impl R9Host {
                         Err(code) => refuse(self, code, None),
                     }
                 }
+                return Vec::new();
+            }
+            // An op of a feature this host doesn't advertise: after the
+            // authority check (a principal outside the op's right still
+            // learns `forbidden`), before anything is read.
+            if let Some(feature) = data
+                .get("op")
+                .and_then(Value::as_str)
+                .and_then(delegated_feature_of)
+                && !self.advertised_features().iter().any(|f| f == feature)
+            {
+                refuse(
+                    self,
+                    code::UNSUPPORTED_VERSION,
+                    Some(&format!("{feature} is not advertised")),
+                );
                 return Vec::new();
             }
             match data.get("op").and_then(Value::as_str) {
