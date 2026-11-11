@@ -505,7 +505,7 @@ carry the builders and queries so Astation can be ready.
 | `host_sender_revoke_action(host_id, interrupt_running, signed_at)` | a `host_sender_revoke`: the host's later envelopes are refused, and with `interrupt_running` each receiving host also interrupts what it already started from it. The verifier: `unknown_host`, `already_revoked` (`check_change` says it first). Purpose `HostSender` |
 | `host_sender_readmit_action(host_id, signed_at)` | a `host_sender_readmit` of a revoked host (`not_revoked` otherwise; `check_change` says it first). Purpose `HostSender` |
 | `host_enc_key_action(host_id, host_trust_gen, enc_key, enc_sig_b64u, retire_previous, signed_at)` | a `host_enc_key`: install the X25519 `enc_key` the host vouched for with `enc_sig` (64 bytes of base64url, from the host over its channel), for its newest trust generation. `retire_previous` (false is omitted: its only form) retires the key this one replaces at once, after a suspected compromise. `wrong_alg` for a key that isn't X25519. The verifier: `not_a_host`, `host_trust_gen_not_current`, `bad_enc_sig`, `enc_key_reused` (a key set for the host since its newest `add_host` never comes back, a retired one included; `check_change` says it first). Purpose `HostEncKey` |
-| `verify_host_enc_sig(host_key, account_id, genesis_hash, host_id, host_trust_gen, enc_key, enc_sig_b64u)` | `true` when `enc_sig` is the host's (`host_key`, Ed25519 strict) signature over exactly this account, genesis, host, generation and `enc_key`; `false` for anything else, malformed inputs included. Check what the host handed over before building the entry. The host signs `enc_sig` itself, in Rust (label `atem-host-enc-key-v1`); no binding signs it, and an app provider never sees that label except as `HostSigning` |
+| `verify_host_enc_sig(host_key, account_id, genesis_hash, host_id, host_trust_gen, enc_key, enc_sig_b64u)` | `true` when `enc_sig` is the host's (`host_key`, Ed25519 strict) signature over exactly this account, genesis, host, generation and `enc_key`; `false` for anything else, malformed inputs included, never an error (JS `verifyHostEncSig` too: an unknown `hostAlg` or `encAlg`, or a `hostTrustGen` that isn't a non-negative safe integer, is `false`). Check what the host handed over before building the entry. The host signs `enc_sig` itself, in Rust (label `atem-host-enc-key-v1`); no binding signs it, and an app provider never sees that label except as `HostSigning` |
 
 The queries are on `MembershipLog` (`host_sender_state`,
 `host_membership_epoch`, `projects`, `host_projects`, `project_ops_between`,
@@ -785,23 +785,26 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (the same 45 checks in each language, plus one in Kotlin
-  and Swift, whose provider sees the signing request and so the purposes of
-  the five device-list actions; over
+- **Conformance** (45 checks in JS, 46 in Kotlin and in Swift: the same 45
+  in each language, plus one in Kotlin and Swift, whose provider sees the
+  signing request and so the purposes of the five device-list actions; over
   `designs/protocol/fixtures/r9-vectors-*.json` and atem-client's own
   `crates/atem-client/vectors/r9-svc-fingerprint.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks per language): every `P*`/`EK*`/`HS*` vector of
+  checks in JS, five in Kotlin and Swift, of the 45 and 46 above): every
+  `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
-  refusals (`reason`), the builders against the vectors' `jcs`,
-  `verify_host_enc_sig` on every `enc_sig`, and a manager signing each
+  refusals (`reason`), the builders against the vectors' `jcs` and
+  `check_change`'s advice, `verify_host_enc_sig` on every `enc_sig` whose
+  binding fields parse (and `false`, never a throw, for inputs that can't
+  be a key, a generation or an algorithm), and a manager signing each
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
-- **Durable log** (`tests/stored_log.rs`, Rust; one conformance check per
-  language): a partly elapsed wait across a same-boot restart and a reboot,
+- **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
+  language, of the 45 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,

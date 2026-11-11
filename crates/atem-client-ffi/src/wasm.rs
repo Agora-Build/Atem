@@ -666,8 +666,11 @@ pub fn host_enc_key_action(
     ))
 }
 
-/// Whether the host's `enc_sig` over its `enc_key` verifies (`false` for
-/// anything else, malformed values included).
+/// Whether the host's `enc_sig` over its `enc_key` verifies: `false` for
+/// anything else, never a throw, as the UniFFI `verify_host_enc_sig`
+/// (malformed values included: an unknown `hostAlg` or `encAlg`, and a
+/// `hostTrustGen` that isn't a non-negative safe integer, which UniFFI's
+/// `u64` can't carry).
 #[wasm_bindgen(js_name = verifyHostEncSig)]
 #[allow(clippy::too_many_arguments)]
 pub fn verify_host_enc_sig(
@@ -680,16 +683,23 @@ pub fn verify_host_enc_sig(
     enc_alg: &str,
     enc_raw: Vec<u8>,
     enc_sig_b64u: String,
-) -> JsResult<bool> {
-    Ok(crate::host_actions::verify_host_enc_sig(
-        key(host_alg, host_raw)?,
+) -> bool {
+    let (Ok(host_key), Ok(host_trust_gen), Ok(enc_key)) = (
+        key(host_alg, host_raw),
+        ms(host_trust_gen),
+        key(enc_alg, enc_raw),
+    ) else {
+        return false;
+    };
+    crate::host_actions::verify_host_enc_sig(
+        host_key,
         account_id,
         genesis_hash,
         host_id,
-        ms(host_trust_gen)?,
-        key(enc_alg, enc_raw)?,
+        host_trust_gen,
+        enc_key,
         enc_sig_b64u,
-    ))
+    )
 }
 
 /// `r9_svc` of a service `auth_key` (`alg` `p256` or `ed25519`, raw bytes).

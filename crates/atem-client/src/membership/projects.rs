@@ -192,7 +192,12 @@ impl Membership {
         self.derived.projects.by_name.get(name).map(|p| &p.project)
     }
 
-    /// The projects in effect, by name.
+    /// The projects in effect, by name, each as its latest `project_set`
+    /// signed it: its `hosts` may name hosts whose membership has since
+    /// ended (a `remove_host` after that entry). Never authorize from
+    /// `hosts`: who is a member is [`Membership::project_hosts`] and
+    /// [`Membership::host_projects`], and what two hosts may send each
+    /// other [`Membership::project_ops_between`].
     pub fn projects(&self) -> impl Iterator<Item = &Project> {
         self.derived.projects.by_name.values().map(|p| &p.project)
     }

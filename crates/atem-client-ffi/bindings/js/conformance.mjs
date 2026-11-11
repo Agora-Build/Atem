@@ -446,6 +446,10 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
   eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, { alg: "ed25519", raw: key.raw }, ek.enc_sig), false, "an Ed25519 enc_key");
   eq(verify(hostA, ACCOUNT, "not hex", "host-a", 1, key, ek.enc_sig), false, "a malformed genesis");
   eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, key, "AAAA"), false, "a short signature");
+  // Inputs no key, generation or algorithm can be: false, never a throw.
+  eq(verify(["rsa", hostA[1]], ACCOUNT, GENESIS, "host-a", 1, key, ek.enc_sig), false, "an unknown host alg");
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, { alg: "rsa", raw: key.raw }, ek.enc_sig), false, "an unknown enc alg");
+  for (const gen of [-1, 1.5, 2 ** 53]) eq(verify(hostA, ACCOUNT, GENESIS, "host-a", gen, key, ek.enc_sig), false, `generation ${gen}`);
   // Every enc_sig of the vectors whose binding fields parse (they carry
   // enc_sig_input_hex) verifies under the host key of its generation, but the bad one.
   for (const v of delegated.filter((x) => x.enc_sig_input_hex !== undefined)) {
