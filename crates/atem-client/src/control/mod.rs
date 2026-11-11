@@ -11,14 +11,20 @@
 //!
 //! [`record`] parses and builds the object: what holds for the record
 //! alone. [`verify`] checks who may sign which action, against which key of
-//! the device list (I.5.4). Applying it is the host's (I.5.5).
+//! the device list (I.5.4). [`state`] applies it to a host's control state
+//! and gives its per-effect application results (I.5.5, I.5.8); carrying
+//! out the actions is the host's.
 pub mod record;
+pub mod state;
 pub mod verify;
 
 pub use record::{
     CONTROL_TYPE, ControlAbout, ControlAction, ControlBody, ControlError, ControlFeed,
     ControlPrincipal, ControlRecord, ControlSigner, KNOWN_BY, MAX_BY_CHARS, build_control,
     principal_key_of,
+};
+pub use state::{
+    ApplicationResult, Applied, ControlState, EffectKind, EffectResult, FeedPos, HostAction,
 };
 pub use verify::{
     ControlCheck, PendingReason, RefusalReason, VerifiedControl, VerifiedSigner, verify_control,

@@ -62,7 +62,9 @@
 //! Delegated host work (`designs/delegated-host-work.md`):
 //!
 //! - [`control`]: control records (`atem-host-work-control`, I.5.3), the
-//!   signed stops of a principal: strict parse, build and sign.
+//!   signed stops of a principal: strict parse, build and sign; their
+//!   verification against the device list (I.5.4); a host's control state
+//!   with per-effect application results (I.5.5, I.5.8).
 
 pub mod backup;
 pub mod backup_writer;
