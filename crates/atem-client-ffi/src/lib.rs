@@ -22,6 +22,10 @@
 //!   clock;
 //! - [`service`]: service member builders (`add`/`set_roles` action JSON,
 //!   renewal, narrowing) and the `projects` scope hash (§R9.6);
+//! - [`host_actions`]: the five device-list actions of delegated host work
+//!   (`project_set`, `project_remove`, `host_sender_revoke`,
+//!   `host_sender_readmit`, `host_enc_key`): their builders, the host's
+//!   `enc_sig` check and the log's queries over the state they derive;
 //! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
@@ -41,6 +45,7 @@ mod macros;
 pub mod connection;
 pub mod encoding;
 pub mod error;
+pub mod host_actions;
 pub mod kit;
 pub mod log;
 pub mod provider;

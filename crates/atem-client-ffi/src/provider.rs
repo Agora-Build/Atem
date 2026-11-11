@@ -184,6 +184,13 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
                 Some("remove") => SigningPurpose::Remove,
                 Some("set_roles") => SigningPurpose::Roles,
                 Some("add_host" | "remove_host") => SigningPurpose::Host,
+                // Delegated host work (II.2.2, II.3.1, II.4.1): each asks a
+                // fresh confirmation of the exact body, as every manager
+                // entry does (R9.6 rule 4), under a purpose that says what
+                // is being signed.
+                Some("project_set" | "project_remove") => SigningPurpose::Project,
+                Some("host_sender_revoke" | "host_sender_readmit") => SigningPurpose::HostSender,
+                Some("host_enc_key") => SigningPurpose::HostEncKey,
                 Some("recovery_add" | "recovery_approve" | "recovery_veto") => {
                     SigningPurpose::Recovery
                 }
@@ -477,6 +484,13 @@ mod tests {
             ("set_roles", SigningPurpose::Roles),
             ("add_host", SigningPurpose::Host),
             ("remove_host", SigningPurpose::Host),
+            // The delegated host-work actions (II.2.2, II.3.1, II.4.1): each
+            // names what the owner confirms, never `Enroll`.
+            ("project_set", SigningPurpose::Project),
+            ("project_remove", SigningPurpose::Project),
+            ("host_sender_revoke", SigningPurpose::HostSender),
+            ("host_sender_readmit", SigningPurpose::HostSender),
+            ("host_enc_key", SigningPurpose::HostEncKey),
             ("recovery_add", SigningPurpose::Recovery),
             ("recovery_approve", SigningPurpose::Recovery),
             ("recovery_veto", SigningPurpose::Recovery),

@@ -354,6 +354,207 @@ fun main(args: Array<String>) {
         eq(isProjectHash("h1.0123abcd.zz"), false)
     }
 
+    // ------------------------------- delegated host work: device-list actions
+    // The vectors of `others` that follow a `chain` on log L (P*, EK*, HS*): a
+    // valid one carries `expect`, the state a verifier derives after it (read
+    // here through the log's queries); a refused one `valid: false` and
+    // `reason` (`evaluate` stops with it at index 0). The five actions are
+    // also rebuilt by their builders, byte for byte, and a manager signs them
+    // through the foreign provider under purposes that name them.
+    val fiveActions = setOf("project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key")
+    val delegated = mlog["others"].arr().filter { it.obj().containsKey("chain") }
+    fun strs(v: Any?) = v.arr().map { it.s() }
+    fun logAfter(chain: List<String>): MembershipLog {
+        val log = logL()
+        eq(log.extend(chain.map(::entry), now).stop, null, "chain $chain")
+        return log
+    }
+    fun hostKeyName(hostId: String, gen: Long) = if (gen == 1L) hostId else "$hostId-gen-$gen"
+    fun encKeyOf(k: Any?) = PublicKeyData(KeyAlg.X25519, b64u(k["pub"].s()))
+    fun stateOf(log: MembershipLog): Map<String, Any?> {
+        val hosts = LinkedHashMap<String, Any?>()
+        val senders = LinkedHashMap<String, Any?>()
+        val encKeys = LinkedHashMap<String, Any?>()
+        fun keyOut(k: HostEncKeyInfo) = linkedMapOf<String, Any?>(
+            "enc_kid" to k.encKid,
+            "pub" to Base64.getUrlEncoder().withoutPadding().encodeToString(k.key.raw),
+            "seq" to k.seq.toLong(),
+            "host_trust_gen" to k.hostTrustGen.toLong())
+        for (id in listOf("host-a", "host-b")) {
+            log.host(id)?.let { hosts[id] = it.hostTrustGen.toLong() }
+            val sender = log.hostSenderState(id)
+            val epoch = log.hostMembershipEpoch(id)
+            if (sender != null) {
+                val entry = linkedMapOf<String, Any?>()
+                when (sender) {
+                    is HostSenderStateInfo.Authorized -> { entry["state"] = "authorized"; entry["seq"] = sender.generation.toLong() }
+                    is HostSenderStateInfo.Revoked -> { entry["state"] = "revoked"; entry["seq"] = sender.seq.toLong() }
+                }
+                if (epoch != null) entry["membership_epoch"] = epoch.toLong()
+                senders[id] = entry
+            } else {
+                eq(epoch, null, "$id epoch without an add_host")
+            }
+            log.hostEncKey(id)?.let { keys ->
+                val entry = linkedMapOf<String, Any?>("current" to keyOut(keys.current))
+                keys.previous?.let { p ->
+                    entry["previous"] = keyOut(p.key).also { it["retired"] = p.retired; it["replaced_at_seq"] = p.replacedAtSeq.toLong() }
+                }
+                encKeys[id] = entry
+            }
+        }
+        val projects = LinkedHashMap<String, Any?>()
+        for (p in log.projects()) projects[p.name] = mapOf("hosts" to p.hosts, "members" to p.members, "ops" to p.ops)
+        return mapOf("hosts" to hosts, "projects" to projects, "host_senders" to senders, "host_enc_keys" to encKeys)
+    }
+    fun opsBetween(expect: Any?, a: String, b: String): List<String> {
+        if (a == b) return listOf()
+        val ops = java.util.TreeSet<String>()
+        for (p in expect["projects"].obj().values) if (strs(p["members"]).containsAll(listOf(a, b))) ops.addAll(strs(p["ops"]))
+        return ops.toList()
+    }
+    check("device-list actions: the queries read every vector's expect, refusals carry their reason") {
+        var valid = 0
+        var refused = 0
+        for (v in delegated) {
+            val label = v["label"].s()
+            val log = logAfter(strs(v["chain"]))
+            if (v.obj()["valid"] == false) {
+                refused++
+                eq(log.evaluate(listOf(entry(label)), now).stop, CarriageStop.Invalid(0uL, v["reason"].s()), label)
+                continue
+            }
+            valid++
+            val r = log.extend(listOf(entry(label)), now)
+            eq(r.stop, null, label)
+            eq(r.appended, 1uL, label)
+            eq(r.head.hash, v["entry_hash"], label)
+            eq(stateOf(log), v["expect"].obj(), label)
+            for ((a, b) in listOf("host-a" to "host-b", "host-b" to "host-a", "host-a" to "host-a")) {
+                eq(log.projectOpsBetween(a, b), opsBetween(v["expect"], a, b), "$label $a $b")
+            }
+            for (id in listOf("host-a", "host-b")) {
+                val inEffect = v["expect"]["projects"].obj().filter { strs(it.value["members"]).contains(id) }.keys.sorted()
+                eq(log.hostProjects(id), inEffect, "$label $id")
+            }
+        }
+        check(valid >= 28 && refused >= 17) { "$valid valid, $refused refused" }
+    }
+    fun buildAction(body: Any?): String {
+        val at = body["signed_at"].l().toULong()
+        return when (val action = body["action"].s()) {
+            "project_set" -> projectSetAction(body["project"]["name"].s(), strs(body["project"]["hosts"]), strs(body["project"]["ops"]), at)
+            "project_remove" -> projectRemoveAction(body["name"].s(), at)
+            "host_sender_revoke" -> hostSenderRevokeAction(body["host_id"].s(), body["interrupt_running"] as Boolean, at)
+            "host_sender_readmit" -> hostSenderReadmitAction(body["host_id"].s(), at)
+            "host_enc_key" -> hostEncKeyAction(body["host_id"].s(), body["host_trust_gen"].l().toULong(), encKeyOf(body["enc_key"]), body["enc_sig"].s(), body["retire_previous"] == true, at)
+            else -> error(action)
+        }
+    }
+    check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit") {
+        var built = 0
+        for (v in delegated.filter { fiveActions.contains(it["entry"]["body"]["action"].s()) }) {
+            val label = v["label"].s()
+            val body = v["entry"]["body"]
+            // `retire_previous: false` has one form, omitted: no builder writes it.
+            if (body["retire_previous"] == false) continue
+            // A shape the verifier refuses by itself is the builder's refusal too.
+            if (v.obj()["reason"] == "bad_project") {
+                throwsCode("bad_project") { buildAction(body) }
+                continue
+            }
+            val log = logAfter(strs(v["chain"]))
+            val action = buildAction(body)
+            built++
+            val signedAt = body["signed_at"].l().toULong()
+            eq(log.draftEntry("dev-mac", signedAt, action), v["jcs"], label)
+            val want = when (v.obj()["reason"]) {
+                "already_revoked" -> ChangeRefusalInfo.AlreadyRevoked
+                "not_revoked" -> ChangeRefusalInfo.NotRevoked
+                else -> null
+            }
+            eq(log.checkChange(action, signedAt), want, "$label check_change")
+        }
+        check(built >= 28) { "$built built" }
+    }
+    check("device-list actions: shapes the verifier refuses by itself") {
+        val two = listOf("host-a", "host-b")
+        throwsCode("bad_project") { projectSetAction("astation", two, listOf("deploy"), 1uL) }
+        throwsCode("bad_project") { projectSetAction("astation", two, listOf(), 1uL) }
+        throwsCode("bad_project") { projectSetAction("astation", listOf("host-a"), listOf("message"), 1uL) }
+        throwsCode("bad_project") { projectSetAction("Astation", two, listOf("message"), 1uL) }
+        throwsCode("bad_project") { projectSetAction("astation", two, listOf("notify", "prompt"), 1uL) }
+        throwsCode("bad_project") { projectRemoveAction("Bad Name", 1uL) }
+        throwsCode("malformed") { hostSenderRevokeAction("Not an id", false, 1uL) }
+        throwsCode("malformed") { hostSenderReadmitAction("", 1uL) }
+        val ek = byLabel.getValue("EK7_set")["entry"]["body"]
+        val hostA = PublicKeyData(KeyAlg.ED25519, unhex(keys["host-a"]["host_key"]["pub_hex"].s()))
+        throwsCode("wrong_alg") { hostEncKeyAction("host-a", 1uL, hostA, ek["enc_sig"].s(), false, 1uL) }
+        throwsCode("malformed") { hostEncKeyAction("host-a", 1uL, encKeyOf(ek["enc_key"]), "AAAA", false, 1uL) }
+        throwsCode("malformed") { hostEncKeyAction("host-a", 1uL, encKeyOf(ek["enc_key"]), ek["enc_sig"].s() + "=", false, 1uL) }
+    }
+    check("device-list actions: verifyHostEncSig binds every field of a host's enc_sig") {
+        val ek = byLabel.getValue("EK7_set")["entry"]["body"]
+        val sig = ek["enc_sig"].s()
+        fun hostKey(name: String) = PublicKeyData(KeyAlg.ED25519, unhex(keys[name]["host_key"]["pub_hex"].s()))
+        val key = encKeyOf(ek["enc_key"])
+        fun verify(host: PublicKeyData, account: String, genesisHash: String, hostId: String, gen: ULong, enc: PublicKeyData, signature: String) =
+            verifyHostEncSig(host, account, genesisHash, hostId, gen, enc, signature)
+        eq(verify(hostKey("host-a"), account, genesis, "host-a", 1uL, key, sig), true)
+        eq(verify(hostKey("host-b"), account, genesis, "host-a", 1uL, key, sig), false, "another host's key")
+        eq(verify(hostKey("host-a"), "acct-other", genesis, "host-a", 1uL, key, sig), false, "account")
+        eq(verify(hostKey("host-a"), account, "00".repeat(32), "host-a", 1uL, key, sig), false, "genesis")
+        eq(verify(hostKey("host-a"), account, genesis, "host-b", 1uL, key, sig), false, "host id")
+        eq(verify(hostKey("host-a"), account, genesis, "host-a", 2uL, key, sig), false, "generation")
+        eq(verify(hostKey("host-a"), account, genesis, "host-a", 1uL, encKeyOf(byLabel.getValue("EK8_rotate")["entry"]["body"]["enc_key"]), sig), false, "key")
+        val p256 = PublicKeyData(KeyAlg.P256, unhex(keys["dev-mac"]["auth"]["pub_hex"].s()))
+        eq(verify(p256, account, genesis, "host-a", 1uL, key, sig), false, "a P-256 host key")
+        eq(verify(hostKey("host-a"), account, genesis, "host-a", 1uL, PublicKeyData(KeyAlg.ED25519, key.raw), sig), false, "an Ed25519 enc_key")
+        eq(verify(hostKey("host-a"), account, "not hex", "host-a", 1uL, key, sig), false, "a malformed genesis")
+        eq(verify(hostKey("host-a"), account, genesis, "host-a", 1uL, key, "AAAA"), false, "a short signature")
+        // Every enc_sig of the vectors verifies under the host key of its generation, but the bad one.
+        for (v in delegated.filter { it["entry"]["body"]["action"] == "host_enc_key" }) {
+            val b = v["entry"]["body"]
+            val gen = b["host_trust_gen"].l()
+            eq(verify(hostKey(hostKeyName(b["host_id"].s(), gen)), account, genesis, b["host_id"].s(), gen.toULong(), encKeyOf(b["enc_key"]), b["enc_sig"].s()),
+                v["label"].s() != "EK8_bad_enc_sig", v["label"].s())
+        }
+    }
+    check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
+        val mac = JdkKeys()
+        mac.addP256("dev-mac/auth", unhex(keys["dev-mac"]["auth"]["secret_hex"].s()), unhex(keys["dev-mac"]["auth"]["pub_hex"].s()))
+        // L plus host-b (P7_add_host_b), so a project can list two hosts.
+        val log = logAfter(listOf("P7_add_host_b"))
+        val ek = byLabel.getValue("EK7_set")["entry"]["body"]
+        val at = 1_793_620_800_000uL
+        val steps = listOf(
+            Triple(projectSetAction("astation", listOf("host-b", "host-a"), listOf("prompt", "message"), at + 8000uL), SigningPurpose.PROJECT, "project_set"),
+            Triple(hostSenderRevokeAction("host-b", true, at + 9000uL), SigningPurpose.HOST_SENDER, "host_sender_revoke"),
+            Triple(hostSenderReadmitAction("host-b", at + 10000uL), SigningPurpose.HOST_SENDER, "host_sender_readmit"),
+            Triple(hostEncKeyAction("host-a", 1uL, encKeyOf(ek["enc_key"]), ek["enc_sig"].s(), false, at + 11000uL), SigningPurpose.HOST_ENC_KEY, "host_enc_key"),
+            Triple(projectRemoveAction("astation", at + 12000uL), SigningPurpose.PROJECT, "project_remove"))
+        for ((action, purpose, name) in steps) {
+            eq(log.checkChange(action, at), null, name)
+            val body = log.draftEntry("dev-mac", at, action)
+            val p = EntryPublisher()
+            p.prepare(log, body)
+            p.sign(mac, "dev-mac/auth", null)
+            val sent = mac.requests.last()
+            eq(sent.purpose, purpose, name)
+            eq(sent.freshConfirmation, true, "$name: a fresh confirmation")
+            eq(sent.bodyJson, body, "$name: the confirmed body")
+            eq(sent.label, "atem-membership-entry-v1", name)
+            eq(p.replyStored(log, now) is PublishOutcome.Committed, true, name)
+            p.destroy()
+        }
+        eq(log.head().seq, 12uL)
+        eq(log.projects().isEmpty(), true)
+        eq(log.hostSenderState("host-b"), HostSenderStateInfo.Authorized(10uL))
+        val keysOf = log.hostEncKey("host-a")!!
+        eq(keysOf.current.encKid, encKid(encKeyOf(ek["enc_key"])))
+        eq(keysOf.previous, null)
+    }
+
     // ------------------------------------------------------------ recovery
     fun kit1() = RecoveryKitHandle.read(unhex(rec["R_hex"].s()), rec["kit"]["account_id"].s(), rec["kit"]["genesis_hash"].s(), unhex(rec["kit"]["kit_tag_hex"].s()))
     check("kit 1: tag, recovery key, X25519 key") {

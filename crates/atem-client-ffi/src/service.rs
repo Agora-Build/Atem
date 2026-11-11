@@ -33,7 +33,7 @@ pub(crate) fn scope_info(scope: &Scope) -> ServiceScopeInfo {
 
 /// `{"action": …, …its fields}` in canonical JSON (what `draft_entry`
 /// takes).
-fn action_json(action: &Action) -> Result<String> {
+pub(crate) fn action_json(action: &Action) -> Result<String> {
     let mut object = action.fields();
     object.insert("action".into(), Value::from(action.name()));
     canonical(&Value::Object(object))

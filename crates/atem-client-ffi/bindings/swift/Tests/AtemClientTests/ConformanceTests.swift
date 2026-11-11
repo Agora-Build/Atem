@@ -26,6 +26,10 @@ private func b64u(_ s: String) -> Data {
     return Data(base64Encoded: t)!
 }
 
+private func b64uString(_ d: Data) -> String {
+    d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+}
+
 private func utf8(_ s: String) -> Data { Data(s.utf8) }
 
 private func o(_ v: Any?) -> [String: Any] { v as! [String: Any] }
@@ -34,6 +38,11 @@ private func s(_ v: Any?) -> String { v as! String }
 private func u(_ v: Any?) -> UInt64 { (v as! NSNumber).uint64Value }
 private func js(_ v: Any) -> String {
     String(data: try! JSONSerialization.data(withJSONObject: v, options: [.fragmentsAllowed]), encoding: .utf8)!
+}
+
+// JSON with sorted keys, to compare two values whatever their key order.
+private func canon(_ v: Any) -> String {
+    String(data: try! JSONSerialization.data(withJSONObject: v, options: [.fragmentsAllowed, .sortedKeys]), encoding: .utf8)!
 }
 
 private struct Failure: Error, CustomStringConvertible {
@@ -389,6 +398,224 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("malformed") { _ = try projectHashFromMac(kid: "0123abcd", mac: Data(count: 31)) }
             try eq(isProjectHash(text: s(a(scopeOfE5()["projects"])[0])), true)
             try eq(isProjectHash(text: "h1.0123abcd.zz"), false)
+        }
+
+        // ------------------------------- delegated host work: device-list actions
+        // The vectors of `others` that follow a `chain` on log L (P*, EK*, HS*): a
+        // valid one carries `expect`, the state a verifier derives after it (read
+        // here through the log's queries); a refused one `valid: false` and
+        // `reason` (`evaluate` stops with it at index 0). The five actions are
+        // also rebuilt by their builders, byte for byte, and a manager signs them
+        // through the foreign provider under purposes that name them.
+        let fiveActions: Set<String> = ["project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key"]
+        let delegated = a(mlog["others"]).map(o).filter { $0["chain"] != nil }
+        func logAfter(_ chain: [String]) throws -> MembershipLog {
+            let log = try logL()
+            try eq(try log.extend(entries: chain.map(entry), now: now).stop, nil, "chain \(chain)")
+            return log
+        }
+        func hostKeyName(_ hostId: String, _ gen: UInt64) -> String { gen == 1 ? hostId : "\(hostId)-gen-\(gen)" }
+        func encKeyOf(_ k: Any?) -> PublicKeyData { PublicKeyData(alg: .x25519, raw: b64u(s(o(k)["pub"]))) }
+        func stateOf(_ log: MembershipLog) throws -> [String: Any] {
+            var hosts: [String: Any] = [:]
+            var senders: [String: Any] = [:]
+            var encKeys: [String: Any] = [:]
+            func keyOut(_ k: HostEncKeyInfo) -> [String: Any] {
+                ["enc_kid": k.encKid, "pub": b64uString(k.key.raw), "seq": k.seq, "host_trust_gen": k.hostTrustGen]
+            }
+            for id in ["host-a", "host-b"] {
+                if let h = log.host(hostId: id) { hosts[id] = h.hostTrustGen }
+                let epoch = log.hostMembershipEpoch(hostId: id)
+                if let sender = log.hostSenderState(hostId: id) {
+                    var item: [String: Any] = [:]
+                    switch sender {
+                    case let .authorized(generation): item["state"] = "authorized"; item["seq"] = generation
+                    case let .revoked(seq): item["state"] = "revoked"; item["seq"] = seq
+                    }
+                    if let e = epoch { item["membership_epoch"] = e }
+                    senders[id] = item
+                } else {
+                    try eq(epoch, nil, "\(id) epoch without an add_host")
+                }
+                if let keysOf = log.hostEncKey(hostId: id) {
+                    var item: [String: Any] = ["current": keyOut(keysOf.current)]
+                    if let p = keysOf.previous {
+                        var previous = keyOut(p.key)
+                        previous["retired"] = p.retired
+                        previous["replaced_at_seq"] = p.replacedAtSeq
+                        item["previous"] = previous
+                    }
+                    encKeys[id] = item
+                }
+            }
+            var projects: [String: Any] = [:]
+            for p in log.projects() { projects[p.name] = ["hosts": p.hosts, "members": p.members, "ops": p.ops] as [String: Any] }
+            return ["hosts": hosts, "projects": projects, "host_senders": senders, "host_enc_keys": encKeys]
+        }
+        func opsBetween(_ expect: [String: Any], _ x: String, _ y: String) -> [String] {
+            if x == y { return [] }
+            var ops = Set<String>()
+            for (_, project) in o(expect["projects"]) {
+                let members = a(o(project)["members"]).map(s)
+                if members.contains(x) && members.contains(y) { for op in a(o(project)["ops"]) { ops.insert(s(op)) } }
+            }
+            return ops.sorted()
+        }
+        check("device-list actions: the queries read every vector's expect, refusals carry their reason") {
+            var valid = 0
+            var refused = 0
+            for v in delegated {
+                let label = s(v["label"])
+                let log = try logAfter(a(v["chain"]).map(s))
+                if (v["valid"] as? Bool) == false {
+                    refused += 1
+                    try eq(try log.evaluate(entries: [entry(label)], now: now).stop, .invalid(index: 0, code: s(v["reason"])), label)
+                    continue
+                }
+                valid += 1
+                let r = try log.extend(entries: [entry(label)], now: now)
+                try eq(r.stop, nil, label)
+                try eq(r.appended, 1, label)
+                try eq(r.head.hash, s(v["entry_hash"]), label)
+                let expect = o(v["expect"])
+                try eq(canon(try stateOf(log)), canon(expect), label)
+                for (x, y) in [("host-a", "host-b"), ("host-b", "host-a"), ("host-a", "host-a")] {
+                    try eq(log.projectOpsBetween(a: x, b: y), opsBetween(expect, x, y), "\(label) \(x) \(y)")
+                }
+                for id in ["host-a", "host-b"] {
+                    let inEffect = o(expect["projects"]).filter { a(o($0.value)["members"]).map(s).contains(id) }.keys.sorted()
+                    try eq(log.hostProjects(hostId: id), inEffect, "\(label) \(id)")
+                }
+            }
+            if !(valid >= 28 && refused >= 17) { throw Failure(description: "\(valid) valid, \(refused) refused") }
+        }
+        func buildAction(_ body: [String: Any]) throws -> String {
+            let at = u(body["signed_at"])
+            switch s(body["action"]) {
+            case "project_set":
+                let project = o(body["project"])
+                return try projectSetAction(name: s(project["name"]), hosts: a(project["hosts"]).map(s), ops: a(project["ops"]).map(s), signedAt: at)
+            case "project_remove":
+                return try projectRemoveAction(name: s(body["name"]), signedAt: at)
+            case "host_sender_revoke":
+                return try hostSenderRevokeAction(hostId: s(body["host_id"]), interruptRunning: body["interrupt_running"] as! Bool, signedAt: at)
+            case "host_sender_readmit":
+                return try hostSenderReadmitAction(hostId: s(body["host_id"]), signedAt: at)
+            case "host_enc_key":
+                return try hostEncKeyAction(hostId: s(body["host_id"]), hostTrustGen: u(body["host_trust_gen"]), encKey: encKeyOf(body["enc_key"]),
+                                            encSigB64u: s(body["enc_sig"]), retirePrevious: (body["retire_previous"] as? Bool) == true, signedAt: at)
+            default:
+                throw Failure(description: "unknown action \(s(body["action"]))")
+            }
+        }
+        check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit") {
+            var built = 0
+            for v in delegated.filter({ fiveActions.contains(s(o(o($0["entry"])["body"])["action"])) }) {
+                let label = s(v["label"])
+                let body = o(o(v["entry"])["body"])
+                // `retire_previous: false` has one form, omitted: no builder writes it.
+                if (body["retire_previous"] as? Bool) == false { continue }
+                // A shape the verifier refuses by itself is the builder's refusal too.
+                if (v["reason"] as? String) == "bad_project" {
+                    try throwsCode("bad_project") { _ = try buildAction(body) }
+                    continue
+                }
+                let log = try logAfter(a(v["chain"]).map(s))
+                let action = try buildAction(body)
+                built += 1
+                let signedAt = u(body["signed_at"])
+                try eq(try log.draftEntry(signer: "dev-mac", signedAt: signedAt, actionJson: action), s(v["jcs"]), label)
+                var want: ChangeRefusalInfo? = nil
+                if (v["reason"] as? String) == "already_revoked" { want = .alreadyRevoked }
+                if (v["reason"] as? String) == "not_revoked" { want = .notRevoked }
+                try eq(try log.checkChange(actionJson: action, nowMs: signedAt), want, "\(label) check_change")
+            }
+            if built < 28 { throw Failure(description: "\(built) built") }
+        }
+        check("device-list actions: shapes the verifier refuses by itself") {
+            let two = ["host-a", "host-b"]
+            try throwsCode("bad_project") { _ = try projectSetAction(name: "astation", hosts: two, ops: ["deploy"], signedAt: 1) }
+            try throwsCode("bad_project") { _ = try projectSetAction(name: "astation", hosts: two, ops: [], signedAt: 1) }
+            try throwsCode("bad_project") { _ = try projectSetAction(name: "astation", hosts: ["host-a"], ops: ["message"], signedAt: 1) }
+            try throwsCode("bad_project") { _ = try projectSetAction(name: "Astation", hosts: two, ops: ["message"], signedAt: 1) }
+            try throwsCode("bad_project") { _ = try projectSetAction(name: "astation", hosts: two, ops: ["notify", "prompt"], signedAt: 1) }
+            try throwsCode("bad_project") { _ = try projectRemoveAction(name: "Bad Name", signedAt: 1) }
+            try throwsCode("malformed") { _ = try hostSenderRevokeAction(hostId: "Not an id", interruptRunning: false, signedAt: 1) }
+            try throwsCode("malformed") { _ = try hostSenderReadmitAction(hostId: "", signedAt: 1) }
+            let ek = o(o(byLabel["EK7_set"]!["entry"])["body"])
+            let hostA = PublicKeyData(alg: .ed25519, raw: unhex(s(key("host-a", "host_key")["pub_hex"])))
+            try throwsCode("wrong_alg") { _ = try hostEncKeyAction(hostId: "host-a", hostTrustGen: 1, encKey: hostA, encSigB64u: s(ek["enc_sig"]), retirePrevious: false, signedAt: 1) }
+            try throwsCode("malformed") { _ = try hostEncKeyAction(hostId: "host-a", hostTrustGen: 1, encKey: encKeyOf(ek["enc_key"]), encSigB64u: "AAAA", retirePrevious: false, signedAt: 1) }
+            try throwsCode("malformed") { _ = try hostEncKeyAction(hostId: "host-a", hostTrustGen: 1, encKey: encKeyOf(ek["enc_key"]), encSigB64u: s(ek["enc_sig"]) + "=", retirePrevious: false, signedAt: 1) }
+        }
+        check("device-list actions: verifyHostEncSig binds every field of a host's enc_sig") {
+            let ek = o(o(byLabel["EK7_set"]!["entry"])["body"])
+            let sig = s(ek["enc_sig"])
+            func hostKey(_ name: String) -> PublicKeyData { PublicKeyData(alg: .ed25519, raw: unhex(s(key(name, "host_key")["pub_hex"]))) }
+            let enc = encKeyOf(ek["enc_key"])
+            func verify(_ host: PublicKeyData, _ acct: String, _ genesisHex: String, _ hostId: String, _ gen: UInt64, _ encKey: PublicKeyData, _ signature: String) -> Bool {
+                verifyHostEncSig(hostKey: host, accountId: acct, genesisHash: genesisHex, hostId: hostId, hostTrustGen: gen, encKey: encKey, encSigB64u: signature)
+            }
+            try eq(verify(hostKey("host-a"), account, genesis, "host-a", 1, enc, sig), true)
+            try eq(verify(hostKey("host-b"), account, genesis, "host-a", 1, enc, sig), false, "another host's key")
+            try eq(verify(hostKey("host-a"), "acct-other", genesis, "host-a", 1, enc, sig), false, "account")
+            try eq(verify(hostKey("host-a"), account, String(repeating: "00", count: 32), "host-a", 1, enc, sig), false, "genesis")
+            try eq(verify(hostKey("host-a"), account, genesis, "host-b", 1, enc, sig), false, "host id")
+            try eq(verify(hostKey("host-a"), account, genesis, "host-a", 2, enc, sig), false, "generation")
+            try eq(verify(hostKey("host-a"), account, genesis, "host-a", 1, encKeyOf(o(o(byLabel["EK8_rotate"]!["entry"])["body"])["enc_key"]), sig), false, "key")
+            let p256 = PublicKeyData(alg: .p256, raw: unhex(s(key("dev-mac", "auth")["pub_hex"])))
+            try eq(verify(p256, account, genesis, "host-a", 1, enc, sig), false, "a P-256 host key")
+            try eq(verify(hostKey("host-a"), account, genesis, "host-a", 1, PublicKeyData(alg: .ed25519, raw: enc.raw), sig), false, "an Ed25519 enc_key")
+            try eq(verify(hostKey("host-a"), account, "not hex", "host-a", 1, enc, sig), false, "a malformed genesis")
+            try eq(verify(hostKey("host-a"), account, genesis, "host-a", 1, enc, "AAAA"), false, "a short signature")
+            // Every enc_sig of the vectors verifies under the host key of its generation, but the bad one.
+            for v in delegated.filter({ s(o(o($0["entry"])["body"])["action"]) == "host_enc_key" }) {
+                let b = o(o(v["entry"])["body"])
+                let gen = u(b["host_trust_gen"])
+                try eq(verify(hostKey(hostKeyName(s(b["host_id"]), gen)), account, genesis, s(b["host_id"]), gen, encKeyOf(b["enc_key"]), s(b["enc_sig"])),
+                       s(v["label"]) != "EK8_bad_enc_sig", s(v["label"]))
+            }
+        }
+        check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
+            #if canImport(CryptoKit)
+            let mac = CryptoKitKeys()
+            try mac.addP256("dev-mac/auth", secret: unhex(s(key("dev-mac", "auth")["secret_hex"])))
+            // L plus host-b (P7_add_host_b), so a project can list two hosts.
+            let log = try logAfter(["P7_add_host_b"])
+            let ek = o(o(byLabel["EK7_set"]!["entry"])["body"])
+            let at: UInt64 = 1_793_620_800_000
+            let setAction = try projectSetAction(name: "astation", hosts: ["host-b", "host-a"], ops: ["prompt", "message"], signedAt: at + 8000)
+            let revokeAction = try hostSenderRevokeAction(hostId: "host-b", interruptRunning: true, signedAt: at + 9000)
+            let readmitAction = try hostSenderReadmitAction(hostId: "host-b", signedAt: at + 10000)
+            let encAction = try hostEncKeyAction(hostId: "host-a", hostTrustGen: 1, encKey: encKeyOf(ek["enc_key"]), encSigB64u: s(ek["enc_sig"]), retirePrevious: false, signedAt: at + 11000)
+            let removeAction = try projectRemoveAction(name: "astation", signedAt: at + 12000)
+            let steps: [(String, SigningPurpose, String)] = [
+                (setAction, .project, "project_set"),
+                (revokeAction, .hostSender, "host_sender_revoke"),
+                (readmitAction, .hostSender, "host_sender_readmit"),
+                (encAction, .hostEncKey, "host_enc_key"),
+                (removeAction, .project, "project_remove"),
+            ]
+            for (action, purpose, name) in steps {
+                try eq(try log.checkChange(actionJson: action, nowMs: at), nil, name)
+                let body = try log.draftEntry(signer: "dev-mac", signedAt: at, actionJson: action)
+                let p = EntryPublisher()
+                try p.prepare(log: log, bodyJson: body)
+                _ = try p.sign(provider: mac, keyId: "dev-mac/auth", cosignKit: nil)
+                guard let sent = mac.requests.last else { throw Failure(description: "\(name): no signing request") }
+                try eq(sent.purpose, purpose, name)
+                try eq(sent.freshConfirmation, true, "\(name): a fresh confirmation")
+                try eq(sent.bodyJson, body, "\(name): the confirmed body")
+                try eq(sent.label, "atem-membership-entry-v1", name)
+                guard case .committed = try p.replyStored(log: log, now: now) else { throw Failure(description: "\(name): not committed") }
+            }
+            try eq(log.head().seq, 12)
+            try eq(log.projects().isEmpty, true)
+            try eq(log.hostSenderState(hostId: "host-b"), .authorized(generation: 10))
+            let keysOf = log.hostEncKey(hostId: "host-a")!
+            try eq(keysOf.current.encKid, try encKid(encKey: encKeyOf(ek["enc_key"])))
+            try eq(keysOf.previous, nil)
+            #endif
         }
 
         // ------------------------------------------------------------ recovery
