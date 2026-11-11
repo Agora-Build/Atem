@@ -715,6 +715,13 @@ fun main(args: Array<String>) {
             val (verdict, plain) = envelopeVerdict(got)
             mailExpect(c, verdict, plain)
         }
+        // A low-order `enc` (the zero point) doesn't open either: the XDH's
+        // own refusal is OpenFailed too, never a provider failure.
+        try {
+            jdk.hpkeOpen("host-b-enc-1", ByteArray(32), ByteArray(16), ByteArray(0), ByteArray(0))
+            throw AssertionError("a low-order enc opened")
+        } catch (e: ProviderException.OpenFailed) {
+        }
     }
     check("host mail: every result check's verdict (acceptResult)") {
         val store = mailStore()

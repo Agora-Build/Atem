@@ -22,9 +22,14 @@
 //!   refused before anything is sealed.
 //! - **Judge**: `open_envelope` (the receiver's checks 1 to 6) and
 //!   `accept_result` (the sending host's check of a result against its
-//!   outbox row) return a verdict, never an error for the object's content:
-//!   an error is only for input that isn't a signed object at all (not
-//!   strict JSON, over 512 KiB, no `body` or `sig`). The receiver passes the
+//!   outbox row) return a verdict for every signed object. An error is only
+//!   for bytes that don't parse as a signed object: not strict JSON (a
+//!   duplicate key, a float, a `null`), over 512 KiB, not an object, no
+//!   `body` or `sig` (or a `sig` that isn't base64url), an unknown top-level
+//!   field, `enc` without `ct`, a body without a known `type` or with `v`
+//!   other than 1, or a body over 4,096 bytes. The host refuses those bytes
+//!   too, under the SHA-256 of the bytes as fetched (host-work-v1 §11.5).
+//!   The receiver passes its own trust generation (from its pairing) and the
 //!   keys it accepts now (`MailRecipientData.keys`: its current key, and the
 //!   previous one only inside its 24 h window unless `retire_previous`
 //!   retired it).
@@ -91,6 +96,9 @@ record! {
     /// and the keys that may open mail now.
     pub struct MailRecipientData {
         pub host_id: String,
+        /// The host's own trust generation, from its pairing, never one read
+        /// from its device list (which may lag behind its own new
+        /// `add_host`).
         pub host_trust_gen: u64,
         pub keys: Vec<MailKeyData>,
     }
@@ -116,15 +124,20 @@ data_enum! {
         /// sender's principal, `host:<host_id>`. The host-work checks of a
         /// message (route, project, ops, target) are the host's.
         Open { plain_json: String, sender: String },
-        /// Signed at a head beyond this host's list, the body's times
-        /// passed (and the signature too, when the list holds the claimed
-        /// generation): judge it again after each device-list advance.
+        /// Signed at a head beyond this host's list (which may hold the
+        /// sender's newer standing, or the key it is sealed to, a key this
+        /// host hasn't applied yet), the body's times passed (and the
+        /// signature too, when the list holds the claimed generation):
+        /// judge it again after each device-list advance and each change of
+        /// the keys it accepts.
         Pending { host_id: String, host_trust_gen: u64 },
-        /// Refused before the signature verified; `evidence` (hex) is what
-        /// the host keeps. Nothing is reported to anyone.
+        /// Refused before the copy was shown to be the sender's (its
+        /// signature, and the sealed part it names); `evidence` (hex) is what
+        /// the host keeps it under. Nothing is reported, and it claims no id.
         Refused { reason: String, evidence: String },
-        /// Refused after the signature verified: the host reports it to the
-        /// sender (a status naming `object_id`, `refused: invalid_request`).
+        /// Refused after the signature verified and the sealed part matched:
+        /// the host reports it to the sender (a status naming `object_id`,
+        /// `refused: invalid_request`), and it claims the id.
         RefusedAuthenticated { object_id: String, reason: String },
         /// A local failure (the key provider): nothing is decided; retry.
         Unavailable { code: String, detail: String },

@@ -813,6 +813,13 @@ final class ConformanceTests: XCTestCase {
                 let (verdict, plain) = envelopeVerdict(got)
                 try mailExpect(c, verdict, plain)
             }
+            // A low-order `enc` (the zero point) doesn't open either: the
+            // encapsulated key's refusal is OpenFailed too.
+            do {
+                _ = try platform.hpkeOpen(keyId: "host-b-enc-1", enc: Data(count: 32), ct: Data(count: 16), info: Data(), aad: Data())
+                throw Failure(description: "a low-order enc opened")
+            } catch ProviderError.OpenFailed {
+            }
             #endif
         }
         check("host mail: every result check's verdict (acceptResult)") {
