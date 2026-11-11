@@ -20,17 +20,19 @@ to its session (III.2, "Who sees the live tag"; VI). The implementation, its vec
 
 **Amended after agreement, 2026-11-10 (host mail; for Astation's review).** Step 3 builds the envelope and result
 objects (II.4.2, II.4.4; their contract is host-work-v1 §11.5), and three of II.4.2's receiver rules are written as
-built: the claimed generation's `add_host` comes at or before `signed_at_head.seq` (with the matching sender rule);
-only a `signed_at_head` beyond this host's head waits, so a generation this host's list doesn't hold at a head it
-holds is refused; and a waiting object from a generation this host holds has its signature checked first. IX.4 gains
+built: the claimed generation's `add_host` comes at or before `signed_at_head.seq` (with the matching sender rule); only
+a `signed_at_head` beyond this host's head waits, so a generation this host's list doesn't hold at a head it holds is
+refused; and a waiting object from a generation this host holds is verified first, signed and intact. IX.4 gains
 question 4, host senders across Stations: in this version a host sends host-sender work only to hosts on its own
-Station. II.4.2 also says: a host should accept mail to a key it handed out before its own list applied it, and mail
-to a key it hasn't applied yet waits when signed beyond its head; the host's trust generation is its own; the
-`sealed_hash` check comes with the signature (step 4), and only a copy the sender is shown to have sent claims its
-`id`, so a damaged or injected copy can't make the host refuse the sender's object; and a removed host's envelope at
-the generation it last held is refused at any head. The envelope vectors are `r9-vectors-host-envelope.json`
-(III.1), named apart from R9.7a's `r9-envelope-vectors.json`. Each changed passage is marked "Amended after
-agreement, 2026-11-10" (in II.4.2 and III.1) or "Added after agreement, 2026-11-10" (IX.4).
+Station. II.4.2 also says: a host should accept mail to a key it handed out before its own list applied it, and mail to
+a key it hasn't applied yet waits when signed beyond its head; the host's trust generation is its own; the `sealed_hash`
+check comes with the signature (step 4), before waiting too; a claim on an `id` is the authenticated sender's,
+`(sender.host_id, id)`, and only a copy the sender is shown to have sent, signed and intact, makes one, so no copy the
+sender didn't send can make the host refuse the sender's object; duplicates get the first verdict; an object over the
+pending limits is dropped undecided, not refused; and a removed host's envelope at the generation it last held is
+refused at any head. The envelope vectors are `r9-vectors-host-envelope.json` (III.1), named apart from R9.7a's
+`r9-envelope-vectors.json`. Each changed passage is marked "Amended after agreement, 2026-11-10" (in II.4.2 and III.1)
+or "Added after agreement, 2026-11-10" (IX.4).
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
@@ -1669,25 +1671,32 @@ with the sealed part beside it.
   the sender's new `add_host`, or its readmit, or its own new `host_enc_key`, the key the object is sealed to, yet. Step
   5's time checks run first, on the body's times; an object that fails them is refused. When this host already holds the
   `add_host` of the claimed `(host_id, host_trust_gen)` (a current host at its newest generation, or a removed host's
-  result), it then checks the signature with that `add_host`'s `host_key` and refuses an object whose signature fails,
-  since that pair has one key forever; otherwise (a sender it doesn't know, or a generation above its newest) the
-  signature can't be checked yet. One that passes stays pending, isn't marked done, and is judged again after each
-  device-list advance and each change of the keys it accepts, until it expires. At most 64 objects stay pending per
-  claimed `(host_id, host_trust_gen)` and 256 in all; more are refused and kept as evidence. **Pending objects don't
-  hold the gate** (II.5): an object this host can't verify yet can't stop its other work. **New rule.**
+  result), it then verifies the copy as step 4 does, its signature with that `add_host`'s `host_key` and its sealed part
+  against the signed `sealed_hash`, and refuses an object that fails, since that pair has one key forever (so neither
+  junk nor a variant of the sender's own object takes its slots); otherwise (a sender it doesn't know, or a generation
+  above its newest) the signature can't be checked yet. One that passes stays pending, isn't marked done, and is judged
+  again after each device-list advance and each change of the keys it accepts, until it expires. At most 64 objects stay
+  pending per claimed `(host_id, host_trust_gen)` and 256 in all; more are dropped undecided (it read: "more are refused
+  and kept as evidence"): an overflow is no verdict, records nothing, claims no `id` and isn't marked done, so the
+  sender's resend is judged anew. **Pending objects don't hold the gate** (II.5): an object this host can't verify yet
+  can't stop its other work. **New rule.**
 - **Steps 5 and 6, once step 4 passed:** the sender is authenticated, so the refusal is reported back to it as a
   status naming the object's `id`, `refused` with `invalid_request` (II.4.4); its outbox doesn't stay `sent` until
   expiry.
 - **Step 7:** a recorded decision (`refused`), reported back (II.4.4).
 - **Duplicates.** **Amended after agreement, 2026-11-10 (for Astation)** (it read: "The same `id` with the same
   `sealed_hash` is a duplicate: acknowledged, nothing changes. The same `id` with other bytes is refused and kept as
-  evidence"). Only an object whose signature verified and whose sealed part its `sealed_hash` names claims its `id` (an
-  open, a refusal at steps 5 to 7, or a result accepted or kept). A later object with that `id` and the same
-  `sealed_hash` is a duplicate, acknowledged with the first verdict; with another `sealed_hash` it is refused and kept
-  as evidence. Every other refusal is recorded under its evidence hash only: the same bytes again are a duplicate of it,
-  and other bytes with that `id` (the sender's own copy) are judged on their own, so a damaged or injected copy can't
-  make the host refuse the sender's object. Message ids keep host-work v1's rules: the same content returns the recorded
-  receipt, other content is `request_id_reused`.
+  evidence"). A claim on an `id` is the authenticated sender's, `(sender.host_id, id)`, the key of the Station's
+  puts (II.4.3), and only an object whose signature verified and whose sealed part its `sealed_hash` names claims it (an
+  open, a refusal at steps 5 to 7, or a result accepted or kept). A later object from that sender with that `id` and the
+  same `sealed_hash` (the body's field: the sender may re-sign the same sealed part at a newer head) is a duplicate,
+  acknowledged with the first verdict; with another `sealed_hash` it is refused as a reused `id` and kept as evidence,
+  and the first verdict stands. An object of another sender with that `id` is judged on its own: a copy another host
+  re-signs as its own claims only its own pair. Every other refusal is recorded under its evidence hash only: the same
+  bytes again are a duplicate of it, and other bytes with that `id` are judged on their own. So no copy the sender
+  didn't send (damaged, injected or re-signed by another host) can make the host refuse the sender's object or take its
+  `id`; flooding the pending limits only delays it (an overflow is dropped undecided, above). Message ids keep host-work
+  v1's rules: the same content returns the recorded receipt, other content is `request_id_reused`.
 
 ### II.4.3 The mailbox
 

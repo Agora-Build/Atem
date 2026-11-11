@@ -23,11 +23,13 @@
 //! - **Judge**: `open_envelope` (the receiver's checks 1 to 6) and
 //!   `accept_result` (the sending host's check of a result against its
 //!   outbox row) return a verdict for every signed object. An error is only
-//!   for bytes that don't parse as a signed object: not strict JSON (a
-//!   duplicate key, a float, a `null`), over 512 KiB, not an object, no
-//!   `body` or `sig` (or a `sig` that isn't base64url), an unknown top-level
-//!   field, `enc` without `ct`, a body without a known `type` or with `v`
-//!   other than 1, or a body over 4,096 bytes. The host refuses those bytes
+//!   for bytes that don't parse as a signed object: for example not strict
+//!   JSON (a duplicate key, a float, a `null`), over 512 KiB, not an object,
+//!   no `body` or `sig`, a `sig`, `enc` or `ct` that isn't base64url, an
+//!   unknown top-level field, a `kit_sig`, `enc` without `ct`, a body
+//!   without a known `type` or with `v` other than 1, an array in a mail
+//!   body, or a body over 4,096 bytes; or anything else the signed-object
+//!   parse refuses. The host refuses those bytes
 //!   too, under the SHA-256 of the bytes as fetched (host-work-v1 §11.5).
 //!   The receiver passes its own trust generation (from its pairing) and the
 //!   keys it accepts now (`MailRecipientData.keys`: its current key, and the

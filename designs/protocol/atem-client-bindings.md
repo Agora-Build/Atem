@@ -542,14 +542,16 @@ The bindings carry them so the Swift, Kotlin and WASM suites run
 |---|---|
 | `seal_envelope(provider, host_key_id, fields, plain_json, recipient_enc)`, `seal_result(…)` | the object's wire JSON (canonical): `plain_json` (one plaintext shape, read by the receiver's own strict parse: no `null`, exactly its fields; its canonical form is what is sealed; within its bound) sealed to the recipient host's X25519 encryption key, whose `enc_kid` must be `fields.enc_kid` (`malformed` otherwise), and the body signed with the Ed25519 `host_key_id` (purpose `HostSigning`). `fields` is `MailFieldsData{account_id, genesis_hash, sender, recipient, enc_kid, id, created_at, expires_at, signed_at_head}`, its `sender` and `recipient` each a `MailHostData{host_id, host_trust_gen}` |
 | `seal_envelope_with_ikm(…, ikm_e)`, `seal_result_with_ikm(…, ikm_e)` | the same with the ephemeral `DeriveKeyPair(ikm_e)`: the vectors' objects byte for byte (feature `test-vectors`) |
-| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list: `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason}` or `Unavailable{code, detail}`. `Pending` may also mean the object is sealed to a key this host hasn't applied yet (signed at a head beyond its own): judge it again after each device-list advance and each change of `me.keys`. `Refused` (a copy not shown to be the sender's: a bad signature, or a sealed part its `sealed_hash` doesn't name) claims no id and is never reported. `me` is `MailRecipientData{host_id, host_trust_gen, keys}`: the host's own trust generation from its pairing (never one read from its device list) and the keys it accepts now (`MailKeyData{key_id, enc_kid}`) |
+| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list: `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason}` or `Unavailable{code, detail}`. `Pending` may also mean the object is sealed to a key this host hasn't applied yet (signed at a head beyond its own): judge it again after each device-list advance and each change of `me.keys`. `Refused` (any refusal before the copy is shown to be the sender's, signed and intact: steps 1 to 4, for example a bad signature or a sealed part its `sealed_hash` doesn't name) claims no id and is never reported; the ids `Open` and `RefusedAuthenticated` claim are the authenticated sender's, `(sender.host_id, id)`. `me` is `MailRecipientData{host_id, host_trust_gen, keys}`: the host's own trust generation from its pairing (never one read from its device list) and the keys it accepts now (`MailKeyData{key_id, enc_kid}`) |
 | `accept_result(object_json, log, me, outbox, provider, now_ms)` | the sending host's check of a result against its row `MailOutboxData{recipient, message_id, cancel_complete_ids, task_ids}`: `ResultVerdictInfo` `Accepted`, `NotDelivered{plain_json, sender, reason}` (a revoked or removed sender's result, kept as data), and the same `Pending`, `Refused`, `RefusedAuthenticated`, `Unavailable` |
 
 The verdict functions throw only for bytes that don't parse as a signed
-object: not strict JSON (a duplicate key, a float, a `null`), over 512 KiB,
-not an object, no `body` or `sig` (or a `sig` that isn't base64url), an
-unknown top-level field, `enc` without `ct`, a body without a known `type`
-or with `v` other than 1, or a body over 4,096 bytes. The host refuses
+object: for example not strict JSON (a duplicate key, a float, a `null`),
+over 512 KiB, not an object, no `body` or `sig`, a `sig`, `enc` or `ct`
+that isn't base64url, an unknown top-level field, a `kit_sig`, `enc`
+without `ct`, a body without a known `type` or with `v` other than 1, an
+array in a mail body, or a body over 4,096 bytes; or anything else the
+signed-object parse refuses. The host refuses
 those bytes too, under the SHA-256 of the bytes as fetched (host-work-v1
 §11.5). Anything about a signed object's content is a verdict. JS: `sealEnvelope`, `sealResult`,
 `sealEnvelopeWithIkm`, `sealResultWithIkm`, `openEnvelope`, `acceptResult`

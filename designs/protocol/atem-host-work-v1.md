@@ -1006,14 +1006,20 @@ storage and its receipts are the host's.
   pending object is judged again after each device-list advance and each
   change of the keys this host accepts, until it expires (the design's
   limits: 64 per claimed pair, 256 in all; pending objects don't hold the
-  gate).
+  gate). **For Astation:** an object that arrives over either limit is no
+  verdict: it is dropped undecided, with no refusal and no evidence record,
+  it claims no id and isn't marked done, so the sender's resend is judged
+  anew.
 - **Verify before waiting.** When this list already holds the `add_host` of
   the claimed `(host_id, host_trust_gen)` (a current host at its newest
-  generation, or a removed host's result), the signature is checked with
-  that `add_host`'s key before the object waits, since that pair has exactly
-  one key forever: a failure is `bad_signature`, so junk can't fill a known
-  sender's pending slots. A sender this list doesn't name, or a generation
-  above its newest, has no key yet, and its object waits unverified.
+  generation, or a removed host's result), the copy is verified before it
+  waits, as step 4 verifies it: its signature with that `add_host`'s key
+  (`bad_signature`), and its sealed part against the signed `sealed_hash`
+  (`sealed_hash_mismatch`). That pair has exactly one key forever, so
+  neither junk nor a ciphertext variant of the sender's own object can take
+  a known sender's pending slots. A sender this list doesn't name, or a
+  generation above its newest, has no key yet, and its object waits
+  unverified.
 
 | Verdict | When | What the host does |
 |---|---|---|
@@ -1029,37 +1035,48 @@ it is `ProviderError.OpenFailed` from `hpke_open` (atem-client-bindings.md
 §3).
 
 **Which copies claim an id** (**for Astation**; design II.4.2,
-"Duplicates"). Only a copy whose signature verified and whose sealed part
-its `sealed_hash` names (step 4) claims its `id`: its verdict is Open,
-RefusedAuthenticated, Accepted or NotDelivered. A later object with that
-`id` and the same `sealed_hash` is a duplicate, acknowledged with the first
-verdict; with another `sealed_hash` it is refused and kept as evidence.
-Every other refusal is recorded under its evidence hash only: the same bytes
-again are a duplicate of that refusal, and other bytes with that `id` (the
-sender's own copy, resent) are judged on their own. So a damaged or injected
-copy can't make the host refuse the sender's object, and the host never
-reports a refusal of an object the sender didn't send.
+"Duplicates"). A claim is the authenticated sender's: `(sender.host_id,
+id)`, the key of the Station's puts (design II.4.3). Only a copy whose signature
+verified and whose sealed part its `sealed_hash` names (step 4) claims that
+pair: its verdict is Open, RefusedAuthenticated, Accepted or NotDelivered. A
+later object from that sender with that `id` and the same `sealed_hash` (the
+body's field, so the sender may re-sign the same sealed part at a newer
+head) is a duplicate, acknowledged with the first verdict; one with another
+`sealed_hash` is refused as a reused id and kept as evidence, and the first
+verdict stands. An object of another sender with that `id` is judged on its
+own: a copy another host strips and re-signs as its own claims only `(that
+host, id)` (the `resigned` vector), so the sender's own copy is still
+judged. Every other refusal is recorded under its evidence hash only: the
+same bytes again are a duplicate of that refusal, and other bytes with that
+`id` are judged on their own. An overflow of the pending limits is no
+verdict at all (above). So no copy the sender didn't send, damaged, injected
+or re-signed by another host, can make the host refuse the sender's object
+or take its id, and the host never reports a refusal of an object the sender
+didn't send. What remains is what the Station could already do: delay or
+withhold the sender's object until it expires (flooding the pending pool
+only delays it, since an overflow is dropped undecided and the sender
+resends).
 
 **Verdicts over time.** Finality is the host's own rule, and it applies to
-the copies that claim an id: one the host judged (opened or refused) is
-done, marked done in the mailbox, and never judged again, and its duplicates
-get its first verdict; only a pending object is judged again. A refusal
-recorded under an evidence hash says nothing about the id. So a refusal of
-the sender's own copy never later becomes Open. Refusals in steps 3 and 4,
-and step 5's `bad_times`, `lifetime_too_long` and `expired`, also don't
-depend on what this host holds later: at any later head the same bytes are
-refused too (a later head keeps every entry up to `signed_at_head.seq`, and
-generations only rise). The others are final by the rule alone: they depend
-on this host itself (its own trust generation, the keys it accepts at a head
-it holds) or on its clock (`created_too_far_ahead`). The converse doesn't
-hold: bytes that opened would be refused at a later head once the sender's
-standing changes (revoked, removed, re-verified). An Open is the verdict
-when the host judged it, and the host's start check re-checks the sender's
-standing before work starts (design I.4.3). The vectors show both: a request
-that opens on the list it was signed at is `revoked_sender`,
-`removed_sender`, `stale_sender_generation` or
-`signed_at_head_before_generation` after a revoke, a removal, a
-re-verification or a readmit.
+the copies that claim an id, keyed by the authenticated sender and the id:
+one the host judged (opened or refused) is done, marked done in the mailbox,
+and never judged again, and its duplicates get its first verdict; only a
+pending object is judged again. A refusal recorded under an evidence hash
+says nothing about the id. So a refusal of the sender's own copy never later
+becomes Open. Refusals in steps 3 and 4, and step 5's `bad_times`,
+`lifetime_too_long` and `expired`, also don't depend on what this host holds
+later: at any later head the same bytes are refused too (a later head keeps
+every entry up to `signed_at_head.seq`, and generations only rise). The
+others are final by the rule alone: they depend on this host itself (its own
+trust generation, the keys it accepts at a head it holds) or on its clock
+(`created_too_far_ahead`). The converse doesn't hold: bytes that opened
+would be refused at a later head once the sender's standing changes
+(revoked, removed, re-verified). An Open is the verdict when the host judged
+it, and the host's start check re-checks the sender's standing before work
+starts (design I.4.3). The vectors show both: a request that opens on the
+list it was signed at is `revoked_sender`, `removed_sender`,
+`stale_sender_generation` or `signed_at_head_before_generation` after a
+revoke, a removal, a re-verification or a readmit.
 
 **The sending host's result check** (design II.4.4; `accept_result`). The
 same checks for an `atem-result`, against the outbox row it answers (the
