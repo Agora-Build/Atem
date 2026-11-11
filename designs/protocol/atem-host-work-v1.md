@@ -71,7 +71,7 @@ R9.6 gains three ops for service `scope.ops` and browser grant `ops`:
 | Op | Requests | Control op |
 |---|---|---|
 | `launch` | `host_profiles`, `host_launch`, `host_launch_query` | yes |
-| `notify` | `work_enqueue`, `work_query`, `reply_query`, `work_cancel`, `work_complete` | yes |
+| `notify` | `work_enqueue`, `work_query`, `reply_query`, `work_cancel`, `work_complete`, `work_interrupt`, `work_resolve` (the last two: `host.delegated`, §11.2) | yes |
 | `message` | `message_publish`, `message_query`, `attachment_put` | no |
 
 A native member needs the `control` role for the `launch` and `notify`
@@ -764,7 +764,7 @@ request's `id`:
 | `unauthorized` | the caller's authority is no longer current |
 | `stale_target` | the host triple doesn't match |
 | `invalid_request` | decoding, a field rule, an expiry, an upload gap, bad PNG bytes |
-| `request_id_reused` | the same id with other content |
+| `request_id_reused` | the same id with other content; another result for a task already `completed`, another resolution for a task already resolved (§11.2) |
 | `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state, an op of a feature the host doesn't list (§11.2) |
 
 After a lost reply, query (`host_launch_query`, `work_query`, `reply_query`,
@@ -838,7 +838,8 @@ three features, defined in `atem_client::session::host_work`
 **No host advertises them in this version**, and a host refuses each of
 their ops as it refuses any op of a feature it doesn't list: a session op
 (`control_records`) is `unsupported_version` with no effect (session-v1
-R9.8; **Atem's choice of code, for Astation to confirm**). Clients check
+R9.8; **Atem's choice of code, for Astation to confirm**), and a host-work
+request (`work_interrupt`, `work_resolve`) is `busy` (§7, §11.2). Clients check
 `welcome.features` first; the client core
 refuses to send `control_records` to a host that doesn't list
 `host.senders` (`host feature not available`).
@@ -1165,8 +1166,8 @@ they serialize back to the same JSON.
 |---|---|
 | `task_id` | a UUID v4 |
 | `resolution.kind` | `failed` or `done`, exactly its fields |
-| `failed.detail` | 1–1024 bytes, no control character: the detail the task then shows |
-| `done.result` | a context snapshot, with `work_complete`'s checks (a `result` kind is local only) |
+| `failed.detail` | 1–1024 bytes, no control character: the detail the task then shows (**Atem's choice, for Astation to confirm**: the design says only `failed{detail}`, so a multi-line reason is `invalid_request`) |
+| `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, for Astation to confirm**) |
 
 **Authority.** Both are directed-work requests: the channel checks `notify`
 before decoding (`forbidden`; a native member needs `control`), as for every
@@ -1186,10 +1187,16 @@ not name is `forbidden`, as for `work_query`.
   with the given `detail`; `done` makes it `completed` with that `result`.
   The same resolution again returns the recorded status; another
   resolution of a resolved task is `request_id_reused`.
-- A task resolved by either path has `resolved`: `{"by":"member:<id>"|
-  "service:<id>"|"local","at":<ms>}`, the resolver and the host's wall clock
-  then. It is omitted before, and appears on `failed` and `completed`
-  statuses only.
+- A task resolved by either path has `resolved`: `{"by":…,"at":<ms>}`, the
+  resolver and the host's wall clock then. `by` is `member:<id>`,
+  `service:<id>` or `browser:<grant_id>` (the id is 1–128 bytes of
+  `[A-Za-z0-9._:-]`, as a message's sender is), or the literal `local` for
+  the host's own command (`atem task resolve`); a host sender (`host:<id>`)
+  is none, since it gets no `work_resolve` in this version (design I.4.5).
+  `resolved` is omitted before the task is resolved, never `null` (a
+  reader refuses `null`), and appears on `failed` and `completed` statuses
+  only. Its shape is **Atem's choice, for Astation to confirm**: the design
+  says only that "the resolver and the time are recorded".
 - `receipt_id` is the id of the task's current attempt (design I.6.4): a
   new dispatch after an attempt proven side-effect-free has a new one. It is
   opaque to a client, which compares it with nothing; a client that
@@ -1208,5 +1215,16 @@ request the host can't take has (§1, §7), unlike `control_records`, which is
 a session op (§11, `unsupported_version`). Nothing is queued or recorded
 (**Atem's choice of code, for Astation to confirm**).
 
+**Compatibility: enable `host.delegated` together.** `WorkStatus` denies
+unknown fields, so every reader released before `resolved` existed (Atem's
+own earlier clients and every SDK built from them) rejects a `work` result
+that carries it as a malformed result and drops the channel. A host
+therefore writes `resolved` only behind `host.delegated`, and Atem and
+Astation enable `host.delegated` together, once every reader that can query
+a task knows `resolved` (controller ruling T17b). `receipt_id` and
+`failed.detail` change nothing for an old reader: the first is still a UUID
+v4, the second a status `detail` of at most 1024 bytes.
+
 Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
-invalid, and `work` results with `resolved`).
+invalid, and `work` results with `resolved`: each kind of resolver, a bare
+or unknown one, and `null`).

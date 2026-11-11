@@ -549,8 +549,13 @@ pub struct WorkStatus {
     pub detail: String,
     pub result: Option<ContextSnapshot>,
     /// Who resolved the task and when, once `work_resolve` (or the host's
-    /// own `atem task resolve`) has; omitted until then (`host.delegated`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// own `atem task resolve`) has; omitted until then, never `null`
+    /// (`host.delegated`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     pub resolved: Option<Resolved>,
 }
 
@@ -569,9 +574,21 @@ impl WorkStatus {
     }
 }
 
-/// `resolved{by, at}`: the principal that resolved a task (`member:<id>`,
-/// `service:<id>`, or `local` for the host's own command) and the host's
-/// wall clock then, Unix ms.
+/// An optional field that is omitted when absent: `null` is no value
+/// (strict I-JSON, "absent fields are omitted").
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// `resolved{by, at}`: the principal that resolved a task and the host's
+/// wall clock then, Unix ms. `by` is `member:<id>`, `service:<id>` or
+/// `browser:<grant_id>` (an id of 1-128 bytes, as a message's sender is), or
+/// `local` for the host's own command. A host sender (`host:`) has no
+/// `work_resolve` (design I.4.5), so it is never one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resolved {
@@ -581,7 +598,11 @@ pub struct Resolved {
 
 impl Resolved {
     pub fn valid(&self) -> bool {
-        is_opaque_id(&self.by) && self.at <= MAX_SAFE_INTEGER
+        (self.by == "local"
+            || ["member:", "service:", "browser:"]
+                .iter()
+                .any(|prefix| self.by.strip_prefix(prefix).is_some_and(is_opaque_id)))
+            && self.at <= MAX_SAFE_INTEGER
     }
 }
 
@@ -886,6 +907,16 @@ mod tests {
                 .iter()
                 .any(|c| c["result"]["result"]["reply"]["dropped"] == true)
         );
+        // A `resolved` that is `null` is refused, as the resolvers that
+        // aren't principals.
+        for name in ["work_resolved_null", "work_resolved_by_a_bare_id"] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == false),
+                "{name}"
+            );
+        }
         // Work results too: a task's current attempt and a resolved task.
         assert!(
             cases.iter().any(
@@ -1634,7 +1665,20 @@ mod tests {
             work_answer(&query, work)
         };
         let by = |by: &str, at: u64| Some(Resolved { by: by.into(), at });
-        for who in ["member:dev-phone", "service:svc-bot", "local"] {
+        // The resolver is a principal (`member:`, `service:` or `browser:`
+        // and an id of 1-128 bytes) or the host's own `local`.
+        let long_id = "x".repeat(128);
+        for who in [
+            "member:dev-phone",
+            "service:svc-bot",
+            "browser:grant-1",
+            "local",
+            "member:x",
+            &format!("member:{long_id}"),
+            &format!("service:{long_id}"),
+            &format!("browser:{long_id}"),
+            "member:a.b_c:d-e",
+        ] {
             assert!(build(WorkState::Failed, by(who, 1)).is_ok(), "{who}");
         }
         assert!(
@@ -1651,8 +1695,32 @@ mod tests {
                 WorkState::Failed,
                 by("member: x", 1),
             ),
+            ("a bare id", WorkState::Failed, by("x", 1)),
+            ("a prefix and no id", WorkState::Failed, by("member:", 1)),
+            ("an unknown prefix", WorkState::Failed, by("whatever:y", 1)),
             (
-                "a resolver too long",
+                "a host sender (it has no work_resolve)",
+                WorkState::Failed,
+                by("host:host-a", 1),
+            ),
+            (
+                "a prefix of another case",
+                WorkState::Failed,
+                by("Member:x", 1),
+            ),
+            ("local with an id", WorkState::Failed, by("local:x", 1)),
+            (
+                "a prefix with a space",
+                WorkState::Failed,
+                by("service:a b", 1),
+            ),
+            (
+                "an id over 128 bytes",
+                WorkState::Failed,
+                by(&format!("member:{}", "x".repeat(129)), 1),
+            ),
+            (
+                "a resolver over 128 bytes, no prefix",
                 WorkState::Failed,
                 by(&"x".repeat(129), 1),
             ),
@@ -1686,10 +1754,50 @@ mod tests {
             |v: &mut Value| v["work"]["resolved"]["at"] = json!("1"),
             |v: &mut Value| v["work"]["resolved"]["by"] = json!(null),
             |v: &mut Value| v["work"]["resolved"] = json!("local"),
+            // Absent fields are omitted, never `null`.
+            |v: &mut Value| v["work"]["resolved"] = json!(null),
         ] {
             let mut bad = good.clone();
             edit(&mut bad);
             assert!(serde_json::from_value::<ResultBody>(bad).is_err());
         }
+        // Omitted, the status is as before; present, it reads back.
+        let mut omitted = good.clone();
+        omitted["work"].as_object_mut().unwrap().remove("resolved");
+        let ResultBody::Work { work } = serde_json::from_value(omitted).unwrap() else {
+            panic!("work")
+        };
+        assert_eq!(work.resolved, None);
+        assert!(matches!(
+            serde_json::from_value::<ResultBody>(good).unwrap(),
+            ResultBody::Work { work } if work.resolved == by("local", 1)
+        ));
+    }
+
+    /// A status that says `"resolved": null` is no `work` result: the
+    /// host never writes it, and a reader that took it would let an SDK
+    /// drift from "omitted, never null".
+    #[test]
+    fn resolved_null_is_refused() {
+        let task = super::super::new_id();
+        let query = Request::WorkQuery {
+            v: 1,
+            id: super::super::new_id(),
+            host: reply_host(),
+            task_id: task.clone(),
+        };
+        let mut wire = result(
+            &super::super::new_id(),
+            query.id(),
+            query.host(),
+            &super::super::new_id(),
+            "channel",
+            ResultBody::Work {
+                work: work_status(&task, WorkState::Failed),
+            },
+        );
+        assert!(Response::from_data(&wire["data"]).is_ok());
+        wire["data"]["result"]["work"]["resolved"] = json!(null);
+        assert!(Response::from_data(&wire["data"]).is_err());
     }
 }

@@ -2009,6 +2009,282 @@
       }
     },
     {
+      "name": "work_resolved_by_member_with_a_128_byte_id",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "member:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_by_service",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "service:svc-bot",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_by_browser",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "browser:grant-1",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_by_a_bare_id",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "x",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_by_a_prefix_without_an_id",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "member:",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_by_an_id_over_128_bytes",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "member:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_by_an_unknown_prefix",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "whatever:y",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_by_a_host_sender",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": {
+              "by": "host:host-a",
+              "at": 1793620800000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolved_null",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "failed",
+            "detail": "agent exited",
+            "result": null,
+            "resolved": null
+          }
+        }
+      }
+    },
+    {
       "name": "work_resolved_needs_a_resolver",
       "valid": false,
       "result": {
