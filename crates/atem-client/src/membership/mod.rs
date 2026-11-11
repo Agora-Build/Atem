@@ -52,6 +52,7 @@ use crate::signed::SignedObject;
 pub mod capacity;
 pub mod draft;
 pub mod entry;
+pub mod host_senders;
 pub mod projects;
 pub mod publish;
 pub mod service;
@@ -67,6 +68,7 @@ pub use entry::{
     Action, Entry, HostRecord, KBackupRecord, KitMode, Member, MemberKind, RECOVERY_SIGNER, Role,
     RolesChange, Scope,
 };
+pub use host_senders::{HostSenderState, host_sender_readmit, host_sender_revoke};
 pub use projects::{
     MAX_PROJECT_HOSTS, MAX_PROJECT_NAME, MIN_PROJECT_HOSTS, Project, ProjectOp, project_name_ok,
     project_remove, project_set,
@@ -155,6 +157,15 @@ pub enum Invalid {
     BadProject,
     /// A `project_remove` of a name no project in effect has.
     NotAProject,
+    /// A `host_sender_revoke` of a host already `revoked` at `seq-1`
+    /// (II.3.1).
+    AlreadyRevoked,
+    /// A `host_sender_revoke` of a host no `add_host` of the log named
+    /// (current or removed; II.3.1).
+    UnknownHost,
+    /// A `host_sender_readmit` of a host that isn't `revoked` at `seq-1`
+    /// (`authorized`, or never added; II.3.1).
+    NotRevoked,
     /// The log (or its member or host list) is full.
     LogFull,
     /// More than 64 entries or 256 KiB in one carriage.
@@ -197,6 +208,9 @@ impl Invalid {
             Invalid::KBackupKitNotCurrent => "k_backup_kit_not_current",
             Invalid::BadProject => "bad_project",
             Invalid::NotAProject => "not_a_project",
+            Invalid::AlreadyRevoked => "already_revoked",
+            Invalid::UnknownHost => "unknown_host",
+            Invalid::NotRevoked => "not_revoked",
             Invalid::LogFull => "log_full",
             Invalid::CarriageTooLarge => "carriage_too_large",
         }
@@ -473,6 +487,21 @@ pub enum Effect {
     ProjectRemoved {
         name: String,
     },
+    /// The host was revoked as a sender by the entry at `seq` (II.3.1):
+    /// host-work cancels its unstarted tasks (`sender revoked`) and, with
+    /// `interrupt_running`, writes an interrupt intent for each of its
+    /// started ones, in step 4.
+    HostSenderRevoked {
+        host_id: String,
+        seq: u64,
+        interrupt_running: bool,
+    },
+    /// The host was readmitted as a sender by the entry at `seq`: it is
+    /// `authorized(seq)` again, for work signed at or after `seq` only.
+    HostSenderReadmitted {
+        host_id: String,
+        seq: u64,
+    },
     /// Atem's veto at the head was replaced by an equivalent one (§R9.4 row 1).
     VetoReplaced(Head),
     Evidence(EvidenceReason),
@@ -496,8 +525,8 @@ struct HostState {
 }
 
 /// What follows from a chain prefix: members, hosts, keys, the newest K
-/// backup, projects. Pure function of the entries and the recorded
-/// decisions.
+/// backup, projects, host senders. Pure function of the entries and the
+/// recorded decisions.
 #[derive(Debug, Clone, PartialEq)]
 struct Derived {
     members: BTreeMap<String, MemberState>,
@@ -509,6 +538,7 @@ struct Derived {
     pending_keys: Vec<(Hash32, PublicKey)>,
     k_backup: Option<KBackupRecord>,
     projects: projects::Projects,
+    host_senders: host_senders::HostSenders,
 }
 
 impl Derived {
@@ -537,6 +567,7 @@ impl Derived {
             pending_keys: Vec::new(),
             k_backup: None,
             projects: projects::Projects::default(),
+            host_senders: host_senders::HostSenders::default(),
         }
     }
 
@@ -597,12 +628,14 @@ impl Derived {
                         removed: false,
                     },
                 );
+                self.host_senders.host_added(&host.host_id, entry.seq);
             }
             Action::RemoveHost { host_id } => {
                 if let Some(host) = self.hosts.get_mut(host_id) {
                     host.removed = true;
                 }
                 self.projects.host_removed(host_id);
+                self.host_senders.host_removed(host_id);
             }
             Action::SetRecoveryKey { recovery_key, kit } => {
                 self.used_keys.push(recovery_key.clone());
@@ -615,6 +648,12 @@ impl Derived {
             Action::KBackup(record) => self.k_backup = Some(record.clone()),
             Action::ProjectSet { project } => self.projects.set(project),
             Action::ProjectRemove { name } => self.projects.remove(name),
+            Action::HostSenderRevoke { host_id, .. } => {
+                self.host_senders.revoke(host_id, entry.seq);
+            }
+            Action::HostSenderReadmit { host_id } => {
+                self.host_senders.readmit(host_id, entry.seq);
+            }
         }
     }
 
@@ -1107,6 +1146,22 @@ impl Membership {
                     return Err(Invalid::NotAProject);
                 }
             }
+            // II.3.1: a revoke needs an `add_host` of the host in the log
+            // (current or removed) and `authorized` at `seq-1`; a readmit
+            // needs `revoked` at `seq-1`.
+            Action::HostSenderRevoke { host_id, .. } => match d.host_senders.state(host_id) {
+                None => return Err(Invalid::UnknownHost),
+                Some(HostSenderState::Revoked { .. }) => return Err(Invalid::AlreadyRevoked),
+                Some(HostSenderState::Authorized { .. }) => {}
+            },
+            Action::HostSenderReadmit { host_id } => {
+                if !matches!(
+                    d.host_senders.state(host_id),
+                    Some(HostSenderState::Revoked { .. })
+                ) {
+                    return Err(Invalid::NotRevoked);
+                }
+            }
         }
         Ok(deferred)
     }
@@ -1175,6 +1230,18 @@ impl Membership {
             Action::ProjectRemove { name } => {
                 effects.push(Effect::ProjectRemoved { name: name.clone() })
             }
+            Action::HostSenderRevoke {
+                host_id,
+                interrupt_running,
+            } => effects.push(Effect::HostSenderRevoked {
+                host_id: host_id.clone(),
+                seq: head.seq,
+                interrupt_running: *interrupt_running,
+            }),
+            Action::HostSenderReadmit { host_id } => effects.push(Effect::HostSenderReadmitted {
+                host_id: host_id.clone(),
+                seq: head.seq,
+            }),
             _ => {}
         }
         let pending = entry.action.is_pending_type();

@@ -106,6 +106,11 @@ impl Action {
             Action::KBackup(record) => json!({"k_backup": record.to_json()}),
             Action::ProjectSet { project } => json!({"project": project.to_json()}),
             Action::ProjectRemove { name } => json!({"name": name}),
+            Action::HostSenderRevoke {
+                host_id,
+                interrupt_running,
+            } => json!({"host_id": host_id, "interrupt_running": interrupt_running}),
+            Action::HostSenderReadmit { host_id } => json!({"host_id": host_id}),
         };
         match value {
             Value::Object(map) => map,
@@ -178,9 +183,10 @@ pub fn sign_entry_cosigned(
 }
 
 /// The action as the verifier parses it, for the typed builders (services,
-/// projects): drafted on a placeholder chain position (account, `seq`,
-/// hashes and signer don't affect the action's own rules) at `signed_at`
-/// (a service's expiry bound counts from it), then [`check_body`].
+/// projects, host senders): drafted on a placeholder chain position
+/// (account, `seq`, hashes and signer don't affect the action's own rules)
+/// at `signed_at` (a service's expiry bound counts from it), then
+/// [`check_body`].
 pub(super) fn verified(action: Action, signed_at: u64) -> Result<Action, Invalid> {
     let body = draft_on(
         "draft-check",

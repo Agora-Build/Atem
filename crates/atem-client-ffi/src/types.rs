@@ -252,6 +252,10 @@ data_enum! {
         /// service's last grant (its add, or a change that granted
         /// something new; signed at `last_signed_at`): retry at `retry_at`.
         ServiceChangeTooSoon { last_signed_at: u64, retry_at: u64 },
+        /// A `host_sender_revoke` of a host already revoked.
+        AlreadyRevoked,
+        /// A `host_sender_readmit` of a host that isn't revoked.
+        NotRevoked,
     }
 }
 
@@ -295,6 +299,8 @@ data_enum! {
         KBackupRecorded { blob_version: u64 },
         ProjectSet { name: String },
         ProjectRemoved { name: String },
+        HostSenderRevoked { host_id: String, seq: u64, interrupt_running: bool },
+        HostSenderReadmitted { host_id: String, seq: u64 },
         VetoReplaced { head: LogHead },
         Evidence { reason: String },
         Frozen,

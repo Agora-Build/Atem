@@ -6,7 +6,8 @@
 //! §R9.1), the fixed algorithm of every key inside it (`auth_key` P-256 or
 //! Ed25519, `enc_key` X25519, `host_key` and `recovery_key` Ed25519), id
 //! syntax, roles, scope and service expiry, a project's shape
-//! ([`super::projects`]), and who may sign which action.
+//! ([`super::projects`]), a host sender's revoke and readmit
+//! ([`super::host_senders`]), and who may sign which action.
 //! Rules that need the chain (signer authority, ids never reused, version
 //! floors) are [`super::Membership`]'s.
 use std::collections::BTreeSet;
@@ -205,6 +206,18 @@ pub enum Action {
     ProjectRemove {
         name: String,
     },
+    /// Revokes the host `host_id` as a sender (delegated host-work design
+    /// II.3.1); `interrupt_running` asks for interrupt intents for its
+    /// started tasks.
+    HostSenderRevoke {
+        host_id: String,
+        interrupt_running: bool,
+    },
+    /// Authorizes a revoked host as a sender again, for work signed at or
+    /// after this entry only (II.3.1).
+    HostSenderReadmit {
+        host_id: String,
+    },
 }
 
 impl Action {
@@ -223,6 +236,8 @@ impl Action {
             Action::KBackup(_) => "k_backup",
             Action::ProjectSet { .. } => "project_set",
             Action::ProjectRemove { .. } => "project_remove",
+            Action::HostSenderRevoke { .. } => "host_sender_revoke",
+            Action::HostSenderReadmit { .. } => "host_sender_readmit",
         }
     }
 
@@ -284,7 +299,8 @@ impl Entry {
             "remove" => &["device_id"],
             "set_roles" => &["device_id", "roles", "scope", "expires_at"],
             "add_host" => &["host"],
-            "remove_host" => &["host_id"],
+            "remove_host" | "host_sender_readmit" => &["host_id"],
+            "host_sender_revoke" => &["host_id", "interrupt_running"],
             "set_recovery_key" => &["recovery_key", "kit"],
             "recovery_approve" | "recovery_veto" => &["target"],
             "k_backup" => &["k_backup"],
@@ -396,15 +412,9 @@ impl Entry {
                     },
                 }
             }
-            "remove_host" => {
-                let host_id = str_field(body, "host_id")?;
-                if !id_ok(host_id) {
-                    return Err(Invalid::Malformed("host_id"));
-                }
-                Action::RemoveHost {
-                    host_id: host_id.to_owned(),
-                }
-            }
+            "remove_host" => Action::RemoveHost {
+                host_id: host_id(body)?,
+            },
             "set_recovery_key" => Action::SetRecoveryKey {
                 recovery_key: key(field(body, "recovery_key")?, &[Alg::Ed25519])?,
                 kit: match str_field(body, "kit")? {
@@ -452,6 +462,15 @@ impl Entry {
             },
             "project_remove" => Action::ProjectRemove {
                 name: project_name(str_field(body, "name")?)?,
+            },
+            "host_sender_revoke" => Action::HostSenderRevoke {
+                host_id: host_id(body)?,
+                interrupt_running: field(body, "interrupt_running")?
+                    .as_bool()
+                    .ok_or(Invalid::Malformed("interrupt_running"))?,
+            },
+            "host_sender_readmit" => Action::HostSenderReadmit {
+                host_id: host_id(body)?,
             },
             _ => unreachable!("matched above"),
         };
@@ -553,6 +572,16 @@ fn key(value: &Value, algs: &[Alg]) -> Result<PublicKey, Invalid> {
         return Err(Invalid::from(Error::WrongAlg));
     }
     Ok(key)
+}
+
+/// The body's `host_id` (`remove_host`, `host_sender_revoke`,
+/// `host_sender_readmit`): an opaque id.
+fn host_id(body: &Map<String, Value>) -> Result<String, Invalid> {
+    let host_id = str_field(body, "host_id")?;
+    if !id_ok(host_id) {
+        return Err(Invalid::Malformed("host_id"));
+    }
+    Ok(host_id.to_owned())
 }
 
 fn device_id(value: &Value) -> Result<String, Invalid> {
