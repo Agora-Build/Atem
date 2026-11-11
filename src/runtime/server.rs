@@ -699,12 +699,18 @@ impl Server {
 
     fn insert_session(&mut self, session: BrokerSession) {
         let sid = session.id.clone();
+        if let Some(bridge) = self.bridge.as_mut() {
+            bridge.session_added(&sid);
+        }
         if self.sessions.insert(sid.clone(), session).is_none() {
             self.order.push(sid);
         }
     }
 
     fn remove_session(&mut self, sid: &SessionId) {
+        if let Some(bridge) = self.bridge.as_mut() {
+            bridge.session_removed(sid);
+        }
         self.sessions.remove(sid);
         self.order.retain(|id| id != sid);
         super::collab::remove_tags(self.options.launcher.state(), sid.as_str());
