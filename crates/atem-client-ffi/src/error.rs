@@ -228,6 +228,19 @@ impl From<atem_client::push::Refusal> for AtemError {
     }
 }
 
+impl From<atem_client::control::ControlError> for AtemError {
+    /// A record its parse refuses (delegated host-work I.5.3):
+    /// `Invalid{code}` with the signed-object layer's code, or
+    /// `wrong_type`, `unknown_field`, `malformed`, `field_not_allowed`,
+    /// `not_for_host_principal`; `detail` names the field.
+    fn from(e: atem_client::control::ControlError) -> Self {
+        AtemError::Invalid {
+            code: e.code().into(),
+            detail: e.to_string(),
+        }
+    }
+}
+
 impl From<Invalid> for AtemError {
     fn from(reason: Invalid) -> Self {
         AtemError::membership(&reason, None)

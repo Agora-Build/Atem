@@ -26,6 +26,9 @@
 //!   (`project_set`, `project_remove`, `host_sender_revoke`,
 //!   `host_sender_readmit`, `host_enc_key`): their builders, the host's
 //!   `enc_sig` check and the log's queries over the state they derive;
+//! - [`control`]: control records of delegated host work (build, parse,
+//!   verify) and the reference control state with its per-effect results,
+//!   production exports for Station builders;
 //! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
@@ -43,6 +46,7 @@ uniffi::setup_scaffolding!();
 mod macros;
 
 pub mod connection;
+pub mod control;
 pub mod encoding;
 pub mod error;
 pub mod host_actions;

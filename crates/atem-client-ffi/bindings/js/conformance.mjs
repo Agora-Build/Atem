@@ -459,6 +459,129 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
   }
 });
 
+// ---------------------------------- delegated host work: control records
+// r9-vectors-host-work-control: every record parses and verifies on each of
+// its chains as `checks` says (or its parse refuses it, `parse_error`); the
+// builders reproduce it byte for byte (a software store, or the signing
+// input and a signature: a Station's KMS or WebCrypto); every sequence runs
+// through a ControlStateHandle with each step's per-effect results and the
+// state it leaves, which loads again only for its own device list.
+const ctl = load("r9-vectors-host-work-control");
+const ctlByLabel = Object.fromEntries(ctl.records.map((r) => [r.label, r]));
+const CONTROL_FIELDS = ["type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key", "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about"];
+// The typed body of a record's body JSON (null: a field the body doesn't have).
+const controlBodyOf = (b) => {
+  if (!Object.keys(b).every((k) => CONTROL_FIELDS.includes(k))) return null;
+  const opt = (v) => (v === undefined ? null : v);
+  return {
+    accountId: b.account_id,
+    genesisHash: b.genesis_hash,
+    origin: opt(b.origin),
+    feedId: opt(b.feed_id),
+    principal: b.principal,
+    principalKey: opt(b.principal_key),
+    signer: b.signer,
+    action: b.action,
+    interruptRunning: opt(b.interrupt_running),
+    revokeSeq: opt(b.revoke_seq),
+    recordId: b.record_id,
+    issuedAt: b.issued_at,
+    integrationId: opt(b.about.integration_id),
+    by: b.about.by,
+  };
+};
+// A test key by name: a member's auth key, or a host's host_key.
+const testKey = (name) => {
+  const k = keys[name].auth ?? keys[name].host_key;
+  return { alg: k.alg, pub: unhex(k.pub_hex), secret: unhex(k.secret_hex) };
+};
+const verdictOf = (chain, got) => {
+  if (got.type !== "valid") return { chain, verdict: got.type, reason: got.reason };
+  const v = { chain, verdict: "valid", signer: got.signer };
+  if (got.keySeq !== null && got.keySeq !== undefined) v.key_seq = got.keySeq;
+  return v;
+};
+check("control records: every record parses and verifies on its chains as the vectors say", () => {
+  let verdicts = 0;
+  const svc = ctl.services["svc-discord"].auth_key;
+  for (const r of ctl.records) {
+    const json = str(r.record);
+    if (r.parse_error !== undefined) {
+      throwsCode(() => m.parseControlRecord(json), r.parse_error);
+      throwsCode(() => m.verifyControlRecord(logL(), json), r.parse_error);
+      continue;
+    }
+    same(m.parseControlRecord(json), controlBodyOf(r.record.body), `${r.label} body`);
+    const info = m.signedObjectInfo(json);
+    eq(info.bodyJcs, r.jcs, r.label);
+    eq(hex(info.signingInput), r.signing_input_hex, r.label);
+    eq(hex(m.signingInput("host_work_control", utf8(r.jcs))), r.signing_input_hex, r.label);
+    if (r.r9_svc !== undefined) {
+      eq(m.serviceKeyFingerprint(svc.alg, b64u(svc.pub)), r.r9_svc, r.label);
+      eq(r.record.body.principal_key === r.r9_svc, r.checks[0].reason !== "key_mismatch", `${r.label} principal_key`);
+    }
+    for (const c of r.checks) {
+      const log = logAfter(c.chain);
+      const got = m.verifyControlRecord(log, json);
+      same(verdictOf(c.chain, got), c, `${r.label} on ${c.chain}`);
+      if (got.type === "valid") eq(got.head, log.head(), r.label);
+      verdicts++;
+    }
+  }
+  if (verdicts < 41) throw new Error(`${verdicts} verdicts`);
+});
+check("control records: the builders reproduce every record; a body the parse refuses is refused", () => {
+  let built = 0;
+  for (const r of ctl.records) {
+    const body = controlBodyOf(r.record.body);
+    if (body === null) {
+      eq(r.parse_error, "unknown_field", r.label);
+      continue;
+    }
+    const key = testKey(r.signed_with);
+    const store = new m.SoftwareKeyStore();
+    if (key.alg === "p256") store.insertP256("k", key.secret);
+    else store.insertEd25519("k", key.secret);
+    if (r.parse_error !== undefined) {
+      throwsCode(() => m.buildControlRecord(store, "k", body), r.parse_error);
+      throwsCode(() => m.controlRecordSigningInput(body), r.parse_error);
+      continue;
+    }
+    eq(hex(m.controlRecordSigningInput(body)), r.signing_input_hex, r.label);
+    const sig = b64u(r.record.sig);
+    if (r.checks[0].reason === "bad_signature") {
+      throwsCode(() => m.controlRecordWithSignature(body, key.alg, key.pub, sig), "bad_signature");
+      continue;
+    }
+    const canonical = m.canonicalJson(str(r.record));
+    eq(m.controlRecordWithSignature(body, key.alg, key.pub, sig), canonical, r.label);
+    eq(m.buildControlRecord(store, "k", body), canonical, r.label);
+    built++;
+  }
+  if (built < 33) throw new Error(`${built} built`);
+  // A field the body doesn't name (here snake_case) is refused, never dropped.
+  throwsCode(() => m.controlRecordSigningInput({ ...controlBodyOf(ctl.records[0].record.body), feed_id: "x" }), "malformed");
+});
+const controlActionOut = ({ feedId, ...rest }) => (feedId === undefined ? rest : { ...rest, feed_id: feedId });
+check("control records: every sequence's per-effect results and its state through ControlStateHandle", () => {
+  for (const q of ctl.sequences) {
+    const state = new m.ControlStateHandle(logL());
+    q.steps.forEach((step, i) => {
+      const pos = step.pos === undefined ? null : { feedId: step.pos.feed_id, feedSeq: step.pos.feed_seq };
+      const got = state.apply(str(ctlByLabel[step.record].record), logAfter(step.chain), pos, step.host_applied_seq);
+      same({ ...got, actions: got.actions.map(controlActionOut) }, step.expect, `${q.label} step ${i + 1}`);
+    });
+    const text = m.canonicalJson(str(q.state));
+    eq(state.toJson(), text, q.label);
+    eq(m.ControlStateHandle.fromJson(logL(), text).toJson(), text, q.label);
+  }
+  // Only its own device list's state, exactly as written.
+  const text = m.canonicalJson(str(ctl.sequences[0].state));
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"acct-test-1"', '"acct-other"')), "account_mismatch");
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"v":1', '"v":2')), "unsupported_version");
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), "["), "malformed");
+});
+
 // ---------------------------------------------------------------- recovery
 const kit1 = () => m.RecoveryKit.read(unhex(rec.R_hex), rec.kit.account_id, rec.kit.genesis_hash, unhex(rec.kit.kit_tag_hex));
 check("kit 1: tag, recovery key, X25519 key", () => {

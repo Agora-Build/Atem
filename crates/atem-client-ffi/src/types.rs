@@ -57,12 +57,22 @@ unit_enum! {
         /// `retire_previous`: the key it replaces stops opening mail at
         /// once). Not the host's own `enc_sig`, which is `HostSigning`.
         HostEncKey,
-        /// A control record (`atem-host-work-control`, delegated host-work
-        /// I.5.3): a signed stop of a service or a host sender. A native
-        /// manager signs only `revoke` and `interrupt_running` (show the
-        /// principal, the action and `interrupt_running`); the principal's
-        /// own key (a Station's, for a service it hosts) may sign any action.
+        /// A native manager's control record (`atem-host-work-control`,
+        /// delegated host-work I.5.3, `signer` `member:<device_id>`): a
+        /// signed stop of a service or a host sender, `revoke` or
+        /// `interrupt_running` only. A fresh confirmation of the exact body:
+        /// show the principal, the action and `interrupt_running`; for a
+        /// host principal (`host:<host_id>`), the host and the `revoke_seq`
+        /// of the device-list revoke it follows.
         ControlRecord,
+        /// A control record signed with the principal's own service key
+        /// (`signer` equal to `principal`, `service:<id>`): the Station that
+        /// hosts the integration signs it on its own, from the Portal's
+        /// feed (`cover`, `hold`, `release`, `revoke`,
+        /// `interrupt_running`). No owner confirmation; never asked of a
+        /// native member's key (a native app's provider refuses it: such a
+        /// signature would never verify).
+        ServiceControl,
         /// `recovery_add`, `recovery_approve`, `recovery_veto`.
         Recovery,
         /// `set_recovery_key` and the current kit's co-signature.
@@ -79,9 +89,13 @@ unit_enum! {
 
 impl SigningPurpose {
     /// Whether R9.6 rule 4 asks for a fresh confirmation (everything but the
-    /// channel signature and host signing).
+    /// channel signature, host signing and a service key's own control
+    /// records).
     pub fn needs_fresh_confirmation(self) -> bool {
-        !matches!(self, SigningPurpose::Channel | SigningPurpose::HostSigning)
+        !matches!(
+            self,
+            SigningPurpose::Channel | SigningPurpose::HostSigning | SigningPurpose::ServiceControl
+        )
     }
 }
 
@@ -95,6 +109,9 @@ unit_enum! {
         Seen,
         ChannelHost,
         ChannelClient,
+        /// `atem-host-work-control-v1`: control records (delegated host
+        /// work I.5.3).
+        HostWorkControl,
     }
 }
 
@@ -812,5 +829,160 @@ data_enum! {
         /// The attachment is over (`unauthorized`/`account_frozen` without
         /// `re`): the channel is closed; reconnect to learn more.
         Fenced { code: String, detail: Option<String>, json: String },
+    }
+}
+
+// ------------------------------------- control records (delegated host work)
+
+record! {
+    /// A control record's body (`atem-host-work-control`, delegated host
+    /// work I.5.3; host-work-v1 §11.1), field by field. Absent fields are
+    /// `None` and omitted from the body. A service's record (`principal`
+    /// `service:<id>`) has `origin`, `feed_id`, `principal_key` (the
+    /// integration's `r9Svc`: `service_key_fingerprint` of its `auth_key`)
+    /// and `integration_id`; a host principal's (`host:<host_id>`) is
+    /// `interrupt_running` only, with `revoke_seq` and none of those.
+    /// `interrupt_running` is present exactly on `revoke`.
+    pub struct ControlRecordBody {
+        pub account_id: String,
+        /// Lowercase hex.
+        pub genesis_hash: String,
+        /// The Station's exact origin (`https://…`).
+        pub origin: Option<String>,
+        /// The Station feed's UUID v4.
+        pub feed_id: Option<String>,
+        /// `service:<device_id>` or `host:<host_id>`.
+        pub principal: String,
+        /// Lowercase hex SHA-256 of the principal's `auth_key` bytes.
+        pub principal_key: Option<String>,
+        /// The principal itself, or `member:<device_id>` (a native manager).
+        pub signer: String,
+        /// `cover`, `revoke`, `hold`, `release` or `interrupt_running`.
+        pub action: String,
+        pub interrupt_running: Option<bool>,
+        /// A host principal's: the `seq` of its `host_sender_revoke`.
+        pub revoke_seq: Option<u64>,
+        /// A fresh UUID v4: the record's identity, kept before it is sent.
+        pub record_id: String,
+        /// Milliseconds since the epoch (orders covers, ruling T11a).
+        pub issued_at: u64,
+        /// `about.integration_id`: Auth's client id (`i-…`).
+        pub integration_id: Option<String>,
+        /// `about.by`: a label of 1 to 32 characters of `[a-z_]`; display
+        /// only (an unknown value is accepted).
+        pub by: String,
+    }
+}
+
+data_enum! {
+    /// A record against a device list (`verify_control_record`, I.5.4).
+    pub enum ControlCheckInfo {
+        /// Signed by a key allowed to sign it: the verified `signer`
+        /// (`service:<id>` for the principal's own key, from the entry at
+        /// `key_seq`; `member:<device_id>` for a current native manager), at
+        /// the list's `head`.
+        Valid {
+            signer: String,
+            key_seq: Option<u64>,
+            head: LogHead,
+        },
+        /// Not verifiable yet (`principal_unknown`, `signer_unknown`,
+        /// `revoke_not_in_list`): keep it and verify again after every
+        /// device-list advance.
+        Pending { reason: String },
+        /// Refused against this list (`wrong_account`, `bad_signature`,
+        /// `key_mismatch`, `signer_not_allowed`, `removed_manager`,
+        /// `host_key_signed`, `not_a_service`, `not_a_revoke`): keep it as
+        /// evidence.
+        Refused { reason: String },
+    }
+}
+
+unit_enum! {
+    /// An application result (I.5.8): of a record, or of one effect.
+    pub enum ControlResultKind {
+        /// This record put the effect in force on this host.
+        Applied,
+        /// The host already had it in force (for the revocation: "already
+        /// in force on this host", decision 8).
+        Duplicate,
+        /// Not in force yet; apply the record again later.
+        Pending,
+        /// Not in force, and never from this record.
+        Refused,
+    }
+}
+
+unit_enum! {
+    /// One effect a record carries (I.5.8).
+    pub enum ControlEffectKind {
+        /// The principal's revocation.
+        Revocation,
+        /// The interrupt for that revocation.
+        Interrupt,
+        Hold,
+        Release,
+        Cover,
+    }
+}
+
+record! {
+    /// One effect's result.
+    pub struct ControlEffectResult {
+        pub effect: ControlEffectKind,
+        pub result: ControlResultKind,
+    }
+}
+
+data_enum! {
+    /// What the host does in the transaction that applies a record (I.5.5).
+    /// Principals are named in full (`service:<id>`, `host:<host_id>`).
+    pub enum ControlHostAction {
+        /// Refuse the service's requests, fence it, cancel its unstarted
+        /// tasks.
+        Revoke { principal: String },
+        /// An interrupt intent for each started task of `principal`
+        /// admitted before `revocation` (the revoking record's `record_id`,
+        /// or a host principal's `revoke_seq` in decimal).
+        Interrupt {
+            principal: String,
+            revocation: String,
+        },
+        /// Hold its unstarted tasks.
+        Hold { principal: String },
+        /// Let them run again.
+        Release { principal: String },
+        /// Its future tasks are delegated under `origin`'s gate, from the
+        /// feed `feed_id`.
+        Cover {
+            principal: String,
+            origin: String,
+            feed_id: String,
+        },
+    }
+}
+
+record! {
+    /// What `ControlStateHandle::apply` did with one record.
+    pub struct ControlApplied {
+        /// The record's result: `applied` when any effect is, `duplicate`
+        /// when every effect is, else `pending` or `refused`. Read
+        /// `effects`, not only this.
+        pub result: ControlResultKind,
+        /// Every effect the record carries, with its result.
+        pub effects: Vec<ControlEffectResult>,
+        /// What the host does, in the same transaction.
+        pub actions: Vec<ControlHostAction>,
+        /// Keep the record as evidence and alert (I.5.4).
+        pub evidence: bool,
+    }
+}
+
+record! {
+    /// Where a record was read: its feed's `feed_id` and its position
+    /// (`feed_seq`). None over a channel.
+    pub struct ControlFeedPos {
+        pub feed_id: String,
+        pub feed_seq: u64,
     }
 }

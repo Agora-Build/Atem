@@ -48,15 +48,18 @@ launch token scopes and HTTP adapters remain Station/Auth/Portal integration
 work; `agent.prompt` alone does not authorize creating a process.
 
 Every production SDK artifact includes
-`atem-client-<version>-host-work-requests-v1.json` and
-`atem-client-<version>-host-work-prompt-framing-v1.json` in its SHA-256
+`atem-client-<version>-host-work-requests-v1.json`,
+`atem-client-<version>-host-work-prompt-framing-v1.json` and
+`atem-client-<version>-r9-vectors-host-work-control.json` in its SHA-256
 manifest. These are the shared positive/negative request vectors from
-`fixtures/host-work/requests-v1.json` and the prompt framing's vectors from
+`fixtures/host-work/requests-v1.json`, the prompt framing's vectors from
 `fixtures/host-work/prompt-framing-v1.json` (tags, escaping, rendered prompts
 and the size check; delegated host-work design III.2), both run by the Rust
-core's tests. They are fixture data, not an additional binding export or a
-live integration test: the framing runs on the host (`session::framing`), and
-no binding exports it yet.
+core's tests, and the control records' vectors from
+`fixtures/r9-vectors-host-work-control.json` (§9), run by the Rust core's
+tests and every conformance suite. The first two are fixture data, not an
+additional binding export or a live integration test: the framing runs on
+the host (`session::framing`), and no binding exports it yet.
 
 Status: built and released in Atem v0.8.0 (2026-10-31);
 Astation integrates the bindings, and the joint live tests passed. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
@@ -527,6 +530,17 @@ key, `verify_host_enc_sig` on every `enc_sig` whose binding fields parse,
 and (Kotlin and Swift, whose providers see the request) the signing
 purposes.
 
+### Control records (delegated host work; planned)
+
+`build_control_record`, `control_record_signing_input`,
+`control_record_with_signature`, `parse_control_record`,
+`verify_control_record` and `ControlStateHandle`: the signed stops a
+Station issues for the integrations it hosts and a native manager signs
+for a service or a host sender. Production exports for Station builders:
+§9. An app (Astation) signs a native manager's `revoke` or
+`interrupt_running` with `build_control_record` under purpose
+`ControlRecord` (§3).
+
 ### Encoding helpers
 
 `canonical_json`, `encode_fields`, `hash_fields` (SHA-256 of `enc`),
@@ -578,14 +592,17 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
   | `Project` | `project_set`, `project_remove`: a project grant, which hosts may send each other which ops (show the name, hosts and ops, or the removal) | fresh |
   | `HostSender` | `host_sender_revoke`, `host_sender_readmit`: stop (with `interrupt_running`, also interrupt what it started) or resume accepting one host as a sender of host work | fresh |
   | `HostEncKey` | `host_enc_key`: install the encryption key a host vouched for, which other hosts seal mail to (show the host, its trust generation, the key's `enc_kid` and `retire_previous`) | fresh |
+  | `ControlRecord` | a native manager's control record (`signer` `member:<device_id>`): `revoke` or `interrupt_running` of a service or a host sender (show the principal, the action and `interrupt_running`; for a host principal, the host and the `revoke_seq` of the device-list revoke it follows) | fresh |
+  | `ServiceControl` | a control record signed with the principal's own service key (`signer` equal to a `service:` principal): the Station that hosts the integration signs it on its own, from the Portal's feed (§9) | none; never asked of a native member's key (refuse it: such a signature would never verify) |
   | `Recovery` | `recovery_add`, `recovery_approve`, `recovery_veto` | fresh |
   | `Kit` | `set_recovery_key`, the current kit's co-signature | fresh |
   | `KeyBackup` | `k_backup` | fresh (decision: a manager entry like the others) |
   | `BrowserGrant` | a browser grant | fresh |
   | `HostSigning` | `sig_h`, push hints, seens, a host's `enc_sig` | never asked of a client |
 
-  `fresh_confirmation` is true for every purpose but `Channel` and
-  `HostSigning`. A fresh confirmation covers exactly `body_json` (show the
+  `fresh_confirmation` is true for every purpose but `Channel`,
+  `HostSigning` and `ServiceControl`. A control record's purpose comes from
+  the signer its body names, never from the key asked. A fresh confirmation covers exactly `body_json` (show the
   account, head and seq, applicant keys, roles, scope, expiry); a changed
   body needs a new one; never in the background or a notification
   extension. Managers' keys always need owner authentication (biometrics
@@ -623,7 +640,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 
 | variant | `code` (stable) |
 |---|---|
-| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body; `malformed` for a `HostClock` time above 2^53 − 1 |
+| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body; `malformed` for a `HostClock` time above 2^53 − 1; for a control record its parse refuses (§9), also `wrong_type`, `unknown_field`, `field_not_allowed`, `not_for_host_principal` (`detail` names the field) |
 | `Membership{code, detail, index}` | `membership_invalid`; `detail` the verifier's (`bad_signature`, `gap`, `signer_not_manager`, `blob_version_not_increasing`, `kit_sig_missing`, …); `index` into what was passed |
 | `Channel{code, detail}` | `handshake_failed`, `stale_target`, `account_frozen`, `busy` (also as the host's clear, advisory error before the channel opens), `unknown_host`, `record_rejected`, `limit`, `too_large`, `closed`, `signing_failed`, `invalid_hello`, `cannot_carry` (a divergence deeper than any carriage) |
 | `Refused{code, detail, error_json, next}` | the host's session error code (`unauthorized`, `membership_invalid`, `membership_incomplete`, `recovery_pending`, `account_frozen`, `unsupported_version`, `busy`, …) |
@@ -632,7 +649,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 | `Restore{code, detail}` | `kit_tag_mismatch`, `genesis_mismatch`, `membership_invalid`, `no_host_reachable`, `log_behind_host`, `kit_not_current`, `no_backup`, `backup_hash_mismatch`, `backup_invalid` |
 | `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
-| `Stored{code, detail}` | `MembershipLog::from_stored` refused the snapshot: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid` |
+| `Stored{code, detail}` | `MembershipLog::from_stored` (or `ControlStateHandle::from_json`, §9, over 64 MiB) refused the snapshot: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid` |
 | `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
@@ -642,7 +659,8 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 - Every object is thread-safe (an internal lock held only for the call)
   and can be used from several threads at once: `MembershipLog`,
   `ClientConnection`, `EntryPublisher`, `KBackupWriter`, `RestoreSession`,
-  `PushHint`, `PushHintBook`, `RecoveryKitHandle`. Records are values.
+  `PushHint`, `PushHintBook`, `RecoveryKitHandle`, `ControlStateHandle`.
+  Records are values.
 - **No binding lock is held while the app's provider runs.** The calls
   that sign (`ClientConnection::on_accept`, `EntryPublisher::sign`,
   `KBackupWriter::sign`, `issue_browser_grant`, `PushHint::open`) do their
@@ -785,16 +803,17 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (45 checks in JS, 46 in Kotlin and in Swift: the same 45
-  in each language, plus one in Kotlin and Swift, whose provider sees the
-  signing request and so the purposes of the five device-list actions; over
+- **Conformance** (48 checks in JS, 50 in Kotlin and in Swift: the same 48
+  in each language, plus two in Kotlin and Swift, whose provider sees the
+  signing request and so the purposes of the five device-list actions and
+  of control records; over
   `designs/protocol/fixtures/r9-vectors-*.json` and atem-client's own
   `crates/atem-client/vectors/r9-svc-fingerprint.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 45 and 46 above): every
+  checks in JS, five in Kotlin and Swift, of the 48 and 50 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -803,8 +822,20 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   be a key, a generation or an algorithm), and a manager signing each
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
+- **Control records** (`tests/control.rs`, Rust; three conformance checks
+  in JS, four in Kotlin and Swift, of the 48 and 50 above): every record of
+  `r9-vectors-host-work-control` parsed (or refused by the parse with its
+  code) and verified on each of its chains as `checks` says, the builders
+  reproducing it byte for byte (a software store, and the signing input
+  plus the vector's signature; a body the parse refuses is refused, nothing
+  signed), every sequence through a `ControlStateHandle` with each step's
+  per-effect results and the state it leaves, the state loading only for
+  its own device list and exactly as written, and (Kotlin and Swift) the
+  provider asked under `ServiceControl` (no confirmation) for the
+  integration's own key and `ControlRecord` (a fresh confirmation of the
+  body) for a native manager.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 45 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 48 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
@@ -832,3 +863,100 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   `src/session_protocol/membership/fixtures_tests.rs` (real engine, store
   and session host) and `tests/r9_*_binary.rs` (the `atem runtime`
   process).
+
+## 9. For Station builders
+
+A Station that hosts integrations signs control records with their service
+keys, serves them in its control feed and accounts for the hosts'
+acknowledgments (delegated host-work design I.5; `atem-host-work-v1.md`
+§11; **planned**: no host advertises `host.senders` yet). The built-in
+Station uses the `atem-client` crate directly (`atem_client::control`); a
+Station written in another language uses these exports, which are the
+same code and pass the same vectors (`r9-vectors-host-work-control`, run by
+the Rust core and all three conformance suites). They are production
+exports, in the default UniFFI build and in the `wasm`-only package (plan
+decision 6). The acknowledgment ledger and the relay calls join this
+section in a later step.
+
+### Control records
+
+| call | what it does |
+|---|---|
+| `build_control_record(provider, key_id, body)` (Swift, Kotlin) | signs `body` (a `ControlRecordBody`) with `key_id` through the provider and returns the record's wire JSON (canonical). The body is checked first exactly as a host's parse checks it: one it refuses is `Invalid{code}` and nothing is signed. The provider sees purpose `ServiceControl` when `signer` is the principal itself (the integration's service key: no owner confirmation) and `ControlRecord` for `member:<device_id>` (a fresh confirmation, §3) |
+| `control_record_signing_input(body)`, then `control_record_with_signature(body, signer_key, signature)` (all three; JS `controlRecordSigningInput(body)`, `controlRecordWithSignature(body, signerAlg, signerRaw, signature)`) | the same in two steps, for a key that signs elsewhere (a KMS, an HSM, WebCrypto): the bytes to sign, `enc(["atem-host-work-control-v1", jcs(body)])`, then the record. The signature (P-256 64-byte `r‖s`, either S, normalized to low S; Ed25519) is verified under `signer_key` before the record is returned (`bad_signature`; an X25519 key is `wrong_alg`) |
+| `parse_control_record(record_json)` | the body, field by field (strict JSON, at most 16 KiB, exactly the body's fields); no signature check |
+| `verify_control_record(log, record_json)` | against a verified `MembershipLog`: `Valid{signer, key_seq, head}` (`signer` `service:<id>` for the principal's own key, from the entry at `key_seq`; `member:<id>` for a current native manager), `Pending{reason}` (`principal_unknown`, `signer_unknown`, `revoke_not_in_list`: verify again after the list advances) or `Refused{reason}` (`wrong_account`, `bad_signature`, `key_mismatch`, `signer_not_allowed`, `removed_manager`, `host_key_signed`, `not_a_service`, `not_a_revoke`: keep it as evidence). A record the parse refuses is `Invalid{code}` |
+| `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlApplied{result, effects, actions, evidence}` |
+
+JS takes a body as a plain object with `ControlRecordBody`'s fields in
+camelCase (`accountId`, `genesisHash`, `origin`, `feedId`, `principal`,
+`principalKey`, `signer`, `action`, `interruptRunning`, `revokeSeq`,
+`recordId`, `issuedAt`, `integrationId`, `by`), absent ones omitted, `null`
+or `undefined`; any other key is refused (`malformed`), never dropped, and
+`apply`'s `pos` is `{feedId, feedSeq}` or `null`. Only bots and tests get
+`buildControlRecord(store, keyId, body)` (feature `software-keys`).
+
+**The body** (`atem-host-work-control`, host-work-v1 §11.1). A service's
+record names `origin` (the Station's exact origin), `feed_id` (the feed's
+UUID v4: minted with the feed, never reused, not after a restore or a
+migration either), `principal_key` (the integration's `r9Svc`, the
+lowercase hex SHA-256 of its `auth_key`'s raw bytes,
+`service_key_fingerprint`: cross-check it against the Portal feed's value)
+and `integration_id` (Auth's client id). `by` is the Portal feed's
+least-disclosure reason (`owner`, `station`, `agora_build`,
+`member_removed`, `station_removed`, `reconciled`, later
+`account_deleted`); any 1 to 32 characters of `[a-z_]` are accepted for
+display, and nothing is decided by it. `record_id` is a fresh UUID v4 per
+record, a re-signed record included. `issued_at` comes from the Station's
+synchronized clock: it orders covers (below).
+
+**Persistence and the order of calls** (each step durable before the next):
+
+1. Build the record and store it in the feed at its position (`feed_seq`)
+   in one transaction, before you announce the head or report the change
+   to the Portal as propagating (I.5.8, "durable before announced").
+2. If you keep a control state (to predict what hosts report, or to know
+   what a reset's snapshot must re-issue), `apply` the record at its
+   position and store `to_json()` in the same transaction as the feed row.
+   Never rebuild a state by re-applying stored records: a record that
+   verified then may not verify against today's list, and idempotency is
+   by the records the state keeps.
+3. At start, load it with `from_json(log, state_json)`, the log being the
+   same account's and genesis's. A state that doesn't load is
+   `Stored{code}` (`too_large`, `malformed`, `unsupported_version`,
+   `account_mismatch`, `genesis_mismatch`, `stored_invalid`): stop the
+   work it guards; never start again from an empty state.
+
+**Reading results.** `apply` gives the record's `result` and one result per
+effect it carries (`revocation`, `interrupt`, `hold`, `release`, `cover`).
+Read `effects`, not only `result`: a revoke that adds `interrupt_running:
+true` to one already applied is `applied` for its interrupt and
+`duplicate` for its revocation. For the revocation, `duplicate` means
+"already in force on this host" and counts as done (decision 8).
+`pending` waits (apply the record again once the device list or
+host-work's applied `seq` advanced); `refused` never applies from this
+record; `evidence` means keep the record and alert. `actions` is what the
+host does in the same transaction (`Revoke`, `Interrupt`, `Hold`,
+`Release`, `Cover`).
+
+**The Station's duties** (rulings T11a and T11b, **for Astation's and
+Auth/Portal's agreement**):
+
+- Covers are ordered by `(issued_at, record_id)`: another Station's cover
+  takes coverage only when strictly newer, and a cover never releases a
+  hold. Sign with a synchronized clock: a Station whose clock went back
+  signs covers that take nothing, and fails closed (its holds and releases
+  are refused until it signs a newer cover).
+- A reset (a new `feed_id` for your origin) starts with a snapshot: for each
+  principal you **currently** cover, its `cover` first, signed anew (so
+  newer), then its current hold or release, signed anew; revoke and
+  interrupt records as they are, or signed anew. Never re-issue a cover for
+  a principal you no longer cover.
+- The principal's own key may sign every action, so whoever holds it
+  controls coverage. An integration handed to another Station: stop
+  signing for it, and the key leaves with it (or the integration is created
+  again as a new principal). A revoke is final whoever holds the key.
+- A Station learns of its own removal only through the Portal's two-phase
+  removal (its integrations go `revoking` with reason `station_removed`, it
+  issues and serves their records, then the removal completes), never
+  another way.
