@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 use super::MAX_MAIL_OBJECT_BYTES;
 use super::body::{EnvelopePlain, MailBody, MailFields, MailKind, ResultPlain};
+use super::verified::VerifiedMail;
 use crate::encoding::{ct_eq, enc, u64_field};
 use crate::error::{Error, Result};
 use crate::hpke;
@@ -85,22 +86,23 @@ fn seal_bytes(
 }
 
 /// The one open behind [`unseal_envelope`] and [`unseal_result`] (whose docs
-/// carry the rules): the plaintext bytes of a mailbox object of `kind`.
+/// carry the rules): the plaintext bytes of a verified mailbox object of
+/// `kind`.
 fn unseal_bytes(
     kind: MailKind,
     provider: &dyn KeyProvider,
     enc_key_id: &KeyId,
-    object: &SignedObject,
+    mail: &VerifiedMail,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let (found, body) = MailBody::from_object(object)?;
-    if found != kind {
+    if mail.kind() != kind {
         return Err(Error::Malformed("not this kind of object"));
     }
+    let body = mail.body();
     let ours = enc_kid(&provider.public_key(enc_key_id)?)?;
     if !ct_eq(ours.as_bytes(), body.enc_kid.as_bytes()) {
         return Err(Error::Malformed("not this enc_key's object"));
     }
-    let sealed = object.sealed().ok_or(Error::OpenFailed)?;
+    let sealed = mail.object().sealed().ok_or(Error::OpenFailed)?;
     if !body.names(sealed) {
         return Err(Error::OpenFailed);
     }
@@ -206,41 +208,67 @@ pub fn seal_result_with_ikm(
 
 /// The inverse of [`seal_envelope`], with the recipient's `enc_key` behind
 /// `provider` (`enc_key_id`): the strictly parsed plaintext (II.4.2 step 6).
-/// The object's label must be an envelope's, its `enc_kid` must name this key
-/// (else it is refused before opening), its `sealed_hash` must name `enc` and
-/// `ct` (HPKE base mode is unauthenticated and `info` is public, so only
-/// that hash, under the signature, says the sealed part is the sender's),
-/// and the `info` rebuilt from the body must open it.
 ///
-/// **The signature isn't checked here:** it needs the sender's key from the
-/// receiver's device list (II.4.2 steps 3 and 4). Verify first
-/// ([`SignedObject::verify`]), then open.
+/// It takes a [`VerifiedMail`], which only [`VerifiedMail::verify`] makes: an
+/// object whose signature verified with the sender's Ed25519 key (step 4,
+/// with the key the receiver took from its device list in step 3). HPKE base
+/// mode is unauthenticated and `info` is public, so anyone can seal a
+/// plaintext of their choosing to the recipient; an unverified object can't
+/// be opened. The object's label must be an envelope's, its `enc_kid` must
+/// name this key (else it is refused before opening), its `sealed_hash` must
+/// name `enc` and `ct` (the hash is under the signature, so a substituted
+/// sealed part is refused), and the `info` rebuilt from the body must open
+/// it.
+///
+/// Opening an object that wasn't verified doesn't compile:
+///
+/// ```compile_fail,E0308
+/// use atem_client::host_mail::unseal_envelope;
+/// use atem_client::{KeyId, KeyProvider, SignedObject};
+///
+/// fn open(provider: &dyn KeyProvider, key: &KeyId, object: &SignedObject) {
+///     let _ = unseal_envelope(provider, key, object);
+/// }
+/// ```
+///
+/// and the same, with the signature verified first, does:
+///
+/// ```
+/// use atem_client::host_mail::{VerifiedMail, unseal_envelope};
+/// use atem_client::{KeyId, KeyProvider, PublicKey, SignedObject};
+///
+/// fn open(
+///     provider: &dyn KeyProvider,
+///     key: &KeyId,
+///     object: &SignedObject,
+///     sender: &PublicKey,
+/// ) -> atem_client::Result<()> {
+///     let verified = VerifiedMail::verify(object, sender)?;
+///     let _plain = unseal_envelope(provider, key, &verified)?;
+///     Ok(())
+/// }
+/// ```
 pub fn unseal_envelope(
     provider: &dyn KeyProvider,
     enc_key_id: &KeyId,
-    object: &SignedObject,
+    mail: &VerifiedMail,
 ) -> Result<EnvelopePlain> {
     EnvelopePlain::parse(&unseal_bytes(
         MailKind::Envelope,
         provider,
         enc_key_id,
-        object,
+        mail,
     )?)
 }
 
 /// The inverse of [`seal_result`]: the same rules as [`unseal_envelope`], for
-/// a result's label and seal.
+/// a verified result's label and seal.
 pub fn unseal_result(
     provider: &dyn KeyProvider,
     enc_key_id: &KeyId,
-    object: &SignedObject,
+    mail: &VerifiedMail,
 ) -> Result<ResultPlain> {
-    ResultPlain::parse(&unseal_bytes(
-        MailKind::Result,
-        provider,
-        enc_key_id,
-        object,
-    )?)
+    ResultPlain::parse(&unseal_bytes(MailKind::Result, provider, enc_key_id, mail)?)
 }
 
 #[cfg(test)]
@@ -253,6 +281,7 @@ mod tests {
     use crate::domain::{self, SignLabel};
     use crate::encoding::{Hash32, dec, enc, u64_field};
     use crate::error::Error;
+    use crate::host_mail::VerifiedMail;
     use crate::host_mail::test_support::*;
     use crate::host_mail::{
         EnvelopePlain, MAX_MAIL_OBJECT_BYTES, MAX_PLAINTEXT_BYTES, MailBody, MailFields, MailKind,
@@ -263,6 +292,10 @@ mod tests {
     use crate::session::messages::MAX_MESSAGE_BYTES;
     use crate::signed::{SealedPart, SignedObject};
     use crate::software::SoftwareKeys;
+
+    fn verified(r: &Rig, object: &SignedObject) -> VerifiedMail {
+        VerifiedMail::verify(object, &r.host_key_public()).unwrap()
+    }
 
     fn request(f: &MailFields) -> EnvelopePlain {
         EnvelopePlain::Request {
@@ -329,12 +362,12 @@ mod tests {
 
             // Opened with the recipient's key, and only with it.
             assert_eq!(
-                unseal_envelope(&r.receiver, &r.enc_key, &parsed).unwrap(),
+                unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &parsed)).unwrap(),
                 plain
             );
             let mut other = SoftwareKeys::new();
             other.generate(r.enc_key.clone(), Alg::X25519).unwrap();
-            assert!(unseal_envelope(&other, &r.enc_key, &parsed).is_err());
+            assert!(unseal_envelope(&other, &r.enc_key, &verified(&r, &parsed)).is_err());
         }
     }
 
@@ -468,7 +501,7 @@ mod tests {
             let forged = resigned(&r, MailKind::Envelope, &object, changed);
             forged.verify(&r.host_key_public()).unwrap();
             assert!(
-                unseal_envelope(&r.receiver, &r.enc_key, &forged).is_err(),
+                unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &forged)).is_err(),
                 "{name}"
             );
         }
@@ -478,7 +511,7 @@ mod tests {
         let mut moved = f.clone();
         moved.signed_at_head.seq += 1;
         let forged = resigned(&r, MailKind::Envelope, &object, moved.clone());
-        assert!(unseal_envelope(&r.receiver, &r.enc_key, &forged).is_ok());
+        assert!(unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &forged)).is_ok());
         let (_, body) = MailBody::from_object(&object).unwrap();
         let mut value = object.to_json();
         value["body"] = MailBody::from_fields(moved, body.sealed_hash).to_value(MailKind::Envelope);
@@ -513,7 +546,7 @@ mod tests {
             let tampered = object.clone().with_sealed(part);
             tampered.verify(&r.host_key_public()).unwrap();
             assert_eq!(
-                unseal_envelope(&r.receiver, &r.enc_key, &tampered),
+                unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &tampered)),
                 Err(Error::OpenFailed),
                 "{which}"
             );
@@ -550,7 +583,7 @@ mod tests {
             "the forged part does open"
         );
         assert_eq!(
-            unseal_envelope(&r.receiver, &r.enc_key, &swapped),
+            unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &swapped)),
             Err(Error::OpenFailed)
         );
         // Moving a byte from one part to the other changes the hash too:
@@ -623,10 +656,10 @@ mod tests {
         }
 
         // And each opener refuses the other's object before it opens it.
-        assert!(unseal_result(&r.receiver, &r.enc_key, &envelope).is_err());
-        assert!(unseal_envelope(&r.receiver, &r.enc_key, &result).is_err());
+        assert!(unseal_result(&r.receiver, &r.enc_key, &verified(&r, &envelope)).is_err());
+        assert!(unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &result)).is_err());
         assert_eq!(
-            unseal_result(&r.receiver, &r.enc_key, &result).unwrap(),
+            unseal_result(&r.receiver, &r.enc_key, &verified(&r, &result)).unwrap(),
             status
         );
     }
@@ -658,7 +691,7 @@ mod tests {
             parsed.verify(&r.host_key_public()).unwrap();
             assert_eq!(MailBody::from_object(&parsed).unwrap().0, MailKind::Result);
             assert_eq!(
-                unseal_result(&r.receiver, &r.enc_key, &parsed).unwrap(),
+                unseal_result(&r.receiver, &r.enc_key, &verified(&r, &parsed)).unwrap(),
                 plain
             );
         }
@@ -690,7 +723,7 @@ mod tests {
         assert!(bytes.len() > 320_000 && bytes.len() < MAX_MAIL_OBJECT_BYTES);
         let parsed = parse_object(&bytes).unwrap();
         assert_eq!(
-            unseal_envelope(&r.receiver, &r.enc_key, &parsed).unwrap(),
+            unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &parsed)).unwrap(),
             plain
         );
 
@@ -729,7 +762,10 @@ mod tests {
         let at = result_of_size(MAX_PLAINTEXT_BYTES);
         let object = seal_result(&r.sender, &r.host_key, &f, &at, &r.enc_pub).unwrap();
         assert!(wire(&object).len() > 320_000 && wire(&object).len() < MAX_MAIL_OBJECT_BYTES);
-        assert_eq!(unseal_result(&r.receiver, &r.enc_key, &object).unwrap(), at);
+        assert_eq!(
+            unseal_result(&r.receiver, &r.enc_key, &verified(&r, &object)).unwrap(),
+            at
+        );
         let over = result_of_size(MAX_PLAINTEXT_BYTES + 1);
         assert_eq!(
             seal_result(&r.sender, &r.host_key, &f, &over, &r.enc_pub),
@@ -819,12 +855,12 @@ mod tests {
         let mut other = SoftwareKeys::new();
         other.generate(r.enc_key.clone(), Alg::X25519).unwrap();
         assert!(matches!(
-            unseal_envelope(&other, &r.enc_key, &object),
+            unseal_envelope(&other, &r.enc_key, &verified(&r, &object)),
             Err(Error::Malformed(_))
         ));
         // A signing key isn't an encryption key.
         assert_eq!(
-            unseal_envelope(&r.sender, &r.host_key, &object),
+            unseal_envelope(&r.sender, &r.host_key, &verified(&r, &object)),
             Err(Error::WrongAlg)
         );
         // A status that parses as a body but whose reply is not a Result's.
@@ -833,7 +869,7 @@ mod tests {
             refused: "invalid_request".into(),
         };
         let sealed = seal_result(&r.sender, &r.host_key, &f, &status, &r.enc_pub).unwrap();
-        assert!(unseal_envelope(&r.receiver, &r.enc_key, &sealed).is_err());
+        assert!(unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &sealed)).is_err());
     }
 
     #[test]
@@ -872,7 +908,7 @@ mod tests {
         let object = seal_result(&r.sender, &r.host_key, &f, &plain, &r.enc_pub).unwrap();
         let parsed = parse_object(&wire(&object)).unwrap();
         assert_eq!(
-            unseal_result(&r.receiver, &r.enc_key, &parsed).unwrap(),
+            unseal_result(&r.receiver, &r.enc_key, &verified(&r, &parsed)).unwrap(),
             plain
         );
         // The same for a reply with every member present.
@@ -906,7 +942,10 @@ mod tests {
         assert_ne!(a, envelope(&r, &f, &plain));
         // They are ordinary objects: signed, and they open to the plaintext.
         a.verify(&r.host_key_public()).unwrap();
-        assert_eq!(unseal_envelope(&r.receiver, &r.enc_key, &a).unwrap(), plain);
+        assert_eq!(
+            unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &a)).unwrap(),
+            plain
+        );
 
         let status = ResultPlain::Refusal {
             object_id: ID2.into(),
@@ -917,8 +956,20 @@ mod tests {
         let y =
             seal_result_with_ikm(&r.sender, &r.host_key, &f, &status, &r.enc_pub, &ikm).unwrap();
         assert_eq!(x, y);
-        assert_eq!(unseal_result(&r.receiver, &r.enc_key, &x).unwrap(), status);
-        // The same ikm under the other label is another object.
-        assert_ne!(x.sealed().unwrap().ct, a.sealed().unwrap().ct);
+        assert_eq!(
+            unseal_result(&r.receiver, &r.enc_key, &verified(&r, &x)).unwrap(),
+            status
+        );
+        // The same ikm, recipient and plaintext bytes under the two kinds'
+        // `info`: one ephemeral (the ikm's), two ciphertexts, so the seal
+        // domain separates them.
+        let recipient = r.enc_pub.as_32().unwrap();
+        let bytes = b"the same plaintext bytes";
+        let under =
+            |kind| hpke::seal_with_ikm(recipient, &seal_info(kind, &f), b"", bytes, &ikm).unwrap();
+        let (envelope, result) = (under(MailKind::Envelope), under(MailKind::Result));
+        assert_eq!(envelope.enc, result.enc);
+        assert_ne!(envelope.ct, result.ct);
+        assert_eq!(envelope, under(MailKind::Envelope));
     }
 }

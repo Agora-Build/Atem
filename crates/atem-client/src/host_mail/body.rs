@@ -404,8 +404,12 @@ fn value_of<T: serde::Serialize>(value: &T) -> Result<Value> {
     serde_json::to_value(value).map_err(|_| Error::Malformed("plaintext"))
 }
 
-/// Room for `{"kind":"request","message":` and `}` around a Message.
-const ENVELOPE_WRAPPER_BYTES: usize = 64;
+/// `{"kind":"request","message":` and `}`: all that a request's plaintext adds
+/// around its Message. The bound is on the Message (a host sender's Message
+/// keeps host-work-v1's 240 KiB, II.4.2), so a request's plaintext is at most
+/// [`MAX_PLAINTEXT_BYTES`] plus these 29 bytes, and so is what its parse
+/// reads.
+const ENVELOPE_WRAPPER_BYTES: usize = r#"{"kind":"request","message":}"#.len();
 
 /// The plaintext of an envelope (II.4.2): `{"kind":"request","message":…}`,
 /// `{"kind":"cancel","task_id":…}` or `{"kind":"complete","task_id":…,
@@ -466,18 +470,29 @@ impl EnvelopePlain {
         })
     }
 
-    /// `jcs` of the plaintext without `null` members, wiped when dropped.
+    /// `jcs` of the plaintext without `null` members, wiped when dropped. A
+    /// request's Message is at most [`MAX_PLAINTEXT_BYTES`] (so its plaintext
+    /// at most that and its wrapper); the whole plaintext of any other kind is.
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.check()?;
-        plain_bytes(self.to_value()?)
+        let bytes = plain_bytes(self.to_value()?)?;
+        let limit = match self {
+            EnvelopePlain::Request { .. } => MAX_PLAINTEXT_BYTES + ENVELOPE_WRAPPER_BYTES,
+            _ => MAX_PLAINTEXT_BYTES,
+        };
+        if bytes.len() > limit {
+            return Err(Error::TooLarge);
+        }
+        Ok(bytes)
     }
 
     /// Exactly what [`to_bytes`](Self::to_bytes) writes (II.4.2, step 6):
     /// strict I-JSON with no `null`, one of the three shapes with exactly its
     /// fields, and nothing but the canonical form.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        // The Message's bound, and the few bytes of `{"kind":"request",
-        // "message":…}` around it.
+        // The longest plaintext of any kind: a request's Message at its bound,
+        // in its wrapper. `to_bytes` holds the other kinds to the bound
+        // itself, and `check` the Message.
         let mut o = plain_object(bytes, MAX_PLAINTEXT_BYTES + ENVELOPE_WRAPPER_BYTES)?;
         let kind = str_of(&o, "kind")?.to_owned();
         let plain = match kind.as_str() {
@@ -541,8 +556,14 @@ impl ResultPlain {
             ResultPlain::Refusal { object_id, refused } => {
                 is_uuid_v4(object_id) && REFUSAL_CODES.contains(&refused.as_str())
             }
+            // The reply as `reply_query` returns it once `submitted`, and
+            // still kept: a reply the host dropped has no text or context
+            // left, so it would deliver an empty result.
             ResultPlain::Result { task_id, reply } => {
-                task_id_ok(task_id) && reply.valid() && reply.state == ReplyState::Submitted
+                task_id_ok(task_id)
+                    && reply.valid()
+                    && reply.state == ReplyState::Submitted
+                    && !reply.dropped
             }
         };
         if ok {
@@ -1188,6 +1209,66 @@ mod tests {
         assert_eq!(
             EnvelopePlain::parse(request.as_bytes()),
             Err(Error::NullValue)
+        );
+    }
+
+    #[test]
+    fn a_request_is_the_message_plus_a_29_byte_wrapper() {
+        // `{"kind":"request","message":` and `}`: the bound is on the
+        // Message, so the plaintext is at most the bound plus these.
+        assert_eq!(ENVELOPE_WRAPPER_BYTES, 29);
+        assert_eq!(
+            ENVELOPE_WRAPPER_BYTES,
+            r#"{"kind":"request","message":}"#.len()
+        );
+        let f = Rig::new().fields();
+        let at = message_of_size(&f, MAX_PLAINTEXT_BYTES);
+        let plain = EnvelopePlain::Request { message: at };
+        let bytes = plain.to_bytes().unwrap();
+        assert_eq!(bytes.len(), MAX_PLAINTEXT_BYTES + ENVELOPE_WRAPPER_BYTES);
+        assert_eq!(EnvelopePlain::parse(&bytes).unwrap(), plain);
+        // Not one byte more, even of white space the parse would skip.
+        let mut padded = bytes.to_vec();
+        padded.push(b' ');
+        assert_eq!(EnvelopePlain::parse(&padded), Err(Error::TooLarge));
+        // The other kinds are bounded as a whole, and are far below it.
+        let complete = EnvelopePlain::Complete {
+            task_id: ID2.into(),
+            result: snapshot(0, 128 * 1024),
+        };
+        assert!(complete.to_bytes().unwrap().len() < MAX_PLAINTEXT_BYTES);
+    }
+
+    #[test]
+    fn a_dropped_reply_is_no_result() {
+        // A reply the host no longer keeps (text and context gone, the
+        // digest kept) is a valid reply but carries nothing to deliver.
+        let mut dropped = reply(0);
+        dropped.text.clear();
+        dropped.dropped = true;
+        assert!(dropped.valid());
+        let plain = ResultPlain::Result {
+            task_id: ID2.into(),
+            reply: dropped.clone(),
+        };
+        assert_eq!(plain.to_bytes(), Err(Error::Malformed("result")));
+        let raw = jcs(&json!({"kind": "result", "task_id": ID2,
+                              "reply": serde_json::to_value(&dropped).unwrap()}))
+        .unwrap();
+        assert_eq!(
+            ResultPlain::parse(raw.as_bytes()),
+            Err(Error::Malformed("result"))
+        );
+        // The same reply, kept.
+        let mut kept = dropped;
+        kept.dropped = false;
+        let plain = ResultPlain::Result {
+            task_id: ID2.into(),
+            reply: kept,
+        };
+        assert_eq!(
+            ResultPlain::parse(&plain.to_bytes().unwrap()).unwrap(),
+            plain
         );
     }
 }
