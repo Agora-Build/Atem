@@ -1968,8 +1968,9 @@ no later entry reaches it, revocations included. Astation therefore
 signs none until every strict verifier of the account knows them (Atem
 hosts, Station replicas, native controllers and other SDK consumers),
 starting with an enumerated test account; an unknown, offline or
-unconfirmed verifier keeps signing off (delegated host work II.2.2 "The
-signing gate", I.8). Each is signed by a native manager, like every
+unconfirmed verifier keeps signing off, removing an obsolete verifier is
+an explicit manager action, and no feature flag alone is proof
+(delegated host work II.2.2 "The signing gate", I.8). Each is signed by a native manager, like every
 entry but `recovery_add` (the recovery key signing one is
 `recovery_signer_action`), with a fresh confirmation bound to the exact
 body (R9.6 rule 4). Every rule below is judged at `seq-1`, on the state
@@ -2060,10 +2061,14 @@ a native manager readmits it; re-verification never readmits.
 
 *The host encryption key.* `host_enc_key{host_id, host_trust_gen,
 enc_key{alg:"x25519",pub}, enc_sig, retire_previous?}`. Its shape, at
-parse: `host_id` an id, `host_trust_gen` an integer ≥ 1, `enc_key`
-pinned to `x25519` (`wrong_alg` otherwise), `enc_sig` base64url of
-exactly 64 bytes (`malformed` otherwise). Then, against the chain, in
-this order:
+parse: `host_id` an id (R9.2 `member`'s id grammar), `host_trust_gen` an
+integer ≥ 1 and `enc_sig` base64url of exactly 64 bytes, each
+`malformed` otherwise; `enc_key` pinned to `x25519` (`wrong_alg`
+otherwise). A `host_id` outside the id grammar is `malformed` for every
+action that carries one (`remove_host`, `host_sender_revoke`,
+`host_sender_readmit`, `host_enc_key`); only an id inside
+`project.hosts` is `bad_project`. Then, against the chain, in this
+order:
 
 1. `host_id` is a current host, else `not_a_host`.
 2. `host_trust_gen` is that host's newest `add_host`'s generation; older
@@ -3862,13 +3867,18 @@ signing gate): projects (`P7_add_host_b`, `P8_set`, the replacing
 `P9_remove_host_b`, `P10_readd_host_b`, `P11_set_again`; a project
 emptied by `remove_host` and still removable, `P10_remove_host_a`,
 `P11_remove_emptied`; a re-verified host, `P9_reverify_a`; refused:
-`P11_remove_again` `not_a_project`, `P9_bad_project` `bad_project`,
-`P7_not_a_host` `not_a_host`), host encryption keys (`EK7_set`,
-`EK8_rotate` without and `EK9_rotate_retire` with `retire_previous`,
-`EK7_retire_first`, `EK8_reverify_a` voiding them, `EK9_set_gen_2`;
+`P11_remove_again` `not_a_project`, `P9_bad_project`, `P9_bad_name`,
+`P9_one_host` and `P9_unknown_op` `bad_project`, `P7_not_a_host` (never
+added) and `P10_set_removed_host` (added, then removed) `not_a_host`),
+host encryption keys (`EK7_set`, `EK8_rotate` without and
+`EK9_rotate_retire` with `retire_previous`, `EK7_retire_first`,
+`EK8_reverify_a` voiding them, `EK9_set_gen_2`; `EK8_remove_host_a`
+voiding them by a removal, `EK9_readd_a` carrying none over and
+`EK10_set_after_readd` setting the voided key again as a new one;
 refused: `EK8_same_key` `same_enc_key`, `EK8_bad_enc_sig`
 `bad_enc_sig`, `EK8_retire_false` `malformed`, `EK9_stale_gen`
-`host_trust_gen_not_current`, `EK7_not_a_host` `not_a_host`) and host
+`host_trust_gen_not_current`, `EK7_not_a_host` (never added) and
+`EK9_removed_host` (removed) `not_a_host`) and host
 senders (`HS7_revoke`, `HS8_readmit`; a revoked host re-verified,
 removed and added again, `HS8_reverify_a`, `HS9_remove_host_a`,
 `HS10_readd_host_a`, then `HS11_readmit` and `HS12_revoke_interrupt`;

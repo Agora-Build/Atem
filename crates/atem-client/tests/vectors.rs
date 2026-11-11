@@ -501,6 +501,12 @@ fn chain_reason(label: &str) -> Option<&'static str> {
             Some("invalid: a readmit of a host that isn't revoked: not_revoked")
         }
         "HS7_revoke_unknown" => Some("invalid: no add_host names the host: unknown_host"),
+        "EK9_removed_host" | "P10_set_removed_host" => {
+            Some("invalid: the host was added but is removed: not_a_host")
+        }
+        "P9_bad_name" => Some("invalid: a name outside [a-z0-9-]: bad_project"),
+        "P9_one_host" => Some("invalid: one host listed: bad_project"),
+        "P9_unknown_op" => Some("invalid: an unknown op: bad_project"),
         _ => None,
     }
 }
@@ -3081,6 +3087,93 @@ fn delegated_vectors(book: &Book, file: &Value) -> Vec<Value> {
         no_edit,
         Ok(expect(none.clone(), none.clone(), a("revoked", 8, None), none.clone())),
     );
+
+    // ---- removal: keys voided, and "current" (no later remove_host)
+    // rather than "ever added" (review fix: appended, so earlier vectors
+    // keep their place in the file)
+    let ek8_rm = ["EK7_set", "EK8_remove_host_a"];
+    g.push(
+        "EK8_remove_host_a",
+        &ek7,
+        "remove_host host-a on EK7_set: host-a is no longer current and its encryption keys are voided (no current or previous key); its sending state stays authorized(2), no membership epoch",
+        &remove("host-a"),
+        no_edit,
+        Ok(expect(none.clone(), none.clone(), a("authorized", 2, None), none.clone())),
+    );
+    g.push(
+        "EK9_removed_host",
+        &ek8_rm,
+        "host_enc_key host-a (host_trust_gen 1, host_enc_key 2, enc_sig by host-a's generation-1 key, which verifies) on EK8_remove_host_a: invalid (host-a was added but is removed, not current): not_a_host",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_2, false),
+        no_edit,
+        Err("not_a_host"),
+    );
+    g.push(
+        "EK9_readd_a",
+        &ek8_rm,
+        "add_host host-a again at host_trust_gen 2 (key \"host-a host_channel_key gen 2\") on EK8_remove_host_a: current again, membership epoch 9, still authorized(2), and no encryption key carried over",
+        &g.add_host("host-a", 2),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 2}),
+            none.clone(),
+            a("authorized", 2, Some(9)),
+            none.clone(),
+        )),
+    );
+    let sig_a2_1 = g.enc_sig("host-a", 2, "host-a-enc-1");
+    g.push(
+        "EK10_set_after_readd",
+        &["EK7_set", "EK8_remove_host_a", "EK9_readd_a"],
+        "host_enc_key for host_trust_gen 2 on EK9_readd_a with \"host-a host_enc_key 1\", the key the removal voided: a new key here (not the current one, none is), current with no previous key",
+        &g.enc_entry("host-a", 2, "host-a-enc-1", &sig_a2_1, false),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 2}),
+            none.clone(),
+            a("authorized", 2, Some(9)),
+            keys_of(g.key_info("host-a-enc-1", 10, 2), None),
+        )),
+    );
+    g.push(
+        "P10_set_removed_host",
+        &p9_rb,
+        "project_set \"astation\" listing host-a and host-b on P9_remove_host_b: invalid (host-b was added but is removed, not current): not_a_host",
+        &set_ab(&[ProjectOp::Message]),
+        no_edit,
+        Err("not_a_host"),
+    );
+    let bad_project = |name: &str, hosts: &[&str]| Action::ProjectSet {
+        project: Project {
+            name: name.into(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            ops: vec![ProjectOp::Message],
+        },
+    };
+    g.push(
+        "P9_bad_name",
+        &p8,
+        "project_set named \"Astation\" on P8_set: invalid (a name is 1 to 32 characters of [a-z0-9-]): bad_project",
+        &bad_project("Astation", &["host-a", "host-b"]),
+        no_edit,
+        Err("bad_project"),
+    );
+    g.push(
+        "P9_one_host",
+        &p8,
+        "project_set \"astation\" listing host-a only, on P8_set: invalid (a project lists 2 to 64 hosts): bad_project",
+        &bad_project("astation", &["host-a"]),
+        no_edit,
+        Err("bad_project"),
+    );
+    g.push(
+        "P9_unknown_op",
+        &p8,
+        "project_set \"astation\" with ops [deploy, message] on P8_set: invalid (an op outside launch, message, notify, prompt): bad_project",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["ops"] = serde_json::json!(["deploy", "message"]),
+        Err("bad_project"),
+    );
     g.vectors
 }
 
@@ -3345,6 +3438,43 @@ fn delegated_in_context(run: &mut Run, ctx: &Context, book: &Book, file: &Value)
     }
     assert_eq!(m.entry_hash_at(12), None);
     run.pass("log L: host-a authorized(2), epoch 2; entry_hash_at names each entry");
+
+    // A removal voids the keys and a re-add carries none over; "current"
+    // means no later remove_host, not "ever added" (`EK9_removed_host`,
+    // `P10_set_removed_host` name hosts an add_host added).
+    let keyed = ctx.chain(&["EK7_set"]);
+    assert_eq!(keyed.host_enc_key("host-a").map(|k| k.current.seq), Some(7));
+    let removed = ctx.chain(&["EK7_set", "EK8_remove_host_a"]);
+    assert_eq!(removed.host("host-a"), None);
+    assert_eq!(removed.host_enc_key("host-a"), None);
+    let readded = ctx.chain(&["EK7_set", "EK8_remove_host_a", "EK9_readd_a"]);
+    assert_eq!(readded.host_enc_key("host-a"), None);
+    for (base, label) in [
+        (&["EK7_set", "EK8_remove_host_a"][..], "EK9_removed_host"),
+        (
+            &["P7_add_host_b", "P8_set", "P9_remove_host_b"][..],
+            "P10_set_removed_host",
+        ),
+    ] {
+        let m = ctx.chain(base);
+        let entry = ctx.entry(label);
+        let host = match &entry.action {
+            Action::HostEncKey { host_id, .. } => host_id.clone(),
+            Action::ProjectSet { .. } => "host-b".to_owned(),
+            other => panic!("{label}: {other:?}"),
+        };
+        assert!(
+            m.host_sender_state(&host).is_some(),
+            "{label}: {host} was added"
+        );
+        assert_eq!(m.host(&host), None, "{label}: {host} isn't current");
+        assert_eq!(
+            m.check_next(&entry),
+            Check::Invalid(Invalid::NotAHost),
+            "{label}"
+        );
+    }
+    run.pass("remove_host voids keys, a re-add carries none; not_a_host for removed (added) hosts");
 
     // §R9.4 with these actions: an alternative at `seq` is judged against
     // C[..seq-1], replayed with the host-sender state, projects and keys.

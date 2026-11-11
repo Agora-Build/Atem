@@ -210,7 +210,8 @@ impl std::error::Error for ChangeRefusal {}
 ///   suspected compromise; it adds no member or host. Each is signed by a
 ///   manager with a fresh confirmation, so nothing drafts them in bulk.
 ///   Whether the entry is valid (a current host, its newest generation, the
-///   host's `enc_sig`) is the verifier's to judge;
+///   host's `enc_sig`, a key other than the host's current one) is the
+///   verifier's to judge: there is no drafting guard for `same_enc_key`;
 /// - every other action (genesis, a native's roles, removals, recovery and
 ///   kit entries, K backups) is never paced.
 ///
