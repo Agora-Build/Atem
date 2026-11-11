@@ -30,6 +30,14 @@ before emitting that event; apps still inspect errors and each result state.
 | `host.reply` | `reply_query` | [Host work](atem-host-work-v1.md#reply) |
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
+| `host.delegated` (planned; no host advertises it yet) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
+| `host.alerts` (planned; no host advertises it yet) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
+
+The two planned features' results are host-work results too:
+- `alert_list` answers with an `alerts` result kind, and `work_resolve` with
+  a `work` result that carries `resolved`.
+- Released readers reject both, so Atem and Astation enable these features
+  together (host-work-v1 §11.2, "Compatibility").
 
 Planned, advertised by no host yet: `host.senders`'s two session ops,
 `control_records` and `host_enc_key_get`, go through `send_json` the same way
@@ -449,7 +457,10 @@ A phone receiving a hint (APNs/FCM payload):
    approval hint's `Approval{tool, summary}`, or an `outcome_unknown` hint's
    `OutcomeUnknown{task_id, session_id, sender, reason}` (HPKE open by the
    provider; refused for another device or `enc_key` before anything is
-   opened). A locked device shows a generic hint instead.
+   opened). Facts that aren't a delegated sender's UUID v4 task are refused
+   `malformed` at open (`r9-vectors-push-hint`'s
+   `outcome_unknown_invalid_facts`). A locked device shows a generic hint
+   instead.
 
 `verify_push_hint` takes both kinds of hint (the body's `kind`, which only
 the planned `outcome_unknown` hint of `host.alerts` has, tells them apart;
@@ -458,10 +469,17 @@ or `OutcomeUnknown{device_id, enc_kid, sealed_hash}`; `hint.approval()` and
 `hint.alert()` (an `AlertRef`: the account, genesis, host, trust generation
 and `alert_id`) each fail `malformed` for the other kind; `book.offer`,
 `ack_json`, `json`, `check_sealed`, `created_at` and `expires_at` serve both.
-An `outcome_unknown` hint has no resolved hint and no seen. **Binding API
-change** (for Astation's review): `HintContent` was a record `{tool,
-summary}` and `approval()` could not fail; no host sends the new kind until
-`host.alerts` is advertised.
+An `outcome_unknown` hint has no resolved hint and no seen.
+
+**Binding API change** (for Astation's review). No host sends the new kind
+until `host.alerts` is advertised. What changes:
+- `HintContent` was a record `{tool, summary}`; it is now an enum.
+- `approval()` can now fail.
+- `HintStateInfo` gains the case `OutcomeUnknown`. That breaks every
+  exhaustive Swift `switch` and Kotlin `when` over it, which must handle the
+  new case.
+- In JS, `open()` now returns an object with a `type` tag (`"approval"` or
+  `"outcome_unknown"`), and `state()` has the `outcome_unknown` type.
 
 The relay: `verify_push_hint(…, Relay)`, its book, `push_stages(created_at,
 recipient)`, `push_send_now(…)`, `push_next_due(…)`, `push_guard(expires_at)`

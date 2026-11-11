@@ -2869,7 +2869,7 @@ principals = ["local"]
     /// The delegated ops of step 3 never reach the bridge (the channel
     /// refuses an op of a feature the host doesn't advertise). One that did
     /// is refused `busy`, never half-served: `work_interrupt`,
-    /// `work_resolve` and `alert_list` (T17 minor 7).
+    /// `work_resolve` and `alert_list`.
     #[test]
     fn delegated_ops_that_reach_the_bridge_are_busy() {
         local_test(async |root| {

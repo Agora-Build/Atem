@@ -2590,7 +2590,7 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
     let created_at = now + 1_000;
     // Alert A: the common case, a service's task; alert B: the bounds (a
     // host sender with a 128-byte id, a 256-byte reason). Only a delegated
-    // sender's UUID v4 task raises an alert (ruling P5a): the hints whose
+    // sender's UUID v4 task raises an alert: the hints whose
     // sealed facts name another are `outcome_unknown_invalid_facts`.
     struct Alert {
         name: &'static str,
@@ -2778,7 +2778,7 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
     );
 
     // Hints a host never builds: well signed and well sealed, but their
-    // sealed facts aren't a delegated sender's UUID v4 task (ruling P5a).
+    // sealed facts aren't a delegated sender's UUID v4 task.
     // The relay can't tell (it never opens them); the recipient refuses each
     // at open (`malformed`). Sealed here from the raw facts, since the
     // crate's builder refuses them.

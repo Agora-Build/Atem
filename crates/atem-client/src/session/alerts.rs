@@ -18,9 +18,10 @@ use crate::canonical::MAX_SAFE_INTEGER;
 /// The feature: `alert_list`, and the push hint of kind `outcome_unknown`.
 pub const FEATURE: &str = super::host_work::ALERTS_FEATURE;
 /// The most alerts one `alert_list` result carries (**Atem's choice, for
-/// Astation to confirm**): 64 of at most about 450 bytes each stay far under
-/// every bound, and a host holds at most 256 unresolved outcomes (design
-/// I.4.6), so a full list is four pages.
+/// Astation to confirm**): an alert is typically about 450 bytes, at most
+/// about 750 (about 1 KB with escaping), so 64 stay far under every bound;
+/// a host holds at most 256 unresolved outcomes (design I.4.6), so a full
+/// list is four pages.
 pub const MAX_PAGE: usize = 64;
 /// The longest `reason`, in bytes (**Atem's choice, for Astation to
 /// confirm**): a short phrase (`agent exited`, `write interrupted`), well
@@ -37,7 +38,7 @@ pub enum AlertKind {
 /// One alert, as `alert_list` returns it. `alert_id` is a UUID v4 the host
 /// chose and keeps (an alert is durable); `seq` is the host's sequence
 /// number of it, from 1, rising with every alert the host creates and never
-/// reused: the list's order (ruling P5b); `host_id` is the host's own
+/// reused: the list's order; `host_id` is the host's own
 /// `atem_device_id`; `created_at` is the host's wall clock, Unix ms, when the
 /// task became `outcome_unknown`, for people only: it orders nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,7 +56,7 @@ pub struct Alert {
 }
 
 /// A task id as an alert names it: a UUID v4. Only a delegated sender's
-/// task raises an alert (ruling P5a; design I.1.3, I.4.6), and a remote
+/// task raises an alert (design I.1.3, I.4.6), and a remote
 /// task's id is a UUID v4. A local selector's UUID v5 task keeps v1, whose
 /// unknown outcomes expire.
 pub fn valid_task_id(task_id: &str) -> bool {
@@ -96,7 +97,7 @@ impl Alert {
 
 /// A page is in the host's order: strictly ascending by `seq`, so no alert
 /// repeats. `created_at` orders nothing: a wall clock set back gives a later
-/// alert an earlier time (ruling P5b).
+/// alert an earlier time.
 pub fn in_order(alerts: &[Alert]) -> bool {
     alerts.windows(2).all(|pair| pair[0].seq < pair[1].seq)
 }
@@ -251,7 +252,7 @@ mod tests {
     }
 
     /// The host lists its alerts in the order it created them, by its
-    /// sequence number, never by `created_at` (ruling P5b): a wall clock set
+    /// sequence number, never by `created_at`: a wall clock set
     /// back gives a new alert an earlier `created_at`, and a client paging
     /// with `after` still gets it after the cursor.
     #[test]
@@ -365,7 +366,7 @@ mod tests {
         assert!(refused(
             &|d| d["result"]["alerts"][0]["created_at"] = json!(1u64 << 53)
         ));
-        // Only a delegated sender's task raises an alert (ruling P5a): a
+        // Only a delegated sender's task raises an alert: a
         // UUID v4 task of a `member:`, `service:` or `host:` sender. `local`
         // and browser grants keep v1, whose unknown outcomes expire.
         for (field, value) in [
@@ -416,7 +417,7 @@ mod tests {
             &|d| d["result"]["alerts"][1]["host_id"] = json!("other-host")
         ));
         // In the host's order: strictly ascending by `seq`, no repeat.
-        // `created_at` is informational and orders nothing (ruling P5b).
+        // `created_at` is informational and orders nothing.
         assert!(refused(&|d| {
             let a = d["result"]["alerts"].as_array_mut().unwrap();
             a.swap(0, 1);

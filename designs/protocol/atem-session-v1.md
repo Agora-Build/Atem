@@ -3805,12 +3805,18 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   "outcome_unknown", alert_id, u64(created_at), u64(expires_at), device_id,
   enc_kid])` (11 fields, where an approval hint's has 12, so neither kind's
   sealed part opens as the other's), plaintext `jcs({"reason":…,
-  "sender":…, "session_id":…, "task_id":…})`: the task (a UUID v4, or the
-  v5 of a local selector's resolution), its session id, its sender
-  (`member:<id>`, `service:<id>`, `browser:<id>`, `host:<id>` or `local`) and
-  why the outcome is unknown (1-256 bytes, no control character). The
-  body names the alert, never the task: nothing the owner reads is in the
-  clear. No new label: it is the push hint's own, and the seal's. **Atem's
+  "sender":…, "session_id":…, "task_id":…})`:
+  - the task, a UUID v4;
+  - its session id;
+  - its sender: a delegated sender, `member:<id>`, `service:<id>` or
+    `host:<id>`, as host-work-v1 §11.3's alert names it;
+  - why the outcome is unknown: 1-256 bytes, no control or Cf character.
+
+  Only a delegated sender's task raises an alert. A `local` or browser
+  grant's task keeps v1 (its unknown outcome expires) and gets no hint, so
+  a recipient refuses facts naming one, at open (`malformed`): the relay
+  can't see them. The body names the alert, never the task: nothing the
+  owner reads is in the clear. No new label: it is the push hint's own, and the seal's. **Atem's
   choices, for Astation to confirm:** the sealed facts (the design's "the
   host, session, task and sender, and why": the host is the body's
   `host_id`), their bounds, the `kind` discriminator, and an `alert_id` (the
@@ -3837,6 +3843,11 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   for an alert: nothing cancels a stage, and an alert's own state is read
   with `alert_list` (it lasts until its task is resolved). The daily reminder
   is Astation's. **Atem's choice, for Astation to confirm.**
+- **Collapse id.** An alert's notifications collapse on its `alert_id`
+  (collapse id / FCM tag = `alert_id`), as an approval's do on its
+  `approval_id`. So the hints of one alert to one device replace each other,
+  and two alerts never do. The crate's reference relay schedules by it
+  (`RelayLedger`). **Atem's choice, for Astation to confirm.**
 
 **Verification** (relay and clients; `now` is the verifier's clock):
 signature by the newest `add_host` key of `host_id` in its verified log;
@@ -4018,7 +4029,9 @@ the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
 `r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
-`r9-vectors-host-route`, and, planned, `r9-vectors-host-work-control`
+`r9-vectors-host-route`, and, planned, `r9-vectors-delegated-wire`
+(R9.14's shapes: `host_enc_key_get`, `host_enc_key`, receipts with and
+without provenance) and `r9-vectors-host-work-control`
 (control records, host-work-v1 §11.1: service records for each action,
 native managers' and a host principal's records, a record signed by a
 manager removed before the host received it, every verification reason
@@ -4365,8 +4378,8 @@ agreement.
          refused before it was queued.
      - **The repeats end.** A consumed write either releases one of the
        finitely many waiting hooks or falls in that window, which is
-       bounded. A turn is never left in Codex's dialog past its task's
-       deadline.
+       bounded. So a turn stays in Codex's dialog past its task's deadline by
+       at most that window (about 500 ms) and a pass.
      - **An error after queueing** may have reached the terminal. It
        counts as delivered, so no blind second Esc follows. If the
        turn is still the session's current turn 10 s later (§6's bound
@@ -4507,10 +4520,19 @@ host` (items 3, 4), `withdrawn at recovery` (item 6). `request_id_reused`
 list not reconciled` (item 8). `unsupported_version`, detail `host.senders
 is not advertised` (item 8, while unadvertised).
 
-**Tests and fixtures.** No shared fixture changes. The shared core's tests
-cover the wire: `receipt_provenance.rs`, `session::r9`'s
-`host_enc_key_get` unit tests, and `client_e2e.rs`'s `host_enc_key_get`
-module (an answer drafts an entry the drafting guard accepts, and unbound
-answers and the bound of 64 are refused). The host's step 3 refusal is
-tested in `src/session_protocol/r9/tests.rs` (`host_enc_key_get`).
-Fixtures for items 1 to 7 come with the host (step 4), with Astation.
+**Tests and fixtures.**
+- **The shapes:** `fixtures/r9-vectors-delegated-wire.json`, valid and
+  refused, for `host_enc_key_get`, `host_enc_key` (its binding verified
+  against log L) and receipts with and without provenance. The shared
+  core's runner and the independent checker read it, and the binding
+  packages ship it.
+- **The shared core's own tests:** `receipt_provenance.rs` (every
+  scenario fixture's receipt unchanged), `session::r9`'s
+  `host_enc_key_get` unit tests, and `client_e2e.rs`'s `host_enc_key_get`
+  module (an answer drafts an entry the drafting guard accepts; unbound
+  answers, the bound of 64 and an id pending in another request map are
+  refused).
+- **The host's step 3 refusal:** tested in
+  `src/session_protocol/r9/tests.rs` (`host_enc_key_get`).
+- **Scenario fixtures for items 1 to 7** come with the host (step 4), with
+  Astation.

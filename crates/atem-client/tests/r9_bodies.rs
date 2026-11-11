@@ -765,7 +765,7 @@ fn outcome_unknown_hint_seal_open() {
     assert!(edit(&|p| p.reason = "a\nb".into()).is_err());
     assert!(edit(&|p| p.reason = "a\u{202E}b".into()).is_err(), "no Cf");
     assert!(edit(&|p| p.sender = "phone".into()).is_err());
-    // Only a delegated sender's UUID v4 task raises an alert (ruling P5a):
+    // Only a delegated sender's UUID v4 task raises an alert:
     // `local` and browser grants keep v1, and a local selector's UUID v5
     // task is never one.
     assert!(edit(&|p| p.sender = "local".into()).is_err());

@@ -1792,7 +1792,7 @@ mod control_records {
     /// One `id` is one pending request, across the three request maps a
     /// channel keeps (host work, `control_records`, `host_enc_key_get`): an
     /// id waiting in one is refused in the others, so an `error{re}` can
-    /// only ever name one request (n1).
+    /// only ever name one request.
     #[test]
     fn an_id_pending_in_one_request_map_is_refused_in_the_others() {
         use atem_client::session::host_work::WORK_FEATURE;

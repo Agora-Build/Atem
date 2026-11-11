@@ -1171,7 +1171,7 @@ they serialize back to the same JSON.
 |---|---|
 | `task_id` | a UUID v4 |
 | `resolution.kind` | `failed` or `done`, exactly its fields |
-| `failed.detail` | 1–1024 bytes, no control character: the detail the task then shows (**Atem's choice, for Astation to confirm**: the design says only `failed{detail}`, so a multi-line reason is `invalid_request`) |
+| `failed.detail` | 1–1024 bytes, not blank (something besides White_Space), no control character and no Cf character (bidi controls, zero-width characters; the framing module's General_Category Cf, `framing::is_format`): the detail the task then shows. **Atem's choice, for Astation to confirm**: the design says only `failed{detail}`, so a multi-line, blank or Cf-carrying reason is `invalid_request` |
 | `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, for Astation to confirm**) |
 
 **Authority.** Both are directed-work requests: the channel checks `notify`
@@ -1185,19 +1185,35 @@ not name is `forbidden`, as for `work_query`.
 **Results** are `work` results (§4 "Status").
 
 - `work_interrupt` interrupts the task's turn when it is the session's
-  current turn. Otherwise nothing happens: the result is the task's status
-  as it is, with `detail` `not running`.
-- `work_resolve` settles an `outcome_unknown` task; a task in any other
-  state, unless it was resolved, is `forbidden`. `failed` makes it `failed`
-  with the given `detail`; `done` makes it `completed` with that `result`.
-  The same resolution again returns the recorded status; another
-  resolution of a resolved task is `request_id_reused`.
+  current turn. Its result is the task's status as it stood when the
+  interrupt was accepted, before the interrupt is written: the turn's end
+  shows in later queries. Otherwise nothing happens: the result is the
+  task's status as it is, with `detail` `not running`. That detail replaces
+  the task's own in that one result only, and isn't stored.
+- `work_resolve` settles an `outcome_unknown` task of a **delegated
+  sender** (§11.6); a task in any other state, unless it was resolved, is
+  `forbidden`, and so is a task of a sender that isn't delegated (`local`,
+  a browser grant): its `outcome_unknown` keeps v1 and expires at
+  `expires_at` (§11.3). `failed` makes it `failed` with the given
+  `detail`; `done` makes it `completed` with that `result`.
+- **The same resolution** is the same canonical `resolution` (for `done`,
+  the whole snapshot, `digest` included), whoever asks and whatever the
+  exchange `id`. It returns the recorded status, which keeps the first
+  resolver's `resolved{by, at}`, as a repeated `work_complete` keeps its
+  result. Another resolution of a resolved task is `request_id_reused`.
+- **`failed.detail` is kept exactly as given:** the host stores and shows
+  it byte for byte, leading and trailing spaces included, and a client
+  never compares it with what it sent (a mismatch would close the
+  channel for no gain).
 - A task resolved by either path has `resolved`: `{"by":…,"at":<ms>}`, the
-  resolver and the host's wall clock then. `by` is `member:<id>`,
-  `service:<id>` or `browser:<grant_id>` (the id is 1–128 bytes of
-  `[A-Za-z0-9._:-]`, as a message's sender is), or the literal `local` for
-  the host's own command (`atem task resolve`); a host sender (`host:<id>`)
-  is none, since it gets no `work_resolve` in this version (design I.4.5).
+  resolver and the host's wall clock then. `by` is `member:<id>` or
+  `service:<id>` (the id is 1–128 bytes of `[A-Za-z0-9._:-]`, as a
+  message's sender is): the task's sender or the owner. Or it is the
+  literal `local`, for the host's own command (`atem task resolve`).
+  - A browser grant is never one: its tasks keep v1, and only a
+    delegated task is resolved.
+  - A host sender (`host:<id>`) is none either, since it gets no
+    `work_resolve` in this version (design I.4.5).
   `resolved` is omitted before the task is resolved, never `null` (a
   reader refuses `null`), and appears on `failed` and `completed` statuses
   only. Its shape is **Atem's choice, for Astation to confirm**: the design
@@ -1206,6 +1222,10 @@ not name is `forbidden`, as for `work_query`.
   new dispatch after an attempt proven side-effect-free has a new one. It is
   opaque to a client, which compares it with nothing; a client that
   needs a task's identity uses `task_id`.
+- **A message's progress** (`message_query`'s per-recipient `work`,
+  `WorkProgress`, §5) carries the same per-attempt `receipt_id` and no
+  `resolved`. A resolved task shows there only as its state and `detail`;
+  `work_query` gives the resolver.
 
 **Client core.** `Attached::send` refuses both unless `welcome.features`
 lists `host.delegated` (`host feature not available`). A result answers
@@ -1231,15 +1251,23 @@ a task knows `resolved` (controller ruling T17b). `receipt_id` and
 v4, the second a status `detail` of at most 1024 bytes.
 
 Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
-invalid, and `work` results with `resolved`: each kind of resolver, a bare
-or unknown one, and `null`).
+invalid, a blank and a Cf-carrying `failed.detail` among the refused, and
+`work` results with `resolved`: each kind of resolver, a bare, unknown or
+browser one, and `null`).
 
 ### 11.3 `alert_list` (`host.alerts`)
 
 An unknown outcome needs a person (design I.4.6, owner decision): when a
-task becomes `outcome_unknown` the host records an **alert**, and the owner's
-devices show it with **Mark failed** and **Mark done**, each a `work_resolve`
-(§11.2) by the owner. This section is the alert's wire: a query, and the
+**delegated sender's** task becomes `outcome_unknown` the host records an
+**alert**, and the owner's devices show it with **Mark failed** and **Mark
+done**, each a `work_resolve` (§11.2) by the owner.
+- Only delegated senders' tasks raise one: `member:`, `service:` and
+  `host:` senders (§11.6). A `local` or browser grant's task keeps v1: its
+  `outcome_unknown` expires at `expires_at`, and it raises no alert and no
+  hint. **Atem's reading of the design, for Astation to confirm:** design
+  I.4.6's rules sit under "tasks that Atem owns", and I.1.3 keeps `local`
+  and browser grants on v1.
+- So every alert can be answered with Mark failed or Mark done. This section is the alert's wire: a query, and the
 push hint that tells the owner's devices (session-v1 R9.9, "`outcome_unknown`
 hint"). Both belong to feature `host.alerts`.
 
@@ -1267,8 +1295,8 @@ alerts.)
 
 ```json
 {"kind":"alerts","alerts":[
-  {"alert_id":"<UUID v4>","kind":"outcome_unknown","host_id":"<atem_device_id>",
-   "session_id":"ses-…","task_id":"<UUID>","sender":"service:svc-1",
+  {"alert_id":"<UUID v4>","seq":17,"kind":"outcome_unknown","host_id":"<atem_device_id>",
+   "session_id":"ses-…","task_id":"<UUID v4>","sender":"service:svc-1",
    "reason":"agent exited","created_at":1793264006000}],
  "more":false}
 ```
@@ -1276,13 +1304,14 @@ alerts.)
 | Field | Rule |
 |---|---|
 | `alert_id` | a UUID v4 the host chose, kept with the alert |
+| `seq` | the host's sequence number of the alert: from 1, rising by at least one with every alert the host creates, never reused, kept with the alert. The list's order |
 | `kind` | `outcome_unknown`, the one kind; a reader refuses any other |
 | `host_id` | the host's own `atem_device_id`, the `host` of the result; another host's is refused |
 | `session_id` | the task's target session (`ses-` and 12 characters) |
-| `task_id` | the task: a UUID v4, or the UUID v5 of a local selector's resolution (sender `local`; `work_query` and `work_resolve` take UUID v4 only, so the owner resolves such a task on the host with `atem task resolve`) |
-| `sender` | the principal that enqueued the task: `member:<id>`, `service:<id>`, `browser:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), or the literal `local` |
-| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
-| `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown` |
+| `task_id` | the task: a UUID v4 (a delegated task's id) |
+| `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
 Every field is **Atem's choice, for Astation to confirm**: the design says
@@ -1290,22 +1319,33 @@ only that the alert "names the host, session, task and sender, and why the
 outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
 `detail` may be 1,024 bytes).
 
-- **Order and pages.** Oldest first: strictly ascending by `(created_at,
-  alert_id)`, so no alert repeats within a page. At most **64** alerts per
-  result (**Atem's choice**: a host holds at most 256 unresolved outcomes,
-  design I.4.6, so a full list is four pages of about 450 bytes an alert). A
-  caller asks for the next page with `after` equal to the last `alert_id` it
-  read, until `more` is `false`. A page never carries its `after`.
+- **Order and pages.**
+  - Alerts are listed in the order the host created them: strictly
+    ascending by `seq`, so no alert repeats within a page. `seq` may skip
+    numbers (alerts end).
+  - Never by `created_at`. A wall clock set back gives a later alert an
+    earlier `created_at`, and a client following `after` would otherwise
+    miss it (**Atem's choice, for Astation to confirm**).
+  - At most **64** alerts per result (**Atem's choice**). A host holds at
+    most 256 unresolved outcomes (design I.4.6), so a full list is four
+    pages. An alert is typically about 450 bytes, at most about 750, and
+    about 1 KB with escaping.
+  - A caller asks for the next page with `after` equal to the last
+    `alert_id` it read, until `more` is `false`. The cursor stays the
+    `alert_id`; the host finds it and lists what follows it in `seq`. A page
+    never carries its `after`.
+  - `atem_client::session::alerts::page` is the host's reference.
 - **An unknown cursor.** An `after` the host has no alert for (the alert
   ended, or never was) is `stale_target`, detail `unknown alert`; the caller
   lists again from the start (**Atem's choice of code, for Astation to
   confirm**: the host triple is what §7's `stale_target` usually names, but a
   cursor that no longer points at anything is a stale target too).
-- **What is listed.** Exactly the tasks that are `outcome_unknown` and
-  unresolved, one alert each. An alert ends when its task is resolved
-  (`work_resolve`, or the host's command) or a reply moves it to
-  `awaiting_result` (design I.4.6, "Ending"); an ended alert is no longer
-  listed. A task reaches `outcome_unknown` once, so an alert is never raised
+- **What is listed.** Exactly the delegated tasks that are
+  `outcome_unknown` and unresolved, one alert each. An alert ends when its
+  task is resolved (`work_resolve`, or the host's command) or a reply
+  moves it to `awaiting_result` (design I.4.6, "Ending"); an ended alert is
+  no longer listed. No other ending exists: a delegated task's
+  `outcome_unknown` never expires (§11.6, "Unknown outcomes"). A task reaches `outcome_unknown` once, so an alert is never raised
   twice for one. The host keeps an alert for every unresolved outcome; at 32
   unresolved on a host the `reason` of a new alert says so (for example
   `agent exited; 32 outcomes unresolved on this host`) within the 256 bytes
@@ -1346,10 +1386,15 @@ push hints refuses the new `kind` (`malformed`), and an older reader of a
 and answers the query only behind `host.alerts`, which Atem and Astation
 enable together, once the relay and every client verify the new hint body.
 
-Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
-invalid, and the `alerts` results: an empty page, a page, every sender and
-the bounds, and each refusal), `fixtures/r9-vectors-push-hint.json` (the
-hints).
+Vectors:
+- `fixtures/host-work/requests-v1.json`: the requests, valid and invalid,
+  and the `alerts` results. These are an empty page, a page, every delegated
+  sender and the bounds, a later alert with an earlier `created_at` (valid:
+  the order is `seq`'s), and each refusal, `local`, a browser grant and a
+  UUID v5 task among them.
+- `fixtures/r9-vectors-push-hint.json`: the hints, and
+  `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
+  refused at open).
 
 ### 11.6 Delegated lifecycle (planned)
 
@@ -1517,120 +1562,129 @@ I.6.5, as amended by the **owner's decision of 2026-11-10**). It is
 Atem-internal: no field or message changes, and Astation's `station_time`
 stays as the design gives it.
 
-- **Boot time.** Atem measures elapsed time on a clock that keeps
-  counting while the machine sleeps: `CLOCK_BOOTTIME` on Linux,
-  `mach_continuous_time` on macOS. (`CLOCK_MONOTONIC` and
-  `mach_absolute_time` stop during suspend, so a laptop's sleep would look
-  like a forward jump that never comes back.) Boot time counts only
-  within the boot it was read in (its `boot_id`). Session-v1 §3's lease
-  deadlines keep `CLOCK_MONOTONIC`.
+- **Boot time.** Atem measures elapsed time on a raw counter that keeps
+  counting while the machine sleeps, and that nothing slews or steps:
+  - **macOS:** `mach_continuous_time`.
+  - **Linux:** `CLOCK_MONOTONIC_RAW + (CLOCK_BOOTTIME − CLOCK_MONOTONIC)`
+    (**Atem's fill-in** of how boot time is measured on Linux):
+    - `CLOCK_BOOTTIME` counts suspend, but the kernel slews it with the
+      wall clock;
+    - `CLOCK_MONOTONIC_RAW` is never slewed, but stops in suspend;
+    - their difference `CLOCK_BOOTTIME − CLOCK_MONOTONIC` is the kernel's
+      suspended time. It is measured at each resume (by a nonstop
+      clocksource or the RTC) and never slewed.
+  - **The read must be consistent.** The difference is read before and
+    after `CLOCK_MONOTONIC_RAW`, and the read is retried if it changed, so
+    a resume between the reads never yields a reading off by one suspend.
+  - **Not the monotonic clocks.** `CLOCK_MONOTONIC` and
+    `mach_absolute_time` stop during suspend, so a laptop's sleep would
+    look like a forward jump that never comes back.
+  - **Within one boot only.** Boot time counts only within the boot it was
+    read in (its `boot_id`).
+  - **Leases keep `CLOCK_MONOTONIC`** (session-v1 §3's lease deadlines).
 - **The host's own time `H`.** The host keeps the `wall_hw` record: a
   value, the `boot_id` and the boot time it was recorded at. Its
   **prediction** at boot time `b` of the same boot is `wall_hw + (b −
   the recorded boot time)`.
   - In the same boot, `H = max(wall clock, the prediction)`.
-  - After a reboot, `H = max(wall clock, wall_hw)` until a new record.
+  - After a reboot, `H = max(wall clock, wall_hw + this boot's boot time so
+    far)` until a new record (one boot, below).
   - `H` never includes `station_time`.
 - **One boot** (**Atem's fill-in**). Every boot-time difference is taken
   within one `boot_id` only: a prediction, an update's `Δ`, the floor's
   elapsed time, and an anchor's predictions.
-  - A record, floor or anchor copy from an earlier boot predicts its own
-    value, never more, and `Δ` across a reboot is 0.
+  - A record or floor from an earlier boot was made before this boot
+    began. So it predicts its value plus this boot's boot time so far (the
+    counter's reading, which starts at boot): a lower bound, which leaves
+    only the downtime uncounted.
+  - `Δ` across a reboot is 0.
   - No anchor carries over a reboot.
   - The **first reading of a boot** is no jump and makes no anchor: it
-    follows the rule after a reboot (below).
-  - A runtime restarted within the same boot is the same boot: its
-    first reading is compared as any other.
+    follows the rule across a reboot (below).
+  - A runtime restarted within the same boot is the same boot: its first
+    reading is compared as any other.
 - **The record's update** (**Atem's fill-in** of the design's "the
   highest wall-clock reading"). The host updates the record at least once
   a minute and at shutdown. Take the reading `w`, the prediction `p`, and
-  `Δ`, the boot time since the previous update in this boot. The new
-  value is:
-  - `w` when `w ≥ p`;
-  - when `w < p`, `max(w, p − ρ·Δ)` if the **follow-down** applies, else
-    `p`.
+  `Δ`, the boot time since the previous update in this boot. The new value
+  is `w` when `w ≥ p`, and `max(w, p − ρ·Δ)` when `w < p`: the
+  **follow-down**.
 
   The new value is stamped with the current `boot_id` and boot time. A
-  clock set back (all at once or in small steps) pulls the prediction
-  down by no more than the follow-down. Recording the highest raw
-  reading instead would let a set-back reading still above the stored
+  clock set back, all at once or in small steps, pulls the prediction down
+  by no more than the follow-down. Recording the highest raw reading
+  instead would let a set-back reading that is still above the stored
   value replace a higher prediction.
-  - **The follow-down rate `ρ` is 500 ppm** (0.5 ms a second, 30 ms a
-    minute, 43.2 s a day). That is NTP's frequency tolerance (RFC 5905,
-    `MAXFREQ`), and the bound the Linux kernel puts on the frequency
-    correction its NTP discipline applies (`MAXFREQ` in the kernel's
-    `include/linux/timex.h`, "max frequency error", 500 000 ns a second).
-  - **When it applies.**
-    - On Linux, at an update whose reading comes with the OS's report
-      that its clock is synchronized (`adjtimex` without `STA_UNSYNC`;
-      below).
-    - On macOS, at every update, until its report is confirmed (below).
-    - Without it, `p` is kept.
+  - **The follow-down rate `ρ` is 500 ppm:** 0.5 ms a second, 30 ms a
+    minute, 43.2 s a day.
+    - It is NTP's frequency tolerance (RFC 5905, `MAXFREQ`).
+    - It is also the bound the Linux kernel puts on the frequency
+      correction its NTP discipline applies (`MAXFREQ` in the kernel's
+      `include/linux/timex.h`, "max frequency error", 500 000 ns a second).
+  - **It applies at every update,** on both systems, whatever the OS
+    reports. The OS's sync report serves only rule 4 below and the mark
+    after a reboot.
   - **Why it is needed.**
-    - **On Linux,** the OS's slewing moves `CLOCK_BOOTTIME` and the wall
-      clock together, so only the OS's steps separate them: a leap
-      second, or a step back by the time-sync daemon.
-    - **On macOS,** `mach_continuous_time` is a raw counter. The wall
-      clock that `timed` corrects drifts from it by the oscillator's
-      error, a quartz crystal's typically well under 100 ppm.
-    - **Without the follow-down,** a record that never comes down keeps
-      every such lead:
+    - On both systems the counter is raw. The wall clock the OS
+      disciplines drifts from it by the oscillator's error and by the OS's
+      slewing.
+    - Without the follow-down, a record that never comes down keeps every
+      such lead:
       - the lead builds over the whole uptime;
-      - it carries into the next boot whenever the reboot is shorter
-        than the lead;
+      - it carries into the next boot whenever the reboot is shorter than
+        the lead;
       - past 10 minutes it raises a false "host clock went back" alert
         every hour on a healthy host.
 
       At 23 ppm that is a minute a month; at 20 ppm, 10 minutes takes
       about a year.
-  - **What it bounds, and its price there.** The follow-down bounds what
-    the record gives up to a wall clock that falls behind the boot-time
-    counter:
-    - on Linux, the OS's own steps back while it reports synchronized;
-    - on macOS, any fall of the wall clock against the raw counter,
-      stepped or slewed.
-
-    There someone who can move the clock back walks the record down by
-    at most 500 ppm of the boot time: 43.2 s a day. A fall faster than
-    that leaves the wall clock below `H`, and past 10 minutes the owner
-    is alerted. A step back made while the OS reports its clock
-    unsynchronized (any manual `settimeofday` on Linux) isn't followed
-    at all.
-  - **The price of trusting the OS's slewing (Linux).**
-    - On Linux the OS's slewing moves `CLOCK_BOOTTIME` too. So a time
-      source the OS follows can slew the wall clock and the boot-time
-      counter down together.
-    - The wall clock never falls behind the prediction, so nothing is
-      followed down and **no alert fires**: `H` moves with the source at
-      the OS's slew rate. chrony's default maximum (`maxslewrate`) is
-      83,333 ppm, about 2 hours a day. The kernel accepts tick changes of
-      up to ±10% (`adjtimex`'s `ADJ_TICK`).
-    - The owner's decision takes boot time and the OS's sync report as
-      the inputs, and Linux has no raw boot-time clock that counts
-      suspend. So no rule within the decision removes this: it is the
-      price of trusting the OS's own synchronization, stated here for
-      the owner.
-    - On macOS the counter is raw, so such a slew is followed down at
-      500 ppm and alerted as above.
+  - **What it bounds, and its price.** Any fall of the wall clock against
+    the raw counter, stepped or slewed, by the OS, a time source it follows
+    or anyone who can set the clock, is followed down at most 500 ppm:
+    43.2 s a day.
+    - A fall faster than that leaves the wall clock below `H`, and past 10
+      minutes the owner is alerted.
+    - So someone who can move the clock back walks the record down by at
+      most 43.2 s a day, on both systems.
   - **A healthy host, worked through.**
     - **A Mac** whose counter runs 20 ppm fast against `timed`'s wall
-      clock (about 52 s a month): each minute the prediction gains
-      1.2 ms on the wall clock, and the follow-down allows 30 ms. So
-      every update brings the record back onto the wall clock. The lead
-      stays within 1.2 ms, never builds over the uptime, and never raises
-      the alert.
-    - **A synchronized Linux host:** slewing moves both clocks, and a
-      leap second's 1 s step back is followed down in about 33 minutes.
+      clock (about 52 s a month): each minute the prediction gains 1.2 ms
+      on the wall clock, and the follow-down allows 30 ms. So every update
+      brings the record back onto the wall clock. The lead stays within
+      1.2 ms, never builds over the uptime, and never raises the alert.
+    - **A synchronized Linux host** is the same case: the raw counter's
+      oscillator error is brought back at each update while it is under
+      500 ppm. A leap second's 1 s, stepped or slewed, comes down in about
+      33 minutes.
     - In both cases deadlines fall at most that lead early, never late.
-  - **What the follow-down doesn't clear quickly.** Say a clock booted
-    an hour ahead and the OS's first sync stepped it back.
-    - The record is followed down at 500 ppm, an hour in about 83 days,
-      with the alert raised meanwhile.
-    - At the next reboot, the rule after a reboot (below) lowers it at
-      once.
-    - A step back reported as the OS's sync isn't taken within the boot:
-      the owner's decision lowers the record to a synchronized wall clock
-      only across a reboot.
+  - **The counter's assumptions** (stated for the owner):
+    - **The oscillator's error is under 500 ppm,** the range the kernel's
+      frequency discipline corrects (`ADJ_FREQUENCY` is clamped to
+      `MAXFREQ`). A host whose time-sync daemon has to use tick
+      adjustments (`ADJ_TICK`; some mis-calibrated VMs) builds an early
+      lead at the excess, and past 10 minutes a false alert.
+    - **Each resume can add about 1 s of early lead** where the RTC
+      measures the suspended time (its 1 s granularity, plus its drift
+      while suspended). The lead is followed down the same way.
+    - **Anchors age at the counter's rate.** An anchor's prediction drifts
+      from true time by the counter's error times the anchor's age. So a
+      jump undone more than `60 s / error` after it was made (about 7
+      days at 100 ppm) can miss the band: no repair, early only. The
+      follow-down still brings the record down.
+  - **What the follow-down doesn't clear quickly.** Say a clock booted an
+    hour ahead.
+    - **If the OS's first sync steps it back,** that sync is normally the
+      boot's first synchronized reading, where the rule across a reboot
+      (below) lowers the lead at once.
+    - **A step back after that reading** isn't taken within the boot. The
+      owner's decision lowers the record to a synchronized wall clock only
+      at a boot's first synchronized reading. The record is followed down
+      at 500 ppm (an hour in about 83 days), with the alert raised
+      meanwhile, and the next boot's first synchronized reading lowers it
+      at once.
+    - **macOS, until its report is confirmed:** only the follow-down
+      clears it, or a reboot whose downtime exceeds the remaining lead
+      (one boot, above).
 - **The clock floor** is the latest `station_time` the host has seen,
   with the boot time it was seen at.
   - It takes a `station_time` only up to `H` plus 10 minutes. One further
@@ -1643,28 +1697,28 @@ stays as the design gives it.
     on the floor either.
     - This uses the Station's time, which is not one of the repair's
       inputs, so it is no part of the repair.
-    - It can only bring the floor toward the Station's time, and the
-      floor lowers no deadline comparison below `H`.
-  - Only this follow-down and the repair below lower the floor.
+    - It can only bring the floor toward the Station's time, and the floor
+      lowers no deadline comparison below `H`.
+  - Only this follow-down, the repair and the rule across a reboot (below)
+    lower the floor.
 - **Deadline comparisons** use `max(H, floor + boot time elapsed since
   the floor was set)`, the floor's boot time counting within one boot
-  only. After a restart or a reboot, the floor alone is the lower bound
-  until the next sync. The envelope times of host senders use the same
-  clock.
+  only. After a restart or a reboot, the floor (plus this boot's boot time
+  so far, after a reboot) is the lower bound until the next sync. The
+  envelope times of host senders use the same clock.
 - **A clock that goes back.** A wall clock more than 10 minutes below `H`
   raises an owner alert ("host clock went back", at most one an hour).
   Nothing is revived: every comparison keeps using `H`.
 - **Automatic repair** (owner decision 2026-11-10). It replaces the
-  design's "owner's reset", a local command left unnamed. There is no
-  command and no network time. Keeping the clock right is the OS's job,
-  and HTTP `Date` headers are no time service. A clock that jumped
-  forward and was corrected would otherwise expire tasks early for good,
-  so Atem repairs `wall_hw` and the floor itself.
-
-  The decision's inputs are the boot time and the OS's own sync report,
-  and every rule below uses only those. The rules are **Atem's fill-in**
-  of the owner's "comes back to the trajectory the boot time predicts
-  from before the jump (within 60 s)".
+  design's "owner's reset", a local command left unnamed.
+  - There is no command and no network time. Keeping the clock right is the
+    OS's job, and HTTP `Date` headers are no time service.
+  - A clock that jumped forward and was corrected would otherwise expire
+    tasks early for good, so Atem repairs `wall_hw` and the floor itself.
+  - The decision's inputs are the boot time and the OS's own sync report,
+    and every rule below uses only those.
+  - The rules are **Atem's fill-in** of the owner's "comes back to the
+    trajectory the boot time predicts from before the jump (within 60 s)".
   - **A jump undone within one boot.**
     1. **A forward jump** is a reading more than 60 s above the
        prediction of a record of the same boot. The first reading of a
@@ -1682,75 +1736,76 @@ stays as the design gives it.
     2. **While an anchor is pending:**
        - the record goes on as above: it takes the jumped readings, and
          comes down only by the follow-down;
-       - a `station_time` that raises the floor is kept with the anchor
-         as well, the highest one with its boot time;
+       - a `station_time` that raises the floor is kept with the anchor as
+         well: of the raises since the anchor was taken, the one with the
+         highest prediction, with its boot time;
        - a further jump keeps the first anchor.
     3. **The jump is undone** when a later reading `w`, in the anchor's
        boot, is within 60 s of the anchor's record prediction (above or
-       below it). Then both values are lowered, never raised, and
-       stamped now:
+       below it). Then both values are lowered, never raised, and stamped
+       now:
        - `wall_hw` to `max(w, the anchor's record prediction)`;
        - the floor to `max(w, the anchor's floor prediction, the
-         prediction of the highest Station raise kept with it)`.
+         prediction of the Station raise kept with it)`.
 
        The anchor is dropped. Keeping the Station raise means a repair
-       never undoes the Station's own lead. A raise that only the
-       jumped `H`'s wider cap let in stays too: it can only make
-       deadlines early.
+       never undoes the Station's own lead. A raise that only the jumped
+       `H`'s wider cap let in stays too: it can only make deadlines early.
     4. **The OS's sync ends an anchor.** At a reading outside the
-       anchor's band, a report from the OS that its clock is
-       synchronized drops the anchor: the OS has made the jumped
-       trajectory its synchronized time, and the jump stands.
+       anchor's band, a report from the OS that its clock is synchronized
+       drops the anchor: the OS has made the jumped trajectory its
+       synchronized time, and the jump stands.
        - **Why the report can be trusted here:** a step clears the Linux
          kernel's synchronized state until the time-sync daemon next
-         reports, so a synchronized report after a jump is the OS's
-         report on the new time (to be checked in step 4).
-       - **Dropping an anchor only gives up a repair:** `H` stays as
-         high as the record is. So no lateness can come of this rule,
-         even if that check fails.
+         reports, so a synchronized report after a jump is the OS's report
+         on the new time (to be checked in step 4).
+       - **Dropping an anchor only gives up a repair:** `H` stays as high
+         as the record is. So no lateness can come of this rule, even if
+         that check fails.
        - **Nothing else ends an anchor** in its boot. A reading more than
-         60 s below its record prediction is a clock set back: the
-         alert, and no repair. A reboot drops the anchor (one boot,
-         above).
+         60 s below its record prediction is a clock set back: the alert,
+         and no repair. A reboot drops the anchor (one boot, above).
   - **The invariants**, measured on the boot-time counter, within one
     boot:
     - the record's prediction decreases only at a repair, by the rule
-      after a reboot (once, at the boot's first synchronized reading),
-      or at an update under the follow-down by at most 500 ppm of the
-      boot time since the previous update;
+      across a reboot (once, at the boot's first synchronized reading), or
+      at an update by the follow-down, by at most 500 ppm of the boot time
+      since the previous update;
     - the anchor's two predictions never decrease, nor does the Station
       raise kept with it;
     - a repair never sets `wall_hw` below the anchor's record prediction,
-      the floor below the higher of the anchor's floor prediction and
-      the Station raise kept with it, or either below the reading;
+      the floor below the higher of the anchor's floor prediction and the
+      Station raise kept with it, or either below the reading;
     - no comparison crosses a reboot.
 
     So, against the boot-time counter, a forward move and back ends
     neither `wall_hw` nor the floor below where each stood before the
-    move, apart from the follow-down while it applies. Against true
-    time, add what the counter itself loses: on macOS only its rate
-    error; on Linux whatever the OS's slewing takes away (the price
-    above). Nothing settled is revived.
+    move, apart from the follow-down and the once-per-boot lowering across
+    a reboot (to a wall clock the OS reports synchronized). Against true
+    time, add only the counter's own rate error. Nothing settled is
+    revived.
   - **The small-steps-back attack, worked through.** Suppose the true
-    time is `T`, the record's prediction is on it, and the OS doesn't
-    report its clock synchronized, so no follow-down applies.
+    time is `T` and the record's prediction is on it.
     1. The attacker sets the clock back 50 s a minute, for 30 minutes.
-       Each update keeps `p`, so the prediction stays at `T`. No reading
-       is ahead of it, so no anchor is made. Past 10 minutes, "host
-       clock went back" fires.
-    2. The attacker sets the clock to `T`: no jump, and nothing changes.
-    3. It sets the clock to `T` + 2 min: a jump, anchored at `T`'s
-       trajectory, and `wall_hw` rises to `T` + 2 min.
+       Each update lowers the prediction by at most 30 ms (the
+       follow-down), 0.9 s in all. No reading is ahead of it, so no anchor
+       is made. Past 10 minutes, "host clock went back" fires.
+    2. The attacker sets the clock to `T`: no jump, and nothing changes
+       but the 0.9 s.
+    3. It sets the clock to `T` + 2 min: a jump. If the OS reports its
+       clock unsynchronized, as a manual step makes it, the jump is
+       anchored at the record's trajectory, and `wall_hw` rises to
+       `T` + 2 min.
     4. Back to `T`: within 60 s of the anchor, so the jump is undone,
-       and `wall_hw` becomes `T`. Back to `T` − 25 min instead: more
-       than 60 s below the anchor, so there is no repair, and `wall_hw`
-       stays at least `T` + 2 min.
+       and `wall_hw` returns to the anchor's trajectory, at most 0.9 s
+       below `T`. Back to `T` − 25 min instead: more than 60 s below the
+       anchor, so there is no repair, and `wall_hw` stays near `T` + 2 min,
+       coming down at 500 ppm.
 
-    Either way nothing ends below `T`. With the OS reporting synchronized,
-    the same 30 minutes of steps lower the record by at most 0.9 s
-    (30 ms a minute). The jump in step 3 then makes no anchor, or loses it
-    at the OS's next report (rule 4). So `wall_hw` stays at least
-    `T` + 2 min, coming down at 500 ppm: early, never below `T`.
+    Either way nothing ends more than the follow-down below `T`. If the
+    OS reports the jump in step 3 synchronized, it makes no anchor or
+    loses it (rule 4), and `wall_hw` stays near `T` + 2 min, coming down
+    at 500 ppm: early, never below `T`.
   - **An OS forward step, then a set-back or a down-slew, worked
     through.** A Linux host booted three hours slow (no RTC), so the
     record is on the slow trajectory `S`.
@@ -1761,20 +1816,14 @@ stays as the design gives it.
     2. The daemon's next report clears the mark. At Atem's next reading
        (still on the true time `T`, outside the anchor's band, and
        synchronized) the anchor is dropped, and the record stays on `T`.
-    3. Later someone sets the clock back toward `S`. No anchor exists,
-       so nothing is repaired.
-       - While the OS reports the clock unsynchronized, as a manual step
-         makes it, the record keeps `p`.
-       - Once the OS reports synchronized again, the record comes down by
-         at most 500 ppm.
-       - The alert fires once the wall clock is 10 minutes below `H`.
-    4. If instead a bad time source makes the daemon slew the clock down,
-       the slew moves the boot-time counter too. `H` comes down with it
-       at the daemon's slew rate, with no alert: the price of trusting
-       the OS's slewing (above). On a Mac the same slew is followed down
-       at 500 ppm and alerted.
+    3. Later someone sets the clock back toward `S`, or a bad time source
+       makes the daemon slew it down through `S`'s band. No anchor exists,
+       so nothing is repaired. On the raw counter both are a fall of the
+       wall clock: the record comes down by at most 500 ppm, and the alert
+       fires once the wall clock is 10 minutes below `H`. The same holds
+       on a Mac.
 
-    Under the previous text the stale anchor stayed armed for the boot.
+    Under the earlier text the stale anchor stayed armed for the boot.
     The set-back would have lowered `wall_hw` and the floor to `S`,
     three hours below `T`, and later jumps in that boot could no longer
     be repaired.
@@ -1782,34 +1831,32 @@ stays as the design gives it.
     shuts down at `X` with `wall_hw` = `X`, stays off three days, and
     boots.
     1. Its first reading, `X` + 3 days, is the boot's first reading: no
-       jump and no anchor. The record becomes `X` + 3 days in the new
-       boot.
+       jump and no anchor. The record becomes `max(X + 3 days, X + this
+       boot's boot time so far)` = `X` + 3 days, in the new boot.
     2. Later someone steps the clock back to `X` + 30 s. No anchor
-       exists, so nothing is repaired. The follow-down lowers the record
-       by at most 500 ppm, and the alert fires past 10 minutes. `H`
-       stays within 43.2 s a day of the true time, plus the counter's own
-       rate error.
+       exists, so nothing is repaired. The follow-down lowers the record by
+       at most 500 ppm, and the alert fires past 10 minutes. `H` stays
+       within 43.2 s a day of the true time, plus the counter's own rate
+       error.
 
-    Compared across the reboot, the first reading would have been a
-    jump. It would have armed an anchor at `X` for the whole boot, and
-    the step back would have "repaired" `wall_hw` and the floor to
-    `X` + 30 s: three days, plus the uptime, below the true time.
+    Compared across the reboot, the first reading would have been a jump.
+    It would have armed an anchor at `X` for the whole boot, and the step
+    back would have "repaired" `wall_hw` and the floor to `X` + 30 s: three
+    days, plus the uptime, below the true time.
 
     A clock set forward while the machine was off shows up only as the
-    boot's first reading, so it is never repaired in that boot.
-    Deadlines are early. It is cleared by the follow-down (on macOS, or
-    on Linux when the OS steps it back while synchronized), or at the
-    next reboot by the rule after a reboot once the OS reports
-    synchronized.
+    boot's first reading, so it is never repaired in that boot as a jump.
+    Deadlines are early. On Linux, once the OS has corrected the clock, the
+    boot's first synchronized reading lowers a lead of more than 10 minutes
+    at once, by the rule across a reboot. Otherwise the follow-down clears
+    it.
   - **The bounds that remain,** for the owner:
-    - **On Linux, the slewing price** above: `H` moves with a time source
-      the OS follows, at the OS's slew rate, with no alert.
     - **On Linux, the step window.** An anchor armed by the OS's own
-      forward step is still armed until the time-sync daemon next
-      reports synchronized (to be measured in step 4), and for the rest
-      of the boot if it never does. A set-back into its band before then
-      lowers `wall_hw` to the old trajectory, below the true time by up
-      to the step's size.
+      forward step stays armed until Atem's first reading after the
+      time-sync daemon next reports synchronized (to be measured in step
+      4), and for the rest of the boot if it never does. A set-back into
+      its band before then lowers `wall_hw` to the old trajectory, below
+      the true time by up to the step's size.
     - **On macOS, until its sync report is confirmed:**
       - Rule 4 never applies, so an anchor armed by `timed`'s own forward
         step on a clock slow by more than 60 s lasts the boot.
@@ -1817,39 +1864,46 @@ stays as the design gives it.
         to the old trajectory, up to the step's size below the true time.
       - Later jumps in that boot aren't repaired: `H` stays ahead of the
         wall clock, coming down at 500 ppm. A reboot doesn't clear it
-        either, since macOS has no lowering after a reboot before
-        confirmation.
+        either, unless its downtime exceeds the remaining lead: macOS has
+        no lowering across a reboot before confirmation.
       - A Mac's clock keeps time while it's off, so such steps are rare,
         and exploiting one needs someone able to set the clock or to
         steer its time source.
       - The floor is lowered no further than its own pre-step value and
         the Station's raises, so with a Station it stays a lower bound.
     - **A jump the OS reports as synchronized** is never repaired in its
-      boot. `H` stays ahead (deadlines early) and comes down:
-      - by the follow-down when the OS steps the wall clock back while
-        synchronized;
-      - with the counter on Linux, when the OS slews it back;
-      - at the next reboot, by the rule after a reboot (on macOS, once
-        the report is confirmed).
-  - **After a reboot.** Boot time doesn't cross a reboot (one boot,
+      boot. `H` stays ahead (deadlines early) and comes down by the
+      follow-down, and at a later boot's first synchronized reading by the
+      rule across a reboot (on macOS, once the report is confirmed).
+    - **The downtime isn't counted (the late direction).** A wall clock
+      that is behind the true time at a boot's first reading is taken as
+      it is, short by up to the downtime, with no "host clock went back"
+      alert. It may have been set back while the machine was off, set back
+      after boot but before Atem's runtime first reads, or restored stale
+      with no attacker at all (fake-hwclock on a machine without an RTC).
+      The record's lower bound, `wall_hw` plus this boot's boot time so
+      far, counts everything but the downtime. Remote starts still wait
+      for the Station's sync, whose head would hit the cap.
+    - **The counter's assumptions** above (the oscillator under 500 ppm,
+      about 1 s a resume, anchors ageing).
+  - **Across a reboot.** Boot time doesn't cross a reboot (one boot,
     above).
-    - The boot's first reading records `max(w, wall_hw)` with the new
-      `boot_id`.
-    - The record carries a **mark** from the reboot until the first
-      reading at which the OS reports its clock synchronized in the new
-      boot. At that reading, if `wall_hw` or the floor is more than 10
-      minutes ahead of the wall clock, Atem lowers both to the current
-      wall clock.
-    - Then the mark goes, and for the rest of the boot only the rules
-      above apply. The mark is **Atem's fill-in**: it fixes when the rule
-      applies.
+    - The boot's first reading records `max(w, wall_hw + this boot's boot
+      time so far)` with the new `boot_id`.
+    - The record carries a **mark** from the reboot until the first reading
+      at which the OS reports its clock synchronized in the new boot. At
+      that reading, if `wall_hw` or the floor is more than 10 minutes ahead
+      of the wall clock, Atem lowers both to the current wall clock.
+    - Then the mark goes, and for the rest of the boot only the rules above
+      apply. The mark is **Atem's fill-in**: it fixes when the rule applies.
+      It is stored with the record, so the lowering and the mark's removal
+      are one write.
     - **Linux:** `adjtimex`'s status without `STA_UNSYNC`, which chrony
       and systemd-timesyncd clear once synchronized. In a container it
       reports the host kernel's state, which is the right answer.
     - **macOS:** the candidate is `ntp_gettime()` returning `TIME_OK`
-      rather than `TIME_ERROR`, to be confirmed against `timed`'s
-      behaviour in step 4. Until it is, macOS doesn't lower them after a
-      reboot.
+      rather than `TIME_ERROR`, to be confirmed against `timed`'s behaviour
+      in step 4. Until it is, macOS doesn't lower them across a reboot.
   - **Otherwise** Atem stays on the safe side: tasks may expire early, and
     `atem status` says why and names the fix. Where the flag never clears
     because no time-sync daemon runs, it says `host clock ahead of its
@@ -1857,14 +1911,14 @@ stays as the design gives it.
     On macOS before confirmation, it says `host clock ahead of its
     record; waiting for a synchronized clock`.
   - **What doesn't change.**
-    - No repair, and no lowering after a reboot, sets either value below
+    - No repair, and no lowering across a reboot, sets either value below
       the current wall clock.
     - Nothing already settled is revived: tasks already `expired`,
       envelopes already refused as expired, `outcome_unknown` tasks
       already past their deadline.
     - The device list's recovery waits (session-v1 R9.5) keep their own
       clocks.
-    - Every repair, and every lowering after a reboot, writes one
+    - Every repair, and every lowering across a reboot, writes one
       `runtime.log` line with the old and new values, and `atem status`
       shows it. The follow-down is no repair: it writes no line.
 
@@ -1876,8 +1930,9 @@ stays as the design gives it.
   session, sender, reason and when.
 - `atem task resolve <task_id> failed|done` resolves one as the owner, on
   the host. Its `resolved.by` is `local` (§11.2), and it works for a
-  revoked sender's task and for a local task's UUID v5 id, which
-  `work_resolve` doesn't take.
+  revoked sender's task. Like `work_resolve`, it resolves only a delegated
+  task: a local or browser grant's task keeps v1, and its unknown outcome
+  expires.
 
 Both commands are built in step 4, with the lifecycle. Their output, and
 how `done` takes its result snapshot and `failed` its detail, are

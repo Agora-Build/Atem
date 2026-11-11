@@ -332,7 +332,7 @@ impl Resolution {
         match self {
             // Kept exactly as given (the host shows it as the task's
             // detail; a client never compares it), but never blank, and no
-            // control or Cf character (T17 minors 5 and 8).
+            // control or Cf character.
             Self::Failed { detail } => {
                 !detail.trim().is_empty()
                     && detail.len() <= MAX_DETAIL_BYTES
@@ -611,7 +611,7 @@ where
 /// wall clock then, Unix ms. `by` is `member:<id>` or `service:<id>` (an id
 /// of 1-128 bytes, as a message's sender is): the task's delegated sender or
 /// the owner, or `local` for the host's own command. Only a delegated task
-/// is resolved (ruling P5a), so a browser grant, whose tasks keep v1, never
+/// is resolved, so a browser grant, whose tasks keep v1, never
 /// is one; a host sender (`host:`) has no `work_resolve` (design I.4.5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1005,16 +1005,16 @@ mod tests {
             ("alert_kind_is_outcome_unknown", false),
             ("alerts_in_order", false),
             ("alert_is_this_hosts", false),
-            // Only a delegated sender's UUID v4 task (ruling P5a).
+            // Only a delegated sender's UUID v4 task.
             ("alert_sender_not_local", false),
             ("alert_sender_not_a_browser_grant", false),
             ("alert_task_id_is_uuid_v4", false),
-            // The host's order, by its sequence number (ruling P5b).
+            // The host's order, by its sequence number.
             ("alerts_by_seq_not_time", true),
             ("alerts_by_seq_even_when_time_ascends", false),
             ("alert_seq_from_one", false),
             ("alert_needs_a_seq", false),
-            // No Cf character in a reason (T17 minor 8).
+            // No Cf character in a reason.
             ("alert_reason_without_cf", false),
         ] {
             assert!(
@@ -1808,8 +1808,8 @@ mod tests {
         let by = |by: &str, at: u64| Some(Resolved { by: by.into(), at });
         // The resolver is the task's delegated sender or the owner
         // (`member:` or `service:` and an id of 1-128 bytes), or the host's
-        // own `local` command. Only a delegated task is resolved (ruling
-        // P5a), so a browser grant never is one.
+        // own `local` command. Only a delegated task is resolved, so a
+        // browser grant never is one.
         let long_id = "x".repeat(128);
         for who in [
             "member:dev-phone",
