@@ -202,6 +202,12 @@ FILES+=("$FRAMING_VECTOR")
 CONTROL_VECTOR="atem-client-${VERSION}-r9-vectors-host-work-control.json"
 cp designs/protocol/fixtures/r9-vectors-host-work-control.json "$OUT/$CONTROL_VECTOR"
 FILES+=("$CONTROL_VECTOR")
+# The Station's acknowledgment fixtures (test 48), for Station builders.
+for fixture in designs/protocol/fixtures/r9-control-ack-*.json; do
+  ACK_FIXTURE="atem-client-${VERSION}-$(basename "$fixture")"
+  cp "$fixture" "$OUT/$ACK_FIXTURE"
+  FILES+=("$ACK_FIXTURE")
+done
 SUMS="atem-client-${VERSION}-SHA256SUMS.txt"
 (cd "$OUT" && sha256sum "${FILES[@]}" >"$SUMS")
 echo "Packaged into $OUT:"

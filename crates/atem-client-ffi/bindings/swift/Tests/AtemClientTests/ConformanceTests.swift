@@ -862,6 +862,220 @@ final class ConformanceTests: XCTestCase {
             #endif
         }
 
+        // ------------------------------- delegated host work: the Station's side
+        // r9-control-ack-*: every acknowledgment fixture through AckLedgerHandle
+        // as a Station persists it (each call's next state committed before the
+        // reports go, adopted after; restarts reload the committed state;
+        // replicas serialized); a call never changes its handle; the relay
+        // builders and readers agree; the Portal's statuses in their classes.
+        func intentOf(_ i: ReportIntentInfo) -> [String: Any] {
+            let report: [String: Any]
+            switch i.report {
+            case let .revocationApplied(integrationId, host, recordId):
+                report = ["kind": "revocation_applied", "integration_id": integrationId, "host": host, "record_id": recordId]
+            case let .revoked(integrationId, outcome, pendingHosts):
+                report = ["kind": "revoked", "integration_id": integrationId, "outcome": outcome, "pending_hosts": pendingHosts]
+            }
+            return ["not_before": i.notBefore, "report": report, "report_id": i.reportId]
+        }
+        func alertOf(_ alert: LedgerAlertInfo) -> [String: Any] {
+            switch alert {
+            case let .reportRefused(reportId): return ["kind": "report_refused", "report_id": reportId]
+            case let .reportingStopped(dropped): return ["kind": "reporting_stopped", "dropped": dropped]
+            }
+        }
+        func answerOf(_ answer: ReportAnswerKind) -> String {
+            switch answer {
+            case .confirm: return "confirm"
+            case .retry: return "retry"
+            case .refuse: return "refuse"
+            case .stopReporting: return "stop_reporting"
+            }
+        }
+        func linkOf(_ v: Any?) -> LinkAssociationInfo {
+            let l = o(v)
+            return LinkAssociationInfo(accountId: s(l["account_id"]), genesisHash: s(l["genesis_hash"]), hostId: s(l["host_id"]),
+                                       hostTrustGen: u(l["host_trust_gen"]), connectionId: s(l["connection_id"]))
+        }
+        func ctlRecord(_ label: String) -> String { js(ctlByLabel[label]!["record"]!) }
+        let ackNames = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("r9-control-ack-") && $0.hasSuffix(".json") }
+            .map { String($0.dropLast(5)) }
+            .sorted()
+        for name in ackNames {
+            check("Station acks: \(name) through AckLedgerHandle") {
+                try eq(ackNames.count, 5, "the acknowledgment fixtures")
+                let f = try load(name)
+                let setup = o(f["setup"])
+                let st = o(setup["station"])
+                let links = o(setup["links"])
+                var ledger = try AckLedgerHandle(origin: s(st["origin"]), accountId: s(st["account_id"]), genesisHash: s(st["genesis_hash"]))
+                var committed = ledger.toJson()
+                var now = u(setup["station_now_ms"])
+                func input(_ on: AckLedgerHandle, _ step: [String: Any]) throws -> AckTransition? {
+                    if let label = step["control_record"] {
+                        let at = step["revoked_at_ms"].map { u($0) } ?? now
+                        return try on.record(recordJson: ctlRecord(s(label)), revokedAtMs: at, coveredHosts: a(step["covered_hosts"]).map(s), nowMs: now)
+                    }
+                    if let message = step["control_ack"] {
+                        let link = linkOf(links[s(step["link"])])
+                        if let refused = step["refused"] {
+                            try throwsCode(s(refused)) { _ = try on.ack(link: link, ackJson: js(message), nowMs: now) }
+                            return nil
+                        }
+                        return try on.ack(link: link, ackJson: js(message), nowMs: now)
+                    }
+                    if step["tick"] != nil { return on.tick(nowMs: now) }
+                    throw Failure(description: "not an input: \(canon(step))")
+                }
+                func made(_ t: AckTransition, _ step: [String: Any]) throws {
+                    try eq(t.intents.map { $0.reportId }, a(step["made"]).map(s), "\(name) made")
+                    try eq(t.alerts, [LedgerAlertInfo](), "\(name) alerts")
+                }
+                func commit(_ t: AckTransition) {
+                    committed = t.next.toJson()
+                    ledger = t.next
+                }
+                func sendable(_ id: String) throws {
+                    if !ledger.pendingReports().contains(where: { $0.reportId == id }) {
+                        throw Failure(description: "\(id) is not sendable")
+                    }
+                }
+                for step in a(f["steps"]).map(o) {
+                    if step["control_record"] != nil || step["control_ack"] != nil || step["tick"] != nil {
+                        if let t = try input(ledger, step) {
+                            try made(t, step)
+                            if (step["commit"] as? Bool) != false { commit(t) }
+                        }
+                    } else if let inner = step["replica"].map(o) {
+                        let t1 = try input(try AckLedgerHandle.fromJson(stateJson: committed), inner)!
+                        let t2 = try input(try AckLedgerHandle.fromJson(stateJson: committed), inner)!
+                        try eq(t1.next.toJson(), t2.next.toJson(), "\(name) replicas' states")
+                        try eq(t1.intents, t2.intents, "\(name) replicas' intents")
+                        try made(t1, inner)
+                        commit(t1)
+                        let lost = try input(try AckLedgerHandle.fromJson(stateJson: committed), inner)!
+                        try eq(lost.intents, [ReportIntentInfo](), "\(name) the replica that lost")
+                    } else if let ms = step["advance_ms"] {
+                        now += u(ms)
+                    } else if step["restart"] != nil {
+                        ledger = try AckLedgerHandle.fromJson(stateJson: committed)
+                        try eq(ledger.toJson(), committed, "\(name) restart")
+                    } else if let want = step["expect_report"] {
+                        try eq(canon(ledger.pendingReports().map(intentOf)), canon(want), "\(name) reports")
+                    } else if let id = step["confirm"] {
+                        try sendable(s(id))
+                        commit(ledger.confirm(reportId: s(id)))
+                    } else if let fl = step["report_failure"].map(o) {
+                        let id = s(fl["report_id"])
+                        try sendable(id)
+                        let answer = fl["status"] is String ? "retry" : answerOf(reportAnswer(status: UInt16(u(fl["status"]))))
+                        try eq(answer, s(fl["answer"]), "\(name) answer")
+                        let t: AckTransition? = answer == "refuse" ? ledger.refuse(reportId: id)
+                            : answer == "stop_reporting" ? ledger.stopReporting() : nil
+                        let alerts: [[String: Any]] = t?.alerts.map(alertOf) ?? []
+                        try eq(canon(alerts), canon(fl["alerts"] ?? [Any]()), "\(name) alerts")
+                        if let t = t { commit(t) }
+                    } else if let labels = step["expect_resign_alerts"] {
+                        let want = a(labels).map { s(o(o(ctlByLabel[s($0)]!["record"])["body"])["record_id"]) }.sorted()
+                        try eq(ledger.resignAlerts(), want, "\(name) resign alerts")
+                    } else if let want = step["expect_refused"] {
+                        try eq(ledger.refusedReports(), a(want).map(s), "\(name) refused")
+                    } else if let want = step["expect_stopped"] {
+                        try eq(ledger.reportingStopped(), want as! Bool, "\(name) stopped")
+                    } else if step["expect_portal"] == nil {
+                        // expect_portal is the Portal's side: no Portal model here.
+                        throw Failure(description: "unknown step \(canon(step))")
+                    }
+                }
+            }
+        }
+        check("Station acks: a call never changes its handle; the state loads only as written") {
+            let f = try load("r9-control-ack-per-effect")
+            let setup = o(f["setup"])
+            let st = o(setup["station"])
+            let linkB = linkOf(o(setup["links"])["host-b"])
+            let nowMs: UInt64 = 1_793_620_940_000
+            let l = try AckLedgerHandle(origin: s(st["origin"]), accountId: s(st["account_id"]), genesisHash: s(st["genesis_hash"]))
+                .record(recordJson: ctlRecord("S4_revoke"), revokedAtMs: 1_793_620_903_000, coveredHosts: ["host-b", "host-c"], nowMs: nowMs).next
+            let before = l.toJson()
+            let ack = js(o(a(f["steps"])[6])["control_ack"]!)
+            let t1 = try l.ack(link: linkB, ackJson: ack, nowMs: nowMs)
+            let t2 = try l.ack(link: linkB, ackJson: ack, nowMs: nowMs)
+            // The commit failed: the handle is as it was, and the same call again gives the same.
+            try eq(l.toJson(), before)
+            try eq(t1.next.toJson(), t2.next.toJson())
+            try eq(t1.intents, t2.intents)
+            try eq(t1.intents.count, 1)
+            let id = t1.intents[0].reportId
+            try eq(t1.next.refuse(reportId: id).alerts, [LedgerAlertInfo.reportRefused(reportId: id)])
+            try eq(t1.next.pendingReports().count, 1)
+            try eq(t1.next.stopReporting().next.reportingStopped(), true)
+            try eq(t1.next.reportingStopped(), false)
+            let text = t1.next.toJson()
+            try eq(try AckLedgerHandle.fromJson(stateJson: text).toJson(), text)
+            try throwsCode("malformed") { _ = try AckLedgerHandle.fromJson(stateJson: "[") }
+            try throwsCode("unsupported_version") { _ = try AckLedgerHandle.fromJson(stateJson: text.replacingOccurrences(of: "\"v\":1", with: "\"v\":2")) }
+            try throwsCode("stored_invalid") { _ = try AckLedgerHandle.fromJson(stateJson: "{\"extra\":1," + text.dropFirst()) }
+            try throwsCode("malformed") { _ = try AckLedgerHandle(origin: "https://Station-dev.agora.build/", accountId: s(st["account_id"]), genesisHash: s(st["genesis_hash"])) }
+            var noConnection = linkB
+            noConnection.connectionId = ""
+            try throwsCode("incomplete_link") { _ = try l.ack(link: noConnection, ackJson: ack, nowMs: nowMs) }
+            try throwsCode("not_the_link") { _ = try l.ack(link: linkB, ackJson: ack.replacingOccurrences(of: "host-b", with: "host-c"), nowMs: nowMs) }
+            try throwsCode("unknown_field") { _ = try l.record(recordJson: ctlRecord("P4_unknown_field"), revokedAtMs: 0, coveredHosts: [], nowMs: nowMs) }
+        }
+        check("Station calls: fixture acks read and write back; pages, heads and fetches round-trip; builders refuse what readers refuse") {
+            for name in ackNames {
+                for step in a(try load(name)["steps"]).map(o) {
+                    let inner = step["replica"].map(o) ?? step
+                    guard let msg = inner["control_ack"] else { continue }
+                    guard case let .controlAck(ack) = try relayDecodeToStation(message: js(msg)) else {
+                        throw Failure(description: "\(name): not an ack")
+                    }
+                    try eq(try canonicalJson(json: relayControlAck(ack: ack)), try canonicalJson(json: js(msg)), name)
+                }
+            }
+            let station = o(o(ctl["stations"])["A"])
+            let origin = s(station["origin"])
+            let feed = s(station["feed_id"])
+            try eq(try relayDecodeToStation(message: relayControlSync(origin: origin, feedId: feed, after: 7)), .controlSync(origin: origin, feedId: feed, after: 7))
+            try eq(try relayDecodeToStation(message: relayControlSync(origin: origin, feedId: nil, after: 0)), .controlSync(origin: origin, feedId: nil, after: 0))
+            try throwsCode("malformed") { _ = try relayControlSync(origin: origin, feedId: nil, after: 5) }
+            let page = ["S1_cover", "S4_revoke", "M1_revoke"].enumerated().map {
+                RelayFeedRecord(feedSeq: UInt64($0.offset + 1), recordJson: ctlRecord($0.element))
+            }
+            guard case let .controlSyncResult(_, _, _, _, records) = try relayDecodeToHost(message: relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000, records: page)) else {
+                throw Failure(description: "not a page")
+            }
+            try eq(try records.map { try canonicalJson(json: $0.recordJson) }, try page.map { try canonicalJson(json: $0.recordJson) })
+            var refusedPage = page
+            refusedPage[1] = RelayFeedRecord(feedSeq: 2, recordJson: ctlRecord("P4_unknown_field"))
+            try throwsCode("unknown_field") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 0, records: refusedPage) }
+            try throwsCode("malformed") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 2, stationTime: 0, records: page) }
+            let heads = [RelayFeedHead(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000)]
+            let hm = try relayHeads(feeds: heads, membership: mlogHead)
+            try eq(try relayDecodeToHost(message: hm), .heads(feeds: heads, membership: mlogHead))
+            var withMailbox = o(try JSONSerialization.jsonObject(with: Data(hm.utf8)))
+            withMailbox["mailbox"] = ["mailbox_id": feed, "head": 1] as [String: Any]
+            try throwsCode("unknown_field") { _ = try relayDecodeToHost(message: js(withMailbox)) }
+            try eq(try relayDecodeToStation(message: relayMembershipFetch(after: 2)), .membershipFetch(after: 2))
+            let entries = ["E3", "E4", "E5", "E6"].map(entry)
+            guard case let .membershipFetchResult(fetchedHead, fetched) = try relayDecodeToHost(message: relayMembershipFetchResult(head: mlogHead, entries: entries)) else {
+                throw Failure(description: "not a fetch result")
+            }
+            try eq(fetchedHead, mlogHead)
+            try eq(try fetched.map { try canonicalJson(json: $0) }, try entries.map { try canonicalJson(json: $0) })
+            try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: relayControlSync(origin: origin, feedId: nil, after: 0)) }
+            try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: "{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
+            try throwsCode("not_strict") { _ = try relayDecodeToStation(message: "{") }
+        }
+        check("Station: the Portal's statuses in their classes") {
+            let want: [(UInt16, String)] = [(200, "confirm"), (401, "retry"), (429, "retry"), (500, "retry"), (503, "retry"),
+                                            (400, "refuse"), (404, "refuse"), (409, "refuse"), (413, "refuse"), (415, "refuse"),
+                                            (204, "refuse"), (302, "refuse"), (403, "stop_reporting")]
+            for (status, answer) in want { try eq(answerOf(reportAnswer(status: status)), answer, "\(status)") }
+        }
+
         // ------------------------------------------------------------ recovery
         let kit = o(rec["kit"])
         func kit1() throws -> RecoveryKitHandle {

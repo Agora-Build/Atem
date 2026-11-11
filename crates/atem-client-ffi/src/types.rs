@@ -992,3 +992,176 @@ record! {
         pub feed_seq: u64,
     }
 }
+
+// ---------------------------------------- Station calls and acknowledgments
+
+record! {
+    /// The verified association of the link a host's call arrived on
+    /// (I.5.8, "Which host is calling"): the account and its root
+    /// (`genesis_hash`, lowercase hex), the host and its trust generation,
+    /// and the Station's id of the authenticated connection (1 to 128
+    /// characters of `[A-Za-z0-9._:-]`). The Station takes it from its
+    /// authenticated link, never from the call.
+    pub struct LinkAssociationInfo {
+        pub account_id: String,
+        pub genesis_hash: String,
+        pub host_id: String,
+        pub host_trust_gen: u64,
+        pub connection_id: String,
+    }
+}
+
+data_enum! {
+    /// A report the Station owes the Portal, keyed by integration. The
+    /// Portal's HTTP body is Auth/Portal's (`platform.md`: `state` is the
+    /// variant's name, with `host` and `recordId`, or `outcome` and
+    /// `pendingHosts`, and `reportId`).
+    pub enum StationReport {
+        /// The revocation is in force on `host`, as the result for
+        /// `record_id` said first.
+        RevocationApplied {
+            integration_id: String,
+            host: String,
+            record_id: String,
+        },
+        /// The revocation is done: `outcome` `all_applied` (no pending
+        /// host) or `deadline_passed` (the hosts that didn't confirm,
+        /// sorted, never none).
+        Revoked {
+            integration_id: String,
+            outcome: String,
+            pending_hosts: Vec<String>,
+        },
+    }
+}
+
+record! {
+    /// A report to send with its `report_id` (the Portal's `reportId`)
+    /// until it is settled, once every report `not_before` names is
+    /// settled.
+    pub struct ReportIntentInfo {
+        pub report_id: String,
+        pub report: StationReport,
+        /// Sorted.
+        pub not_before: Vec<String>,
+    }
+}
+
+data_enum! {
+    /// An operator alert a ledger transition raises, once.
+    pub enum LedgerAlertInfo {
+        /// The Portal refused this report for good: done, never sent again.
+        ReportRefused { report_id: String },
+        /// The Portal refused this Station's reports (`403`): the reports
+        /// `dropped` are done unsent, and none is made from now on.
+        ReportingStopped { dropped: Vec<String> },
+    }
+}
+
+unit_enum! {
+    /// What a Station does with the Portal's answer to a report
+    /// (`report_answer`; the classes are Auth/Portal's).
+    pub enum ReportAnswerKind {
+        /// `200` (a repeat's recorded `200` too): `confirm`.
+        Confirm,
+        /// Send the same report again later, with backoff: a network error
+        /// or timeout, a 5xx, `429` (after `Retry-After`), `401` (after
+        /// refreshing the `station.report` token).
+        Retry,
+        /// Final, with an operator alert: `refuse`.
+        Refuse,
+        /// `403`: `stop_reporting` (one alert).
+        StopReporting,
+    }
+}
+
+record! {
+    /// One record of a control feed at its position. `record_json` is the
+    /// record's JSON text: for a builder, a record the control parser
+    /// accepts (a Station serves only what it validated at intake); as
+    /// decoded, the value the Station sent, of any JSON type (judge it with
+    /// `parse_control_record`, and keep one it refuses as evidence).
+    pub struct RelayFeedRecord {
+        pub feed_seq: u64,
+        pub record_json: String,
+    }
+}
+
+record! {
+    /// One feed's head announcement (I.5.2).
+    pub struct RelayFeedHead {
+        pub origin: String,
+        pub feed_id: String,
+        pub head: u64,
+        /// The Station's clock, ms since the epoch (I.6.5).
+        pub station_time: u64,
+    }
+}
+
+data_enum! {
+    /// One result of a `control_ack` (I.5.8): a record's, or a host
+    /// sender's device-list revoke entry's, per effect.
+    pub enum RelayAckResult {
+        Record {
+            record_id: String,
+            effects: Vec<ControlEffectResult>,
+        },
+        Entry {
+            seq: u64,
+            entry_hash: String,
+            applied_seq: u64,
+            effects: Vec<ControlEffectResult>,
+        },
+    }
+}
+
+record! {
+    /// A `control_ack`: the host's scan `cursor` in the feed
+    /// `(origin, feed_id)` and its durable per-effect results. The account,
+    /// root, host and trust generation are the host's claim, refused when
+    /// they aren't its link's.
+    pub struct ControlAckInfo {
+        pub account_id: String,
+        pub genesis_hash: String,
+        pub host_id: String,
+        pub host_trust_gen: u64,
+        pub origin: String,
+        pub feed_id: String,
+        pub cursor: u64,
+        pub results: Vec<RelayAckResult>,
+    }
+}
+
+data_enum! {
+    /// A host's call to its Station, as `relay_decode_to_station` reads it.
+    pub enum RelayToStation {
+        ControlSync {
+            origin: String,
+            feed_id: Option<String>,
+            after: u64,
+        },
+        ControlAck { ack: ControlAckInfo },
+        MembershipFetch { after: u64 },
+    }
+}
+
+data_enum! {
+    /// A Station's message to a host, as `relay_decode_to_host` reads it.
+    pub enum RelayToHost {
+        ControlSyncResult {
+            origin: String,
+            feed_id: String,
+            head: u64,
+            station_time: u64,
+            records: Vec<RelayFeedRecord>,
+        },
+        Heads {
+            feeds: Vec<RelayFeedHead>,
+            membership: LogHead,
+        },
+        MembershipFetchResult {
+            head: LogHead,
+            entries: Vec<String>,
+        },
+    }
+}

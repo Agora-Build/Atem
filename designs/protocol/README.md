@@ -138,11 +138,11 @@ wins, unless it contradicts the contract text: then stop and report.
 | Runner | What it runs | Command |
 |---|---|---|
 | Core runner (`src/session_protocol/fixtures.rs`) | every base and `r8-*` scenario: host ones against `SessionHost` in a fake runtime (with the memory journal and with the `FileJournal`), client ones against the client machines; reports `r9-*` as not run | `cargo test --bin atem session_protocol::fixtures` |
-| atem-client (`crates/atem-client/tests/`) | the r9 vectors, client and relay scenarios (against a reference relay), and host scenarios against a test host | `cargo test -p atem-client -p atem-client-ffi` |
+| atem-client (`crates/atem-client/tests/`) | the r9 vectors, client and relay scenarios (against a reference relay; the Station's acknowledgment scenarios `r9-control-ack-*` against the reference ledger), and host scenarios against a test host | `cargo test -p atem-client -p atem-client-ffi` |
 | r9 engine (`src/session_protocol/r9/fixtures_tests.rs`) | the `r9-envelope-*` fixtures in process | `cargo test --bin atem session_protocol::r9::fixtures_tests` |
 | Real runtime, r8 (`tests/runtime_fixtures_binary.rs`) | host scenarios against the `atem runtime` binary, real `atem worker`s running a fake Claude Code, and a fake Astation playing the client | `cargo test --test runtime_fixtures_binary` (`ATEM_FIXTURE=<name>` runs one) |
 | Real runtime, r9 (`tests/r9_runner/`) | every r9 host scenario: a device list pinned as `atem pair` writes it, clients that speak `atem-ch1` in the envelope, a fake Astation that also plays the relay | `cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture` (`ATEM_FIXTURE=<name>[,…]`; `ATEM_R9_PARALLEL` runtimes at once, default 6) |
-| Bindings | Swift, Kotlin and WASM conformance over the r9 vectors | `./scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e]` |
+| Bindings | Swift, Kotlin and WASM conformance over the r9 vectors and the acknowledgment fixtures | `./scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e]` |
 
 Notes:
 

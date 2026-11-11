@@ -233,7 +233,7 @@ fn check_info(rec: &ControlRecord, check: &ControlCheck) -> ControlCheckInfo {
     }
 }
 
-fn result_kind(result: ApplicationResult) -> ControlResultKind {
+pub(crate) fn result_kind(result: ApplicationResult) -> ControlResultKind {
     match result {
         ApplicationResult::Applied => ControlResultKind::Applied,
         ApplicationResult::Duplicate => ControlResultKind::Duplicate,
@@ -242,7 +242,7 @@ fn result_kind(result: ApplicationResult) -> ControlResultKind {
     }
 }
 
-fn effect_kind(effect: EffectKind) -> ControlEffectKind {
+pub(crate) fn effect_kind(effect: EffectKind) -> ControlEffectKind {
     match effect {
         EffectKind::Revocation => ControlEffectKind::Revocation,
         EffectKind::Interrupt => ControlEffectKind::Interrupt,

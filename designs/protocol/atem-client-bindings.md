@@ -49,15 +49,18 @@ work; `agent.prompt` alone does not authorize creating a process.
 
 Every production SDK artifact includes
 `atem-client-<version>-host-work-requests-v1.json`,
-`atem-client-<version>-host-work-prompt-framing-v1.json` and
-`atem-client-<version>-r9-vectors-host-work-control.json` in its SHA-256
+`atem-client-<version>-host-work-prompt-framing-v1.json`,
+`atem-client-<version>-r9-vectors-host-work-control.json` and the five
+`atem-client-<version>-r9-control-ack-*.json` in its SHA-256
 manifest. These are the shared positive/negative request vectors from
 `fixtures/host-work/requests-v1.json`, the prompt framing's vectors from
 `fixtures/host-work/prompt-framing-v1.json` (tags, escaping, rendered prompts
 and the size check; delegated host-work design III.2), both run by the Rust
 core's tests, and the control records' vectors from
 `fixtures/r9-vectors-host-work-control.json` (§9), run by the Rust core's
-tests and every conformance suite. The first two are fixture data, not an
+tests and every conformance suite, and the Station's acknowledgment
+fixtures `fixtures/r9-control-ack-*.json` (§9, delegated host-work test 48),
+run the same way. The first two are fixture data, not an
 additional binding export or a live integration test: the framing runs on
 the host (`session::framing`), and no binding exports it yet.
 
@@ -542,6 +545,16 @@ for a service or a host sender. Production exports for Station builders:
 `interrupt_running` with `build_control_record` under purpose
 `ControlRecord` (§3).
 
+### Station calls and the acknowledgment ledger (delegated host work; planned)
+
+`relay_decode_to_station`, `relay_decode_to_host`, the relay builders
+(`relay_control_sync`, `relay_control_sync_result`, `relay_heads`,
+`relay_control_ack`, `relay_membership_fetch`,
+`relay_membership_fetch_result`), `AckLedgerHandle` (whose calls return an
+`AckTransition`) and `report_answer`: a Station's side of its hosts' feed
+calls and acknowledgments, and its reports to the Portal. Production
+exports for Station builders: §9. An app (Astation) uses none of them.
+
 ### Encoding helpers
 
 `canonical_json`, `encode_fields`, `hash_fields` (SHA-256 of `enc`),
@@ -805,11 +818,12 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (49 checks in JS, 51 in Kotlin and in Swift: the same 49
+- **Conformance** (57 checks in JS, 59 in Kotlin and in Swift: the same 57
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over
-  `designs/protocol/fixtures/r9-vectors-*.json` and atem-client's own
+  `designs/protocol/fixtures/r9-vectors-*.json`, the acknowledgment
+  fixtures `r9-control-ack-*.json` and atem-client's own
   `crates/atem-client/vectors/r9-svc-fingerprint.json`): `bindings/kotlin/Conformance.kt`
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
@@ -840,8 +854,22 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
+- **The Station's side** (`tests/station.rs`, Rust; eight conformance
+  checks per language, of the 57 and 59 above): every acknowledgment
+  fixture (`r9-control-ack-*`, one check each) through `AckLedgerHandle` as
+  a Station persists it (each call's next state committed before the
+  reports go and adopted after, restarts from the committed state, two
+  replicas from one state giving the same next state and reports and the
+  one that lost the compare-and-swap making nothing), with the Portal's
+  answers through `report_answer`; a call never changing the handle it was
+  called on, and the state loading only as written; every fixture ack read
+  and written back, feed pages, heads and device-list fetches round-tripping,
+  the builders refusing what the readers refuse (a record the control
+  parser refuses, a position above the head, a `mailbox` head before stage
+  3, another direction's message); and the Portal's statuses in their
+  classes.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 49 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 57 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
@@ -878,11 +906,12 @@ acknowledgments (delegated host-work design I.5; `atem-host-work-v1.md`
 §11; **planned**: no host advertises `host.senders` yet). The built-in
 Station uses the `atem-client` crate directly (`atem_client::control`); a
 Station written in another language uses these exports, which are the
-same code and pass the same vectors (`r9-vectors-host-work-control`, run by
-the Rust core and all three conformance suites). They are production
-exports, in the default UniFFI build and in the `wasm`-only package (plan
-decision 6). The acknowledgment ledger and the relay calls join this
-section in a later step.
+same code and pass the same vectors and fixtures
+(`r9-vectors-host-work-control`, `r9-control-ack-*`, run by the Rust core
+and all three conformance suites). They are production exports, in the
+default UniFFI build and in the `wasm`-only package (plan decision 6). The
+wire they read and write is host-work-v1 §11.4 ("Station calls and
+acknowledgments").
 
 ### Control records
 
@@ -944,8 +973,9 @@ synchronized clock: it orders covers (below).
 **Its size.** The state keeps every record that counted (about 110 bytes
 each) and is read whole: `from_json` takes at most 64 MiB, some 600,000
 records, and refuses a larger one `too_large`. Pruning records that can no
-longer come again is planned with the acknowledgment ledger; until then a
-long-lived Station sizes its state against that bound.
+longer come again is planned (neither this state nor the acknowledgment
+ledger prunes in this version); until then a long-lived Station sizes its
+state against that bound.
 
 **Reading results.** `apply` gives the record's `result` and one result per
 effect it carries (`revocation`, `interrupt`, `hold`, `release`, `cover`).
@@ -996,3 +1026,165 @@ trust model"):
   removal (its integrations go `revoking` with reason `station_removed`, it
   issues and serves their records, then the removal completes), never
   another way.
+
+### Station calls
+
+A host calls its Station over its one link (`{"type":"relay","op":…}`,
+host-work-v1 §11.4). Every message is read and written by the shared code:
+
+| call | what it does |
+|---|---|
+| `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{origin, feed_id?, after}`, `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below) |
+| `relay_control_sync_result(origin, feed_id, head, station_time, records)` | the page after the host's `after`: at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` in `1..=head`, 256 KiB in all. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
+| `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored |
+| `relay_membership_fetch_result(head, entries)` | the device list's head and the entries after the host's `after` (signed objects' JSON), at most 64: an R9.3 carriage |
+| `relay_control_sync(origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts |
+
+Each builder checks what the reader checks, so what it writes the reader
+accepts; a value out of its grammar is `Invalid{code}` (`too_large`,
+`malformed`). `relay_decode_to_host` gives each record's JSON as the
+Station sent it, of any JSON type: a record the control parser refuses
+costs only itself, never the page. JS: `relayDecodeToStation(message)`,
+`relayDecodeToHost(message)` (plain objects, `{type: "control_sync" | "control_ack" | …, …}`, camelCase),
+`relayControlSync(origin, feedId?, after)`,
+`relayControlSyncResult(origin, feedId, head, stationTime, [{feedSeq, recordJson}])`,
+`relayHeads([{origin, feedId, head, stationTime}], {seq, hash})`,
+`relayControlAck({accountId, genesisHash, hostId, hostTrustGen, origin, feedId, cursor, results})`
+(each result `{type: "record", recordId, effects}` or `{type: "entry", seq,
+entryHash, appliedSeq, effects}`, each effect `{effect, result}`),
+`relayMembershipFetch(after)`, `relayMembershipFetchResult({seq, hash}, entries)`;
+an object with a key outside these is refused (`malformed`).
+
+### The acknowledgment ledger
+
+`AckLedgerHandle` is the reference Station side of the hosts'
+acknowledgments for one device list (an account and its root) at one
+Station (its exact origin): which covered hosts have each revocation in
+force, the reports owed to the Portal, and the native-signed records still
+to re-sign. Keep one per device list your Station serves.
+
+| call | what it does |
+|---|---|
+| `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger; the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`); its durable state, canonical JSON (`"v": 1`) |
+| `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration, `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
+| `ack(link, ack_json, now_ms)` | a host's `control_ack` as received, on the link whose verified association is `link` (`LinkAssociationInfo{account_id, genesis_hash, host_id, host_trust_gen, connection_id}`). Refused whole, nothing counted: `incomplete_link`, `not_the_link` (the ack's account, root, host or trust generation isn't the link's), `other_account`, `other_station`, `not_the_record` (a result whose effects aren't the record's), or the reader's code |
+| `tick(now_ms)` | your timer: a revocation 24 hours past `revoked_at_ms` gets its `revoked{deadline_passed}` report |
+| `pending_reports()` | what to send now, in order: `ReportIntentInfo{report_id, report, not_before}`, `report` being `RevocationApplied{integration_id, host, record_id}` or `Revoked{integration_id, outcome, pending_hosts}` |
+| `report_answer(status)` | the class of the Portal's HTTP status: `Confirm`, `Retry`, `Refuse`, `StopReporting` (below) |
+| `confirm(report_id)`, `refuse(report_id)`, `stop_reporting()` | the Portal accepted the report; refused it for good (settled, never sent again, a `ReportRefused` alert); answered `403` (every pending report settled unsent, none made from now on, one `ReportingStopped` alert) |
+| `resign_alerts()`, `refused_reports()`, `reporting_stopped()` | the native-signed records not yet in force on every host they cover, for every effect they carry (`record_id`s: Astation alerts the owner to re-sign those whose signer was removed); the reports settled unsent; whether reporting stopped |
+
+Every call that moves the ledger returns `AckTransition{next, intents,
+alerts}` and never changes the handle it was called on. JS: `new
+AckLedgerHandle(origin, accountId, genesisHash)`,
+`AckLedgerHandle.fromJson(text)`, `toJson()`, `record(recordJson,
+revokedAtMs, coveredHosts, nowMs)`, `ack({accountId, genesisHash, hostId,
+hostTrustGen, connectionId}, ackJson, nowMs)`, `tick(nowMs)`,
+`confirm(id)`, `refuse(id)`, `stopReporting()`, `pendingReports()` (plain
+objects: `{reportId, report: {type: "revocation_applied" | "revoked", …},
+notBefore}`), `resignAlerts()`, `refusedReports()`, `reportingStopped()`;
+`AckTransition` has the getters `next`, `intents` and `alerts` (`{type:
+"report_refused", reportId}`, `{type: "reporting_stopped", dropped}`);
+`reportAnswer(status)` gives `"confirm"`, `"retry"`, `"refuse"` or
+`"stop_reporting"`.
+
+**Which host is calling.** `link` is the complete association of the link
+the ack arrived on, as your transport authenticated it: the account and its
+root, the host and its trust generation, and the connection. Take it from
+the link: a routed link's verified root, host and connection binding; for
+a link the paired Astation authenticated (carrier A) or a call through
+Astation's `:8080`, the authenticated transport's host association, or a
+fresh host-key challenge proof where that can't be verified (host-work-v1
+§11.4). Never from a field of the ack: the ledger refuses an ack whose
+claim differs from `link`. **Fence connections at your transport**: an ack
+from a connection of the host that isn't its current authenticated
+connection (a superseded one) never reaches `ack`. The ledger compares the
+account, root, host and trust generation and requires a connection id, but
+it can't tell a superseded connection from the current one.
+
+**Persistence and the order of calls** (each step durable before the next):
+
+1. **A record.** Store it in your feed and call `record` at that time; in
+   one transaction, store the feed row and `next.to_json()`. Then announce
+   the head (`relay_heads`). Mint every `record_id` as a fresh UUID v4,
+   unique in your Station (a re-signed record gets a new one).
+2. **An ack.** Read it with `relay_decode_to_station`, take `link` from
+   the connection, call `ack`, and store `next.to_json()` in one
+   transaction **before any HTTP**: `next` holds every report not yet
+   settled, so the reports are persisted with the state. Adopt `next` only
+   once that committed. If the commit failed, keep the handle you called
+   on: the host sends its ack again, and the same call on the same state
+   gives the same next state and the same `report_id`s.
+3. **Serialize the transitions of one ledger**, by compare-and-swap on the
+   stored state. Two replicas that load the same state and process the
+   same ack at the same `now_ms` give the same next state and the same
+   reports, byte for byte, so the Portal would deduplicate them; but only
+   serialized transitions keep it so (an ack processed at another time can
+   pass a deadline). The replica whose compare-and-swap failed loads the
+   new state and calls again: it makes nothing new.
+4. **Your timer** calls `tick(now_ms)` at least once a minute, so a
+   revocation's deadline is reported when no ack arrives (`ack` and
+   `record` apply passed deadlines too).
+5. **Delivery.** After each commit, POST `pending_reports()` in order to
+   the Portal (`POST /api/v1/stations/reports`, the `report_id` as
+   `reportId`; the HTTP body is Auth/Portal's, `platform.md`), and act on
+   each answer by `report_answer(status)`. `Confirm`, `refuse` and
+   `stop_reporting` are transitions: commit each, and raise its `alerts`
+   once it committed.
+6. **At start**, load the state with `from_json` and send
+   `pending_reports()` again. On any `Stored` error, keep reporting
+   stopped for that device list and never start again from an empty
+   ledger: it would lose the deadlines and the per-host counts.
+
+**`report_id` and the Portal's idempotency.** A report's id comes from its
+identity only, never from time, order or a counter: `<kind>:` + lowercase
+hex SHA-256 of `enc(["atem-station-report-id-v1", kind, account_id,
+genesis_hash (32 raw bytes), principal, integration_id, host])`, without
+the host for `revoked`; `enc` puts a 4-byte big-endian length before every
+field (R9.1). The derivation is host-work-v1 §11.4, "Reports", with known
+answers in `r9-control-ack-*` (recomputed independently by
+`scripts/check-r9-vectors.py`). An id is 72 or 83 characters of
+`[a-z0-9_:]`, within the Portal's 1 to 128 characters of
+`[A-Za-z0-9._:-]`. A retry, a restart or a replica sends the same id with
+the same body; the Portal answers a repeated id with the same body with its
+recorded answer and counts nothing again, and a repeated id with another
+body with `409 report_id_reused` (the first stands). A revocation has one
+`revoked` and one `revocation_applied` per host, so neither the record a
+`revocation_applied` names nor a `revoked`'s outcome is part of the id.
+
+**The Portal's answers** (Auth/Portal's classes; `report_answer`):
+
+| answer | class | what the Station does |
+|---|---|---|
+| `200`, the recorded `200` of a repeated `reportId` included | `Confirm` | `confirm` |
+| a network error, a timeout, any 5xx (`503` and unknown ones too) | `Retry` | send the same report (same `reportId`, same body) again later, with backoff |
+| `429` | `Retry` | the same, after its `Retry-After` |
+| `401` | `Retry` | refresh the `station.report` token, then the same |
+| `409 report_id_reused`, `400`, `404`, `409 invalid_state`, `413`, `415`, any other 4xx | `Refuse` | `refuse`: final, with an operator alert |
+| `403` | `StopReporting` | `stop_reporting`: final for every report, stop reporting, alert once |
+| any other status (1xx, 3xx, a 2xx other than `200`) | `Refuse` | final, with an operator alert (**Atem's choice, for Auth/Portal to confirm**: the Portal answers none of these) |
+
+A report that waits for another (`not_before`) goes once that one is
+settled, confirmed or refused. Keep sending `revocation_applied` after a
+revocation's `revoked{deadline_passed}`: a host that applies it late is
+still reported, and the Portal records it (it lowers "n hosts didn't
+confirm"); `revoked` is never sent again.
+
+**What counts** (host-work-v1 §11.4, "Acknowledgments"): only an effect
+result of `applied` or `duplicate`, per host and per effect (a principal's
+revocation, and the interrupt for it); the cursor, `pending` and `refused`
+never count. `revocation_applied` goes once per host and revoked
+integration, at the host's first `applied` or `duplicate` for the
+revocation, naming that record (**changed agreed meaning, agreed by
+Auth/Portal, for Astation's confirmation**: the agreed design sent it only
+at `applied`; a host that applied the revocation through another record
+first reports this Station's record `duplicate` and is still counted);
+`revoked{all_applied}` goes after every covered host's
+`revocation_applied`, `revoked{deadline_passed, pending_hosts}` 24 hours
+after the revocation.
+
+**Its size.** The ledger keeps the `revoke` and `interrupt_running` records
+it tracks (at most 64 covered hosts each), what each host has in force, the
+reports not yet settled and the ids of those settled unsent. Nothing is
+pruned in this version: keep it as long as the principal exists (design
+I.5.2's retention); `from_json` reads at most 64 MiB.

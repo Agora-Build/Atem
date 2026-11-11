@@ -29,6 +29,10 @@
 //! - [`control`]: control records of delegated host work (build, parse,
 //!   verify) and the reference control state with its per-effect results,
 //!   production exports for Station builders;
+//! - [`station`]: the Station's side of delegated host work: the relay
+//!   calls (strict readers and builders) and the reference acknowledgment
+//!   ledger with its reports to the Portal, production exports for Station
+//!   builders;
 //! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
@@ -56,6 +60,7 @@ pub mod provider;
 pub mod publish;
 pub mod push;
 pub mod service;
+pub mod station;
 pub mod station_route;
 pub mod types;
 #[cfg(feature = "wasm")]

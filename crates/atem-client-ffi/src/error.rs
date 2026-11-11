@@ -241,6 +241,42 @@ impl From<atem_client::control::ControlError> for AtemError {
     }
 }
 
+impl From<atem_client::control::RelayError> for AtemError {
+    /// A Station call a strict reader or builder refuses (I.5.8):
+    /// `Invalid{code}`, `too_large`, `not_strict`, `wrong_message`,
+    /// `unknown_field` or `malformed` (`detail` names the field).
+    fn from(e: atem_client::control::RelayError) -> Self {
+        AtemError::Invalid {
+            code: e.code().into(),
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl From<atem_client::control::AckRefusal> for AtemError {
+    /// An ack the Station's ledger refuses whole, nothing of it counted:
+    /// `Invalid{code}`, `incomplete_link`, `malformed`, `not_the_link`,
+    /// `other_account`, `other_station` or `not_the_record`.
+    fn from(e: atem_client::control::AckRefusal) -> Self {
+        AtemError::Invalid {
+            code: e.code().into(),
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl From<atem_client::control::RecordRefusal> for AtemError {
+    /// A record the Station's ledger refuses: `Invalid{code}`,
+    /// `other_account`, `other_station`, `record_id_reused` or
+    /// `malformed`.
+    fn from(e: atem_client::control::RecordRefusal) -> Self {
+        AtemError::Invalid {
+            code: e.code().into(),
+            detail: e.to_string(),
+        }
+    }
+}
+
 impl From<Invalid> for AtemError {
     fn from(reason: Invalid) -> Self {
         AtemError::membership(&reason, None)
