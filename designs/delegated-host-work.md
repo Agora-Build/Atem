@@ -999,15 +999,28 @@ from the one the decision names.
     frequency tolerance), at every update, on both systems.
     - **What it bounds:** any fall of the wall clock against the raw counter, stepped or slewed, by the OS, a time
       source it follows, or anyone who can set the clock.
-    - **The bound:** a clock moved back gains at most 43.2 s a day, and a faster fall raises the "host clock went
-      back" alert past 10 minutes.
+    - **The bound:** once the boot's first synchronized reading has passed, a clock moved back gains at most 43.2 s a
+      day, and a faster fall raises the "host clock went back" alert past 10 minutes. That reading itself can lower the
+      record to a wall clock however far behind: the rule across a reboot trusts the OS's sync report once per boot
+      (below, "What remains").
     - **On a healthy host,** the oscillator's error builds no lead: none carries across reboots, and no false alert
       fires.
     - **Its assumptions:** the oscillator's error is under 500 ppm, and each RTC-measured resume adds about 1 s of
       early lead, followed down the same way.
   - **One boot.** Every boot-time difference is taken within one `boot_id`.
     - A record or floor from an earlier boot predicts its value plus this boot's boot time so far: a lower bound,
-      since it predates the boot, which leaves only the downtime uncounted.
+      since it predates the boot, which leaves uncounted only the time from the record to this boot (the downtime,
+      and any time before the shutdown that no runtime recorded).
+    - **Its two assumptions:** the record predates this boot, and the counter starts at this boot. Two setups break
+      them, and either can push `H` ahead of the true time at the first reading, so tasks expire early:
+      - **a store opened on another node with the same identity** (a container's profile volume rescheduled with a
+        stable hostname, or an image that carries one `/etc/machine-id` to every node): the record may have been
+        written after this node booted, and the first reading adds this node's whole uptime;
+      - **a Linux time namespace with a boot-time offset** (a CRIU restore, `unshare --time --boottime`): the counter
+        reads this boot's boot time plus the offset, so a positive one adds itself to the prediction.
+    - **Guarded in step 4.** Step 4 detects both (for example by a boot id or a machine id recorded with `wall_hw`,
+      and the namespace's offsets) and then adds no boot time across the reboot, so the first reading records
+      `max(w, wall_hw)`. On macOS, that `mach_continuous_time` starts at boot is to be confirmed in step 4 too.
     - An update's elapsed time across a reboot is 0.
     - No anchor carries over a reboot.
     - A boot's first reading is no jump and makes no anchor: it follows the rule across a reboot (below).
@@ -1015,7 +1028,8 @@ from the one the decision names.
   "Boot time since" a reading counts only within the boot it was recorded in:
   - the same `boot_id`: `H = max(wall clock, wall_hw + boot time since wall_hw was recorded)`;
   - after a reboot (another `boot_id`): `H = max(wall clock, wall_hw + this boot's boot time so far)` until a new
-    reading is recorded. Time while the machine was off never counts, as in R9.5.
+    reading is recorded, under one boot's two assumptions above. Time while the machine was off never counts, as in
+    R9.5.
 
   `H` never includes `station_time`.
 - **A host clock that goes back.** A wall clock more than 10 minutes below `H` raises an owner alert ("host clock
@@ -1074,42 +1088,66 @@ from the one the decision names.
         remaining lead.
       - **A jump the OS reports as synchronized** is never repaired in its boot: deadlines stay early, never late.
       - **The downtime isn't counted (the late direction).** A wall clock that is behind the true time at a boot's
-        first reading is taken as it is, short by up to the downtime, with no alert. It may have been set back while
-        the machine was off or before Atem's runtime first reads, or restored stale (fake-hwclock without an RTC).
+        first reading is taken as it is, short by up to the time from the last record to this boot (the downtime,
+        plus any time before the shutdown that no runtime recorded: hosting off, a crash), with no alert. It may have
+        been set back while the machine was off or before Atem's runtime first reads, or restored stale
+        (fake-hwclock without an RTC). This bound holds until the boot's first synchronized reading, which can lower
+        `H` further (next item).
+      - **The once-per-boot lowering trusts the OS's sync report (the late direction).** This is the price of the
+        owner's decision of 2026-11-10, whose input is the OS's own sync report, trusted here once per boot. At a
+        boot's first synchronized reading, when `wall_hw` or the floor is more than 10 minutes ahead of the wall
+        clock, the rule across a reboot lowers both to whatever wall clock the OS then reports as synchronized,
+        however far behind the true time it is, with a `runtime.log` line and no owner alert. Anyone who can set the
+        clock can usually also clear the unsynchronized flag (on Linux the same privilege sets `adjtimex`'s status),
+        and on a host with no time-sync daemon (or chrony without `rtcsync`) that can happen at any time in the boot.
+        A time source the daemon follows that is wrong at boot does the same. So the walk-back of at most 43.2 s a
+        day holds only after that reading, and the downtime bound above only until it. On macOS this applies once its
+        report is confirmed.
       - **The counter's assumptions:** an oscillator error over 500 ppm builds an early lead at the excess;
         anchors age at the counter's rate, so a jump undone days later can miss the band (no repair, early only).
+        The rule across a reboot assumes the record predates the boot and the counter starts at it (one boot,
+        above): a store moved to another node or a time namespace's offset can make deadlines early; guarded in
+        step 4.
 
       The worked cases (small steps back, an OS step, a reboot) are in host-work-v1 §11.6.
   - **Across a reboot.** If `wall_hw` or the floor is more than 10 minutes ahead of the wall clock, and the OS reports
     its clock synchronized, Atem lowers both to the current wall clock. **Filled in by Atem's spec:**
-    - The boot's first reading records the later of the wall clock and `wall_hw` plus this boot's boot time so far.
+    - The boot's first reading records the later of the wall clock and `wall_hw` plus this boot's boot time so far,
+      under one boot's two assumptions (above; guarded in step 4). When that reading is also the first synchronized
+      one, the record and the lowering are one evaluation, before any deadline is compared.
     - The rule is checked at the first reading in the new boot at which the OS reports synchronized (a mark stored
       with the record until then), so on Linux a lead set before that point is lowered at once.
     - After that, only the rules above apply.
-    - On Linux the OS's report is `adjtimex`'s status without `STA_UNSYNC`: chrony and systemd-timesyncd clear it
-      once synchronized. In a container it reports the host kernel's state, which is the right answer.
+    - On Linux the OS's report is `adjtimex`'s status without `STA_UNSYNC`: systemd-timesyncd clears it once
+      synchronized, and chrony too when `rtcsync` is set (as distributions usually ship it; without it chrony leaves
+      the flag set). In a container it reports the host kernel's state, which is the right answer.
     - On macOS the candidate is `ntp_gettime()` returning `TIME_OK` rather than `TIME_ERROR`, to be confirmed against
       `timed`'s behaviour in step 4. Until it is, macOS doesn't lower them across a reboot.
   - **Otherwise** Atem stays on the safe side: tasks may expire early, and `atem status` says why and names the fix.
-    On a host where the flag never clears because no time-sync daemon runs: "host clock ahead of its record; enable
-    time synchronization (chrony or systemd-timesyncd)". On macOS before confirmation: "host clock ahead of its
-    record; waiting for a synchronized clock".
+    On a host where the flag never clears (no time-sync daemon runs, or chrony runs without `rtcsync`): "host clock
+    ahead of its record; enable time synchronization (chrony with rtcsync, or systemd-timesyncd)". On macOS before
+    confirmation: "host clock ahead of its record; waiting for a synchronized clock".
   - **What doesn't change:**
     - No repair, and no lowering across a reboot, goes below the current wall clock.
     - Nothing already settled is revived: tasks already `expired`, envelopes already refused as expired,
       `outcome_unknown` tasks already past their deadline.
     - The device list's recovery waits (R9.5) keep their own clocks.
-    - Every repair writes a `runtime.log` line with the old and new values, and is shown in `atem status`.
+    - Every repair, and every lowering across a reboot, writes a `runtime.log` line with the old and new values, and
+      is shown in `atem status`.
 - **Deadline comparisons. Changed to match Atem's spec:** they use `max(H, floor + boot time elapsed since the floor
   was set)`, where the source has the host clock in place of `H`; the floor's boot time counts within one boot only
   (**changed by owner decision 2026-11-10:** boot time, where this said monotonic time). That covers restarts too:
   after a restart or a reboot, the floor (plus this boot's boot time so far, after a reboot) is the lower bound until
   the next sync. Every deadline check in this design uses this clock, the envelope times of II.4.2 included.
 - **The effect. Changed to match Atem's spec.**
-  - **A host clock set backwards,** before or after a sync, can't revive an expired task, and the owner is told.
-    The one exception is while the machine is off: a clock set back during the downtime, or restored stale at boot,
-    is taken at the boot's first reading, short by up to the downtime and with no alert (host-work-v1 §11.6, "The
-    bounds that remain").
+  - **A host clock set backwards,** before or after a sync, can't revive an expired task, and the owner is told,
+    with two exceptions (host-work-v1 §11.6, "The bounds that remain"):
+    - a clock set back while the machine is off or after boot but before Atem's runtime first reads, or restored
+      stale at boot, is taken at the boot's first reading, short by up to the time from the last record to this
+      boot, with no alert;
+    - at the boot's first synchronized reading, a `wall_hw` or floor more than 10 minutes ahead of the wall clock is
+      lowered to it, however far behind the true time that synchronized clock is, with a `runtime.log` line and no
+      alert (Linux; macOS once its report is confirmed).
   - **A Station time set forwards** can only expire tasks early, never start one, and by at most 10 minutes. A
     Station further ahead stops new starts on that origin until it is corrected, and the owner is told.
   - **A host clock that jumped forward** expires tasks early until the jump is undone in the same boot or, across a

@@ -3812,15 +3812,18 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
     `host:<id>`, as host-work-v1 §11.3's alert names it;
   - why the outcome is unknown: 1-256 bytes, no control or Cf character.
 
-  Only a delegated sender's task raises an alert. A `local` or browser
-  grant's task keeps v1 (its unknown outcome expires) and gets no hint, so
-  a recipient refuses facts naming one, at open (`malformed`): the relay
-  can't see them. The body names the alert, never the task: nothing the
-  owner reads is in the clear. No new label: it is the push hint's own, and the seal's. **Atem's
-  choices, for Astation to confirm:** the sealed facts (the design's "the
-  host, session, task and sender, and why": the host is the body's
-  `host_id`), their bounds, the `kind` discriminator, and an `alert_id` (the
-  host's own UUID v4, the `alert_id` of `alert_list`) as the identity.
+  Only a delegated sender's task raises an alert. A task of `local`, a
+  browser grant or a service no feed covers keeps v1 (its unknown outcome
+  expires) and gets no hint. A recipient refuses facts naming `local` or a
+  browser grant, at open (`malformed`): the relay can't see them. A
+  `service:` sender passes, since only the host knows whether a feed covers
+  it. The body names the alert, never the task: nothing the owner reads is
+  in the clear. No new label: it is the push hint's own, and the seal's.
+  **Atem's choices, for Astation to confirm:** the sealed facts (the
+  design's "the host, session, task and sender, and why": the host is the
+  body's `host_id`), their bounds, the `kind` discriminator, and an
+  `alert_id` (the host's own UUID v4, the `alert_id` of `alert_list`) as
+  the identity.
 - Identity: `(account_id, genesis_hash, host_id, host_trust_gen, alert_id)`
   plus `recipient.device_id`; every match and deduplication uses all of it. A
   `push_ack` entry is `{"kind":"outcome_unknown", "account_id", "genesis_hash",

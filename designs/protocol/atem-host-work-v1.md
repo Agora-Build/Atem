@@ -1193,9 +1193,9 @@ not name is `forbidden`, as for `work_query`.
 - `work_resolve` settles an `outcome_unknown` task of a **delegated
   sender** (§11.6); a task in any other state, unless it was resolved, is
   `forbidden`, and so is a task of a sender that isn't delegated (`local`,
-  a browser grant): its `outcome_unknown` keeps v1 and expires at
-  `expires_at` (§11.3). `failed` makes it `failed` with the given
-  `detail`; `done` makes it `completed` with that `result`.
+  a browser grant, a service no feed covers): its `outcome_unknown` keeps
+  v1 and expires at `expires_at` (§11.3). `failed` makes it `failed` with
+  the given `detail`; `done` makes it `completed` with that `result`.
 - **The same resolution** is the same canonical `resolution` (for `done`,
   the whole snapshot, `digest` included), whoever asks and whatever the
   exchange `id`. It returns the recorded status, which keeps the first
@@ -1246,9 +1246,9 @@ own earlier clients and every SDK built from them) rejects a `work` result
 that carries it as a malformed result and drops the channel. A host
 therefore writes `resolved` only behind `host.delegated`, and Atem and
 Astation enable `host.delegated` together, once every reader that can query
-a task knows `resolved` (controller ruling T17b). `receipt_id` and
-`failed.detail` change nothing for an old reader: the first is still a UUID
-v4, the second a status `detail` of at most 1024 bytes.
+a task knows `resolved`. `receipt_id` and `failed.detail` change nothing for
+an old reader: the first is still a UUID v4, the second a status `detail` of
+at most 1024 bytes.
 
 Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
 invalid, a blank and a Cf-carrying `failed.detail` among the refused, and
@@ -1261,15 +1261,18 @@ An unknown outcome needs a person (design I.4.6, owner decision): when a
 **delegated sender's** task becomes `outcome_unknown` the host records an
 **alert**, and the owner's devices show it with **Mark failed** and **Mark
 done**, each a `work_resolve` (§11.2) by the owner.
-- Only delegated senders' tasks raise one: `member:`, `service:` and
-  `host:` senders (§11.6). A `local` or browser grant's task keeps v1: its
-  `outcome_unknown` expires at `expires_at`, and it raises no alert and no
-  hint. **Atem's reading of the design, for Astation to confirm:** design
-  I.4.6's rules sit under "tasks that Atem owns", and I.1.3 keeps `local`
-  and browser grants on v1.
-- So every alert can be answered with Mark failed or Mark done. This section is the alert's wire: a query, and the
-push hint that tells the owner's devices (session-v1 R9.9, "`outcome_unknown`
-hint"). Both belong to feature `host.alerts`.
+- Only delegated senders' tasks raise one (§11.6): a native member
+  (`member:`), a service its Station's control feed covers (`service:`)
+  and a host sender (`host:`). A task of `local`, a browser grant or a
+  service no feed covers keeps v1: its `outcome_unknown` expires at
+  `expires_at`, and it raises no alert and no hint. **Atem's reading of
+  the design, for Astation to confirm:** design I.4.6's rules sit under
+  "tasks that Atem owns", and I.1.3 keeps them on v1.
+- So every alert can be answered with Mark failed or Mark done.
+
+This section is the alert's wire: a query, and the push hint that tells the
+owner's devices (session-v1 R9.9, "`outcome_unknown` hint"). Both belong to
+feature `host.alerts`.
 
 ```json
 {"v":1,"id":"…","host":{…},"op":"alert_list"}
@@ -1344,8 +1347,10 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
   `outcome_unknown` and unresolved, one alert each. An alert ends when its
   task is resolved (`work_resolve`, or the host's command) or a reply
   moves it to `awaiting_result` (design I.4.6, "Ending"); an ended alert is
-  no longer listed. No other ending exists: a delegated task's
-  `outcome_unknown` never expires (§11.6, "Unknown outcomes"). A task reaches `outcome_unknown` once, so an alert is never raised
+  no longer listed. No other ending exists in this store: a delegated
+  task's `outcome_unknown` never expires (§11.6, "Unknown outcomes"), and a
+  new host identity moves the whole store aside, alerts included (design
+  I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
   twice for one. The host keeps an alert for every unresolved outcome; at 32
   unresolved on a host the `reason` of a new alert says so (for example
   `agent exited; 32 outcomes unresolved on this host`) within the 256 bytes
@@ -1574,8 +1579,22 @@ stays as the design gives it.
       suspended time. It is measured at each resume (by a nonstop
       clocksource or the RTC) and never slewed.
   - **The read must be consistent.** The difference is read before and
-    after `CLOCK_MONOTONIC_RAW`, and the read is retried if it changed, so
-    a resume between the reads never yields a reading off by one suspend.
+    after `CLOCK_MONOTONIC_RAW`, so a resume between the reads never
+    yields a reading off by one suspend.
+    - **A tolerance of 1 ms.** The difference is itself two reads, so it
+      moves by their own span on every read: nanoseconds, more if the
+      thread is preempted. Two differences more than 1 ms apart mean a
+      resume fell between the reads (it moves the difference by the
+      suspended time), or the thread was preempted that long; either way
+      the whole read is retried. A resume that moved it by less leaves an
+      error under 1 ms.
+    - **At most 3 retries.** If they run out (a machine suspending and
+      resuming again and again), Atem takes the last `CLOCK_MONOTONIC_RAW`
+      plus the difference read after it. The suspended time only grows,
+      so that sum lies, within the reads' own span, between the counter's
+      values at the `CLOCK_MONOTONIC_RAW` read and at the end of the read:
+      a reading of the counter during the read, never off by a suspend
+      outside it.
   - **Not the monotonic clocks.** `CLOCK_MONOTONIC` and
     `mach_absolute_time` stop during suspend, so a laptop's sleep would
     look like a forward jump that never comes back.
@@ -1588,7 +1607,7 @@ stays as the design gives it.
   the recorded boot time)`.
   - In the same boot, `H = max(wall clock, the prediction)`.
   - After a reboot, `H = max(wall clock, wall_hw + this boot's boot time so
-    far)` until a new record (one boot, below).
+    far)` until a new record (one boot, below, with its two assumptions).
   - `H` never includes `station_time`.
 - **One boot** (**Atem's fill-in**). Every boot-time difference is taken
   within one `boot_id` only: a prediction, an update's `Δ`, the floor's
@@ -1596,7 +1615,30 @@ stays as the design gives it.
   - A record or floor from an earlier boot was made before this boot
     began. So it predicts its value plus this boot's boot time so far (the
     counter's reading, which starts at boot): a lower bound, which leaves
-    only the downtime uncounted.
+    uncounted only the time from the record to this boot (the downtime, and
+    any time before the shutdown that no runtime recorded).
+  - **Its two assumptions:** the record predates this boot, and the
+    counter starts at this boot. Two setups break them, and either can
+    push `H` ahead of the true time at the first reading, so tasks expire
+    early:
+    - **A store opened on another node with the same identity:** a
+      container's profile volume rescheduled to another node with a stable
+      hostname, or an image that carries one `/etc/machine-id` to every
+      node. The record may have been written after this node booted, and
+      the first reading adds this node's whole uptime.
+    - **A Linux time namespace with a boot-time offset** (a CRIU restore,
+      `unshare --time --boottime`): the counter reads this boot's boot time
+      plus the offset, so a positive one adds itself to the prediction (a
+      negative one leaves that much more uncounted, as the downtime is).
+    - **Guarded in step 4.** Step 4 detects both (for example by a boot id
+      or a machine id recorded with `wall_hw`, and the namespace's offsets
+      in `/proc/self/timens_offsets`; how it tells nodes apart that share
+      one `/etc/machine-id` is step 4's) and then adds no boot time across
+      the reboot: the record and the floor predict their bare values, so
+      the first reading records `max(w, wall_hw)`.
+    - **macOS:** Apple documents `mach_continuous_time` as counting from
+      an arbitrary point. That it starts at boot is to be confirmed in step
+      4; if it doesn't, macOS adds no boot time across a reboot either.
   - `Δ` across a reboot is 0.
   - No anchor carries over a reboot.
   - The **first reading of a boot** is no jump and makes no anchor: it
@@ -1644,8 +1686,12 @@ stays as the design gives it.
     43.2 s a day.
     - A fall faster than that leaves the wall clock below `H`, and past 10
       minutes the owner is alerted.
-    - So someone who can move the clock back walks the record down by at
-      most 43.2 s a day, on both systems.
+    - So, once the boot's first synchronized reading has passed, someone
+      who can move the clock back walks the record down by at most 43.2 s
+      a day, on both systems. That reading itself can lower the record to
+      a wall clock however far behind: the rule across a reboot trusts the
+      OS's sync report once per boot (Linux, and macOS once its report is
+      confirmed; "The bounds that remain").
   - **A healthy host, worked through.**
     - **A Mac** whose counter runs 20 ppm fast against `timed`'s wall
       clock (about 52 s a month): each minute the prediction gains 1.2 ms
@@ -1785,22 +1831,25 @@ stays as the design gives it.
     time, add only the counter's own rate error. Nothing settled is
     revived.
   - **The small-steps-back attack, worked through.** Suppose the true
-    time is `T` and the record's prediction is on it.
+    time is `T`, the record's prediction is on it, and the boot's first
+    synchronized reading has passed (before it, see "The bounds that
+    remain").
     1. The attacker sets the clock back 50 s a minute, for 30 minutes.
        Each update lowers the prediction by at most 30 ms (the
        follow-down), 0.9 s in all. No reading is ahead of it, so no anchor
        is made. Past 10 minutes, "host clock went back" fires.
-    2. The attacker sets the clock to `T`: no jump, and nothing changes
-       but the 0.9 s.
+    2. The attacker sets the clock to `T`: no jump (it is 0.9 s above the
+       prediction, well within 60 s), so the record takes the reading and
+       is back on `T`.
     3. It sets the clock to `T` + 2 min: a jump. If the OS reports its
        clock unsynchronized, as a manual step makes it, the jump is
        anchored at the record's trajectory, and `wall_hw` rises to
        `T` + 2 min.
     4. Back to `T`: within 60 s of the anchor, so the jump is undone,
-       and `wall_hw` returns to the anchor's trajectory, at most 0.9 s
-       below `T`. Back to `T` − 25 min instead: more than 60 s below the
-       anchor, so there is no repair, and `wall_hw` stays near `T` + 2 min,
-       coming down at 500 ppm.
+       and `wall_hw` returns to the anchor's trajectory: on `T`, or at most
+       0.9 s below it had step 2 been skipped. Back to `T` − 25 min
+       instead: more than 60 s below the anchor, so there is no repair,
+       and `wall_hw` stays near `T` + 2 min, coming down at 500 ppm.
 
     Either way nothing ends more than the follow-down below `T`. If the
     OS reports the jump in step 3 synchronized, it makes no anchor or
@@ -1877,19 +1926,48 @@ stays as the design gives it.
       rule across a reboot (on macOS, once the report is confirmed).
     - **The downtime isn't counted (the late direction).** A wall clock
       that is behind the true time at a boot's first reading is taken as
-      it is, short by up to the downtime, with no "host clock went back"
-      alert. It may have been set back while the machine was off, set back
-      after boot but before Atem's runtime first reads, or restored stale
-      with no attacker at all (fake-hwclock on a machine without an RTC).
-      The record's lower bound, `wall_hw` plus this boot's boot time so
-      far, counts everything but the downtime. Remote starts still wait
-      for the Station's sync, whose head would hit the cap.
+      it is, short by up to the time from the last record to this boot,
+      with no "host clock went back" alert. That time is the downtime,
+      plus any time before the shutdown that no runtime recorded (hosting
+      off, a crash). The clock may have been set back while the machine
+      was off, set back after boot but before Atem's runtime first reads,
+      or restored stale with no attacker at all (fake-hwclock on a machine
+      without an RTC). The record's lower bound, `wall_hw` plus this boot's
+      boot time so far, counts everything but that time. This bound holds
+      until the boot's first synchronized reading, which can lower `H`
+      further (next item). Remote starts still wait for the Station's
+      sync, whose head would hit the cap.
+    - **The once-per-boot lowering trusts the OS's sync report (the late
+      direction).** This is the price of the owner's decision of
+      2026-11-10, whose input is the OS's own sync report, trusted here
+      once per boot. At a boot's first synchronized reading, when
+      `wall_hw` or the floor is more than 10 minutes ahead of the wall
+      clock, the rule across a reboot lowers both to whatever wall clock
+      the OS then reports as synchronized, however far behind the true
+      time it is, with a `runtime.log` line and no owner alert. Anyone who
+      can set the clock can usually also clear the unsynchronized flag (on
+      Linux the same privilege sets `adjtimex`'s status), and on a host
+      with no time-sync daemon (or chrony without `rtcsync`) that can
+      happen at any time in the boot. A time source the daemon follows
+      that is wrong at boot does the same.
+      So the walk-back of at most 43.2 s a day holds only after that
+      reading, and the downtime bound above only until it. On macOS this
+      applies once its report is confirmed. Remote starts still wait for
+      the Station's sync, whose head would hit the cap.
     - **The counter's assumptions** above (the oscillator under 500 ppm,
-      about 1 s a resume, anchors ageing).
+      about 1 s a resume, anchors ageing), and the two assumptions of the
+      rule across a reboot (one boot, above: a store moved to another node
+      or a time namespace's offset can make deadlines early; guarded in
+      step 4).
   - **Across a reboot.** Boot time doesn't cross a reboot (one boot,
     above).
     - The boot's first reading records `max(w, wall_hw + this boot's boot
-      time so far)` with the new `boot_id`.
+      time so far)` with the new `boot_id`. This assumes the record
+      predates this boot and the counter starts at it (one boot, above:
+      a store moved to another node and a time namespace's offset break
+      that; guarded in step 4). When that reading is also the first
+      synchronized one, the record and the lowering below are one
+      evaluation, before any deadline is compared.
     - The record carries a **mark** from the reboot until the first reading
       at which the OS reports its clock synchronized in the new boot. At
       that reading, if `wall_hw` or the floor is more than 10 minutes ahead
@@ -1898,16 +1976,19 @@ stays as the design gives it.
       apply. The mark is **Atem's fill-in**: it fixes when the rule applies.
       It is stored with the record, so the lowering and the mark's removal
       are one write.
-    - **Linux:** `adjtimex`'s status without `STA_UNSYNC`, which chrony
-      and systemd-timesyncd clear once synchronized. In a container it
-      reports the host kernel's state, which is the right answer.
+    - **Linux:** `adjtimex`'s status without `STA_UNSYNC`, which
+      systemd-timesyncd clears once synchronized, and chrony too when
+      `rtcsync` is set (as distributions usually ship it; without it chrony
+      leaves the flag set). In a container it reports the host kernel's
+      state, which is the right answer.
     - **macOS:** the candidate is `ntp_gettime()` returning `TIME_OK`
       rather than `TIME_ERROR`, to be confirmed against `timed`'s behaviour
       in step 4. Until it is, macOS doesn't lower them across a reboot.
   - **Otherwise** Atem stays on the safe side: tasks may expire early, and
     `atem status` says why and names the fix. Where the flag never clears
-    because no time-sync daemon runs, it says `host clock ahead of its
-    record; enable time synchronization (chrony or systemd-timesyncd)`.
+    (no time-sync daemon runs, or chrony runs without `rtcsync`), it says
+    `host clock ahead of its record; enable time synchronization (chrony
+    with rtcsync, or systemd-timesyncd)`.
     On macOS before confirmation, it says `host clock ahead of its
     record; waiting for a synchronized clock`.
   - **What doesn't change.**
@@ -1931,8 +2012,8 @@ stays as the design gives it.
 - `atem task resolve <task_id> failed|done` resolves one as the owner, on
   the host. Its `resolved.by` is `local` (§11.2), and it works for a
   revoked sender's task. Like `work_resolve`, it resolves only a delegated
-  task: a local or browser grant's task keeps v1, and its unknown outcome
-  expires.
+  task: a task of `local`, a browser grant or a service no feed covers
+  keeps v1, and its unknown outcome expires.
 
 Both commands are built in step 4, with the lifecycle. Their output, and
 how `done` takes its result snapshot and `failed` its detail, are
