@@ -8,6 +8,7 @@ use super::host_work::{
 };
 use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4};
 use crate::canonical::MAX_SAFE_INTEGER;
+use crate::host_principal::parse_host_principal;
 
 pub const FEATURE: &str = "host.messages";
 pub const MAX_RECIPIENTS: usize = 32;
@@ -116,6 +117,29 @@ impl Message {
             && self.kind == MessageKind::Request
             && self.reply_to.is_none()
             && self.from_session.is_none()
+            && self.valid_body(false)
+    }
+
+    /// A host sender's Message (delegated host work II.4.2), the plaintext
+    /// of an envelope signed by `host_id`: its `sender` is exactly
+    /// `host:<host_id>` ([`crate::host_principal`]), it is a plain request
+    /// (the reply link and the sending session are local only, as for a
+    /// remote sender) and it carries no attachments in this version: no
+    /// `mark`, and so no task with `attachments`. Screenshot bytes reach a
+    /// host only through `attachment_put` over a channel, which a host
+    /// sender doesn't have. Every other bound is a remote Message's, and
+    /// [`Message::valid`] and [`Message::valid_local`] are unchanged.
+    pub fn valid_from_host(&self, host_id: &str) -> bool {
+        parse_host_principal(&self.sender) == Some(host_id)
+            && self.kind == MessageKind::Request
+            && self.reply_to.is_none()
+            && self.from_session.is_none()
+            && self.mark.is_none()
+            && self
+                .recipients
+                .iter()
+                .filter_map(|r| self.task(r))
+                .all(|t| t.attachments.is_empty())
             && self.valid_body(false)
     }
 
@@ -495,6 +519,168 @@ mod tests {
             local.from_session = Some("ses-abcdefghijkl".into());
             assert!(local.valid_local(), "{local:?}");
         }
+    }
+
+    /// An agent recipient of `host` for the host-sender tests.
+    fn agent_recipient(host: &HostTarget, c: char) -> Recipient {
+        Recipient {
+            recipient_id: new_id(),
+            host: host.clone(),
+            destination: Destination::Agent {
+                route_id: "backend".into(),
+                route_revision: 1,
+                target: Target {
+                    account_id: host.account_id.clone(),
+                    atem_device_id: host.atem_device_id.clone(),
+                    host_trust_gen: host.host_trust_gen,
+                    session_id: format!("ses-aaaaaaaaaaa{c}"),
+                    process_gen: new_id(),
+                },
+            },
+        }
+    }
+
+    /// A host sender's Message (delegated host work II.4.2): the sender is
+    /// `host:<host_id>` and equals the envelope's `sender.host_id`; no
+    /// `mark`, no task with `attachments`, no `from_session`; the remote
+    /// `valid` and `valid_local` are unchanged and refuse it.
+    #[test]
+    fn message_from_host_rules() {
+        let mut base = message();
+        base.sender = "host:host-a".into();
+        let host = base.recipients[0].host.clone();
+        base.recipients.push(agent_recipient(&host, 'a'));
+        assert!(base.valid_from_host("host-a"));
+        // The remote and local rules are unchanged: a host isn't a channel
+        // principal and isn't `local`.
+        assert!(!base.valid());
+        assert!(!base.valid_local());
+        assert!(base.publications().is_err());
+
+        // The sender is exactly `host:<id>` for the id asked.
+        for (sender, id) in [
+            ("host:host-a", "host-b"),
+            ("host:host-a", ""),
+            ("host:host-a", "host-a "),
+            ("host:host-a", "host:host-a"),
+            ("host:", ""),
+            ("host:a b", "a b"),
+            ("host:\u{e9}", "\u{e9}"),
+            ("member:host-a", "host-a"),
+            ("service:host-a", "host-a"),
+            ("browser:host-a", "host-a"),
+            ("local", "host-a"),
+            ("Host:host-a", "host-a"),
+            ("host-a", "host-a"),
+        ] {
+            let mut m = base.clone();
+            m.sender = sender.into();
+            assert!(!m.valid_from_host(id), "{sender:?} as {id:?}");
+        }
+        let longest = "h".repeat(128);
+        let mut m = base.clone();
+        m.sender = format!("host:{longest}");
+        assert!(m.valid_from_host(&longest));
+        m.sender = format!("host:{longest}x");
+        assert!(!m.valid_from_host(&format!("{longest}x")));
+
+        // `from_session` stays local only.
+        let mut m = base.clone();
+        m.from_session = Some("ses-abcdefghijkl".into());
+        assert!(!m.valid_from_host("host-a"));
+
+        // The reply link and kinds other than `request` are local only too.
+        let reply_to = ReplyTo {
+            message_id: new_id(),
+            task_id: new_id(),
+        };
+        let mut m = base.clone();
+        m.reply_to = Some(reply_to.clone());
+        assert!(!m.valid_from_host("host-a"));
+        for kind in [MessageKind::Status, MessageKind::Result] {
+            let mut m = base.clone();
+            m.kind = kind;
+            m.reply_to = Some(reply_to.clone());
+            assert!(!m.valid_from_host("host-a"), "{kind:?}");
+        }
+
+        // No attachments in this version: no mark, and so no task carries
+        // an attachment.
+        let task = base.task(&base.recipients[1]).unwrap();
+        assert!(task.attachments.is_empty());
+        let mut marked = base.clone();
+        marked.text.clear();
+        marked.recipients.remove(0);
+        marked.mark = Some(super::super::mark::MarkTask {
+            mark_id: "mark_123".into(),
+            url: "http://localhost:3000".into(),
+            title: "Page".into(),
+            screenshot: super::super::attachments::Attachment {
+                attachment_id: new_id(),
+                digest: host_work::digest(b"png"),
+                size: 68,
+                media_type: "image/png".into(),
+            },
+            annotations: vec![super::super::mark::Annotation {
+                tool: "arrow".into(),
+                text: "Make this red".into(),
+                x: 20,
+                y: 40,
+            }],
+        });
+        // The same message from a remote member is a valid mark task ...
+        let mut member = marked.clone();
+        member.sender = "member:phone".into();
+        assert!(member.valid());
+        assert_eq!(
+            member
+                .task(&member.recipients[0])
+                .unwrap()
+                .attachments
+                .len(),
+            1
+        );
+        // ... and from a host it is refused, with or without text.
+        assert!(!marked.valid_from_host("host-a"));
+        marked.text = "see the mark".into();
+        assert!(!marked.valid_from_host("host-a"));
+        marked.mark = None;
+        assert!(marked.valid_from_host("host-a"));
+
+        // Everything else a remote Message must satisfy still applies:
+        // blank content, a bad id, too many or a repeated recipient, a
+        // select past the budget, a text with control characters.
+        let mut blank = base.clone();
+        blank.text = " ".into();
+        assert!(!blank.valid_from_host("host-a"));
+        let mut bad_id = base.clone();
+        bad_id.message_id = "not-a-uuid".into();
+        assert!(!bad_id.valid_from_host("host-a"));
+        let mut expired = base.clone();
+        expired.expires_at = expired.created_at;
+        assert!(!expired.valid_from_host("host-a"));
+        let mut control = base.clone();
+        control.text.push('\u{1b}');
+        assert!(!control.valid_from_host("host-a"));
+        let mut repeated = base.clone();
+        repeated.recipients.push(base.recipients[0].clone());
+        assert!(!repeated.valid_from_host("host-a"));
+        let mut select = base.clone();
+        select.recipients[0].destination = Destination::Select {
+            selectors: vec!["tag:a".into()],
+            budget: 33,
+        };
+        assert!(!select.valid_from_host("host-a"));
+        select.recipients[0].destination = Destination::Select {
+            selectors: vec!["tag:a".into()],
+            budget: 32,
+        };
+        assert!(
+            !select.valid_from_host("host-a"),
+            "32 for the select and 1 for the agent is past the budget"
+        );
+        select.recipients.remove(1);
+        assert!(select.valid_from_host("host-a"), "select is a destination");
     }
 
     #[test]

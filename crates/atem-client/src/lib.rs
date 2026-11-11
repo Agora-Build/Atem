@@ -68,6 +68,7 @@ pub mod connect;
 pub mod domain;
 pub mod encoding;
 pub mod error;
+pub mod host_principal;
 pub mod host_route;
 pub mod hpke;
 pub mod keys;

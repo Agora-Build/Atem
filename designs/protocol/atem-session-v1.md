@@ -2901,7 +2901,18 @@ substitute chain `SUB1`–`SUB3`) and the kits in `r9-vectors-keys`
 | `native` | member of kind `native` at Atem's head; `sig_c` by its `auth_key` | `member:<device_id>` | `view`; `control` if in its roles (`manage` gives the host nothing but the host policy, R9.8a) |
 | `service` | member of kind `service`, not expired, host in `scope.hosts`; `sig_c` by its `auth_key` | `service:<device_id>` | `view`; `control` if `scope.ops` has any of `prompt`, `interrupt`, `stop`, `terminal`, `approval`, `rule_revoke`; each op checked separately |
 | `browser` | grant (below) whose issuer is a native member with `control` at Atem's head; `sig_c` by the grant's `browser_key` | `browser:<grant_id>` (issuer recorded) | `view`; `control` if the grant's `ops` have a control op; never more than the issuer |
-| `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client) | — |
+| `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client). **Planned** (delegated host work, step 3; nothing advertised): `host:<host_id>`, a sender in envelopes and route principals only | — |
+
+**The `host:<host_id>` principal** (planned, delegated host work II.2.1;
+nothing advertised). It names a host as the signer of an envelope and in
+a route's principals, never as a client: it isn't an `atem-ch1` principal
+kind and no admission reads it. `host_id` is the `atem_device_id` of the
+host's `add_host`, with the device list's id grammar (1–128 bytes of
+`[A-Za-z0-9._:-]`); anything else after `host:`, another case or spacing
+is no host principal. Its key is the `host_key` of the host's newest
+`add_host` (Ed25519, the `host_channel_key`), and its principal key is the
+lowercase hex SHA-256 of that key's raw bytes, the shape of `r9_svc`
+(`atem_client::host_principal`).
 
 Each principal has its own §H `control_gen`; `attachment_gen` and
 `controller_session` stay per attachment.
