@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "relay",
   "log": "r9-vectors-membership-log",
-  "note": "The Portal's answers to reports (Auth/Portal, 2026-11-10). 200 confirms; a network error, a timeout, a 5xx, a 408, a 429 (after its Retry-After) or a 401 (after refreshing the station.report token) is retried with the same report_id and body; a final refusal (400, 404, 409 report_id_reused or invalid_state, 413, 415, any other 4xx) settles the report with an operator alert, and the reports waiting for it go once the others are settled. A 403 stops reporting under the Station's report client ID, with one alert: every report is held (none sent) while counting and reports go on, and a restart keeps the stop. A resume under the same ID (an operator fixed the token) clears the stop and keeps every report; a resume under another ID is another Station at Auth (a removed Station registered again, with new integrations): the held reports are dropped with an alert, and the revocation reported before makes no more. Here host-b's report is confirmed after a 401; host-c's is refused for good (409); the deadline's revoked{deadline_passed} waits for neither once both are settled, is retried after a 503, a 429 and a 408, and then gets a 403; host-d's late report is held, both go after a resume under the same ID; host-d's report gets a 403 again, and a resume under another ID drops it; host-e's later ack reports nothing.",
+  "note": "The Portal's answers to reports (Auth/Portal, 2026-11-10). 200 confirms; a network error, a timeout, a 5xx, a 408, a 429 (after its Retry-After) or a 401 (after refreshing the station.report token) is retried with the same report_id and body; a final refusal (400, 404, 409 report_id_reused or invalid_state, 413, 415, any other 4xx) settles the report with an operator alert, and the reports waiting for it go once the others are settled. A 403 stops reporting under the Station's report client ID, with one alert: every report is held (none sent) while counting and reports go on, and a restart keeps the stop. A resume under the same ID (an operator fixed the token) clears the stop and keeps every report. A resume under another ID than the stop's is, as Atem reads Auth/Portal's \"start fresh\" (for Auth/Portal to confirm), another Station at Auth: the reports pending at that moment are dropped, each named in an alert and kept apart; nothing else changes, so the revocation reports on as usual. Here host-b's report is confirmed after a 401; host-c's is refused for good (409); the deadline's revoked{deadline_passed} waits for neither once both are settled, is retried after a 503, a 429 and a 408, and then gets a 403; host-d's late report is held, both go after a resume under the same ID; host-d's report gets a 403 again, and a resume under another ID drops it; host-e's later ack is reported under the new ID.",
   "setup": {
     "station": {
       "origin": "https://station-dev.agora.build",
@@ -395,8 +395,12 @@
     },
     {
       "expect_refused": [
-        "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068",
         "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+      ]
+    },
+    {
+      "expect_dropped": [
+        "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068"
       ]
     },
     {
@@ -423,10 +427,26 @@
         ]
       },
       "link": "host-e",
-      "made": []
+      "made": [
+        "revocation_applied:529115819b89ff43e18280be3fd76b3d0b92215f85475eae09fad9d073b00382"
+      ]
     },
     {
-      "expect_report": []
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-e",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:529115819b89ff43e18280be3fd76b3d0b92215f85475eae09fad9d073b00382"
+        }
+      ]
+    },
+    {
+      "confirm": "revocation_applied:529115819b89ff43e18280be3fd76b3d0b92215f85475eae09fad9d073b00382"
     },
     {
       "restart": true
@@ -438,7 +458,13 @@
       "expect_report": []
     },
     {
+      "expect_dropped": [
+        "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068"
+      ]
+    },
+    {
       "expect_portal": [
+        "revocation_applied:529115819b89ff43e18280be3fd76b3d0b92215f85475eae09fad9d073b00382",
         "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
         "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
       ]

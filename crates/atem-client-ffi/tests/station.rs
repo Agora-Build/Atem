@@ -264,6 +264,8 @@ impl Station {
                 .collect();
             want.sort();
             assert_eq!(self.ledger.resign_alerts(), want, "{}", self.name);
+        } else if let Some(want) = step.get("expect_dropped") {
+            assert_eq!(json!(self.ledger.dropped_reports()), *want, "{}", self.name);
         } else if let Some(want) = step.get("expect_refused") {
             assert_eq!(json!(self.ledger.refused_reports()), *want, "{}", self.name);
         } else if let Some(id) = step.get("resume_reporting") {

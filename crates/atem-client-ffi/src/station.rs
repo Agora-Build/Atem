@@ -634,12 +634,14 @@ impl AckLedgerHandle {
 
     /// The Station reports again as the report client `client_id` (at
     /// start; the built-in Station's ID comes from its configuration and
-    /// always resumes). The stop's own ID clears the stop and keeps every
-    /// report. Another ID is another Station at Auth (a removed Station
-    /// registered again, with new integrations): every pending report is
-    /// dropped (done unsent, a `ReportsDropped` alert) and the revocations
-    /// the ledger has make no more reports. A ledger not stopped changes
-    /// nothing.
+    /// always resumes). The ID is compared only at a resume after a `403`
+    /// stop: a ledger not stopped changes nothing, whatever the ID. The
+    /// stop's own ID clears the stop and keeps every report. Another ID than
+    /// the stop's is, as Atem reads Auth/Portal's "start fresh" (for
+    /// Auth/Portal to confirm), another Station at Auth: the reports pending
+    /// at that moment are dropped, done unsent (`dropped_reports`, a
+    /// `ReportsDropped` alert naming each), and every revocation reports on
+    /// as usual under the new ID.
     pub fn resume_reporting(&self, client_id: String) -> Result<AckTransition> {
         Ok(transition(self.ledger.resume_reporting(&client_id)?))
     }
@@ -661,10 +663,15 @@ impl AckLedgerHandle {
         self.ledger.resign_alerts()
     }
 
-    /// The reports the Portal refused for good, and those a resume under
-    /// another report client ID dropped.
+    /// The reports the Portal refused for good.
     pub fn refused_reports(&self) -> Vec<String> {
         self.ledger.refused_reports()
+    }
+
+    /// The reports a resume under another report client ID than the stop's
+    /// dropped unsent (kept, so the alert can be raised again at start).
+    pub fn dropped_reports(&self) -> Vec<String> {
+        self.ledger.dropped_reports()
     }
 
     /// The Portal refused this Station's reports (`403`): every report is

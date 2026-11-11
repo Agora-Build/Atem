@@ -1049,8 +1049,9 @@ record! {
 
 data_enum! {
     /// An operator alert a ledger transition raises, once (the ledger keeps
-    /// what it is about: raise it again from `refused_reports` and
-    /// `stopped_client_id` after a restart if you may have lost it).
+    /// what it is about: raise it again from `refused_reports`,
+    /// `stopped_client_id` and `dropped_reports` after a restart if you may
+    /// have lost it).
     pub enum LedgerAlertInfo {
         /// The Portal refused this report for good: done, never sent again.
         ReportRefused { report_id: String },
@@ -1058,9 +1059,9 @@ data_enum! {
         /// (`403`): every report is held, none sent, until a resume.
         ReportingStopped { client_id: String },
         /// Reporting resumed under another report client ID than
-        /// `client_id`, the stopped one (another Station at Auth): the
-        /// reports `dropped` are done unsent, and the revocations reported
-        /// before make no more.
+        /// `client_id`, the stopped one (another Station at Auth): each
+        /// report pending then, `dropped`, is done unsent; every revocation
+        /// reports on as usual.
         ReportsDropped {
             client_id: String,
             dropped: Vec<String>,

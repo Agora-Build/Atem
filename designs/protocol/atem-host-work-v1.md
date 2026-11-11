@@ -1428,14 +1428,21 @@ Station stops reporting on every ledger it keeps, with one operator alert.
 Each ledger records the report client ID, holds every report (none is sent,
 none is dropped) and goes on counting and making reports. When the Station
 reports again, at its next start (after an operator fixed a misconfigured
-token, say), it resumes each ledger with its report client ID:
+token, say), it resumes each ledger with its report client ID. The ID is
+compared only there, at a resume after a `403` stop: a Station whose report
+client changes without a stop changes nothing in its ledgers.
 
-- **the same ID** clears the stop and keeps every report, sent in order;
-- **another ID** is another Station at Auth (a removed Station registered
-  again, with new integrations): the held reports are dropped, with an
-  operator alert, and the revocations reported before make no more reports;
-  counting goes on (the re-sign alerts need it), and a revocation that
-  starts later reports as usual.
+- **The stop's own ID** clears the stop and keeps every report, sent in
+  order (agreed with Auth/Portal).
+- **Another ID than the stop's** is another Station at Auth (a removed
+  Station registered again, with new integrations), and Auth/Portal's rule
+  is "start fresh, drop the old pending reports". **Atem's reading, for
+  Auth/Portal to confirm:** the reports pending at that moment are dropped,
+  done unsent, each named in an operator alert and kept in the ledger
+  (`dropped_reports`); nothing else changes, so every revocation reports on
+  as usual under the new ID (a host that applies it later, its final
+  `revoked`), and the Portal's answers decide what becomes of them (a
+  refusal is final, with an alert). No revocation is ever silenced.
 
 The built-in Station takes its report client ID from its configuration and
 always resumes.
@@ -1460,8 +1467,9 @@ Auth/Portal's agreement**):
   under a `record_id` it tracks, but a `cover`, `hold` or `release` id it
   doesn't track can't be checked against a later revoke.
 - **Raise every operator alert once its transition committed.** The
-  ledger keeps what an alert is about (the reports refused or dropped, the
-  stopped report client ID), so a Station that may have lost one (a crash
+  ledger keeps what an alert is about (the reports refused, the reports
+  dropped, the stopped report client ID), so a Station that may have lost
+  one (a crash
   between the commit and the alert) raises it again from the state at
   start.
 - **No pruning in this version.** The ledger keeps every revocation and
@@ -1505,7 +1513,8 @@ re-signed copy) and `r9-control-ack-portal-refusals` (retries after a
 `401`, a `503`, a `429` and a `408`, a final refusal with its alert, a
 `403` that holds every report across a restart, a resume under the same
 report client ID that sends them, and a resume under another that drops
-them and retires the revocation). They run in
+only the report pending then, after which a late host is reported as
+usual). They run in
 `crates/atem-client/tests/r9_fixtures.rs` against `AckLedger`, in the
 bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes

@@ -697,6 +697,8 @@ for (const name of ACKS) {
         if (t !== undefined) commit(t);
       } else if ("expect_resign_alerts" in step) {
         eq(ledger.resignAlerts(), step.expect_resign_alerts.map((l) => ctlByLabel[l].record.body.record_id).sort(), `${name} resign alerts`);
+      } else if ("expect_dropped" in step) {
+        eq(ledger.droppedReports(), step.expect_dropped, `${name} dropped`);
       } else if ("expect_refused" in step) {
         eq(ledger.refusedReports(), step.expect_refused, `${name} refused`);
       } else if ("resume_reporting" in step) {

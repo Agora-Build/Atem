@@ -884,6 +884,7 @@ fun main(args: Array<String>) {
                 "expect_resign_alerts" in o -> eq(ledger.resignAlerts(),
                     strs(o["expect_resign_alerts"]).map { ctlByLabel.getValue(it)["record"]["body"]["record_id"].s() }.sorted(), "$name resign alerts")
                 "expect_refused" in o -> eq(ledger.refusedReports(), strs(o["expect_refused"]), "$name refused")
+                "expect_dropped" in o -> eq(ledger.droppedReports(), strs(o["expect_dropped"]), "$name dropped")
                 "resume_reporting" in o -> {
                     clientId = o["resume_reporting"].s()
                     val t = ledger.resumeReporting(clientId!!)

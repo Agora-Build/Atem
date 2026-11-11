@@ -18,13 +18,15 @@
 //! [`AckLedger::stop_reporting`] and [`AckLedger::resume_reporting`] return
 //! a [`LedgerTransition`]: the next ledger, the report intents the
 //! transition made and the operator alerts it raised. The next ledger holds
-//! every intent not yet settled (confirmed or refused), so the Station
-//! persists `next`'s [`AckLedger::to_json`] (and the intents and alerts, if
-//! it keeps them apart as an outbox) in one transaction,
-//! before any HTTP, and adopts `next` only once that committed. A crash or a
-//! failed save before the commit loses nothing: the host resends its ack, and
-//! the same transition on the same ledger gives the same next ledger and the
-//! same intents, their `report_id`s included. Transitions of one ledger are
+//! every intent not yet settled (confirmed, refused or dropped), so the
+//! Station persists `next`'s [`AckLedger::to_json`] in one transaction,
+//! before any HTTP, and adopts `next` only once that committed. What to send
+//! is always [`AckLedger::pending_reports`] of the adopted ledger, never the
+//! transition's intents: those are what the call made, sent or held (while
+//! reporting is stopped they are held, and nothing is sent), never an
+//! outbox. A crash or a failed save before the commit loses nothing: the
+//! host resends its ack, and the same transition on the same ledger gives
+//! the same next ledger and the same intents, their `report_id`s included. Transitions of one ledger are
 //! serialized, each from the latest committed state (two replicas may load
 //! the same state; one commits, and the other starts again from the new one).
 //!
@@ -42,8 +44,9 @@
 //! `403` is [`AckLedger::stop_reporting`] under the Station's report client
 //! ID: every report held, none sent, one alert, until
 //! [`AckLedger::resume_reporting`] (the same ID keeps every report; another
-//! ID, another Station at Auth, drops them and retires the revocations the
-//! ledger has). Each of those is a transition the Station commits like any
+//! ID than the stop's, another Station at Auth as Atem reads "start fresh",
+//! drops the reports pending then, and every revocation reports on as
+//! usual). Each of those is a transition the Station commits like any
 //! other. An intent waits for those its `not_before` names
 //! until they are settled (confirmed or refused): a `revoked` report for the
 //! per-host reports made before it, so the Portal never sees `all_applied`
@@ -241,8 +244,9 @@ impl ReportAnswer {
 
 /// An operator alert a transition raises, once. The ledger keeps what it
 /// is about ([`AckLedger::refused_reports`],
-/// [`AckLedger::stopped_client_id`]), so a Station that died between the
-/// commit and the alert raises it again from the state at start.
+/// [`AckLedger::stopped_client_id`], [`AckLedger::dropped_reports`]), so a
+/// Station that died between the commit and the alert raises it again from
+/// the state at start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LedgerAlert {
     /// The Portal refused this report for good: it is done, never sent
@@ -252,9 +256,9 @@ pub enum LedgerAlert {
     /// (`403`): every report is held, none is sent, until a resume.
     ReportingStopped { client_id: String },
     /// Reporting resumed under another report client ID than `client_id`,
-    /// the one that was stopped (another Station at Auth): the reports
-    /// `dropped` (in delivery order) are done unsent, and the revocations
-    /// reported before make no more.
+    /// the one that was stopped (another Station at Auth): each report
+    /// pending then, `dropped` (in delivery order), is done unsent; every
+    /// revocation reports on as usual.
     ReportsDropped {
         client_id: String,
         dropped: Vec<String>,
@@ -432,7 +436,9 @@ impl ReportIntent {
 /// What a transition gives: the next ledger (persist its
 /// [`AckLedger::to_json`] and adopt it once committed), the intents it
 /// made, which `next` holds until they are settled, and the operator alerts
-/// it raises (raise them once it committed).
+/// it raises (raise them once it committed). Send `next`'s
+/// [`AckLedger::pending_reports`], never `intents`: an intent made while
+/// reporting is stopped is held there, not sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerTransition {
     pub next: AckLedger,
@@ -542,9 +548,11 @@ pub struct AckLedger {
     /// The intents not yet settled, in the order they were made (the
     /// delivery order).
     pending: Vec<Pending>,
-    /// The reports the Portal refused for good, and those a resume under
-    /// another report client ID dropped.
+    /// The reports the Portal refused for good.
     refused: BTreeSet<String>,
+    /// The reports a resume under another report client ID than the
+    /// stop's dropped unsent.
+    dropped: BTreeSet<String>,
     /// The report client ID the Portal refused (`403`): every report is
     /// held until a resume.
     stopped: Option<String>,
@@ -576,9 +584,6 @@ struct Revocation {
     covered: BTreeSet<String>,
     /// The `revoked` report made.
     outcome: Option<RevokedOutcome>,
-    /// Reported under a report client ID the Station no longer reports
-    /// as (a resume under another one): it makes no more reports.
-    retired: bool,
 }
 
 /// An effect of a principal in force on a host.
@@ -634,6 +639,7 @@ impl AckLedger {
             done: BTreeMap::new(),
             pending: Vec::new(),
             refused: BTreeSet::new(),
+            dropped: BTreeSet::new(),
             stopped: None,
         })
     }
@@ -737,7 +743,6 @@ impl AckLedger {
                     revoked_at_ms,
                     covered: covered.clone(),
                     outcome: None,
-                    retired: false,
                 },
             );
             // Hosts that have it in force already, through a native revoke.
@@ -883,15 +888,18 @@ impl AckLedger {
 
     /// The Station reports again as the report client `client_id` (after a
     /// restart, say once an operator fixed its token; the built-in Station
-    /// takes its ID from its configuration and always resumes). The same ID
-    /// as the stop's clears the stop and keeps every report. Another ID is
-    /// another Station at Auth (a removed Station registered again, with
-    /// new integrations): every report not yet settled is dropped (done
-    /// unsent, among [`AckLedger::refused_reports`]), the revocations the
-    /// ledger has make no more reports, and the transition raises
-    /// [`LedgerAlert::ReportsDropped`]; counting goes on, and a revocation
-    /// that starts later reports as usual. A ledger not stopped changes
-    /// nothing. A `client_id` out of grammar is refused.
+    /// takes its ID from its configuration and always resumes). The ID is
+    /// compared only here, at a resume after a `403` stop: a ledger not
+    /// stopped changes nothing, whatever the ID (a change of report client
+    /// without a stop changes nothing either). The same ID as the stop's
+    /// clears the stop and keeps every report. Another ID than the stop's
+    /// is, as Atem reads Auth/Portal's "start fresh", another Station at
+    /// Auth (a removed Station registered again): the reports pending at
+    /// this moment are dropped, done unsent ([`AckLedger::dropped_reports`]),
+    /// and the transition raises [`LedgerAlert::ReportsDropped`] naming
+    /// each; nothing else changes, so every revocation reports on as usual
+    /// (a late host, its final), under the new ID. A `client_id` out of
+    /// grammar is refused.
     pub fn resume_reporting(&self, client_id: &str) -> Result<LedgerTransition> {
         client(client_id)?;
         let Some(stopped) = &self.stopped else {
@@ -903,10 +911,7 @@ impl AckLedger {
             return Ok(next.with(Vec::new()));
         }
         let dropped: Vec<String> = next.pending.drain(..).map(|p| p.intent.report_id).collect();
-        next.refused.extend(dropped.iter().cloned());
-        for r in next.revocations.values_mut() {
-            r.retired = true;
-        }
+        next.dropped.extend(dropped.iter().cloned());
         let mut t = next.with(Vec::new());
         t.alerts.push(LedgerAlert::ReportsDropped {
             client_id: stopped.clone(),
@@ -915,10 +920,16 @@ impl AckLedger {
         Ok(t)
     }
 
-    /// The reports the Portal refused for good, and those a resume under
-    /// another report client ID dropped (sorted).
+    /// The reports the Portal refused for good (sorted).
     pub fn refused_reports(&self) -> Vec<String> {
         self.refused.iter().cloned().collect()
+    }
+
+    /// The reports a resume under another report client ID than the stop's
+    /// dropped unsent (sorted): kept, like the refusals, so a Station that
+    /// may have lost the alert raises it again.
+    pub fn dropped_reports(&self) -> Vec<String> {
+        self.dropped.iter().cloned().collect()
     }
 
     /// The Portal refused this Station's reports: every report is held.
@@ -991,7 +1002,8 @@ impl AckLedger {
     ///    "revoked_at_ms":…,"covered":[…],"outcome"?:"all_applied"}},
     ///  "done":[{"principal","effect","revoke_seq"?,"host","record_id"}],
     ///  "pending":[{"principal","report_id","report":{…},"not_before":[…]}],
-    ///  "refused":["<report_id>"],"stopped"?:"<report client id>"}
+    ///  "refused":["<report_id>"],"dropped":["<report_id>"],
+    ///  "stopped"?:"<report client id>"}
     /// ```
     pub fn to_json(&self) -> Value {
         let records: Map<String, Value> = self
@@ -1014,6 +1026,7 @@ impl AckLedger {
         let mut o = Map::new();
         o.insert("account_id".into(), json!(self.account_id));
         o.insert("done".into(), Value::Array(done));
+        o.insert("dropped".into(), json!(self.dropped));
         o.insert("genesis_hash".into(), json!(self.genesis_hash.to_hex()));
         o.insert("origin".into(), json!(self.origin));
         o.insert("pending".into(), Value::Array(pending));
@@ -1033,9 +1046,9 @@ impl AckLedger {
     /// revoke recorded, every count of a tracked record and an effect it
     /// carries, `all_applied` exactly when every covered host has the
     /// revocation in force, each pending intent's `report_id` its
-    /// report's, consistent with what it reports, each refused report one
-    /// the ledger made and no longer pending, and no report pending of a
-    /// revocation retired by a resume under another report client ID.
+    /// report's, consistent with what it reports, and each refused or
+    /// dropped report one the ledger made, no longer pending, and settled
+    /// once (never both refused and dropped).
     pub fn from_json(value: &Value) -> Result<Self> {
         let o = fields(
             value,
@@ -1049,6 +1062,7 @@ impl AckLedger {
                 "done",
                 "pending",
                 "refused",
+                "dropped",
             ],
             &["stopped"],
             "ack ledger",
@@ -1133,6 +1147,12 @@ impl AckLedger {
                 return Err(Error::Malformed("ack ledger refused"));
             }
             ledger.refused.insert(id);
+        }
+        for id in id_list(&o["dropped"], "ack ledger dropped")? {
+            if !made.contains(&id) || ids.contains(&id) || ledger.refused.contains(&id) {
+                return Err(Error::Malformed("ack ledger dropped"));
+            }
+            ledger.dropped.insert(id);
         }
         ledger.stopped = match o.get("stopped") {
             None => None,
@@ -1306,12 +1326,8 @@ impl AckLedger {
         self.make(principal, intent, intents);
     }
 
-    /// An intent made: kept until settled, unless its revocation was
-    /// retired by a resume under another report client ID.
+    /// An intent made: kept until settled.
     fn make(&mut self, principal: &str, intent: ReportIntent, intents: &mut Vec<ReportIntent>) {
-        if self.revocations[principal].retired {
-            return;
-        }
         intents.push(intent.clone());
         self.pending.push(Pending {
             principal: principal.to_owned(),
@@ -1354,7 +1370,6 @@ impl AckLedger {
         let r = self
             .revocations
             .get(principal)
-            .filter(|r| !r.retired)
             .ok_or(Error::Malformed(what))?;
         let report = Report::read(&o["report"])?;
         let report_id = o["report_id"].as_str().ok_or(Error::Malformed(what))?;
@@ -1496,9 +1511,6 @@ impl Revocation {
         if let Some(outcome) = self.outcome {
             o.insert("outcome".into(), json!(outcome.code()));
         }
-        if self.retired {
-            o.insert("retired".into(), json!(true));
-        }
         o.insert("revoked_at_ms".into(), json!(self.revoked_at_ms));
         Value::Object(o)
     }
@@ -1508,15 +1520,9 @@ impl Revocation {
         let o = fields(
             value,
             &["integration_id", "revoked_at_ms", "covered"],
-            &["outcome", "retired"],
+            &["outcome"],
             what,
         )?;
-        // Present only when true.
-        let retired = match o.get("retired") {
-            None => false,
-            Some(Value::Bool(true)) => true,
-            Some(_) => return Err(Error::Malformed("ack ledger revocation retired")),
-        };
         let outcome = match o.get("outcome") {
             None => None,
             Some(code) => Some(
@@ -1537,7 +1543,6 @@ impl Revocation {
                 .ok_or(Error::Malformed("ack ledger revocation revoked_at_ms"))?,
             covered: host_set(&o["covered"], "ack ledger revocation covered")?,
             outcome,
-            retired,
         })
     }
 }
@@ -3334,12 +3339,12 @@ mod ack_ledger_tests {
         assert_eq!(AckLedger::from_json(&l.to_json()).unwrap(), l);
     }
 
-    /// A resume under another report client ID is another Station at Auth
-    /// (a removed Station registered again, with new integrations): the old
-    /// reports are dropped, with an alert, and the revocations it reported
-    /// make no more.
+    /// A resume under another report client ID than the stop's (another
+    /// Station at Auth, as Atem reads "start fresh") drops the reports
+    /// pending at that moment, names each in its alert and keeps their ids;
+    /// it retires nothing, so every revocation reports on as usual.
     #[test]
-    fn a_resume_under_another_client_id_drops_the_reports_and_starts_fresh() {
+    fn a_resume_under_another_client_id_drops_only_the_pending_reports() {
         let (mut l, s) = revoked_ledger();
         let a = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         l = l.stop_reporting(CLIENT).unwrap().next;
@@ -3359,19 +3364,33 @@ mod ack_ledger_tests {
         l = t.next;
         assert!(!l.reporting_stopped());
         assert_eq!(l.pending_reports(), vec![]);
-        assert_eq!(l.refused_reports(), ids(&a));
-        // The old revocation reports nothing more: not a host, not the
-        // deadline. Counting goes on.
+        // Kept apart from the refusals, so a Station raises them again.
+        assert_eq!(l.dropped_reports(), ids(&a));
+        assert_eq!(l.refused_reports(), Vec::<String>::new());
+        // The revocation reports on: a late host, then the final, which
+        // waits for nothing dropped (a dropped report is settled).
+        let b = l.ack_by("b", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         assert_eq!(
-            l.ack_by("b", vec![res(&s, &[(E::Revocation, R::Applied)])], T0),
+            reports(&b),
+            vec![applied("b", &s), revoked(RevokedOutcome::AllApplied, &[])]
+        );
+        let mut both = vec![a[0].report_id.clone(), b[0].report_id.clone()];
+        both.sort();
+        assert_eq!(b[1].not_before, both);
+        assert_eq!(l.pending_reports(), vec![b[0].clone()]);
+        l.confirm_id(&b[0].report_id);
+        assert_eq!(l.pending_reports(), vec![b[1].clone()]);
+        // A dropped report is never made again.
+        assert_eq!(
+            l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Duplicate)])], T0),
             vec![]
         );
-        assert_eq!(l.tick_at(T0 + 2 * DAY), vec![]);
         let v = l.to_json();
-        assert_eq!(v["revocations"]["service:svc-1"]["retired"], json!(true));
+        assert_eq!(v["dropped"], json!(ids(&a)));
         assert_eq!(AckLedger::from_json(&v).unwrap(), l);
-        // Its own revoke again (a re-signed copy, a snapshot) restarts nothing.
-        assert_eq!(l.rec(&revoke(By::Own, true, 9), T0, &["a", "b"]), vec![]);
+        // Not stopped, a resume compares no ID: it changes nothing.
+        let t = l.resume_reporting(CLIENT).unwrap();
+        assert_eq!((t.next, t.intents, t.alerts), (l.clone(), vec![], vec![]));
     }
 
     #[test]
@@ -3400,11 +3419,35 @@ mod ack_ledger_tests {
                 Box::new(|v| v["stopped"] = json!("a b")),
             ),
             (
-                "retired not true",
-                Box::new(|v| v["revocations"]["service:svc-1"]["retired"] = json!(false)),
+                "no dropped",
+                Box::new(|v| {
+                    v.as_object_mut().unwrap().remove("dropped");
+                }),
             ),
             (
-                "a report of a retired revocation pending",
+                "dropped not a list",
+                Box::new(|v| v["dropped"] = json!("x")),
+            ),
+            (
+                "dropped and pending",
+                Box::new({
+                    let rb = rb.clone();
+                    move |v| v["dropped"] = json!([rb.clone()])
+                }),
+            ),
+            (
+                "dropped and refused",
+                Box::new({
+                    let ra = ra.clone();
+                    move |v| v["dropped"] = json!([ra.clone()])
+                }),
+            ),
+            (
+                "dropped, never made",
+                Box::new(|v| v["dropped"] = json!([format!("revoked:{}", "0".repeat(64))])),
+            ),
+            (
+                "a revocation retired",
                 Box::new(|v| v["revocations"]["service:svc-1"]["retired"] = json!(true)),
             ),
             (

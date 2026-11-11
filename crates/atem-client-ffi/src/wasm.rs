@@ -1367,7 +1367,7 @@ impl AckLedgerHandle {
     }
     /// The Station reports again as the report client `clientId`
     /// (`resume_reporting`): the stop's own ID keeps every report, another
-    /// drops them.
+    /// drops the reports pending then.
     #[wasm_bindgen(js_name = resumeReporting)]
     pub fn resume_reporting(&self, client_id: String) -> JsResult<AckTransition> {
         ack_transition(err(self.0.resume_reporting(client_id))?)
@@ -1388,11 +1388,15 @@ impl AckLedgerHandle {
     pub fn resign_alerts(&self) -> Vec<String> {
         self.0.resign_alerts()
     }
-    /// The reports refused for good, and those a resume under another
-    /// report client ID dropped.
+    /// The reports refused for good.
     #[wasm_bindgen(js_name = refusedReports)]
     pub fn refused_reports(&self) -> Vec<String> {
         self.0.refused_reports()
+    }
+    /// The reports a resume under another report client ID dropped.
+    #[wasm_bindgen(js_name = droppedReports)]
+    pub fn dropped_reports(&self) -> Vec<String> {
+        self.0.dropped_reports()
     }
     /// The Portal refused this Station's reports (`403`).
     #[wasm_bindgen(js_name = reportingStopped)]

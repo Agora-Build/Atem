@@ -985,6 +985,8 @@ final class ConformanceTests: XCTestCase {
                     } else if let labels = step["expect_resign_alerts"] {
                         let want = a(labels).map { s(o(o(ctlByLabel[s($0)]!["record"])["body"])["record_id"]) }.sorted()
                         try eq(ledger.resignAlerts(), want, "\(name) resign alerts")
+                    } else if let want = step["expect_dropped"] {
+                        try eq(ledger.droppedReports(), a(want).map(s), "\(name) dropped")
                     } else if let want = step["expect_refused"] {
                         try eq(ledger.refusedReports(), a(want).map(s), "\(name) refused")
                     } else if let id = step["resume_reporting"] {

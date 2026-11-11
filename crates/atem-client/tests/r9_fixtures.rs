@@ -536,7 +536,7 @@ impl AckRun {
 
     /// Every step kind and the keys it takes (an unknown step or key
     /// fails the run).
-    const KINDS: [(&'static str, &'static [&'static str]); 14] = [
+    const KINDS: [(&'static str, &'static [&'static str]); 15] = [
         (
             "control_record",
             &["revoked_at_ms", "covered_hosts", "made", "commit"],
@@ -552,6 +552,7 @@ impl AckRun {
         ("resume_reporting", &["alerts"]),
         ("expect_resign_alerts", &[]),
         ("expect_refused", &[]),
+        ("expect_dropped", &[]),
         ("expect_stopped", &[]),
         ("expect_portal", &[]),
     ];
@@ -691,6 +692,14 @@ impl AckRun {
                 assert_eq!(json!(alerts), step["alerts"], "{}", self.name());
                 assert_eq!(t.intents, vec![], "{}", self.name());
                 self.commit(t);
+            }
+            "expect_dropped" => {
+                assert_eq!(
+                    json!(self.ledger.dropped_reports()),
+                    step["expect_dropped"],
+                    "{}",
+                    self.name()
+                );
             }
             "expect_stopped" => {
                 // The stopped report client ID, or `false`.
