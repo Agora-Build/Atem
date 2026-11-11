@@ -18,9 +18,8 @@
 //!   or `release`. A service record it signs still names the principal's
 //!   key.
 //! - **Removed managers** (the strict rule): a record whose native signer
-//!   was removed or lost `manage` before the host applies it is refused,
-//!   and kept as evidence by the caller; Astation re-signs it with a
-//!   current manager.
+//!   was removed or lost `manage` in the list it is checked against is
+//!   refused; Astation re-signs it with a current manager.
 //! - **Host principals** (`host:<host_id>`): the only record is a native
 //!   manager's `interrupt_running`; the host's own key signs nothing. The
 //!   host must have an `add_host` in the log, current or removed, and the
@@ -38,13 +37,26 @@
 //! a host principal's `revoke_seq` beyond its head, to be verified again
 //! after every device-list advance.
 //!
-//! **Order.** The account; then what no list can make valid (a host's own
-//! key, a manager's `cover`, `hold` or `release`, a removed manager, a
-//! signer that never was a manager); then a host principal's `revoke_seq`
-//! naming another entry; then a principal the list doesn't hold, a native
-//! principal, the principal's key, a `revoke_seq` beyond the head; then a
-//! signer the list doesn't hold; then the signature. A refusal that no
-//! advance could undo comes before a pending verdict.
+//! **The verdict is relative to the list given.** It is a pure function of
+//! the record and that list, and another list can give another verdict: a
+//! native without `manage` signs validly once a `set_roles` gives it
+//! `manage`, a demoted manager once it is promoted again. What is final is
+//! what the host does with a refused record (kept as evidence, the scan
+//! cursor moves past it, I.5.4), which is the application's.
+//!
+//! **Order.** Nothing the list doesn't hold yet is refused for the signer's
+//! current roles:
+//! 1. the account;
+//! 2. what no later entry can make valid: a host's own key, a manager's
+//!    `cover`, `hold` or `release`, and a `member:` signer that is removed,
+//!    cancelled (ids are never reused) or a service (a member's kind never
+//!    changes);
+//! 3. the principal: one the list doesn't hold yet waits; then a native
+//!    principal, the principal's key, a host's `revoke_seq` naming another
+//!    entry (a committed entry never changes) or beyond the head (waits);
+//! 4. the signer: one the list doesn't hold yet waits; an active native
+//!    without `manage` is refused;
+//! 5. the signature.
 //!
 //! The verdict holds for the list it was checked against: a host verifies
 //! a record against the head of the transaction that applies it, never a
@@ -59,11 +71,13 @@ use super::record::{
 /// The verdict on a record, against one device list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCheck {
-    /// Signed by a key allowed to sign it: apply it (I.5.5).
+    /// Signed by a key allowed to sign it: the host applies it per I.5.5,
+    /// never while its device list is frozen or held.
     Valid(VerifiedControl),
     /// Stored, and verified again after every device-list advance.
     Pending(PendingReason),
-    /// Kept as evidence and skipped; reported `refused`.
+    /// Refused against this list. The host keeps it as evidence, skips it
+    /// and reports it `refused` (I.5.4).
     Refused(RefusalReason),
 }
 
@@ -122,11 +136,11 @@ pub enum RefusalReason {
     /// had.
     KeyMismatch,
     /// A native manager's `cover`, `hold` or `release`, or a `member:`
-    /// signer that never was a native manager (a native without `manage`,
-    /// a service, a `recovery_add` that was cancelled).
+    /// signer that never was a native manager in this list (a native
+    /// without `manage`, a service, a `recovery_add` that was cancelled).
     SignerNotAllowed,
-    /// Its native signer was a manager and was removed or lost `manage`
-    /// before the host applies the record (its signature verified).
+    /// Its native signer was a manager in this list and was removed or lost
+    /// `manage` since (its signature verified under its key).
     RemovedManager,
     /// A host principal's record naming the host as its signer: a host's
     /// own key signs nothing.
@@ -157,6 +171,11 @@ impl RefusalReason {
 
 /// Verifies `rec` against `list`, the device list at the head the host
 /// applies it on (I.5.4; the module docs give the rules and their order).
+///
+/// `Valid` means the record is signed by a key allowed to sign it, nothing
+/// more: the host never applies a record while its device list is frozen
+/// (R9.4) or the host is held after a write fault (R9.3), whatever this
+/// says; it applies it per I.5.5.
 pub fn verify_control(rec: &ControlRecord, list: &Membership) -> ControlCheck {
     if rec.account_id() != list.account_id() || rec.genesis_hash() != list.genesis_hash() {
         return ControlCheck::Refused(RefusalReason::WrongAccount);
@@ -203,39 +222,70 @@ fn by_manager(rec: &ControlRecord, list: &Membership, device_id: &str) -> Verdic
     ) {
         return Err(refused(RefusalReason::SignerNotAllowed));
     }
-    let key = match list.current_manager_key(device_id) {
-        Some(key) => Some(key),
-        None => match list.member(device_id).map(|state| state.status) {
-            // Not in the list yet, or a `recovery_add` still waiting: after
-            // the principal.
-            None | Some(MemberStatus::Pending { .. }) => None,
-            // Removed, or lost `manage`: refused once its signature shows
-            // it signed the record (else a forgery in its name).
-            Some(_) if list.was_manager(device_id) => {
-                let signed = list
-                    .keys_ever(device_id)
-                    .iter()
-                    .any(|(_, key)| signed_by(rec, key).is_ok());
-                return Err(refused(if signed {
-                    RefusalReason::RemovedManager
-                } else {
-                    RefusalReason::BadSignature
-                }));
-            }
-            Some(_) => return Err(refused(RefusalReason::SignerNotAllowed)),
-        },
-    };
+    let standing = standing(rec, list, device_id)?;
     match rec.principal() {
         ControlPrincipal::Service(id) => {
             service_key(rec, list, id)?;
         }
         ControlPrincipal::Host(host_id) => host_revoke(rec, list, host_id)?,
     }
-    let key = key.ok_or(pending(PendingReason::SignerUnknown))?;
+    let key = match standing {
+        Standing::Manager(key) => key,
+        Standing::Unknown => return Err(pending(PendingReason::SignerUnknown)),
+        Standing::NotManager => return Err(refused(not_a_manager(rec, list, device_id))),
+    };
     signed_by(rec, &key)?;
     Ok(VerifiedSigner::Manager {
         device_id: device_id.to_owned(),
     })
+}
+
+/// A `member:` signer's standing on this list.
+enum Standing {
+    /// A current native manager, with its key.
+    Manager(PublicKey),
+    /// Not in the list yet, or a `recovery_add` still waiting.
+    Unknown,
+    /// An active native without `manage` (never given it, or demoted): a
+    /// later `set_roles` can give it `manage`, so it is refused only after
+    /// what the list doesn't hold yet waited.
+    NotManager,
+}
+
+/// The signer's standing, or its refusal when no later entry can make it a
+/// manager: removed, or its `recovery_add` cancelled (ids are never
+/// reused), or a service (a member's kind never changes).
+fn standing(rec: &ControlRecord, list: &Membership, device_id: &str) -> Verdict<Standing> {
+    if let Some(key) = list.current_manager_key(device_id) {
+        return Ok(Standing::Manager(key));
+    }
+    let Some(state) = list.member(device_id) else {
+        return Ok(Standing::Unknown);
+    };
+    match (&state.member.kind, state.status) {
+        (_, MemberStatus::Pending { .. }) => Ok(Standing::Unknown),
+        (MemberKind::Native { .. }, MemberStatus::Active) => Ok(Standing::NotManager),
+        _ => Err(refused(not_a_manager(rec, list, device_id))),
+    }
+}
+
+/// Why a signer that isn't a current manager is refused: one that was a
+/// manager (removed, or lost `manage`) is `RemovedManager` once its key
+/// from the history verifies the record, else `BadSignature` (a forgery in
+/// its name); any other is `SignerNotAllowed`.
+fn not_a_manager(rec: &ControlRecord, list: &Membership, device_id: &str) -> RefusalReason {
+    if !list.was_manager(device_id) {
+        return RefusalReason::SignerNotAllowed;
+    }
+    let signed = list
+        .keys_ever(device_id)
+        .iter()
+        .any(|(_, key)| signed_by(rec, key).is_ok());
+    if signed {
+        RefusalReason::RemovedManager
+    } else {
+        RefusalReason::BadSignature
+    }
 }
 
 /// The service `id`'s key the record's `principal_key` names, with the
@@ -1045,6 +1095,135 @@ mod verify_control_tests {
         let mut body = host_body(&list, "host-a", manager("mac"), 7);
         body.action = ControlAction::Release;
         assert!(build_control(&keys, &KeyId::new("mac"), &body).is_err());
+    }
+
+    /// Review fix 1: a native member without `manage` can still be given
+    /// it, so a principal or revoke the list doesn't hold yet waits before
+    /// that signer is refused (I.5.4, "Verification").
+    #[test]
+    fn unknown_principal_pending_before_non_manager_refused() {
+        let keys = keys();
+        let mut list = account(&keys);
+        let revoke = ControlAction::Revoke {
+            interrupt_running: false,
+        };
+        let next = list.head().seq + 1;
+        let svc = service_body(&list, &keys, "svc-new", "ipad", revoke);
+        let host_b = host_body(&list, "host-b", manager("ipad"), next + 10);
+        let host_a = host_body(&list, "host-a", manager("ipad"), next);
+        for body in [&svc, &host_b] {
+            assert_eq!(
+                check(&list, &keys, "ipad", body),
+                pending(PendingReason::PrincipalUnknown)
+            );
+        }
+        assert_eq!(
+            check(&list, &keys, "ipad", &host_a),
+            pending(PendingReason::RevokeNotInList)
+        );
+        // In the list, the signer still without `manage`: refused against
+        // this list.
+        assert_eq!(revoke_host(&mut list, &keys, "host-a"), next);
+        let scope = ServiceScope::new(["host-a"]);
+        let add = service_add("svc-new", key(&keys, "svc-new"), &scope, T0 + HOUR, T0).unwrap();
+        append(&mut list, &keys, "mac", add);
+        for body in [&svc, &host_a] {
+            assert_eq!(
+                check(&list, &keys, "ipad", body),
+                refused(RefusalReason::SignerNotAllowed)
+            );
+        }
+        // Given `manage`: valid.
+        let promote = Action::SetRoles {
+            device_id: "ipad".into(),
+            change: RolesChange::Native(ALL.into_iter().collect()),
+        };
+        append(&mut list, &keys, "mac", promote);
+        for body in [&svc, &host_a] {
+            assert_eq!(
+                check(&list, &keys, "ipad", body),
+                valid(&list, by_manager("ipad"))
+            );
+        }
+    }
+
+    /// Review fix 1: the same for a manager that lost `manage`.
+    #[test]
+    fn unknown_principal_pending_before_demoted_manager_refused() {
+        let keys = keys();
+        let mut list = account(&keys);
+        let roles = |roles: &[Role]| Action::SetRoles {
+            device_id: "dev-new".into(),
+            change: RolesChange::Native(roles.iter().copied().collect()),
+        };
+        let add = Action::Add {
+            member: native(&keys, "dev-new", &ALL),
+        };
+        append(&mut list, &keys, "mac", add);
+        append(&mut list, &keys, "mac", roles(&[Role::Control, Role::View]));
+        let revoke = ControlAction::Revoke {
+            interrupt_running: true,
+        };
+        // svc-new's add, host-b's add_host, then host-b's revoke follow.
+        let r_b = list.head().seq + 3;
+        let svc = service_body(&list, &keys, "svc-new", "dev-new", revoke);
+        let host_b = host_body(&list, "host-b", manager("dev-new"), r_b);
+        for body in [&svc, &host_b] {
+            assert_eq!(
+                check(&list, &keys, "dev-new", body),
+                pending(PendingReason::PrincipalUnknown)
+            );
+        }
+        let scope = ServiceScope::new(["host-a"]);
+        let add = service_add("svc-new", key(&keys, "svc-new"), &scope, T0 + HOUR, T0).unwrap();
+        append(&mut list, &keys, "mac", add);
+        add_host_b(&mut list, &keys);
+        assert_eq!(revoke_host(&mut list, &keys, "host-b"), r_b);
+        for body in [&svc, &host_b] {
+            assert_eq!(
+                check(&list, &keys, "dev-new", body),
+                refused(RefusalReason::RemovedManager)
+            );
+            // One forged in its name.
+            assert_eq!(
+                check(&list, &keys, "mac", body),
+                refused(RefusalReason::BadSignature)
+            );
+        }
+        append(&mut list, &keys, "mac", roles(&ALL));
+        for body in [&svc, &host_b] {
+            assert_eq!(
+                check(&list, &keys, "dev-new", body),
+                valid(&list, by_manager("dev-new"))
+            );
+        }
+    }
+
+    /// What no later entry changes is refused even while the principal is
+    /// unknown: a removed manager (`removed_manager_refused`), a service as
+    /// signer, a member whose `recovery_add` was cancelled (ids are never
+    /// reused and a member's kind never changes).
+    #[test]
+    fn permanent_signer_refusals_before_unknown_principal() {
+        let keys = keys();
+        let mut list = account(&keys);
+        let recovery = Action::RecoveryAdd {
+            member: native(&keys, "dev-kit", &ALL),
+        };
+        let seq = append(&mut list, &keys, RECOVERY_SIGNER, recovery);
+        let target = list.entry(seq).unwrap().hash();
+        append(&mut list, &keys, "mac", Action::RecoveryVeto { target });
+        let revoke = ControlAction::Revoke {
+            interrupt_running: false,
+        };
+        for signer in ["svc-ed", "dev-kit"] {
+            let body = service_body(&list, &keys, "svc-new", signer, revoke);
+            assert_eq!(
+                check(&list, &keys, signer, &body),
+                refused(RefusalReason::SignerNotAllowed),
+                "{signer}"
+            );
+        }
     }
 
     /// Adds the host `host-b` (signed by `mac`); returns its `seq`.
