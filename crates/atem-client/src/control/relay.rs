@@ -596,9 +596,9 @@ pub struct EntryRef {
 }
 
 /// The effects of a record, as its results list them (the order of
-/// `EffectKind::of`, which this module can't call: it is the control state's
-/// own): a `cover`, a `revoke` (with the interrupt, when it asks for one), a
-/// `hold`, a `release` or an `interrupt_running`.
+/// `EffectKind::of`; the ledger's tests check that every set it gives is
+/// one of these): a `cover`, a `revoke` (with the interrupt, when it asks
+/// for one), a `hold`, a `release` or an `interrupt_running`.
 const RECORD_EFFECTS: [&[EffectKind]; 6] = [
     &[EffectKind::Cover],
     &[EffectKind::Revocation],
@@ -797,7 +797,9 @@ impl ControlAck {
         "results",
     ];
 
-    fn check(&self) -> Result<()> {
+    /// What the reader checks (the Station's ledger checks an ack it is
+    /// handed with it, [`super::ledger::AckLedger::ack`]).
+    pub(super) fn check(&self) -> Result<()> {
         if self.results.len() > MAX_ACK_RESULTS {
             return Err(RelayError::TooLarge);
         }

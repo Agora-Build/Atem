@@ -120,6 +120,8 @@ pub const RECOVERY_KIT_TAG: &str = "atem-recovery-kit-tag-v1";
 pub const K_BACKUP_HASH: &str = "atem-k-backup-hash-v1";
 pub const RECOVERY_SIGN: &str = "atem-recovery-sign-v1";
 pub const SAFETY_CODE: &str = "atem-safety-code-v2";
+/// A Station's report ids to the Portal (`control::ledger`).
+pub const STATION_REPORT_ID: &str = "atem-station-report-id-v1";
 
 #[cfg(test)]
 mod tests {
@@ -200,6 +202,7 @@ mod tests {
             K_BACKUP_HASH,
             RECOVERY_SIGN,
             SAFETY_CODE,
+            STATION_REPORT_ID,
         ];
         let mut all: Vec<&str> = signing.iter().chain(others.iter()).copied().collect();
         let n = all.len();

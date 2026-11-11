@@ -15,12 +15,20 @@
 //! and gives its per-effect application results (I.5.5, I.5.8); carrying
 //! out the actions is the host's. [`relay`] is the wire of a host's calls to
 //! its Station (I.5.8): the feed, its heads, the host's acknowledgments of
-//! per-effect results, and its own device-list fetch.
+//! per-effect results, and its own device-list fetch. [`ledger`] is the
+//! Station's reference side of those acknowledgments: what each covered host
+//! has in force, the durable, retryable reports it owes the Portal, and the
+//! re-sign alerts (I.5.4, I.5.8).
+pub mod ledger;
 pub mod record;
 pub mod relay;
 pub mod state;
 pub mod verify;
 
+pub use ledger::{
+    AckLedger, AckRefusal, LedgerTransition, LinkAssociation, REVOCATION_DEADLINE_MS,
+    RecordRefusal, Report, ReportIntent, RevokedOutcome,
+};
 pub use record::{
     CONTROL_TYPE, ControlAbout, ControlAction, ControlBody, ControlError, ControlFeed,
     ControlPrincipal, ControlRecord, ControlSigner, KNOWN_BY, MAX_BY_CHARS, build_control,

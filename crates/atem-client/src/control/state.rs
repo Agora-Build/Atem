@@ -225,7 +225,7 @@ impl EffectKind {
     }
 
     /// The effects a record with `action` carries, in this order.
-    fn of(action: ControlAction) -> Vec<EffectKind> {
+    pub(super) fn of(action: ControlAction) -> Vec<EffectKind> {
         match action {
             ControlAction::Cover => vec![EffectKind::Cover],
             ControlAction::Revoke {
