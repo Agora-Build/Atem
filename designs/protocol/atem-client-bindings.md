@@ -1037,7 +1037,8 @@ of the calling link's verified association: `heads` names only that
 account's feeds, `control_sync` serves only them, `membership_fetch` only
 its device list, and a request naming another account's feed is refused
 (`forbidden`; **Atem's proposal, for Astation's and Auth/Portal's
-agreement**).
+agreement**; **the refusal's wire form is open (for Astation)**: §11.4 has
+no message that carries it).
 
 | call | what it does |
 |---|---|
@@ -1072,11 +1073,11 @@ to re-sign. Keep one per device list your Station serves.
 
 | call | what it does |
 |---|---|
-| `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger (`origin` exact, as hosts compare it: `https://` and a lowercase host, a port only when not the default, no path; `http://` on a loopback address for development; else `Invalid{malformed}`); the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`); its durable state, canonical JSON (`"v": 1`) |
+| `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger (`origin` exact, as hosts compare it: `https://` and a lowercase host, a port only when not the default, no path; `http://` on a loopback address for development; else `Invalid{malformed}`); the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`, also for a `pending` list not in the order the reports were made: it would stall a principal); its durable state, canonical JSON (`"v": 1`) |
 | `origin()`, `account_id()`, `genesis_hash()` | the Station and the device list the ledger is for (`genesis_hash` in lowercase hex): check them against the device list a stored state is loaded for |
-| `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration, `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
+| `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration (the deadline's start, but the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)`, so the deadline is at most `issued_at` plus 25 hours, where a host stops resending the revoke's result: **Atem's proposal, for Astation's agreement**, host-work-v1 §11.4), `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
 | `ack(link, ack_json, now_ms)` | a host's `control_ack` as received, on the link whose verified association is `link` (`LinkAssociationInfo{account_id, genesis_hash, host_id, host_trust_gen, connection_id}`). Refused whole, nothing counted: `incomplete_link`, `not_the_link` (the ack's account, root, host or trust generation isn't the link's), `other_account`, `other_station`, `not_the_record` (a result whose effects aren't the record's), or the reader's code |
-| `tick(now_ms)` | your timer: a revocation 24 hours past `revoked_at_ms` gets its `revoked{deadline_passed}` report |
+| `tick(now_ms)` | your timer: a revocation 24 hours past its start (`record`'s `min(revoked_at_ms, issued_at + 1 hour)`) gets its `revoked{deadline_passed}` report |
 | `pending_reports()` | what to send now, in order: `ReportIntentInfo{report_id, report, not_before}`, `report` being `RevocationApplied{integration_id, host, record_id}` or `Revoked{integration_id, outcome, pending_hosts}` |
 | `report_answer(status)` | the class of the Portal's HTTP status: `Confirm`, `Retry`, `Refuse`, `StopReporting` (below) |
 | `confirm(report_id)`, `refuse(report_id)` | the Portal accepted the report; refused it for good (settled, never sent again, a `ReportRefused` alert) |
@@ -1243,7 +1244,8 @@ first reports this Station's record `duplicate` and is still counted);
 `revoked{all_applied}` goes after every covered host's
 `revocation_applied` (but one dropped by a resume under another report
 client ID), `revoked{deadline_passed, pending_hosts}` 24 hours after the
-revocation.
+revocation's start (`min(revoked_at_ms, the own revoke's issued_at + 1
+hour)`).
 
 **Its size.** The ledger keeps the `revoke` and `interrupt_running` records
 it tracks (at most 64 covered hosts each), what each host has in force, the

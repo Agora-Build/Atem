@@ -340,7 +340,7 @@ Auth). Every ledger call is made at the Station's clock.
 
 | step | meaning |
 |---|---|
-| `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`, default the clock: when the Portal revoked the integration, for the Station's own first revoke); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
+| `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`, default the clock: when the Portal revoked the integration, for the Station's own first revoke; the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)` as the deadline's start); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
 | `{"control_ack": message, "link": name, "made": [report_id], "commit"?: false, "refused"?: code}` | a host's `control_ack` (the complete wire message, read with the strict reader) arrives on the link `name`; `refused`: the ledger refuses it whole with that code (`not_the_link`, `other_account`, `other_station`, `not_the_record`, `incomplete_link`, `malformed`) and nothing changes |
 | `{"tick": true, "made": [report_id], "commit"?: false}` | the Station's timer, at its clock |
 | `{"advance_ms": n}` | the Station's clock moves |

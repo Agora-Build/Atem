@@ -38,11 +38,12 @@
 //! is [`AckLedger::confirm`]; a network error, a timeout, a 5xx, a `408`, a
 //! `429` (after its `Retry-After`) or a `401` (after refreshing the token)
 //! is sent again later with the same `report_id` and body, after a restart
-//! too (`pending_reports` offers every report until it is settled); a final
-//! refusal (`400`, `404`, `409`, `413`, `415`, any other 4xx) is
-//! [`AckLedger::refuse`]: done, never sent again, and an operator alert; a
-//! `403` is [`AckLedger::stop_reporting`] under the Station's report client
-//! ID: every report held, none sent, one alert, until
+//! too (`pending_reports` keeps offering a principal's earliest report
+//! until it is settled); a final refusal (`400`, `404`, `409`, `413`,
+//! `415`, any other 4xx) is [`AckLedger::refuse`]: done, never sent
+//! again, and an operator alert; a `403` is [`AckLedger::stop_reporting`]
+//! under the Station's report client ID: every report held, none sent, one
+//! alert, until
 //! [`AckLedger::resume_reporting`] (the same ID keeps every report; another
 //! ID than the stop's, another Station at Auth as Atem reads "start fresh",
 //! drops the reports pending then, and every revocation reports on as
@@ -78,8 +79,8 @@
 //! service's revocation starts at the Station's own `revoke` (signed with the
 //! service key: the Portal revoked the integration), whose `record` fixes the
 //! integration (`about.integration_id`), the covered hosts and the
-//! revocation's time; a later revoke of the same principal (a re-signed copy,
-//! a snapshot after a reset) changes none of them. A native revoke appended to
+//! revocation's start (below); a later revoke of the same principal (a
+//! re-signed copy, a snapshot after a reset) changes none of them. A native revoke appended to
 //! the feed is counted, and reported once the Station's own revoke is
 //! recorded.
 //! - `revocation_applied{integration_id, host, record_id}`: once per covered
@@ -89,8 +90,15 @@
 //! - `revoked{integration_id, outcome, pending_hosts}`: once per revocation:
 //!   `all_applied`, with no pending host, when every covered host has it in
 //!   force; else `deadline_passed`, with the hosts that didn't confirm (never
-//!   none), [`REVOCATION_DEADLINE_MS`] after the revocation's own time
-//!   (`revoked_at_ms`, persisted), never after a restart's. An ack or a
+//!   none), [`REVOCATION_DEADLINE_MS`] after the revocation's start
+//!   (persisted), never after a restart's. The start is the Station's
+//!   `revoked_at_ms` (when the Portal revoked the integration), but at most
+//!   [`REVOCATION_START_SLACK_MS`] after the own `revoke`'s `issued_at`:
+//!   `min(revoked_at_ms, issued_at + 1 hour)`. A host stops sending the
+//!   result of that revoke again at its `issued_at` plus 25 hours (§11.4,
+//!   the deadline plus the slack), so a Station that records its revoke
+//!   late must not push the deadline past it (Atem's proposal, for
+//!   Astation's agreement). An ack or a
 //!   record is applied after any deadline its `now_ms` has passed, so the
 //!   outcome depends on time, never on when the Station ticked; an own
 //!   revoke recorded after its own deadline is final at once.
@@ -140,6 +148,11 @@ use super::state::{ApplicationResult, EffectKind};
 /// How long after a revocation the Station reports it `deadline_passed`:
 /// 24 hours, by which time every task has passed its deadline (I.4.4).
 pub const REVOCATION_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// How long after the own `revoke`'s `issued_at` a revocation's start may
+/// be: 1 hour, so its deadline is at most `issued_at` plus 25 hours, where
+/// a host stops sending the revoke's result again (§11.4).
+pub const REVOCATION_START_SLACK_MS: u64 = 60 * 60 * 1000;
 
 /// `account_id`: 1 to this many bytes, as the device list's (§R9.2).
 const MAX_ACCOUNT_ID_BYTES: usize = 128;
@@ -593,6 +606,8 @@ struct Tracked {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Revocation {
     integration_id: String,
+    /// The deadline's start: the Station's `revoked_at_ms`, at most an hour
+    /// after the own revoke's `issued_at` ([`REVOCATION_START_SLACK_MS`]).
     revoked_at_ms: u64,
     covered: BTreeSet<String>,
     /// The `revoked` report made.
@@ -674,9 +689,13 @@ impl AckLedger {
     /// [`AckLedger::tick`] would). For the Station's own `revoke` (signed
     /// with the service key), the first of its principal starts the
     /// revocation: `revoked_at_ms` is when the Portal revoked the
-    /// integration (the deadline's start) and `covered_hosts` the hosts its
-    /// grant covered (a set); the hosts that have it in force already
-    /// (through a native revoke) are reported at once, and a revocation
+    /// integration (the deadline's start, but at most
+    /// [`REVOCATION_START_SLACK_MS`] after the record's `issued_at`: the
+    /// start kept is `min(revoked_at_ms, issued_at + 1 hour)`, so the
+    /// deadline never passes the host's last resend at `issued_at` plus 25
+    /// hours) and `covered_hosts` the hosts its grant covered (a set); the
+    /// hosts that have it in force already (through a native revoke) are
+    /// reported at once, and a revocation
     /// recorded after its own deadline is final at once. For any other
     /// record `revoked_at_ms` is unused, and `covered_hosts` are the hosts
     /// its alert waits for. The same record again (a retried intake, a
@@ -753,7 +772,8 @@ impl AckLedger {
                 principal.clone(),
                 Revocation {
                     integration_id,
-                    revoked_at_ms,
+                    revoked_at_ms: revoked_at_ms
+                        .min(rec.issued_at().saturating_add(REVOCATION_START_SLACK_MS)),
                     covered: covered.clone(),
                     outcome: None,
                 },
@@ -1174,6 +1194,7 @@ impl AckLedger {
             }
             ledger.pending.push(pending);
         }
+        ledger.check_pending_order()?;
         let made = ledger.made_ids();
         for id in id_list(&o["refused"], "ack ledger refused")? {
             if !made.contains(&id) || ids.contains(&id) {
@@ -1392,6 +1413,43 @@ impl AckLedger {
         ];
         parts.extend(host.map(str::as_bytes));
         format!("{kind}:{}", Hash32::of_enc(&parts).to_hex())
+    }
+
+    /// The pending list is in the order the reports were made (a transition
+    /// appends, a settled report leaves): `pending_reports` offers only a
+    /// principal's earliest, so a state out of that order would stall the
+    /// principal for good, with no alert. A report's `not_before` that is
+    /// still pending is earlier in the list (one no longer pending is
+    /// settled, and fine), and a final lists as `pending_hosts` the hosts
+    /// whose reports are made after it, so none of those is earlier.
+    fn check_pending_order(&self) -> Result<()> {
+        let at: BTreeMap<&str, usize> = self
+            .pending
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.intent.report_id.as_str(), i))
+            .collect();
+        for (i, p) in self.pending.iter().enumerate() {
+            let behind = p
+                .intent
+                .not_before
+                .iter()
+                .any(|id| at.get(id.as_str()).is_some_and(|j| *j > i));
+            let ahead = match (&p.intent.report, self.revocations.get(&p.principal)) {
+                (Report::Revoked { pending_hosts, .. }, Some(r)) => {
+                    pending_hosts.iter().any(|host| {
+                        let id =
+                            self.report_id(APPLIED, &p.principal, &r.integration_id, Some(host));
+                        at.get(id.as_str()).is_some_and(|j| *j < i)
+                    })
+                }
+                _ => false,
+            };
+            if behind || ahead {
+                return Err(Error::Malformed("ack ledger pending order"));
+            }
+        }
+        Ok(())
     }
 
     /// A pending intent: its revocation's, with the `report_id` of its
@@ -2459,6 +2517,67 @@ mod ack_ledger_tests {
         assert_eq!(l.pending_reports(), d);
     }
 
+    /// A revocation's start is `min(revoked_at_ms, issued_at + 1 h)`: the
+    /// host stops resending an ack at the revoke's `issued_at` plus 25
+    /// hours (§11.4), so a Station that records its own revoke later than
+    /// an hour after its `issued_at` must not push the deadline past that.
+    #[test]
+    fn a_revocations_start_is_clamped_to_an_hour_after_its_issued_at() {
+        let s = revoke(By::Own, false, 1);
+        let issued = s.issued_at();
+        assert_eq!(issued, T0 + 1);
+
+        // Recorded 3 hours after its issued_at: the deadline is issued_at
+        // + 25 hours, not revoked_at_ms + 24 hours (issued_at + 27).
+        let mut l = ledger();
+        l.rec(&s, issued + 3 * HOUR, &["a", "b"]);
+        assert_eq!(
+            l.to_json()["revocations"]["service:svc-1"]["revoked_at_ms"],
+            json!(issued + HOUR),
+            "the start the state keeps is the clamped one"
+        );
+        assert_eq!(l.tick_at(issued + 25 * HOUR - 1), vec![]);
+        let f = l.tick_at(issued + 25 * HOUR);
+        assert_eq!(
+            reports(&f),
+            vec![revoked(RevokedOutcome::DeadlinePassed, &["a", "b"])]
+        );
+
+        // The same through a restart: the persisted start is the clamped one.
+        let mut l = ledger();
+        l.rec(&s, issued + 3 * HOUR, &["a", "b"]);
+        let mut l = AckLedger::from_json(&l.to_json()).unwrap();
+        assert_eq!(l.tick_at(issued + 25 * HOUR - 1), vec![]);
+        assert_eq!(l.tick_at(issued + 25 * HOUR).len(), 1);
+
+        // Recorded after the clamped deadline already passed: final at
+        // once (revoked_at_ms + 24 hours would be another day away).
+        let mut l = ledger();
+        let made = l.rec(&s, issued + 30 * HOUR, &["a"]);
+        assert_eq!(
+            reports(&made),
+            vec![revoked(RevokedOutcome::DeadlinePassed, &["a"])]
+        );
+
+        // Within an hour of its issued_at, or before it (the Portal revoked
+        // first, the usual case), revoked_at_ms stands.
+        for at in [
+            issued + HOUR,
+            issued + HOUR / 2,
+            issued,
+            issued - 5 * 60_000,
+        ] {
+            let mut l = ledger();
+            l.rec(&s, at, &["a"]);
+            assert_eq!(
+                l.to_json()["revocations"]["service:svc-1"]["revoked_at_ms"],
+                json!(at)
+            );
+            assert_eq!(l.tick_at(at + DAY - 1), vec![], "at {at}");
+            assert_eq!(l.tick_at(at + DAY).len(), 1, "at {at}");
+        }
+    }
+
     /// Reports of one principal go to the Portal in the order they were
     /// made: a late host's report waits for the revocation's final made
     /// before it (a Portal outage across the deadline, or a 403 stop across
@@ -3322,6 +3441,55 @@ mod ack_ledger_tests {
         let mut v = l.to_json();
         v["revocations"]["service:svc-1"]["outcome"] = json!("all_applied");
         assert!(AckLedger::from_json(&v).is_err());
+    }
+
+    /// Reports of one principal are stored in the order they were made, and
+    /// `pending_reports` offers only the earliest of each principal, so a
+    /// stored state out of that order would stall its principal silently
+    /// (the final first, waiting for a report behind it): refused at load.
+    #[test]
+    fn a_reordered_pending_list_is_refused_at_load() {
+        let mut l = ledger();
+        let s = revoke(By::Own, false, 1);
+        l.rec(&s, T0, &["a", "b", "c"]);
+        // a's report is unconfirmed across the deadline: the final names
+        // it, and a late report of b is made after the final.
+        l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
+        l.tick_at(T0 + DAY);
+        l.ack_by(
+            "b",
+            vec![res(&s, &[(E::Revocation, R::Applied)])],
+            T0 + DAY + 1,
+        );
+        let good = l.to_json();
+        let pending = good["pending"].as_array().unwrap().clone();
+        assert_eq!(pending.len(), 3, "a's report, the final and b's report");
+        assert_eq!(pending[1]["report"]["kind"], json!("revoked"));
+        // The state as the ledger wrote it loads and offers a's report.
+        let back = AckLedger::from_json(&good).unwrap();
+        assert_eq!(back, l);
+        assert_eq!(back.pending_reports().len(), 1);
+
+        let order = |order: [usize; 3]| {
+            let mut v = good.clone();
+            v["pending"] = Value::Array(order.iter().map(|i| pending[*i].clone()).collect());
+            v
+        };
+        // The final before the report it waits for: it would be the
+        // principal's head and wait forever.
+        assert!(AckLedger::from_json(&order([1, 0, 2])).is_err());
+        assert!(AckLedger::from_json(&order([1, 2, 0])).is_err());
+        // A late host's report before the final that lists its host as
+        // pending: no transition makes it so.
+        assert!(AckLedger::from_json(&order([0, 2, 1])).is_err());
+        assert!(AckLedger::from_json(&order([2, 0, 1])).is_err());
+        // Settled reports leave the list, so the ones left may name
+        // reports no longer there: the same order, with a's confirmed.
+        let mut settled = l.clone();
+        settled.confirm_id(pending[0]["report_id"].as_str().unwrap());
+        assert_eq!(settled.pending.len(), 2);
+        let v = settled.to_json();
+        assert_eq!(AckLedger::from_json(&v).unwrap(), settled);
     }
 
     /// The feed an ack names is the host's word about what it read; the

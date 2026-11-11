@@ -1285,7 +1285,10 @@ that account's feeds, `control_sync` serves only them and
 another account's feed (an `origin` and `feed_id` that aren't its account's
 feed at this Station) is refused, `forbidden`, and nothing of another
 account is served: no principal, `integration_id`, `about.by`, record id or
-revocation time of another account reaches the link.
+revocation time of another account reaches the link. **The refusal's wire
+form is open (for Astation)**: no message above carries a refusal for
+`control_sync` or `membership_fetch`, so a Station can't send `forbidden` as
+written, and Atem proposes no form.
 
 A native token alone never fetches or acknowledges another host's feeds,
 results or mailbox, and Astation proxies no credentials to an arbitrary
@@ -1350,14 +1353,19 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   (`applied` or `duplicate`) of its `revoke` and `interrupt_running`
   records and its host-sender revoke entries again, for a bounded time. The
   Station's ledger settles a revocation at its deadline, 24 hours after the
-  revocation, whose time the service's own `revoke` carries as `issued_at`
-  (the host knows no other), so: the result of a service's own `revoke`
-  (signed with the service's key) is
+  revocation's start. The host knows no time of the revocation but the
+  service's own `revoke`'s `issued_at`, and the ledger's `revoked_at_ms` is
+  the Station's word, so (**Atem's proposal, for Astation's agreement**) the
+  ledger takes the start as `min(revoked_at_ms, issued_at + 1 hour)`: a
+  Station that records its own revoke more than an hour after its
+  `issued_at` gets its deadline at `issued_at` plus 25 hours, never later,
+  and the host's resends below never stop before it. So: the result of a
+  service's own `revoke` (signed with the service's key) is
   sent again on every (re)connection and every 10 minutes while connected,
   until that record's `issued_at` plus 25 hours on the host's clock (the
-  deadline plus 1 hour); any other in-force result (a native record, an
-  `interrupt_running`, a host sender's revoke entry), which no deadline
-  bounds, at most once per connection. The ack of the cursor itself goes
+  latest deadline plus 1 hour); any other in-force result (a native
+  record, an `interrupt_running`, a host sender's revoke entry), which no
+  deadline bounds, at most once per connection. The ack of the cursor itself goes
   on. Counting is idempotent at the Station, so a result sent again counts
   nothing twice, and a Station that lost a transition before its commit
   gets it back.
@@ -1379,8 +1387,9 @@ The Station reports a revocation's progress to the Portal (`POST
 Station's own `revoke` (signed with the integration's service key: the
 Portal revoked the integration), whose record fixes the integration
 (`about.integration_id`), the hosts its grant covered and the revocation's
-time; a later revoke of the same principal (a re-signed copy, a reset's
-snapshot) changes none of them. A native revoke of the same service
+start (`min(revoked_at_ms, issued_at + 1 hour)`, "When a host
+acknowledges" below); a later revoke of the same principal (a re-signed
+copy, a reset's snapshot) changes none of them. A native revoke of the same service
 appended earlier counts for its hosts, and they are reported once the
 Station's own revoke is recorded, naming the native record. An own revoke
 whose grant covered no host is final at once, as `revoked{all_applied,
@@ -1402,7 +1411,9 @@ revocation is complete (**Atem's choice, for Auth/Portal to confirm**).
 - **`revoked{outcome, pending_hosts}`**: once per revocation:
   `all_applied`, with no pending host, once every covered host has the
   revocation in force; else `deadline_passed`, with the hosts that didn't
-  confirm (never none), 24 hours after the revocation's own time. That time
+  confirm (never none), 24 hours after the revocation's start (the
+  Station's `revoked_at_ms`, at most an hour after the own revoke's
+  `issued_at`, "When a host acknowledges" above). That start
   is persisted, so a restart never moves the deadline. An ack or a record
   is counted after any deadline its time has passed, so the outcome
   depends on time, never on when the Station looked; an own revoke recorded

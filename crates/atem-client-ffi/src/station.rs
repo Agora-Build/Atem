@@ -500,8 +500,9 @@ impl AckLedgerHandle {
     /// A state `to_json()` wrote. `Stored{code}`: `too_large` (over 64
     /// MiB), `malformed` (not strict JSON, not an object, no `v`),
     /// `unsupported_version` (a `v` other than 1), `stored_invalid` (the
-    /// ledger's own rules refuse it, or it isn't exactly `to_json()`'s
-    /// form). Nothing is loaded then: keep reporting stopped and never
+    /// ledger's own rules refuse it, among them a `pending` list not in the
+    /// order the reports were made, which would stall a principal, or it
+    /// isn't exactly `to_json()`'s form). Nothing is loaded then: keep reporting stopped and never
     /// start again from an empty ledger (it would report again what the
     /// Portal has, under the same ids, and lose the deadlines).
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
@@ -569,7 +570,9 @@ impl AckLedgerHandle {
     /// parser reads it), before it serves it, at `now_ms`. For the
     /// Station's own `revoke` (signed with the integration's service key),
     /// the first of its principal starts the revocation: `revoked_at_ms` is
-    /// when the Portal revoked the integration and `covered_hosts` the
+    /// when the Portal revoked the integration (the deadline's start, but at
+    /// most an hour after the record's `issued_at`: the start kept is
+    /// `min(revoked_at_ms, issued_at + 1 hour)`) and `covered_hosts` the
     /// hosts its grant covered. For any other record `revoked_at_ms` is
     /// unused and `covered_hosts` are the hosts its re-sign alert waits
     /// for. The same record again changes nothing.
@@ -611,7 +614,8 @@ impl AckLedgerHandle {
     }
 
     /// The Station's timer at `now_ms`: a revocation whose deadline (24 h
-    /// after `revoked_at_ms`) passed gets its `revoked` report.
+    /// after its start, `record`'s clamped `revoked_at_ms`) passed gets its
+    /// `revoked` report.
     pub fn tick(&self, now_ms: u64) -> AckTransition {
         transition(self.ledger.tick(now_ms))
     }
@@ -652,8 +656,12 @@ impl AckLedgerHandle {
         Ok(transition(self.ledger.resume_reporting(&client_id)?))
     }
 
-    /// What to send now, in order: every report not yet settled whose
-    /// `not_before` are all settled.
+    /// What to send now, after a commit, a restart or a failed POST: for
+    /// each principal, its earliest report not yet settled (confirmed,
+    /// refused or dropped), when every report its `not_before` names is
+    /// settled too, in delivery order. Reports of one principal thus go in
+    /// the order they were made, one at a time. Nothing while reporting is
+    /// stopped.
     pub fn pending_reports(&self) -> Vec<ReportIntentInfo> {
         self.ledger
             .pending_reports()

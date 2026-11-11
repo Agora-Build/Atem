@@ -1294,7 +1294,9 @@ impl AckLedgerHandle {
     pub fn genesis_hash(&self) -> String {
         self.0.genesis_hash()
     }
-    /// A record the Station stored in its feed (`record`).
+    /// A record the Station stored in its feed (`record`): for its own
+    /// `revoke`, the revocation starts at `min(revokedAtMs, the record's
+    /// issued_at + 1 hour)`.
     pub fn record(
         &self,
         record_json: String,
@@ -1378,7 +1380,11 @@ impl AckLedgerHandle {
         self.0.stopped_client_id()
     }
     /// What to send now, in order: `[{reportId, report: {type, …},
-    /// notBefore}]`.
+    /// notBefore}]`. For each principal only its earliest report not yet
+    /// settled (confirmed, refused or dropped), when every report its
+    /// `notBefore` names is settled too: the reports of one principal go in
+    /// the order they were made, one at a time. Nothing while reporting is
+    /// stopped.
     #[wasm_bindgen(js_name = pendingReports)]
     pub fn pending_reports(&self) -> JsResult<JsValue> {
         to_js(&self.0.pending_reports())
