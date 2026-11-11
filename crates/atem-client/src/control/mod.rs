@@ -13,8 +13,11 @@
 //! alone. [`verify`] checks who may sign which action, against which key of
 //! the device list (I.5.4). [`state`] applies it to a host's control state
 //! and gives its per-effect application results (I.5.5, I.5.8); carrying
-//! out the actions is the host's.
+//! out the actions is the host's. [`relay`] is the wire of a host's calls to
+//! its Station (I.5.8): the feed, its heads, the host's acknowledgments of
+//! per-effect results, and its own device-list fetch.
 pub mod record;
+pub mod relay;
 pub mod state;
 pub mod verify;
 
@@ -22,6 +25,10 @@ pub use record::{
     CONTROL_TYPE, ControlAbout, ControlAction, ControlBody, ControlError, ControlFeed,
     ControlPrincipal, ControlRecord, ControlSigner, KNOWN_BY, MAX_BY_CHARS, build_control,
     control_signing_input, control_with_signature, principal_key_of,
+};
+pub use relay::{
+    AckResult, ControlAck, ControlSync, ControlSyncResult, EntryRef, FeedEntry, FeedHead, Heads,
+    MembershipFetch, MembershipFetchResult, RelayError, ToHost, ToStation,
 };
 pub use state::{
     ApplicationResult, Applied, ControlState, EffectKind, EffectResult, FeedPos, HostAction,
