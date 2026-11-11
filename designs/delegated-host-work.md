@@ -18,12 +18,17 @@ pause's bound the host's own (a day on both clocks, never the sender's deadline)
 to its session (III.2, "Who sees the live tag"; VI). The implementation, its vectors
 (`designs/protocol/fixtures/host-work/prompt-framing-v1.json`) and this text land together; nothing else changed.
 
+**Amended by owner decision, 2026-11-10 (clocks).** Atem-internal: no wire or contract change. Clock repair is
+automatic, with no command and no network time, and elapsed time is counted on boot time, which counts suspend
+(I.6.5, replacing "the owner's reset"). Each changed passage is marked "owner decision 2026-11-10" (in I.6.1, I.6.5,
+I.13, VII.A test 18 and IX.1 item 6). The exact rules are host-work-v1 §11.6, "Clocks"; the host builds them in step 4.
+
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
 the diagram, the two Astation file references in XI (written so they are not read as paths in this repository), and
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing
-amendment above. The diagram is
+and clock amendments above. The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way. Citations of [agent-collaboration.md](agent-collaboration.md) and its section numbers
@@ -880,7 +885,7 @@ restart; interrupting a turn that has already ended does nothing.
 
 | Store | Holds |
 |---|---|
-| `host-work.sqlite` | Tasks and admission records, attempts, launches, messages, replies, return grants, control records, per-feed cursors and per-principal state, interrupt intents, alerts, the clock floor. **Changed to match Atem's spec:** the host's highest wall-clock reading, with its `boot_id` and monotonic stamp (I.6.5). **Changed for host senders (owner decision 2026-11-07):** host principals' `interrupt_running` records and the intents they create, bound to no feed; their sending authorization is derived from the device list (II.3.1); mailbox cursors, the hashes of mailbox objects already processed, objects pending a device-list advance, and the sealed bytes of objects this host sends, kept for resending (II.4) |
+| `host-work.sqlite` | Tasks and admission records, attempts, launches, messages, replies, return grants, control records, per-feed cursors and per-principal state, interrupt intents, alerts, the clock floor. **Changed to match Atem's spec:** the host's highest wall-clock reading, with its `boot_id` and boot-time stamp (I.6.5; boot time by owner decision 2026-11-10), and the repair's anchor reading (host-work-v1 §11.6). **Changed for host senders (owner decision 2026-11-07):** host principals' `interrupt_running` records and the intents they create, bound to no feed; their sending authorization is derived from the device list (II.3.1); mailbox cursors, the hashes of mailbox objects already processed, objects pending a device-list advance, and the sealed bytes of objects this host sends, kept for resending (II.4) |
 | The session-v1 journal (revised, I.7) | Prompt receipts: `accepted` (fsync before the reply), `executing` (fsync before the first side effect), `completed`, `rejected`, `outcome_unknown`; the refusal list |
 | The device list (R9, extended) | Grants, removals and narrowing, as signed entries. **Changed for host senders:** project grants too (II.2.2) |
 
@@ -947,18 +952,28 @@ Before the runtime dispatches anything:
 
 ### I.6.5 Clocks
 
+**Amended by owner decision 2026-11-10** (Atem-internal: no wire or contract change). Clock repair is automatic,
+with no command and no network time; it replaces "the owner's reset" (a local command left unnamed), and elapsed time
+is counted on boot time, which counts suspend, where this section said `CLOCK_MONOTONIC`. The exact rules are
+host-work-v1 §11.6, "Clocks".
+
 - **Station time.** `control_sync` results and head announcements carry `station_time`.
 - **The clock floor.** The host keeps a durable **clock floor** that never decreases: the latest `station_time` it
-  has seen, stored with the monotonic time at which it was seen. **Changed to match Atem's spec:** the floor takes a
-  `station_time` only within the cap below, and only the owner's reset (below) lowers it.
+  has seen, stored with the boot time at which it was seen. **Changed to match Atem's spec:** the floor takes a
+  `station_time` only within the cap below, and only the automatic repair (below; owner decision 2026-11-10) lowers
+  it.
 - **The host's own time `H`. Changed to match Atem's spec** (R9 never takes authority time from a carrier: R9.5's
   wait uses the host's clocks only, with its `boot_id` rule). The host records `wall_hw`, the highest wall-clock
-  reading it has seen, with the `boot_id` and the monotonic time (`CLOCK_MONOTONIC`, the clock of session-v1 §3's
-  deadlines) at which it saw it. It updates the record at least once a minute and at shutdown, as R9.5 persists its
-  waits. "Monotonic time since" a reading counts only within the boot it was recorded in:
-  - the same `boot_id`: `H = max(wall clock, wall_hw + monotonic time since wall_hw was recorded)`;
+  reading it has seen, with the `boot_id` and the boot time at which it saw it. **Changed by owner decision
+  2026-11-10:** boot time keeps counting while the machine sleeps (`CLOCK_BOOTTIME` on Linux, `mach_continuous_time`
+  on macOS); the earlier text said `CLOCK_MONOTONIC`, which, like `mach_absolute_time`, stops during suspend, so a
+  laptop's sleep would look like a forward jump that never comes back, and a wall clock corrected during sleep could
+  fail the repair's 60 s check. Session-v1 §3's lease deadlines keep `CLOCK_MONOTONIC`. The host updates the record
+  at least once a minute and at shutdown, as R9.5 persists its waits. "Boot time since" a reading counts only within
+  the boot it was recorded in:
+  - the same `boot_id`: `H = max(wall clock, wall_hw + boot time since wall_hw was recorded)`;
   - after a reboot (another `boot_id`): `H = max(wall clock, wall_hw)` until a new reading is recorded. Time while the
-    machine was off, or before its monotonic clock restarted, never counts, as in R9.5.
+    machine was off never counts, as in R9.5.
 
   `H` never includes `station_time`.
 - **A host clock that goes back.** A wall clock more than 10 minutes below `H` raises an owner alert ("host clock
@@ -968,23 +983,44 @@ Before the runtime dispatches anything:
   move the floor: it closes the gate for that origin and raises an owner alert ("Station clock ahead of this host",
   at most one an hour), and the gate reopens when a head within the cap arrives. Because the cap is measured from `H`,
   not from the floor, repeated announcements can't walk the floor forward.
-- **The owner's reset. Changed to match Atem's spec.** A host clock that jumped forward and was then corrected (a
-  manual mistake, a bad NTP source, a hardware clock fault) would otherwise leave `H` at the jumped value for good. A
-  local owner command (its name is an open Atem spec item) sets both `wall_hw` and the floor to the current wall
-  clock, with fresh `boot_id` and monotonic stamps, and writes a `runtime.log` line with the old and new values.
-  - **What it resets:** those two values, so later deadline checks follow the corrected clock. It never sets either
-    below the current wall clock.
-  - **What it can't undo:** anything settled while the clock was ahead (tasks already `expired`, envelopes already
-    refused as expired, `outcome_unknown` tasks already past their deadline: nothing is revived); the device list's
-    recovery waits (R9.5), which keep their own clocks; and a wall clock that is still wrong.
-- **Deadline comparisons. Changed to match Atem's spec:** they use `max(H, floor + monotonic time elapsed since the
-  floor was set)`, where the source has the host clock in place of `H`; the floor's monotonic time counts within one
-  boot only. That covers restarts too: after a restart or a reboot, the floor alone is the lower bound until the next
-  sync. Every deadline check in this design uses this clock, the envelope times of II.4.2 included.
+- **Automatic repair. Owner decision 2026-11-10** (replaces "the owner's reset", a local owner command whose name was
+  left open). A host clock that jumped forward and was then corrected (a manual mistake, a bad NTP source, a hardware
+  clock fault) would otherwise leave `H` at the jumped value for good. Atem repairs it itself:
+  - **Why not network time.** HTTP `Date` headers from websites aren't a time service: 1 s resolution, no accuracy
+    guarantee, a dependency on unrelated companies, surprising network calls, and possibly blocked by firewalls.
+    Keeping the clock right is the OS's job, so Atem works with the host's own clocks and the OS's own
+    synchronization.
+  - **A jump and its correction within one boot.** Atem keeps `wall_hw` with its `boot_id` and its boot time.
+    Suppose the wall clock jumps forward and later comes back to the trajectory the boot time predicts from before the
+    jump (within 60 s). The jump was undone, so `wall_hw` and the floor drop to the current wall clock. This is safe:
+    they never fall below the pre-jump trajectory, so nothing settled is revived, and jumping a clock forward and back
+    gains an attacker nothing. **Filled in by Atem's spec** (host-work-v1 §11.6): the host keeps the last reading
+    before the jump (an anchor) to predict the trajectory from, and lowers the two values, never raising them, to the
+    later of the current wall clock and that trajectory.
+  - **Across a reboot.** If `wall_hw` or the floor is more than 10 minutes ahead of the wall clock, and the OS reports
+    its clock synchronized, Atem lowers both to the current wall clock.
+    - On Linux the OS's report is `adjtimex`'s status without `STA_UNSYNC`: chrony and systemd-timesyncd clear it
+      once synchronized. In a container it reports the host kernel's state, which is the right answer.
+    - On macOS the candidate is `ntp_gettime()` returning `TIME_OK` rather than `TIME_ERROR`, to be confirmed against
+      `timed`'s behaviour in step 4. Until it is, macOS doesn't lower them after a reboot.
+  - **Otherwise** Atem stays on the safe side: tasks may expire early, and `atem status` says why and names the fix.
+    On a host where the flag never clears because no time-sync daemon runs: "host clock ahead of its record; enable
+    time synchronization (chrony or systemd-timesyncd)". On macOS before confirmation: "host clock ahead of its
+    record; waiting for a synchronized clock".
+  - **What doesn't change:** never below the current wall clock; nothing already settled is revived (tasks already
+    `expired`, envelopes already refused as expired, `outcome_unknown` tasks already past their deadline); the device
+    list's recovery waits (R9.5) keep their own clocks; every repair writes a `runtime.log` line with the old and new
+    values, and is shown in `atem status`.
+- **Deadline comparisons. Changed to match Atem's spec:** they use `max(H, floor + boot time elapsed since the floor
+  was set)`, where the source has the host clock in place of `H`; the floor's boot time counts within one boot only
+  (**changed by owner decision 2026-11-10:** boot time, where this said monotonic time). That covers restarts too:
+  after a restart or a reboot, the floor alone is the lower bound until the next sync. Every deadline check in this
+  design uses this clock, the envelope times of II.4.2 included.
 - **The effect. Changed to match Atem's spec.** A host clock set backwards, before or after a sync, can't revive an
   expired task, and the owner is told. A Station time set forwards can only expire tasks early, never start one, and
   by at most 10 minutes; a Station further ahead stops new starts on that origin until it is corrected, and the owner
-  is told. A host clock that jumped forward expires tasks early until the owner corrects it and runs the reset.
+  is told. A host clock that jumped forward expires tasks early until the jump is undone in the same boot or, after a
+  reboot, until the OS reports its clock synchronized (the automatic repair; owner decision 2026-11-10).
 - **The Station's clock. Changed after Astation's review.** The built-in Station keeps a UTC-synchronized clock and
   alerts its operator on drift. The host's own 10-minute cap and the gate's closure stand: a Station being available
   doesn't make every host's clock right, and a Station's time is never authority (session-v1 R9.5).
@@ -1238,7 +1274,7 @@ step 2.
 | The source's choice | Proposal | Basis |
 |---|---|---|
 | The name of the host-work principal | `host-work`, with one internal attachment (I.4.2) | collaboration §6, §9; session-v1 §5, §6, §H |
-| The exact encodings, error codes and vectors of the new ops and records | Encodings: III.1. Errors: host-work-v1 §7's codes only (`forbidden`, `unauthorized`, `stale_target`, `invalid_request`, `request_id_reused`, `busy`), with new `detail` texts (I.3.3, II.8). Vectors: III.1. The exact request shapes of `work_interrupt`, `work_resolve`, `alert_list`, `control_records` and `host_enc_key_get`, the relay calls of I.5.8 and II.4.3, and the clock-floor reset command (I.6.5), stay an **open Atem spec item**, written with Astation | session-v1 R9.1, R9.12; host-work-v1 §7 |
+| The exact encodings, error codes and vectors of the new ops and records | Encodings: III.1. Errors: host-work-v1 §7's codes only (`forbidden`, `unauthorized`, `stale_target`, `invalid_request`, `request_id_reused`, `busy`), with new `detail` texts (I.3.3, II.8). Vectors: III.1. The exact request shapes of `work_interrupt`, `work_resolve`, `alert_list`, `control_records` and `host_enc_key_get`, and the relay calls of I.5.8 and II.4.3, stay an **open Atem spec item**, written with Astation (the clock-floor reset command is gone: the repair is automatic, owner decision 2026-11-10, I.6.5) | session-v1 R9.1, R9.12; host-work-v1 §7 |
 | How the host-work principal renews its lease | On the runtime's own pass, a renew every 5 s, a 15 s lease, released at turn end (I.4.2) | session-v1 §5, r9 appendix introduction |
 | The value of `account` in a record | `account_id` and `genesis_hash` (I.5.3) | session-v1 R9.2, R9.9 |
 
@@ -2606,8 +2642,10 @@ Nothing is merged or deployed before step 1.
     that origin closes, the owner gets one alert, and no task expires; a head within 10 minutes of the host's own time
     reopens it. Repeated announcements 9 minutes ahead don't walk the floor forward. The host's wall clock set back
     an hour raises "host clock went back" and revives nothing. The host's wall clock jumps a year ahead and is then
-    corrected: new tasks expire early until the owner's reset, after which deadlines follow the corrected clock and
-    the tasks already expired stay expired. A reboot doesn't count the time the machine was off (I.6.5).
+    corrected: new tasks expire early until the jump is undone, when the host repairs its record by itself (owner
+    decision 2026-11-10, I.6.5), after which deadlines follow the corrected clock and the tasks already expired stay
+    expired. A reboot doesn't count the time the machine was off; after one, the record is lowered once the OS reports
+    its clock synchronized (I.6.5).
 19. **A launch at the spawn boundary** (I.4.3, "Launches"). A hold of a delegated sender arrives after its
     `host_launch` was accepted and before the spawn: the launch waits, and a release lets it start. A 60-second gap
     in heads does the same, and so does a deferred device-list entry. A revoke instead ends the launch `failed`, and
@@ -2924,7 +2962,8 @@ forced binding; the rooms the migration can't resolve are refused until claimed 
 4. Should mailbox plaintexts be padded to size classes, so sizes reveal less (II.4.3)?
 5. Attachments for host senders, once Atem #109's attachment contract is agreed (II.4.2).
 6. The exact wire of `work_interrupt`, `work_resolve`, `alert_list`, `control_records`, `host_enc_key_get`, the feed
-   and mailbox calls, and the clock-floor reset command (I.13); the exact verifier details of `host_sender_revoke` and
+   and mailbox calls (I.13; there is no clock-floor reset command: the repair is automatic, owner decision 2026-11-10,
+   I.6.5); the exact verifier details of `host_sender_revoke` and
    `host_sender_readmit` (II.3.1). **Changed after review 6:** also the wire of the host's application-result
    acknowledgment to the Station (I.5.8: its identifying fields, the per-effect
    `applied`/`duplicate`/`pending`/`refused` results, its authentication by the host's current link, the scan cursor
