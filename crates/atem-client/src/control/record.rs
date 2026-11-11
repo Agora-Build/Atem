@@ -41,7 +41,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::canonical::MAX_SAFE_INTEGER;
-use crate::domain::SignLabel;
+use crate::domain::{SignLabel, SigningInput};
 use crate::encoding::Hash32;
 use crate::error::{Error, Result};
 use crate::keys::PublicKey;
@@ -49,7 +49,7 @@ use crate::membership::entry::{RECOVERY_SIGNER, id_ok};
 use crate::membership::service_key_fingerprint;
 use crate::provider::{KeyId, KeyProvider};
 use crate::session::wire::is_uuid_v4;
-use crate::signed::SignedObject;
+use crate::signed::{SignedObject, check_body};
 use crate::station_route::normalize_relay;
 
 /// The body's `type`.
@@ -357,6 +357,19 @@ impl ControlBody {
         Value::Object(body)
     }
 
+    /// A body from its JSON object, read exactly as [`ControlRecord::parse`]
+    /// reads a record's: the signed-object checks first (R9.1: an object,
+    /// a known `type`, `v: 1`, no `null`, no array, `jcs` at most 4,096
+    /// bytes), then `type` must be this one's, then the body's own rules.
+    /// For a builder that has the body as JSON (the bindings).
+    pub fn from_json(body: &Value) -> std::result::Result<Self, ControlError> {
+        let (label, _) = check_body(body).map_err(ControlError::Object)?;
+        if label != SignLabel::HostWorkControl {
+            return Err(ControlError::WrongType);
+        }
+        Self::read(body)
+    }
+
     /// Exactly a record's body (the object layer already checked `type`,
     /// `v`, `null`, arrays and the size).
     fn read(body: &Value) -> std::result::Result<Self, ControlError> {
@@ -592,6 +605,65 @@ pub fn build_control(
     let value = body.to_json();
     ControlBody::read(&value)?;
     SignedObject::sign(provider, key, value)
+}
+
+/// The bytes a signer signs for `body`, `enc(["atem-host-work-control-v1",
+/// jcs(body)])`, after checking it exactly as [`build_control`] does: for a
+/// signer that answers asynchronously (a Station's key in a KMS, WebCrypto),
+/// which then hands the signature to [`control_with_signature`].
+pub fn control_signing_input(body: &ControlBody) -> Result<SigningInput> {
+    let value = body.to_json();
+    ControlBody::read(&value)?;
+    let (label, jcs) = check_body(&value)?;
+    Ok(SigningInput::new(label, jcs.as_bytes()))
+}
+
+/// The record of `body` with `signature`, a signature by `signer` over
+/// [`control_signing_input`]'s bytes (P-256 `r‖s`, either S: normalized to
+/// low S; Ed25519). The body is checked as [`build_control`] checks it,
+/// and the signature verified under `signer` before the record is
+/// returned (`bad_signature` otherwise; an X25519 key is `wrong_alg`).
+/// Whether `signer` may sign this record is the verifier's, against the
+/// device list ([`super::verify`]).
+pub fn control_with_signature(
+    body: &ControlBody,
+    signer: &PublicKey,
+    signature: &[u8],
+) -> Result<SignedObject> {
+    build_control(&Given { signer, signature }, &KeyId::new("signer"), body)
+}
+
+/// A key store that holds one signature already made: `sign` hands it
+/// back, and [`crate::provider::sign`] normalizes and verifies it under
+/// the key as for any provider.
+struct Given<'a> {
+    signer: &'a PublicKey,
+    signature: &'a [u8],
+}
+
+impl KeyProvider for Given<'_> {
+    fn public_key(&self, _: &KeyId) -> Result<PublicKey> {
+        Ok(self.signer.clone())
+    }
+
+    fn sign(&self, _: &KeyId, _: &SigningInput) -> Result<Vec<u8>> {
+        Ok(self.signature.to_vec())
+    }
+
+    fn x25519(&self, _: &KeyId, _: &[u8; 32]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        Err(Error::UnknownKey)
+    }
+
+    fn hpke_open(
+        &self,
+        _: &KeyId,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        Err(Error::UnknownKey)
+    }
 }
 
 /// A service record's `principal_key` for the principal's `auth_key`: the
@@ -1301,6 +1373,93 @@ mod tests {
         assert_eq!(
             build_control(&keys, &KeyId::new("none"), &host(7)),
             Err(Error::UnknownKey)
+        );
+    }
+
+    /// A signer that answers later: the signing input, then the record
+    /// from its signature, equal to what `build_control` signs; a body the
+    /// parse refuses, another key's signature and a garbled one never make
+    /// a record.
+    #[test]
+    fn signing_input_then_signature_is_build_control() {
+        let keys = keys();
+        for (body, key) in [
+            (service(ControlAction::Hold), "svc-ed"),
+            (service(ControlAction::Cover), "svc"),
+            (host(7), "mac"),
+        ] {
+            let object = build_control(&keys, &KeyId::new(key), &body).unwrap();
+            let input = control_signing_input(&body).unwrap();
+            assert_eq!(input, object.signing_input());
+            let public = keys.public_key(&KeyId::new(key)).unwrap();
+            let signature = keys.sign(&KeyId::new(key), &input).unwrap();
+            let made = control_with_signature(&body, &public, &signature).unwrap();
+            assert_eq!(made.to_json(), object.to_json(), "{key}");
+            assert_eq!(ControlRecord::from_signed(made).unwrap().body(), &body);
+            // Another key's signature, or a flipped bit, is refused.
+            let other = keys.public_key(&KeyId::new("mac")).unwrap();
+            if key != "mac" {
+                assert_eq!(
+                    control_with_signature(&body, &other, &signature),
+                    Err(Error::BadSignature)
+                );
+            }
+            let mut flipped = signature.clone();
+            flipped[10] ^= 1;
+            assert!(control_with_signature(&body, &public, &flipped).is_err());
+        }
+        let mut refused = host(7);
+        refused.action = ControlAction::Hold;
+        assert!(matches!(
+            control_signing_input(&refused),
+            Err(Error::Malformed(_))
+        ));
+        let public = keys.public_key(&KeyId::new("mac")).unwrap();
+        assert!(matches!(
+            control_with_signature(&refused, &public, &[0u8; 64]),
+            Err(Error::Malformed(_))
+        ));
+        let mut x25519 = SoftwareKeys::new();
+        x25519.insert_x25519(KeyId::new("x"), &[4u8; 32]);
+        let enc = x25519.public_key(&KeyId::new("x")).unwrap();
+        assert_eq!(
+            control_with_signature(&host(7), &enc, &[0u8; 64]),
+            Err(Error::WrongAlg)
+        );
+    }
+
+    /// `from_json` reads a body exactly as the parse reads a record's,
+    /// with the same refusals.
+    #[test]
+    fn from_json_reads_as_the_parse() {
+        for json in [revoke_json(), host_json()] {
+            let parsed = parse(&json).unwrap();
+            assert_eq!(&ControlBody::from_json(&json).unwrap(), parsed.body());
+        }
+        let cases = [
+            with(revoke_json(), "note", json!("x")),
+            with(revoke_json(), "revoke_seq", json!(3)),
+            with(host_json(), "action", json!("release")),
+            with(revoke_json(), "v", json!(2)),
+            with(revoke_json(), "origin", Value::Null),
+            with(revoke_json(), "type", json!("atem-push-hint")),
+            with(
+                revoke_json(),
+                "about",
+                json!({"by": "Owner", "integration_id": INTEGRATION}),
+            ),
+        ];
+        for json in cases {
+            let want = parse(&json).unwrap_err();
+            assert_eq!(
+                ControlBody::from_json(&json).unwrap_err().code(),
+                want.code(),
+                "{json}"
+            );
+        }
+        assert_eq!(
+            ControlBody::from_json(&json!([])).unwrap_err().code(),
+            "malformed"
         );
     }
 }

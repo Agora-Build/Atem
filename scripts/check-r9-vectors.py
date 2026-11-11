@@ -478,6 +478,7 @@ class Replay:
 
 def check_membership_log(file, data, report, context):
     keys = context["keys"]
+    context["membership_log"] = data
     vectors = data["log"] + data["others"]
     by_label = {}
     by_hash = {}
@@ -687,12 +688,130 @@ def check_membership_log(file, data, report, context):
         case.equal(log_labels, ["E1", "E2", "E3", "E4", "E5", "E6"], "E1..E6 in order")
 
 
+# ------------------------------------------- r9-vectors-host-work-control
+
+LOG_L = ["E1", "E2", "E3", "E4", "E5", "E6"]
+
+
+def signer_key_in(replay, signer):
+    """The key a chain names for a record's `signer` (`member:<id>`,
+    `service:<id>`, `host:<id>`: the newest generation's host key), or None
+    when the chain doesn't hold it."""
+    kind, _, name = signer.partition(":")
+    if kind in ("member", "service"):
+        return replay.members.get(name)
+    if kind == "host":
+        gens = [gen for (host_id, gen) in replay.hosts if host_id == name]
+        return replay.hosts[(name, max(gens))] if gens else None
+    return None
+
+
+def test_key_of(keys, name):
+    """The `auth` key, or the `host_key`, of a test key name: (alg, public)."""
+    entry = keys.keys[name]
+    part = "auth" if "auth" in entry else "host_key"
+    return entry[part].get("alg", "ed25519"), unhex(entry[part]["pub_hex"])
+
+
+def check_host_work_control(file, data, report, context):
+    """Control records (delegated host-work I.5.3): every body's jcs, its
+    signing input and signature (by the test key named, and that key is the
+    one the chain names for the body's signer wherever the chain holds
+    it), each service record's principal_key against the r9_svc of the
+    principal's auth_key, and the record digests a sequence's state keeps.
+    Verdicts and per-effect results are the Rust runner's and the binding
+    suites' (R9.12)."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+
+    def replay(chain):
+        return Replay([entries[label] for label in LOG_L + list(chain)])
+
+    with report.case(file, "account") as case:
+        case.equal(data["account_id"], mlog["account_id"], "log L's account_id")
+        case.equal(data["genesis_hash"], mlog["genesis_hash"], "log L's genesis_hash")
+    with report.case(file, "services") as case:
+        replay_l = replay([])
+        for name, service in data["services"].items():
+            public = b64u_decode(service["auth_key"]["pub"])
+            case.equal(sha256(public).hex(), service["r9_svc"], f"{name} r9_svc = SHA-256 of its auth_key")
+            case.equal(service["auth_key"], replay_l.members.get(name), f"{name}'s auth_key in log L")
+            case.equal(entries[LOG_L[service["seq"] - 1]]["member"]["device_id"], name, f"enrolled at seq {service['seq']}")
+
+    by_label = {}
+    jcs_by_record_id = {}
+    for vector in data["records"]:
+        label = vector["label"]
+        by_label[label] = vector
+        with report.case(file, label) as case:
+            wire = vector["record"]
+            case.equal(sorted(wire), ["body", "sig"], "wire {body, sig}")
+            body = wire["body"]
+            case.equal((body.get("type"), body.get("v")), ("atem-host-work-control", 1), "type and v")
+            text = jcs(body)
+            case.equal(text, vector["jcs"], "jcs")
+            case.check(len(text.encode()) <= MAX_BODY_BYTES, "body within 4096 bytes")
+            jcs_by_record_id.setdefault(body["record_id"], set()).add(text)
+            signing_input = enc(["atem-host-work-control-v1", text])
+            case.equal(signing_input.hex(), vector["signing_input_hex"], "signing input")
+
+            # The signature, by the test key named.
+            checks = vector.get("checks", [])
+            reasons = {c.get("reason") for c in checks}
+            alg, public = test_key_of(keys, vector["signed_with"])
+            ok = verify(alg, public, b64u_decode(wire["sig"]), signing_input)
+            if "bad_signature" in reasons:
+                case.check(not ok, f"{alg} signature refused (bad_signature)")
+            else:
+                case.check(ok, f"{alg} signature by {vector['signed_with']}")
+            # That key is the one each chain names for the signer, where it holds one.
+            for chain in [c["chain"] for c in checks] or [[]]:
+                named = signer_key_in(replay(chain), body["signer"])
+                if named is None:
+                    case.check(True, f"{body['signer']} not in L + {chain}")
+                else:
+                    case.equal(
+                        (named["alg"], b64u_decode(named["pub"])),
+                        (alg, public),
+                        f"{body['signer']}'s key in L + {chain}",
+                    )
+
+            # A service record's principal_key beside its key's r9_svc.
+            if "r9_svc" in vector:
+                kind, _, name = body["principal"].partition(":")
+                key = replay([]).members.get(name)
+                case.check(kind == "service" and key is not None, "a service of log L")
+                r9_svc = sha256(b64u_decode(key["pub"])).hex()
+                case.equal(r9_svc, vector["r9_svc"], "r9_svc = SHA-256 of the principal's auth_key")
+                if "key_mismatch" in reasons:
+                    case.check(body["principal_key"] != r9_svc, "principal_key names another key (key_mismatch)")
+                else:
+                    case.equal(body["principal_key"], r9_svc, "principal_key = r9_svc")
+            if "parse_error" in vector:
+                case.check(True, f"refused at parse ({vector['parse_error']}; not derived here)")
+
+    for sequence in data["sequences"]:
+        with report.case(file, sequence["label"]) as case:
+            for step in sequence["steps"]:
+                case.check(step["record"] in by_label, f"{step['record']} is a record of the file")
+            state = sequence["state"]
+            case.equal((state["account_id"], state["genesis_hash"]), (data["account_id"], data["genesis_hash"]), "the state's account")
+            for record_id, digest in state["records"].items():
+                texts = jcs_by_record_id.get(record_id, set())
+                case.check(
+                    digest in {sha256(t.encode()).hex() for t in texts},
+                    f"{record_id[-4:]}: the SHA-256 of a record body with that id",
+                )
+
+
 # ---------------------------------------------------------------------- main
 
 # In order: a checker may use what an earlier one recorded in `context`.
 CHECKERS = [
     ("r9-vectors-keys", check_keys),
     ("r9-vectors-membership-log", check_membership_log),
+    ("r9-vectors-host-work-control", check_host_work_control),
 ]
 
 

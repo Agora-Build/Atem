@@ -21,7 +21,7 @@ pub mod verify;
 pub use record::{
     CONTROL_TYPE, ControlAbout, ControlAction, ControlBody, ControlError, ControlFeed,
     ControlPrincipal, ControlRecord, ControlSigner, KNOWN_BY, MAX_BY_CHARS, build_control,
-    principal_key_of,
+    control_signing_input, control_with_signature, principal_key_of,
 };
 pub use state::{
     ApplicationResult, Applied, ControlState, EffectKind, EffectResult, FeedPos, HostAction,
