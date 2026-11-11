@@ -7,9 +7,15 @@ values `crates/atem-client` computed for the r9 vector files: canonical
 JSON (RFC 8785 for the subset the vectors use: objects, arrays, strings,
 integers, booleans), `enc` (a 4-byte big-endian length before every field),
 hashes, key derivations, and every Ed25519 and P-256 signature (P-256 as
-64-byte r||s, low S required), a host's `enc_sig` included. It doesn't
-derive a verifier's verdicts: `expect` and each `reason` are checked by the
-Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding suites.
+64-byte r||s, low S required), a host's `enc_sig` included, and the sealed
+parts of the envelopes and results between hosts (RFC 9180 base mode,
+written here: opened, and sealed again from the ephemeral to the same
+bytes). It derives no verifier's verdict, but for `r9-vectors-host-envelope`,
+whose every check's verdict and reason it derives from the bytes, the device
+list and the receiver (II.4.2's checks 1 to 6 and II.4.4's, written here from
+host-work-v1 §11.5). The other files' `expect` and each `reason` are checked
+by the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
+suites.
 
 Usage: python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures
 
@@ -29,7 +35,8 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, x25519
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF, HKDFExpand
 
 P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 ED25519_P = 2**255 - 19
@@ -478,6 +485,7 @@ class Replay:
 
 def check_membership_log(file, data, report, context):
     keys = context["keys"]
+    context["membership_log"] = data
     vectors = data["log"] + data["others"]
     by_label = {}
     by_hash = {}
@@ -687,12 +695,569 @@ def check_membership_log(file, data, report, context):
         case.equal(log_labels, ["E1", "E2", "E3", "E4", "E5", "E6"], "E1..E6 in order")
 
 
+# ------------------------------------------------- r9-vectors-host-envelope
+
+# RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305
+# (the suite of R9.9), written from the RFC with the `cryptography` package's
+# primitives: no code of this repository.
+_KEM_SUITE = b"KEM" + (0x0020).to_bytes(2, "big")
+_SUITE = b"HPKE" + (0x0020).to_bytes(2, "big") + (0x0001).to_bytes(2, "big") + (0x0003).to_bytes(2, "big")
+
+
+def _labeled_extract(salt, label, ikm, suite):
+    return hmac.new(salt or bytes(32), b"HPKE-v1" + suite + label + ikm, hashlib.sha256).digest()
+
+
+def _labeled_expand(prk, label, info, length, suite):
+    labeled = length.to_bytes(2, "big") + b"HPKE-v1" + suite + label + info
+    return HKDFExpand(algorithm=hashes.SHA256(), length=length, info=labeled).derive(prk)
+
+
+def hpke_derive_key_pair(ikm):
+    """DeriveKeyPair for X25519: (secret, public)."""
+    prk = _labeled_extract(b"", b"dkp_prk", ikm, _KEM_SUITE)
+    secret = _labeled_expand(prk, b"sk", b"", 32, _KEM_SUITE)
+    return secret, x25519_public(secret)
+
+
+def _hpke_schedule(dh, enc_key, recipient_public, info):
+    kem_context = enc_key + recipient_public
+    eae_prk = _labeled_extract(b"", b"eae_prk", dh, _KEM_SUITE)
+    shared = _labeled_expand(eae_prk, b"shared_secret", kem_context, 32, _KEM_SUITE)
+    psk_id_hash = _labeled_extract(b"", b"psk_id_hash", b"", _SUITE)
+    info_hash = _labeled_extract(b"", b"info_hash", info, _SUITE)
+    context = b"\x00" + psk_id_hash + info_hash
+    secret = _labeled_extract(shared, b"secret", b"", _SUITE)
+    return (
+        _labeled_expand(secret, b"key", context, 32, _SUITE),
+        _labeled_expand(secret, b"base_nonce", context, 12, _SUITE),
+    )
+
+
+def hpke_seal(recipient_public, info, plaintext, ikm_e):
+    """Single-shot seal with the ephemeral DeriveKeyPair(ikm_e): (enc, ct)."""
+    secret_e, enc_key = hpke_derive_key_pair(ikm_e)
+    dh = x25519.X25519PrivateKey.from_private_bytes(secret_e).exchange(
+        x25519.X25519PublicKey.from_public_bytes(recipient_public)
+    )
+    key, nonce = _hpke_schedule(dh, enc_key, recipient_public, info)
+    return enc_key, ChaCha20Poly1305(key).encrypt(nonce, plaintext, b"")
+
+
+def hpke_open(secret, enc_key, ct, info):
+    """Single-shot open; raises InvalidTag when it doesn't open."""
+    recipient_public = x25519_public(secret)
+    dh = x25519.X25519PrivateKey.from_private_bytes(secret).exchange(
+        x25519.X25519PublicKey.from_public_bytes(enc_key)
+    )
+    key, nonce = _hpke_schedule(dh, enc_key, recipient_public, info)
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, b"")
+
+
+# Envelopes and results between hosts (delegated host-work II.4.2, II.4.4;
+# host-work-v1 §11.5): the body's type -> (signing label, seal label).
+MAIL_LABELS = {
+    "atem-envelope": ("atem-envelope-v1", "atem-envelope-seal-v1"),
+    "atem-result": ("atem-result-v1", "atem-result-seal-v1"),
+}
+MAIL_BODY_KEYS = sorted(
+    [
+        "type", "v", "account_id", "genesis_hash", "sender", "recipient", "id",
+        "created_at", "expires_at", "signed_at_head", "sealed_hash",
+    ]
+)
+MAX_MESSAGE_BYTES = 240 * 1024  # host-work-v1 §5: a Message's bound, and every other plaintext's
+REQUEST_WRAPPER_BYTES = len('{"kind":"request","message":}')  # 29
+MAX_MAIL_OBJECT_BYTES = 512 * 1024  # one mailbox call (owner choice 13)
+MAX_LIFETIME_MS = 24 * 3600 * 1000
+MAX_CREATED_AHEAD_MS = 60_000
+MAIL_REFUSAL_CODES = {"forbidden", "unauthorized", "stale_target", "invalid_request", "request_id_reused", "busy"}
+UUID_V5 = r"[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+MAIL_HOST_ID = r"[A-Za-z0-9._:-]{1,128}"
+HEX64 = r"[0-9a-f]{64}"
+
+
+def is_uuid(text, version):
+    pattern = UUID_V5 if version == 5 else r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+    return isinstance(text, str) and re.fullmatch(pattern, text) is not None
+
+
+def safe_int(n, low=0):
+    return type(n) is int and low <= n <= 2**53 - 1
+
+
+def mail_seal_info(body):
+    """The seal's info: the label of the body's type and the fields that bind
+    both hosts, the ids and the times (`signed_at_head` is only signed)."""
+    seal_label = MAIL_LABELS[body["type"]][1]
+    s, r = body["sender"], body["recipient"]
+    return enc(
+        [
+            seal_label,
+            body["account_id"],
+            unhex(body["genesis_hash"]),
+            s["host_id"],
+            u64(s["host_trust_gen"]),
+            r["host_id"],
+            u64(r["host_trust_gen"]),
+            r["enc_kid"],
+            body["id"],
+            u64(body["created_at"]),
+            u64(body["expires_at"]),
+        ]
+    )
+
+
+def mail_signing_input(body):
+    return enc([MAIL_LABELS[body["type"]][0], jcs(body)])
+
+
+def mail_wire_bytes(wire):
+    """The object as one mailbox call carries it (compact JSON)."""
+    return json.dumps(wire, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def mail_evidence(wire):
+    """SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent."""
+    part = lambda k: b64u_decode(wire[k]) if k in wire else b""
+    return sha256(enc([jcs(wire["body"]), b64u_decode(wire["sig"]), part("enc"), part("ct")])).hex()
+
+
+def mail_well_formed(wire):
+    """Check 1's strict reading of a mailbox object: exact fields in their
+    grammar, a sealed part of the right shape, a body within 4,096 bytes."""
+    try:
+        if sorted(wire) != ["body", "ct", "enc", "sig"]:
+            return False
+        body = wire["body"]
+        if not isinstance(body, dict) or sorted(body) != MAIL_BODY_KEYS:
+            return False
+        if body["type"] not in MAIL_LABELS or body["v"] != 1 or type(body["v"]) is not int:
+            return False
+        if not (isinstance(body["account_id"], str) and 1 <= len(body["account_id"].encode()) <= 128):
+            return False
+        for key in ("genesis_hash", "sealed_hash"):
+            if not (isinstance(body[key], str) and re.fullmatch(HEX64, body[key])):
+                return False
+        for host, extra in ((body["sender"], []), (body["recipient"], ["enc_kid"])):
+            if not isinstance(host, dict) or sorted(host) != sorted(["host_id", "host_trust_gen"] + extra):
+                return False
+            if not (isinstance(host["host_id"], str) and re.fullmatch(MAIL_HOST_ID, host["host_id"])):
+                return False
+            if not safe_int(host["host_trust_gen"], 1):
+                return False
+        if not (isinstance(body["recipient"]["enc_kid"], str) and re.fullmatch(r"[0-9a-f]{16}", body["recipient"]["enc_kid"])):
+            return False
+        if not is_uuid(body["id"], 4) or not safe_int(body["created_at"]) or not safe_int(body["expires_at"]):
+            return False
+        head = body["signed_at_head"]
+        if not isinstance(head, dict) or sorted(head) != ["hash", "seq"] or not safe_int(head["seq"], 1):
+            return False
+        if not (isinstance(head["hash"], str) and re.fullmatch(HEX64, head["hash"])):
+            return False
+        if len(jcs(body).encode()) > MAX_BODY_BYTES:
+            return False
+        return len(b64u_decode(wire["enc"])) == 32 and len(b64u_decode(wire["ct"])) >= 16
+    except (ValueError, KeyError, TypeError, NotStrict):
+        return False
+
+
+def mail_times(body, now):
+    """Check 5: the reason the body's times are refused, else None."""
+    created, expires = body["created_at"], body["expires_at"]
+    if expires <= created:
+        return "bad_times"
+    if expires - created > MAX_LIFETIME_MS:
+        return "lifetime_too_long"
+    if now >= expires:
+        return "expired"
+    if created > now + MAX_CREATED_AHEAD_MS:
+        return "created_too_far_ahead"
+    return None
+
+
+def has_null(value):
+    if value is None:
+        return True
+    if isinstance(value, list):
+        return any(has_null(v) for v in value)
+    if isinstance(value, dict):
+        return any(has_null(v) for v in value.values())
+    return False
+
+
+def snapshot_ok(s):
+    return (
+        isinstance(s, dict)
+        and sorted(s) == ["digest", "id", "kind", "text", "version"]
+        and s["kind"] in ("memory", "vault")
+        and safe_int(s["version"], 1)
+        and isinstance(s["text"], str)
+        and s["digest"] == sha256(s["text"].encode()).hex()
+    )
+
+
+def reply_ok(r):
+    """A reply as reply_query returns it once submitted, still kept."""
+    return (
+        isinstance(r, dict)
+        and set(r) in ({"result_id", "state", "digest", "text", "context", "dropped"}, {"result_id", "state", "digest", "text", "context", "submitted_at", "dropped"})
+        and is_uuid(r["result_id"], 5)
+        and r["state"] == "submitted"
+        and safe_int(r.get("submitted_at"))
+        and r["dropped"] is False
+        and r["digest"] == sha256(r["text"].encode()).hex()
+        and isinstance(r["context"], list)
+        and all(snapshot_ok(s) for s in r["context"])
+    )
+
+
+def receipts_ok(recipients):
+    ids = [r.get("recipient_id") for r in recipients if isinstance(r, dict)]
+    return (
+        isinstance(recipients, list)
+        and 1 <= len(recipients)
+        and len(ids) == len(recipients) == len(set(ids))
+        and all(is_uuid(i, 4) for i in ids)
+        and all(
+            sorted(r) == ["delivery", "recipient_id"]
+            and isinstance(r["delivery"], dict)
+            and r["delivery"].get("state") in ("stored", "refused", "work")
+            for r in recipients
+        )
+    )
+
+
+def mail_plaintext(kind, plain):
+    """Step 6's strict reading of a plaintext: (reason, value). Strict I-JSON
+    with no null, one of the shapes with exactly its fields, within its bound
+    (a request's Message 240 KiB, so its plaintext 29 bytes more; every other
+    plaintext 240 KiB) and nothing but its canonical form."""
+    bound = MAX_MESSAGE_BYTES + (REQUEST_WRAPPER_BYTES if kind == "atem-envelope" else 0)
+    if len(plain) > bound:
+        return "plaintext_too_large", None
+    try:
+        text = plain.decode("utf-8")
+        value = json.loads(text, object_pairs_hook=_no_duplicates, parse_float=_no_float, parse_constant=_no_constant)
+    except (ValueError, NotStrict):
+        return "plaintext_malformed", None
+    if has_null(value):
+        return "plaintext_null", None
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        return "plaintext_malformed", None
+    shape = sorted(value)
+    k = value["kind"]
+    if kind == "atem-envelope":
+        task_ok = lambda t: is_uuid(t, 4) or is_uuid(t, 5)
+        if k == "request" and shape == ["kind", "message"] and isinstance(value["message"], dict):
+            if len(jcs(value["message"]).encode()) > MAX_MESSAGE_BYTES:
+                return "plaintext_too_large", None
+        elif k == "cancel" and shape == ["kind", "task_id"] and task_ok(value["task_id"]):
+            pass
+        elif k == "complete" and shape == ["kind", "result", "task_id"] and task_ok(value["task_id"]) and snapshot_ok(value["result"]):
+            pass
+        else:
+            return "plaintext_malformed", None
+    else:
+        if k == "status" and "object_id" in value:
+            ok = shape == ["kind", "object_id", "refused"] and is_uuid(value["object_id"], 4) and value["refused"] in MAIL_REFUSAL_CODES
+        elif k == "status":
+            ok = shape == ["kind", "message_id", "recipients"] and is_uuid(value["message_id"], 4) and receipts_ok(value["recipients"])
+        elif k == "result":
+            ok = shape == ["kind", "reply", "task_id"] and (is_uuid(value["task_id"], 4) or is_uuid(value["task_id"], 5)) and reply_ok(value["reply"])
+        else:
+            ok = False
+        if not ok:
+            return "plaintext_malformed", None
+    if not (kind == "atem-envelope" and k == "request") and len(plain) > MAX_MESSAGE_BYTES:
+        return "plaintext_too_large", None
+    if jcs(value) != text:
+        return "plaintext_malformed", None
+    return None, value
+
+
+class MailList:
+    """What a receiver's device list says about hosts, replayed from its
+    entries (log L and a chain): current and removed hosts with the key of
+    their newest add_host, the seq of each (host, generation)'s add_host, the
+    sending state (authorized(g) at the first add_host or a readmit, revoked
+    at a revoke; a removal keeps it), and each entry's hash."""
+
+    def __init__(self, account_id, genesis_hash, vectors):
+        self.account_id, self.genesis_hash = account_id, genesis_hash
+        self.current, self.removed, self.add_hosts, self.senders, self.hashes = {}, {}, {}, {}, {}
+        self.head = 0
+        for vector in vectors:
+            body = vector["entry"]["body"]
+            seq, action = body["seq"], body["action"]
+            self.head = seq
+            self.hashes[seq] = vector["entry_hash"]
+            if action == "add_host":
+                host = body["host"]
+                self.current[host["host_id"]] = (host["host_trust_gen"], b64u_decode(host["host_key"]["pub"]))
+                self.removed.pop(host["host_id"], None)
+                self.add_hosts[(host["host_id"], host["host_trust_gen"])] = seq
+                self.senders.setdefault(host["host_id"], ("authorized", seq))
+            elif action == "remove_host":
+                self.removed[body["host_id"]] = self.current.pop(body["host_id"])
+            elif action == "host_sender_revoke":
+                self.senders[body["host_id"]] = ("revoked", seq)
+            elif action == "host_sender_readmit":
+                self.senders[body["host_id"]] = ("authorized", seq)
+
+
+def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
+    """The receiver's verdict on a mailbox object (II.4.2 checks 1 to 6, and
+    for a result II.4.4's), from the spec: (verdict, opened plaintext)."""
+    body = wire.get("body")
+    envelope = call == "open_envelope"
+
+    def refused(reason):
+        return {"verdict": "refused", "reason": reason, "evidence": mail_evidence(wire)}, None
+
+    def authenticated(reason):
+        return {"verdict": "refused_authenticated", "object_id": body["id"], "reason": reason}, None
+
+    # 1. Strict parse and pin.
+    if not mail_well_formed(wire):
+        return refused("malformed")
+    if body["type"] != ("atem-envelope" if envelope else "atem-result"):
+        return refused("wrong_kind")
+    if (body["account_id"], body["genesis_hash"]) != (hosts.account_id, hosts.genesis_hash):
+        return refused("pin_mismatch")
+    # 2. The recipient: this host, its current generation, a key it accepts.
+    recipient = body["recipient"]
+    if recipient["host_id"] != receiver["host_id"]:
+        return refused("not_for_this_host")
+    if recipient["host_trust_gen"] != receiver["host_trust_gen"]:
+        return refused("recipient_generation_not_current")
+    secret = receiver_keys.get(recipient["enc_kid"])
+    if secret is None:
+        return refused("enc_key_not_accepted")
+    # 3. The sender (a result's: only the host the outbox row went to).
+    sender = body["sender"]
+    sid, sgen = sender["host_id"], sender["host_trust_gen"]
+    if outbox is not None and (sid, sgen) != (outbox["recipient"]["host_id"], outbox["recipient"]["host_trust_gen"]):
+        return refused("not_the_recipient")
+    head = body["signed_at_head"]
+    ahead = head["seq"] > hosts.head
+    signing_input = mail_signing_input(body)
+    sig = b64u_decode(wire["sig"])
+
+    def wait(key):
+        # Beyond this head: the body's times first, then (a pair this list
+        # holds has one key forever) the signature, then pending.
+        reason = mail_times(body, now)
+        if reason:
+            return refused(reason)
+        if key is not None and not verify("ed25519", key, sig, signing_input):
+            return refused("bad_signature")
+        return {"verdict": "pending", "host_id": sid, "host_trust_gen": sgen}, None
+
+    removed = sid not in hosts.current
+    known = hosts.current.get(sid) or hosts.removed.get(sid)
+    if known is None:
+        return wait(None) if ahead else refused("unknown_sender")
+    newest, key = known
+    if sgen < newest:
+        return refused("stale_sender_generation")
+    generation_ahead = sgen > newest
+    state, at = hosts.senders[sid]
+    if not ahead:
+        if removed and (envelope or generation_ahead):
+            return refused("removed_sender")
+        if generation_ahead:
+            return refused("generation_ahead")
+        if state == "revoked" and envelope:
+            return refused("revoked_sender")
+        if state == "authorized" and head["seq"] < at:
+            return refused("signed_at_head_before_generation")
+        added = hosts.add_hosts.get((sid, sgen))
+        if added is None or added > head["seq"]:
+            return refused("generation_ahead")
+        if hosts.hashes.get(head["seq"]) != head["hash"]:
+            return refused("signed_at_head_wrong_hash")
+    if ahead:
+        return wait(None if generation_ahead else key)
+    standing = "revoked" if state == "revoked" else "removed" if removed else "current"
+    # 4. The signature, with the key of the sender's newest add_host.
+    if not verify("ed25519", key, sig, signing_input):
+        return refused("bad_signature")
+    # 5. The times (the sender is authenticated now).
+    reason = mail_times(body, now)
+    if reason:
+        return authenticated(reason)
+    # 6. sealed_hash, the open, the plaintext.
+    enc_bytes, ct = b64u_decode(wire["enc"]), b64u_decode(wire["ct"])
+    if sha256(enc([enc_bytes, ct])).hex() != body["sealed_hash"]:
+        return authenticated("sealed_hash_mismatch")
+    try:
+        plain = hpke_open(secret, enc_bytes, ct, mail_seal_info(body))
+    except Exception:
+        return authenticated("open_failed")
+    reason, value = mail_plaintext(body["type"], plain)
+    if reason:
+        return authenticated(reason)
+    principal = "host:" + sid
+    if envelope:
+        if value["kind"] == "request":
+            message = value["message"]
+            if (message.get("message_id"), message.get("created_at"), message.get("expires_at"), message.get("sender")) != (
+                body["id"], body["created_at"], body["expires_at"], principal
+            ):
+                return authenticated("plaintext_mismatch")
+            # No attachments in this version: no mark (a task's attachments
+            # are its message's mark).
+            if "mark" in message:
+                return authenticated("attachments_not_allowed")
+            # A host sender's Message (the part of valid_from_host written here).
+            if message.get("kind", "request") != "request" or "reply_to" in message or "from_session" in message:
+                return authenticated("invalid_message")
+        return {"verdict": "open", "sender": principal}, plain
+    answers = (
+        value.get("message_id") == outbox["message_id"]
+        if value["kind"] == "status" and "message_id" in value
+        else value["object_id"] in [outbox["message_id"]] + outbox["cancel_complete_ids"]
+        if value["kind"] == "status"
+        else value["task_id"] in outbox["task_ids"]
+    )
+    if not answers:
+        return authenticated("does_not_answer_outbox_row")
+    if standing == "current":
+        return {"verdict": "accepted", "sender": principal}, plain
+    detail = f"result not delivered: sender {standing}"
+    return {"verdict": "not_delivered", "sender": principal, "reason": detail}, plain
+
+
+def check_host_envelope(file, data, report, context):
+    """Envelopes and results between hosts (delegated host-work II.4.2,
+    II.4.4; host-work-v1 §11.5). The entries: chained on log L, hashed and
+    signed by dev-mac, each enc_sig by the host. Each object: its body's jcs
+    and size, the signing input, the signature (by the test key it names, by
+    nobody over a body changed after signing), `info` from the body's fields,
+    `sealed_hash`, the open with the recipient key, the plaintext and its
+    bounds, the seal again from ikmE to the same enc and ct, and the object's
+    size on the wire. Each check: the verdict and reason recomputed from the
+    bytes, the device list (L + chain) and the receiver, written here from
+    the spec, and the plaintext an open gives."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    log_l = mlog["log"]
+    account_id, genesis = data["account_id"], data["genesis_hash"]
+    entries = {v["label"]: v for v in data["entries"]}
+    objects = {v["label"]: v for v in data["objects"]}
+    dev_mac = b64u_decode(log_l[0]["entry"]["body"]["member"]["auth_key"]["pub"])
+
+    with report.case(file, "account") as case:
+        case.equal((account_id, genesis), (mlog["account_id"], mlog["genesis_hash"]), "log L's account and genesis")
+        case.check(len(entries) == len(data["entries"]) and len(objects) == len(data["objects"]), "labels used once")
+
+    def chain_of(labels):
+        return log_l + [entries[label] for label in labels]
+
+    for vector in data["entries"]:
+        with report.case(file, vector["label"]) as case:
+            body = vector["entry"]["body"]
+            before = chain_of(vector["chain"])
+            text = jcs(body)
+            case.check(len(text.encode()) <= MAX_BODY_BYTES, "body within 4096 bytes")
+            case.equal(sha256(enc(["atem-membership-hash-v1", text])).hex(), vector["entry_hash"], "entry_hash")
+            case.equal((body["seq"], body["prev_hash"]), (len(before) + 1, before[-1]["entry_hash"]), "follows L + chain")
+            case.equal((body["account_id"], body["genesis_hash"], body["signer"]), (account_id, genesis, "dev-mac"), "account, genesis, signer")
+            signing_input = enc(["atem-membership-entry-v1", text])
+            case.check(verify("p256", dev_mac, b64u_decode(vector["entry"]["sig"]), signing_input), "p256 signature by dev-mac")
+            hosts = MailList(account_id, genesis, before)
+            if body["action"] == "add_host":
+                host = body["host"]
+                name = host_key_name(host["host_id"], host["host_trust_gen"])
+                case.equal(b64u_decode(host["host_key"]["pub"]), keys.public(name, "host_key"), f"the host key {name}")
+            if body["action"] == "host_enc_key":
+                enc_pub = b64u_decode(body["enc_key"]["pub"])
+                case.check(keys.name_of(enc_pub) is not None, f"enc_key is a test key ({keys.name_of(enc_pub)})")
+                enc_input = enc(["atem-host-enc-key-v1", account_id, unhex(genesis), body["host_id"], u64(body["host_trust_gen"]), enc_pub])
+                gen, host_key = hosts.current[body["host_id"]]
+                case.equal(gen, body["host_trust_gen"], "the host's newest generation")
+                case.check(verify("ed25519", host_key, b64u_decode(body["enc_sig"]), enc_input), "enc_sig by the host's key")
+
+    plaintexts = {}
+    for vector in data["objects"]:
+        label = vector["label"]
+        with report.case(file, label) as case:
+            wire = vector["object"]
+            body = wire["body"]
+            text = jcs(body)
+            case.equal(text, vector["jcs"], "jcs")
+            case.check(len(text.encode()) <= MAX_BODY_BYTES, "body within 4096 bytes")
+            case.equal(vector["kind"], {"atem-envelope": "envelope", "atem-result": "result"}[body["type"]], "kind")
+            signing_input = mail_signing_input(body)
+            case.equal(signing_input.hex(), vector["signing_input_hex"], "signing input")
+            size = len(mail_wire_bytes(wire))
+            case.check(size <= MAX_MAIL_OBJECT_BYTES, f"{size} bytes on the wire, within a 512 KiB mailbox call")
+            sig = b64u_decode(wire["sig"])
+            if "signed_with" in vector:
+                case.check(verify("ed25519", keys.public(vector["signed_with"], "host_key"), sig, signing_input), f"ed25519 signature by {vector['signed_with']}")
+            if "edited_from" in vector:
+                source = objects[vector["edited_from"]]
+                case.equal(wire["sig"], source["object"]["sig"], f"{source['label']}'s signature")
+                signer = keys.public(source["signed_with"], "host_key")
+                if body != source["object"]["body"]:
+                    case.check(not verify("ed25519", signer, sig, signing_input), "it signs another body")
+                else:
+                    case.check(wire.get("ct") != source["object"].get("ct"), "the sealed part changed after signing")
+            if "sealed_from" in vector:
+                source = objects[vector["sealed_from"]]["object"]
+                case.equal((wire["enc"], wire["ct"]), (source["enc"], source["ct"]), f"{vector['sealed_from']}'s sealed part")
+            sealed = vector.get("sealed")
+            if sealed is None:
+                continue
+            to = sealed["to"]
+            case.equal(enc_kid(keys.public(to, "enc")), body["recipient"]["enc_kid"], f"enc_kid of {to}")
+            info = mail_seal_info(body)
+            case.equal(info.hex(), sealed["info_hex"], "seal info from the body's fields")
+            enc_bytes, ct = b64u_decode(wire["enc"]), b64u_decode(wire["ct"])
+            sealed_hash = sha256(enc([enc_bytes, ct])).hex()
+            case.equal((sealed_hash, sealed_hash), (sealed["sealed_hash"], body["sealed_hash"]), "sealed_hash = SHA-256(enc([enc, ct]))")
+            ikm = sha256(enc(["atem-r9-test-ikm", sealed["ikm_label"]]))
+            case.equal(ikm.hex(), sealed["ikmE_hex"], "ikmE from its label")
+            plain = hpke_open(unhex(keys.keys[to]["enc"]["secret_hex"]), enc_bytes, ct, info)
+            if "plaintext" in sealed:
+                case.equal(plain.decode(), sealed["plaintext"], f"opens for {to} (RFC 9180, ChaCha20-Poly1305)")
+            else:
+                case.equal((len(plain), sha256(plain).hex()), (sealed["plaintext_bytes"], sealed["plaintext_sha256"]), f"opens for {to}: its length and SHA-256")
+            case.equal(hpke_seal(keys.public(to, "enc"), info, plain, ikm), (enc_bytes, ct), "sealed again from ikmE: the same enc and ct")
+            plaintexts[label] = plain
+            value = json.loads(plain) if b"null" not in plain else None
+            if isinstance(value, dict) and value.get("kind") == "request":
+                message_size = len(jcs(value["message"]).encode())
+                case.check(True, f"Message {message_size} bytes, plaintext {len(plain)} (bounds {MAX_MESSAGE_BYTES}, +{REQUEST_WRAPPER_BYTES})")
+            if vector["built"]:
+                reason, _ = mail_plaintext(body["type"], plain)
+                case.equal(reason, None, "a builder's plaintext: strict, canonical, within its bound")
+
+    for check in data["checks"]:
+        with report.case(file, f"check {check['label']}") as case:
+            hosts = MailList(account_id, genesis, chain_of(check["chain"]))
+            receiver = check["receiver"]
+            receiver_keys = {enc_kid(keys.public(name, "enc")): unhex(keys.keys[name]["enc"]["secret_hex"]) for name in receiver["keys"]}
+            wire = objects[check["object"]]["object"]
+            got, plain = mail_verdict(wire, check["call"], hosts, receiver_keys, receiver, check["now"], check.get("outbox"))
+            case.equal(got, check["expect"], f"{check['call']} on L + {len(check['chain'])}: {got['verdict']} {got.get('reason', '')}")
+            if plain is not None:
+                case.equal(plain, plaintexts.get(check["object"]), "the plaintext the object sealed")
+    with report.case(file, "coverage") as case:
+        reasons = {c["expect"].get("reason") for c in data["checks"]} - {None}
+        verdicts = {c["expect"]["verdict"] for c in data["checks"]}
+        case.equal(verdicts, {"open", "pending", "refused", "refused_authenticated", "accepted", "not_delivered"}, "every verdict")
+        case.check(len(reasons) >= 30, f"{len(reasons)} reasons")
+
+
 # ---------------------------------------------------------------------- main
 
 # In order: a checker may use what an earlier one recorded in `context`.
 CHECKERS = [
     ("r9-vectors-keys", check_keys),
     ("r9-vectors-membership-log", check_membership_log),
+    ("r9-vectors-host-envelope", check_host_envelope),
 ]
 
 
