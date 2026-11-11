@@ -9,7 +9,7 @@
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
-use super::MAX_MAIL_OBJECT_BYTES;
+use super::MAX_PLAINTEXT_BYTES;
 use crate::canonical::{self, MAX_SAFE_INTEGER, Numbers, jcs};
 use crate::domain::{self, SignLabel};
 use crate::encoding::{Hash32, hex_decode_array};
@@ -18,7 +18,7 @@ use crate::host_principal::host_principal;
 use crate::membership::Head;
 use crate::membership::entry::id_ok;
 use crate::session::host_work::{ContextSnapshot, ReplyState, ResultReply};
-use crate::session::messages::{MAX_MESSAGE_BYTES, Message, RecipientReceipt, recipients_valid};
+use crate::session::messages::{Message, RecipientReceipt, recipients_valid};
 use crate::session::wire::{is_uuid_v4, is_uuid_v5};
 use crate::signed::SealedPart;
 use crate::signed::SignedObject;
@@ -330,13 +330,56 @@ fn task_id_ok(id: &str) -> bool {
     is_uuid_v4(id) || is_uuid_v5(id)
 }
 
-/// What the object's sealed part decodes to: `jcs` of one JSON object whose
-/// `kind` says which, read back exactly.
-fn plain_object(bytes: &[u8]) -> Result<Map<String, Value>> {
-    match canonical::parse_strict(bytes, MAX_MAIL_OBJECT_BYTES, Numbers::IntegersOnly)? {
+/// What a sealed part decodes to: one JSON object (whose `kind` says which),
+/// read strictly: within `max` bytes, strict I-JSON, integers only and no
+/// `null` anywhere (R9.1; II.4.2 step 6).
+fn plain_object(bytes: &[u8], max: usize) -> Result<Map<String, Value>> {
+    if bytes.len() > max {
+        return Err(Error::TooLarge);
+    }
+    let value = canonical::parse_strict(bytes, max, Numbers::IntegersOnly)?;
+    reject_nulls(&value)?;
+    match value {
         Value::Object(o) => Ok(o),
         _ => Err(Error::Malformed("plaintext")),
     }
+}
+
+/// `Err(NullValue)` for a `null` anywhere in `value`.
+fn reject_nulls(value: &Value) -> Result<()> {
+    match value {
+        Value::Null => Err(Error::NullValue),
+        Value::Array(items) => items.iter().try_for_each(reject_nulls),
+        Value::Object(o) => o.values().try_for_each(reject_nulls),
+        _ => Ok(()),
+    }
+}
+
+/// Makes `value` strict for sealing (R9.1: absent members are omitted, never
+/// `null`): drops every object member whose value is `null`, recursively
+/// (the channel's wire types write `"result":null` and the like; serde reads
+/// a missing `Option` member as `None`), and refuses an array holding one.
+fn drop_nulls(value: &mut Value) -> Result<()> {
+    match value {
+        Value::Object(o) => {
+            o.retain(|_, v| !v.is_null());
+            o.values_mut().try_for_each(drop_nulls)
+        }
+        Value::Array(items) => items.iter_mut().try_for_each(|item| {
+            if item.is_null() {
+                Err(Error::NullValue)
+            } else {
+                drop_nulls(item)
+            }
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `jcs` of `value` without its `null` members, wiped when dropped.
+fn plain_bytes(mut value: Value) -> Result<Zeroizing<Vec<u8>>> {
+    drop_nulls(&mut value)?;
+    Ok(Zeroizing::new(jcs(&value)?.into_bytes()))
 }
 
 /// Bytes are the plaintext's own canonical form, and nothing else.
@@ -361,6 +404,9 @@ fn value_of<T: serde::Serialize>(value: &T) -> Result<Value> {
     serde_json::to_value(value).map_err(|_| Error::Malformed("plaintext"))
 }
 
+/// Room for `{"kind":"request","message":` and `}` around a Message.
+const ENVELOPE_WRAPPER_BYTES: usize = 64;
+
 /// The plaintext of an envelope (II.4.2): `{"kind":"request","message":…}`,
 /// `{"kind":"cancel","task_id":…}` or `{"kind":"complete","task_id":…,
 /// "result":…}`, as `jcs`.
@@ -384,13 +430,13 @@ pub enum EnvelopePlain {
 
 impl EnvelopePlain {
     /// What a sender may seal and a receiver reads: ids in their grammar, a
-    /// Message of at most [`MAX_MESSAGE_BYTES`] (its own validity is the
+    /// Message of at most [`MAX_PLAINTEXT_BYTES`] (its own validity is the
     /// receiver's), a snapshot as `work_complete` takes one.
     fn check(&self) -> Result<()> {
         match self {
             EnvelopePlain::Request { message } => {
                 let size = serde_json::to_vec(message).map_err(|_| Error::Malformed("message"))?;
-                if size.len() > MAX_MESSAGE_BYTES {
+                if size.len() > MAX_PLAINTEXT_BYTES {
                     return Err(Error::TooLarge);
                 }
             }
@@ -420,17 +466,19 @@ impl EnvelopePlain {
         })
     }
 
-    /// `jcs` of the plaintext, wiped when dropped.
+    /// `jcs` of the plaintext without `null` members, wiped when dropped.
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.check()?;
-        Ok(Zeroizing::new(jcs(&self.to_value()?)?.into_bytes()))
+        plain_bytes(self.to_value()?)
     }
 
     /// Exactly what [`to_bytes`](Self::to_bytes) writes (II.4.2, step 6):
-    /// strict I-JSON, one of the three shapes with exactly its fields, and
-    /// nothing but the canonical form.
+    /// strict I-JSON with no `null`, one of the three shapes with exactly its
+    /// fields, and nothing but the canonical form.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut o = plain_object(bytes)?;
+        // The Message's bound, and the few bytes of `{"kind":"request",
+        // "message":…}` around it.
+        let mut o = plain_object(bytes, MAX_PLAINTEXT_BYTES + ENVELOPE_WRAPPER_BYTES)?;
         let kind = str_of(&o, "kind")?.to_owned();
         let plain = match kind.as_str() {
             "request" => {
@@ -464,9 +512,10 @@ impl EnvelopePlain {
 /// "recipients":[…]}`, `{"kind":"status","object_id":…,"refused":…}` or
 /// `{"kind":"result","task_id":…,"reply":…}`, as `jcs`.
 ///
-/// These reuse host-work-v1's own wire shapes, so they carry the `null`s
-/// those emit (`work.result: null`); R9.1's ban on `null` is for signed
-/// bodies, which have none.
+/// These reuse host-work-v1's own wire shapes, which write `null` for an
+/// absent `Option` (`work.result: null`); the plaintext, strict like every new
+/// object (R9.1), leaves such members out and reads a missing one as `None`.
+/// The whole plaintext is at most [`MAX_PLAINTEXT_BYTES`], as a Message is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultPlain {
     /// This host's receipts for the message's recipients (host-work-v1 §5
@@ -519,17 +568,23 @@ impl ResultPlain {
         })
     }
 
-    /// `jcs` of the plaintext, wiped when dropped.
+    /// `jcs` of the plaintext without `null` members, wiped when dropped;
+    /// `TooLarge` beyond [`MAX_PLAINTEXT_BYTES`].
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.check()?;
-        Ok(Zeroizing::new(jcs(&self.to_value()?)?.into_bytes()))
+        let bytes = plain_bytes(self.to_value()?)?;
+        if bytes.len() > MAX_PLAINTEXT_BYTES {
+            return Err(Error::TooLarge);
+        }
+        Ok(bytes)
     }
 
     /// Exactly what [`to_bytes`](Self::to_bytes) writes (II.4.2 step 6 for
-    /// the receiver of a result): the two `status` shapes are told apart by
-    /// their fields, and nothing but the canonical form is accepted.
+    /// the receiver of a result): at most [`MAX_PLAINTEXT_BYTES`], no `null`,
+    /// the two `status` shapes told apart by their fields, and nothing but
+    /// the canonical form.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut o = plain_object(bytes)?;
+        let mut o = plain_object(bytes, MAX_PLAINTEXT_BYTES)?;
         let kind = str_of(&o, "kind")?.to_owned();
         let plain = match kind.as_str() {
             "status" if o.contains_key("object_id") => {
@@ -1038,6 +1093,101 @@ mod tests {
             }
             .to_bytes()
             .is_err()
+        );
+    }
+
+    /// No `null` anywhere in `value`.
+    fn nullless(value: &Value) -> bool {
+        match value {
+            Value::Null => false,
+            Value::Array(items) => items.iter().all(nullless),
+            Value::Object(o) => o.values().all(nullless),
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn sealed_plaintexts_have_no_null() {
+        // The receipts' wire type writes `"result":null`; the sealed
+        // plaintext leaves the member out, and a missing member reads as
+        // `None` again.
+        let plain = result_plains().remove(1);
+        let bytes = plain.to_bytes().unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(nullless(&value), "{}", String::from_utf8_lossy(&bytes));
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"result\""));
+        assert_eq!(ResultPlain::parse(&bytes).unwrap(), plain);
+        for plain in result_plains() {
+            let value: Value = serde_json::from_slice(&plain.to_bytes().unwrap()).unwrap();
+            assert!(nullless(&value));
+        }
+        for plain in envelope_plains() {
+            let value: Value = serde_json::from_slice(&plain.to_bytes().unwrap()).unwrap();
+            assert!(nullless(&value));
+        }
+    }
+
+    #[test]
+    fn nulls_are_dropped_from_objects_and_refused_in_arrays() {
+        let mut v = json!({"a": null, "b": [{"c": null, "d": 1}, []], "e": {"f": null}, "g": 0});
+        drop_nulls(&mut v).unwrap();
+        assert_eq!(v, json!({"b": [{"d": 1}, []], "e": {}, "g": 0}));
+        for mut bad in [
+            json!({"a": [1, null]}),
+            json!([null]),
+            json!({"a": {"b": [[null]]}}),
+        ] {
+            assert_eq!(drop_nulls(&mut bad), Err(Error::NullValue), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_plaintext_with_a_null_is_refused_at_parse() {
+        let status = result_plains().remove(1);
+        // The status written as the wire type writes it, `"result":null`
+        // included: canonical JSON otherwise, but not strict.
+        let mut value: Value = serde_json::from_slice(&status.to_bytes().unwrap()).unwrap();
+        value["recipients"][0]["delivery"]["work"]["result"] = Value::Null;
+        let with_null = jcs(&value).unwrap();
+        assert!(with_null.contains(r#""result":null"#));
+        assert_eq!(
+            ResultPlain::parse(with_null.as_bytes()),
+            Err(Error::NullValue)
+        );
+        // Anywhere: a member, an array item, a required field.
+        let cancel = |extra: &str| format!(r#"{{"kind":"cancel","task_id":"{ID2}"{extra}}}"#);
+        for text in [
+            cancel(r#","x":null"#),
+            r#"{"kind":"cancel","task_id":null}"#.to_string(),
+            format!(r#"{{"kind":"status","message_id":"{ID}","recipients":[null]}}"#),
+            format!(r#"{{"kind":"status","object_id":"{ID}","refused":null}}"#),
+        ] {
+            assert_eq!(
+                EnvelopePlain::parse(text.as_bytes())
+                    .err()
+                    .or(ResultPlain::parse(text.as_bytes()).err()),
+                Some(Error::NullValue),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            EnvelopePlain::parse(cancel(r#","x":null"#).as_bytes()),
+            Err(Error::NullValue)
+        );
+        assert_eq!(
+            ResultPlain::parse(
+                format!(r#"{{"kind":"status","message_id":"{ID}","recipients":[null]}}"#)
+                    .as_bytes()
+            ),
+            Err(Error::NullValue)
+        );
+        // A message carrying a null member is refused as well.
+        let mut message = serde_json::to_value(message(&Rig::new().fields())).unwrap();
+        message["reply_to"] = Value::Null;
+        let request = jcs(&json!({"kind": "request", "message": message})).unwrap();
+        assert_eq!(
+            EnvelopePlain::parse(request.as_bytes()),
+            Err(Error::NullValue)
         );
     }
 }

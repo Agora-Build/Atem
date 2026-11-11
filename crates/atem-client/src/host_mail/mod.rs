@@ -36,13 +36,19 @@
 //! the body's, the route and project checks): those are the receiver's
 //! checks (II.4.2 steps 2 to 7).
 //!
-//! **Bounds.** A signed body's `jcs` is at most 4,096 bytes (R9.1); the
-//! Message in a request at most [`MAX_MESSAGE_BYTES`](crate::session::messages::MAX_MESSAGE_BYTES)
-//! (240 KiB, host-work-v1 §5); the whole object, as it arrives, at most
-//! [`MAX_MAIL_OBJECT_BYTES`] (512 KiB; owner decision 2026-11-07, choice 13:
-//! a sealed 240 KiB Message is about 330 KB after base64url).
+//! **Bounds.** A signed body's `jcs` is at most 4,096 bytes (R9.1). One bound
+//! for what is sealed, [`MAX_PLAINTEXT_BYTES`] (240 KiB): a request's
+//! Message (host-work-v1 §5) and a result's whole plaintext. The whole
+//! object, as it arrives, is at most [`MAX_MAIL_OBJECT_BYTES`] (512 KiB;
+//! owner decision 2026-11-07, choice 13): a sealed 240 KiB plaintext is about
+//! 330 KB after base64url, so every sealed object fits a mailbox call.
+//!
+//! **Plaintexts are strict** (II.4.2 step 6, R9.1): no `null`. Sealing drops
+//! every member whose value is `null` (a missing `Option` member reads as
+//! `None`) and refuses an array holding one; reading refuses any `null`.
 use crate::canonical::{self, Numbers};
 use crate::error::Result;
+use crate::session::messages::MAX_MESSAGE_BYTES;
 use crate::signed::SignedObject;
 
 pub mod body;
@@ -54,6 +60,14 @@ pub use body::{
     EnvelopePlain, HostRef, MailBody, MailFields, MailKind, REFUSAL_CODES, ResultPlain,
 };
 pub use seal::{seal_envelope, seal_info, seal_result, unseal_envelope, unseal_result};
+#[cfg(feature = "test-vectors")]
+pub use seal::{seal_envelope_with_ikm, seal_result_with_ikm};
+
+/// The most a sealed plaintext holds: a request's Message (host-work-v1 §5's
+/// 240 KiB, which the shared core keeps as its one Message bound) and a
+/// result's whole plaintext. One bound for both objects, so every sealed
+/// object fits [`MAX_MAIL_OBJECT_BYTES`].
+pub const MAX_PLAINTEXT_BYTES: usize = MAX_MESSAGE_BYTES;
 
 /// One mailbox object's wire bytes are at most this long (II.4.2, "Size";
 /// owner decision 2026-11-07, choice 13). Checked before anything is parsed

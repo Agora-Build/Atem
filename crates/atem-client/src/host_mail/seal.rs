@@ -41,8 +41,10 @@ pub fn seal_info(kind: MailKind, fields: &MailFields) -> Vec<u8> {
     ])
 }
 
-/// Seals `plaintext` to `recipient_enc`, names it in the body and signs the
-/// body with `host_key` behind `provider`.
+/// Seals `plaintext` to `recipient_enc` with `seal` (`recipient, info,
+/// plaintext`: a fresh ephemeral, or a given one for the known-answer
+/// vectors), names it in the body and signs the body with `host_key` behind
+/// `provider`.
 fn seal_bytes(
     kind: MailKind,
     provider: &dyn KeyProvider,
@@ -50,6 +52,7 @@ fn seal_bytes(
     fields: &MailFields,
     plaintext: &[u8],
     recipient_enc: &PublicKey,
+    seal: impl FnOnce(&[u8; 32], &[u8], &[u8]) -> Result<hpke::Sealed>,
 ) -> Result<SignedObject> {
     fields.check()?;
     // The object is bounded on the wire: a plaintext that can't fit is
@@ -69,7 +72,7 @@ fn seal_bytes(
         return Err(Error::Malformed("enc_kid is not the recipient key's"));
     }
     let recipient = recipient_enc.as_32().ok_or(Error::BadKey)?;
-    let sealed = hpke::seal(recipient, &seal_info(kind, fields), b"", plaintext)?;
+    let sealed = seal(recipient, &seal_info(kind, fields), plaintext)?;
     let body = MailBody::from_fields(fields.clone(), sealed.hash()).to_value(kind);
     let object = SignedObject::sign(provider, host_key, body)?.with_sealed(SealedPart {
         enc: sealed.enc.to_vec(),
@@ -132,6 +135,7 @@ pub fn seal_envelope(
         fields,
         &plain.to_bytes()?,
         recipient_enc,
+        |recipient, info, plaintext| hpke::seal(recipient, info, b"", plaintext),
     )
 }
 
@@ -150,6 +154,53 @@ pub fn seal_result(
         fields,
         &plain.to_bytes()?,
         recipient_enc,
+        |recipient, info, plaintext| hpke::seal(recipient, info, b"", plaintext),
+    )
+}
+
+/// [`seal_envelope`] with the HPKE ephemeral `DeriveKeyPair(ikm_e)`, for
+/// known-answer vectors only (feature `test-vectors`, never in shipped
+/// builds): the same `ikm_e` gives byte-identical objects (the signature is
+/// deterministic). `ikm_e` must be secret and never reused outside a vector.
+#[cfg(feature = "test-vectors")]
+pub fn seal_envelope_with_ikm(
+    provider: &dyn KeyProvider,
+    host_key: &KeyId,
+    fields: &MailFields,
+    plain: &EnvelopePlain,
+    recipient_enc: &PublicKey,
+    ikm_e: &[u8; 32],
+) -> Result<SignedObject> {
+    seal_bytes(
+        MailKind::Envelope,
+        provider,
+        host_key,
+        fields,
+        &plain.to_bytes()?,
+        recipient_enc,
+        |recipient, info, plaintext| hpke::seal_with_ikm(recipient, info, b"", plaintext, ikm_e),
+    )
+}
+
+/// [`seal_result`] with the HPKE ephemeral `DeriveKeyPair(ikm_e)` (known-answer
+/// vectors only, like [`seal_envelope_with_ikm`]).
+#[cfg(feature = "test-vectors")]
+pub fn seal_result_with_ikm(
+    provider: &dyn KeyProvider,
+    host_key: &KeyId,
+    fields: &MailFields,
+    plain: &ResultPlain,
+    recipient_enc: &PublicKey,
+    ikm_e: &[u8; 32],
+) -> Result<SignedObject> {
+    seal_bytes(
+        MailKind::Result,
+        provider,
+        host_key,
+        fields,
+        &plain.to_bytes()?,
+        recipient_enc,
+        |recipient, info, plaintext| hpke::seal_with_ikm(recipient, info, b"", plaintext, ikm_e),
     )
 }
 
@@ -204,8 +255,8 @@ mod tests {
     use crate::error::Error;
     use crate::host_mail::test_support::*;
     use crate::host_mail::{
-        EnvelopePlain, MAX_MAIL_OBJECT_BYTES, MailBody, MailFields, MailKind, ResultPlain,
-        parse_object,
+        EnvelopePlain, MAX_MAIL_OBJECT_BYTES, MAX_PLAINTEXT_BYTES, MailBody, MailFields, MailKind,
+        ResultPlain, parse_object,
     };
     use crate::keys::{Alg, enc_kid};
     use crate::provider::{KeyId, KeyProvider};
@@ -670,14 +721,36 @@ mod tests {
             Err(Error::Strict(crate::canonical::StrictError::TooLarge))
         ));
 
-        // A result carries up to eight 128 KiB snapshots of reply context;
-        // two fit the object bound, three don't.
-        let two = ResultPlain::Result {
-            task_id: ID2.into(),
-            reply: reply(2),
+        // A result's plaintext has the same bound, so every sealed object
+        // fits a 512 KiB mailbox call: exactly at it seals, one byte over
+        // doesn't (a reply carries up to eight 128 KiB snapshots, so the
+        // bound bites well before the object's).
+        assert_eq!(MAX_PLAINTEXT_BYTES, MAX_MESSAGE_BYTES);
+        let at = result_of_size(MAX_PLAINTEXT_BYTES);
+        let object = seal_result(&r.sender, &r.host_key, &f, &at, &r.enc_pub).unwrap();
+        assert!(wire(&object).len() > 320_000 && wire(&object).len() < MAX_MAIL_OBJECT_BYTES);
+        assert_eq!(unseal_result(&r.receiver, &r.enc_key, &object).unwrap(), at);
+        let over = result_of_size(MAX_PLAINTEXT_BYTES + 1);
+        assert_eq!(
+            seal_result(&r.sender, &r.host_key, &f, &over, &r.enc_pub),
+            Err(Error::TooLarge)
+        );
+        assert_eq!(over.to_bytes(), Err(Error::TooLarge));
+        // The plaintext's strict parse refuses it too (a sender that
+        // skipped the seal's check).
+        let ResultPlain::Result {
+            task_id,
+            reply: over_reply,
+        } = &over
+        else {
+            unreachable!()
         };
-        let object = seal_result(&r.sender, &r.host_key, &f, &two, &r.enc_pub).unwrap();
-        assert!(wire(&object).len() < MAX_MAIL_OBJECT_BYTES);
+        let raw = jcs(&json!({"kind": "result", "task_id": task_id,
+                              "reply": serde_json::to_value(over_reply).unwrap()}))
+        .unwrap();
+        assert_eq!(raw.len(), MAX_PLAINTEXT_BYTES + 1);
+        assert_eq!(ResultPlain::parse(raw.as_bytes()), Err(Error::TooLarge));
+        // And three snapshots of the largest size, a valid reply, are over.
         let three = ResultPlain::Result {
             task_id: ID2.into(),
             reply: reply(3),
@@ -761,5 +834,91 @@ mod tests {
         };
         let sealed = seal_result(&r.sender, &r.host_key, &f, &status, &r.enc_pub).unwrap();
         assert!(unseal_envelope(&r.receiver, &r.enc_key, &sealed).is_err());
+    }
+
+    #[test]
+    fn a_status_with_no_result_seals_without_null() {
+        use crate::session::host_work::WorkState;
+        use crate::session::messages::{Delivery, RecipientReceipt, WorkProgress};
+        let r = Rig::new();
+        let f = r.fields();
+        let plain = ResultPlain::Status {
+            message_id: ID.into(),
+            recipients: vec![RecipientReceipt {
+                recipient_id: ID2.into(),
+                delivery: Delivery::Work {
+                    work: WorkProgress {
+                        task_id: ID2.into(),
+                        receipt_id: ID.into(),
+                        state: WorkState::Queued,
+                        detail: "waiting for a ready agent".into(),
+                        result: None,
+                    },
+                },
+            }],
+        };
+        // The wire type says `"result":null` (host-work-v1 section 5); the
+        // sealed plaintext leaves the member out.
+        assert!(
+            serde_json::to_string(match &plain {
+                ResultPlain::Status { recipients, .. } => recipients,
+                _ => unreachable!(),
+            })
+            .unwrap()
+            .contains("\"result\":null")
+        );
+        let bytes = plain.to_bytes().unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("null"));
+        let object = seal_result(&r.sender, &r.host_key, &f, &plain, &r.enc_pub).unwrap();
+        let parsed = parse_object(&wire(&object)).unwrap();
+        assert_eq!(
+            unseal_result(&r.receiver, &r.enc_key, &parsed).unwrap(),
+            plain
+        );
+        // The same for a reply with every member present.
+        let result = ResultPlain::Result {
+            task_id: ID2.into(),
+            reply: reply(1),
+        };
+        assert!(!String::from_utf8_lossy(&result.to_bytes().unwrap()).contains("null"));
+    }
+
+    /// Deterministic seals for the known-answer vectors (`test-vectors`).
+    #[cfg(feature = "test-vectors")]
+    #[test]
+    fn the_same_ikm_gives_byte_identical_objects() {
+        let r = Rig::new();
+        let f = r.fields();
+        let ikm = [5u8; 32];
+        let plain = request(&f);
+        let a =
+            seal_envelope_with_ikm(&r.sender, &r.host_key, &f, &plain, &r.enc_pub, &ikm).unwrap();
+        let b =
+            seal_envelope_with_ikm(&r.sender, &r.host_key, &f, &plain, &r.enc_pub, &ikm).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(wire(&a), wire(&b));
+        // Another ikm is another ephemeral: another `enc`, `ct`, hash and
+        // signature; a fresh random seal differs from both.
+        let c = seal_envelope_with_ikm(&r.sender, &r.host_key, &f, &plain, &r.enc_pub, &[6u8; 32])
+            .unwrap();
+        assert_ne!(a.sealed().unwrap().enc, c.sealed().unwrap().enc);
+        assert_ne!(a.sig(), c.sig());
+        assert_ne!(a, envelope(&r, &f, &plain));
+        // They are ordinary objects: signed, and they open to the plaintext.
+        a.verify(&r.host_key_public()).unwrap();
+        assert_eq!(unseal_envelope(&r.receiver, &r.enc_key, &a).unwrap(), plain);
+
+        let status = ResultPlain::Refusal {
+            object_id: ID2.into(),
+            refused: "invalid_request".into(),
+        };
+        let x =
+            seal_result_with_ikm(&r.sender, &r.host_key, &f, &status, &r.enc_pub, &ikm).unwrap();
+        let y =
+            seal_result_with_ikm(&r.sender, &r.host_key, &f, &status, &r.enc_pub, &ikm).unwrap();
+        assert_eq!(x, y);
+        assert_eq!(unseal_result(&r.receiver, &r.enc_key, &x).unwrap(), status);
+        // The same ikm under the other label is another object.
+        assert_ne!(x.sealed().unwrap().ct, a.sealed().unwrap().ct);
     }
 }

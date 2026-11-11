@@ -1,6 +1,6 @@
 //! Fixtures the `host_mail` tests share (test builds only).
 use crate::encoding::Hash32;
-use crate::host_mail::{HostRef, MailFields};
+use crate::host_mail::{HostRef, MailFields, ResultPlain};
 use crate::host_principal::host_principal;
 use crate::keys::{PublicKey, enc_kid};
 use crate::membership::Head;
@@ -148,4 +148,30 @@ pub(crate) fn reply(contexts: usize) -> ResultReply {
         submitted_at: Some(CREATED_AT + 60_000),
         dropped: false,
     }
+}
+
+/// A `result` plaintext whose `jcs` is exactly `target` bytes: a reply with
+/// three snapshots, the last one sized to fit. (Built without encoding it,
+/// so `target` may be beyond the bound.)
+pub(crate) fn result_of_size(target: usize) -> ResultPlain {
+    let build = |last: usize| {
+        let mut reply = reply(0);
+        reply.context = vec![
+            snapshot(0, 60 * 1024),
+            snapshot(1, 60 * 1024),
+            snapshot(2, last),
+        ];
+        ResultPlain::Result {
+            task_id: ID2.into(),
+            reply,
+        }
+    };
+    let probe = 40 * 1024;
+    let base = build(probe).to_bytes().unwrap().len();
+    // The text is ASCII with no escapes: one byte per byte.
+    let plain = build(probe + target - base);
+    if target <= crate::host_mail::MAX_PLAINTEXT_BYTES {
+        assert_eq!(plain.to_bytes().unwrap().len(), target);
+    }
+    plain
 }
