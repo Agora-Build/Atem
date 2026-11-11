@@ -746,6 +746,14 @@ check("outcome_unknown hints: refusals, dedup and acks", () => {
   throwsCode(() => swapped.checkSealed(), "bad_sealed");
   throwsCode(() => new m.PushHintBook().offer(swapped), "bad_sealed");
   throwsCode(() => swapped.open(sealedTo("dev-phone"), "enc", "dev-phone"), "open_failed");
+  // Well signed and well sealed, but the sealed facts aren't a delegated
+  // sender's UUID v4 task: verified and kept, refused at open.
+  for (const c of push.outcome_unknown_invalid_facts) {
+    for (const verifier of ["client", "relay"]) m.verifyPushHint(str(c.hint), logL(), NOWP, verifier);
+    const hint = verified(c.hint);
+    hint.checkSealed();
+    throwsCode(() => hint.open(sealedTo(c.device_id), "enc", c.device_id), c.code);
+  }
   // The ack entries, and an approval hint is no alert.
   const acks = push.outcome_unknown.map((h) => verified(h).ackJson());
   eq(m.parsePushAck(m.pushAckMessage(acks)), acks);

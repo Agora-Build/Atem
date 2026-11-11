@@ -742,7 +742,7 @@ impl Attached {
             if !w.features.iter().any(|f| f == feature) {
                 return Err(ConnectError::Request("host feature not available"));
             }
-            if self.host_work.contains_key(request.id()) {
+            if self.id_pending(request.id()) {
                 return Err(ConnectError::Request("duplicate host work message id"));
             }
             if self.host_work.len() >= 64 {
@@ -753,6 +753,16 @@ impl Attached {
             return Ok(frame);
         }
         self.seal(message, now_ms)
+    }
+
+    /// Whether `id` names a request still waiting for its answer, in any of
+    /// the three request maps (host work, `control_records`,
+    /// `host_enc_key_get`): one id is one pending request, so an
+    /// `error{re}` can only ever name one.
+    fn id_pending(&self, id: &str) -> bool {
+        self.host_work.contains_key(id)
+            || self.control_records.contains_key(id)
+            || self.host_enc_key.contains(id)
     }
 
     /// `list`: the registry snapshot (and subscribes to changes).
@@ -1055,7 +1065,7 @@ impl Attached {
         let request =
             crate::session::r9::ControlRecordsRequest::decode(message.to_string().as_bytes())
                 .map_err(ConnectError::Request)?;
-        if self.control_records.contains_key(&request.id) {
+        if self.id_pending(&request.id) {
             return Err(ConnectError::Request("duplicate control records id"));
         }
         if self.control_records.len() >= 64 {
@@ -1103,7 +1113,7 @@ impl Attached {
         }
         let request = crate::session::r9::HostEncKeyGet::decode(message.to_string().as_bytes())
             .map_err(ConnectError::Request)?;
-        if self.host_enc_key.contains(&request.id) {
+        if self.id_pending(&request.id) {
             return Err(ConnectError::Request("duplicate host enc key id"));
         }
         if self.host_enc_key.len() >= 64 {

@@ -209,6 +209,12 @@ fn old_receipts_unchanged() {
     }
     for file in &files {
         let fixture: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        // Vectors files carry receipts with and without provenance on
+        // purpose (`r9-vectors-delegated-wire`), and their own runners read
+        // them; this walk is about the scenario fixtures.
+        if fixture["kind"] == "vectors" {
+            continue;
+        }
         let mut found = Vec::new();
         walk(&fixture, &mut found);
         for original in found {

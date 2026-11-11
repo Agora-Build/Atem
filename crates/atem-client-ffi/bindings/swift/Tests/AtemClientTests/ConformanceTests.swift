@@ -1048,6 +1048,17 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("bad_sealed") { try swapped.checkSealed() }
             try throwsCode("bad_sealed") { _ = try PushHintBook().offer(hint: swapped) }
             try throwsCode("open_failed") { _ = try swapped.open(provider: providerFor("dev-phone"), encKeyId: "enc", deviceId: "dev-phone") }
+            // Well signed and well sealed, but the sealed facts aren't a
+            // delegated sender's UUID v4 task: verified and kept, refused at open.
+            for c in a(push["outcome_unknown_invalid_facts"]).map(o) {
+                for verifier in [PushVerifier.client, PushVerifier.relay] {
+                    _ = try verifyPushHint(hintJson: js(c["hint"]!), log: logL(), nowMs: nowP, verifier: verifier)
+                }
+                let hint = try verified(o(c["hint"]))
+                try hint.checkSealed()
+                let device = s(c["device_id"])
+                try throwsCode(s(c["code"])) { _ = try hint.open(provider: providerFor(device), encKeyId: "enc", deviceId: device) }
+            }
             // The ack entries, and an approval hint is no alert.
             let acks = try alertHints.map { try verified($0).ackJson() }
             try eq(try parsePushAck(messageJson: pushAckMessage(acks: acks)), acks)

@@ -330,10 +330,15 @@ pub const MAX_DETAIL_BYTES: usize = 1024;
 impl Resolution {
     pub fn valid(&self) -> bool {
         match self {
+            // Kept exactly as given (the host shows it as the task's
+            // detail; a client never compares it), but never blank, and no
+            // control or Cf character (T17 minors 5 and 8).
             Self::Failed { detail } => {
-                !detail.is_empty()
+                !detail.trim().is_empty()
                     && detail.len() <= MAX_DETAIL_BYTES
-                    && !detail.chars().any(char::is_control)
+                    && !detail
+                        .chars()
+                        .any(|c| c.is_control() || super::framing::is_format(c))
             }
             Self::Done { result } => result.valid(),
         }
@@ -603,10 +608,11 @@ where
 }
 
 /// `resolved{by, at}`: the principal that resolved a task and the host's
-/// wall clock then, Unix ms. `by` is `member:<id>`, `service:<id>` or
-/// `browser:<grant_id>` (an id of 1-128 bytes, as a message's sender is), or
-/// `local` for the host's own command. A host sender (`host:`) has no
-/// `work_resolve` (design I.4.5), so it is never one.
+/// wall clock then, Unix ms. `by` is `member:<id>` or `service:<id>` (an id
+/// of 1-128 bytes, as a message's sender is): the task's delegated sender or
+/// the owner, or `local` for the host's own command. Only a delegated task
+/// is resolved (ruling P5a), so a browser grant, whose tasks keep v1, never
+/// is one; a host sender (`host:`) has no `work_resolve` (design I.4.5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resolved {
@@ -617,7 +623,7 @@ pub struct Resolved {
 impl Resolved {
     pub fn valid(&self) -> bool {
         (self.by == "local"
-            || ["member:", "service:", "browser:"]
+            || ["member:", "service:"]
                 .iter()
                 .any(|prefix| self.by.strip_prefix(prefix).is_some_and(is_opaque_id)))
             && self.at <= MAX_SAFE_INTEGER
@@ -913,6 +919,19 @@ mod tests {
         }
         // `alert_list` (`host.alerts`, I.4.6): the first page and a page after
         // a cursor, and what a host refuses.
+        // A failed resolution's detail: kept as given, never blank, no Cf.
+        for (name, valid) in [
+            ("work_resolve_failed_detail_not_blank", false),
+            ("work_resolve_failed_detail_without_cf", false),
+            ("work_resolve_failed_detail_kept_as_given", true),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
         for (name, valid) in [
             ("alert_list_first_page", true),
             ("alert_list_after", true),
@@ -964,7 +983,11 @@ mod tests {
         );
         // A `resolved` that is `null` is refused, as the resolvers that
         // aren't principals.
-        for name in ["work_resolved_null", "work_resolved_by_a_bare_id"] {
+        for name in [
+            "work_resolved_null",
+            "work_resolved_by_a_bare_id",
+            "work_resolved_not_by_a_browser_grant",
+        ] {
             assert!(
                 cases
                     .iter()
@@ -982,6 +1005,17 @@ mod tests {
             ("alert_kind_is_outcome_unknown", false),
             ("alerts_in_order", false),
             ("alert_is_this_hosts", false),
+            // Only a delegated sender's UUID v4 task (ruling P5a).
+            ("alert_sender_not_local", false),
+            ("alert_sender_not_a_browser_grant", false),
+            ("alert_task_id_is_uuid_v4", false),
+            // The host's order, by its sequence number (ruling P5b).
+            ("alerts_by_seq_not_time", true),
+            ("alerts_by_seq_even_when_time_ascends", false),
+            ("alert_seq_from_one", false),
+            ("alert_needs_a_seq", false),
+            // No Cf character in a reason (T17 minor 8).
+            ("alert_reason_without_cf", false),
         ] {
             assert!(
                 cases
@@ -1718,6 +1752,40 @@ mod tests {
         assert!(Request::from_data(&interrupt).is_err());
     }
 
+    /// A `failed` resolution's `detail` is kept exactly as given (the client
+    /// doesn't compare it), but it says something: one that is blank after
+    /// trimming white space, or that carries a Cf character (bidi controls,
+    /// zero-width characters: the framing module's rule), is refused.
+    #[test]
+    fn failed_detail_is_not_blank_and_has_no_cf_character() {
+        let data = |detail: &str| {
+            let mut data = work_resolve(failed("x")).to_json()["data"].clone();
+            data["resolution"]["detail"] = json!(detail);
+            data
+        };
+        for good in [
+            "agent exited",
+            "  agent exited ",
+            "the owner checked: nothing ran",
+            "é ü 中文",
+        ] {
+            assert!(Request::from_data(&data(good)).is_ok(), "{good:?}");
+        }
+        for bad in [
+            "",
+            " ",
+            "   ",
+            "\u{3000}",
+            "a\u{200B}b",
+            "\u{202E}detail",
+            "x\u{2066}y",
+            "\u{FEFF}x",
+            "a\nb",
+        ] {
+            assert!(Request::from_data(&data(bad)).is_err(), "{bad:?}");
+        }
+    }
+
     /// `resolved{by, at}` is the resolver and the time, on a settled task
     /// only; a status without it is as it was.
     #[test]
@@ -1738,18 +1806,18 @@ mod tests {
             work_answer(&query, work)
         };
         let by = |by: &str, at: u64| Some(Resolved { by: by.into(), at });
-        // The resolver is a principal (`member:`, `service:` or `browser:`
-        // and an id of 1-128 bytes) or the host's own `local`.
+        // The resolver is the task's delegated sender or the owner
+        // (`member:` or `service:` and an id of 1-128 bytes), or the host's
+        // own `local` command. Only a delegated task is resolved (ruling
+        // P5a), so a browser grant never is one.
         let long_id = "x".repeat(128);
         for who in [
             "member:dev-phone",
             "service:svc-bot",
-            "browser:grant-1",
             "local",
             "member:x",
             &format!("member:{long_id}"),
             &format!("service:{long_id}"),
-            &format!("browser:{long_id}"),
             "member:a.b_c:d-e",
         ] {
             assert!(build(WorkState::Failed, by(who, 1)).is_ok(), "{who}");
@@ -1775,6 +1843,11 @@ mod tests {
                 "a host sender (it has no work_resolve)",
                 WorkState::Failed,
                 by("host:host-a", 1),
+            ),
+            (
+                "a browser grant (its tasks keep v1 and are never resolved)",
+                WorkState::Failed,
+                by("browser:grant-1", 1),
             ),
             (
                 "a prefix of another case",

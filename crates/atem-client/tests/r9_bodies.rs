@@ -763,12 +763,18 @@ fn outcome_unknown_hint_seal_open() {
     assert!(edit(&|p| p.reason = "x".repeat(257)).is_err());
     assert!(edit(&|p| p.reason.clear()).is_err());
     assert!(edit(&|p| p.reason = "a\nb".into()).is_err());
+    assert!(edit(&|p| p.reason = "a\u{202E}b".into()).is_err(), "no Cf");
     assert!(edit(&|p| p.sender = "phone".into()).is_err());
-    assert!(edit(&|p| p.sender = "local".into()).is_ok());
+    // Only a delegated sender's UUID v4 task raises an alert (ruling P5a):
+    // `local` and browser grants keep v1, and a local selector's UUID v5
+    // task is never one.
+    assert!(edit(&|p| p.sender = "local".into()).is_err());
+    assert!(edit(&|p| p.sender = "browser:grant-1".into()).is_err());
+    assert!(edit(&|p| p.sender = "host:host-b".into()).is_ok());
     assert!(edit(&|p| p.session_id = "ses-A".into()).is_err());
     assert!(edit(&|p| p.task_id = "x".into()).is_err());
     assert!(
-        edit(&|p| p.task_id = "6ba7b810-9dad-51d1-80b4-00c04fd430c8".into()).is_ok(),
+        edit(&|p| p.task_id = "6ba7b810-9dad-51d1-80b4-00c04fd430c8".into()).is_err(),
         "a local selector's UUID v5 task"
     );
     // One hint per native member with control, as for an approval.

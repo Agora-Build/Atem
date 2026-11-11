@@ -2866,6 +2866,57 @@ principals = ["local"]
         });
     }
 
+    /// The delegated ops of step 3 never reach the bridge (the channel
+    /// refuses an op of a feature the host doesn't advertise). One that did
+    /// is refused `busy`, never half-served: `work_interrupt`,
+    /// `work_resolve` and `alert_list` (T17 minor 7).
+    #[test]
+    fn delegated_ops_that_reach_the_bridge_are_busy() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let local = rig.bridge.local_attachment().to_string();
+            let host = rig.bridge.work_host();
+            let id = || uuid::Uuid::new_v4().to_string();
+            let requests = [
+                hw::Request::WorkInterrupt {
+                    v: 1,
+                    id: id(),
+                    host: host.clone(),
+                    task_id: id(),
+                },
+                hw::Request::WorkResolve {
+                    v: 1,
+                    id: id(),
+                    host: host.clone(),
+                    task_id: id(),
+                    resolution: hw::Resolution::Failed {
+                        detail: "agent exited".into(),
+                    },
+                },
+                hw::Request::AlertList {
+                    v: 1,
+                    id: id(),
+                    host: host.clone(),
+                    after: None,
+                },
+            ];
+            for request in &requests {
+                assert_eq!(
+                    rig.bridge.work_request(
+                        &local,
+                        request,
+                        &mut Cx {
+                            client: &rig.app.astation_client,
+                            sessions: &mut rig.sessions,
+                        },
+                    ),
+                    Err("busy"),
+                    "{request:?}"
+                );
+            }
+        });
+    }
+
     /// A retry of a request whose payload was dropped is answered from its
     /// record by its digest, as before the drop: the same `work_enqueue` or
     /// `message_publish` gets the receipt recorded, another content

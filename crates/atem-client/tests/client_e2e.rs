@@ -1789,6 +1789,75 @@ mod control_records {
         assert_eq!(result_of(&events).unwrap()["re"], MINE);
     }
 
+    /// One `id` is one pending request, across the three request maps a
+    /// channel keeps (host work, `control_records`, `host_enc_key_get`): an
+    /// id waiting in one is refused in the others, so an `error{re}` can
+    /// only ever name one request (n1).
+    #[test]
+    fn an_id_pending_in_one_request_map_is_refused_in_the_others() {
+        use atem_client::session::host_work::WORK_FEATURE;
+        use atem_client::session::r9::{control_records_op, host_enc_key_get};
+        const SHARED: &str = "aaaaaaaa-0000-4000-8000-0000000000f4";
+        let world = World::new(&L);
+        let now = || world.mono();
+        world.core.lock().unwrap().welcome_override = Some(|w| {
+            w.features.push(SENDERS_FEATURE.into());
+            w.features.push(WORK_FEATURE.into());
+        });
+        let phone = Device::native(&world, "dev-phone", world.log(&L));
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        let w = attached.welcome().clone();
+        let work_query = json!({"type": "session", "data": {
+            "v": 1, "id": SHARED, "op": "work_query",
+            "task_id": "aaaaaaaa-0000-4000-8000-0000000000f5",
+            "host": {"account_id": w.account_id, "atem_device_id": w.atem_device_id,
+                     "host_trust_gen": w.host_trust_gen},
+        }});
+        // A host_enc_key_get holds the id: the other two families refuse it.
+        attached.send(&host_enc_key_get(SHARED), now()).unwrap();
+        assert_eq!(
+            attached
+                .send(&control_records_op(SHARED, &[record(1)]).unwrap(), now())
+                .err(),
+            Some(ConnectError::Request("duplicate control records id"))
+        );
+        assert_eq!(
+            attached.send(&work_query, now()).err(),
+            Some(ConnectError::Request("duplicate host work message id"))
+        );
+        // A control_records request holds another id: the other two refuse it.
+        let other = "aaaaaaaa-0000-4000-8000-0000000000f6";
+        attached
+            .send(&control_records_op(other, &[record(2)]).unwrap(), now())
+            .unwrap();
+        assert_eq!(
+            attached.send(&host_enc_key_get(other), now()).err(),
+            Some(ConnectError::Request("duplicate host enc key id"))
+        );
+        let mut query = work_query.clone();
+        query["data"]["id"] = json!(other);
+        assert_eq!(
+            attached.send(&query, now()).err(),
+            Some(ConnectError::Request("duplicate host work message id"))
+        );
+        // A host-work request holds a third: the other two refuse it.
+        let third = "aaaaaaaa-0000-4000-8000-0000000000f7";
+        let mut query = work_query.clone();
+        query["data"]["id"] = json!(third);
+        attached.send(&query, now()).unwrap();
+        assert_eq!(
+            attached.send(&host_enc_key_get(third), now()).err(),
+            Some(ConnectError::Request("duplicate host enc key id"))
+        );
+        assert_eq!(
+            attached
+                .send(&control_records_op(third, &[record(3)]).unwrap(), now())
+                .err(),
+            Some(ConnectError::Request("duplicate control records id"))
+        );
+    }
+
     /// At most 64 requests wait for their answers; an answer, or an error
     /// for the request, frees its place.
     #[test]

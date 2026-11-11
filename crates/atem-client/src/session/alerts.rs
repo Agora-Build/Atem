@@ -12,7 +12,7 @@
 //! four facts (task, session, sender, reason) to the owner's devices.
 use serde::{Deserialize, Serialize};
 
-use super::wire::{is_opaque_id, is_session_id, is_uuid_v4, is_uuid_v5};
+use super::wire::{is_delegated_sender, is_opaque_id, is_session_id, is_uuid_v4};
 use crate::canonical::MAX_SAFE_INTEGER;
 
 /// The feature: `alert_list`, and the push hint of kind `outcome_unknown`.
@@ -35,13 +35,16 @@ pub enum AlertKind {
 }
 
 /// One alert, as `alert_list` returns it. `alert_id` is a UUID v4 the host
-/// chose and keeps (an alert is durable); `host_id` is the host's own
+/// chose and keeps (an alert is durable); `seq` is the host's sequence
+/// number of it, from 1, rising with every alert the host creates and never
+/// reused: the list's order (ruling P5b); `host_id` is the host's own
 /// `atem_device_id`; `created_at` is the host's wall clock, Unix ms, when the
-/// task became `outcome_unknown`.
+/// task became `outcome_unknown`, for people only: it orders nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Alert {
     pub alert_id: String,
+    pub seq: u64,
     pub kind: AlertKind,
     pub host_id: String,
     pub session_id: String,
@@ -51,30 +54,37 @@ pub struct Alert {
     pub created_at: u64,
 }
 
-/// A task id as an alert names it: a UUID v4, or the UUID v5 of a local
-/// selector's fixed resolution (sender `local`).
+/// A task id as an alert names it: a UUID v4. Only a delegated sender's
+/// task raises an alert (ruling P5a; design I.1.3, I.4.6), and a remote
+/// task's id is a UUID v4. A local selector's UUID v5 task keeps v1, whose
+/// unknown outcomes expire.
 pub fn valid_task_id(task_id: &str) -> bool {
-    is_uuid_v4(task_id) || is_uuid_v5(task_id)
+    is_uuid_v4(task_id)
 }
 
-/// A task's sender as an alert names it: the principal that enqueued it,
-/// `member:<id>`, `service:<id>`, `browser:<grant_id>` or `host:<host_id>`
-/// (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), or the literal `local`.
+/// A task's sender as an alert names it: the delegated sender that enqueued
+/// it, `member:<id>`, `service:<id>` or `host:<host_id>` (an id of 1-128
+/// bytes of `[A-Za-z0-9._:-]`; [`is_delegated_sender`], as a receipt's
+/// provenance names it). Never `local` or a browser grant: their tasks keep
+/// v1 and raise no alert.
 pub fn valid_sender(sender: &str) -> bool {
-    sender == "local"
-        || ["member:", "service:", "browser:", "host:"]
-            .iter()
-            .any(|prefix| sender.strip_prefix(prefix).is_some_and(is_opaque_id))
+    is_delegated_sender(sender)
 }
 
-/// A reason: 1-[`MAX_REASON_BYTES`] bytes, no control character.
+/// A reason: 1-[`MAX_REASON_BYTES`] bytes, no control or Cf character (the
+/// framing module's rule: no bidi control or zero-width character in text
+/// shown to the owner).
 pub fn valid_reason(reason: &str) -> bool {
-    (1..=MAX_REASON_BYTES).contains(&reason.len()) && !reason.chars().any(char::is_control)
+    (1..=MAX_REASON_BYTES).contains(&reason.len())
+        && !reason
+            .chars()
+            .any(|c| c.is_control() || super::framing::is_format(c))
 }
 
 impl Alert {
     pub fn valid(&self) -> bool {
         is_uuid_v4(&self.alert_id)
+            && (1..=MAX_SAFE_INTEGER).contains(&self.seq)
             && is_opaque_id(&self.host_id)
             && is_session_id(&self.session_id)
             && valid_task_id(&self.task_id)
@@ -82,19 +92,30 @@ impl Alert {
             && valid_reason(&self.reason)
             && self.created_at <= MAX_SAFE_INTEGER
     }
-
-    /// Where the alert stands in the list: oldest first, ties by id.
-    fn position(&self) -> (u64, &str) {
-        (self.created_at, &self.alert_id)
-    }
 }
 
-/// A page is in the host's order: strictly ascending by `(created_at,
-/// alert_id)`, so no alert repeats.
+/// A page is in the host's order: strictly ascending by `seq`, so no alert
+/// repeats. `created_at` orders nothing: a wall clock set back gives a later
+/// alert an earlier time (ruling P5b).
 pub fn in_order(alerts: &[Alert]) -> bool {
-    alerts
-        .windows(2)
-        .all(|pair| pair[0].position() < pair[1].position())
+    alerts.windows(2).all(|pair| pair[0].seq < pair[1].seq)
+}
+
+/// The host's side of `alert_list` (the host keeps its alerts; step 4): the
+/// page after `after`, at most `limit` alerts in the host's order, and
+/// whether more follow. `None` for an `after` the host has no alert for (the
+/// alert ended, or never was): `stale_target`, detail `unknown alert`.
+pub fn page(alerts: &[Alert], after: Option<&str>, limit: usize) -> Option<(Vec<Alert>, bool)> {
+    let mut ordered: Vec<&Alert> = alerts.iter().collect();
+    ordered.sort_by_key(|a| a.seq);
+    let start = match after {
+        None => 0,
+        Some(after) => ordered.iter().position(|a| a.alert_id == after)? + 1,
+    };
+    let rest = &ordered[start..];
+    let taken: Vec<Alert> = rest.iter().take(limit).map(|a| (*a).clone()).collect();
+    let more = rest.len() > taken.len();
+    Some((taken, more))
 }
 
 #[cfg(test)]
@@ -114,10 +135,11 @@ mod tests {
         }
     }
 
-    /// The nth alert (ids ascend with `n`).
+    /// The nth alert (its host sequence number is `n`).
     fn alert(n: u64, created_at: u64) -> Alert {
         Alert {
             alert_id: format!("aaaaaaaa-0000-4000-8000-{n:012x}"),
+            seq: n,
             kind: AlertKind::OutcomeUnknown,
             host_id: "host".into(),
             session_id: "ses-aaaaaaaaaaaa".into(),
@@ -228,6 +250,43 @@ mod tests {
         assert!(Response::from_data(&empty).unwrap().answers(&request));
     }
 
+    /// The host lists its alerts in the order it created them, by its
+    /// sequence number, never by `created_at` (ruling P5b): a wall clock set
+    /// back gives a new alert an earlier `created_at`, and a client paging
+    /// with `after` still gets it after the cursor.
+    #[test]
+    fn a_later_alert_with_an_earlier_created_at_is_listed_after_the_cursor() {
+        // Alert 2 was created after alert 1, with the wall clock set back.
+        let held = vec![alert(2, 1_000), alert(1, 5_000), alert(3, 6_000)];
+        let (first, more) = page(&held, None, 1).unwrap();
+        assert_eq!((first.len(), more), (1, true));
+        assert_eq!(first[0].seq, 1);
+        let (next, more) = page(&held, Some(&first[0].alert_id), 1).unwrap();
+        assert_eq!((next[0].seq, next[0].created_at, more), (2, 1_000, true));
+        let (last, more) = page(&held, Some(&next[0].alert_id), 10).unwrap();
+        assert_eq!((last.len(), last[0].seq, more), (1, 3, false));
+        // Every page is in order, and a client reading it agrees.
+        for (p, _) in [
+            page(&held, None, MAX_PAGE).unwrap(),
+            page(&held, Some(&first[0].alert_id), MAX_PAGE).unwrap(),
+        ] {
+            assert!(in_order(&p));
+        }
+        let (all, more) = page(&held, None, MAX_PAGE).unwrap();
+        assert_eq!(
+            (all.iter().map(|a| a.seq).collect::<Vec<_>>(), more),
+            (vec![1, 2, 3], false)
+        );
+        // A cursor the host has no alert for is `stale_target`'s case.
+        assert_eq!(
+            page(&held, Some("aaaaaaaa-0000-4000-8000-0000000000ff"), 10),
+            None
+        );
+        // Past the last alert: an empty page, and no more.
+        let (none, more) = page(&held, Some(&last[0].alert_id), 10).unwrap();
+        assert_eq!((none.len(), more), (0, false));
+    }
+
     #[test]
     fn alerts_result_strict() {
         let request = list(None);
@@ -248,6 +307,7 @@ mod tests {
         assert!(refused(&|d| d["result"]["more"] = json!("no")));
         for field in [
             "alert_id",
+            "seq",
             "kind",
             "host_id",
             "session_id",
@@ -305,14 +365,40 @@ mod tests {
         assert!(refused(
             &|d| d["result"]["alerts"][0]["created_at"] = json!(1u64 << 53)
         ));
+        // Only a delegated sender's task raises an alert (ruling P5a): a
+        // UUID v4 task of a `member:`, `service:` or `host:` sender. `local`
+        // and browser grants keep v1, whose unknown outcomes expire.
+        for (field, value) in [
+            ("sender", json!("local")),
+            ("sender", json!("browser:grant-1")),
+            ("sender", json!("host-work")),
+            ("task_id", json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ] {
+            assert!(
+                refused(&|d| d["result"]["alerts"][0][field] = value.clone()),
+                "{field} {value}"
+            );
+        }
+        // A reason with a Cf character (bidi controls, zero-width
+        // characters) is refused, as a failed resolution's detail is.
+        for reason in ["a\u{202E}b", "\u{200B}agent exited", "x\u{2066}"] {
+            assert!(
+                refused(&|d| d["result"]["alerts"][0]["reason"] = json!(reason)),
+                "{reason:?}"
+            );
+        }
+        // The host's sequence number: from 1, a safe integer.
+        assert!(refused(&|d| d["result"]["alerts"][0]["seq"] = json!(0)));
+        assert!(refused(&|d| d["result"]["alerts"][0]["seq"] = json!(null)));
+        assert!(refused(
+            &|d| d["result"]["alerts"][1]["seq"] = json!(1u64 << 53)
+        ));
         // The bounds themselves are fine.
         for (field, value) in [
             ("reason", json!("x".repeat(256))),
-            ("sender", json!("local")),
-            ("sender", json!("browser:grant-1")),
             ("sender", json!("host:host-b")),
             ("sender", json!(format!("member:{}", "d".repeat(128)))),
-            ("task_id", json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+            ("sender", json!(format!("service:{}", "s".repeat(128)))),
         ] {
             let mut data = good.clone();
             data["result"]["alerts"][0][field] = value.clone();
@@ -329,7 +415,8 @@ mod tests {
         assert!(refused(
             &|d| d["result"]["alerts"][1]["host_id"] = json!("other-host")
         ));
-        // In order: ascending by (created_at, alert_id), no repeat.
+        // In the host's order: strictly ascending by `seq`, no repeat.
+        // `created_at` is informational and orders nothing (ruling P5b).
         assert!(refused(&|d| {
             let a = d["result"]["alerts"].as_array_mut().unwrap();
             a.swap(0, 1);
@@ -338,9 +425,13 @@ mod tests {
             let first = d["result"]["alerts"][0].clone();
             d["result"]["alerts"].as_array_mut().unwrap().push(first);
         }));
-        assert!(refused(
-            &|d| d["result"]["alerts"][0]["created_at"] = json!(101)
-        ));
+        assert!(refused(&|d| d["result"]["alerts"][1]["seq"] = json!(1)));
+        let mut earlier = good.clone();
+        earlier["result"]["alerts"][0]["created_at"] = json!(101);
+        assert!(
+            Response::from_data(&earlier).is_ok(),
+            "a later alert may carry an earlier created_at"
+        );
         // A page holds at most 64; `more` needs a last alert to continue from.
         let page = |n: u64, more: bool| {
             answer(
@@ -353,6 +444,10 @@ mod tests {
         assert!(Response::from_data(&page(65, true)).is_err());
         assert!(Response::from_data(&page(0, true)).is_err());
         assert!(Response::from_data(&page(0, false)).is_ok());
+        // The sequence may skip numbers (alerts end), but never goes back.
+        let mut gaps = good.clone();
+        gaps["result"]["alerts"][1]["seq"] = json!(9);
+        assert!(Response::from_data(&gaps).is_ok());
         // The result is read as written: no other kind of body is one.
         let mut as_work = good.clone();
         as_work["result"]["kind"] = json!("work");

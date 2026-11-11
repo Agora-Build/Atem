@@ -425,6 +425,72 @@
       }
     },
     {
+      "name": "work_resolve_failed_detail_not_blank",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_resolve",
+          "task_id": "22222222-2222-4222-8222-222222222222",
+          "resolution": {
+            "kind": "failed",
+            "detail": "   "
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolve_failed_detail_without_cf",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_resolve",
+          "task_id": "22222222-2222-4222-8222-222222222222",
+          "resolution": {
+            "kind": "failed",
+            "detail": "agent\u200bexited"
+          }
+        }
+      }
+    },
+    {
+      "name": "work_resolve_failed_detail_kept_as_given",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_resolve",
+          "task_id": "22222222-2222-4222-8222-222222222222",
+          "resolution": {
+            "kind": "failed",
+            "detail": "  agent exited "
+          }
+        }
+      }
+    },
+    {
       "name": "work_resolve_failed_detail_too_long",
       "valid": false,
       "message": {
@@ -2246,8 +2312,8 @@
       }
     },
     {
-      "name": "work_resolved_by_browser",
-      "valid": true,
+      "name": "work_resolved_not_by_a_browser_grant",
+      "valid": false,
       "result": {
         "v": 1,
         "op": "host_work_result",
@@ -2713,6 +2779,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -2723,6 +2790,7 @@
             },
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 2,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -2733,6 +2801,7 @@
             },
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000003",
+              "seq": 3,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -2765,54 +2834,37 @@
           "kind": "alerts",
           "alerts": [
             {
-              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
-              "kind": "outcome_unknown",
-              "host_id": "host",
-              "session_id": "ses-aaaaaaaaaaaa",
-              "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
-              "sender": "local",
-              "reason": "agent exited",
-              "created_at": 1
-            },
-            {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
               "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
               "sender": "member:dev-phone",
               "reason": "write interrupted",
-              "created_at": 2
-            },
-            {
-              "alert_id": "aaaaaaaa-0000-4000-8000-000000000003",
-              "kind": "outcome_unknown",
-              "host_id": "host",
-              "session_id": "ses-aaaaaaaaaaaa",
-              "task_id": "bbbbbbbb-0000-4000-8000-000000000003",
-              "sender": "browser:grant-1",
-              "reason": "agent exited",
-              "created_at": 3
+              "created_at": 1
             },
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000004",
+              "seq": 2,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
               "task_id": "bbbbbbbb-0000-4000-8000-000000000004",
               "sender": "host:host-b",
               "reason": "agent exited",
-              "created_at": 4
+              "created_at": 2
             },
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000005",
+              "seq": 3,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
               "task_id": "bbbbbbbb-0000-4000-8000-000000000005",
               "sender": "service:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
               "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-              "created_at": 5
+              "created_at": 3
             }
           ],
           "more": false
@@ -2861,6 +2913,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -2893,6 +2946,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -2926,6 +2980,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -2960,6 +3015,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -2994,6 +3050,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3026,6 +3083,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "expired",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3059,6 +3117,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3092,6 +3151,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3125,12 +3185,47 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
               "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
               "sender": "service:svc-1",
               "reason": "a\nb",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_reason_without_cf",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 1,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "agent\u202eexited",
               "created_at": 1
             }
           ],
@@ -3158,6 +3253,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3191,6 +3287,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3224,12 +3321,81 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
               "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
               "sender": "admin:x",
               "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_sender_not_local",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 1,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "local",
+              "reason": "write interrupted",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_sender_not_a_browser_grant",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 1,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "browser:grant-1",
+              "reason": "write interrupted",
               "created_at": 1
             }
           ],
@@ -3257,12 +3423,47 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
               "task_id": "task-1",
               "sender": "service:svc-1",
               "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_task_id_is_uuid_v4",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 1,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+              "sender": "service:svc-1",
+              "reason": "write interrupted",
               "created_at": 1
             }
           ],
@@ -3290,6 +3491,7 @@
           "alerts": [
             {
               "alert_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3323,6 +3525,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-A",
@@ -3356,6 +3559,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "other-host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3389,6 +3593,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3396,6 +3601,107 @@
               "sender": "service:svc-1",
               "reason": "agent exited",
               "created_at": 9007199254740992
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_seq_from_one",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 0,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "write interrupted",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_needs_a_seq",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "write interrupted",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_seq_is_a_safe_integer",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 9007199254740992,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "write interrupted",
+              "created_at": 1
             }
           ],
           "more": false
@@ -3422,6 +3728,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 2,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3432,6 +3739,7 @@
             },
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3446,7 +3754,7 @@
       }
     },
     {
-      "name": "alerts_by_time_first",
+      "name": "alerts_by_seq_even_when_time_ascends",
       "valid": false,
       "result": {
         "v": 1,
@@ -3464,7 +3772,53 @@
           "kind": "alerts",
           "alerts": [
             {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 2,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            },
+            {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 2
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alerts_by_seq_not_time",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3475,6 +3829,7 @@
             },
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 2,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3508,6 +3863,7 @@
           "alerts": [
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",
@@ -3518,6 +3874,7 @@
             },
             {
               "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "seq": 1,
               "kind": "outcome_unknown",
               "host_id": "host",
               "session_id": "ses-aaaaaaaaaaaa",

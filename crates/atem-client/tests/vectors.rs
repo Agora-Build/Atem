@@ -242,6 +242,7 @@ fn every_vectors_file_has_a_runner() {
         [
             "r9-vectors-browser-grant.json",
             "r9-vectors-channel-handshake.json",
+            "r9-vectors-delegated-wire.json",
             "r9-vectors-encoding.json",
             "r9-vectors-host-route.json",
             "r9-vectors-host-work-control.json",
@@ -2493,6 +2494,80 @@ fn check_outcome_unknown(run: &mut Run, book: &Book) {
         }
         run.pass(format!("{name}: refused {code}, {}", s(case, "reason")));
     }
+    // Hints whose sealed facts aren't a delegated task's: both verifiers
+    // take them, the relay keeps them, the sealed part is the one named,
+    // and the recipient refuses each at open. A host never builds one.
+    let secrets = run.get("recipient_secrets");
+    for (i, case) in run
+        .get("outcome_unknown_invalid_facts")
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let name = format!("outcome_unknown_invalid_facts[{i}]");
+        assert_eq!(s(case, "code"), "malformed");
+        let object = SignedObject::from_strict(&strict(&case["hint"])).unwrap();
+        object.verify(&host_key).unwrap();
+        let client = AlertHint::verify(&object, &log, now, Verifier::Client).unwrap();
+        assert_eq!(
+            AlertHint::verify(&object, &log, now, Verifier::Relay).unwrap(),
+            client
+        );
+        client.check_sealed().unwrap();
+        assert_eq!(
+            RelayLedger::new().receive_hint(&object, &log, now).0,
+            Verdict::Accepted,
+            "{name}: the relay never opens it"
+        );
+        let device = s(case, "device_id");
+        let sealed = object.sealed().unwrap();
+        let plain = hpke::open_with_secret(
+            &unhex32(s(&secrets, device)),
+            &sealed.enc,
+            &sealed.ct,
+            &unhex(s(case, "info_hex")),
+            b"",
+        )
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&plain).unwrap(),
+            jcs(&case["facts"]).unwrap(),
+            "{name}: only the facts are wrong"
+        );
+        assert!(
+            matches!(
+                client.open(&book.provider, &KeyId::new(format!("{device}/enc")), device),
+                Err(Error::Malformed(_))
+            ),
+            "{name}: refused at open"
+        );
+        let facts = AlertPlain {
+            task_id: s(&case["facts"], "task_id").into(),
+            session_id: s(&case["facts"], "session_id").into(),
+            sender: s(&case["facts"], "sender").into(),
+            reason: s(&case["facts"], "reason").into(),
+        };
+        assert!(
+            push::alert_hint_with_ikm(
+                &book.provider,
+                &book.signer("host-a"),
+                client.key(),
+                client.created_at(),
+                client.expires_at(),
+                device,
+                &book.public(&format!("{device}/enc")),
+                &facts,
+                &[7u8; 32],
+            )
+            .is_err(),
+            "{name}: a host never builds it"
+        );
+        run.pass(format!(
+            "{name}: verified, kept by the relay, refused at open: {}",
+            s(case, "reason")
+        ));
+    }
     // The key type is the one the builder makes.
     let _: &AlertKey = first[0].key();
 }
@@ -2514,7 +2589,9 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
     };
     let created_at = now + 1_000;
     // Alert A: the common case, a service's task; alert B: the bounds (a
-    // local selector's UUID v5 task, the sender `local`, a 256-byte reason).
+    // host sender with a 128-byte id, a 256-byte reason). Only a delegated
+    // sender's UUID v4 task raises an alert (ruling P5a): the hints whose
+    // sealed facts name another are `outcome_unknown_invalid_facts`.
     struct Alert {
         name: &'static str,
         alert_id: &'static str,
@@ -2541,9 +2618,9 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
             created_at: created_at + 1_000,
             expires_at: created_at + 1_000 + 900_000,
             facts: json!({
-                "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+                "task_id": "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0",
                 "session_id": "ses-bbbbbbbbbbbb",
-                "sender": "local",
+                "sender": format!("host:{}", "h".repeat(128)),
                 "reason": format!("write interrupted: {}", "x".repeat(256 - 19)),
             }),
         },
@@ -2700,15 +2777,91 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
         "outcome_unknown[0]'s body and signature with outcome_unknown[1]'s ct: not the sealed part sealed_hash names",
     );
 
+    // Hints a host never builds: well signed and well sealed, but their
+    // sealed facts aren't a delegated sender's UUID v4 task (ruling P5a).
+    // The relay can't tell (it never opens them); the recipient refuses each
+    // at open (`malformed`). Sealed here from the raw facts, since the
+    // crate's builder refuses them.
+    let mut invalid_facts = Vec::new();
+    for (alert_id, facts, why) in [
+        (
+            "8c4d9e13-5f60-4b8a-93eb-2f0a819c4d56",
+            json!({
+                "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+                "session_id": "ses-bbbbbbbbbbbb",
+                "sender": "local",
+                "reason": format!("write interrupted: {}", "x".repeat(256 - 19)),
+            }),
+            "a local selector's UUID v5 task, sender `local`: local tasks keep v1 (their unknown outcomes expire) and raise no alert",
+        ),
+        (
+            "9d5eaf24-6071-4c9b-a4fc-3a1b920d5e67",
+            json!({
+                "task_id": "1e2f3a4b-5c6d-4e7f-8091-a2b3c4d5e6f7",
+                "session_id": "ses-aaaaaaaaaaaa",
+                "sender": "browser:grant-1",
+                "reason": "agent exited",
+            }),
+            "a browser grant's task: browser grants keep v1 and raise no alert",
+        ),
+    ] {
+        let device = "dev-phone";
+        let template = Alert {
+            name: "invalid",
+            alert_id,
+            created_at,
+            expires_at: created_at + 600_000,
+            facts: alerts[0].facts.clone(),
+        };
+        let valid = build(&template, device, "unused");
+        let recipient = book.public(&format!("{device}/enc"));
+        let kid = enc_kid(&recipient).unwrap();
+        let info = push::alert_seal_info(
+            &key_of(&template),
+            template.created_at,
+            template.expires_at,
+            device,
+            &kid,
+        )
+        .unwrap();
+        let label = format!("alert-{alert_id}-{device}-facts");
+        let sealed = hpke::seal_with_ikm(
+            recipient.as_32().unwrap(),
+            &info,
+            b"",
+            jcs(&facts).unwrap().as_bytes(),
+            &ikm(&label),
+        )
+        .unwrap();
+        let mut body = valid.body().clone();
+        body["sealed_hash"] = json!(sealed.hash().to_hex());
+        let hint = SignedObject::sign(&book.provider, &host, body)
+            .unwrap()
+            .with_sealed(atem_client::signed::SealedPart {
+                enc: sealed.enc.to_vec(),
+                ct: sealed.ct.clone(),
+            });
+        invalid_facts.push(json!({
+            "code": "malformed",
+            "device_id": device,
+            "facts": facts,
+            "hint": hint.to_json(),
+            "ikm_label": label,
+            "info_hex": hex(&info),
+            "reason": why,
+        }));
+    }
+
     BTreeMap::from([
         ("outcome_unknown", Value::Array(hints)),
         ("outcome_unknown_acks", Value::Array(acks)),
         ("outcome_unknown_details", Value::Array(details)),
         ("outcome_unknown_invalid", Value::Array(invalid)),
+        ("outcome_unknown_invalid_facts", Value::Array(invalid_facts)),
         (
             "outcome_unknown_note",
             json!(
-                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers."
+                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's: the recipient refuses it at open (malformed)."
             ),
         ),
     ])
@@ -5793,4 +5946,395 @@ fn write_control_vectors() {
         text,
     )
     .unwrap();
+}
+
+// ------------------------------------------------- the delegated wire shapes
+//
+// `r9-vectors-delegated-wire` (session-v1 R9.14, planned): the shapes of
+// `host_enc_key_get` and its `host_enc_key` answer, and of receipts with and
+// without provenance (`task_id`, `sender`), valid and refused. Every value
+// comes from the crate's own builders; the valid answer's `enc_key` and
+// `enc_sig` are `r9-vectors-membership-log`'s first `host_enc_key` pair, so
+// its binding verifies against log L.
+
+const WIRE_ID: &str = "c1c2c3c4-0000-4000-8000-000000000001";
+const WIRE_RE: &str = "c1c2c3c4-0000-4000-8000-000000000002";
+
+fn delegated_wire_vectors(book: &Book) -> Value {
+    use atem_client::membership::{host_enc_sig_input, sign_host_enc_key};
+    use atem_client::session::r9::{HostEncKey, host_enc_key_get};
+    use atem_client::session::wire::{
+        Envelope, Op, Receipt, ReceiptKind, ReceiptState, SessionMessage, Target,
+    };
+    use serde_json::json;
+    let log = log_l();
+    let case = |name: &str, valid: bool, message: Value| json!({"name": name, "valid": valid, "message": message});
+
+    // host_enc_key_get: exactly v, op and a UUID v4 id.
+    let get = host_enc_key_get(WIRE_ID);
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = get.clone();
+        f(&mut m);
+        m
+    };
+    let mut gets = vec![case("host_enc_key_get", true, get.clone())];
+    for (name, m) in [
+        (
+            "host_enc_key_get_unknown_field",
+            edit(&|m| m["data"]["extra"] = json!(1)),
+        ),
+        (
+            "host_enc_key_get_version",
+            edit(&|m| m["data"]["v"] = json!(2)),
+        ),
+        (
+            "host_enc_key_get_id_is_uuid_v4",
+            edit(&|m| m["data"]["id"] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ),
+        (
+            "host_enc_key_get_id_not_null",
+            edit(&|m| m["data"]["id"] = Value::Null),
+        ),
+        (
+            "host_enc_key_get_needs_an_id",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("id");
+            }),
+        ),
+        (
+            "host_enc_key_get_is_a_session_message",
+            edit(&|m| m["type"] = json!("terminal")),
+        ),
+    ] {
+        gets.push(case(name, false, m));
+    }
+    gets.push(json!({
+        "name": "host_enc_key_get_duplicate_key",
+        "valid": false,
+        "raw": format!(r#"{{"type":"session","data":{{"v":1,"op":"host_enc_key_get","id":"{WIRE_ID}","id":"{WIRE_RE}"}}}}"#),
+    }));
+
+    // host_enc_key: the host-a key of log L, bound by host-a's host_key.
+    let enc_pub: [u8; 32] = b64u_decode("VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let genesis = log.genesis_hash();
+    let enc_sig = sign_host_enc_key(
+        &book.provider,
+        &book.signer("host-a"),
+        log.account_id(),
+        &genesis,
+        "host-a",
+        1,
+        &enc_pub,
+    )
+    .unwrap();
+    let answer = HostEncKey {
+        id: WIRE_RE.into(),
+        re: WIRE_ID.into(),
+        host_id: "host-a".into(),
+        host_trust_gen: 1,
+        enc_key: PublicKey::new(Alg::X25519, &enc_pub).unwrap(),
+        enc_sig: enc_sig.clone(),
+    }
+    .to_json();
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = answer.clone();
+        f(&mut m);
+        m
+    };
+    let mut keys = vec![case("host_enc_key", true, answer.clone())];
+    for (name, m) in [
+        (
+            "host_enc_key_unknown_field",
+            edit(&|m| m["data"]["extra"] = json!(1)),
+        ),
+        (
+            "host_enc_key_needs_re",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("re");
+            }),
+        ),
+        (
+            "host_enc_key_re_not_null",
+            edit(&|m| m["data"]["re"] = Value::Null),
+        ),
+        (
+            "host_enc_key_host_id_grammar",
+            edit(&|m| m["data"]["host_id"] = json!("host a")),
+        ),
+        (
+            "host_enc_key_host_trust_gen_from_one",
+            edit(&|m| m["data"]["host_trust_gen"] = json!(0)),
+        ),
+        (
+            "host_enc_key_is_x25519",
+            edit(&|m| m["data"]["enc_key"]["alg"] = json!("ed25519")),
+        ),
+        (
+            "host_enc_key_32_bytes",
+            edit(&|m| m["data"]["enc_key"]["pub"] = json!(b64u(&enc_pub[..31]))),
+        ),
+        (
+            "host_enc_key_key_object",
+            edit(&|m| m["data"]["enc_key"]["extra"] = json!(1)),
+        ),
+        (
+            "host_enc_key_sig_64_bytes",
+            edit(&|m| m["data"]["enc_sig"] = json!(b64u(&enc_sig[..63]))),
+        ),
+        (
+            "host_enc_key_sig_base64url",
+            edit(&|m| m["data"]["enc_sig"] = json!("not base64url!")),
+        ),
+    ] {
+        keys.push(case(name, false, m));
+    }
+
+    // Receipts: provenance on a prompt receipt only, both or neither.
+    let target = Target {
+        account_id: "acct-test-1".into(),
+        atem_device_id: "host-a".into(),
+        host_trust_gen: 1,
+        session_id: "ses-aaaaaaaaaaaa".into(),
+        process_gen: "22222222-2222-4222-8222-222222222222".into(),
+    };
+    let receipt = |kind, state, task_id: Option<&str>, sender: Option<&str>| {
+        atem_client::session::wire::to_value(&Envelope::Session(SessionMessage {
+            id: WIRE_ID.into(),
+            re: None,
+            op: Op::Receipt(Receipt {
+                request_id: "44444444-4444-4444-8444-000000000001".into(),
+                target: target.clone(),
+                kind,
+                state,
+                detail: None,
+                updated_at: 1_793_620_800_000,
+                lease: None,
+                result: None,
+                task_id: task_id.map(str::to_owned),
+                sender: sender.map(str::to_owned),
+            }),
+        }))
+    };
+    const TASK: &str = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+    let with = |sender: &str| {
+        receipt(
+            ReceiptKind::Prompt,
+            ReceiptState::Executing,
+            Some(TASK),
+            Some(sender),
+        )
+    };
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = with("service:svc-1");
+        f(&mut m);
+        m
+    };
+    let mut receipts = vec![
+        case(
+            "receipt_without_provenance",
+            true,
+            receipt(ReceiptKind::Prompt, ReceiptState::Accepted, None, None),
+        ),
+        case(
+            "receipt_of_a_stop_without_provenance",
+            true,
+            receipt(ReceiptKind::Stop, ReceiptState::Completed, None, None),
+        ),
+        case("receipt_provenance_service", true, with("service:svc-1")),
+        case("receipt_provenance_member", true, with("member:dev-phone")),
+        case("receipt_provenance_host", true, with("host:host-b")),
+        case(
+            "receipt_provenance_128_byte_id",
+            true,
+            with(&format!("service:{}", "s".repeat(128))),
+        ),
+    ];
+    for (name, m) in [
+        (
+            "receipt_provenance_needs_sender",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("sender");
+            }),
+        ),
+        (
+            "receipt_provenance_needs_task_id",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("task_id");
+            }),
+        ),
+        (
+            "receipt_provenance_sender_not_null",
+            edit(&|m| m["data"]["sender"] = Value::Null),
+        ),
+        (
+            "receipt_provenance_task_id_not_null",
+            edit(&|m| m["data"]["task_id"] = Value::Null),
+        ),
+        (
+            "receipt_provenance_task_id_is_uuid_v4",
+            edit(&|m| m["data"]["task_id"] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ),
+        (
+            "receipt_provenance_sender_not_local",
+            edit(&|m| m["data"]["sender"] = json!("local")),
+        ),
+        (
+            "receipt_provenance_sender_not_a_browser_grant",
+            edit(&|m| m["data"]["sender"] = json!("browser:g-1")),
+        ),
+        (
+            "receipt_provenance_sender_not_host_work",
+            edit(&|m| m["data"]["sender"] = json!("host-work")),
+        ),
+        (
+            "receipt_provenance_sender_has_an_id",
+            edit(&|m| m["data"]["sender"] = json!("service:")),
+        ),
+        (
+            "receipt_provenance_sender_id_at_most_128_bytes",
+            edit(&|m| m["data"]["sender"] = json!(format!("service:{}", "s".repeat(129)))),
+        ),
+        (
+            "receipt_provenance_only_on_a_prompt",
+            edit(&|m| m["data"]["kind"] = json!("interrupt")),
+        ),
+    ] {
+        receipts.push(case(name, false, m));
+    }
+
+    json!({
+        "name": "r9-vectors-delegated-wire",
+        "kind": "vectors",
+        "requires": "r9",
+        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without. Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+        "host_enc_key_binding": {
+            "account_id": log.account_id(),
+            "genesis_hash": genesis.to_hex(),
+            "host_id": "host-a",
+            "host_trust_gen": 1,
+            "enc_sig_input_hex": hex(host_enc_sig_input(log.account_id(), &genesis, "host-a", 1, &enc_pub).as_bytes()),
+        },
+        "host_enc_key_get": gets,
+        "host_enc_key": keys,
+        "receipt": receipts,
+    })
+}
+
+#[test]
+#[ignore = "writes the delegated wire shape vectors"]
+fn write_delegated_wire_vectors() {
+    let value = delegated_wire_vectors(&Book::load());
+    let mut text = serde_json::to_string_pretty(&value).unwrap();
+    text.push('\n');
+    std::fs::write(fixtures_dir().join("r9-vectors-delegated-wire.json"), text).unwrap();
+}
+
+/// `r9-vectors-delegated-wire`: each case read as the shared core reads it
+/// (valid or refused as a whole), the valid ones written back byte for
+/// byte, and the answer's binding verified against log L.
+#[test]
+fn delegated_wire() {
+    use atem_client::membership::{host_enc_sig_input, verify_host_enc_sig};
+    use atem_client::session::r9::{HostEncKeyGet, Incoming, host_enc_key_get};
+    use atem_client::session::wire::{self as swire, Envelope};
+    let mut run = Run::new("r9-vectors-delegated-wire");
+    let book = Book::load();
+    let bytes = |case: &Value| -> Vec<u8> {
+        match case.get("raw") {
+            Some(raw) => raw.as_str().unwrap().as_bytes().to_vec(),
+            None => case["message"].to_string().into_bytes(),
+        }
+    };
+    for case in run.get("host_enc_key_get").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = HostEncKeyGet::decode(&bytes(case));
+        assert_eq!(read.is_ok(), case["valid"] == true, "{name}");
+        if let Ok(read) = read {
+            assert_eq!(host_enc_key_get(&read.id), case["message"], "{name}");
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    let binding = run.get("host_enc_key_binding");
+    let log = log_l();
+    assert_eq!(s(&binding, "account_id"), log.account_id());
+    assert_eq!(s(&binding, "genesis_hash"), log.genesis_hash().to_hex());
+    for case in run.get("host_enc_key").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = match Incoming::parse(&bytes(case)) {
+            Ok(Incoming::HostEncKey(answer)) => Some(answer),
+            _ => None,
+        };
+        assert_eq!(read.is_some(), case["valid"] == true, "{name}");
+        if let Some(answer) = read {
+            assert_eq!(answer.to_json(), case["message"], "{name}");
+            let enc_pub = answer.enc_key.as_32().unwrap();
+            assert_eq!(
+                hex(host_enc_sig_input(
+                    log.account_id(),
+                    &log.genesis_hash(),
+                    &answer.host_id,
+                    answer.host_trust_gen,
+                    enc_pub
+                )
+                .as_bytes()),
+                s(&binding, "enc_sig_input_hex"),
+                "{name}"
+            );
+            verify_host_enc_sig(
+                &book.signer_public("host-a"),
+                log.account_id(),
+                &log.genesis_hash(),
+                &answer.host_id,
+                answer.host_trust_gen,
+                enc_pub,
+                &answer.enc_sig,
+            )
+            .unwrap();
+            assert!(answer.action(false, 1).is_ok(), "{name}: drafts the entry");
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read, binding verified"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    for case in run.get("receipt").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = swire::decode(&bytes(case));
+        assert_eq!(read.is_ok(), case["valid"] == true, "{name}");
+        if let Ok(Envelope::Session(message)) = read {
+            assert_eq!(
+                swire::to_value(&Envelope::Session(message)),
+                case["message"],
+                "{name}"
+            );
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read and written back"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    // The fixture is the crate's own output.
+    assert_eq!(
+        delegated_wire_vectors(&book),
+        run.file.clone(),
+        "regenerate with write_delegated_wire_vectors"
+    );
 }

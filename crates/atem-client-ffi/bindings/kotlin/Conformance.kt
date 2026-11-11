@@ -919,6 +919,19 @@ fun main(args: Array<String>) {
         val keysJdk = JdkKeys()
         keysJdk.addX25519("enc", unhex(push["recipient_secrets"]["dev-phone"].s()), unhex(keys["dev-phone"]["enc"]["pub_hex"].s()))
         throwsCode("open_failed") { swapped.open(keysJdk, "enc", "dev-phone") }
+        // Well signed and well sealed, but the sealed facts aren't a
+        // delegated sender's UUID v4 task: verified and kept, refused at open.
+        for (c in push["outcome_unknown_invalid_facts"].arr()) {
+            for (verifier in listOf(PushVerifier.CLIENT, PushVerifier.RELAY)) {
+                verifyPushHint(Json.write(c["hint"]), logL(), nowP, verifier)
+            }
+            val hint = verified(c["hint"])
+            hint.checkSealed()
+            val device = c["device_id"].s()
+            val keysFor = JdkKeys()
+            keysFor.addX25519("enc", unhex(push["recipient_secrets"][device].s()), unhex(keys[device]["enc"]["pub_hex"].s()))
+            throwsCode(c["code"].s()) { hint.open(keysFor, "enc", device) }
+        }
         // The ack entries, and an approval hint is no alert.
         val acks = push["outcome_unknown"].arr().map { verified(it).ackJson() }
         eq(parsePushAck(pushAckMessage(acks)), acks)
