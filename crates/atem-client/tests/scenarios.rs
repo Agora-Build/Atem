@@ -1487,7 +1487,7 @@ fn membership_scenarios() {
     let names = scenario_files();
     assert_eq!(
         names.len(),
-        40,
+        42,
         "chain, recovery and service-expiry scenarios"
     );
     let mut total = (0, 0);

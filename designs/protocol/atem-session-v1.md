@@ -2106,7 +2106,14 @@ nothing: a host principal has no attachments, and their host-work
 effects (cancellations, interrupt intents, narrowing) belong to R9.3's
 step 4 together with host-work's applied device-list `seq` (delegated
 host work II.3.1, "Crash safety"), which isn't built. The host
-advertises no `host.delegated`, `host.alerts` or `host.senders`.
+advertises no `host.delegated`, `host.alerts` or `host.senders`. Two
+host scenarios replay the conflict outcomes on a list that holds
+`HS7_revoke` at seq 7: `r9-chain-conflict-with-a-host-sender-revoke-by-a-current-manager-freezes`
+(`EK7_set`, another entry at seq 7 by a current manager, valid at its own
+position: freeze) and
+`r9-chain-conflict-with-a-redundant-host-sender-readmit-is-ignored`
+(`HS7_readmit_authorized`, `not_revoked` at its own position: ignored, logged
+as `invalid` evidence, no freeze).
 
 *Signers.* `check_change` never paces these actions (only the full log
 refuses them) and refuses to draft a revoke of a host already revoked

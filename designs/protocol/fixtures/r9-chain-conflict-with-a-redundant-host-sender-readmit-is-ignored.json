@@ -1,0 +1,75 @@
+{
+  "name": "r9-chain-conflict-with-a-redundant-host-sender-readmit-is-ignored",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "R9.4 for the delegated host-work actions: the host's list holds HS7_revoke (host_sender_revoke of host-a) at seq 7; HS7_readmit_authorized is another entry at seq 7 on the same E6, validly signed by dev-mac, but a host_sender_readmit of a host that is authorized at E6 (not_revoked): invalid at its own position, so it is no fork a manager signed: ignored and logged as evidence (invalid), no freeze, the head stays HS7_revoke.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6",
+      "HS7_revoke"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true,
+        "project": "h1.b982533d.abababababababababababababababababababababababababababababababab"
+      }
+    ],
+    "clients": [
+      {
+        "name": "phone",
+        "principal": "member:dev-phone",
+        "key": "dev-phone"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "connect": "phone",
+      "client_head": "HS7_readmit_authorized",
+      "carry": [
+        "HS7_readmit_authorized"
+      ]
+    },
+    {
+      "expect": "phone",
+      "match": {
+        "op": "welcome",
+        "revision": 9,
+        "client_kind": "native",
+        "principal": "member:dev-phone",
+        "permissions": [
+          "control",
+          "view"
+        ],
+        "head.seq": 7,
+        "head.hash": "${hash:HS7_revoke}"
+      }
+    },
+    {
+      "assert": {
+        "head": "HS7_revoke",
+        "frozen": false,
+        "evidence_count": 1,
+        "evidence_reason": "invalid"
+      }
+    }
+  ]
+}
