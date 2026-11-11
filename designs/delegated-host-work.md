@@ -24,11 +24,13 @@ built: the claimed generation's `add_host` comes at or before `signed_at_head.se
 only a `signed_at_head` beyond this host's head waits, so a generation this host's list doesn't hold at a head it
 holds is refused; and a waiting object from a generation this host holds has its signature checked first. IX.4 gains
 question 4, host senders across Stations: in this version a host sends host-sender work only to hosts on its own
-Station. II.4.2 also says that a host should accept mail to a key it handed out before its own list applied it, and
-that a refused object is done for good, and it refuses a removed host's envelope at the generation it last held at
-any head. The envelope vectors are `r9-vectors-host-envelope.json` (III.1), named apart from R9.7a's
-`r9-envelope-vectors.json`. Each changed passage is marked "Amended after agreement, 2026-11-10" (in II.4.2 and
-III.1) or "Added after agreement, 2026-11-10" (IX.4).
+Station. II.4.2 also says: a host should accept mail to a key it handed out before its own list applied it, and mail
+to a key it hasn't applied yet waits when signed beyond its head; the host's trust generation is its own; the
+`sealed_hash` check comes with the signature (step 4), and only a copy the sender is shown to have sent claims its
+`id`, so a damaged or injected copy can't make the host refuse the sender's object; and a removed host's envelope at
+the generation it last held is refused at any head. The envelope vectors are `r9-vectors-host-envelope.json`
+(III.1), named apart from R9.7a's `r9-envelope-vectors.json`. Each changed passage is marked "Amended after
+agreement, 2026-11-10" (in II.4.2 and III.1) or "Added after agreement, 2026-11-10" (IX.4).
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
@@ -1630,50 +1632,62 @@ with the sealed part beside it.
 1. Strict parse (R9.1); `type` and `v`; `account_id` and `genesis_hash` are its pin.
 2. The recipient is itself, at its current trust generation, and `enc_kid` names its current `enc_key` (or, for 24 h
    after a routine `host_enc_key` rotation, its previous one; never after a rotation with `retire_previous`, II.3.1).
-   **Amended after agreement, 2026-11-10 (for Astation).** A key the host generated and handed out but whose
-   `host_enc_key` its own list hasn't applied yet should be accepted too: a sender whose list already has the entry
-   seals to it, and a refusal is final (the sender's resend of the same bytes is a duplicate, below).
+   **Amended after agreement, 2026-11-10 (for Astation).** The current trust generation is the host's own, from its
+   pairing, never one read from its device list, which may lag behind its own new `add_host`. When `signed_at_head.seq`
+   is beyond this host's head, a key it doesn't accept waits (below): its own new `host_enc_key` may be among the
+   entries it lacks. A key the host generated and handed out but whose `host_enc_key` its own list hasn't applied yet
+   should be accepted too: a sender whose list already has the entry seals to it, and the mail then opens at once
+   instead of waiting.
 3. The sender is a current host at its applied head whose newest `add_host` has exactly `sender.host_trust_gen`.
    **Owner decision 2026-11-07:** its `host_id` is `authorized(g)` at this host's head (II.3.1), `signed_at_head.seq`
    is at least g, and this host's entry at `signed_at_head.seq` has `signed_at_head.hash`. **Amended after
    agreement, 2026-11-10 (for Astation).** The claimed generation's `add_host` is at or before `signed_at_head.seq`:
    a host signs only once its own device list shows its `add_host` at exactly its `host_trust_gen`.
-4. The signature, with that `add_host`'s `host_key`.
+4. The signature, with that `add_host`'s `host_key`. **Amended after agreement, 2026-11-10 (for Astation).** And
+   `sealed_hash` names `enc` and `ct` (it was the first part of step 6): the signature never covered a sealed part its
+   `sealed_hash` doesn't name, so such a copy isn't the sender's, and every later verdict is about the sender's own,
+   intact copy.
 5. The times: `expires_at` after `created_at` and at most 24 h later, not passed, and `created_at` at most 60 s ahead
    of its clock at first acceptance (host-work-v1 §5). The clock is I.6.5's.
-6. `sealed_hash`, then open, then strict parse of the plaintext, whose ids, times and sender equal the body's.
+6. Open, then strict parse of the plaintext, whose ids, times and sender equal the body's. **Amended after agreement,
+   2026-11-10 (for Astation):** its `sealed_hash` check is step 4's now.
 7. Then the host-work checks of a message: route, project, ops, target and no attachments (II.2; host-work-v1 §5
    "Publish"), committed in one transaction with the mailbox cursor.
 
 **Outcomes.**
 - **Steps 1, 2 and 4, and step 3 for a sender this host doesn't know, has removed or holds `revoked`, or whose
   `signed_at_head` is before its generation or names another hash:** the object is refused and its hash kept as
-  evidence; the host marks it done in the mailbox. Nothing reaches an agent. **Amended after agreement, 2026-11-10
-  (for Astation).** Step 3 refuses these only at a `signed_at_head` this host's list holds (one beyond it waits,
-  below), and there it also refuses a claimed generation the list doesn't hold, or whose `add_host` comes after
-  `signed_at_head.seq`: the list the sender signed at is the one this host holds. Two are refused at any head, since
-  `add_host` generations strictly rise: a generation below the sender's newest, and an envelope from a removed host
-  at the generation it last held (after step 5's times when the head is beyond this host's). A refused object is
-  done for good: the host never judges it again, so a refusal never later becomes an open.
-- **Amended after agreement, 2026-11-10 (for Astation).** **Step 3 for a `signed_at_head.seq` beyond this host's
-  head** (it read: "for a `sender.host_trust_gen`, or a `signed_at_head.seq`, beyond this host's head"): the host
-  may not have the sender's new `add_host`, or its readmit, yet. Step 5's time checks run first, on the body's times;
-  an object that fails them is refused. When this host already holds the `add_host` of the claimed
-  `(host_id, host_trust_gen)` (a current host at its newest generation, or a removed host's result), it then checks
-  the signature with that `add_host`'s `host_key` and refuses an object whose signature fails, since that pair has
-  one key forever; otherwise (a sender it doesn't know, or a generation above its newest) the signature can't be
-  checked yet. One that passes stays pending, isn't marked done, and is judged again after each device-list advance,
-  until it expires. At most 64 objects stay pending per claimed `(host_id, host_trust_gen)` and 256 in all; more are
-  refused and kept as evidence. **Pending objects don't hold the gate** (II.5): an object this host can't verify yet
-  can't stop its other work. **New rule.**
+  evidence; the host marks it done in the mailbox. Nothing reaches an agent. **Amended after agreement, 2026-11-10 (for
+  Astation).** Step 2's key part and step 3 refuse these only at a `signed_at_head` this host's list holds (one beyond
+  it waits, below), and there step 3 also refuses a claimed generation the list doesn't hold, or whose `add_host` comes
+  after `signed_at_head.seq`: the list the sender signed at is the one this host holds. Two are refused at any head,
+  since `add_host` generations strictly rise: a generation below the sender's newest, and an envelope from a removed
+  host at the generation it last held (after step 5's times when the head is beyond this host's). These refusals claim
+  no `id` (Duplicates, below): the sender's own copy, sent again, is still judged.
+- **Amended after agreement, 2026-11-10 (for Astation).** **Step 3 for a `signed_at_head.seq` beyond this host's head**
+  (it read: "for a `sender.host_trust_gen`, or a `signed_at_head.seq`, beyond this host's head"): the host may not have
+  the sender's new `add_host`, or its readmit, or its own new `host_enc_key`, the key the object is sealed to, yet. Step
+  5's time checks run first, on the body's times; an object that fails them is refused. When this host already holds the
+  `add_host` of the claimed `(host_id, host_trust_gen)` (a current host at its newest generation, or a removed host's
+  result), it then checks the signature with that `add_host`'s `host_key` and refuses an object whose signature fails,
+  since that pair has one key forever; otherwise (a sender it doesn't know, or a generation above its newest) the
+  signature can't be checked yet. One that passes stays pending, isn't marked done, and is judged again after each
+  device-list advance and each change of the keys it accepts, until it expires. At most 64 objects stay pending per
+  claimed `(host_id, host_trust_gen)` and 256 in all; more are refused and kept as evidence. **Pending objects don't
+  hold the gate** (II.5): an object this host can't verify yet can't stop its other work. **New rule.**
 - **Steps 5 and 6, once step 4 passed:** the sender is authenticated, so the refusal is reported back to it as a
   status naming the object's `id`, `refused` with `invalid_request` (II.4.4); its outbox doesn't stay `sent` until
   expiry.
 - **Step 7:** a recorded decision (`refused`), reported back (II.4.4).
-- **Duplicates.** The same `id` with the same `sealed_hash` is a duplicate: acknowledged, nothing changes (**amended
-  after agreement, 2026-11-10:** acknowledged with its first verdict). The same `id` with other bytes is refused and
-  kept as evidence. Message ids keep host-work v1's rules: the same content returns the recorded receipt, other
-  content is `request_id_reused`.
+- **Duplicates.** **Amended after agreement, 2026-11-10 (for Astation)** (it read: "The same `id` with the same
+  `sealed_hash` is a duplicate: acknowledged, nothing changes. The same `id` with other bytes is refused and kept as
+  evidence"). Only an object whose signature verified and whose sealed part its `sealed_hash` names claims its `id` (an
+  open, a refusal at steps 5 to 7, or a result accepted or kept). A later object with that `id` and the same
+  `sealed_hash` is a duplicate, acknowledged with the first verdict; with another `sealed_hash` it is refused and kept
+  as evidence. Every other refusal is recorded under its evidence hash only: the same bytes again are a duplicate of it,
+  and other bytes with that `id` (the sender's own copy) are judged on their own, so a damaged or injected copy can't
+  make the host refuse the sender's object. Message ids keep host-work v1's rules: the same content returns the recorded
+  receipt, other content is `request_id_reused`.
 
 ### II.4.3 The mailbox
 

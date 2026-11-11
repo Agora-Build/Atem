@@ -3923,7 +3923,10 @@ a redirected copy, stale, newer and unheld generations, a tampered
 `sealed_hash`, `signed_at_head` before the sender's generation or naming a
 wrong hash, revoked, removed and unknown senders (a removed host's
 envelope refused even when signed beyond the receiver's head, its result
-waiting), expiry and every time
+waiting; a revoked host's waiting until its readmit), a copy whose sealed
+part its `sealed_hash` doesn't name (refused unauthenticated), mail to a
+key the receiver hasn't applied yet (waiting when signed beyond its head),
+expiry and every time
 check, mismatched plaintext ids, attachments, a plaintext with `null`, a
 retired previous key, a result from a host the row didn't go to, a dropped
 reply, results of revoked and removed hosts kept as data, and an object at
